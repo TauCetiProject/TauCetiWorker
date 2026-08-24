@@ -107,6 +107,12 @@ Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
 the worker. A GitHub API failure aborts the round rather than reading as "nothing
 to do", so a transient outage never falls through to authoring.
 
+A review has two outputs with different roles. The head-pinned scoreboard posted
+on the PR is the live verdict that auto-merge reads. Detailed run records are also
+kept in a local outbox for the public TauCetiData analytics/provenance archive;
+failure or lack of permission to publish that archive does not stop the posted
+review from counting.
+
 ## Configure a round
 
 Three independent dials: which work, which agent, and where it runs. Combine

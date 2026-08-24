@@ -6,9 +6,9 @@ themselves but as CONTRIBUTOR (or NONE) to an outside contributor. The old trust
 ({OWNER, MEMBER, COLLABORATOR}) therefore silently discarded legitimate scoreboards for every
 unprivileged contributor — Bryan's PR #470 had a real kim-em scoreboard with four blocking rubrics that
 his worker treated as "no scoreboard at this head", so `fix` never ran. gh_meta now identifies the
-scoreboard by the <!--tauceti-scoreboard--> marker alone and parses the newest one's meta. (Safe: this
-meta only drives the worker's own review/fix eligibility; merges are gated by the write-restricted
-TauCetiData records, not this comment.)
+scoreboard by the <!--tauceti-scoreboard--> marker alone and parses the newest one's meta. This mirrors
+the live merge gate's deliberate no-access-bar policy: the scoreboard supplies review state, while
+trusted CI independently supplies build, scope, and bump-guard status.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """

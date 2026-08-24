@@ -608,27 +608,20 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             w.counters.write(errkey, 0)
             clear_review_failure(w.cfg.state, pr)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
-            # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
-            # outbox mean the merge gate can't see this round, so don't report the round as a success.
+            # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
+            # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
+            # visible and non-lossy but must not turn a successfully posted review into failed work.
             srv = _sync_review_outbox(w, pr)
             if srv != 0:
-                # The sync failed: publishing this round's records to TauCetiData (a git push, after
-                # archive.sync's own retries) did not land — auth, network, or the remote being down.
-                # That is MACHINE-WIDE: every PR's publish would fail identically, so it must NOT be
-                # charged to this PR's review-error budget. Charging it did exactly the damage the
-                # host-binary preflight above guards against — a stale gh credential helper made every
-                # push fail, and green PRs marched one-by-one to the "needs a human" cap even though
-                # each review posted fine. Mirror that preflight: warn loudly and raise NoProgress
-                # (⇒ backoff, no counter bump). The review IS posted and its records are kept in the
-                # outbox; a later round re-drains them once the machine-wide cause clears.
+                # A push-capable host hit an archive outage (auth, network, remote, or local checkout).
+                # Keep the records for the next review's whole-outbox retry and warn, but continue the
+                # successful review path: the scoreboard already landed and can drive auto-merge.
                 warn_red(
-                    f"review #{pr}: the review posted, but publishing its records to TauCetiData "
-                    f"FAILED — records kept in {w.cfg.store_dir / 'outbox'}, so the merge gate can't "
-                    f"see this round until they land. This is machine-wide (every PR's publish would "
-                    f"fail the same way), so it is NOT charged to any PR's review-error budget. Check "
-                    f"the host's git/gh credentials; the loop re-drains on its own once it is fixed."
+                    f"review #{pr}: review posted and counts for auto-merge, but publishing its "
+                    f"analytics/provenance records to TauCetiData FAILED — records kept in "
+                    f"{w.cfg.store_dir / 'outbox'}. This archive failure is NOT charged to the PR; "
+                    f"check the host's git/gh credentials. A later review retries the whole outbox."
                 )
-                raise NoProgress(f"review #{pr}: TauCetiData publish failed — machine-wide, not charged to the PR")
             if c.contest:
                 # The engine advanced replies_through in the new scoreboard (the durable per-reply
                 # watermark); rs.bust below re-fetches it, so this contest won't re-fire once the 👀
@@ -639,7 +632,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
             # The engine stopped because the reviewer's provider is unusable — a revoked credential or
             # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).
-            # That is MACHINE-WIDE in exactly the sense the TauCetiData carve-out below means: the next
+            # That is MACHINE-WIDE in the same sense as an archive service outage: the next
             # PR the loop picks would abort identically, so charging it to whichever PR happened to be
             # this round's candidate is charging a PR for someone else's outage. Three of them strand
             # that PR at MAX_REVIEW_ERRORS: dropped from review candidacy and given a public "Review
@@ -686,16 +679,16 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     outbox = w.cfg.store_dir / "outbox"
     if not outbox.is_dir() or not any(p.is_file() for p in outbox.rglob("*")):
         return 0
-    # A contributor without write access to TauCetiData (anyone but the maintainer/worker identity)
-    # cannot push records there. Don't fail their round over it: the review IS posted and the records
-    # are kept in the local outbox — an external review will count once contributor-publishing lands.
+    # A contributor without write access to TauCetiData cannot push archive records there. The review
+    # itself already counts through its posted scoreboard; retain the records locally for a future
+    # contributor-publishing path without treating archival as operational review state.
     # The maintainer's identity returns push=true, so the sync below runs and a genuine outage still
     # surfaces loudly. A failed/ambiguous check falls through to the sync (preserving the loud-fail).
     perm = gh_run(["gh", "api", "repos/TauCetiProject/TauCetiData", "--jq", ".permissions.push"])
     if perm.returncode == 0 and perm.stdout.strip() == "false":
         log(
-            f"  review #{pr}: no write access to TauCetiData — review posted, records kept in "
-            f"{outbox} (they won't count for auto-merge until contributor-publishing lands)"
+            f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
+            f"auto-merge; analytics/provenance records kept in {outbox}"
         )
         return 0
     eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")  # a local engine checkout, for pre-merge tests
