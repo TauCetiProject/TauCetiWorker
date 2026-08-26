@@ -155,6 +155,7 @@ def test_roadmap():
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     os.environ["TAUCETI_PUSH_EXPECT"] = "stale"  # must be popped by do_roadmap (create-only on the fork)
     tc.work_units.ensure_fork = lambda: FORK
+    tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
 
     # A real review checkout, so the round exercises the BUNDLED path rather than the fallback:
     # stage_rubrics only produces a bundle when it finds rubrics to concatenate.

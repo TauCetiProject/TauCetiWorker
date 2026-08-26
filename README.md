@@ -151,6 +151,8 @@ Roadmap workers also avoid finer-grained targets other contributors have claimed
 on the [intentions board](https://github.com/leanprover-community/intentions).
 Adjust with `--roadmap-extra-identities` (logins that count as your own side) or
 turn it off with `--ignore-claims`; see [the reference](docs/reference.md).
+Assigned intentions carrying the maintainer-applied `administrative-hold` label are binding for
+every worker, including the assignee's own workers, and cannot be disabled by those options.
 
 ### Which agent: `--agent`
 

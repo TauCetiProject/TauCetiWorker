@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Roadmap claim discovery: the worker avoids targets other contributors have claimed on the
 intentions board, but not unclaimed intentions or claims held by its own (or operator-named)
-identities.
+identities. Assigned administrative holds bind every identity.
 
 These exercise the pure pieces (no network): parse_scope (pull "Items in scope" from an Intention
 issue body), select_foreign (ours/theirs/unassigned filtering), and claimed_block (prompt rendering).
@@ -87,6 +87,31 @@ check("foreign claim carries parsed scope", foreign and foreign[0].scope == "rep
 
 # extra identities widen "ours": mrdouglasny becomes ours too
 check("extra identities suppress a foreign claim", it.select_foreign(issues, {"kim-em", "mrdouglasny"}) == [])
+
+# A maintainer-labelled hold is selected on the binding path, even when held by our own identity.
+admin_issues = [
+    {
+        "number": 5,
+        "url": "u5",
+        "title": "Hold",
+        "body": "### Items in scope\n\nreserved target",
+        "assignees": [{"login": "kim-em"}],
+        "labels": [{"name": "administrative-hold"}],
+    },
+    {
+        "number": 6,
+        "url": "u6",
+        "title": "Expired hold",
+        "body": "### Items in scope\n\nreleased target",
+        "assignees": [],
+        "labels": ["administrative-hold"],
+    },
+]
+check("administrative holds are excluded from ordinary claims", it.select_foreign(admin_issues, own) == [])
+admin = it.select_administrative_holds(admin_issues)
+check("assigned administrative hold is binding for its holder", [c.number for c in admin] == [5])
+check("unassigned administrative hold is inactive", all(c.number != 6 for c in admin))
+check("administrative hold preserves scope", admin and admin[0].scope == "reserved target")
 
 # blank "Items in scope" falls back to the issue title
 blank = it.select_foreign(

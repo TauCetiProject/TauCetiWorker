@@ -56,7 +56,7 @@ from .constants import (
     TAUCETI,
 )
 from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
-from .intentions import claimed_avoid_list
+from .intentions import administrative_hold_avoid_list, claimed_avoid_list
 from .paths import CLAIM_SH, HERE
 from .quota import Quota, _unavail_reason, mirror_creds
 from .review_diagnostics import (
@@ -1205,11 +1205,14 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is
     # already excluded from the auto pick above, so this only matters for an explicit --roadmap-only.
     skip_str = ", ".join(a for a in skip if a != only) or "none"
-    # Cross-contributor claims: avoid targets others have claimed on the intentions board. Soft and
-    # fail-open; skipped for the "any" roam (no single area to scope the query to) and when opted out.
-    claimed_str = "none"
-    if respect_claims() and only not in ("any", ""):
-        claimed_str = claimed_avoid_list(w.gh, only)
+    # Administrative holds are binding, including for the holder's own workers, and fail closed.
+    # Ordinary cross-contributor claims remain cooperative, fail-open, and optional.
+    hold_area = None if only in ("any", "") else only
+    blocks = [administrative_hold_avoid_list(w.gh, hold_area)]
+    if only not in ("any", ""):
+        if respect_claims():
+            blocks.append(claimed_avoid_list(w.gh, only))
+    claimed_str = "\n".join(block for block in blocks if block != "none") or "none"
     refs = w.cfg.state / "refs"
     if not fetch_ref(ROADMAP, refs / "roadmap"):
         raise Die(f"fetch {ROADMAP} failed")

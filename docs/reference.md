@@ -88,6 +88,12 @@ those logins with `--roadmap-extra-identities` so the worker does not avoid your
 own side's claims. This is cooperative and fail-open;
 `--ignore-claims` or `TAUCETI_RESPECT_CLAIMS=false` opts out.
 
+An assigned intention with the maintainer-applied `administrative-hold` label is different: every
+worker avoids its scope, even when authenticated as the assignee and even with `--ignore-claims`.
+Reading these holds is fail-closed, so a GitHub error stops roadmap authoring. The hold remains tied
+to the normal intentions lifecycle: when its dated claim expires, the bot clears the assignee and
+the hold becomes inactive.
+
 ## Codex model selection
 
 The committed Codex authoring profile defaults to `gpt-5.6-sol`. Before the real
