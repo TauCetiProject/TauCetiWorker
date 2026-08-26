@@ -71,13 +71,12 @@ class ReviewState:
         a reviewer who is a PRIVATE org member reads as MEMBER to themselves but as CONTRIBUTOR/NONE to an
         outside contributor, so an association filter silently discarded legitimate scoreboards for every
         unprivileged contributor (Bryan's PR #470: a real kim-em scoreboard, four blocking rubrics, that
-        his worker treated as "no scoreboard at this head" — so `fix` never ran). The cost of trusting any
-        marked scoreboard is bounded: this meta only drives the worker's OWN review/fix eligibility on its
-        OWN PRs; the merge gate reads the authoritative, write-restricted TauCetiData records, not this
-        comment, so a forged comment cannot merge anything. The residual risk is a forged all-green
-        scoreboard suppressing a review — which a forger can't parlay into a merge and which self-heals on
-        the next push (its head_sha stops matching). A FETCH FAILURE with a prior cache value → serve the
-        stale value (stale-but-real beats a phantom '{}'); a SUCCESSFUL fetch that finds no scoreboard
+        his worker treated as "no scoreboard at this head" — so `fix` never ran). This mirrors the live
+        merge gate's deliberate no-access-bar policy: the newest marked scoreboard supplies the review
+        verdict, while trusted CI still supplies the build, scope, and bump-guard boundaries. A forged
+        all-green scoreboard can therefore satisfy the review part of that policy; reviewer trust is
+        social rather than enforced by author association. A FETCH FAILURE with a prior cache value →
+        serve the stale value (stale-but-real beats a phantom '{}'); a SUCCESSFUL fetch that finds no scoreboard
         returns '{}' even with a cache, so a scoreboard that was deleted/edited away (or a forged one a
         worker briefly cached) can't be served as fresh past the TTL.
         """
