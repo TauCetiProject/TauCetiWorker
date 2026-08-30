@@ -467,6 +467,73 @@ def sync_mathlib_pool(cfg: Config) -> None:
         log(f"mathlib cache pool: promoted {promoted}, hydrated {hydrated} ({pool})")
 
 
+def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
+    """Drop this worker's owned Lake artifact store when canonical main changes toolchains.
+
+    The marker follows ``origin/main``, not the branch left by the previous round and not a PR the
+    worker is about to check out.  Otherwise alternating between an old-toolchain PR and current
+    main would erase the cache every round.  The first observation only seeds the marker, so enabling
+    this policy does not unexpectedly discard an established store.
+
+    Only the default per-worker path is ours to delete.  An explicit ``LAKE_CACHE_DIR`` can name an
+    operator-managed or shared store, and is therefore reported but left untouched.
+    """
+    import hashlib
+
+    toolchain_file = cfg.checkout / "lean-toolchain"
+    try:
+        contents = toolchain_file.read_bytes()
+    except OSError:
+        return
+    digest = hashlib.sha256(contents).hexdigest()
+    label = next((line.strip() for line in contents.decode(errors="replace").splitlines() if line.strip()), "empty")
+    label = label[:160]
+
+    marker = cfg.state / "cache" / "lake-cache-toolchain.json"
+    previous = _read_json_file(marker)
+    if not isinstance(previous, dict) or not isinstance(previous.get("sha256"), str):
+        # Missing is the expected migration path.  A corrupt marker is also treated conservatively:
+        # replace it, but do not turn unreadable bookkeeping into permission for a destructive clean.
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(marker, {"sha256": digest, "toolchain": label})
+        except OSError as e:
+            log(f"Lake artifact cache: could not record toolchain marker ({e})")
+        return
+    if previous["sha256"] == digest:
+        return
+
+    old_label = str(previous.get("toolchain") or previous["sha256"][:12])
+    owned_cache = cfg.data_home / ".cache" / "lake"
+    configured_cache = Path(os.environ.get("LAKE_CACHE_DIR") or owned_cache)
+    same_path = os.path.abspath(configured_cache) == os.path.abspath(owned_cache)
+    if not same_path or configured_cache.is_symlink():
+        log(
+            f"Lake artifact cache: main toolchain changed ({old_label} → {label}); "
+            f"leaving operator-managed LAKE_CACHE_DIR untouched ({configured_cache})"
+        )
+    else:
+        try:
+            had_cache = configured_cache.exists()
+            if had_cache:
+                shutil.rmtree(configured_cache)
+        except OSError as e:
+            # Do not advance the marker: retry at the next quiescent checkout preparation.
+            log(
+                f"Lake artifact cache: main toolchain changed ({old_label} → {label}), "
+                f"but cleanup failed ({e})"
+            )
+            return
+        result = f"cleared {configured_cache}" if had_cache else "cache already empty"
+        log(f"Lake artifact cache: main toolchain changed ({old_label} → {label}); {result}")
+
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(marker, {"sha256": digest, "toolchain": label})
+    except OSError as e:
+        log(f"Lake artifact cache: cleanup completed but could not update toolchain marker ({e})")
+
+
 def prepare_checkout(cfg: Config) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
     sync_mathlib_pool(cfg)
@@ -487,6 +554,10 @@ def prepare_checkout(cfg: Config) -> bool:
     # the old branch with only main's content. Bail if even the forced checkout fails.
     if g("checkout", "-q", "-f", "-B", "main", "origin/main"):
         return False
+    # The checkout is quiescent here: the previous agent has exited and the next one has not started.
+    # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
+    # before anything can begin writing this worker's private Lake store again.
+    clean_lake_cache_after_toolchain_bump(cfg)
     g("clean", "-fdxq", "-e", ".lake")
     return True
 

@@ -148,8 +148,12 @@ store instead of the build directory, and TauCeti's audits (`lake exe axioms`,
 `lake exe module-system`) resolve `.olean`s through the Lean search path. Asking
 for the copy keeps them working, and measured on a 1500-declaration module,
 returning to a previously built state still fell from 4s of recompilation to 0s
-of restore. The trade is disk: the store holds a second copy of what it caches,
-and `lake cache clean` empties it all or nothing.
+of restore. The trade is disk: old build generations remain in the store, and
+Lake supplies no selective eviction — `lake cache clean` empties it all or
+nothing. TauCeti records the toolchain on canonical `main` for each worker and
+clears that worker's default Lake cache when the pin changes. The first observed
+pin only seeds the record; there is deliberately no size- or calendar-based
+cleanup. An operator-supplied `LAKE_CACHE_DIR` is never deleted automatically.
 
 ## `workers add` flags
 
@@ -280,7 +284,10 @@ already had.
 directory, and would otherwise follow `$ELAN_HOME` into the pool, but unlike an
 install it is written throughout every build. That also keeps a per-worker
 `LAKE_ARTIFACT_CACHE` experiment honest, since the store it fills is that
-worker's alone.
+worker's alone. Once canonical `main` moves to a different `lean-toolchain`, the
+next host checkout preparation clears this private store while no agent is
+running. Switching between PR branches does not count as a bump and therefore
+does not churn the cache.
 
 Setting any of the three yourself overrides this. `scripts/share-build-caches`
 folds the private copies an already-running fleet accumulated into the pool
