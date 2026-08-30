@@ -33,6 +33,7 @@ fails = 0
 
 LOGIN_HOME = Path("/home/pretend-operator")
 CACHE_VARS = ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR")
+ARTIFACT_VARS = ("LAKE_ARTIFACT_CACHE", "LAKE_RESTORE_ARTIFACTS")
 
 
 def check(name, cond):
@@ -42,19 +43,42 @@ def check(name, cond):
 
 
 def clear(env):
-    for var in (*CACHE_VARS, "TAUCETI_DATA_HOME", "TAUCETI_MATHLIB_POOL", "XDG_CACHE_HOME"):
+    for var in (*CACHE_VARS, *ARTIFACT_VARS, "TAUCETI_DATA_HOME", "TAUCETI_MATHLIB_POOL", "XDG_CACHE_HOME"):
         env.pop(var, None)
 
 
 def main():
     env = tc.agents.os.environ
     saved = {
-        k: env.get(k) for k in (*CACHE_VARS, "TAUCETI_DATA_HOME", "TAUCETI_MATHLIB_POOL", "XDG_CACHE_HOME", "HOME")
+        k: env.get(k)
+        for k in (
+            *CACHE_VARS,
+            *ARTIFACT_VARS,
+            "TAUCETI_DATA_HOME",
+            "TAUCETI_MATHLIB_POOL",
+            "XDG_CACHE_HOME",
+            "TAUCETI_WORKER_ID",
+            "CLAIM_GITDIR_BASE",
+            "HOME",
+        )
     }
     orig_host_home, orig_platform = tc.agents._host_home, tc.agents.sys.platform
     tc.agents._host_home = lambda: LOGIN_HOME
     data_home = Path("/srv/tauceti/state/worker1/home")
     try:
+        # --- default Lake artifact policy ---------------------------------------------------------
+        clear(env)
+        tc.Config.resolve("worker1", home=LOGIN_HOME)
+        check("Lake's local artifact cache is enabled by default", env["LAKE_ARTIFACT_CACHE"] == "1")
+        check("cached artifacts are restored to the build directory by default", env["LAKE_RESTORE_ARTIFACTS"] == "1")
+
+        clear(env)
+        env["LAKE_ARTIFACT_CACHE"] = "0"
+        env["LAKE_RESTORE_ARTIFACTS"] = "0"
+        tc.Config.resolve("worker1", home=LOGIN_HOME)
+        check("an explicit artifact-cache override wins", env["LAKE_ARTIFACT_CACHE"] == "0")
+        check("an explicit restore override wins", env["LAKE_RESTORE_ARTIFACTS"] == "0")
+
         # --- what is shared, and what is not -------------------------------------------------------
         clear(env)
         resolved = tc.agents.share_build_caches("worker1", data_home)
