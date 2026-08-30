@@ -49,6 +49,7 @@ from .constants import (
     PROGRESS_TOOL_LINE,
     PROGRESS_TOOL_TAIL,
     REVIEW,
+    REVIEW_AFFINITY_GRACE_S,
     REVIEW_DAILY_CAP,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
@@ -75,6 +76,7 @@ from .survey import (
     Counters,
     Survey,
     bust_progress_cache,
+    prioritize_review_candidates,
     progress_argv,
     spread_candidates,
     survey,
@@ -246,12 +248,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         reason = f"its review has errored {n_err} times without posting a verdict"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
-    # Spread concurrent workers across different PRs: shuffle each CONTENDED stage's candidates so workers
-    # starting together don't all pick the lowest-numbered PR and probe the same target in lockstep
-    # (review collides on the in-progress marker; fix/fix-ci/rebase each cost a branch-claim round-trip to
-    # discover the clash). This only reorders WITHIN a stage — the cascade's stage priority below is
-    # unchanged — and the real de-contention (marker / branch claim) remains the authority and backstop.
+    # Spread concurrent workers across different branch-writing work: shuffle each non-review stage so
+    # workers starting together don't all pick the lowest-numbered PR and spend a branch-claim round-trip
+    # discovering the clash. Reviews get their affinity + age-weighted order below. This only reorders
+    # WITHIN a stage — the cascade's priority is unchanged — and the real claims remain the backstop.
     for stage in AUTO_STAGES:
+        if stage == "review":
+            continue
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
     # The undocumented review throttles, off unless an expert asked for them. Applied here rather than
@@ -260,6 +263,26 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # worker isn't reviewing anyway, so a `--only fix` round never logs a review it was not going to do.
     if want(opts.only, "review"):
         throttle_review(sv, opts)
+        stamp = time.time()
+        affinity_present = any(
+            c.preferred_reviewer and c.ready_at is not None and max(0.0, stamp - c.ready_at) < REVIEW_AFFINITY_GRACE_S
+            for c in sv.reviewable.actionable
+        )
+        reviewer = ""
+        if affinity_present:
+            try:
+                reviewer = me()
+            except Die as exc:
+                log(f"  review: {exc}; reviewer affinity disabled for this round")
+        ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
+        sv.reviewable.actionable = ordered
+        if deferred:
+            waits = [REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at) for c in deferred if c.ready_at is not None]
+            next_wait = max(0, int(min(waits))) if waits else REVIEW_AFFINITY_GRACE_S
+            log(
+                f"  review: deferring {len(deferred)} PR(s) for their previous reviewers; "
+                f"next first-refusal window expires in {next_wait // 60}m {next_wait % 60:02d}s"
+            )
 
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its

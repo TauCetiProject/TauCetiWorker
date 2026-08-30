@@ -103,6 +103,12 @@ A round does exactly one unit of work: the first of these that applies.
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
+Review selection is cooperative across community workers. The worker named by
+the latest scoreboard gets a 20-minute first-refusal window on that PR's next
+green head or contest reply. After that window, every worker may take it;
+eligible reviews are chosen by an age-weighted lottery, with waiting-time weight
+capped after 24 hours so older work is favored without imposing a rigid queue.
+
 Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
 the worker. A GitHub API failure aborts the round rather than reading as "nothing
 to do", so a transient outage never falls through to authoring.

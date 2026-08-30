@@ -4,6 +4,7 @@ picker, `status`, and the TUI all consume."""
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import subprocess
@@ -33,6 +34,9 @@ from .constants import (
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_REF,
     PROGRESS_TTL,
+    REVIEW_AFFINITY_GRACE_S,
+    REVIEW_AGE_CAP_S,
+    REVIEW_AGE_SCALE_S,
     REVIEW_DAILY_CAP,
     STATUS_LABELS,
     TAUCETI,
@@ -159,6 +163,8 @@ class Candidate:
     budget: int = 0
     contest: str = ""  # set to the contested rubric when this is an author-contest re-review
     contest_reply_id: int = 0  # the review-comment id of the contesting reply (the 👀 claim anchor)
+    ready_at: int | None = None  # when this exact review unit became actionable
+    preferred_reviewer: str = ""  # latest scoreboard publisher; gets a short first refusal
 
 
 @dataclass
@@ -342,6 +348,55 @@ def spread_candidates(candidates: list, rng=random) -> list:
     out = list(candidates)
     rng.shuffle(out)
     return out
+
+
+def _review_age_weight(candidate: Candidate, now: float) -> float:
+    """Linear aging with a one-day cap; unknown/future timestamps stay at the base weight."""
+    waited = max(0.0, now - candidate.ready_at) if candidate.ready_at is not None else 0.0
+    return 1.0 + min(waited, REVIEW_AGE_CAP_S) / REVIEW_AGE_SCALE_S
+
+
+def _scoreboard_reviewer(meta: Meta) -> str:
+    value = meta.data.get("submitted_by")
+    return value if isinstance(value, str) else ""
+
+
+def prioritize_review_candidates(
+    candidates: list[Candidate], reviewer: str, *, now: float | None = None, rng=random
+) -> tuple[list[Candidate], list[Candidate]]:
+    """Apply soft reviewer affinity, then return an age-weighted random permutation.
+
+    During the grace period a prior publisher's units form that reviewer's first tier and are hidden
+    from peers. Expired or unowned units form the shared tier. Missing identity/timestamps fail open.
+    The second return value is the foreign-affinity set deferred for this worker.
+    """
+    stamp = time.time() if now is None else now
+    login = (reviewer or "").casefold()
+    owned: list[Candidate] = []
+    shared: list[Candidate] = []
+    deferred: list[Candidate] = []
+    for candidate in candidates:
+        owner = (candidate.preferred_reviewer or "").strip()
+        waited = max(0.0, stamp - candidate.ready_at) if candidate.ready_at is not None else None
+        in_grace = bool(owner and login and waited is not None and waited < REVIEW_AFFINITY_GRACE_S)
+        if not in_grace:
+            shared.append(candidate)
+        elif owner.casefold() == login:
+            owned.append(candidate)
+        else:
+            deferred.append(candidate)
+
+    def weighted(items: list[Candidate]) -> list[Candidate]:
+        # Exponential keys produce a weighted permutation without replacement. random() may legally
+        # return zero, so clamp it away from log(0) without changing any ordinary RNG result.
+        keyed = []
+        for candidate in items:
+            draw = max(float(rng.random()), 1e-300)
+            keyed.append((-math.log(draw) / _review_age_weight(candidate, stamp), candidate))
+        keyed.sort(key=lambda item: item[0])
+        return [candidate for _, candidate in keyed]
+
+    return weighted(owned) + weighted(shared), deferred
 
 
 def fix_disposition(
@@ -567,7 +622,9 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         if not p.build_success:
             continue
         if not deep:
-            sv.reviewable.actionable.append(Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed"))
+            sv.reviewable.actionable.append(
+                Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
+            )
             continue
         m = rs.gh_meta(p.number)
         if rs.ledger_clean_head(p.number) != p.head_oid:
@@ -578,6 +635,8 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
                 "build-green, head not cleanly reviewed",
                 attempts=counters.read(f"review-err-{p.number}"),
                 budget=MAX_REVIEW_ERRORS,
+                ready_at=p.build_status_at,
+                preferred_reviewer=_scoreboard_reviewer(m),
             )
             if c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
@@ -630,6 +689,8 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
             contest_reply_id=reply["id"],
             attempts=counters.read(f"review-contest-{p.number}"),
             budget=MAX_REVIEW_CONTESTS,
+            ready_at=_parse_iso8601(reply.get("created_at")),
+            preferred_reviewer=_scoreboard_reviewer(m),
         )
         if (
             counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS

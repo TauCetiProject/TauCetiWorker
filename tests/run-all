@@ -66,6 +66,7 @@ RUN_STDLIB=(
   review_daily_cap.py
   review_diagnostics.py
   review_provider_down.py
+  review_scheduling.py
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py

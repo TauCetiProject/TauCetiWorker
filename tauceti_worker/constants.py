@@ -74,6 +74,17 @@ MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't s
 # of re-selecting it every round and tight-looping. MUST stay in sync with the engine default (review.py).
 REVIEW_DAILY_CAP = int(os.environ.get("TAUCETI_REVIEW_DAILY_CAP", "12"))
 
+# Soft reviewer affinity: the publisher of the latest scoreboard gets first refusal on a new
+# reviewable head (or an author contest) for twenty minutes. After that the unit returns to the shared
+# fleet queue. Fixed fleet policy rather than an operator knob: reviewers must agree on the same grace.
+REVIEW_AFFINITY_GRACE_S = 20 * 60
+
+# Review candidates are drawn by an age-weighted lottery. One hour of waiting adds one unit of weight;
+# cap at one day so old work is strongly preferred without making every worker converge deterministically
+# on the single oldest PR.
+REVIEW_AGE_SCALE_S = 60 * 60
+REVIEW_AGE_CAP_S = 24 * 60 * 60
+
 CONTEST_CLAIM_TTL = 3600  # seconds a 👀 on the contested reply claims an in-flight contest re-review.
 
 # The claim lives on GitHub (a reaction on the reply comment), so it dedups
