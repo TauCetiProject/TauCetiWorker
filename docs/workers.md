@@ -134,22 +134,21 @@ mechanisms `tauceti` already uses (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
 `KIRO_API_KEY`), which keep them in files rather than argv. Status output prints
 only the variable names for the same reason.
 
-```toml
-[[workers]]
-id = "worker5"
-enabled = true
-# Restore a previously built module from Lake's local store instead of recompiling it.
-env = { LAKE_ARTIFACT_CACHE = "1", LAKE_RESTORE_ARTIFACTS = "1" }
-```
+Every worker enables `LAKE_ARTIFACT_CACHE=1` and
+`LAKE_RESTORE_ARTIFACTS=1` by default. The second setting belongs with the first:
+with the artifact cache writable, Lake may keep a build product in its store
+instead of the build directory, and TauCeti's audits (`lake exe axioms`, `lake
+exe module-system`) resolve `.olean`s through the Lean search path. Restoring the
+copy keeps them working, and measured on a 1500-declaration module, returning to
+a previously built state still fell from 4s of recompilation to 0s of restore.
+An explicit value in a worker's `env` table overrides either default.
 
-`LAKE_RESTORE_ARTIFACTS` belongs with that first variable rather than being
-optional: with the artifact cache writable, Lake may keep a build product in its
-store instead of the build directory, and TauCeti's audits (`lake exe axioms`,
-`lake exe module-system`) resolve `.olean`s through the Lean search path. Asking
-for the copy keeps them working, and measured on a 1500-declaration module,
-returning to a previously built state still fell from 4s of recompilation to 0s
-of restore. The trade is disk: the store holds a second copy of what it caches,
-and `lake cache clean` empties it all or nothing.
+The trade is disk: old build generations remain in the store, and Lake supplies
+no selective eviction — `lake cache clean` empties it all or nothing. TauCeti
+records the toolchain on canonical `main` for each worker and clears that
+worker's default Lake cache when the pin changes. The first observed pin only
+seeds the record; there is deliberately no size- or calendar-based cleanup. An
+operator-supplied `LAKE_CACHE_DIR` is never deleted automatically.
 
 ## `workers add` flags
 
@@ -278,9 +277,12 @@ already had.
 
 `$LAKE_CACHE_DIR` stays per-worker too. It normally sits under the toolchain
 directory, and would otherwise follow `$ELAN_HOME` into the pool, but unlike an
-install it is written throughout every build. That also keeps a per-worker
-`LAKE_ARTIFACT_CACHE` experiment honest, since the store it fills is that
-worker's alone.
+install it is written throughout every build. That keeps the default
+`LAKE_ARTIFACT_CACHE` store private to the worker that fills it. Once canonical
+`main` moves to a different `lean-toolchain`, the next host checkout preparation
+clears this private store while no agent is
+running. Switching between PR branches does not count as a bump and therefore
+does not churn the cache.
 
 Setting any of the three yourself overrides this. `scripts/share-build-caches`
 folds the private copies an already-running fleet accumulated into the pool
