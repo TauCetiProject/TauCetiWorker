@@ -161,7 +161,8 @@ class ReviewState:
         carries `tauceti-reply:` and a root carries `tauceti-rubric:`, so both are skipped, while a
         human contest (even one sharing the worker's login) is never wrongly dropped. "Newest" is by
         the monotonic comment `id` (not the second-resolution timestamp, which can't separate two
-        replies in one second). Returns {'id', 'rubric'} of the newest such reply."""
+        replies in one second). Its creation time is returned for review-affinity aging. Returns
+        {'id', 'rubric', 'created_at'} of the newest such reply."""
         rcs = self.gh.review_comments(pr)
         if not rcs:
             return None
@@ -181,7 +182,7 @@ class ReviewState:
                 continue
             cid = c.get("id") or 0
             if best is None or cid > best["id"]:
-                best = {"id": cid, "rubric": rubric}
+                best = {"id": cid, "rubric": rubric, "created_at": c.get("created_at")}
         return best
 
     def ledger_blocking(self, pr: int, head: str) -> bool:
