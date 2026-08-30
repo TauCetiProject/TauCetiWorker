@@ -10,7 +10,6 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 
-
 NOW = 2_000_000_000
 fails = 0
 
@@ -28,9 +27,7 @@ def candidate(pr, *, age=0, owner=""):
 
 
 def ordered(candidates, reviewer="alice", seed=0):
-    picked, deferred = tc.prioritize_review_candidates(
-        candidates, reviewer, now=NOW, rng=random.Random(seed)
-    )
+    picked, deferred = tc.prioritize_review_candidates(candidates, reviewer, now=NOW, rng=random.Random(seed))
     return [c.pr for c in picked], [c.pr for c in deferred]
 
 
@@ -68,8 +65,11 @@ class ContestComments:
 
 
 state = tc.ReviewState(types.SimpleNamespace(sbcache=Path("/unused")), ContestComments())
-check("contest discovery retains its affinity timestamp",
-      state.newest_contest_reply(1)["created_at"], "2033-05-18T03:33:20Z")
+check(
+    "contest discovery retains its affinity timestamp",
+    state.newest_contest_reply(1)["created_at"],
+    "2033-05-18T03:33:20Z",
+)
 
 # Weighted permutation preserves the eligible set exactly and is deterministic with a seeded RNG.
 candidates = [candidate(i, age=i * 600) for i in range(10, 20)]

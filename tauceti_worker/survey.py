@@ -34,10 +34,10 @@ from .constants import (
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_REF,
     PROGRESS_TTL,
-    REVIEW_DAILY_CAP,
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_AGE_CAP_S,
     REVIEW_AGE_SCALE_S,
+    REVIEW_DAILY_CAP,
     STATUS_LABELS,
     TAUCETI,
     TAUCETI_OWNER,
@@ -361,8 +361,9 @@ def _scoreboard_reviewer(meta: Meta) -> str:
     return value if isinstance(value, str) else ""
 
 
-def prioritize_review_candidates(candidates: list[Candidate], reviewer: str, *, now: float | None = None,
-                                 rng=random) -> tuple[list[Candidate], list[Candidate]]:
+def prioritize_review_candidates(
+    candidates: list[Candidate], reviewer: str, *, now: float | None = None, rng=random
+) -> tuple[list[Candidate], list[Candidate]]:
     """Apply soft reviewer affinity, then return an age-weighted random permutation.
 
     During the grace period a prior publisher's units form that reviewer's first tier and are hidden
@@ -376,8 +377,7 @@ def prioritize_review_candidates(candidates: list[Candidate], reviewer: str, *, 
     deferred: list[Candidate] = []
     for candidate in candidates:
         owner = (candidate.preferred_reviewer or "").strip()
-        waited = (max(0.0, stamp - candidate.ready_at)
-                  if candidate.ready_at is not None else None)
+        waited = max(0.0, stamp - candidate.ready_at) if candidate.ready_at is not None else None
         in_grace = bool(owner and login and waited is not None and waited < REVIEW_AFFINITY_GRACE_S)
         if not in_grace:
             shared.append(candidate)
@@ -622,9 +622,9 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         if not p.build_success:
             continue
         if not deep:
-            sv.reviewable.actionable.append(Candidate(
-                p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at
-            ))
+            sv.reviewable.actionable.append(
+                Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
+            )
             continue
         m = rs.gh_meta(p.number)
         if rs.ledger_clean_head(p.number) != p.head_oid:

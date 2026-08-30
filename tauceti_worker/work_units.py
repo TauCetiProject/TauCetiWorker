@@ -76,8 +76,8 @@ from .survey import (
     Counters,
     Survey,
     bust_progress_cache,
-    progress_argv,
     prioritize_review_candidates,
+    progress_argv,
     spread_candidates,
     survey,
 )
@@ -264,14 +264,20 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     if want(opts.only, "review"):
         throttle_review(sv, opts)
         stamp = time.time()
-        ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, me(), now=stamp)
+        affinity_present = any(
+            c.preferred_reviewer and c.ready_at is not None and max(0.0, stamp - c.ready_at) < REVIEW_AFFINITY_GRACE_S
+            for c in sv.reviewable.actionable
+        )
+        reviewer = ""
+        if affinity_present:
+            try:
+                reviewer = me()
+            except Die as exc:
+                log(f"  review: {exc}; reviewer affinity disabled for this round")
+        ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
         sv.reviewable.actionable = ordered
         if deferred:
-            waits = [
-                REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at)
-                for c in deferred
-                if c.ready_at is not None
-            ]
+            waits = [REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at) for c in deferred if c.ready_at is not None]
             next_wait = max(0, int(min(waits))) if waits else REVIEW_AFFINITY_GRACE_S
             log(
                 f"  review: deferring {len(deferred)} PR(s) for their previous reviewers; "
