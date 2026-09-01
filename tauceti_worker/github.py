@@ -315,6 +315,32 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
 # ============================================================================
 
 
+# PR fields whose per-PR expansion dominates a `gh pr list` GraphQL query's cost. GitHub.pr_list
+# fetches these separately from the descriptive fields; see its docstring for why.
+COSTLY_PR_FIELDS = frozenset(
+    {"statusCheckRollup", "reviews", "latestReviews", "comments", "commits", "files", "projectItems"}
+)
+
+# A `gh pr list` failure that says "ask again", not "you asked wrongly": GitHub's GraphQL endpoint
+# gave up on a query it could have served. Observed as a plain 504, as the prose 504 body, and as a
+# truncated response gh cannot parse — the same server-side timeout in three guises. Measured on a
+# 135-PR repo, the survey's full field set failed 3/3 while the split halves failed intermittently
+# (3/4, then 1/4, then 4/4 at descending limits), so the flakiness tracks GitHub's load rather than
+# our query size: splitting lowers the cost, and only a retry actually rides out the variance.
+_GH_TRANSIENT_RE = re.compile(
+    r"HTTP 50[234]\b"
+    r"|Gateway Time-?out"
+    r"|couldn't respond to your request in time"
+    r"|unexpected end of JSON input",
+    re.I,
+)
+
+# Attempts (and the pauses between them) for a transient `gh pr list` failure. A survey that fails
+# aborts the whole round before any work unit is chosen, so a few seconds spent here is far cheaper
+# than the escalating back-off — up to 900s — that the caller would otherwise fall into.
+_PR_LIST_RETRY_PAUSES = (2, 5, 11)
+
+
 class GitHub:
     def __init__(self, repo: str = TAUCETI):
         self.repo = repo
@@ -322,14 +348,62 @@ class GitHub:
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         return gh_run(["gh", *args])
 
-    def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open") -> list[dict]:
+    def _pr_list_call(self, fields: list[str], *, author: str | None, state: str) -> list[dict]:
+        """One `gh pr list`, retried while GitHub is merely refusing to finish it in time."""
         args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200", "--json", ",".join(fields)]
         if author:
             args += ["--author", author]
-        p = self._gh(args)
-        if p.returncode != 0:
-            raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
-        return json.loads(p.stdout or "[]")
+        for pause in (*_PR_LIST_RETRY_PAUSES, None):
+            p = self._gh(args)
+            detail = ((p.stderr or "") + (p.stdout or "")).strip()
+            if p.returncode == 0:
+                try:
+                    return json.loads(p.stdout or "[]")
+                except ValueError:
+                    # A truncated body exits 0 on some gh versions; it is the same timeout, so it
+                    # earns the same retry rather than crashing the survey on a half-read page.
+                    detail = "unexpected end of JSON input"
+            if pause is None or not _GH_TRANSIENT_RE.search(detail):
+                raise GitHubError(f"gh pr list failed: {detail}")
+            log(f"gh: pr list transient failure ({detail.splitlines()[0][:80]}) — retrying in {pause}s")
+            time.sleep(pause)
+        raise GitHubError("gh pr list failed: exhausted retries")  # unreachable; keeps the type honest
+
+    def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open") -> list[dict]:
+        """The PRs in `state`, each carrying `fields`.
+
+        A costly field is fetched in a SECOND call and merged on `number`, because asking for one
+        alongside the descriptive fields makes the whole GraphQL query exceed GitHub's execution
+        budget on a busy repo: at 135 open PRs the survey's twelve-field request 504s outright
+        ("We couldn't respond to your request in time"), while the descriptive half and the costly
+        half each answer fine at the same --limit. Two cheap queries beat one that never returns.
+
+        Splitting by FIELD rather than by page is forced: `gh pr list` has --limit but no offset or
+        cursor, so there is no second page to ask for — a smaller limit would silently truncate the
+        survey instead, which is worse than slow (a dropped PR is one the worker stops tending).
+
+        The descriptive call defines the roster; a PR that lands between the two calls is simply
+        absent from the costly half and gets None for those fields. For statusCheckRollup that
+        reads as "no build status yet" — pending, neither green nor red — so a straggler waits one
+        round rather than being misrouted, and the next survey picks it up whole.
+        """
+        costly = [f for f in fields if f in COSTLY_PR_FIELDS]
+        plain = [f for f in fields if f not in COSTLY_PR_FIELDS]
+        if not costly or not plain:
+            return self._pr_list_call(fields, author=author, state=state)
+        # `number` is the join key, so both halves must carry it even when the caller did not ask.
+        wanted_number = "number" in plain
+        rows = self._pr_list_call(plain if wanted_number else ["number", *plain], author=author, state=state)
+        extra = {r["number"]: r for r in self._pr_list_call(["number", *costly], author=author, state=state)}
+        absent = dict.fromkeys(costly)
+        merged = []
+        for row in rows:
+            found = extra.get(row["number"])
+            row.update({k: v for k, v in (found or absent).items() if k != "number"})
+            if not wanted_number:
+                row.pop("number", None)
+            merged.append(row)
+        return merged
 
     def issue_list(
         self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200
