@@ -519,10 +519,7 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
                 shutil.rmtree(configured_cache)
         except OSError as e:
             # Do not advance the marker: retry at the next quiescent checkout preparation.
-            log(
-                f"Lake artifact cache: main toolchain changed ({old_label} → {label}), "
-                f"but cleanup failed ({e})"
-            )
+            log(f"Lake artifact cache: main toolchain changed ({old_label} → {label}), but cleanup failed ({e})")
             return
         result = f"cleared {configured_cache}" if had_cache else "cache already empty"
         log(f"Lake artifact cache: main toolchain changed ({old_label} → {label}); {result}")
@@ -880,7 +877,13 @@ KIRO_BUBBLE_MIN_VERSION = "0.7.31"
 
 # TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
 # `lake exe cache get`; this one contains TauCeti's own main-built outputs.
-TAUCETI_CACHE_DOMAIN = "pub-1825e93d97ca45b2a98d9ad45a5972f8.r2.dev"
+#
+# The custom domain, NOT the bucket's `pub-<id>.r2.dev` development URL. That development URL is
+# disabled on this bucket and answers 401 for every path, root included, so every round's
+# `lake cache get` failed and fell through to a from-scratch `lake build` -- silently, because a
+# cache miss is non-fatal here. The custom domain is also what TauCeti's own CI publishes and reads
+# through (the LAKE_CACHE_*_PUBLIC repo variables). Keep the two in step.
+TAUCETI_CACHE_DOMAIN = "cache.taucetiproject.org"
 TAUCETI_CACHE_SERVICE = "tauceti-public"
 TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
 TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
@@ -919,6 +922,39 @@ def bubble_supports_lake_cache_service() -> bool:
     import re
 
     return re.search(r"(?<![\w-])--lake-cache-service(?=[\s=,]|$)", _bubble_open_help()) is not None
+
+
+@functools.lru_cache(maxsize=1)
+def tauceti_cache_unreachable_reason() -> str | None:
+    """``None`` if TauCeti's public artifact cache serves anonymous reads, else why it does not.
+
+    Probes the revision endpoint rather than trusting the URL. A healthy bucket answers 404 for a
+    path that holds no object -- including its own root -- so ANY 404 here means the host is serving
+    us. What we are looking for is 401/403, which is what R2 returns for a bucket whose public access
+    is switched off: the host then rejects every path identically and no revision can ever be found.
+
+    That is not hypothetical. The worker pointed at the bucket's `pub-<id>.r2.dev` development URL
+    after it had been disabled, so `lake cache get` failed on every round and the non-fatal fallback
+    quietly rebuilt TauCeti from source each time. A dead endpoint must stop a round in preflight,
+    where it is one loud line, not 30 minutes into a build the cache existed to avoid.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"{TAUCETI_CACHE_REVISION_URL}/"
+    try:
+        with urllib.request.urlopen(url, timeout=30):
+            return None
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return f"{url} answered {e.code} {e.reason}; the cache is not publicly readable"
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        # Unreachable for a reason that is not an auth wall (DNS, TLS, offline). Do not block the
+        # round on it: the round's own `lake cache get` retries, and a transient network fault must
+        # not be indistinguishable from a misconfigured bucket.
+        log(f"could not probe TauCeti's artifact cache ({e}); continuing")
+        return None
 
 
 def _host_home() -> Path:
@@ -1262,13 +1298,36 @@ def bubble_work_cmd(inner: str) -> str:
     cache config for the host-global proxy. Keep a Lake-cache miss and the preliminary build non-fatal:
     fix/fix-ci/bump/rebase rounds often start from a red tree, and repairing it is the agent's job. A
     Mathlib-cache failure is fatal because compiling Mathlib would consume the round.
+
+    A Lake-cache miss stays non-fatal but no longer stays quiet, and the two reasons for one are now
+    told apart. "No outputs for this revision" is ordinary: it is every round on a commit main has not
+    built yet, and there is nothing to do but build them. Any OTHER failure means the cache did not
+    answer, which is infrastructure being broken rather than cold, and it used to look identical in the
+    log to the ordinary case. It printed one `warning: TauCeti Lake cache miss` line and rebuilt the
+    library from source, every round, for as long as the endpoint stayed down.
     """
+    fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     return (
         "set -e; "
         "lake exe cache get || lake exe cache get; "
-        f"if ! lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}; then "
-        "echo 'warning: TauCeti Lake cache miss; building missing outputs' >&2; "
+        'tc_log="$(mktemp)"; tc_hit=0; tc_cold=0; '
+        # Two attempts, because a dropped connection is worth one retry, but stop immediately when
+        # Lake reports the revision simply is not cached: retrying cannot change that answer.
+        "for _ in 1 2; do "
+        f'if {fetch} >"$tc_log" 2>&1; then tc_hit=1; break; fi; '
+        "if grep -q 'no outputs found' \"$tc_log\"; then tc_cold=1; break; fi; "
+        "sleep 2; "
+        "done; "
+        'if [ "$tc_hit" != 1 ]; then '
+        'if [ "$tc_cold" = 1 ]; then '
+        "echo 'warning: TauCeti Lake cache holds no outputs for this revision; building them' >&2; "
+        "else "
+        "echo 'error: TauCeti Lake cache did not answer (not a missing revision); building TauCeti "
+        "from scratch. The cache endpoint is probably broken -- this should not happen.' >&2; "
+        "sed 's/^/  cache: /' \"$tc_log\" >&2; "
         "fi; "
+        "fi; "
+        'rm -f "$tc_log"; '
         "if ! timeout 1800 lake build; then "
         "echo 'warning: pre-agent lake build failed or timed out; the agent starts from a red tree' >&2; "
         "fi; "

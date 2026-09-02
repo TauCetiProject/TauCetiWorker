@@ -61,7 +61,7 @@ lake.write_text(
     'printf "%s\\n" "$*" >> "$LAKE_CALLS"\n'
     'case "$*" in\n'
     '  "exe cache get") exit "${MATHLIB_RC:-0}" ;;\n'
-    '  cache\\ get*) exit "${TAUCETI_RC:-0}" ;;\n'
+    '  cache\\ get*) [ -n "$TAUCETI_MSG" ] && printf "%s\\n" "$TAUCETI_MSG"; exit "${TAUCETI_RC:-0}" ;;\n'
     '  build) exit "${BUILD_RC:-0}" ;;\n'
     "esac\n"
     "exit 99\n"
@@ -69,7 +69,7 @@ lake.write_text(
 lake.chmod(0o755)
 
 
-def run_bootstrap(*, mathlib=0, tauceti=0, build=0):
+def run_bootstrap(*, mathlib=0, tauceti=0, build=0, tauceti_msg=""):
     marker.unlink(missing_ok=True)
     calls.unlink(missing_ok=True)
     env = {
@@ -78,6 +78,7 @@ def run_bootstrap(*, mathlib=0, tauceti=0, build=0):
         "LAKE_CALLS": str(calls),
         "MATHLIB_RC": str(mathlib),
         "TAUCETI_RC": str(tauceti),
+        "TAUCETI_MSG": tauceti_msg,
         "BUILD_RC": str(build),
         "MARKER": str(marker),
     }
@@ -97,7 +98,64 @@ result, _ = run_bootstrap(build=1)
 check("red preliminary build still launches the repair agent", result.returncode == 0 and marker.exists())
 check("red preliminary build emits a warning", "agent starts from a red tree" in result.stderr)
 
+# The two reasons a TauCeti fetch comes back empty must not read alike. "No outputs for this revision"
+# is the ordinary case on a commit main has not built yet. Anything else means the cache did not answer,
+# which is broken infrastructure; it used to print the same line and rebuild the library from source
+# every round for as long as the endpoint stayed down.
+result, lake_calls = run_bootstrap(tauceti=1, tauceti_msg="error: no outputs found for revision abc123")
+check("a cold revision still launches the agent", result.returncode == 0 and marker.exists())
+check("a cold revision is reported as cold", "holds no outputs for this revision" in result.stderr)
+check("a cold revision is not reported as an endpoint failure", "did not answer" not in result.stderr)
+check(
+    "a cold revision is not retried", lake_calls.count("cache get --service tauceti-public --repo " + tc.TAUCETI) == 1
+)
+
+result, lake_calls = run_bootstrap(tauceti=1, tauceti_msg="curl: (22) The requested URL returned 401")
+check("an unreachable cache still launches the agent", result.returncode == 0 and marker.exists())
+check("an unreachable cache is reported as a failure", "did not answer" in result.stderr)
+check("an unreachable cache is not reported as cold", "holds no outputs" not in result.stderr)
+check("an unreachable cache echoes the fetch log", "cache: curl: (22)" in result.stderr)
+check(
+    "an unreachable cache is retried once",
+    lake_calls.count("cache get --service tauceti-public --repo " + tc.TAUCETI) == 2,
+)
+
 shutil.rmtree(shimdir, ignore_errors=True)
+
+
+# The cache is reached over the custom domain, not the bucket's `pub-<id>.r2.dev` development URL.
+# That URL was disabled and answered 401 for every path, so `lake cache get` failed on every round.
+check("cache uses the custom domain", tc.TAUCETI_CACHE_DOMAIN == "cache.taucetiproject.org")
+check("cache does not use the r2.dev development URL", "r2.dev" not in tc.TAUCETI_CACHE_ARTIFACT_URL)
+
+
+# A bucket with public access switched off answers 401/403 for every path, root included, so no revision
+# can ever be found through it. A healthy bucket answers 404 for a path holding no object. Only the
+# former is a misconfiguration; the latter is what the probe's own URL returns when all is well.
+import urllib.error
+
+
+def _probe_with(exc):
+    tc.agents.tauceti_cache_unreachable_reason.cache_clear()
+    import urllib.request as ur
+
+    real = ur.urlopen
+    ur.urlopen = lambda *a, **k: (_ for _ in ()).throw(exc)
+    try:
+        return tc.agents.tauceti_cache_unreachable_reason()
+    finally:
+        ur.urlopen = real
+        tc.agents.tauceti_cache_unreachable_reason.cache_clear()
+
+
+def _http_error(code):
+    return urllib.error.HTTPError(tc.TAUCETI_CACHE_REVISION_URL, code, "Unauthorized", {}, None)
+
+
+check("401 is reported as unreadable", "401" in (_probe_with(_http_error(401)) or ""))
+check("403 is reported as unreadable", "403" in (_probe_with(_http_error(403)) or ""))
+check("404 is healthy", _probe_with(_http_error(404)) is None)
+check("a network fault does not block the round", _probe_with(urllib.error.URLError("offline")) is None)
 
 
 # Cache isolation is load-bearing: a failed Bubble setting command must not leave a sentinel that makes
