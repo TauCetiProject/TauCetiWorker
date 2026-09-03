@@ -240,12 +240,12 @@ The reconciler and the worker control sockets are portable Unix code. No Linux
 
 Every worker id namespaces its state, checkout, review store, logs, and Bubble
 home. Workers coordinate through GitHub rather than sharing local mutable state,
-so several workers can use one host without sharing a checkout. A maintenance
-branch claim lives in the PR head repository, where the worker that can update
-the branch can also maintain its lease; roadmap and progress claims use the
-canonical repository by default. Review markers, claims, and compare-and-swap
-push and PR helpers keep workers from overwriting one another when they select
-the same target.
+so several workers can use one host without sharing a checkout. Branch,
+roadmap-target, and progress claims all live in the worker's
+[claim namespace](reference.md#the-claim-namespace), never in the canonical
+repository, so every worker that resolves the same namespace contends for the
+same leases. Review markers, claims, and compare-and-swap push and PR helpers
+keep workers from overwriting one another when they select the same target.
 
 Every id other than `default` also enables credential isolation. On Linux and
 other non-macOS hosts, the worker gets a private `$HOME` containing private

@@ -12,6 +12,8 @@ not land roadmap work). This harness pins three pure-ish decisions without touch
      fork to allow git fetch/push to.
   3. `do_roadmap` points the push at the fork, passes `--allow-push <fork>` to bubble while keeping the
      bubble TARGET canonical, and substitutes the fork owner + worker id into the prompt's `--head`.
+  4. `do_roadmap` exports `CLAIM_REPO` = the worker's claim namespace in both modes, so the agent's
+     own `claim.sh acquire author/...` lands somewhere it can push rather than erroring on canonical.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -30,6 +32,7 @@ import tauceti_worker as tc
 
 TAUCETI = tc.constants.TAUCETI  # "TauCetiProject/TauCeti"
 FORK = "alice/TauCeti"
+CLAIM_NS = "TauCetiProject/tauceti-claims"
 fails = 0
 
 
@@ -155,6 +158,8 @@ def test_roadmap():
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     os.environ["TAUCETI_PUSH_EXPECT"] = "stale"  # must be popped by do_roadmap (create-only on the fork)
     tc.work_units.ensure_fork = lambda: FORK
+    os.environ.pop("CLAIM_REPO", None)
+    tc.work_units.claims_repo = lambda: CLAIM_NS
     tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
 
     # A real review checkout, so the round exercises the BUNDLED path rather than the fallback:
@@ -190,6 +195,7 @@ def test_roadmap():
     check("roadmap: --allow-push is the fork", cap.get("allow_push") == FORK)
     check("roadmap: push remote is the fork URL", os.environ.get("TAUCETI_PUSH_REMOTE") == f"https://github.com/{FORK}")
     check("roadmap: PUSH_EXPECT popped (create-only)", "TAUCETI_PUSH_EXPECT" not in os.environ)
+    check("roadmap: bubble agent's claim goes to the claim namespace", os.environ.get("CLAIM_REPO") == CLAIM_NS)
     prompt = cap.get("prompt", "")
     check("roadmap: prompt has --head <forkowner>:", "--head alice:roadmap/" in prompt)
     check("roadmap: prompt carries the worker id", "worker3" in prompt)
@@ -241,8 +247,10 @@ def test_roadmap():
     tc.work_units.prepare_checkout = lambda cfg: True
     tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir: host_cap.update(prompt=prompt) or 0
     opts.source = str(source)
+    os.environ.pop("CLAIM_REPO", None)
     tc.work_units.do_roadmap(w, None, c, opts, bubble=False)
     host_prompt = host_cap.get("prompt", "")
+    check("roadmap: host agent's claim goes to the claim namespace", os.environ.get("CLAIM_REPO") == CLAIM_NS)
     check("roadmap: host uses a disposable snapshot", "worker-owned disposable snapshot" in host_prompt)
     check("roadmap: host prompt points at materialized copy", str(materialized["dest"]) in host_prompt)
 

@@ -1250,6 +1250,13 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     fork_owner = fork.split("/", 1)[0]
     os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{fork}"
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)  # a fresh branch ⇒ create-only CAS on the fork
+    # The agent's own target claim (`claim.sh acquire author/<roadmap>/<slug>` in prompts/roadmap.md)
+    # must go where this worker can push. claim.sh defaults to canonical, which nobody outside the org
+    # can push to, so every acquire errored (exit 2) and a whole fleet authored unclaimed — the same
+    # account re-authoring one target five times in an afternoon. claims_repo() honours an operator-set
+    # $CLAIM_REPO verbatim, so a pinned fleet is unaffected. Left set, like TAUCETI_PUSH_REMOTE: the
+    # round is its own child process.
+    os.environ["CLAIM_REPO"] = claims_repo()
     source = getattr(opts, "source", None)
     source_dir = None
     if source is not None:
