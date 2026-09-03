@@ -39,6 +39,7 @@ from .agents import (
     isolate_home,
     resolve_authoring_profile,
     run_in_bubble,
+    tauceti_cache_unreachable_reason,
 )
 from .config import (
     Config,
@@ -992,6 +993,18 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "`--lake-cache-service`. Install or update Bubble from kim-em/bubble, then re-run "
             "(override the executable with $TAUCETI_BUBBLE)."
         )
+    # Having the capability is not the same as the cache being readable through it. Check the endpoint
+    # itself, because the round's own fallback is to build TauCeti from source and carry on: a dead
+    # cache costs an hour per round and never fails anything, so nothing else would ever report it.
+    if uses_fork and not opts.dry_run:
+        unreachable = tauceti_cache_unreachable_reason()
+        if unreachable:
+            raise Die(
+                f"preflight: TauCeti's public Lake artifact cache is not readable: {unreachable}. "
+                "Every work round would rebuild the library from source instead. Check the bucket's "
+                "public access and that TAUCETI_CACHE_DOMAIN still matches the LAKE_CACHE_*_PUBLIC "
+                "repository variables on TauCetiProject/TauCeti, then re-run."
+            )
     # The CLI may advertise --allow-push while an older live daemon keeps rejecting fork pushes (403).
     # Require a reachable endpoint that advertises the capability, and refresh it safely when needed.
     # Fork-pushing rounds only (a stale daemon must not block review).
