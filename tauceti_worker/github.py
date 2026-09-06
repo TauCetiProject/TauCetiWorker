@@ -6,6 +6,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import random
 import re
 import subprocess
 import time
@@ -315,6 +316,18 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
 # ============================================================================
 
 
+def _gh_diagnostic(text: str) -> str:
+    """Bound CLI diagnostics and strip credentials before displaying remote error text."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        if token := os.environ.get(name):
+            text = text.replace(token, "<redacted>")
+    text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b", "<redacted>", text)
+    text = re.sub(r"(?im)(authorization\s*:\s*)(?:bearer|token|basic)\s+\S+", r"\1<redacted>", text)
+    text = re.sub(r"https?://[^\s/@]+:[^\s/@]+@", "https://<redacted>@", text)
+    text = " ".join(text.split())
+    return text if len(text) <= 2000 else text[:2000] + " … [truncated]"
+
+
 class GitHub:
     def __init__(self, repo: str = TAUCETI):
         self.repo = repo
@@ -323,6 +336,11 @@ class GitHub:
         return gh_run(["gh", *args])
 
     def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open") -> list[dict]:
+        # buildStatus is the survey's narrow alternative to gh's full CI rollup.
+        if "buildStatus" in fields:
+            if author is not None or state != "open":
+                raise ValueError("buildStatus listing supports unfiltered open PRs only")
+            return self._survey_pr_list(fields)
         args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200", "--json", ",".join(fields)]
         if author:
             args += ["--author", author]
@@ -330,6 +348,94 @@ class GitHub:
         if p.returncode != 0:
             raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
         return json.loads(p.stdout or "[]")
+
+    def _read_pr_page(self, args: list[str]) -> subprocess.CompletedProcess:
+        """Retry only this read-only request; never replay mutations in the generic wrapper."""
+        for attempt in range(3):
+            p = self._gh(args)
+            if p.returncode == 0:
+                return p
+            diagnostic = (p.stderr or "") + "\n" + (p.stdout or "")
+            if not re.search(r"\bHTTP(?:/\S+)?\s*[: ]\s*(?:502|503|504)\b", diagnostic, re.I) or attempt == 2:
+                return p
+            delay = 2**attempt + random.uniform(0, 1)
+            log(f"GitHub PR query temporarily unavailable; retry {attempt + 1}/2 in {delay:.1f}s")
+            time.sleep(delay)
+        return p
+
+    def _survey_pr_list(self, fields: list[str]) -> list[dict]:
+        """Small pages, fetching only the authoritative build status instead of check runs.
+
+        Keep the normal pr_list/gh JSON shape except for the explicit buildStatus field.
+        Never return a partial survey when a page fails.
+        """
+        selections = {
+            "number": "number",
+            "title": "title",
+            "body": "body",
+            "headRefOid": "headRefOid",
+            "headRefName": "headRefName",
+            "headRepositoryOwner": "headRepositoryOwner { login }",
+            "headRepository": "headRepository { name }",
+            "isDraft": "isDraft",
+            "author": "author { login __typename }",
+            "mergeable": "mergeable",
+            "labels": "labels(first:100) { nodes { name } pageInfo { hasNextPage } }",
+            "buildStatus": 'commits(last:1) { nodes { commit { oid status { context(name:"build") { context state createdAt } } } } }',
+        }
+        selection = " ".join(selections[field] for field in fields)
+        query = (
+            "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){"
+            "pullRequests(first:25,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:DESC}){"
+            "pageInfo{hasNextPage endCursor} nodes{" + selection + "}}}}"
+        )
+        owner, name = self.repo.split("/", 1)
+        cursor = None
+        seen_cursors = set()
+        rows = []
+        while True:
+            args = ["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}"]
+            if cursor is not None:
+                args += ["-f", f"cursor={cursor}"]
+            p = self._read_pr_page(args)
+            context = (
+                f"gh pr list failed (repo={self.repo}, state=open, page={len(seen_cursors) + 1}, exit={p.returncode})"
+            )
+            if p.returncode != 0:
+                detail = _gh_diagnostic(p.stderr or "")
+                detail = "stderr: " + detail if detail else "stdout: " + _gh_diagnostic(p.stdout or "")
+                raise GitHubError(f"{context}: {detail}")
+            try:
+                payload = json.loads(p.stdout)
+                if payload.get("errors"):
+                    raise ValueError(json.dumps(payload["errors"]))
+                connection = payload["data"]["repository"]["pullRequests"]
+                for row in connection["nodes"]:
+                    if "labels" in row:
+                        if row["labels"]["pageInfo"]["hasNextPage"]:
+                            raise ValueError(
+                                f"PR #{row['number']} has more than 100 labels; refusing incomplete metadata"
+                            )
+                        row["labels"] = row["labels"]["nodes"]
+                    if row.get("author"):
+                        row["author"]["is_bot"] = row["author"].pop("__typename", "") == "Bot"
+                    commits = row.pop("commits")["nodes"]
+                    commit = commits[-1]["commit"] if commits else None
+                    if commit and "headRefOid" in row and commit["oid"] != row["headRefOid"]:
+                        raise ValueError(f"PR #{row['number']} head changed during query; retry survey")
+                    row["buildStatus"] = (commit.get("status") or {}).get("context") if commit else None
+                    rows.append(row)
+                page = connection["pageInfo"]
+                if not page["hasNextPage"]:
+                    return rows
+                cursor = page["endCursor"]
+                if not cursor or cursor in seen_cursors:
+                    raise ValueError("invalid or repeated pagination cursor")
+                seen_cursors.add(cursor)
+            except (ValueError, KeyError, TypeError, IndexError) as exc:
+                raise GitHubError(
+                    f"{context}: invalid/incomplete GraphQL response: {_gh_diagnostic(str(exc))}"
+                ) from exc
 
     def issue_list(
         self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200

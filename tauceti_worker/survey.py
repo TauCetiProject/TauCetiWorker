@@ -121,6 +121,9 @@ class PRInfo:
     @staticmethod
     def from_json(d: dict) -> PRInfo:
         rollup = d.get("statusCheckRollup") or []
+        if "buildStatus" in d:
+            status = d["buildStatus"]
+            rollup = [{**status, "startedAt": status.get("createdAt")}] if status else []
         head_owner = (d.get("headRepositoryOwner") or {}).get("login", "")
         # The required `build` signal is a commit STATUS (a StatusContext with context=="build",
         # carrying `state`), posted by the trusted sandboxed-build workflow — that is exactly what
@@ -571,7 +574,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
                 "headRepositoryOwner",
                 "headRepository",
                 "isDraft",
-                "statusCheckRollup",
+                "buildStatus",
                 "author",
                 "mergeable",
                 "labels",
