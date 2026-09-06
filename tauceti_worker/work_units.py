@@ -1078,6 +1078,11 @@ def _do_progress_inner(w, opts) -> int | None:
         str(roadmap_dir),
         "--code-dir",
         str(w.cfg.checkout),
+        # Bootstrap against all merged work, including areas newer than the docs branch.
+        # The planner still caps the report at the published documentation's source SHA
+        # and defers areas whose first merge has not been documented yet.
+        "--ref",
+        "origin/main",
         "--out",
         str(plan_file),
         capture=True,
