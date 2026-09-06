@@ -488,6 +488,8 @@ def _dashboard_app(cfg, loader=None):
                 head.append_text(Text.from_markup(quota_line(self.quota)))
             if sv.github_failed:
                 head.append("\nGitHub fetch failed — survey unavailable", style="red")
+                for error in sv.errors:
+                    head.append("\n" + error, style="red")
             self.query_one("#hdr", Static).update(Panel(head, title="tauceti"))
 
         def _render_table(self) -> None:

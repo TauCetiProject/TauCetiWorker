@@ -506,7 +506,20 @@ def test_dashboard_migrates_host_pref():
             os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
 
 
+async def test_github_failure_details():
+    detail = "gh pr list failed (repo=owner/repo, state=open, exit=1): stderr: HTTP 502 [upstream]"
+    sv = tc.Survey(worker_id="test", github_failed=True, errors=[detail])
+    app = tc._dashboard_app(CFG, loader=lambda: (sv, {}, []))
+    async with app.run_test() as pilot:
+        await await_survey(app, pilot)
+        check(
+            "dashboard shows underlying GitHub error literally",
+            detail in app.query_one("#hdr").content.renderable.plain,
+        )
+
+
 async def run_all():
+    await test_github_failure_details()
     await test_dashboard()
     await test_cursor_before_load()
     await test_sticky_env_focus()

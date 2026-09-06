@@ -36,6 +36,7 @@ RUN_STDLIB=(
   fix_diagnostic.py
   fork_authoring.py
   github_ratelimit.py
+  github_diagnostics.py
   host_agent_preflight.py
   ignore_quota_hardblock.py
   infra_failure_budget.py

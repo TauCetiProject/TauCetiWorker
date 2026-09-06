@@ -315,6 +315,18 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
 # ============================================================================
 
 
+def _gh_diagnostic(text: str) -> str:
+    """Bound CLI diagnostics and strip credentials before displaying remote error text."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        if token := os.environ.get(name):
+            text = text.replace(token, "<redacted>")
+    text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b", "<redacted>", text)
+    text = re.sub(r"(?im)(authorization\s*:\s*)(?:bearer|token|basic)\s+\S+", r"\1<redacted>", text)
+    text = re.sub(r"https?://[^\s/@]+:[^\s/@]+@", "https://<redacted>@", text)
+    text = " ".join(text.split())
+    return text if len(text) <= 2000 else text[:2000] + " … [truncated]"
+
+
 class GitHub:
     def __init__(self, repo: str = TAUCETI):
         self.repo = repo
@@ -328,7 +340,15 @@ class GitHub:
             args += ["--author", author]
         p = self._gh(args)
         if p.returncode != 0:
-            raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
+            context = f"repo={self.repo}, state={state}" + (f", author={author}" if author else "")
+            detail = _gh_diagnostic(p.stderr or "")
+            if detail:
+                detail = "stderr: " + detail
+            else:
+                detail = (
+                    "stdout: " + _gh_diagnostic(p.stdout) if p.stdout and p.stdout.strip() else "no stderr or stdout"
+                )
+            raise GitHubError(f"gh pr list failed ({context}, exit={p.returncode}): {detail}")
         return json.loads(p.stdout or "[]")
 
     def issue_list(
