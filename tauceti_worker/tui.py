@@ -223,14 +223,14 @@ def _dashboard_app(cfg, loader=None):
         # are replacing. Modals (OptionList / Input) are focusable, so their arrows still work there.
         can_focus = False
 
-    def default_loader():
+    def default_loader(progress):
         gh = GitHub()
-        sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+        sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True, progress=progress)
+        progress("Checking quota…")
         _, q = Quota(cfg).choose(None)
+        progress("Fetching roadmap areas…")
         areas = roadmap_areas(gh)  # [] on failure; the area picker falls back to free text
         return sv, q, areas
-
-    load = loader or default_loader
 
     # Restore the operator's last-used dials. An explicit TAUCETI_ROADMAP_ONLY/SKIP in the environment
     # (exported, or passed by a parent) always wins over the saved one; otherwise apply the saved value
@@ -396,6 +396,7 @@ def _dashboard_app(cfg, loader=None):
             self.quota = None
             self.err = None
             self.loading = True
+            self.load_message = "Loading…"
             self._sel_init = False
             self._hdr_row = {}
             self._load_seq = 0  # guards against a slow refresh landing after a newer one
@@ -433,16 +434,35 @@ def _dashboard_app(cfg, loader=None):
 
         # ---- survey load: a background thread, because gh shells out (this was the old lag) ----------
         def _refresh(self) -> None:
+            # A cancelled Textual thread cannot stop its running gh subprocess. Coalesce refreshes
+            # instead of launching overlapping pools when a user presses r during a slow fetch.
+            if self.loading and self._load_seq:
+                return
+            self.loading = True
+            self.load_message = "Loading…"
+            if self.view == "work":
+                self._render_header()
             self._load_seq += 1  # stamp on the main thread, then hand the token to the worker
             self._load(self._load_seq)
 
         @work(thread=True, exclusive=True, group="survey")
         def _load(self, seq: int) -> None:
             try:
-                sv, q, areas = load()
+
+                def progress(message):
+                    self.call_from_thread(self._load_progress, seq, message)
+
+                sv, q, areas = loader() if loader is not None else default_loader(progress)
                 self.call_from_thread(self._loaded, seq, sv, q, areas, None)
             except Exception as e:  # a fetch error must never tear the UI down
                 self.call_from_thread(self._loaded, seq, None, None, None, repr(e))
+
+        def _load_progress(self, seq: int, message: str) -> None:
+            if seq != self._load_seq or not self.loading:
+                return
+            self.load_message = message
+            if self.view == "work":
+                self._render_header()
 
         def _loaded(self, seq, sv, q, areas, err) -> None:
             if seq != self._load_seq:  # a newer refresh superseded this one — ignore the stale result
@@ -476,7 +496,9 @@ def _dashboard_app(cfg, loader=None):
             sv = self.sv
             if sv is None:
                 msg = (
-                    Text("loading…") if self.loading else Text("GitHub fetch failed — " + (self.err or ""), style="red")
+                    Text(self.load_message)
+                    if self.loading
+                    else Text("GitHub fetch failed — " + (self.err or ""), style="red")
                 )
                 self.query_one("#hdr", Static).update(Panel(msg, title="tauceti"))
                 return
@@ -486,6 +508,8 @@ def _dashboard_app(cfg, loader=None):
             if self.quota is not None:
                 head.append("\nquota: ")
                 head.append_text(Text.from_markup(quota_line(self.quota)))
+            if self.loading:
+                head.append("\n" + self.load_message)
             if sv.github_failed:
                 head.append("\nGitHub fetch failed — survey unavailable", style="red")
             self.query_one("#hdr", Static).update(Panel(head, title="tauceti"))

@@ -80,6 +80,7 @@ RUN_STDLIB=(
   spread_candidates.py
   ssl_cert_file.py
   status_labels.py
+  survey_concurrency.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py

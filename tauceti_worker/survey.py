@@ -9,6 +9,8 @@ import random
 import re
 import subprocess
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
@@ -544,12 +546,114 @@ def bust_progress_cache(cfg: Config) -> None:
         pass
 
 
-def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
+# Six concurrent read-only PR checks bound GitHub request pressure. Within a PR, keep
+# reads sequential so scoreboard and in-flight checks share ReviewState's comment memo.
+SURVEY_WORKERS = 6
+
+
+def _survey_review(p: PRInfo, cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, deep: bool) -> Survey:
+    """Evaluate one PR without mutating the aggregate survey (or another PR's cache)."""
+    sv = Survey(worker_id=cfg.wid)
+    if not p.build_success:
+        return sv
+    if not deep:
+        sv.reviewable.actionable.append(
+            Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
+        )
+        return sv
+    m = rs.gh_meta(p.number)
+    if rs.ledger_clean_head(p.number) != p.head_oid:
+        # normal review path: the head moved or the last round errored.
+        c = Candidate(
+            p.number,
+            p.head_oid,
+            "build-green, head not cleanly reviewed",
+            attempts=counters.read(f"review-err-{p.number}"),
+            budget=MAX_REVIEW_ERRORS,
+            ready_at=p.build_status_at,
+            preferred_reviewer=_scoreboard_reviewer(m),
+        )
+        if c.attempts >= c.budget:
+            sv.reviewable.suppressed.append(c)
+            sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
+            return sv
+        # Daily review cap: past REVIEW_DAILY_CAP rounds today the engine refuses but would still clone
+        # repos first, then exit 0 re-posting the scoreboard — the tight loop we hit. Mirror the
+        # engine's count from our LOCAL ledger and skip the PR here, before any launch/clone. Resets at
+        # 00:00 UTC. Fail-CLOSED (None) on a corrupt ledger so a torn file can't re-enable the loop.
+        today_rounds = _review_rounds_today(cfg.store_dir, p.number)
+        if today_rounds is None or today_rounds >= REVIEW_DAILY_CAP:
+            shown = "?" if today_rounds is None else str(today_rounds)
+            sv.review_capped.append((p.number, f"{shown}/{REVIEW_DAILY_CAP}"))
+            return sv
+        # A peer reviewer holds this exact head (de-contention is on the head alone): skip it now,
+        # the same call the engine's coordinate() would make after a full build+launch. Doing it
+        # here keeps the loop off the one PR a peer is reviewing instead of re-selecting it every
+        # round and spending ~25s per pass to have the engine skip. Fail-open (a fetch failure
+        # reads as 'not held'); the engine's own claim is still the authoritative backstop.
+        cov = rs.inflight_review(p.number, p.head_oid)
+        if cov:
+            sv.review_inflight.append((p.number, ",".join(sorted(cov))))
+            return sv
+        sv.reviewable.actionable.append(c)
+        return sv
+    # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
+    # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
+    # reply with a higher id is one no review round has answered yet — precise (monotonic id),
+    # with no second-resolution ambiguity, and self-clearing (the contest round advances
+    # replies_through past it).
+    reply = rs.newest_contest_reply(p.number)
+    if not reply:
+        return sv
+    through = m.data.get("replies_through")
+    through = through if isinstance(through, int) else 0
+    if reply["id"] <= through:
+        return sv  # already adjudicated by some review round
+    # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
+    # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
+    # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
+    age = gh.fresh_claim_age(reply["id"])
+    if age is not None and age < CONTEST_CLAIM_TTL:
+        return sv
+    rubric = reply["rubric"]
+    c = Candidate(
+        p.number,
+        p.head_oid,
+        f"author contest on {rubric}",
+        contest=rubric,
+        contest_reply_id=reply["id"],
+        attempts=counters.read(f"review-contest-{p.number}"),
+        budget=MAX_REVIEW_CONTESTS,
+        ready_at=_parse_iso8601(reply.get("created_at")),
+        preferred_reviewer=_scoreboard_reviewer(m),
+    )
+    if (
+        counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
+        or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
+        or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
+    ):
+        sv.reviewable.suppressed.append(c)
+    else:
+        sv.reviewable.actionable.append(c)
+    return sv
+
+
+def survey(
+    cfg: Config,
+    gh: GitHub,
+    rs: ReviewState,
+    counters: Counters,
+    *,
+    deep: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> Survey:
     """Classify every open PR per work-kind. Read-only — performs no actions.
 
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
     always uses deep=True.
     """
+    if progress:
+        progress("Fetching open PRs from GitHub…")
     _f = roadmap_only()
     # Keep sv.roadmap_only a non-None string: "auto" = unset (a round will pick a random area),
     # "any" = all areas, else the chosen area. The concrete random area is resolved later, in
@@ -584,6 +688,8 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     prs = [PRInfo.from_json(d) for d in raw]
     sv.open_prs = prs
     nondraft = [p for p in prs if not p.is_draft]
+    if progress:
+        progress("Checking GitHub identity and permissions…")
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
@@ -618,89 +724,27 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without posting a verdict is escalated, not silently dropped.
-    for p in nondraft:
-        if not p.build_success:
-            continue
-        if not deep:
-            sv.reviewable.actionable.append(
-                Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
-            )
-            continue
-        m = rs.gh_meta(p.number)
-        if rs.ledger_clean_head(p.number) != p.head_oid:
-            # normal review path: the head moved or the last round errored.
-            c = Candidate(
-                p.number,
-                p.head_oid,
-                "build-green, head not cleanly reviewed",
-                attempts=counters.read(f"review-err-{p.number}"),
-                budget=MAX_REVIEW_ERRORS,
-                ready_at=p.build_status_at,
-                preferred_reviewer=_scoreboard_reviewer(m),
-            )
-            if c.attempts >= c.budget:
-                sv.reviewable.suppressed.append(c)
-                sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
-                continue
-            # Daily review cap: past REVIEW_DAILY_CAP rounds today the engine refuses but would still clone
-            # repos first, then exit 0 re-posting the scoreboard — the tight loop we hit. Mirror the
-            # engine's count from our LOCAL ledger and skip the PR here, before any launch/clone. Resets at
-            # 00:00 UTC. Fail-CLOSED (None) on a corrupt ledger so a torn file can't re-enable the loop.
-            today_rounds = _review_rounds_today(cfg.store_dir, p.number)
-            if today_rounds is None or today_rounds >= REVIEW_DAILY_CAP:
-                shown = "?" if today_rounds is None else str(today_rounds)
-                sv.review_capped.append((p.number, f"{shown}/{REVIEW_DAILY_CAP}"))
-                continue
-            # A peer reviewer holds this exact head (de-contention is on the head alone): skip it now,
-            # the same call the engine's coordinate() would make after a full build+launch. Doing it
-            # here keeps the loop off the one PR a peer is reviewing instead of re-selecting it every
-            # round and spending ~25s per pass to have the engine skip. Fail-open (a fetch failure
-            # reads as 'not held'); the engine's own claim is still the authoritative backstop.
-            cov = rs.inflight_review(p.number, p.head_oid)
-            if cov:
-                sv.review_inflight.append((p.number, ",".join(sorted(cov))))
-                continue
-            sv.reviewable.actionable.append(c)
-            continue
-        # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
-        # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
-        # reply with a higher id is one no review round has answered yet — precise (monotonic id),
-        # with no second-resolution ambiguity, and self-clearing (the contest round advances
-        # replies_through past it).
-        reply = rs.newest_contest_reply(p.number)
-        if not reply:
-            continue
-        through = m.data.get("replies_through")
-        through = through if isinstance(through, int) else 0
-        if reply["id"] <= through:
-            continue  # already adjudicated by some review round
-        # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
-        # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
-        # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
-        age = gh.fresh_claim_age(reply["id"])
-        if age is not None and age < CONTEST_CLAIM_TTL:
-            continue
-        rubric = reply["rubric"]
-        c = Candidate(
-            p.number,
-            p.head_oid,
-            f"author contest on {rubric}",
-            contest=rubric,
-            contest_reply_id=reply["id"],
-            attempts=counters.read(f"review-contest-{p.number}"),
-            budget=MAX_REVIEW_CONTESTS,
-            ready_at=_parse_iso8601(reply.get("created_at")),
-            preferred_reviewer=_scoreboard_reviewer(m),
-        )
-        if (
-            counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
-            or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
-            or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
-        ):
-            sv.reviewable.suppressed.append(c)
-        else:
-            sv.reviewable.actionable.append(c)
+    review_prs = [p for p in nondraft if p.build_success]
+    results = {}
+    if progress:
+        progress(f"Checking PR reviews: 0/{len(review_prs)}")
+    with ThreadPoolExecutor(max_workers=SURVEY_WORKERS, thread_name_prefix="survey") as pool:
+        pending = {pool.submit(_survey_review, p, cfg, gh, rs, counters, deep): p.number for p in review_prs}
+        for future in as_completed(pending):
+            results[pending[future]] = future.result()
+            if progress:
+                progress(f"Checking PR reviews: {len(results)}/{len(review_prs)}")
+    # Completion order depends on network latency; keep the original GitHub PR order for callers.
+    for p in review_prs:
+        result = results[p.number]
+        sv.reviewable.actionable.extend(result.reviewable.actionable)
+        sv.reviewable.suppressed.extend(result.reviewable.suppressed)
+        sv.review_stuck.extend(result.review_stuck)
+        sv.review_capped.extend(result.review_capped)
+        sv.review_inflight.extend(result.review_inflight)
 
+    if progress:
+        progress("Checking author tasks…")
     if deep:
         # 3) fix: tended (ours or bot-authored), reviewed-at-head, latest rubric blocking, under
         #    budgets. Bump PRs get reviewed like any other, so a blocking rubric on one is ours to fix
@@ -778,6 +822,8 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    is the cadence verdict. Deep only: the check costs an API call, and the shallow survey exists
     #    to be cheap. progress_due never raises.
     if deep:
+        if progress:
+            progress("Checking progress-report eligibility…")
         due, reason = progress_due(cfg, counters)
         c = Candidate(0, "", reason or "progress report")
         (sv.progress.actionable if due else sv.progress.suppressed).append(c)

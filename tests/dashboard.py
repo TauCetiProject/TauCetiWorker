@@ -124,6 +124,11 @@ async def test_dashboard():
     async with app.run_test() as pilot:
         await await_survey(app, pilot)
         check("survey loaded", app.sv is not None)
+        app.loading = True
+        app._load_progress(app._load_seq, "Checking PR reviews: 2/12")
+        check("current loading progress is displayed", app.load_message == "Checking PR reviews: 2/12")
+        app.loading = False
+        app._render()
         check("cursor defaults to next_auto (review)", tc.ALLOWED_TASKS[app.sel] == "review")
         table = app.query_one("#tbl")
         check("table has the 6 kinds", table.row_count == len(tc.ALLOWED_TASKS))
@@ -229,6 +234,12 @@ def test_load_token():
     app.sv = "FRESH"
     app._loaded(3, fake_survey(), {}, [], None)  # seq 3 < 5 -> stale
     check("stale load result ignored", app.sv == "FRESH")
+    app.load_message = "current"
+    app._load_progress(3, "stale progress")
+    check("stale loading progress ignored", app.load_message == "current")
+    app.loading = True
+    app._refresh()
+    check("refresh during active survey is coalesced", app._load_seq == 5)
 
 
 def test_random_default():

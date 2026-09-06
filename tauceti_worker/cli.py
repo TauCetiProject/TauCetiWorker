@@ -638,7 +638,19 @@ def cmd_status(args) -> int:
     gh = GitHub()
     rs = ReviewState(cfg, gh)
     counters = Counters(cfg)
-    sv = survey(cfg, gh, rs, counters, deep=True)
+    # Progress belongs on stderr: redirected stdout (especially --json) remains machine-readable.
+    last_progress = 0.0
+
+    def report(message: str) -> None:
+        nonlocal last_progress
+        now = time.monotonic()
+        if message.startswith("Checking PR reviews:") and now - last_progress < 1:
+            return
+        print(f"tauceti: {message}", file=sys.stderr, flush=True)
+        last_progress = now
+
+    sv = survey(cfg, gh, rs, counters, deep=True, progress=report)
+    report("Checking quota…")
     _, quota_snap = Quota(cfg).choose(None)
 
     if getattr(args, "json", False):
