@@ -172,7 +172,13 @@ the daily review cap and the branch claims all still hold: "work on these PRs"
 means "of the work you were already willing to do, only this". Progress and
 roadmap rounds name no existing PR, so a targeted round drops them rather than
 quietly authoring something unrelated when the named PRs turn out to have
-nothing to do.
+nothing to do, and it makes no GitHub writes at all about PRs you did not name —
+not even the tracking issue an untargeted round files for a PR whose review
+keeps erroring.
+
+An empty or unreadable value is an error, not "no targeting": `--pr ""` and
+`--pr 4 12` both stop the round rather than quietly turning it back into a
+free-running worker.
 
 That case — nothing to do — is the one worth knowing about, so the round says
 why, one line per PR you named, before it exits without progress:

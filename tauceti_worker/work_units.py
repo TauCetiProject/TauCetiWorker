@@ -171,11 +171,19 @@ def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
     if not (min_queue or min_age):
         return
     queue = sv.reviewable.actionable
+    throttled = getattr(sv, "_review_throttled", None)
+    if throttled is None:
+        throttled = sv._review_throttled = {}
     if min_queue and len(queue) < min_queue:
         log(
             f"  review: {len(queue)} PR(s) awaiting review, below the requested minimum of "
             f"{min_queue} — not reviewing this round (--review-min-queue)"
         )
+        for c in queue:
+            throttled[c.pr] = (
+                f"review: only {len(queue)} PR(s) awaiting review, below the requested "
+                f"minimum of {min_queue} (--review-min-queue)"
+            )
         sv.reviewable.actionable = []
         return
     if not min_age:
@@ -191,6 +199,9 @@ def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
             log(
                 f"  review #{c.pr}: awaiting review {waited}m, below the requested minimum of "
                 f"{min_age}m — skipping (--review-min-age)"
+            )
+            throttled[c.pr] = (
+                f"review: awaiting review {waited}m, below the requested minimum of {min_age}m (--review-min-age)"
             )
             continue
         kept.append(c)
@@ -224,6 +235,11 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
     if pr in sv.review_stuck:
         notes.append("review keeps erroring without posting a verdict — needs infrastructure repair")
     notes += [f"fix: {why}" for n, why in sv.fix_waiting if n == pr]
+    # A throttle removes a candidate silently, so without this a PR the operator named would be
+    # reported as having no work at all when in fact this worker was told to hold off on it.
+    throttled = getattr(sv, "_review_throttled", None) or {}
+    if pr in throttled:
+        notes.append(throttled[pr])
     if notes:
         return "; ".join(notes)
     info = next((p for p in sv.open_prs if p.number == pr), None)
@@ -287,9 +303,21 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.status_label_line()}")
+    # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named
+    # PR, and pr_focus_reason repeats the ones that apply to a target anyway, so leaving them
+    # unfiltered would bury the operator's answer under a report about PRs they did not ask about.
+    targets = frozenset(getattr(opts, "prs", ()) or ())
+
+    def in_scope(pr: int) -> bool:
+        return not targets or pr in targets
+
     for pr, providers in sv.review_inflight:
+        if not in_scope(pr):
+            continue
         log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
     for pr, count in sv.review_capped:
+        if not in_scope(pr):
+            continue
         if count.startswith("?"):
             log(f"  review #{pr}: local ledger unreadable — skipping review (fail-closed); fix the ledger")
         else:
@@ -303,23 +331,35 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # before the scoreboard landed printed a bare "no eligible work" with no hint the PR was just waiting.
     if "fix" in opts.only and not sv.needs_fix.actionable:
         for pr, why in sv.fix_waiting:
-            log(f"  fix #{pr}: {why}")
+            if in_scope(pr):
+                log(f"  fix #{pr}: {why}")
 
     # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
     # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
     # per PR for a permanent record. These PRs neither merge nor advance toward CI's round cap, so a
     # human must intervene; surfacing them loudly is the alternative to stranding them in silence.
+    #
+    # Two things it must not do. Under `--pr` it stays inside the target set: filing a tracking issue
+    # on GitHub for an unrelated PR is exactly the unrelated work a targeted round promises not to do,
+    # and it would repeat every round of a targeted loop. Under `--dry-run` it warns but writes
+    # nothing — neither the GitHub issue nor the local diagnostic backfill — because a dry run is how
+    # an operator inspects their setup and it is documented as acting on nothing.
     for pr in sv.review_stuck:
+        if not in_scope(pr):
+            continue
         n_err = w.counters.read(f"review-err-{pr}")
+        warn_red(
+            f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
+            f"review it. Needs infrastructure repair. https://github.com/{TAUCETI}/pull/{pr}"
+        )
+        if opts.dry_run:
+            log(f"[dry-run] would open/refresh the tracking issue for #{pr}")
+            continue
         head = next((item.head_oid for item in sv.open_prs if item.number == pr), "")
         retained = read_review_failure(w.cfg.state, pr)
         if not retained:
             retained = recover_review_failures(w.cfg.state, w.cfg.logdir, worker=w.cfg.wid, pr=pr, head=head)
         diagnostic = public_review_failure(retained)
-        warn_red(
-            f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
-            f"review it. Needs infrastructure repair. https://github.com/{TAUCETI}/pull/{pr}"
-        )
         reason = f"its review has errored {n_err} times without posting a verdict"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
@@ -347,6 +387,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
+    declined: list[tuple[str, int]] = []
     for stage in AUTO_STAGES:
         if not want(opts.only, stage):
             continue
@@ -354,6 +395,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             rc = dispatch(stage, w, sv, c, opts)
             if rc is not None:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
+            declined.append((stage, c.pr))
     # `roadmap` authors a PR that does not exist yet, so it can never be one of the PRs `--pr` named.
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
@@ -368,11 +410,16 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             return rc
 
     scope = f"--only={','.join(opts.only) or '(all)'}"
-    if getattr(opts, "prs", ()):
-        targets = ", ".join(f"#{n}" for n in opts.prs)
+    if targets:
+        # focus_prs explains every target it left with no candidate, but a target whose candidate was
+        # OFFERED to dispatch and turned down (a peer holds its claim, or progress's fresh re-check
+        # went stale) has had nothing said about it yet. Say it here rather than let the summary point
+        # at a reason that was never printed.
+        for stage, pr in declined:
+            log(f"  --pr #{pr}: {stage} candidate was offered but not taken (claimed by a peer, or re-checked stale)")
         raise NoProgress(
-            f"nothing actionable on the requested PR(s) {targets} this round ({scope}) — see the "
-            f"per-PR reasons above; no unrelated work was done"
+            f"nothing actionable on the requested PR(s) {', '.join(f'#{n}' for n in opts.prs)} this "
+            f"round ({scope}) — see the per-PR reasons above; no unrelated work was done"
         )
     raise NoProgress(f"no eligible work this round under {scope}")
 

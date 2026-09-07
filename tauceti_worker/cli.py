@@ -19,6 +19,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -170,9 +171,10 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "Filters what the round would already have done — it can never make a PR actionable that "
         "the survey passed over, and never bypasses claims, attempt budgets, or the review caps. "
         "Combines with --only by intersection; drops the two work units that name no existing PR "
-        "(progress, roadmap), so a targeted round never falls through to unrelated work. When none "
-        "of the named PRs are actionable the round says why, per PR, and stops "
-        "(or $TAUCETI_PR)",
+        "(progress, roadmap), so a targeted round never falls through to unrelated work — including "
+        "the tracking issues it would otherwise file for unrelated stuck PRs. When none of the named "
+        "PRs are actionable the round says why, per PR, and stops. An empty or unreadable value is "
+        "an error, never 'no targeting' (or $TAUCETI_PR)",
     )
     p.add_argument(
         "--agent",
@@ -387,31 +389,56 @@ def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
     return tasks
 
 
+# A `--pr` token: an optional `#` and then digits, nothing else. Deliberately strict — see
+# resolve_pr_targets on why a token it cannot read has to be an error rather than a skipped word.
+PR_TOKEN_RE = re.compile(r"#?[0-9]+")
+
+
 def resolve_pr_targets(values: list[str]) -> tuple[int, ...]:
-    """Flatten/validate --pr (comma lists or repeated flags), falling back to $TAUCETI_PR. Empty =
-    untargeted, which is every ordinary round.
+    """Flatten/validate --pr (comma lists or repeated flags), falling back to $TAUCETI_PR.
 
-    A leading `#` is accepted because that is how a PR number is written everywhere else — in the
-    round's own log lines, on GitHub, and in the sentence the operator just read. Anything else is a
-    hard error rather than a silently ignored token: a typo'd target must not read as "no targeting"
-    and quietly turn a `--pr` round back into a free-running one.
+    Three outcomes, and keeping them apart is the whole point:
 
-    De-duplicated, in the order given. The round works down its own cascade rather than this list, so
-    the order steers nothing; keeping it stable only makes the per-PR "why not" report read back the
-    way it was typed."""
-    env_used = not values and (os.environ.get("TAUCETI_PR") or "").strip()
-    raw = values or ([os.environ["TAUCETI_PR"]] if env_used else [])
-    where = "$TAUCETI_PR" if env_used else "--pr"
+      - NOTHING SUPPLIED (no flag, and $TAUCETI_PR unset or blank) ⇒ (), the untargeted round every
+        ordinary invocation makes. A blank environment variable reads as unset here as it does
+        everywhere else in this CLI, because that is what an unfilled `.env` or `env` table entry is.
+      - SUPPLIED AND READABLE ⇒ the targets, de-duplicated in the order given. The round works down
+        its own cascade rather than this list, so the order steers nothing; keeping it stable only
+        makes the per-PR "why not" report read back the way it was typed.
+      - SUPPLIED AND EMPTY OR UNREADABLE ⇒ SystemExit. `--pr ""`, `--pr ",,"` and `TAUCETI_PR=",,"`
+        are the dangerous case: an operator who asked for targeting and got an unrestricted worker
+        instead is the one outcome this flag must never produce, and under `--loop` it would be an
+        unrestricted worker indefinitely. An explicit empty flag must not silently override a valid
+        $TAUCETI_PR either.
+
+    A token is `#?digits` and nothing else. A leading `#` is accepted because that is how a PR number
+    is written everywhere else — in the round's own log lines, on GitHub, and in the sentence the
+    operator just read — but internal whitespace is not: `--pr "4 12"` is a missing comma, and
+    reading it as #412 would send real work at a different PR that may well be actionable.
+    """
+    supplied = list(values)
+    where = "--pr"
+    if not supplied:
+        env = os.environ.get("TAUCETI_PR") or ""
+        if not env.strip():
+            return ()
+        supplied, where = [env], "$TAUCETI_PR"
     out: list[int] = []
-    for value in raw:
-        for tok in value.replace(" ", "").split(","):
+    for value in supplied:
+        for raw in value.split(","):
+            tok = raw.strip()
             if not tok:
                 continue
-            digits = tok.lstrip("#")
-            if not digits.isdigit() or int(digits) <= 0:
+            if not PR_TOKEN_RE.fullmatch(tok) or int(tok.lstrip("#")) <= 0:
                 raise SystemExit(f"{where} value {tok!r} is not a pull request number")
-            if int(digits) not in out:
-                out.append(int(digits))
+            number = int(tok.lstrip("#"))
+            if number not in out:
+                out.append(number)
+    if not out:
+        raise SystemExit(
+            f"{where} was given but names no pull request. Omit it to let the round pick its own "
+            f"work; an empty target list must not quietly become an untargeted worker"
+        )
     return tuple(out)
 
 

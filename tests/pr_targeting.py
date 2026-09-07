@@ -25,7 +25,9 @@ import argparse
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -72,11 +74,47 @@ check("zero is a hard error", raises_exit(tc.resolve_pr_targets, ["0"]) is not N
 check("a negative number is a hard error", raises_exit(tc.resolve_pr_targets, ["-3"]) is not None, True)
 check("a range is a hard error", raises_exit(tc.resolve_pr_targets, ["1-5"]) is not None, True)
 
+# An empty selection is the one outcome this flag must never produce silently: an operator who asked
+# for targeting and got an unrestricted worker instead, indefinitely under --loop.
+for empty in ("", "   ", ",,", " , "):
+    check(
+        f"--pr {empty!r} is refused, not read as untargeted",
+        "names no pull request" in (raises_exit(tc.resolve_pr_targets, [empty]) or ""),
+        True,
+    )
+check(
+    "an empty repeated flag is refused too",
+    raises_exit(tc.resolve_pr_targets, ["", ""]) is not None,
+    True,
+)
+# A missing comma must not retarget the round at a different, possibly actionable, PR.
+check(
+    "internal whitespace is a missing comma, not a number",
+    raises_exit(tc.resolve_pr_targets, ["4 12"]),
+    "--pr value '4 12' is not a pull request number",
+)
+check("a repeated # prefix is refused", raises_exit(tc.resolve_pr_targets, ["##412"]) is not None, True)
+# `str.isdigit()` accepts these; `int()` then raises an uncaught ValueError, so the token shape is
+# validated by pattern rather than by predicate.
+check("a non-ASCII digit is refused", raises_exit(tc.resolve_pr_targets, ["\u00b2"]) is not None, True)
+check("surrounding whitespace is still fine", tc.resolve_pr_targets([" 412 , 415 "]), (412, 415))
+
 os.environ["TAUCETI_PR"] = "77,78"
 check("the environment supplies it when the flag is absent", tc.resolve_pr_targets([]), (77, 78))
 check("the flag wins over the environment", tc.resolve_pr_targets(["412"]), (412,))
+check(
+    "an empty flag does not silently override a valid environment value",
+    raises_exit(tc.resolve_pr_targets, [""]) is not None,
+    True,
+)
 os.environ["TAUCETI_PR"] = "nope"
 check("a bad environment value names itself", "$TAUCETI_PR" in (raises_exit(tc.resolve_pr_targets, []) or ""), True)
+os.environ["TAUCETI_PR"] = ",,"
+check(
+    "an environment value that names nothing is refused",
+    "names no pull request" in (raises_exit(tc.resolve_pr_targets, []) or ""),
+    True,
+)
 os.environ["TAUCETI_PR"] = "   "
 check("a blank environment value is untargeted", tc.resolve_pr_targets([]), ())
 os.environ.pop("TAUCETI_PR", None)
@@ -209,7 +247,9 @@ got = reason(sv, Opts(prs=[1]), 1)
 check("every reason is reported, not just the first", ("attempts spent" in got, "daily cap" in got), (True, True))
 
 
-def pr_info(number, *, draft=False):
+def pr_info(number, *, draft=False, green_since=None):
+    """An open PR. `green_since` is when its `build` status was posted, i.e. when it became
+    reviewable — the clock --review-min-age reads."""
     return tc.PRInfo(
         number=number,
         head_oid=f"head{number}",
@@ -221,6 +261,7 @@ def pr_info(number, *, draft=False):
         author="kim-em",
         build_success=True,
         build_failed=False,
+        build_status_at=green_since,
     )
 
 
@@ -233,7 +274,10 @@ sv = survey_with()
 sv.open_prs.append(pr_info(1))
 check("open with genuinely nothing to do", "no work unit actionable" in reason(sv, Opts(prs=[1]), 1), True)
 
-# --- end to end: the real run_round -----------------------------------------------------------------
+# --- end to end: the real run_round ---------------------------------------------------------------
+# Everything below drives the actual cascade. `dispatch` is stubbed so no model runs, but it can also
+# be told to DECLINE a candidate (what a peer's branch claim looks like from here), and the GitHub
+# object records the one write run_round makes outside dispatch — the stuck-review tracking issue.
 home = Path(tempfile.mkdtemp())
 cfg = tc.Config(
     wid="t",
@@ -246,23 +290,48 @@ cfg = tc.Config(
     logdir=home / "logs",
     quota_cache=home / "qc",
 )
-worker = tc.Worker(cfg, None, None, tc.Counters(cfg), None, None)
+
+
+class FakeGitHub:
+    """Records the GitHub writes a round makes outside dispatch."""
+
+    def __init__(self):
+        self.stuck_issues = []
+
+    def ensure_stuck_issue(self, pr, reason, diagnostic):
+        self.stuck_issues.append(pr)
+
+
+gh = FakeGitHub()
+worker = tc.Worker(cfg, gh, None, tc.Counters(cfg), None, None)
 tc.work_units.mirror_creds = lambda _cfg: None
 tc.work_units.spread_candidates = lambda cs: list(cs)  # the shuffle is not what is under test
+
 dispatched = []
-tc.work_units.dispatch = lambda stage, w, sv, c, opts: dispatched.append((stage, c.pr)) or 0
-
-
-# The per-PR "why not" lines go to the round's log, not into the exception, so capture both: the
-# operator reads the log, and only the summary reaches the loop's back-off.
+declines = set()
 logged = []
 tc.work_units.log = lambda msg: logged.append(msg)
+tc.work_units.warn_red = lambda msg: logged.append(msg)
 
 
-def round_over(make_survey, opts):
+def fake_dispatch(stage, w, sv, c, opts):
+    """Record the unit, or decline it the way a claimed candidate is declined (rc None)."""
+    if (stage, c.pr) in declines:
+        return None
+    dispatched.append((stage, c.pr))
+    return 0
+
+
+tc.work_units.dispatch = fake_dispatch
+
+
+def round_over(make_survey, opts, *, decline=()):
     """run_round against `make_survey`, returning (dispatched units, NoProgress message or None)."""
     dispatched.clear()
     logged.clear()
+    gh.stuck_issues.clear()
+    declines.clear()
+    declines.update(decline)
     tc.work_units.survey = lambda *a, **k: make_survey()
     try:
         tc.run_round(worker, opts)
@@ -271,10 +340,13 @@ def round_over(make_survey, opts):
     return dispatched[:], None
 
 
-def opts_for(prs=(), only=()):
-    return tc.RoundOpts(
-        only=list(only), agent="codex", work_model="codex", sandbox_host=True, dry_run=False, prs=tuple(prs)
-    )
+def opts_for(prs=(), only=(), **kw):
+    kw.setdefault("dry_run", False)
+    return tc.RoundOpts(only=list(only), agent="codex", work_model="codex", sandbox_host=True, prs=tuple(prs), **kw)
+
+
+def said(fragment):
+    return any(fragment in line for line in logged)
 
 
 units, why = round_over(lambda: survey_with(actionable={"review": [1, 2], "fix": [3]}), opts_for(prs=[2]))
@@ -291,10 +363,9 @@ check("with two targets the cascade's own order wins", units, [("fix", 3)])
 # fall through to authoring a roadmap PR; a targeted one must not.
 units, why = round_over(lambda: survey_with(actionable={"review": [1]}), opts_for(prs=[99]))
 check("no target actionable -> nothing is dispatched", units, [])
-check("...not even the roadmap fallback", [s for s, _ in units if s == "roadmap"], [])
 check("...and it says which PRs it was asked about", "#99" in (why or ""), True)
 check("...and that it did nothing else", "no unrelated work was done" in (why or ""), True)
-check("...having explained #99 by name", any(line.strip().startswith("--pr #99:") for line in logged), True)
+check("...having explained #99 by name", said("--pr #99:"), True)
 
 # An untargeted round in the same situation DOES author, which is what makes the case above a choice.
 units, why = round_over(lambda: survey_with(), opts_for())
@@ -306,16 +377,156 @@ check("a due progress report is not a substitute for the named PR", units, [])
 # --only still narrows a targeted round: #1 is actionable for review, but this round only fixes.
 units, why = round_over(lambda: survey_with(actionable={"review": [1]}), opts_for(prs=[1], only=["fix"]))
 check("--only and --pr intersect", units, [])
-check(
-    "...and the logged reason names the excluded unit",
-    any("--only/--skip excludes" in line for line in logged),
-    True,
-)
+check("...and the logged reason names the excluded unit", said("--only/--skip excludes"), True)
 check("...while the exception points at those reasons", "see the per-PR reasons above" in (why or ""), True)
 
-# --- the loop re-applies the targeting every round ------------------------------------------------
-loop_src = __import__("inspect").getsource(tc.loop.cmd_loop)
-check("cmd_loop forwards --pr to the round child", '"--pr", ",".join(str(n) for n in prs)' in loop_src, True)
+# --- a candidate the cascade offers and dispatch turns down (a peer holds its claim) ----------------
+units, why = round_over(lambda: survey_with(actionable={"review": [1]}), opts_for(prs=[1]), decline={("review", 1)})
+check("a declined target is not worked", units, [])
+check("...and the round does not fall through to roadmap", [s for s, _ in units], [])
+check(
+    "...and the decline is reported for that PR, not left implicit", said("--pr #1: review candidate was offered"), True
+)
+check("...and the summary still points somewhere real", "see the per-PR reasons above" in (why or ""), True)
+
+# Without targeting the same decline falls through to authoring, as it always has.
+units, why = round_over(lambda: survey_with(actionable={"review": [1]}), opts_for(), decline={("review", 1)})
+check("without --pr a declined candidate still falls through to roadmap", units, [("roadmap", 0)])
+
+# A declined target does not stop a second target from being worked.
+units, why = round_over(
+    lambda: survey_with(actionable={"review": [1, 2]}), opts_for(prs=[1, 2]), decline={("review", 1)}
+)
+check("the cascade moves on to the next target", units, [("review", 2)])
+
+
+# --- the review throttles are not bypassed ---------------------------------------------------------
+def reviewable_survey(prs):
+    """A review queue of `prs`, every one of them green just now (so --review-min-age bites)."""
+    sv = survey_with(actionable={"review": prs})
+    sv.open_prs += [pr_info(n, green_since=int(time.time())) for n in prs]
+    return sv
+
+
+units, why = round_over(lambda: reviewable_survey([1, 2, 3]), opts_for(prs=[2], only=["review"], review_min_queue=5))
+check("--pr does not bypass --review-min-queue", units, [])
+check("...and the throttle is given as the target's reason", said("--review-min-queue"), True)
+
+# The throttle measures the WHOLE queue, not the targeted subset: three PRs are awaiting review, so a
+# minimum of three is met and the named one is reviewed. Filtering first would have made this 1 < 3.
+units, why = round_over(lambda: reviewable_survey([1, 2, 3]), opts_for(prs=[2], only=["review"], review_min_queue=3))
+check("the throttle counts the whole queue, not just the targets", units, [("review", 2)])
+
+# --review-min-age likewise: #2 went green moments ago, well under the requested hour.
+units, why = round_over(
+    lambda: reviewable_survey([1, 2, 3]),
+    opts_for(prs=[2], only=["review"], review_min_age=60),
+)
+check("--pr does not bypass --review-min-age", units, [])
+check("...and that throttle is reported too", said("--review-min-age"), True)
+
+
+# --- the survey's own stops hold: a named PR is not reviewed just because it was named ---------------
+def capped_survey():
+    sv = survey_with()  # a capped PR is not in the review queue at all
+    sv.open_prs.append(pr_info(412))
+    sv.review_capped.append((412, "3/3"))
+    return sv
+
+
+units, why = round_over(capped_survey, opts_for(prs=[412]))
+check("a PR at its daily review cap is not reviewed", units, [])
+check("...and the cap is the reported reason", said("daily cap 3/3"), True)
+
+
+def inflight_survey():
+    sv = survey_with()
+    sv.open_prs.append(pr_info(412))
+    sv.review_inflight.append((412, "codex"))
+    return sv
+
+
+units, why = round_over(inflight_survey, opts_for(prs=[412]))
+check("a PR a peer is reviewing is not reviewed", units, [])
+check("...and the peer is the reported reason", said("holds this head"), True)
+
+units, why = round_over(lambda: survey_with(suppressed={"fix": [412]}), opts_for(prs=[412]))
+check("a PR whose fix budget is spent is not fixed", units, [])
+check("...and the spent budget is the reported reason", said("attempts spent"), True)
+
+
+# --- GitHub writes outside dispatch stay inside the target set --------------------------------------
+def stuck_survey():
+    sv = survey_with(actionable={"review": [412]})
+    sv.open_prs += [pr_info(412), pr_info(999)]
+    sv.review_stuck.append(999)
+    return sv
+
+
+units, why = round_over(stuck_survey, opts_for(prs=[412]))
+check("a targeted round files no tracking issue for an unrelated PR", gh.stuck_issues, [])
+check("...and does not even warn about it", said("#999"), False)
+check("...while still doing the work it was asked for", units, [("review", 412)])
+
+units, why = round_over(stuck_survey, opts_for())
+check("without --pr the escalation still fires", gh.stuck_issues, [999])
+
+units, why = round_over(stuck_survey, opts_for(prs=[999]))
+check("naming the stuck PR does escalate it", gh.stuck_issues, [999])
+
+units, why = round_over(stuck_survey, opts_for(dry_run=True))
+check("--dry-run writes no tracking issue", gh.stuck_issues, [])
+check("...but still says what it would have filed", said("[dry-run] would open/refresh"), True)
+
+
+# --- the loop re-applies the targeting every round --------------------------------------------------
+# Behavioural, not a source grep: run the real driver for two rounds and read the children's argv.
+class Stop(Exception):
+    """Ends the driver loop after the second back-off."""
+
+
+class LoopClock:
+    """time for the loop module. Sleeping is the loop backing off; the second one ends the test."""
+
+    naps: list = []
+
+    @staticmethod
+    def sleep(n):
+        LoopClock.naps.append(n)
+        if len(LoopClock.naps) >= 2:
+            raise Stop
+
+    time = staticmethod(time.time)
+
+
+spawned = []
+saved = (tc.loop.time, tc.loop.github_budget, tc.loop.run_round_subprocess)
+tc.loop.time = LoopClock
+tc.loop.github_budget = lambda: {"core": (5000, 0), "graphql": (5000, 0)}
+tc.loop.run_round_subprocess = lambda tail: spawned.append(tail) or tc.EX_NOPROGRESS
+loop_args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None)
+try:
+    # An unpaced provider, so the loop needs no quota endpoint to reach the round spawn.
+    tc.loop.cmd_loop(loop_args, SimpleNamespace(wid="t"), only=["review"], agent="deepseek", prs=(412, 415))
+except Stop:
+    pass
+
+check("the loop ran more than one round", len(spawned), 2)
+check(
+    "every round of a targeted loop carries the targets",
+    [tail[tail.index("--pr") + 1] if "--pr" in tail else None for tail in spawned],
+    ["412,415", "412,415"],
+)
+check("...and a fruitless targeted round backs off rather than widening", LoopClock.naps[0] > 0, True)
+
+spawned.clear()
+LoopClock.naps.clear()
+try:
+    tc.loop.cmd_loop(loop_args, SimpleNamespace(wid="t"), only=["review"], agent="deepseek")
+except Stop:
+    pass
+check("an untargeted loop passes no --pr", ["--pr" in tail for tail in spawned], [False, False])
+tc.loop.time, tc.loop.github_budget, tc.loop.run_round_subprocess = saved
 
 # --- this one is documented -------------------------------------------------------------------------
 probe = argparse.ArgumentParser(prog="probe")
