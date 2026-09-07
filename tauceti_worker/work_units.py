@@ -45,6 +45,7 @@ from .constants import (
     MAX_INFRA_REFUNDS,
     MAX_OPEN_PRS,
     OPENROUTER_MODELS,
+    PR_TASKS,
     PROGRESS_REF,
     PROGRESS_TOOL_LINE,
     PROGRESS_TOOL_TAIL,
@@ -109,6 +110,8 @@ class RoundOpts:
     # what every documented configuration gets.
     review_min_queue: int = 0  # review only when at least this many PRs are awaiting review
     review_min_age: int = 0  # minutes a PR must have been awaiting review before this worker takes it
+    # --pr: the pull requests this round is restricted to. Empty (the normal case) = no targeting.
+    prs: tuple[int, ...] = ()
 
     @property
     def agent_name(self) -> str:
@@ -194,6 +197,80 @@ def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
     sv.reviewable.actionable = kept
 
 
+def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
+    """Why a `--pr` target is not being worked this round, in one line.
+
+    An operator who names a PR is owed an answer about THAT PR, so this reads the survey back for
+    everything it knows about it rather than reporting a bare "nothing to do". Several notes can be
+    true at once (a PR whose review is capped today may also have its fix budget spent), so they are
+    joined rather than raced: the first one printed is not necessarily the only reason, and hiding
+    the rest would send the operator to fix the wrong thing.
+
+    A stage's `suppressed` list, `review_inflight` / `review_capped` / `review_stuck` and
+    `fix_waiting` are the survey's own vocabulary for "considered and passed over"; anything left
+    over is either not an open PR at all, a draft, or open with genuinely nothing to do.
+    """
+    notes: list[str] = []
+    for stage in AUTO_STAGES:
+        if any(c.pr == pr for c in sv.kind(stage).actionable):
+            # Still in an actionable list after focus_prs filtered ⇒ only the task selection excludes it.
+            notes.append(f"actionable for {stage}, which this round's --only/--skip excludes")
+        for c in sv.kind(stage).suppressed:
+            if c.pr == pr:
+                spent = f" ({c.attempts}/{c.budget} attempts spent)" if c.budget else ""
+                notes.append(f"{stage} suppressed: {c.reason}{spent}")
+    notes += [f"review: a peer reviewer ({who}) holds this head" for n, who in sv.review_inflight if n == pr]
+    notes += [f"review: daily cap {count} reached" for n, count in sv.review_capped if n == pr]
+    if pr in sv.review_stuck:
+        notes.append("review keeps erroring without posting a verdict — needs infrastructure repair")
+    notes += [f"fix: {why}" for n, why in sv.fix_waiting if n == pr]
+    if notes:
+        return "; ".join(notes)
+    info = next((p for p in sv.open_prs if p.number == pr), None)
+    if info is None:
+        return f"not an open PR in {TAUCETI} (merged, closed, or never opened)"
+    if info.is_draft:
+        return "a draft — the worker acts only on ready-for-review PRs"
+    return "open, but the survey found no work unit actionable for it this round"
+
+
+def focus_prs(sv: Survey, opts) -> None:
+    """Restrict this round's candidates to the pull requests `--pr` named, in place.
+
+    This is a FILTER over what the survey already found actionable, never an override. Naming a PR
+    cannot make it actionable: if the survey put it in a `suppressed` list, behind the daily review
+    cap, or behind a peer's in-progress marker, it stays there, and the branch claim, attempt budgets
+    and review throttles downstream are untouched. "Work on these PRs" therefore means "of the work
+    you were already willing to do, only this" — which is the only reading under which an operator
+    steering a round cannot also spend past a limit the fleet relies on.
+
+    Applied AFTER throttle_review for the same reason: the throttles must see the review queue as it
+    really is, so `--review-min-queue 3` still means "three PRs are awaiting review" rather than
+    "three of the ones you named are".
+
+    Only the stages that act on an existing PR survive (PR_TASKS). `progress` and `roadmap` are not
+    about a PR of ours at all — they carry a pr=0 candidate, which no `--pr` value may be — so a
+    targeted round does not do them: the operator asked for these PRs, and quietly authoring an
+    unrelated roadmap PR instead would be the wrong answer to that request. (`roadmap` is dispatched
+    outside the candidate lists; run_round skips it.)
+
+    Whatever is left with nothing to do is explained PR by PR. The list is as long as the operator's
+    own, so this is bounded output, and it is the signal they actually asked for.
+    """
+    wanted = tuple(getattr(opts, "prs", ()) or ())
+    if not wanted:
+        return
+    keep = set(wanted)
+    for stage in AUTO_STAGES:
+        kind = sv.kind(stage)
+        kind.actionable = [c for c in kind.actionable if stage in PR_TASKS and c.pr in keep]
+    log(f"--pr: this round considers only {', '.join(f'#{n}' for n in wanted)}")
+    picked = {c.pr for stage in AUTO_STAGES if want(opts.only, stage) for c in sv.kind(stage).actionable}
+    for pr in wanted:
+        if pr not in picked:
+            log(f"  --pr #{pr}: {pr_focus_reason(sv, opts, pr)}")
+
+
 def run_round(w: Worker, opts: RoundOpts) -> int:
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
     # before any work runs. The quota pacer does this too, and every paced path now reaches it — but the
@@ -261,6 +338,12 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     if want(opts.only, "review"):
         throttle_review(sv, opts)
 
+    # --pr: the operator named specific pull requests, so narrow every stage to those. Last of the
+    # three narrowings (task selection, throttles, targeting) because each earlier one answers a
+    # question about the queue as a whole, and answering it against an already-narrowed queue would
+    # change what it means.
+    focus_prs(sv, opts)
+
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
@@ -271,7 +354,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             rc = dispatch(stage, w, sv, c, opts)
             if rc is not None:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
-    if want(opts.only, "roadmap"):
+    # `roadmap` authors a PR that does not exist yet, so it can never be one of the PRs `--pr` named.
+    # A targeted round that finds nothing to do on its targets stops rather than falling through to
+    # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
+    if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
         if sv.roadmap_backpressure:
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
@@ -281,7 +367,14 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if rc is not None:
             return rc
 
-    raise NoProgress(f"no eligible work this round under --only={','.join(opts.only) or '(all)'}")
+    scope = f"--only={','.join(opts.only) or '(all)'}"
+    if getattr(opts, "prs", ()):
+        targets = ", ".join(f"#{n}" for n in opts.prs)
+        raise NoProgress(
+            f"nothing actionable on the requested PR(s) {targets} this round ({scope}) — see the "
+            f"per-PR reasons above; no unrelated work was done"
+        )
+    raise NoProgress(f"no eligible work this round under {scope}")
 
 
 # Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a

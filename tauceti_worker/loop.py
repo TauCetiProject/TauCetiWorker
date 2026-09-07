@@ -67,7 +67,7 @@ def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
     return line.replace(old, new, 1)
 
 
-def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
+def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, ...] = ()) -> int:
     """The driver: pace against quota (codex preferred), run ONE round as a child under a hard timeout,
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
     round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
@@ -76,7 +76,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     ignore_quota = getattr(args, "ignore_quota", False)
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
-    log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}{' [bubble]' if bubble else ''}")
+    targeted = f" pr={','.join(str(n) for n in prs)}" if prs else ""
+    log(
+        f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'}{targeted} "
+        f"agent={agent}{' [bubble]' if bubble else ''}"
+    )
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -191,6 +195,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             tail = ["--worker-id", cfg.wid]
             if only:
                 tail += ["--only", ",".join(only)]
+            # --pr must travel to the child for the same reason --account does: the child is what
+            # surveys and picks, this argv is built explicitly rather than inherited, and a targeting
+            # flag omitted here would turn every round of a `--loop --pr` into a free-running one.
+            if prs:
+                tail += ["--pr", ",".join(str(n) for n in prs)]
             if model:
                 tail += ["--agent", model, "--ignore-quota"]  # loop already paced; child must not re-pace
             if pending_init:

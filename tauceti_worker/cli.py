@@ -53,7 +53,16 @@ from .config import (
     set_log_file,
     warn_red,
 )
-from .constants import AGENTS, ALLOWED_TASKS, CLAIMS, EX_NOPROGRESS, OPENROUTER_MODELS, TAUCETI, WORK_TASKS
+from .constants import (
+    AGENTS,
+    ALLOWED_TASKS,
+    CLAIMS,
+    EX_NOPROGRESS,
+    OPENROUTER_MODELS,
+    PR_TASKS,
+    TAUCETI,
+    WORK_TASKS,
+)
 from .github import GitHub, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
@@ -82,13 +91,17 @@ the cascade (priority order; a round does the first that applies):
   roadmap   open a new PR for a roadmap item
 
   With no --only a round walks the whole cascade; --only pins it to a subset,
-  --skip drops a subset (and the two combine by subtraction).
+  --skip drops a subset (and the two combine by subtraction). --pr narrows the
+  same round to named pull requests: it filters what the round would already
+  have done, so progress and roadmap (which name no existing PR) drop out.
 
 examples:
   tauceti work                          one round: auto agent, on the host
   tauceti work --loop                   the driver: keep picking the best job
   tauceti work --loop --only review     a focused reviewer
   tauceti work --loop --skip roadmap    the whole cascade except authoring new PRs
+  tauceti work --pr 412                 whatever the cascade wants to do to PR #412
+  tauceti work --pr 412,415 --only review,fix   only those two PRs, only those two units
   tauceti work --only roadmap --roadmap-only ReductiveGroups
   tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
   tauceti work --only review --agent claude --bubble
@@ -105,6 +118,7 @@ environment (flags win; full reference linked below):
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
+  TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
@@ -146,6 +160,19 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="drop these work units from the round (the inverse of --only); a comma list of "
         "the same names. Combines with --only by subtraction (--only review,fix --skip "
         "fix runs only review)",
+    )
+    p.add_argument(
+        "--pr",
+        action="append",
+        default=[],
+        metavar="N[,N...]",
+        help="work only on these pull requests: a comma list (or repeated flag) of PR numbers. "
+        "Filters what the round would already have done — it can never make a PR actionable that "
+        "the survey passed over, and never bypasses claims, attempt budgets, or the review caps. "
+        "Combines with --only by intersection; drops the two work units that name no existing PR "
+        "(progress, roadmap), so a targeted round never falls through to unrelated work. When none "
+        "of the named PRs are actionable the round says why, per PR, and stops "
+        "(or $TAUCETI_PR)",
     )
     p.add_argument(
         "--agent",
@@ -360,6 +387,47 @@ def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
     return tasks
 
 
+def resolve_pr_targets(values: list[str]) -> tuple[int, ...]:
+    """Flatten/validate --pr (comma lists or repeated flags), falling back to $TAUCETI_PR. Empty =
+    untargeted, which is every ordinary round.
+
+    A leading `#` is accepted because that is how a PR number is written everywhere else — in the
+    round's own log lines, on GitHub, and in the sentence the operator just read. Anything else is a
+    hard error rather than a silently ignored token: a typo'd target must not read as "no targeting"
+    and quietly turn a `--pr` round back into a free-running one.
+
+    De-duplicated, in the order given. The round works down its own cascade rather than this list, so
+    the order steers nothing; keeping it stable only makes the per-PR "why not" report read back the
+    way it was typed."""
+    env_used = not values and (os.environ.get("TAUCETI_PR") or "").strip()
+    raw = values or ([os.environ["TAUCETI_PR"]] if env_used else [])
+    where = "$TAUCETI_PR" if env_used else "--pr"
+    out: list[int] = []
+    for value in raw:
+        for tok in value.replace(" ", "").split(","):
+            if not tok:
+                continue
+            digits = tok.lstrip("#")
+            if not digits.isdigit() or int(digits) <= 0:
+                raise SystemExit(f"{where} value {tok!r} is not a pull request number")
+            if int(digits) not in out:
+                out.append(int(digits))
+    return tuple(out)
+
+
+def raise_on_untargetable_tasks(prs: tuple[int, ...], only: list[str]) -> None:
+    """Refuse `--pr` alongside a task selection that leaves no PR-bearing work unit enabled.
+
+    `--pr roadmap` cannot be honoured in any reading: the roadmap authors a PR that does not exist
+    yet, and a progress round writes a roadmap's generated reports. Silently doing nothing would be
+    the round's answer, one no-progress back-off at a time; saying so at the CLI costs one command."""
+    if prs and only and not any(t in PR_TASKS for t in only):
+        raise SystemExit(
+            f"--pr targets pull requests, but --only/--skip leave only {', '.join(only)} enabled and "
+            f"none of those act on an existing PR (PR work units: {', '.join(PR_TASKS)})"
+        )
+
+
 def resolve_review_throttle(cli_value: int | None, env: str, flag: str) -> int:
     """One of the undocumented review throttles, as an effective non-negative integer: the flag wins,
     else the environment variable, else 0 (off). A malformed value fails loudly rather than silently
@@ -522,6 +590,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_usage(args)
     if cmd in ("work", "_round"):
         only = resolve_tasks(getattr(args, "only", []), getattr(args, "skip", []))
+        prs = resolve_pr_targets(getattr(args, "pr", []))
+        raise_on_untargetable_tasks(prs, only)
         agent = resolve_agent(args)
         # --account names a CODEX account, so the round must be committed to Codex before it starts.
         # Under `auto` the pacer may legitimately land on Claude, and there is no honest answer then:
@@ -538,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
                     "account identity in the credential this worker mirrors."
                 )
             )
-        return cmd_work(args, only=only, agent=agent, one_round=(cmd == "_round"))
+        return cmd_work(args, only=only, prs=prs, agent=agent, one_round=(cmd == "_round"))
     if cmd == "doctor":
         return cmd_doctor(args)
     if cmd == "workers":
@@ -651,7 +721,7 @@ def cmd_status(args) -> int:
     return 1 if sv.github_failed else 0
 
 
-def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
+def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
     # --host used to opt OUT of the bubble sandbox; running on the host is now the default, so the flag
     # is a no-op we only warn about. --bubble is the way to opt back INTO the sandbox.
     if getattr(args, "host", False):
@@ -763,7 +833,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         # its children get theirs. Check here too, so a wrong --account costs one command rather than a
         # full survey, and so the operator sees the message before the loop's own output buries it.
         raise_on_account_mismatch(cfg, getattr(args, "account", None), agent, "account")
-        return cmd_loop(args, cfg, only=only, agent=agent)
+        return cmd_loop(args, cfg, only=only, agent=agent, prs=prs)
     dry = getattr(args, "dry_run", False)
     ignore_quota = getattr(args, "ignore_quota", False)
     quota_cmd = getattr(args, "quota_cmd", None)
@@ -817,6 +887,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             account=getattr(args, "account", None),
             review_min_queue=review_min_queue,
             review_min_age=review_min_age,
+            prs=prs,
         )
         # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,
         # so it is the one run that most needs to answer "am I on the right account?". The check is a
