@@ -232,6 +232,12 @@ class Survey:
         # This is intentionally not a dataclass field: `status --json` uses asdict() and should not
         # duplicate the worker's PRs in its public payload.
         self._mine_open_prs: list[PRInfo] = []
+        # pr -> why the (undocumented) review throttles removed it from THIS round's queue. Also not a
+        # dataclass field, and for a second reason beyond the payload: it is a property of one round's
+        # options, not of the survey, so `status` and the dashboard must never report it. It exists so
+        # a `--pr` round can explain a target the throttles took, instead of reporting the survey found
+        # it no work.
+        self._review_throttled: dict[int, str] = {}
 
     def kind(self, name: str) -> WorkKind:
         return {

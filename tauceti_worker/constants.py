@@ -236,6 +236,12 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # keeps a stuck or rejected progress report from burning every round.
 AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
 
+# The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
+# left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
+# rather than touching a PR of ours, and `roadmap` opens a PR that does not exist yet. Both carry a
+# pr=0 candidate, which is why no `--pr` value is allowed to be 0.
+PR_TASKS = ("rebase", "bump", "fix-ci", "fix", "review")
+
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
 # runtime priority. Keeping those concepts separate avoids silently rebinding established digit keys.
