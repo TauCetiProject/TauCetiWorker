@@ -35,7 +35,18 @@ from .agents import (
     validate_kiro_model_access,
     wrapper_bin,
 )
-from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
+from .config import (
+    Config,
+    Die,
+    NoProgress,
+    is_git_url,
+    log,
+    one_line,
+    respect_claims,
+    roadmap_areas,
+    roadmap_skip,
+    warn_red,
+)
 from .constants import (
     AGENT_NAMES,
     AUTO_STAGES,
@@ -302,7 +313,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
-        raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
+        # Name the failure gh reported. The survey already captured its stderr, and the generic line
+        # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
+        # credential when the answer was an HTTP 504 from the GraphQL gateway, retried out of a round.
+        why = one_line("; ".join(sv.errors)) or "gh pr list failed (GitHub API?)"
+        raise NoProgress(f"{why} — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.status_label_line()}")
     # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named
