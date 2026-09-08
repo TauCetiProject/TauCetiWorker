@@ -113,7 +113,7 @@ If the window still is not reporting afterwards, the status reads
 A provider is available while `used%` is strictly under the budget for the
 elapsed fraction of the window. Strictly, because the request being decided
 costs something: sitting exactly on the budget
-(`session at budget (used 50% = 50% budget)`) is a pause, not a green light.
+(`session at budget (20% elapsed: used 50% = 50% pace budget)`) is a pause, not a green light.
 
 If usage cannot be read at all, the provider is treated as unavailable rather
 than assumed free.

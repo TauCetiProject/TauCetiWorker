@@ -2163,15 +2163,40 @@ class Quota:
         return None, snap
 
 
+def _pace_pcts(used: float, budget: float) -> tuple[str, str]:
+    """`used` and `budget` at the fewest decimals (0..3) that keeps them apart, for the strict
+    inequality of an over-pace window.
+
+    Rounding both to whole percents printed a true `used > budget` as `used 8% > 8% budget`, which
+    reads as a bug in the pacer rather than as what it was: 8.000 against a budget of 7.998, over by
+    a few seconds of clock. Show enough precision that the relation the sentence states is visible in
+    the numbers beside it."""
+    for places in (0, 1, 2):
+        u, b = f"{used:.{places}f}", f"{budget:.{places}f}"
+        if u != b:
+            return u, b
+    return f"{used:.3f}", f"{budget:.3f}"
+
+
 def _pace_reason(w: Window) -> str:
-    """A soft pacing block, with the budget it met or exceeded (so a custom --pace is observable) and
-    the quota still in hand. `at budget` and `ahead of pace` are different situations: the first is
-    waiting for the budget line to rise, the second for usage to fall behind it again."""
-    vs = "" if (w.used is None or w.budget is None) else f" (used {round(w.used)}% {{}} {round(w.budget)}% budget)"
+    """A soft pacing block: which window is holding us, how far into that window we are, the budget
+    the curve allows THERE (so a custom --pace is observable), and the quota still in hand.
+
+    The elapsed fraction is what makes the budget legible — `used 44% > 42% pace budget` is arbitrary
+    until you know it is 62% of the way through the session window, and an operator comparing this
+    against their own usage readout otherwise has no way to tell that the second number is a pace line
+    and not a quota one. `at budget` and `ahead of pace` are different situations: the first is waiting
+    for the budget line to rise, the second for usage to fall behind it again."""
+    at_budget = w.status == STATUS_AT_BUDGET
+    if w.used is None or w.budget is None:
+        detail = ""
+    else:
+        # at-budget is exact equality by construction (see _classify_window), so it needs no widening.
+        u, b = (f"{w.used:.0f}", f"{w.budget:.0f}") if at_budget else _pace_pcts(w.used, w.budget)
+        where = "" if w.elapsed is None else f"{round(w.elapsed)}% elapsed: "
+        detail = f" ({where}used {u}% {'=' if at_budget else '>'} {b}% pace budget)"
     left = "" if w.used is None else f", {max(0, round(100 - w.used))}% left"
-    if w.status == STATUS_AT_BUDGET:
-        return f"{w.name} at budget{vs.format('=')}{left}"
-    return f"{w.name} ahead of pace{vs.format('>')}{left}"
+    return f"{w.name} {'at budget' if at_budget else 'ahead of pace'}{detail}{left}"
 
 
 def _window_reason(w: Window) -> str:
