@@ -134,6 +134,34 @@ for name, p, expected in reason_cases:
     print(f"[{'OK ' if ok else 'XX '}] {name}: got={got} want={expected}")
     fails += not ok
 
+# --- the pace parenthetical explains itself ---------------------------------
+# An operator reads this beside their own usage readout, where every number is used% against elapsed%.
+# Without the elapsed fraction and the word `pace`, the budget looks like a second usage figure that
+# disagrees with theirs. And rounding both sides to whole percents printed a real `used > budget` as
+# `used 8% > 8% budget`: the pair below is over by 0.0017 points, about nine seconds of clock.
+pace_text_cases = [
+    (
+        "the block names how far into the window it is",
+        W("session", 44.0, 61.5, "over-pace", budget=42.2),
+        "session ahead of pace (62% elapsed: used 44% > 42% pace budget), 56% left",
+    ),
+    (
+        "a hair over the budget still reads as over",
+        W("weekly", 8.0, 12.0, "over-pace", budget=7.998347),
+        "weekly ahead of pace (12% elapsed: used 8.000% > 7.998% pace budget), 92% left",
+    ),
+    (
+        "an unmeasurable budget drops the parenthetical rather than inventing one",
+        W("session", 36.0, 23.0, "over-pace"),
+        "session ahead of pace, 64% left",
+    ),
+]
+for name, window, expected in pace_text_cases:
+    got = tc._pace_reason(window)
+    ok = got == expected
+    print(f"[{'OK ' if ok else 'XX '}] {name}: got={got!r} want={expected!r}")
+    fails += not ok
+
 # --- quota_line: glyph + honest reason end-to-end ---------------------------
 soft = {
     "codex": tc.Provider(
@@ -169,7 +197,7 @@ codex_paced = tc.Provider("codex", False, None, [W("weekly", 32.0, 20.0, "over-p
 line = tc._wait_quota_line({"codex": codex_paced, "claude": idle_paced})
 for want in (
     "claude [yellow]~[/]",
-    "weekly ahead of pace (used 38% > 33% budget), 62% left",
+    "weekly ahead of pace (33% elapsed: used 38% > 33% pace budget), 62% left",
     "session window reset — initialization deferred until pacing permits",
 ):
     ok = want in line
@@ -189,7 +217,7 @@ idle_at_budget = prov(
 )
 line = tc._wait_quota_line({"claude": idle_at_budget})
 for want in (
-    "weekly at budget (used 33% = 33% budget), 67% left",
+    "weekly at budget (33% elapsed: used 33% = 33% pace budget), 67% left",
     "session window reset — initialization deferred until pacing permits",
 ):
     ok = want in line

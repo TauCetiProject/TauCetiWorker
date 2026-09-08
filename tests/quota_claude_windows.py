@@ -163,7 +163,11 @@ p = q._claude_from_payload(at)
 check("used == budget ⇒ at-budget, not under-pace", [w.status for w in p.windows], ["at-budget", "under-pace"])
 check("used == budget ⇒ no task", (p.available, p.model), (False, None))
 check("used == budget is a SOFT pacing block", tc._unavail_reason(p)[0], True)
-check("...and reports the equality", tc._unavail_reason(p)[1], "session at budget (used 50% = 50% budget), 50% left")
+check(
+    "...and reports the equality",
+    tc._unavail_reason(p)[1],
+    "session at budget (20% elapsed: used 50% = 50% pace budget), 50% left",
+)
 under = {**at, "five_hour": {"utilization": 49.5, "resets_at": SESSION_LIVE}}
 check("used < budget ⇒ available", q._claude_from_payload(under).available, True)
 over = {**at, "five_hour": {"utilization": 50.5, "resets_at": SESSION_LIVE}}
@@ -327,7 +331,11 @@ over = {
 }
 soft, why = tc._unavail_reason(q._claude_from_payload(over))
 check("over the pace line ⇒ SOFT block", soft, True)
-check("over-pace reason keeps its detail", why, "session ahead of pace (used 80% > 20% budget), 20% left")
+check(
+    "over-pace reason keeps its detail",
+    why,
+    "session ahead of pace (20% elapsed: used 80% > 20% pace budget), 20% left",
+)
 
 # --- the top-level response must be an object ------------------------------------------------------
 # .get() on a list/string/number would raise inside the pacer, and an exception is not a quota verdict.

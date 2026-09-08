@@ -12,26 +12,13 @@ from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
-from .quota import Provider, Quota, _glyph, _hours, _unavail_reason, quota_line
+from .quota import Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
 
 class _LoopTerminated(KeyboardInterrupt):
     """SIGTERM translated to the same teardown path as Ctrl-C, with the right exit code."""
-
-
-def _pace_wait_reason(window) -> str:
-    """One soft pacing condition, formatted like quota.py without changing its control verdict."""
-    relation = "=" if window.status == "at-budget" else ">"
-    label = "at budget" if window.status == "at-budget" else "ahead of pace"
-    comparison = (
-        ""
-        if window.used is None or window.budget is None
-        else f" (used {round(window.used)}% {relation} {round(window.budget)}% budget)"
-    )
-    left = "" if window.used is None else f", {max(0, round(100 - window.used))}% left"
-    return f"{window.name} {label}{comparison}{left}"
 
 
 def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
@@ -58,7 +45,7 @@ def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
 
     why = "; ".join(
         [
-            *(_pace_wait_reason(w) for w in paced),
+            *(_pace_reason(w) for w in paced),
             *(f"{w.name} window reset — initialization deferred until pacing permits" for w in idle),
         ]
     )
