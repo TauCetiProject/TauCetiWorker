@@ -61,7 +61,7 @@ check(
 check(
     "with nothing captured it still says what it was doing",
     abort_reason([]),
-    "gh pr list failed (GitHub API?) — aborting round, not falling through to authoring",
+    "the open PR query failed (GitHub API?) — aborting round, not falling through to authoring",
 )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

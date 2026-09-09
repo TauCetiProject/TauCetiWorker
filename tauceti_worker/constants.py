@@ -161,6 +161,15 @@ GH_SECONDARY_BASE = 60  # first secondary-limit sleep when no Retry-After is giv
 # opening `gh pr list` asks for statusCheckRollup over every open PR, which takes ~10s server-side and
 # is answered with an HTTP 504 often enough to abort whole rounds. A retry a few seconds later almost
 # always lands, so these get a short in-place retry (see gh_run) rather than costing a round.
+# The open-PR survey that opens every round. It used to be one `gh pr list --limit 200` carrying
+# statusCheckRollup, whose cost grew with the number of open PRs: at ~100 PRs it took ~10s server-side
+# against a GraphQL gateway that gives up around 11, and past 200 PRs it would have started silently
+# dropping the rest. The survey pages instead, so the cost of any ONE request is fixed by the page size
+# no matter how large the project grows, and no page is anywhere near the gateway's patience.
+OPEN_PR_PAGE = int(os.environ.get("TAUCETI_OPEN_PR_PAGE", "100"))  # PRs per request (GitHub's maximum)
+
+OPEN_PR_MAX_PAGES = int(os.environ.get("TAUCETI_OPEN_PR_MAX_PAGES", "100"))  # refuse to loop forever
+
 GH_TRANSIENT_TRIES = 3  # retries after a transient failure, then surface it
 
 GH_TRANSIENT_BASE = 5  # first transient-failure sleep, doubling per retry (5s, 10s, 20s)
@@ -172,6 +181,11 @@ _GH_SECONDARY_RE = re.compile(r"secondary rate limit|abuse detection", re.I)
 # Each of these is the transport or the server failing, never a verdict about our request: a 5xx, a
 # body that stopped arriving (gh reports the truncation as a JSON parse error), or a dropped
 # connection. Deliberately narrow — a 4xx is an answer, and retrying one just repeats it.
+# A GraphQL document that opens with `mutation` writes; anything else (a `query`, or the bare `{...}`
+# shorthand) reads. Leading comments are skipped so a commented document is still classified by its
+# operation.
+_GQL_MUTATION_RE = re.compile(r"\A\s*(?:#[^\n]*\n\s*)*mutation\b")
+
 _GH_TRANSIENT_RE = re.compile(
     r"HTTP 5\d\d|unexpected end of JSON input|connection reset by peer|i/o timeout|TLS handshake timeout",
     re.I,

@@ -44,7 +44,7 @@ def classify(access, raw=RAW):
     try:
         sv = survey_mod.survey(
             SimpleNamespace(wid="test"),
-            SimpleNamespace(pr_list=lambda _fields: raw),
+            SimpleNamespace(open_prs=lambda: raw),
             None,
             Counters(),
             deep=False,

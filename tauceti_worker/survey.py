@@ -567,22 +567,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         roadmap_skip=roadmap_skip(),
     )
     try:
-        raw = gh.pr_list(
-            [
-                "number",
-                "title",
-                "body",
-                "headRefOid",
-                "headRefName",
-                "headRepositoryOwner",
-                "headRepository",
-                "isDraft",
-                "statusCheckRollup",
-                "author",
-                "mergeable",
-                "labels",
-            ]
-        )
+        raw = gh.open_prs()
     except GitHubError as e:
         sv.github_failed = True
         sv.errors.append(str(e))
