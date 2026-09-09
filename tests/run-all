@@ -49,6 +49,7 @@ RUN_STDLIB=(
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  open_pr_pages.py
   pace_curve.py
   pr_targeting.py
   preflight_review_lake.py

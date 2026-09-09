@@ -16,12 +16,15 @@ from .constants import (
     _GH_PRIMARY_RE,
     _GH_SECONDARY_RE,
     _GH_TRANSIENT_RE,
+    _GQL_MUTATION_RE,
     CLAIMS,
     CONTEST_CLAIM_EMOJI,
     GH_INROUND_WAIT,
     GH_SECONDARY_BASE,
     GH_TRANSIENT_BASE,
     GH_TRANSIENT_TRIES,
+    OPEN_PR_MAX_PAGES,
+    OPEN_PR_PAGE,
     TAUCETI,
 )
 
@@ -261,8 +264,14 @@ def _gh_read_only(argv: list[str]) -> bool:
     if not args:
         return False
     if args[0] == "api":
-        # `gh api` is GET unless told otherwise, and a field/body argument makes it a POST implicitly.
         rest = args[1:]
+        if rest[:1] == ["graphql"]:
+            # Every GraphQL call is a POST, so the method says nothing about what it does; the document
+            # does. A `query` reads and may be retried, a `mutation` writes and may not. An invocation
+            # whose document we cannot see (--input, a file) is treated as a write.
+            docs = [a[len("query=") :] for a in rest[1:] if a.startswith("query=")]
+            return bool(docs) and not any(_GQL_MUTATION_RE.search(d) for d in docs)
+        # `gh api` is GET unless told otherwise, and a field/body argument makes it a POST implicitly.
         for i, a in enumerate(rest):
             if a in ("-X", "--method"):
                 if i + 1 >= len(rest) or rest[i + 1].upper() != "GET":
@@ -367,12 +376,113 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
 # ============================================================================
 
 
+# The survey's open-PR page. Only the fields PRInfo reads, and for the head's status ONLY the commit
+# status contexts — never a check run. That distinction is load-bearing and predates this query: a
+# check-run reflects a job's outcome and can go red on an infra hiccup while the authoritative `build`
+# status is green (see PRInfo.from_json). `statusCheckRollup` mixes both and costs an order of
+# magnitude more; `commits(last:1)` is the head, whose status is the one that gates the PR.
+_OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){
+    pullRequests(states:OPEN,first:$n,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){
+      pageInfo{hasNextPage endCursor}
+      nodes{
+        number title body isDraft mergeable headRefOid headRefName
+        headRepositoryOwner{login} headRepository{name}
+        author{login __typename}
+        labels(first:50){totalCount nodes{name}}
+        commits(last:1){nodes{commit{status{contexts{context state createdAt}}}}}
+      }
+    }
+  }
+}"""
+
+
+def _pr_json_from_graphql(node: dict) -> dict:
+    """One GraphQL PR node in `gh pr list --json` shape, so PRInfo.from_json stays the single place
+    that decides what a PR's fields MEAN.
+
+    Only the spellings gh normalizes need translating: it flattens `labels`/`contexts` out of their
+    connections, renames a status context's `createdAt` to `startedAt`, and reports a Bot author as
+    `is_bot` with an `app/`-prefixed login rather than as a bare `__typename`. Nothing downstream reads
+    the prefix, but matching gh exactly is what lets the two paths be compared field for field."""
+    commits = (node.get("commits") or {}).get("nodes") or [{}]
+    status = ((commits[0] or {}).get("commit") or {}).get("status") or {}
+    author = node.get("author") or {}
+    is_bot = author.get("__typename") == "Bot"
+    login = author.get("login", "")
+    return {
+        **{k: node.get(k) for k in ("number", "title", "body", "isDraft", "mergeable", "headRefOid", "headRefName")},
+        "headRepositoryOwner": node.get("headRepositoryOwner") or {},
+        "headRepository": node.get("headRepository") or {},
+        "author": {"login": f"app/{login}" if is_bot and login else login, "is_bot": is_bot},
+        "labels": list((node.get("labels") or {}).get("nodes") or []),
+        "statusCheckRollup": [
+            {"context": c.get("context"), "state": c.get("state"), "startedAt": c.get("createdAt")}
+            for c in (status.get("contexts") or [])
+        ],
+    }
+
+
 class GitHub:
     def __init__(self, repo: str = TAUCETI):
         self.repo = repo
 
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         return gh_run(["gh", *args])
+
+    def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
+        """Every open PR, paged, in the same shape `gh pr list --json` returns (so PRInfo.from_json
+        reads either).
+
+        This is the query that opens every round, and `gh pr list` is the wrong shape for it at any
+        size. It asks for `statusCheckRollup` — every check run and status context on every PR's head —
+        when the survey reads exactly one thing out of that rollup: the `build` commit status. The
+        rollup made one request whose server-side cost grew with the project, until at ~100 open PRs it
+        ran ~10s against a gateway that gives up around 11 and failed about a quarter of the time. Its
+        `--limit` was the other half of the problem: a limit is a silent truncation, so past it the
+        survey would have started quietly missing PRs, which is worse than failing.
+
+        Asking for the status contexts alone puts a page of 100 at ~3s, and paging puts a ceiling on
+        what any ONE request costs, independent of how many PRs are open. The work still grows with the
+        project, but it grows as more small requests rather than as one request drifting towards a
+        timeout, and each page is retried on its own (see gh_run)."""
+        owner, _, name = self.repo.partition("/")
+        out: list[dict] = []
+        seen: set[int] = set()
+        truncated: list[int] = []
+        cursor = None
+        for _ in range(OPEN_PR_MAX_PAGES):
+            args = ["api", "graphql", "-F", f"owner={owner}", "-F", f"repo={name}", "-F", f"n={page}"]
+            if cursor:
+                args += ["-F", f"cursor={cursor}"]
+            p = self._gh([*args, "-f", f"query={_OPEN_PRS_QUERY}"])
+            if p.returncode != 0:
+                raise GitHubError(f"open PR query failed: {one_line(p.stderr or p.stdout, 160)}")
+            try:
+                conn = json.loads(p.stdout)["data"]["repository"]["pullRequests"]
+            except (ValueError, TypeError, KeyError) as e:
+                raise GitHubError(f"open PR query returned no pull requests ({e})") from e
+            for node in conn.get("nodes") or []:
+                # Same principle as the page cap, one level down: a PR carrying more labels than we
+                # asked for would come back quietly short, and the status pipeline reads labels.
+                labels = node.get("labels") or {}
+                if labels.get("totalCount", 0) > len(labels.get("nodes") or []):
+                    truncated.append(node.get("number"))
+                # Ordered by creation, which never changes, so a PR updated mid-scan cannot reorder
+                # itself across a page boundary. Dedupe anyway: a skipped PR is invisible work, and
+                # this is the one place that would hide it.
+                if node and node.get("number") not in seen:
+                    seen.add(node["number"])
+                    out.append(_pr_json_from_graphql(node))
+            info = conn.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                if truncated:
+                    log(f"open PR query: {len(truncated)} PR(s) carry more than 50 labels, e.g. #{truncated[0]}")
+                return out
+            cursor = info.get("endCursor")
+        # Refusing here is the point: the alternative is returning a truncated list that reads as the
+        # whole project, which is exactly the failure `--limit` used to hide.
+        raise GitHubError(f"open PR query exceeded {OPEN_PR_MAX_PAGES} pages of {page} ({len(out)} PRs so far)")
 
     def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open") -> list[dict]:
         args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200", "--json", ",".join(fields)]
