@@ -134,6 +134,26 @@ def main() -> int:
         p = tc.gh_run(argv)
         check(f"504 on `{name}` is not retried", (p.returncode, len(fr.calls), slept), (1, 1, []))
 
+    # GraphQL is always a POST, so only the document says whether a call reads. The survey's paged PR
+    # query depends on this: without it, the one query that must survive a flaky gateway is the one
+    # call that never gets retried.
+    for name, argv, want in (
+        ("a graphql query", ["gh", "api", "graphql", "-f", "query=query($n:Int!){viewer{login}}"], True),
+        ("the bare {...} shorthand", ["gh", "api", "graphql", "-f", "query={viewer{login}}"], True),
+        ("a commented query", ["gh", "api", "graphql", "-f", "query=# open PRs\nquery{viewer{login}}"], True),
+        ("a graphql mutation", ["gh", "api", "graphql", "-f", "query=mutation{addComment(input:{}){id}}"], False),
+        ("a document we cannot see", ["gh", "api", "graphql", "--input", "doc.json"], False),
+    ):
+        check(f"{name} is read-only", tc._gh_read_only(argv), want)
+
+    fr, slept = with_stubs([(1, GATEWAY), (0, "")])
+    p = tc.gh_run(["gh", "api", "graphql", "-f", "query=query{viewer{login}}"])
+    check("504 on a graphql query retries", (p.returncode, len(fr.calls)), (0, 2))
+
+    fr, slept = with_stubs([(1, GATEWAY), (0, "")])
+    p = tc.gh_run(["gh", "api", "graphql", "-f", "query=mutation{addComment(input:{}){id}}"])
+    check("504 on a graphql mutation is not retried", (p.returncode, len(fr.calls)), (1, 1))
+
     # The wait budget bounds transient retries as it bounds rate-limit ones.
     fr, slept = with_stubs([(1, GATEWAY), (0, "")])
     p = tc.gh_run(PR_LIST, max_wait=1)

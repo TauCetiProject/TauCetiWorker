@@ -138,7 +138,7 @@ def main():
     ]
 
     class FakeGH:
-        def pr_list(self, fields):
+        def open_prs(self):
             return raw
 
     class FakeCounters:
