@@ -35,6 +35,7 @@ RUN_STDLIB=(
   contest_claim.py
   fix_diagnostic.py
   fork_authoring.py
+  github_failure_reason.py
   github_ratelimit.py
   host_agent_preflight.py
   ignore_quota_hardblock.py

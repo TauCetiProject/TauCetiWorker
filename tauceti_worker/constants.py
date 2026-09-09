@@ -156,9 +156,26 @@ GH_INROUND_WAIT = int(os.environ.get("TAUCETI_GH_INROUND_WAIT", "900"))  # cap o
 
 GH_SECONDARY_BASE = 60  # first secondary-limit sleep when no Retry-After is given (then exponential)
 
+# Transient GitHub failures: a 5xx from the API gateway, or a response that died mid-body. Distinct
+# from a rate limit — nothing is throttling us, the request simply did not survive. The survey's
+# opening `gh pr list` asks for statusCheckRollup over every open PR, which takes ~10s server-side and
+# is answered with an HTTP 504 often enough to abort whole rounds. A retry a few seconds later almost
+# always lands, so these get a short in-place retry (see gh_run) rather than costing a round.
+GH_TRANSIENT_TRIES = 3  # retries after a transient failure, then surface it
+
+GH_TRANSIENT_BASE = 5  # first transient-failure sleep, doubling per retry (5s, 10s, 20s)
+
 _GH_PRIMARY_RE = re.compile(r"(?:API )?rate limit exceeded|rate limit.*exceeded", re.I)
 
 _GH_SECONDARY_RE = re.compile(r"secondary rate limit|abuse detection", re.I)
+
+# Each of these is the transport or the server failing, never a verdict about our request: a 5xx, a
+# body that stopped arriving (gh reports the truncation as a JSON parse error), or a dropped
+# connection. Deliberately narrow — a 4xx is an answer, and retrying one just repeats it.
+_GH_TRANSIENT_RE = re.compile(
+    r"HTTP 5\d\d|unexpected end of JSON input|connection reset by peer|i/o timeout|TLS handshake timeout",
+    re.I,
+)
 
 
 # Claims / scoreboard cache.

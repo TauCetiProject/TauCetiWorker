@@ -11,14 +11,17 @@ import subprocess
 import time
 from pathlib import Path
 
-from .config import Die, log
+from .config import Die, log, one_line
 from .constants import (
     _GH_PRIMARY_RE,
     _GH_SECONDARY_RE,
+    _GH_TRANSIENT_RE,
     CLAIMS,
     CONTEST_CLAIM_EMOJI,
     GH_INROUND_WAIT,
     GH_SECONDARY_BASE,
+    GH_TRANSIENT_BASE,
+    GH_TRANSIENT_TRIES,
     TAUCETI,
 )
 
@@ -237,6 +240,42 @@ def _gh_rate_kind(text: str) -> str | None:
     return None
 
 
+_GH_READ_VERBS = frozenset({"list", "view", "status", "checks", "diff", "search"})
+
+
+def _gh_transient(text: str) -> bool:
+    """Whether a failed `gh` call reads as the transport or the server giving out, rather than as an
+    answer about our request (see _GH_TRANSIENT_RE)."""
+    return bool(_GH_TRANSIENT_RE.search(text))
+
+
+def _gh_read_only(argv: list[str]) -> bool:
+    """Whether this invocation only READS.
+
+    A transient failure is ambiguous in a way a rate limit is not: a rejected request certainly did not
+    run, but a 504 may mean GitHub applied the change and lost the response on the way back. Retrying a
+    read costs a duplicate query; retrying `issue create` or `api -X PATCH` costs a duplicate issue or a
+    change applied twice. So only reads are retried, decided from the command line rather than from a
+    flag each caller could forget to pass."""
+    args = [a for a in argv[1:] if a]  # drop the `gh` program name
+    if not args:
+        return False
+    if args[0] == "api":
+        # `gh api` is GET unless told otherwise, and a field/body argument makes it a POST implicitly.
+        rest = args[1:]
+        for i, a in enumerate(rest):
+            if a in ("-X", "--method"):
+                if i + 1 >= len(rest) or rest[i + 1].upper() != "GET":
+                    return False
+            elif a.startswith("--method="):
+                if a.split("=", 1)[1].upper() != "GET":
+                    return False
+            elif a in ("-f", "-F", "--field", "--raw-field", "--input"):
+                return False
+        return True
+    return len(args) > 1 and args[1] in _GH_READ_VERBS
+
+
 def github_budget() -> dict | None:
     """Per-bucket (remaining, reset_epoch) from GitHub's rate_limit endpoint, keyed 'core' and 'graphql'
     — the two buckets a round spends (REST and the progress-guard GraphQL query). That endpoint is itself
@@ -279,10 +318,14 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
     """Run a `gh` command, waiting out a SECONDARY GitHub rate limit IN PLACE and retrying so the limit
     costs a pause, not a discarded round (bounded by max_wait so it can't blow ROUND_TIMEOUT). A PRIMARY
     (hourly) limit is surfaced immediately — waiting an hour inside a round under the 90-min cap would
-    just be SIGKILLed; the loop preflight waits that reset out instead. Any non-rate-limit failure is
-    returned unchanged for the caller to handle as before."""
+    just be SIGKILLed; the loop preflight waits that reset out instead.
+
+    A TRANSIENT failure of a READ (a 5xx, a truncated body, a dropped connection) is retried a few
+    seconds later, up to GH_TRANSIENT_TRIES times. Any other failure is returned unchanged for the
+    caller to handle as before."""
     waited = 0
     attempt = 0
+    tries = 0
     while True:
         p = run(argv, cwd=cwd)
         if p.returncode == 0:
@@ -290,7 +333,16 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
         text = (p.stderr or "") + "\n" + (p.stdout or "")
         kind = _gh_rate_kind(text)
         if kind is None:
-            return p
+            if not (_gh_transient(text) and _gh_read_only(argv)) or tries >= GH_TRANSIENT_TRIES:
+                return p
+            nap = GH_TRANSIENT_BASE << tries
+            if waited + nap > max_wait:
+                return p
+            log(f"gh: {one_line(text, 120)} — transient, retrying in {nap}s ({' '.join(argv[1:3])})")
+            time.sleep(nap)
+            waited += nap
+            tries += 1
+            continue
         if kind == "primary":
             log(
                 "gh: primary rate limit — surfacing so the round backs off and the loop preflight "

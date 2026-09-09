@@ -22,6 +22,9 @@ import tauceti_worker as tc
 
 PRIMARY = "HTTP 403: API rate limit exceeded for user ID 477956"
 SECONDARY = "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
+GATEWAY = "HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)"
+TRUNCATED = "unexpected end of JSON input"
+PR_LIST = ["gh", "pr", "list", "--repo", "owner/repo", "--json", "number,statusCheckRollup"]
 
 fails = 0
 
@@ -92,6 +95,49 @@ def main() -> int:
     check("primary surfaces the error", p.returncode, 1)
     check("primary did not sleep", slept, [])
     check("primary made one call", len(fr.calls), 1)
+
+    # A transient failure of a READ is retried in place. The survey's opening `gh pr list` asks for
+    # statusCheckRollup over every open PR, which GitHub's GraphQL gateway answers with a 504 often
+    # enough to abort rounds that a retry seconds later would have completed.
+    check("classify 504 as transient", tc._gh_transient(GATEWAY), True)
+    check("classify a truncated body as transient", tc._gh_transient(TRUNCATED), True)
+    check("a 404 is an answer, not a transient failure", tc._gh_transient("HTTP 404: Not Found"), False)
+    check("a rate limit is not a transient failure", tc._gh_transient(SECONDARY), False)
+
+    fr, slept = with_stubs([(1, GATEWAY), (0, "")])
+    p = tc.gh_run(PR_LIST)
+    check("504 on a read retries to success", p.returncode, 0)
+    check("504 waited once, briefly", slept, [tc.GH_TRANSIENT_BASE])
+    check("504 made two gh calls", len(fr.calls), 2)
+
+    fr, slept = with_stubs([(1, TRUNCATED), (0, "")])
+    check("a truncated body retries too", tc.gh_run(PR_LIST).returncode, 0)
+    check("truncated body waited once", slept, [tc.GH_TRANSIENT_BASE])
+
+    # Retries are bounded: the failure surfaces once the allowance is spent, and the round backs off.
+    fr, slept = with_stubs([(1, GATEWAY)] * (tc.GH_TRANSIENT_TRIES + 1))
+    p = tc.gh_run(PR_LIST)
+    check("a persistent 504 surfaces the error", p.returncode, 1)
+    check("a persistent 504 backs off geometrically", slept, [5, 10, 20])
+    check("a persistent 504 stops at the try limit", len(fr.calls), tc.GH_TRANSIENT_TRIES + 1)
+
+    # A WRITE is never retried on a transient failure: a 504 may mean GitHub applied the change and
+    # lost the response, so a second attempt risks a duplicate issue, comment or reaction.
+    for name, argv in (
+        ("issue create", ["gh", "issue", "create", "--title", "t", "--body", "b"]),
+        ("api -X DELETE", ["gh", "api", "-X", "DELETE", "/repos/o/r/pulls/comments/1/reactions/2"]),
+        ("api --method=PATCH", ["gh", "api", "--method=PATCH", "/user/repository_invitations/3"]),
+        ("api with a field", ["gh", "api", "/repos/o/r/issues", "-f", "title=t"]),
+        ("repo fork", ["gh", "repo", "fork", "owner/repo", "--clone=false"]),
+    ):
+        fr, slept = with_stubs([(1, GATEWAY), (0, "")])
+        p = tc.gh_run(argv)
+        check(f"504 on `{name}` is not retried", (p.returncode, len(fr.calls), slept), (1, 1, []))
+
+    # The wait budget bounds transient retries as it bounds rate-limit ones.
+    fr, slept = with_stubs([(1, GATEWAY), (0, "")])
+    p = tc.gh_run(PR_LIST, max_wait=1)
+    check("504 over the wait budget surfaces the error", (p.returncode, slept), (1, []))
 
     # github_budget parses the rate_limit JSON object into per-bucket tuples (restore the real fn).
     tc.github.github_budget = orig_budget
