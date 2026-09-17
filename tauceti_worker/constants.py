@@ -199,6 +199,16 @@ CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every
 
 SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached scoreboard meta stays fresh
 
+# How long a cached comment read may be served on the strength of the PR's `updatedAt` alone (see
+# ReviewState.observe). Nothing about a PR's comments can change without GitHub bumping that clock —
+# measured over 179 in-place scoreboard edits, none landed newer than their PR's `updatedAt` — with the
+# one exception it cannot express: a DELETED comment leaves no timestamp behind. This backstop is the
+# bound on that blind spot, so a deleted or forged scoreboard is refetched within half an hour even
+# though nothing announced it. Deliberately not "until the next reset": a heuristic we cannot verify
+# gets a ceiling. A read served under this rule is `assumed`, never `fresh`, and cannot authorize a
+# mutation; see dispatch()'s revalidation of the one PR a round acts on.
+SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
+
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
 # (scoreboard meta + in-flight marker share one read); << the round/dashboard cadence

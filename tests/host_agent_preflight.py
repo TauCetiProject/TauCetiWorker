@@ -98,6 +98,9 @@ try:
     # 1) host + binary MISSING -> pause as NoProgress, do NOT run the stage (no per-PR counter bump).
     wu._bubble = lambda stage, o: False
     wu.shutil.which = lambda name: None
+    # The pre-launch re-read of the candidate is a separate concern (see dispatch_revalidation); these
+    # cases pass no Worker at all because the PATH check is what they are about.
+    wu._still_actionable = lambda *a: True
     reset()
     raised, msg = False, ""
     try:

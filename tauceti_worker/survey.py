@@ -117,6 +117,10 @@ class PRInfo:
     # with the head's new status. None when no `build` status carries a readable timestamp. Read off
     # the rollup we already fetch, so it costs no extra GitHub call.
     build_status_at: int | None = None
+    # GitHub's own clock on the PR, carried so ReviewState can tell whether anything about it has
+    # changed since it last read its comments (see ReviewState.observe). Free in the query we already
+    # make; "" when unknown, which reads as "cannot tell" and falls back to the plain TTL.
+    updated_at: str = ""
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -151,6 +155,7 @@ class PRInfo:
             build_failed=any(s in BUILD_FAIL for s in build_states),
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
+            updated_at=str(d.get("updatedAt") or ""),
         )
 
 
@@ -428,14 +433,20 @@ def fix_disposition(
     fetches the meta + predicate, this decides the disposition and phrases the reason.
     """
     lh = str(meta.data.get("head_sha") or "")
+    if lh != head and not build_success:
+        return ("skip", "")  # red build: fix-ci/bump greens it before a review can land — not fix's
+    # A failed live fetch — whether or not a stale cache backs it — means we can't trust head_sha to
+    # tell "head moved" from "couldn't refresh", so don't assert either; say so and let a later round
+    # retry. This check used to sit inside the head-moved branch alone, which left the more dangerous
+    # case uncovered: a stale scoreboard whose head HAPPENS to match the current one sailed straight
+    # through to 'actionable' and scheduled a fixer off review state nobody had been able to confirm.
+    # `assumed` is deliberately not refused here. It is the normal state of a warm cache, and refusing
+    # it would park every fix candidate until the backstop expired; what protects the spend is that
+    # dispatch() re-reads this PR live before acting on it.
+    if meta.provenance in ("fetch_failed", "stale"):
+        return ("waiting", "could not read current review state (GitHub fetch failed) — will retry next round")
     if lh != head:
         # No (current) review verdict stands at the head.
-        if not build_success:
-            return ("skip", "")  # red build: fix-ci/bump greens it before a review can land — not fix's
-        # A failed live fetch — whether or not a stale cache backs it — means we can't trust head_sha to
-        # tell "head moved" from "couldn't refresh", so don't assert either; say so and let a later round retry.
-        if meta.provenance in ("fetch_failed", "stale"):
-            return ("waiting", "could not read current review state (GitHub fetch failed) — will retry next round")
         if lh:
             return ("waiting", f"reviewed at {lh[:12]}; head moved to {head[:12]} — awaiting re-review")
         return ("waiting", "build-green, awaiting first review (no scoreboard at this head yet)")
@@ -574,6 +585,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         return sv
     prs = [PRInfo.from_json(d) for d in raw]
     sv.open_prs = prs
+    # Hand ReviewState this pass's clocks BEFORE any per-PR read below: they are what let it skip the
+    # comment fetch for a PR that has not moved since the last round looked at it. A shallow survey
+    # reads no review state at all and its callers need not supply one.
+    if rs is not None:
+        rs.observe(prs)
     nondraft = [p for p in prs if not p.is_draft]
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
