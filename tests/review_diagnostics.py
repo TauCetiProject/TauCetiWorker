@@ -76,9 +76,32 @@ with tempfile.TemporaryDirectory() as raw:
         "GitHub failure is distinguished from provider quota", value["attempts"][-1]["category"], "checkout-or-network"
     )
     check("GitHub diagnosis is publishable", "GitHub API rate limit" in public_review_failure(value), True)
-    log.write_text("Not logged in\n" + "ordinary output\n" * 20000 + "fatal: connection reset\ncleanup\n")
+    log.write_text(
+        "OSError: Argument list too long\n" + "ordinary output\n" * 20000 + "fatal: connection reset\ncleanup\n"
+    )
     check("bounded tail excludes ancient errors", failure_summary(log), "fatal: connection reset")
     check("missing log preserves reason", failure_summary(state / "missing", "Not logged in"), "Not logged in")
+
+    generic = "tauceti-review: command failed (1): python runner/review.py"
+    for prefix in (
+        "$ git clone -q https://github.com/TauCetiProject/TauCeti /tmp/code\n",
+        "git clone completed successfully\n",
+        "[correctness]   ! Request timed out\n",
+        "=" * 72 + "\nThe model is not available and github has a rate limit\n" + "=" * 72 + "\n",
+        "gh: API rate limit exceeded\n$ python runner/post.py\n",
+    ):
+        log.write_text(prefix + generic + "\n")
+        check("non-terminal output is not the diagnosis", failure_summary(log), generic)
+    for error, detail in (
+        ("gh: Resource not accessible by integration (HTTP 403)", "lack of permission"),
+        ("Error: unknown model", "reviewer model is unavailable"),
+        ("OSError: No space left on device", "disk space"),
+        ("subprocess.TimeoutExpired: command exceeded limit", "timed out"),
+        ("OSError: Argument list too long: " + "x" * 1000, "OS argument limit"),
+    ):
+        log.write_text(error + "\n" + generic + "\ncleanup\n")
+        value = record_review_failure(state, worker="w", pr=43, head="a" * 40, provider="codex", code=1, log_file=log)
+        check("specific failure survives wrapper and truncation", detail in public_review_failure(value), True)
 
     # Exercise the actual subprocess path, not just the extraction helper.
     reports = []

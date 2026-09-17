@@ -53,7 +53,7 @@ _FAILURE_DETAILS = (
         "github-rate-limit",
         "checkout-or-network",
         "GitHub API rate limit prevented review",
-        re.compile(r"(?:gh:|github).*rate limit|API rate limit exceeded", re.I),
+        re.compile(r"^gh:.*rate limit|API rate limit exceeded", re.I),
     ),
     (
         "github-permission",
@@ -69,7 +69,7 @@ _FAILURE_DETAILS = (
         "model-unavailable",
         "provider-unavailable",
         "the selected reviewer model is unavailable",
-        re.compile(r"model.*(?:not supported|not available|do not have access)|unknown model", re.I),
+        re.compile(r"model.{0,120}(?:not supported|not available|do not have access)|unknown model", re.I),
     ),
     (
         "disk-full",
@@ -81,7 +81,7 @@ _FAILURE_DETAILS = (
         "timeout",
         "checkout-or-network",
         "a review operation timed out",
-        re.compile(r"TimeoutExpired|timed out|deadline exceeded", re.I),
+        re.compile(r"TimeoutExpired|Request timed out|deadline exceeded", re.I),
     ),
 )
 _LOG_TAIL_BYTES = 128 * 1024
@@ -161,24 +161,58 @@ def failure_summary(log_file: Path | None, reason: str = "") -> str:
                 lines = stream.read(_LOG_TAIL_BYTES).decode("utf-8", "replace").splitlines()
         except OSError:
             pass
-    lines.append(reason)
+    # Command echoes delimit subprocess phases; they are not failures. The CLI
+    # also prints model-written scoreboard/thread bodies between these separators.
+    # Never classify that prose, or a recoverable per-rubric stderr diagnostic, as
+    # the cause of a later command failure.
+    candidates = []
+    in_review_text = False
+    for raw in lines:
+        line = _ANSI_RE.sub("", raw).strip()
+        if line == "=" * 72:
+            candidates.clear()
+            in_review_text = not in_review_text
+            continue
+        if in_review_text:
+            continue
+        if line.startswith("$ ") or line.startswith("=== running review"):
+            candidates.clear()
+            continue
+        if re.match(r"^\[[^]]+\]", line):
+            continue
+        if line:
+            candidates.append(line)
+    if reason.strip():
+        candidates.append(_ANSI_RE.sub("", reason).strip())
 
     def rank(line):
         if any(p.search(line) for _, _, _, p in _FAILURE_DETAILS):
             return 3
         category = classify_failure(line)
         if category not in ("review-command", "review-engine"):
+            # A command name alone (e.g. a clone progress message) is not evidence
+            # that the operation failed.
+            if category == "checkout-or-network" and not re.search(
+                r"error|fatal:|failed|could not resolve host|connection reset", line, re.I
+            ):
+                return 0
             return 2
         if category == "review-engine" or re.search(r"\b\w+(?:Error|Exception):|^fatal:", line):
             return 1
         return 0
 
     # Strip ANSI before classifying, but truncate only AFTER selecting the diagnostic.
-    candidates = [_ANSI_RE.sub("", line).strip() for line in lines if line.strip()]
     if not candidates:
         return ""
     _, chosen = max(enumerate(candidates), key=lambda pair: (rank(pair[1]), pair[0]))
-    return sanitize_failure(chosen)
+    summary = sanitize_failure(chosen)
+    for _, _, _, pattern in _FAILURE_DETAILS:
+        match = pattern.search(chosen)
+        if match and not pattern.search(summary):
+            # A long filename/command after the error must not truncate away the
+            # very signature that made this line useful.
+            return sanitize_failure(chosen[: match.end()])
+    return summary
 
 
 def _path(state: Path, pr: int) -> Path:
