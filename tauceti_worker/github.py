@@ -27,6 +27,7 @@ from .constants import (
     OPEN_PR_PAGE,
     TAUCETI,
 )
+from .review_diagnostics import public_diagnostic_quality
 
 
 @functools.lru_cache(maxsize=1)
@@ -562,12 +563,12 @@ class GitHub:
             if matches:
                 issue = matches[0]
                 existing_body = issue.get("body") if isinstance(issue.get("body"), str) else ""
-                # The issue is fleet-wide but retained diagnostics are per-worker. Once any worker
-                # has supplied an allow-listed diagnostic, do not let peers continually overwrite
-                # it with their own attempt or a generic bubble failure. We still upgrade an older
-                # issue that has no public diagnostic at all.
+                # Keep equally useful peer reports stable, but let an actual diagnosis
+                # replace "review command failed". The comparison uses fixed public
+                # categories only; raw subprocess output never crosses this boundary.
                 has_public_diagnostic = "Latest allow-listed worker diagnostics:" in existing_body
-                if existing_body != body and not has_public_diagnostic:
+                better = public_diagnostic_quality(body) > public_diagnostic_quality(existing_body)
+                if existing_body != body and (not has_public_diagnostic or better):
                     self._gh(
                         [
                             "issue",
