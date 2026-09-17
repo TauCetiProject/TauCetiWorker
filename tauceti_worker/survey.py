@@ -592,14 +592,23 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     # total with the subset this identity authored, for the per-round "open PRs" line.
     sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login)
 
-    # 1) rebase: tended (ours or bot-authored), CONFLICTING, under the per-PR rebase-attempt budget.
+    # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
+    #    this exact head, under the existing per-PR rebase-attempt budget.
     #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
     #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
     #    is rebased until it merges or CI retires it.
     for p in tended:
-        if p.mergeable != "CONFLICTING":
+        labels = {label.lower() for label in p.labels}
+        if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
             continue
-        c = Candidate(p.number, p.head_oid, "conflicting")
+        reason = "conflicting"
+        if p.mergeable != "CONFLICTING":
+            if "needs-rebase" not in labels:
+                continue
+            if not gh.rebase_requested(p.number, p.head_oid):
+                continue
+            reason = "merge-sweep requested branch reconciliation"
+        c = Candidate(p.number, p.head_oid, reason)
         c.attempts = counters.read(f"rebase-pr-{p.number}")
         c.budget = MAX_REBASE_ATTEMPTS
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)

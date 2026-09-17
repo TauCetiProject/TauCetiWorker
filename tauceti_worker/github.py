@@ -585,6 +585,34 @@ class GitHub:
         except Exception:
             pass
 
+    def rebase_requested(self, pr: int, head: str) -> bool:
+        """A trusted sweep handoff for this exact head; stale requests spend no attempts."""
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            return False
+        p = self._gh(
+            [
+                "api",
+                "--paginate",
+                f"/repos/{self.repo}/issues/{pr}/comments?per_page=100",
+                "--jq",
+                ".[] | {body, author: .user.login}",
+            ]
+        )
+        if p.returncode != 0:
+            return False
+        try:
+            comments = [json.loads(line) for line in (p.stdout or "").splitlines() if line.strip()]
+        except (ValueError, TypeError):
+            return False
+        return any(
+            isinstance(c, dict)
+            and c.get("author") == "tauceti-review-bot[bot]"
+            and isinstance(c.get("body"), str)
+            and c["body"].startswith("Merge-queue recovery for head `")
+            and f"<!--tauceti-rebase:v1 {head}-->" in (c.get("body") or "").splitlines()
+            for c in comments
+        )
+
     def issue_comments(self, pr: int) -> list[dict] | None:
         """All issue comments for a PR (paginated). None on fetch failure (distinct from empty)."""
         p = self._gh(["api", "--paginate", f"/repos/{self.repo}/issues/{pr}/comments?per_page=100"])

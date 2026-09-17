@@ -95,7 +95,7 @@ A round does exactly one unit of work: the first of these that applies.
 
 | Step | What it does |
 |------|--------------|
-| **Rebase** | Resolve one of our conflicting PRs — a genuine content conflict under `TauCeti/` after a sibling merged first (the root `TauCeti.lean` is auto-synced on `main`, so it no longer collides). |
+| **Rebase** | Reconcile one of our conflicting PRs, or a fork update requested by the merge sweep for the current head. Both use the existing per-PR rebase-attempt cap; `keep` pauses recovery. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
 | **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
