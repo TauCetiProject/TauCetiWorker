@@ -7,14 +7,14 @@ You are reconciling the branch with current main on pull request #__PR__ of TauC
   git merge origin/main      # (or: git rebase origin/main — either is fine; merge is simpler to resolve)
   ```
 - Resolve every conflict on its merits:
-  - **`TauCeti.lean` (the generated root module)**: preserve `main`'s generated version; do not hand-reconstruct it.
+  - **`TauCeti.lean` (the intentionally empty root module)**: preserve `main`'s version; do not add imports or reconstruct it.
   - **A source file under `TauCeti/`**: resolve so both the upstream change and your PR's intent are preserved. If `main` now provides something your PR duplicated, prefer the upstream version and drop the duplicate.
 - Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
 
 If the branch already includes current `main` and no concrete repair is needed, report that no update is needed and stop. Do not manufacture a commit or push an empty change just to satisfy the submission instructions.
 
 ## Rules of the repo (hard constraints)
-- Code goes under `TauCeti/`. Do NOT hand-edit the root `TauCeti.lean` — it is auto-managed (see above). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
+- Code goes under `TauCeti/`. Do NOT hand-edit the root `TauCeti.lean` — it stays intentionally empty (see above). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
 - Everything under `namespace TauCeti`.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, say so in your report and stop.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
