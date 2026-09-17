@@ -103,6 +103,51 @@ with tempfile.TemporaryDirectory() as raw:
         value = record_review_failure(state, worker="w", pr=43, head="a" * 40, provider="codex", code=1, log_file=log)
         check("specific failure survives wrapper and truncation", detail in public_review_failure(value), True)
 
+    # Redirected stdout is buffered: post.py's stderr lands inside the scoreboard
+    # dump, whose remaining prose flushes only after the terminal CLI diagnostic.
+    log.write_text(
+        "=" * 72 + "\nReview prose: unknown model\n"
+        "$ python runner/post.py\n"
+        "gh: Resource not accessible by integration (HTTP 403)\n"
+        "tauceti-review: command failed (1): python runner/post.py\n"
+        "More prose: No space left on device\n" + "=" * 72 + "\n"
+    )
+    value = record_review_failure(state, worker="w", pr=44, head="a" * 40, provider="codex", code=1, log_file=log)
+    check(
+        "interleaved post failure retains permission diagnosis",
+        "lack of permission" in public_review_failure(value),
+        True,
+    )
+    for error in (
+        "review-root lookup failed: GitHub rejected the request (HTTP 403)",
+        "gh api POST /repos/o/r/pulls/1/comments FAILED: gh: Validation Failed (HTTP 422)",
+    ):
+        log.write_text("=" * 72 + "\nprose\n$ python runner/post.py\n" + error + "\n" + generic + "\n" + "=" * 72)
+        value = record_review_failure(state, worker="w", pr=46, head="a" * 40, provider="codex", code=1, log_file=log)
+        check(
+            "post-layer HTTP failures retain their category", value["attempts"][-1]["category"], "checkout-or-network"
+        )
+    log.write_text("=" * 72 + "\nunknown model\ntauceti-review: review step wrote no post plan\n" + "=" * 72)
+    check(
+        "missing post plan excludes buffered prose",
+        failure_summary(log),
+        "tauceti-review: review step wrote no post plan",
+    )
+    value = record_review_failure(
+        state,
+        worker="w",
+        pr=45,
+        head="a" * 40,
+        provider="codex",
+        code=1,
+        reason="review #45 exited with status 1: gh: You have exceeded a secondary rate limit",
+    )
+    check(
+        "bubble reason retains GitHub rate-limit diagnosis",
+        "GitHub API rate limit" in public_review_failure(value),
+        True,
+    )
+
     # Exercise the actual subprocess path, not just the extraction helper.
     reports = []
     original_report = agents.report_failure

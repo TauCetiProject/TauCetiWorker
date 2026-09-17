@@ -53,7 +53,7 @@ _FAILURE_DETAILS = (
         "github-rate-limit",
         "checkout-or-network",
         "GitHub API rate limit prevented review",
-        re.compile(r"^gh:.*rate limit|API rate limit exceeded", re.I),
+        re.compile(r"(?:^|:\s)gh:.*rate limit|API rate limit exceeded", re.I),
     ),
     (
         "github-permission",
@@ -109,6 +109,8 @@ def classify_failure(summary: str) -> str:
     for _, category, _, pattern in _FAILURE_DETAILS:
         if pattern.search(summary):
             return category
+    if re.search(r"(?:review-root lookup failed:|gh api .+ FAILED:).*HTTP \d{3}", summary):
+        return "checkout-or-network"
     if any(s in low for s in ("not logged in", "run /login", "authentication", "credential")):
         return "reviewer-auth"
     if any(s in low for s in ("not found on path", "no such file or directory", "command not found")):
@@ -169,14 +171,21 @@ def failure_summary(log_file: Path | None, reason: str = "") -> str:
     in_review_text = False
     for raw in lines:
         line = _ANSI_RE.sub("", raw).strip()
+        # stdout (review prose) can flush around stderr (the command and its
+        # error). A new subprocess echo ends the prose phase, and die() is the
+        # parent's final stderr write: anything later is buffered review text.
+        if line.startswith("tauceti-review:"):
+            candidates.append(line)
+            break
+        if line.startswith("$ ") or line.startswith("=== running review"):
+            candidates.clear()
+            in_review_text = False
+            continue
         if line == "=" * 72:
             candidates.clear()
             in_review_text = not in_review_text
             continue
         if in_review_text:
-            continue
-        if line.startswith("$ ") or line.startswith("=== running review"):
-            candidates.clear()
             continue
         if re.match(r"^\[[^]]+\]", line):
             continue
