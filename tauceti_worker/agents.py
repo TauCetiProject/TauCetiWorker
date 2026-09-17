@@ -46,6 +46,7 @@ from .quota import (
     codex_dir,
     mirror_creds,
 )
+from .review_diagnostics import failure_summary
 from .runtime_status import report_failure
 from .transcript import AgentTranscriptRenderer
 from .usage import UsageError, kiro_data_dir, kiro_process_env, snapshot_kiro_auth_db
@@ -851,7 +852,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
                 log("    " + line)
         except OSError:
             pass
-        summary = next((line.strip() for line in reversed(tail) if line.strip()), "")
+        summary = failure_summary(logf)
         reason = f"{label} exited with status {rc}"
         if summary:
             reason += f": {summary}"
