@@ -88,6 +88,7 @@ from .survey import (
     Counters,
     Survey,
     bust_progress_cache,
+    fix_disposition,
     prioritize_review_candidates,
     progress_argv,
     spread_candidates,
@@ -612,6 +613,96 @@ def raise_on_account_mismatch(cfg: Config, account: str | None, work_model: str,
         raise Die(f"{where}: {problem}")
 
 
+def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
+    """Re-read THIS PR's review state live and confirm the candidate the survey chose still stands.
+
+    The survey triages on cached comment reads keyed to each PR's `updatedAt` (see
+    ReviewState.observe), which is what keeps a round's cost proportional to what CHANGED rather than
+    to how many PRs are open. That key is a strong signal but not a promise: a deleted scoreboard or a
+    deleted in-progress marker moves nothing, so a cached answer can be wrong in a way nothing
+    announces. A round spends on exactly ONE candidate, so this re-reads that one from GitHub, where
+    the cost is a couple of calls rather than one per open PR.
+
+    Declining returns None from dispatch, which is the cascade's existing "offered but not taken, try
+    the next candidate" path — the same one a peer's branch claim and progress's fresh re-check use.
+
+    Only the stages whose actionability comes from REVIEW state need this: rebase reads `mergeable`,
+    fix-ci and bump read the build, and roadmap/progress have no PR to re-read.
+
+    Every read here is FORCED past the cache rather than arranged by busting it first. Busting and then
+    reading normally looks equivalent and is not: the cache directory is shared with `status` and the
+    dashboard, either of which can republish an entitled record in the gap, and the read would come
+    back `assumed` from a fetch that happened before whatever prompted this re-check."""
+    if stage not in ("review", "fix"):
+        return True
+    # The head the survey saw. A contributor pushing since then makes every verdict below describe a
+    # commit that is no longer there, and _do_fixlike would check the NEW head out and work on it.
+    live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state"])
+    if live is None:
+        log(f"  {stage} #{c.pr}: could not re-read the PR before launching — leaving it for a later round")
+        return False
+    if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
+        log(f"  {stage} #{c.pr}: moved on since the survey (head, draft or closed) — skipping")
+        return False
+    meta = w.rs.gh_meta(c.pr, force=True)
+    if meta.provenance in ("stale", "fetch_failed"):
+        log(f"  {stage} #{c.pr}: could not re-read review state before launching — leaving it for a later round")
+        return False
+    if stage == "fix":
+        p = next((x for x in sv.open_prs if x.number == c.pr), None)
+        if p is None:
+            return False
+        blocking = w.rs.ledger_blocking(c.pr, c.head)  # reads the meta just forced above
+        # Mirror the survey's own pending-contest test (survey.py, the fix section): a contest reply
+        # that landed after the survey means the scoreboard is about to be re-adjudicated, and sending
+        # a fixer at the identical finding would just burn the per-head budget.
+        pending_contest = False
+        if blocking and str(meta.data.get("head_sha") or "") == c.head:
+            reply = w.rs.newest_contest_reply(c.pr, force=True)
+            through = meta.data.get("replies_through")
+            through = through if isinstance(through, int) else 0
+            pending_contest = bool(reply and reply["id"] > through)
+        disp, why = fix_disposition(
+            meta,
+            c.head,
+            p.build_success,
+            blocking,
+            w.counters.read(f"fix-{c.pr}-{c.head[:12]}"),
+            pending_contest=pending_contest,
+        )
+        if disp != "actionable":
+            log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
+            return False
+        return True
+    held = w.rs.inflight_review(c.pr, c.head, force=True)
+    if held:
+        # Closer to launch than the survey's read was, so this de-contends BETTER than before: the
+        # window in which a peer can claim the head without us noticing is now the launch itself.
+        log(f"  review #{c.pr}: a peer reviewer ({','.join(sorted(held))}) holds this head — skipping")
+        return False
+    if c.contest:
+        reply = w.rs.newest_contest_reply(c.pr, force=True)
+        if not reply or reply.get("id") != c.contest_reply_id:
+            log(f"  review #{c.pr}: the contested reply is gone on a fresh read — skipping")
+            return False
+        # The same two tests the survey made, against state that has moved since it made them: a peer's
+        # review may have adjudicated this reply already (its watermark passes the reply id), and a
+        # peer's 👀 claim may have landed on it after the survey looked.
+        through = meta.data.get("replies_through")
+        if isinstance(through, int) and reply["id"] <= through:
+            log(f"  review #{c.pr}: this contest was adjudicated since the survey — skipping")
+            return False
+        age = w.gh.fresh_claim_age(c.contest_reply_id)
+        if age is not None and age < CONTEST_CLAIM_TTL:
+            log(f"  review #{c.pr}: a peer claimed this contest {age}s ago — skipping")
+            return False
+        return True
+    if w.rs.ledger_clean_head(c.pr) == c.head:
+        log(f"  review #{c.pr}: this head was reviewed since the survey read it — skipping")
+        return False
+    return True
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
     (caller tries the next candidate). Dry-run logs the intent and returns 0."""
@@ -658,6 +749,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # credentials at the top of every round, so a rotation since preflight is visible by now.
     if getattr(opts, "account", None):
         raise_on_account_mismatch(w.cfg, opts.account, opts.work_model, stage)
+    # Last free check before anything that spends — the entitlement probe and the Claude bootstrap
+    # below both cost a provider request. Everything above this line is local (a binary on PATH, the
+    # configured account), so it stays ahead of a network read that only matters if we get this far.
+    if not _still_actionable(stage, w, sv, c):
+        return None
     if needs_codex_probe:
         # Resolve Sol/Terra before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.

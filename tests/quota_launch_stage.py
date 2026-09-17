@@ -169,6 +169,7 @@ def stub_authorize(_self):
 
 ran = []
 tc.work_units._host_agent_binary = lambda stage, model: None  # the binary preflight is not what's under test
+tc.work_units._still_actionable = lambda *a: True  # nor is the pre-launch re-read (see review_state_freshness)
 tc.work_units.do_review = lambda *a, **k: ran.append("review") or 0
 tc.quota.Quota.authorize_claude_launch = stub_authorize
 
