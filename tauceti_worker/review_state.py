@@ -102,7 +102,9 @@ class ReviewState:
         payload = {**payload, "updated_at": self._observed.get(pr, ""), "fetched_at": time.time()}
         try:
             self.sbcache.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
+            # Per-process temp name: `status`, the dashboard and a round can share a worker id, and a
+            # single shared temp path would let two of them interleave into it before the replace.
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
             tmp.write_text(json.dumps(payload) + "\n")
             os.replace(tmp, path)
         except OSError:
@@ -163,8 +165,13 @@ class ReviewState:
             # `assumed`, not `fresh` — and a recorded ABSENCE stays an absence: a cached `missing` must
             # not come back as a present-but-empty scoreboard, which reads as a real one to callers.
             if sc.get("status") == "present":
-                return Meta(self._load(cache), "assumed")
-            if sc.get("status") == "missing":
+                cached = self._load(cache)
+                if cached:
+                    return Meta(cached, "assumed")
+                # The key survived but the payload did not (a half-finished tidy-up, a torn write). An
+                # empty dict here would read to every caller as "no scoreboard at this head", which is a
+                # different answer from the one we recorded — so go and ask.
+            elif sc.get("status") == "missing":
                 return Meta({}, "missing")
         if not self._observed.get(pr) and cache.exists():
             # No clock to compare against (a caller outside a survey pass): the plain TTL, as before.

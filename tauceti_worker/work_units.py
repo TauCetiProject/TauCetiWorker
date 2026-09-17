@@ -639,12 +639,23 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
         p = next((x for x in sv.open_prs if x.number == c.pr), None)
         if p is None:
             return False
+        blocking = w.rs.ledger_blocking(c.pr, c.head)
+        # Mirror the survey's own pending-contest test (survey.py, the fix section): a contest reply
+        # that landed after the survey means the scoreboard is about to be re-adjudicated, and sending
+        # a fixer at the identical finding would just burn the per-head budget.
+        pending_contest = False
+        if blocking and str(meta.data.get("head_sha") or "") == c.head:
+            reply = w.rs.newest_contest_reply(c.pr)
+            through = meta.data.get("replies_through")
+            through = through if isinstance(through, int) else 0
+            pending_contest = bool(reply and reply["id"] > through)
         disp, why = fix_disposition(
             meta,
             c.head,
             p.build_success,
-            w.rs.ledger_blocking(c.pr, c.head),
+            blocking,
             w.counters.read(f"fix-{c.pr}-{c.head[:12]}"),
+            pending_contest=pending_contest,
         )
         if disp != "actionable":
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")

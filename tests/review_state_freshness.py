@@ -116,6 +116,22 @@ with tempfile.TemporaryDirectory() as tmp:
     (rs.sbcache / "1.key.json").write_text(json.dumps({**sc, "fetched_at": time.time() - tc.SBCACHE_BACKSTOP_S - 1}))
     check("...and the backstop expires it", (rs.gh_meta(1).data, rs.gh_meta(1).provenance), ({}, "missing"))
 
+# --- a key without its payload is not an answer ----------------------------------------------------
+# The two files can come apart (a half-finished tidy-up, a torn write). An empty meta served under a
+# "present" key would read to every caller as "no scoreboard at this head", which is a different answer
+# from the one that was recorded.
+with tempfile.TemporaryDirectory() as tmp:
+    gh = FakeGH(issue=[board("abc123")])
+    rs = state(gh, tmp)
+    rs.observe([pr()])
+    rs.gh_meta(1)
+    rs._comments.clear()
+    (rs.sbcache / "1.json").unlink()
+    recovered = rs.gh_meta(1)
+    check("a key whose payload vanished is re-read", (recovered.data.get("head_sha"), gh.n_issue), ("abc123", 2))
+    check("...and comes back live", recovered.provenance, "fresh")
+
+
 # --- absence is a real answer, and stays one -------------------------------------------------------
 with tempfile.TemporaryDirectory() as tmp:
     gh = FakeGH(issue=[{"body": "just a comment"}])
@@ -212,6 +228,20 @@ with tempfile.TemporaryDirectory() as tmp:
     # is not a live answer — so the FIRST read after a bust has to be `fresh`.
     check("the first read after bust is fresh, which is what may authorize work", after.provenance, "fresh")
     check("a repeat read in the same pass is assumed again", rs.gh_meta(1).provenance, "assumed")
+
+# --- two processes sharing a worker id must not share a temp file ----------------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    rs = state(FakeGH(issue=[]), tmp)
+    rs.sbcache.mkdir(parents=True, exist_ok=True)
+    rs._write_sidecar(rs.sbcache / "1.key.json", 1, {"status": "missing", "markers": []})
+    leftovers = [q.name for q in rs.sbcache.iterdir() if q.suffix == ".tmp"]
+    check("the temp file is not left behind", leftovers, [])
+    check(
+        "...and its name is per-process",
+        f".{__import__('os').getpid()}."
+        in str((rs.sbcache / "1.key.json").with_suffix(f".{__import__('os').getpid()}.tmp")),
+        True,
+    )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

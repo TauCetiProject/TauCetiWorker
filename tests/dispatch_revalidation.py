@@ -122,6 +122,26 @@ check(
     False,
 )
 
+# A contest that landed after the survey means this scoreboard is about to be re-adjudicated: sending a
+# fixer at the identical finding would only burn the per-head budget.
+check(
+    "a fix candidate contested since the survey is declined",
+    still(
+        "fix",
+        FakeRS(meta=tc.Meta({"head_sha": HEAD, "replies_through": 3}, "fresh"), contest={"id": 9, "rubric": "reuse"}),
+    ),
+    False,
+)
+check(
+    "a fix candidate whose contest was already adjudicated is taken",
+    still(
+        "fix",
+        FakeRS(meta=tc.Meta({"head_sha": HEAD, "replies_through": 9}, "fresh"), contest={"id": 9, "rubric": "reuse"}),
+    ),
+    True,
+)
+
+
 # --- a re-read we could not trust is never treated as confirmation --------------------------------
 for provenance in ("stale", "fetch_failed"):
     for stage in ("review", "fix"):
