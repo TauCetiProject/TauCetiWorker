@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,7 +64,16 @@ class ReviewState:
         left the open list must go back to being unobserved rather than keep an answer from a previous
         pass. An empty `updated_at` is not recorded — "no clock" has to read as "cannot tell", which
         falls back to the plain TTL, not as a key that might match another blank."""
-        self._observed = {p.number: p.updated_at for p in prs if getattr(p, "updated_at", "")}
+        seen = {p.number: p.updated_at for p in prs if getattr(p, "updated_at", "")}
+        # Drop memoized comments for any PR whose clock moved. The memo exists to coalesce the two
+        # readers inside ONE pass; carried across a change it would hand a stale response to the fetch
+        # that a moved clock just forced, and that response would then be written under the NEW key and
+        # entitled for the whole backstop — the one way a wrong answer could outlive the thing that
+        # should have corrected it.
+        for number, key in list(self._observed.items()):
+            if seen.get(number) != key:
+                self._comments.pop(number, None)
+        self._observed = seen
 
     def _cache_path(self, pr: int) -> Path:
         return self.sbcache / f"{pr}.json"
@@ -78,10 +88,12 @@ class ReviewState:
         """A sidecar that is still ENTITLED to answer for `pr`: same `updatedAt` as this pass observed,
         and inside the backstop. None when it cannot answer, whatever the reason.
 
-        The freshness key lives beside the payload rather than in it so `<pr>.json` keeps holding the
-        bare meta dict it always has — the stale-on-fetch-failure path and the operator's ability to
-        read the file are both worth more than a tidier format. Separate files per reader also keep two
-        processes sharing a worker id (a round and the dashboard) from clobbering each other's half."""
+        The record is SELF-CONTAINED: it carries the payload it is entitled to serve, not a pointer to
+        `<pr>.json`. Two files cannot be replaced as one, so a key paired with a payload written by a
+        different process at a different `updatedAt` would entitle data nobody ever read together.
+        `<pr>.json` still exists, written after, for the stale-on-fetch-failure path and for an operator
+        reading the cache by hand; nothing entitled is ever served out of it. Separate files per reader
+        keep two processes sharing a worker id (a round and the dashboard) off each other's half."""
         key = self._observed.get(pr)
         if not key:
             return None
@@ -102,29 +114,30 @@ class ReviewState:
         payload = {**payload, "updated_at": self._observed.get(pr, ""), "fetched_at": time.time()}
         try:
             self.sbcache.mkdir(parents=True, exist_ok=True)
-            # Per-process temp name: `status`, the dashboard and a round can share a worker id, and a
-            # single shared temp path would let two of them interleave into it before the replace.
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            # A temp name unique per WRITE, not per process: `status`, the dashboard and a round can
+            # share a worker id, and the dashboard refreshes on a background thread, so neither a
+            # shared path nor a per-pid one keeps two writers out of the same temp file.
+            tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             tmp.write_text(json.dumps(payload) + "\n")
             os.replace(tmp, path)
         except OSError:
             pass  # a cache we cannot write is a slow round, not a wrong one
 
-    def _issue_comments(self, pr: int) -> list[dict] | None:
+    def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
         """A PR's issue comments, memoized briefly so the two readers in one survey pass — the scoreboard
         meta and the in-flight review marker — share ONE fetch (a cold meta read plus a marker check
         would otherwise double-read the same paginated endpoint). The window is a few seconds: long
         enough to coalesce within a pass, far short of the round/dashboard cadence, so each pass still
         reads fresh markers (the loop-breaking guarantee). None (a fetch failure) is memoized too, so a
         blip isn't retried twice in one pass."""
-        hit = self._comments.get(pr)
+        hit = None if force else self._comments.get(pr)
         if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
             return hit[1]
         cs = self.gh.issue_comments(pr)
         self._comments[pr] = (time.time(), cs)
         return cs
 
-    def inflight_review(self, pr: int, head: str) -> set[str]:
+    def inflight_review(self, pr: int, head: str, *, force: bool = False) -> set[str]:
         """Providers holding this EXACT head via an unexpired in-progress marker — the engine's
         de-contention, read worker-side so a held head is skipped before the engine is launched. Shares
         the memoized comment fetch with gh_meta so the survey reads each PR's comments at most once.
@@ -135,13 +148,13 @@ class ReviewState:
         another change to the PR, which would read as held until the backstop; that is why dispatch()
         re-reads this live for the one candidate it is about to spend on, where it also lands closer to
         launch than a survey-time read does."""
-        sc = self._sidecar(self._key_path(pr), pr)
+        sc = None if force else self._sidecar(self._key_path(pr), pr)
         markers = sc.get("markers") if sc else None
         if isinstance(markers, list):
             return providers_from_markers(markers, head, int(time.time()))
-        return inflight_review_providers(self._issue_comments(pr), head, int(time.time()))
+        return inflight_review_providers(self._issue_comments(pr, force=force), head, int(time.time()))
 
-    def gh_meta(self, pr: int) -> Meta:
+    def gh_meta(self, pr: int, *, force: bool = False) -> Meta:
         """Newest scoreboard's <!--tauceti-meta:v1 {...}--> JSON, identified by the <!--tauceti-scoreboard-->
         marker, with TTL cache.
 
@@ -159,27 +172,25 @@ class ReviewState:
         worker briefly cached) can't be served as fresh past the TTL.
         """
         cache = self._cache_path(pr)
-        sc = self._sidecar(self._key_path(pr), pr)
+        sc = None if force else self._sidecar(self._key_path(pr), pr)
         if sc is not None:
             # The PR has not changed since this was read, so re-reading it would return the same answer.
             # `assumed`, not `fresh` — and a recorded ABSENCE stays an absence: a cached `missing` must
             # not come back as a present-but-empty scoreboard, which reads as a real one to callers.
-            if sc.get("status") == "present":
-                cached = self._load(cache)
-                if cached:
-                    return Meta(cached, "assumed")
-                # The key survived but the payload did not (a half-finished tidy-up, a torn write). An
-                # empty dict here would read to every caller as "no scoreboard at this head", which is a
-                # different answer from the one we recorded — so go and ask.
-            elif sc.get("status") == "missing":
+            if sc.get("status") == "present" and isinstance(sc.get("meta"), dict):
+                return Meta(sc["meta"], "assumed")
+            if sc.get("status") == "missing":
                 return Meta({}, "missing")
-        if not self._observed.get(pr) and cache.exists():
+        if not force and not self._observed.get(pr) and cache.exists():
             # No clock to compare against (a caller outside a survey pass): the plain TTL, as before.
+            # `assumed`, not `fresh` — it was not read from GitHub during this pass, and `fresh` is the
+            # word the mutating path trusts.
             age = time.time() - cache.stat().st_mtime
-            if age < SBCACHE_TTL:
-                return Meta(self._load(cache), "fresh")
+            cached = self._load(cache)
+            if age < SBCACHE_TTL and cached is not None:
+                return Meta(cached, "assumed")
 
-        comments = self._issue_comments(pr)
+        comments = self._issue_comments(pr, force=force)
         fetch_failed = comments is None
         data = None
         if comments:
@@ -209,24 +220,35 @@ class ReviewState:
         if data is None:
             # Serve a prior value ONLY on a fetch failure (transient); a successful fetch that parsed no
             # scoreboard means there genuinely isn't one now — don't keep serving a now-absent meta.
-            if fetch_failed and cache.exists():
-                return Meta(self._load(cache), "stale")
+            prior = self._load(cache) if fetch_failed else None
+            if prior is not None:
+                return Meta(prior, "stale")
             if not fetch_failed:
                 # A confirmed absence is worth caching: without it, every pass re-reads every PR that
-                # has no scoreboard yet, which is most of a healthy queue.
+                # has no scoreboard yet, which is most of a healthy queue. Drop the payload with it —
+                # left behind, the TTL path would keep serving a board we just confirmed is gone.
                 self._write_sidecar(self._key_path(pr), pr, {"status": "missing", "markers": distil_markers(comments)})
+                cache.unlink(missing_ok=True)
             return Meta({}, "fetch_failed" if fetch_failed else "missing")
-        self.sbcache.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(data) + "\n")
-        self._write_sidecar(self._key_path(pr), pr, {"status": "present", "markers": distil_markers(comments)})
+        self._write_sidecar(
+            self._key_path(pr), pr, {"status": "present", "meta": data, "markers": distil_markers(comments)}
+        )
+        try:  # the legacy copy: the stale-on-failure fallback reads it, nothing entitled does
+            self.sbcache.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(data) + "\n")
+        except OSError:
+            pass
         return Meta(data, "fresh")
 
     @staticmethod
-    def _load(cache: Path) -> dict:
+    def _load(cache: Path) -> dict | None:
+        """The cached meta, or None when there isn't a usable one. `{}` is a legitimate scoreboard (an
+        engine that posted a skeleton), so it must not double as the couldn't-read sentinel."""
         try:
-            return json.loads(cache.read_text() or "{}")
+            data = json.loads(cache.read_text() or "null")
         except (OSError, json.JSONDecodeError):
-            return {}
+            return None
+        return data if isinstance(data, dict) else None
 
     def bust(self, pr: int) -> None:
         """Forget everything about this PR: the meta, both sidecars, and the in-memory comment memo.
@@ -260,7 +282,7 @@ class ReviewState:
         base = counters.read(f"round-base-{pr}")
         return max(0, total - base)
 
-    def newest_contest_reply(self, pr: int):
+    def newest_contest_reply(self, pr: int, *, force: bool = False):
         """The newest author CONTEST reply on this PR's rubric threads, or None. A contest reply has
         its `in_reply_to_id` pointing at a thread root carrying a `<!--tauceti-rubric:NAME-->`
         marker. Our own comments are dropped by MARKER, never by author login: a contest answer
@@ -269,7 +291,7 @@ class ReviewState:
         the monotonic comment `id` (not the second-resolution timestamp, which can't separate two
         replies in one second). Its creation time is returned for review-affinity aging. Returns
         {'id', 'rubric', 'created_at'} of the newest such reply."""
-        sc = self._sidecar(self._contest_path(pr), pr)
+        sc = None if force else self._sidecar(self._contest_path(pr), pr)
         if sc is not None and "contest" in sc:
             return sc["contest"]
         rcs = self.gh.review_comments(pr)

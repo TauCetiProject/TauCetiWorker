@@ -41,12 +41,13 @@ class FakeRS:
     def __init__(self, *, meta=None, clean_head="", held=(), contest=None):
         self.meta = meta if meta is not None else tc.Meta({"head_sha": HEAD}, "fresh")
         self._clean_head, self._held, self._contest = clean_head, set(held), contest
-        self.busted = []
+        self.busted, self.forced = [], []
 
     def bust(self, pr):
         self.busted.append(pr)
 
-    def gh_meta(self, pr):
+    def gh_meta(self, pr, *, force=False):
+        self.forced.append(("meta", force))
         return self.meta
 
     def ledger_clean_head(self, pr):
@@ -55,15 +56,33 @@ class FakeRS:
     def ledger_blocking(self, pr, head):
         return True
 
-    def inflight_review(self, pr, head):
+    def inflight_review(self, pr, head, *, force=False):
+        self.forced.append(("markers", force))
         return set(self._held)
 
-    def newest_contest_reply(self, pr):
+    def newest_contest_reply(self, pr, *, force=False):
+        self.forced.append(("contest", force))
         return self._contest
 
 
-def worker(rs):
-    return SimpleNamespace(rs=rs, counters=SimpleNamespace(read=lambda key: 0), cfg=SimpleNamespace(wid="test"))
+class FakeGH:
+    """The PR itself as a live re-read sees it, plus the reaction claim on a contested reply."""
+
+    def __init__(self, *, head=None, state="OPEN", draft=False, view=True, claim_age=None):
+        self.view = {"headRefOid": head or HEAD, "isDraft": draft, "state": state} if view else None
+        self.claim_age = claim_age
+
+    def pr_view(self, pr, fields):
+        return self.view
+
+    def fresh_claim_age(self, comment_id):
+        return self.claim_age
+
+
+def worker(rs, gh=None):
+    return SimpleNamespace(
+        rs=rs, gh=gh or FakeGH(), counters=SimpleNamespace(read=lambda key: 0), cfg=SimpleNamespace(wid="test")
+    )
 
 
 def survey_with(pr=1, build_success=True):
@@ -85,14 +104,17 @@ def survey_with(pr=1, build_success=True):
     return sv
 
 
-def still(stage, rs, c=None, sv=None):
-    return wu._still_actionable(stage, worker(rs), sv or survey_with(), c or tc.Candidate(1, HEAD, ""))
+def still(stage, rs, c=None, sv=None, gh=None):
+    return wu._still_actionable(stage, worker(rs, gh), sv or survey_with(), c or tc.Candidate(1, HEAD, ""))
 
 
 # --- review ---------------------------------------------------------------------------------------
 rs = FakeRS()
 check("a review candidate that still stands is taken", still("review", rs), True)
-check("...after dropping its cached state", rs.busted, [1])
+# Forced past the cache rather than busted-then-read: the cache directory is shared with `status` and
+# the dashboard, either of which can republish an entitled record in the gap between the two.
+check("...having read every answer live", [f for _, f in rs.forced], [True] * len(rs.forced))
+check("...and without busting a cache other processes share", rs.busted, [])
 
 check("a head a peer now holds is declined", still("review", FakeRS(held=("codex",))), False)
 check("a head reviewed since the survey is declined", still("review", FakeRS(clean_head=HEAD)), False)
@@ -113,6 +135,53 @@ check(
     still("review", FakeRS(clean_head=HEAD, contest={"id": 9, "rubric": "reuse"}), contest_c),
     False,
 )
+# Two ways a peer can take the contest between the survey and the launch.
+check(
+    "a contest adjudicated by a peer since the survey is declined",
+    still(
+        "review",
+        FakeRS(
+            meta=tc.Meta({"head_sha": HEAD, "replies_through": 7}, "fresh"),
+            clean_head=HEAD,
+            contest={"id": 7, "rubric": "reuse"},
+        ),
+        contest_c,
+    ),
+    False,
+)
+check(
+    "a contest a peer has just claimed with an emoji is declined",
+    still(
+        "review",
+        FakeRS(clean_head=HEAD, contest={"id": 7, "rubric": "reuse"}),
+        contest_c,
+        gh=FakeGH(claim_age=5),
+    ),
+    False,
+)
+check(
+    "...but an expired claim does not block it",
+    still(
+        "review",
+        FakeRS(clean_head=HEAD, contest={"id": 7, "rubric": "reuse"}),
+        contest_c,
+        gh=FakeGH(claim_age=tc.CONTEST_CLAIM_TTL + 1),
+    ),
+    True,
+)
+
+# --- the PR itself, not just its review state -------------------------------------------------------
+# Every verdict below describes a commit. If the contributor pushed since the survey, the verdict is
+# about a commit that is no longer the head, and _do_fixlike would check the NEW one out and work on it.
+for label, gh in (
+    ("a head that moved since the survey", FakeGH(head="0" * 40)),
+    ("a PR closed since the survey", FakeGH(state="CLOSED")),
+    ("a PR turned draft since the survey", FakeGH(draft=True)),
+    ("a PR we could not re-read at all", FakeGH(view=False)),
+):
+    for stage in ("review", "fix"):
+        check(f"{label} declines the {stage} candidate", still(stage, FakeRS(), gh=gh), False)
+
 
 # --- fix ------------------------------------------------------------------------------------------
 check("a fix candidate still blocking at head is taken", still("fix", FakeRS()), True)

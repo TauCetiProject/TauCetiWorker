@@ -15,6 +15,7 @@ Exit 0 = all cases agree; 1 = a mismatch.
 """
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -126,10 +127,9 @@ with tempfile.TemporaryDirectory() as tmp:
     rs.observe([pr()])
     rs.gh_meta(1)
     rs._comments.clear()
-    (rs.sbcache / "1.json").unlink()
+    (rs.sbcache / "1.json").unlink()  # the legacy copy goes; the entitled record does not depend on it
     recovered = rs.gh_meta(1)
-    check("a key whose payload vanished is re-read", (recovered.data.get("head_sha"), gh.n_issue), ("abc123", 2))
-    check("...and comes back live", recovered.provenance, "fresh")
+    check("the entitled record carries its own payload", (recovered.data.get("head_sha"), gh.n_issue), ("abc123", 1))
 
 
 # --- absence is a real answer, and stays one -------------------------------------------------------
@@ -140,6 +140,53 @@ with tempfile.TemporaryDirectory() as tmp:
     check("no scoreboard reads as missing", (rs.gh_meta(1).data, rs.gh_meta(1).provenance), ({}, "missing"))
     rs._comments.clear()
     check("a cached absence is not re-read", (rs.gh_meta(1).provenance, gh.n_issue), ("missing", 1))
+
+# --- a moved clock must not be answered from a memo taken before it moved --------------------------
+# The 5s memo exists to let the meta and the marker reader share one fetch inside a pass. Carried
+# across a change of clock it would hand the stale response to the very fetch the change forced, and
+# that response would then be written under the NEW key and entitled for the whole backstop.
+with tempfile.TemporaryDirectory() as tmp:
+    gh = FakeGH(issue=[board("abc123")])
+    rs = state(gh, tmp)
+    rs.observe([pr()])
+    rs.gh_meta(1)
+    gh.issue = [board("def456")]
+    rs.observe([pr(updated_at="2026-09-17T02:00:00Z")])  # within the memo window, deliberately
+    moved = rs.gh_meta(1)
+    check("a moved clock evicts the memo", (moved.data.get("head_sha"), gh.n_issue), ("def456", 2))
+
+# --- a confirmed absence takes the payload with it -------------------------------------------------
+# Left behind, the unobserved TTL path would keep serving a board we just confirmed is gone.
+with tempfile.TemporaryDirectory() as tmp:
+    gh = FakeGH(issue=[board("abc123")])
+    rs = state(gh, tmp)
+    rs.observe([pr()])
+    rs.gh_meta(1)
+    check("the legacy payload is written for the stale path", (rs.sbcache / "1.json").exists(), True)
+    gh.issue = []  # the board is gone, and this time we can see that it is
+    rs.observe([pr(updated_at="2026-09-17T02:00:00Z")])
+    rs._comments.clear()
+    check("a confirmed absence reads as missing", rs.gh_meta(1).provenance, "missing")
+    check("...and removes the payload an unobserved reader would have trusted", (rs.sbcache / "1.json").exists(), False)
+
+# --- forced reads ignore every cache ----------------------------------------------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    gh = FakeGH(issue=[board("abc123")], review=contest())
+    rs = state(gh, tmp)
+    rs.observe([pr()])
+    rs.gh_meta(1)
+    rs.newest_contest_reply(1)
+    before = (gh.n_issue, gh.n_review)
+    gh.issue, gh.review = [board("def456")], []
+    forced = rs.gh_meta(1, force=True)
+    check("a forced meta read goes to GitHub", (forced.data.get("head_sha"), forced.provenance), ("def456", "fresh"))
+    check("a forced contest read goes to GitHub", rs.newest_contest_reply(1, force=True), None)
+    check(
+        "...both of them, even though the record was entitled",
+        (gh.n_issue, gh.n_review),
+        (before[0] + 1, before[1] + 1),
+    )
+
 
 # --- a fetch failure never becomes a cached answer -------------------------------------------------
 with tempfile.TemporaryDirectory() as tmp:
@@ -168,11 +215,12 @@ with tempfile.TemporaryDirectory() as tmp:
     rs = state(gh, tmp)  # never observed: no clock to compare
     rs.gh_meta(1)
     rs._comments.clear()
-    check("an unobserved PR uses the plain TTL", (rs.gh_meta(1).provenance, gh.n_issue), ("fresh", 1))
+    # `fresh` means read from GitHub in THIS pass and nothing else, so a TTL hit is `assumed` too.
+    check("an unobserved PR uses the plain TTL", (rs.gh_meta(1).provenance, gh.n_issue), ("assumed", 1))
     rs2 = state(gh, tmp)
     rs2.observe([SimpleNamespace(number=1, updated_at="")])  # a blank clock is not a key
     rs2._comments.clear()
-    check("a blank updated_at is unobserved, not a match", rs2.gh_meta(1).provenance, "fresh")
+    check("a blank updated_at is unobserved, not a match", rs2.gh_meta(1).provenance, "assumed")
 
 # --- markers: cached, but expiry is still judged against the clock ---------------------------------
 with tempfile.TemporaryDirectory() as tmp:
@@ -233,14 +281,23 @@ with tempfile.TemporaryDirectory() as tmp:
 with tempfile.TemporaryDirectory() as tmp:
     rs = state(FakeGH(issue=[]), tmp)
     rs.sbcache.mkdir(parents=True, exist_ok=True)
-    rs._write_sidecar(rs.sbcache / "1.key.json", 1, {"status": "missing", "markers": []})
-    leftovers = [q.name for q in rs.sbcache.iterdir() if q.suffix == ".tmp"]
-    check("the temp file is not left behind", leftovers, [])
+    seen = []
+    real_replace = os.replace
+
+    def watch(src, dst):
+        seen.append(str(src))
+        return real_replace(src, dst)
+
+    tc.review_state.os.replace = watch
+    try:
+        rs._write_sidecar(rs.sbcache / "1.key.json", 1, {"status": "missing", "markers": []})
+        rs._write_sidecar(rs.sbcache / "1.key.json", 1, {"status": "missing", "markers": []})
+    finally:
+        tc.review_state.os.replace = real_replace
+    check("no temp file is left behind", [f.name for f in rs.sbcache.iterdir() if f.suffix == ".tmp"], [])
+    check("two writers never share a temp path", len(set(seen)), 2)
     check(
-        "...and its name is per-process",
-        f".{__import__('os').getpid()}."
-        in str((rs.sbcache / "1.key.json").with_suffix(f".{__import__('os').getpid()}.tmp")),
-        True,
+        "the record survives the write whole", json.loads((rs.sbcache / "1.key.json").read_text())["status"], "missing"
     )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
