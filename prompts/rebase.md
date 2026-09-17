@@ -1,4 +1,4 @@
-You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The PR has become un-mergeable: its branch conflicts with the current `main`. Bring it up to date with `main` and resolve the conflicts so it can merge again. Work autonomously to completion.
+You are reconciling the branch with current main on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The branch either conflicts with current `main`, or the merge sweep handed off an update it cannot perform on this contributor-owned fork. A mergeable fork may still need this update; do not stop just because Git reports no textual conflict. Bring it up to date with `main` and resolve the conflicts so it can merge again. Work autonomously to completion.
 
 ## Rebase onto current main
 - Fetch and integrate the latest `main`:
@@ -7,7 +7,7 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
   git merge origin/main      # (or: git rebase origin/main — either is fine; merge is simpler to resolve)
   ```
 - Resolve every conflict on its merits:
-  - **`TauCeti.lean` (the root module)** is intentionally empty — the lakefile's glob builds every module without it, and PRs do not edit it, so it should NOT appear among your conflicts. If it somehow does, do not hand-merge: take `main`'s version rather than reconstructing anything by hand.
+  - **`TauCeti.lean` (the generated root module)**: preserve `main`'s generated version; do not hand-reconstruct it.
   - **A source file under `TauCeti/`**: resolve so both the upstream change and your PR's intent are preserved. If `main` now provides something your PR duplicated, prefer the upstream version and drop the duplicate.
 - Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
 
@@ -16,6 +16,8 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 - Everything under `namespace TauCeti`.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, say so in your report and stop.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
+
+Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.
 
 ## Verify before pushing (all three MUST pass, after the merge/rebase)
 ```
