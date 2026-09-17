@@ -608,6 +608,7 @@ class GitHub:
             isinstance(c, dict)
             and c.get("author") == "tauceti-review-bot[bot]"
             and isinstance(c.get("body"), str)
+            and c["body"].startswith("Merge-queue recovery for head `")
             and f"<!--tauceti-rebase:v1 {head}-->" in (c.get("body") or "").splitlines()
             for c in comments
         )

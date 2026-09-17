@@ -16,7 +16,7 @@ HEAD = "a" * 40
 
 
 def request(head=HEAD, author="tauceti-review-bot[bot]"):
-    return {"author": author, "body": f"Recovery requested.\n\n<!--tauceti-rebase:v1 {head}-->"}
+    return {"author": author, "body": f"Merge-queue recovery for head `{head[:7]}`.\n\n<!--tauceti-rebase:v1 {head}-->"}
 
 
 def test_trusted_paginated_comments():
@@ -27,6 +27,8 @@ def test_trusted_paginated_comments():
             ([request(author="peer"), request()], True),
             ([request(author="peer")], False),
             ([request("b" * 40)], False),
+            ([{**request(), "body": request()["body"].replace("tauceti-rebase", "tauceti-merge-stalled")}], False),
+            ([{**request(), "body": "Quoted text\n" + request()["body"]}], False),
             ([{"author": "tauceti-review-bot[bot]", "body": None}], False),
             ([{"author": "tauceti-review-bot[bot]", "body": []}], False),
             ([None, [], request()], True),
