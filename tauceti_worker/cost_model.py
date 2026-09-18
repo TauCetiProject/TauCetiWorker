@@ -14,9 +14,8 @@ import math
 import re
 import statistics
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
-
 
 SESSION_RE = re.compile(r"^\[session\]\s+(codex|claude)\s+([0-9a-f-]+)(?:\s+model=([^\s]+))?", re.M)
 WALL_RE = re.compile(r"Wall time(?::|\s)(?:\s*)([0-9.]+)\s*seconds", re.I)
@@ -153,7 +152,7 @@ def _command_from_codex(name: str, raw: str) -> str:
     except (json.JSONDecodeError, TypeError):
         pass
     # Modern Codex wraps exec_command in a short JavaScript program.
-    match = re.search(r'tools\.exec_command\(\s*(\{.*?\})\s*\)', raw, re.S)
+    match = re.search(r"tools\.exec_command\(\s*(\{.*?\})\s*\)", raw, re.S)
     if match:
         try:
             value = json.loads(match.group(1))
@@ -202,7 +201,7 @@ def _parse_codex(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.datetim
                     completed_ms = item.get("completed_at_ms")
                     duration = item.get("duration") or {}
                     if isinstance(started_ms, (int, float)):
-                        command_started = dt.datetime.fromtimestamp(started_ms / 1000, dt.timezone.utc)
+                        command_started = dt.datetime.fromtimestamp(started_ms / 1000, dt.UTC)
                     else:
                         command_started = when
                     if isinstance(completed_ms, (int, float)) and isinstance(started_ms, (int, float)):
@@ -210,12 +209,18 @@ def _parse_codex(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.datetim
                     else:
                         seconds = float(duration.get("secs", 0)) + float(duration.get("nanos", 0)) / 1e9
                     if command_started:
-                        modern_commands.append(ToolCall(
-                            command, "exec_command", command_started, seconds,
-                            _category(command), _mutates("exec_command", command),
-                        ))
+                        modern_commands.append(
+                            ToolCall(
+                                command,
+                                "exec_command",
+                                command_started,
+                                seconds,
+                                _category(command),
+                                _mutates("exec_command", command),
+                            )
+                        )
             if row.get("type") == "event_msg" and typ == "token_count":
-                usage = ((payload.get("info") or {}).get("total_token_usage") or {})
+                usage = (payload.get("info") or {}).get("total_token_usage") or {}
                 tokens = {k: int(v) for k, v in usage.items() if isinstance(v, (int, float))}
             if typ in {"function_call", "custom_tool_call"} and when:
                 call_id = payload.get("call_id")
@@ -344,8 +349,11 @@ def _initial_prompt(path: Path, provider: str) -> str:
                 if isinstance(content, str):
                     collected.append(content)
                 if isinstance(content, list):
-                    texts = [str(item.get("text", "")) for item in content
-                             if isinstance(item, dict) and item.get("type") in {"input_text", "text"}]
+                    texts = [
+                        str(item.get("text", ""))
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") in {"input_text", "text"}
+                    ]
                     if texts:
                         collected.extend(texts)
                 joined = "\n".join(collected)
@@ -432,8 +440,18 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
         edit_times = [t.started for t in tools if t.mutates]
         sessions.append(
             Session(
-                provider, session_id, model, phase, path, transcript, started, ended, tools, tokens,
-                area, _roadmap_size(state_dir, worker, area),
+                provider,
+                session_id,
+                model,
+                phase,
+                path,
+                transcript,
+                started,
+                ended,
+                tools,
+                tokens,
+                area,
+                _roadmap_size(state_dir, worker, area),
                 (claim_times[0] - started).total_seconds() if started and claim_times else None,
                 (edit_times[0] - started).total_seconds() if started and edit_times else None,
             )
@@ -455,8 +473,7 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
         groups[f"{provider}/{phase}"] = {
             "sessions": len(rows),
             "session_wall_minutes": distribution(
-                (s.ended - s.started).total_seconds() / 60
-                for s in rows if s.started and s.ended
+                (s.ended - s.started).total_seconds() / 60 for s in rows if s.started and s.ended
             ),
             "lean_tool_seconds_per_session": distribution(lean_seconds),
             "tools": categories,
@@ -465,17 +482,24 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
     prep = [s for s in sessions if s.phase == "preparation"]
     orientation = {
         "sessions": len(prep),
-        "to_claim_seconds": distribution(s.orientation_to_claim_seconds for s in prep if s.orientation_to_claim_seconds is not None),
-        "to_first_edit_seconds": distribution(s.orientation_to_edit_seconds for s in prep if s.orientation_to_edit_seconds is not None),
+        "to_claim_seconds": distribution(
+            s.orientation_to_claim_seconds for s in prep if s.orientation_to_claim_seconds is not None
+        ),
+        "to_first_edit_seconds": distribution(
+            s.orientation_to_edit_seconds for s in prep if s.orientation_to_edit_seconds is not None
+        ),
         "roadmap_bytes": distribution(float(s.roadmap_bytes) for s in prep if s.roadmap_bytes is not None),
     }
-    pairs = [(float(s.roadmap_bytes), s.orientation_to_claim_seconds) for s in prep
-             if s.roadmap_bytes is not None and s.orientation_to_claim_seconds is not None]
+    pairs = [
+        (float(s.roadmap_bytes), s.orientation_to_claim_seconds)
+        for s in prep
+        if s.roadmap_bytes is not None and s.orientation_to_claim_seconds is not None
+    ]
     orientation["roadmap_bytes_vs_claim_spearman"] = _spearman(pairs)
     prior_pairs = []
     prior_bins: defaultdict[str, list[float]] = defaultdict(list)
     seen_areas: defaultdict[str, int] = defaultdict(int)
-    for session in sorted(prep, key=lambda s: s.started or dt.datetime.min.replace(tzinfo=dt.timezone.utc)):
+    for session in sorted(prep, key=lambda s: s.started or dt.datetime.min.replace(tzinfo=dt.UTC)):
         if not session.roadmap_area:
             continue
         prior = seen_areas[session.roadmap_area]
@@ -528,10 +552,10 @@ def _ranks(values: list[float]) -> list[float]:
 def _spearman(pairs: list[tuple[float, float]]) -> dict[str, float | int | None]:
     if len(pairs) < 3:
         return {"n": len(pairs), "rho": None}
-    xs, ys = map(list, zip(*pairs))
+    xs, ys = map(list, zip(*pairs, strict=True))
     rx, ry = _ranks(xs), _ranks(ys)
     mx, my = statistics.fmean(rx), statistics.fmean(ry)
-    numerator = sum((x - mx) * (y - my) for x, y in zip(rx, ry))
+    numerator = sum((x - mx) * (y - my) for x, y in zip(rx, ry, strict=True))
     denominator = math.sqrt(sum((x - mx) ** 2 for x in rx) * sum((y - my) ** 2 for y in ry))
     return {"n": len(pairs), "rho": numerator / denominator if denominator else None}
 
@@ -584,19 +608,18 @@ def infrastructure_model(
         cache_fetch["monthly_class_b_usd_after_free_tier"] = max(0, monthly_requests - 10_000_000) / 1_000_000 * 0.36
     component_names = ("fixed", "touched", "repository")
     decomposition = {}
-    for name, pr_share, main_share in zip(component_names, pr_component_shares, main_component_shares):
+    for name, pr_share, main_share in zip(component_names, pr_component_shares, main_component_shares, strict=True):
         branch_minutes = pr_minutes * pr_share
         postmerge_minutes = main_runner_minutes * main_share
         decomposition[name] = {
             "runner_minutes_per_merged_pr": branch_minutes + postmerge_minutes,
             "equivalent_usd_per_merged_pr": (
-                branch_minutes * pr_runner_usd_minute
-                + postmerge_minutes * main_runner_usd_minute
+                branch_minutes * pr_runner_usd_minute + postmerge_minutes * main_runner_usd_minute
             ),
             "pr_build_share": pr_share,
             "postmerge_share": main_share,
         }
-    retained_cache_gb = retained_cache_gib * (2 ** 30 / 1e9)
+    retained_cache_gb = retained_cache_gib * (2**30 / 1e9)
     return {
         "ci": {
             "branch_and_merge_queue_builds_per_merged_pr": pr_builds,
@@ -646,12 +669,10 @@ def loc_cost_model(
     """
     decomposition = infrastructure["ci"]["decomposition"]
     per_changed = {
-        name: values["equivalent_usd_per_merged_pr"] / changed_loc_per_pr
-        for name, values in decomposition.items()
+        name: values["equivalent_usd_per_merged_pr"] / changed_loc_per_pr for name, values in decomposition.items()
     }
     cache_per_changed = (
-        infrastructure["r2_complete_cache_fetch"]["gross_class_b_usd_per_merged_pr"]
-        / changed_loc_per_pr
+        infrastructure["r2_complete_cache_fetch"]["gross_class_b_usd_per_merged_pr"] / changed_loc_per_pr
     )
     repository_at_reference = per_changed["repository"] + cache_per_changed
     intercept = ai_usd_per_changed_loc + per_changed["fixed"] + per_changed["touched"]
@@ -667,17 +688,19 @@ def loc_cost_model(
     for loc in projection_locs:
         changed_marginal = intercept + slope * loc
         no_churn_cumulative = intercept * loc + integrated_quadratic * loc * loc
-        projections.append({
-            "repository_loc": loc,
-            "changed_loc": {
-                "marginal_usd": changed_marginal,
-                "no_churn_cumulative_usd": no_churn_cumulative,
-            },
-            "net_retained_loc": {
-                "marginal_usd": changed_marginal * changed_per_net_loc,
-                "cumulative_usd": no_churn_cumulative * changed_per_net_loc,
-            },
-        })
+        projections.append(
+            {
+                "repository_loc": loc,
+                "changed_loc": {
+                    "marginal_usd": changed_marginal,
+                    "no_churn_cumulative_usd": no_churn_cumulative,
+                },
+                "net_retained_loc": {
+                    "marginal_usd": changed_marginal * changed_per_net_loc,
+                    "cumulative_usd": no_churn_cumulative * changed_per_net_loc,
+                },
+            }
+        )
 
     return {
         "reference_repo_loc": reference_repo_loc,
@@ -751,8 +774,7 @@ def format_report(report: dict) -> str:
     corr = orient["prior_local_sessions_in_area_vs_claim_spearman"]
     if corr["rho"] is not None:
         lines.append(
-            f"  prior local sessions in area vs claim time: Spearman rho={corr['rho']:.2f} "
-            f"(n={corr['n']}; exploratory)"
+            f"  prior local sessions in area vs claim time: Spearman rho={corr['rho']:.2f} (n={corr['n']}; exploratory)"
         )
     infra = report["infrastructure"]
     lines.append("")
