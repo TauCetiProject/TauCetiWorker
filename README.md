@@ -49,6 +49,7 @@ tauceti doctor                     # report the tools and credentials this host 
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
 tauceti usage --json               # prompt-free Kiro/OpenRouter credit telemetry
+tauceti cost-model                 # agent, CI, cache, and marginal/cumulative LOC-cost estimates
 tauceti work --only review         # one round of a specific kind of work, then exit
 tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / roadmap / ...)
 tauceti work --loop                # fully automatic: keep picking the most useful job
