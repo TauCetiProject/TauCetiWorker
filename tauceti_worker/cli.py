@@ -67,8 +67,7 @@ from .constants import (
 )
 from .cost_model import analyze as analyze_costs
 from .cost_model import format_report as format_cost_report
-from .cost_model import infrastructure_model
-from .cost_model import loc_cost_model
+from .cost_model import infrastructure_model, loc_cost_model
 from .github import GitHub, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
@@ -567,49 +566,132 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--logs-dir", type=Path, default=HERE / "logs", help="agent log root")
     c.add_argument("--state-dir", type=Path, default=HERE / "state", help="worker state/transcript root")
     c.add_argument(
-        "--limit", type=int, default=0,
+        "--limit",
+        type=int,
+        default=0,
         help="analyze this many most-recent agent sessions; 0 means all (default: all)",
     )
-    c.add_argument("--ci-builds-per-pr", type=float, default=4.34,
-                   help="branch plus merge-queue builds per merged PR (measured default: 4.34)")
-    c.add_argument("--ci-minutes-per-build", type=float, default=8.77,
-                   help="8-vCPU PR runner-minutes per build (measured default: 8.77)")
-    c.add_argument("--main-ci-minutes", type=float, default=14.07,
-                   help="2-vCPU post-merge runner-minutes per PR (measured default: 14.07)")
-    c.add_argument("--ci-fixed-minutes", type=float, default=1.86,
-                   help="fixed/setup part of a PR build, normalized to its total (sample proxy: 1.86)")
-    c.add_argument("--ci-touched-minutes", type=float, default=5.44,
-                   help="touched-code part of a PR build, normalized to its total (sample proxy: 5.44)")
-    c.add_argument("--ci-repo-minutes", type=float, default=1.47,
-                   help="repository-wide part of a PR build, normalized to its total (sample proxy: 1.47)")
-    c.add_argument("--main-fixed-minutes", type=float, default=3.42,
-                   help="fixed/setup part of post-merge CI, normalized to its total (sample proxy: 3.42)")
-    c.add_argument("--main-touched-minutes", type=float, default=1.15,
-                   help="touched-code part of post-merge CI, normalized to its total (sample proxy: 1.15)")
-    c.add_argument("--main-repo-minutes", type=float, default=9.50,
-                   help="repository-wide part of post-merge CI, normalized to its total (sample proxy: 9.50)")
-    c.add_argument("--pr-runner-usd-minute", type=float, default=0.022,
-                   help="comparison price for an 8-vCPU runner-minute (default: GitHub $0.022)")
-    c.add_argument("--main-runner-usd-minute", type=float, default=0.006,
-                   help="comparison price for a 2-vCPU runner-minute (default: GitHub $0.006)")
-    c.add_argument("--cache-objects", type=int, default=5787,
-                   help="objects in one complete TauCeti Lake cache map (measured default: 5787)")
-    c.add_argument("--cache-gib", type=float, default=0.162,
-                   help="compressed bytes in one complete cache fetch, GiB (sample estimate: 0.162)")
-    c.add_argument("--retained-cache-gib", type=float, default=1.9,
-                   help="estimated retained R2 cache size, GiB (local-history estimate: 1.9)")
-    c.add_argument("--merged-prs-month", type=float, default=None,
-                   help="also project R2 traffic and read charges at this monthly merge rate")
-    c.add_argument("--ai-usd-per-changed-loc", type=float, default=0.077,
-                   help="preparation, review, and revision API-equivalent cost (default: $7.7e-2)")
-    c.add_argument("--changed-loc-per-pr", type=float, default=275.42,
-                   help="mean additions plus deletions per authored PR (measured default: 275.42)")
-    c.add_argument("--changed-per-net-loc", type=float, default=275.42 / 257.60,
-                   help="changed-to-net-retained LOC churn multiplier (measured default: 1.069)")
-    c.add_argument("--reference-repo-loc", type=float, default=1.3e6,
-                   help="repository size at which current infrastructure was measured (default: 1.3e6)")
-    c.add_argument("--projection-loc", type=float, action="append", default=None,
-                   help="target repository LOC for an integrated projection (repeatable; defaults: 1e6, 1e7, 1e8)")
+    c.add_argument(
+        "--ci-builds-per-pr",
+        type=float,
+        default=4.34,
+        help="branch plus merge-queue builds per merged PR (measured default: 4.34)",
+    )
+    c.add_argument(
+        "--ci-minutes-per-build",
+        type=float,
+        default=8.77,
+        help="8-vCPU PR runner-minutes per build (measured default: 8.77)",
+    )
+    c.add_argument(
+        "--main-ci-minutes",
+        type=float,
+        default=14.07,
+        help="2-vCPU post-merge runner-minutes per PR (measured default: 14.07)",
+    )
+    c.add_argument(
+        "--ci-fixed-minutes",
+        type=float,
+        default=1.86,
+        help="fixed/setup part of a PR build, normalized to its total (sample proxy: 1.86)",
+    )
+    c.add_argument(
+        "--ci-touched-minutes",
+        type=float,
+        default=5.44,
+        help="touched-code part of a PR build, normalized to its total (sample proxy: 5.44)",
+    )
+    c.add_argument(
+        "--ci-repo-minutes",
+        type=float,
+        default=1.47,
+        help="repository-wide part of a PR build, normalized to its total (sample proxy: 1.47)",
+    )
+    c.add_argument(
+        "--main-fixed-minutes",
+        type=float,
+        default=3.42,
+        help="fixed/setup part of post-merge CI, normalized to its total (sample proxy: 3.42)",
+    )
+    c.add_argument(
+        "--main-touched-minutes",
+        type=float,
+        default=1.15,
+        help="touched-code part of post-merge CI, normalized to its total (sample proxy: 1.15)",
+    )
+    c.add_argument(
+        "--main-repo-minutes",
+        type=float,
+        default=9.50,
+        help="repository-wide part of post-merge CI, normalized to its total (sample proxy: 9.50)",
+    )
+    c.add_argument(
+        "--pr-runner-usd-minute",
+        type=float,
+        default=0.022,
+        help="comparison price for an 8-vCPU runner-minute (default: GitHub $0.022)",
+    )
+    c.add_argument(
+        "--main-runner-usd-minute",
+        type=float,
+        default=0.006,
+        help="comparison price for a 2-vCPU runner-minute (default: GitHub $0.006)",
+    )
+    c.add_argument(
+        "--cache-objects",
+        type=int,
+        default=5787,
+        help="objects in one complete TauCeti Lake cache map (measured default: 5787)",
+    )
+    c.add_argument(
+        "--cache-gib",
+        type=float,
+        default=0.162,
+        help="compressed bytes in one complete cache fetch, GiB (sample estimate: 0.162)",
+    )
+    c.add_argument(
+        "--retained-cache-gib",
+        type=float,
+        default=1.9,
+        help="estimated retained R2 cache size, GiB (local-history estimate: 1.9)",
+    )
+    c.add_argument(
+        "--merged-prs-month",
+        type=float,
+        default=None,
+        help="also project R2 traffic and read charges at this monthly merge rate",
+    )
+    c.add_argument(
+        "--ai-usd-per-changed-loc",
+        type=float,
+        default=0.077,
+        help="preparation, review, and revision API-equivalent cost (default: $7.7e-2)",
+    )
+    c.add_argument(
+        "--changed-loc-per-pr",
+        type=float,
+        default=275.42,
+        help="mean additions plus deletions per authored PR (measured default: 275.42)",
+    )
+    c.add_argument(
+        "--changed-per-net-loc",
+        type=float,
+        default=275.42 / 257.60,
+        help="changed-to-net-retained LOC churn multiplier (measured default: 1.069)",
+    )
+    c.add_argument(
+        "--reference-repo-loc",
+        type=float,
+        default=1.3e6,
+        help="repository size at which current infrastructure was measured (default: 1.3e6)",
+    )
+    c.add_argument(
+        "--projection-loc",
+        type=float,
+        action="append",
+        default=None,
+        help="target repository LOC for an integrated projection (repeatable; defaults: 1e6, 1e7, 1e8)",
+    )
 
     sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
 
