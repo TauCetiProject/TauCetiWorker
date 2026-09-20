@@ -885,6 +885,7 @@ KIRO_BUBBLE_MIN_VERSION = "0.7.31"
 # cache miss is non-fatal here. The custom domain is also what TauCeti's own CI publishes and reads
 # through (the LAKE_CACHE_*_PUBLIC repo variables). Keep the two in step.
 TAUCETI_CACHE_DOMAIN = "cache.taucetiproject.org"
+CACHE_PROBE_USER_AGENT = "tauceti-worker (+https://github.com/kim-em/TauCetiWorker)"
 TAUCETI_CACHE_SERVICE = "tauceti-public"
 TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
 TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
@@ -944,7 +945,11 @@ def tauceti_cache_unreachable_reason() -> str | None:
 
     url = f"{TAUCETI_CACHE_REVISION_URL}/"
     try:
-        with urllib.request.urlopen(url, timeout=30):
+        # Cloudflare fronts the cache and answers 403 to Python's default `Python-urllib/x.y` user
+        # agent (a bot rule), which this probe would then report as "bucket not publicly readable"
+        # and stop every round. curl and Lake, which identify themselves, get the healthy 404.
+        req = urllib.request.Request(url, headers={"User-Agent": CACHE_PROBE_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30):
             return None
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
