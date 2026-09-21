@@ -69,7 +69,10 @@ for url, timeout in CASES:
     check(f"{tag} refresher accepts JSON", ok_req and req.get_header("Accept") == "application/json")
     check(f"{tag} body is the payload as JSON", ok_req and json.loads(req.data) == PAYLOAD)
     check(f"{tag} the caller's timeout is passed through", seen.get("timeout") == timeout)
-    check(f"{tag} the canned response is parsed", code == 200 and isinstance(payload, dict) and payload.get("access_token") == "x")
+    check(
+        f"{tag} the canned response is parsed",
+        code == 200 and isinstance(payload, dict) and payload.get("access_token") == "x",
+    )
 
 if failures:
     print("oauth_user_agent: FAILED", failures)
