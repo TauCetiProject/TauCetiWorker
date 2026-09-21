@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The OAuth refresher identifies itself. Offline: urlopen is replaced by a recorder that answers a
 canned JSON body, so the test pins the OUTGOING request (a Request object with the worker's
-User-Agent, POST, JSON content type, the given URL and timeout, the payload as the body) without
-depending on either token endpoint's live CDN rules."""
+User-Agent, POST, JSON content type and Accept, the given URL and timeout, the payload as the body)
+without depending on either token endpoint's live CDN rules. Both endpoints and two non-default
+timeouts are exercised, so a helper that hard-coded either would be caught."""
 
 import io
 import json
@@ -38,33 +39,37 @@ class _Resp(io.BytesIO):
         return 200
 
 
-def fake_urlopen(req, *a, **k):
+def fake_urlopen(req, data=None, timeout=None, **kwargs):
+    # urlopen(url, data=None, timeout=...): the first positional after the request is DATA.
     seen["req"] = req
-    seen["timeout"] = k.get("timeout", a[0] if a else None)
+    seen["timeout"] = timeout
     return _Resp(json.dumps({"access_token": "x", "refresh_token": "y", "expires_in": 3600}).encode())
 
 
-ur.urlopen = fake_urlopen
-try:
-    code, payload = O._post_json(O.CLAUDE_TOKEN_URL, {"grant_type": "refresh_token", "refresh_token": "r"}, timeout=15)
-finally:
-    ur.urlopen = real
+PAYLOAD = {"grant_type": "refresh_token", "refresh_token": "r"}
+# Both token endpoints, each with a timeout that is NOT the helper's default (15): a helper that
+# hard-coded the Claude URL, or 15 s, would pass a single-case test and fail here.
+CASES = ((O.CLAUDE_TOKEN_URL, 7), (O.CODEX_TOKEN_URL, 23))
 
-req = seen.get("req")
-check("refresher sends a Request object", isinstance(req, ur.Request))
-check("refresher targets the given token URL", isinstance(req, ur.Request) and req.full_url == O.CLAUDE_TOKEN_URL)
-check("refresher is a POST", isinstance(req, ur.Request) and req.get_method() == "POST")
-check(
-    "refresher carries the worker User-Agent",
-    isinstance(req, ur.Request) and req.get_header("User-agent") == O.USER_AGENT,
-)
-check("refresher sends JSON", isinstance(req, ur.Request) and req.get_header("Content-type") == "application/json")
-check(
-    "body is the payload as JSON",
-    isinstance(req, ur.Request) and json.loads(req.data) == {"grant_type": "refresh_token", "refresh_token": "r"},
-)
-check("timeout is passed through", seen.get("timeout") == 15)
-check("the canned response is parsed", code == 200 and isinstance(payload, dict) and payload.get("access_token") == "x")
+for url, timeout in CASES:
+    seen.clear()
+    ur.urlopen = fake_urlopen
+    try:
+        code, payload = O._post_json(url, PAYLOAD, timeout=timeout)
+    finally:
+        ur.urlopen = real
+    tag = f"[{url.split('/')[2]}, timeout={timeout}]"
+    req = seen.get("req")
+    ok_req = isinstance(req, ur.Request)
+    check(f"{tag} refresher sends a Request object", ok_req)
+    check(f"{tag} refresher targets the given token URL", ok_req and req.full_url == url)
+    check(f"{tag} refresher is a POST", ok_req and req.get_method() == "POST")
+    check(f"{tag} refresher carries the worker User-Agent", ok_req and req.get_header("User-agent") == O.USER_AGENT)
+    check(f"{tag} refresher sends JSON", ok_req and req.get_header("Content-type") == "application/json")
+    check(f"{tag} refresher accepts JSON", ok_req and req.get_header("Accept") == "application/json")
+    check(f"{tag} body is the payload as JSON", ok_req and json.loads(req.data) == PAYLOAD)
+    check(f"{tag} the caller's timeout is passed through", seen.get("timeout") == timeout)
+    check(f"{tag} the canned response is parsed", code == 200 and isinstance(payload, dict) and payload.get("access_token") == "x")
 
 if failures:
     print("oauth_user_agent: FAILED", failures)
