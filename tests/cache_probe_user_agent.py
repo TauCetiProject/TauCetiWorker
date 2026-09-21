@@ -24,9 +24,13 @@ seen = {}
 real = ur.urlopen
 
 
-def fake_urlopen(req, *a, **k):
+def fake_urlopen(req, data=None, timeout=None, **kwargs):
+    # The real signature is urlopen(url, data=None, timeout=...): the first positional after the
+    # request is DATA, not the timeout. A `*a` mock read a positional timeout as data and vice versa.
+    # `timeout=None` is a test sentinel: a probe that omits the timeout must fail the 30 s check.
+    assert data is None, "the cache probe must not send a request body"
     seen["req"] = req
-    seen["timeout"] = k.get("timeout", a[0] if a else None)
+    seen["timeout"] = timeout
     raise urllib.error.HTTPError(getattr(req, "full_url", req), 404, "Not Found", {}, None)
 
 
