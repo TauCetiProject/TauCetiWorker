@@ -847,12 +847,15 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             km = _kiro_review_model(reviewers)
+            eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
+            command = (
+                [sys.executable, str(Path(eng) / "runner" / "cli.py")]
+                if eng
+                else ["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review"]
+            )
             rc = run_to_logfile(
                 [
-                    "uvx",
-                    "--from",
-                    f"git+https://github.com/{REVIEW}",
-                    "tauceti-review",
+                    *command,
                     str(pr),
                     "--store",
                     str(w.cfg.store_dir),
