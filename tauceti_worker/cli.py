@@ -65,6 +65,9 @@ from .constants import (
     TAUCETI,
     WORK_TASKS,
 )
+from .cost_model import analyze as analyze_costs
+from .cost_model import format_report as format_cost_report
+from .cost_model import infrastructure_model, loc_cost_model
 from .github import GitHub, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
@@ -555,6 +558,141 @@ def build_parser() -> argparse.ArgumentParser:
     )
     u.add_argument("--timeout", type=float, default=30.0, help="per-provider query timeout in seconds")
 
+    c = sub.add_parser(
+        "cost-model",
+        help="estimate local agent, CI, and Lake-cache compute costs from available logs",
+    )
+    c.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    c.add_argument("--logs-dir", type=Path, default=HERE / "logs", help="agent log root")
+    c.add_argument("--state-dir", type=Path, default=HERE / "state", help="worker state/transcript root")
+    c.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="analyze this many most-recent agent sessions; 0 means all (default: all)",
+    )
+    c.add_argument(
+        "--ci-builds-per-pr",
+        type=float,
+        default=4.34,
+        help="branch plus merge-queue builds per merged PR (measured default: 4.34)",
+    )
+    c.add_argument(
+        "--ci-minutes-per-build",
+        type=float,
+        default=8.77,
+        help="8-vCPU PR runner-minutes per build (measured default: 8.77)",
+    )
+    c.add_argument(
+        "--main-ci-minutes",
+        type=float,
+        default=14.07,
+        help="2-vCPU post-merge runner-minutes per PR (measured default: 14.07)",
+    )
+    c.add_argument(
+        "--ci-fixed-minutes",
+        type=float,
+        default=1.86,
+        help="fixed/setup part of a PR build, normalized to its total (sample proxy: 1.86)",
+    )
+    c.add_argument(
+        "--ci-touched-minutes",
+        type=float,
+        default=5.44,
+        help="touched-code part of a PR build, normalized to its total (sample proxy: 5.44)",
+    )
+    c.add_argument(
+        "--ci-repo-minutes",
+        type=float,
+        default=1.47,
+        help="repository-wide part of a PR build, normalized to its total (sample proxy: 1.47)",
+    )
+    c.add_argument(
+        "--main-fixed-minutes",
+        type=float,
+        default=3.42,
+        help="fixed/setup part of post-merge CI, normalized to its total (sample proxy: 3.42)",
+    )
+    c.add_argument(
+        "--main-touched-minutes",
+        type=float,
+        default=1.15,
+        help="touched-code part of post-merge CI, normalized to its total (sample proxy: 1.15)",
+    )
+    c.add_argument(
+        "--main-repo-minutes",
+        type=float,
+        default=9.50,
+        help="repository-wide part of post-merge CI, normalized to its total (sample proxy: 9.50)",
+    )
+    c.add_argument(
+        "--pr-runner-usd-minute",
+        type=float,
+        default=0.022,
+        help="comparison price for an 8-vCPU runner-minute (default: GitHub $0.022)",
+    )
+    c.add_argument(
+        "--main-runner-usd-minute",
+        type=float,
+        default=0.006,
+        help="comparison price for a 2-vCPU runner-minute (default: GitHub $0.006)",
+    )
+    c.add_argument(
+        "--cache-objects",
+        type=int,
+        default=5787,
+        help="objects in one complete TauCeti Lake cache map (measured default: 5787)",
+    )
+    c.add_argument(
+        "--cache-gib",
+        type=float,
+        default=0.162,
+        help="compressed bytes in one complete cache fetch, GiB (sample estimate: 0.162)",
+    )
+    c.add_argument(
+        "--retained-cache-gib",
+        type=float,
+        default=1.9,
+        help="estimated retained R2 cache size, GiB (local-history estimate: 1.9)",
+    )
+    c.add_argument(
+        "--merged-prs-month",
+        type=float,
+        default=None,
+        help="also project R2 traffic and read charges at this monthly merge rate",
+    )
+    c.add_argument(
+        "--ai-usd-per-changed-loc",
+        type=float,
+        default=0.077,
+        help="preparation, review, and revision API-equivalent cost (default: $7.7e-2)",
+    )
+    c.add_argument(
+        "--changed-loc-per-pr",
+        type=float,
+        default=275.42,
+        help="mean additions plus deletions per authored PR (measured default: 275.42)",
+    )
+    c.add_argument(
+        "--changed-per-net-loc",
+        type=float,
+        default=275.42 / 257.60,
+        help="changed-to-net-retained LOC churn multiplier (measured default: 1.069)",
+    )
+    c.add_argument(
+        "--reference-repo-loc",
+        type=float,
+        default=1.3e6,
+        help="repository size at which current infrastructure was measured (default: 1.3e6)",
+    )
+    c.add_argument(
+        "--projection-loc",
+        type=float,
+        action="append",
+        default=None,
+        help="target repository LOC for an integrated projection (repeatable; defaults: 1e6, 1e7, 1e8)",
+    )
+
     sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
 
     add_workers_parser(sub)
@@ -616,6 +754,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(args)
     if cmd == "usage":
         return cmd_usage(args)
+    if cmd == "cost-model":
+        return cmd_cost_model(args)
     if cmd in ("work", "_round"):
         only = resolve_tasks(getattr(args, "only", []), getattr(args, "skip", []))
         prs = resolve_pr_targets(getattr(args, "pr", []))
@@ -649,6 +789,82 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_managed_runner(args)
     parser.print_help()
     return 64
+
+
+def cmd_cost_model(args) -> int:
+    numeric = {
+        "--ci-builds-per-pr": args.ci_builds_per_pr,
+        "--ci-minutes-per-build": args.ci_minutes_per_build,
+        "--main-ci-minutes": args.main_ci_minutes,
+        "--pr-runner-usd-minute": args.pr_runner_usd_minute,
+        "--main-runner-usd-minute": args.main_runner_usd_minute,
+        "--cache-gib": args.cache_gib,
+        "--retained-cache-gib": args.retained_cache_gib,
+        "--ci-fixed-minutes": args.ci_fixed_minutes,
+        "--ci-touched-minutes": args.ci_touched_minutes,
+        "--ci-repo-minutes": args.ci_repo_minutes,
+        "--main-fixed-minutes": args.main_fixed_minutes,
+        "--main-touched-minutes": args.main_touched_minutes,
+        "--main-repo-minutes": args.main_repo_minutes,
+        "--ai-usd-per-changed-loc": args.ai_usd_per_changed_loc,
+    }
+    if args.merged_prs_month is not None:
+        numeric["--merged-prs-month"] = args.merged_prs_month
+    for flag, value in numeric.items():
+        if not math.isfinite(value) or value < 0:
+            raise Die(f"{flag} must be a non-negative finite number")
+    if args.limit < 0:
+        raise Die("--limit must be a non-negative integer")
+    if args.cache_objects < 0:
+        raise Die("--cache-objects must be a non-negative integer")
+    positive = {
+        "--changed-loc-per-pr": args.changed_loc_per_pr,
+        "--changed-per-net-loc": args.changed_per_net_loc,
+        "--reference-repo-loc": args.reference_repo_loc,
+    }
+    projections = args.projection_loc or [1e6, 1e7, 1e8]
+    for i, value in enumerate(projections):
+        positive[f"--projection-loc #{i + 1}"] = value
+    for flag, value in positive.items():
+        if not math.isfinite(value) or value <= 0:
+            raise Die(f"{flag} must be a positive finite number")
+    pr_weights = (args.ci_fixed_minutes, args.ci_touched_minutes, args.ci_repo_minutes)
+    main_weights = (args.main_fixed_minutes, args.main_touched_minutes, args.main_repo_minutes)
+    if sum(pr_weights) <= 0:
+        raise Die("the three --ci-*-minutes decomposition values may not all be zero")
+    if sum(main_weights) <= 0:
+        raise Die("the three --main-*-minutes decomposition values may not all be zero")
+    pr_shares = tuple(value / sum(pr_weights) for value in pr_weights)
+    main_shares = tuple(value / sum(main_weights) for value in main_weights)
+    report = analyze_costs(args.logs_dir, args.state_dir, args.limit)
+    report["infrastructure"] = infrastructure_model(
+        pr_builds=args.ci_builds_per_pr,
+        pr_runner_minutes=args.ci_minutes_per_build,
+        pr_runner_vcpus=8,
+        main_runner_minutes=args.main_ci_minutes,
+        main_runner_vcpus=2,
+        pr_runner_usd_minute=args.pr_runner_usd_minute,
+        main_runner_usd_minute=args.main_runner_usd_minute,
+        cache_objects=args.cache_objects,
+        cache_gib=args.cache_gib,
+        retained_cache_gib=args.retained_cache_gib,
+        merged_prs_month=args.merged_prs_month,
+        pr_component_shares=pr_shares,
+        main_component_shares=main_shares,
+    )
+    report["loc_cost"] = loc_cost_model(
+        report["infrastructure"],
+        ai_usd_per_changed_loc=args.ai_usd_per_changed_loc,
+        changed_loc_per_pr=args.changed_loc_per_pr,
+        changed_per_net_loc=args.changed_per_net_loc,
+        reference_repo_loc=args.reference_repo_loc,
+        projection_locs=projections,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(format_cost_report(report))
+    return 0
 
 
 def _usage_burn_rate(value: str | float | None, label: str) -> float | None:

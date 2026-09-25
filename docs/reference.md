@@ -138,6 +138,50 @@ Kiro usage comes from the CLI's ACP extension and retains fractional credit
 values. OpenRouter's inference key reports key usage/limits; an optional
 `OPENROUTER_MANAGEMENT_KEY` adds account-wide purchased-credit telemetry.
 
+## Cost model
+
+`tauceti cost-model` is a read-only analysis of the agent logs and provider
+transcripts already under `logs/` and `state/`. It reports distributions of
+Lean/cache tool time by provider and phase, and exploratory author-orientation
+times from session start to the target claim and first edit. `--json` emits the
+same measurements for notebooks or dashboards; `--limit N` samples the newest
+sessions (`0`, the default, means all available sessions).
+
+The CI and R2 sections are a model, not billing telemetry. Their measured
+defaults are dated snapshots and every important assumption is an overridable
+flag: builds per PR, runner minutes and comparison prices, cache object count,
+compressed transfer size, and retained storage. Run `tauceti cost-model -h` for
+the full list. In particular, the displayed runner price is a public GitHub
+runner equivalent, not a claim about a private Namespace contract, and R2
+request costs are gross marginal costs before the account-wide monthly free
+tier.
+
+The LOC section combines those infrastructure estimates with an overridable
+API-equivalent preparation/review/revision cost. It reports changed LOC and net
+retained LOC separately, using the observed churn ratio, and prints both the
+marginal changed-LOC model `C(N)` and the churn-adjusted retained-growth model
+`T_retained(N)` in dollars and scientific notation. The cumulative table labels
+the unadjusted integral as a no-churn baseline rather than treating changed LOC
+as repository size. By default it projects to `1e6`, `1e7`, and `1e8` retained
+LOC; repeat `--projection-loc N` to choose other targets.
+
+The scaling coefficient is explicitly a scenario rather than a forecast. The
+default decomposition uses a 2026-09-18 sample of 40 PR jobs and 20 post-merge
+jobs to classify runner time as fixed/setup, touched-code, or repository-wide.
+In a separate 97-run cross-check, total PR-build wall time had Pearson
+correlations of only `0.06` with changed LOC and `0.04` with changed-file count,
+so the touched-code bucket is an accounting proxy rather than a fitted
+touched-files slope.
+Only the repository-wide component and complete-cache R2 reads grow with `N`;
+the other components stay constant per changed LOC. The six component-minute
+flags expose that proxy classification, while `--changed-loc-per-pr`,
+`--changed-per-net-loc`, `--reference-repo-loc`, and
+`--ai-usd-per-changed-loc` expose the conversion assumptions. JSON output also
+contains a pessimistic comparison in which all current infrastructure cost
+scales with repository size. Operational improvements and changing PR shape can
+dominate repository growth, so long-range totals—especially `1e8`—should not be
+read as predictions.
+
 ## Codex accounts
 
 `--account EMAIL_OR_ID` (or `TAUCETI_ACCOUNT`) requires the Codex credential to
