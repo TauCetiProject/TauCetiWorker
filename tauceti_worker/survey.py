@@ -805,7 +805,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         c = Candidate(p.number, p.head_oid, "lint-repair, build red")
         per_head = counters.read(f"lint-repair-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"lint-repair-pr-{p.number}")
-        c.attempts, c.budget = per_head, MAX_LINT_REPAIR_ATTEMPTS
+        # Report whichever budget is the binding one, so a lifetime-capped PR does not read as 0/3.
+        if per_pr >= MAX_LINT_REPAIR_PR_ATTEMPTS:
+            c.attempts, c.budget = per_pr, MAX_LINT_REPAIR_PR_ATTEMPTS
+        else:
+            c.attempts, c.budget = per_head, MAX_LINT_REPAIR_ATTEMPTS
         if per_head >= MAX_LINT_REPAIR_ATTEMPTS or per_pr >= MAX_LINT_REPAIR_PR_ATTEMPTS:
             sv.lint_repair.suppressed.append(c)
         else:

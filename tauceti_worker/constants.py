@@ -273,7 +273,7 @@ CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "lint-repair", "progress", "roadmap"]
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "lint-repair"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
