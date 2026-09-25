@@ -77,7 +77,10 @@ def _validate_kiro_model_pin(model: str, source: str) -> str:
 def _reject_retired_opus(model: str, source: str) -> None:
     """Keep direct Claude and Kiro dispatches off the replaced Opus generation."""
     if model.lower() in {"claude-opus-4.8", "claude-opus-4-8"}:
-        raise Die(f"Claude Opus 4.8 from {source} is retired; use the exact claude-opus-5 model")
+        raise Die(
+            f"Claude Opus 4.8 from {source} is retired; use a current exact Opus model "
+            "(claude-opus-5-5 for Claude, claude-opus-5 on Kiro)"
+        )
 
 
 def resolve_authoring_profile(
