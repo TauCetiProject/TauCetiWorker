@@ -43,7 +43,7 @@ additional requirements; see [the sandbox notes](docs/sandbox.md).
 Install it as a tool, no clone needed:
 
 ```bash
-uv tool install git+https://github.com/kim-em/TauCetiWorker.git
+uv tool install git+https://github.com/TauCetiProject/TauCetiWorker
 
 tauceti doctor                     # report the tools and credentials this host can use
 tauceti                            # the dashboard: see the available work, launch it

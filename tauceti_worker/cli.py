@@ -134,7 +134,7 @@ environment (flags win; full reference linked below):
                          TauCeti its own Codex account without disturbing your interactive one
 
 full reference:
-  https://github.com/kim-em/TauCetiWorker/blob/main/docs/reference.md
+  https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/reference.md
 """
 
 
@@ -513,7 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Run 'tauceti work -h' for work units and examples, or 'tauceti workers -h'\n"
         "for persistent workers. Guide and reference:\n"
-        "  https://github.com/kim-em/TauCetiWorker",
+        "  https://github.com/TauCetiProject/TauCetiWorker",
     )
     sub = p.add_subparsers(dest="cmd")
 
