@@ -424,6 +424,11 @@ def _toml_value(value) -> str:
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        # An inline table, which is what `env` is. Keys are already constrained to POSIX-portable
+        # names, so they need no quoting; values go through the string branch. Written in sorted
+        # order so a rewrite of an unchanged definition is byte-identical.
+        return "{ " + ", ".join(f"{k} = {_toml_value(v)}" for k, v in sorted(value.items())) + " }"
     raise WorkersError(f"cannot encode TOML value of type {type(value).__name__}")
 
 
