@@ -19,11 +19,14 @@ from .constants import (
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
+    LINT_REPAIR_HEAD_PREFIX,
     MAX_BUMP_ATTEMPTS,
     MAX_BUMP_PR_ATTEMPTS,
     MAX_CI_ATTEMPTS,
     MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
+    MAX_LINT_REPAIR_ATTEMPTS,
+    MAX_LINT_REPAIR_PR_ATTEMPTS,
     MAX_OPEN_PRS,
     MAX_PROGRESS_ERRORS,
     MAX_REBASE_ATTEMPTS,
@@ -202,6 +205,7 @@ class Survey:
     needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
     red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
     bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
+    lint_repair: WorkKind = field(default_factory=lambda: WorkKind("lint-repair"))  # full-lint repair PRs
     progress: WorkKind = field(default_factory=lambda: WorkKind("progress"))  # a roadmap report is due
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
@@ -251,6 +255,7 @@ class Survey:
             "fix": self.needs_fix,
             "fix-ci": self.red_ci,
             "bump": self.bump,
+            "lint-repair": self.lint_repair,
             "progress": self.progress,
         }[name]
 
@@ -758,10 +763,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
                 sv.needs_fix.suppressed.append(c)
 
     # 4) fix-ci: tended (ours or bot-authored), build FAILED at head, under budgets. A red bump PR is
-    #    the bump stage's job (its adaptation prompt knows mathlib moved), so fix-ci defers those to
-    #    bump; it picks up only non-bump red PRs (ours, or any other bot-authored one).
+    #    the bump stage's job (its adaptation prompt knows mathlib moved), and a red lint-repair PR is
+    #    the lint-repair stage's, so fix-ci defers those; it picks up only other red PRs (ours, or
+    #    any other bot-authored one).
     for p in tended:
-        if not p.build_failed or p.head_ref.startswith(BUMP_HEAD_PREFIX):
+        if not p.build_failed or p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX)):
             continue
         c = Candidate(p.number, p.head_oid, "build failed at head")
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
@@ -788,6 +794,26 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)
+
+    # 5b) lint-repair: the repair PR TauCeti's daily full lint opens (branch lint-repair/..., authored
+    #    by the review bot) whose build is RED — main carries environment-lint violations that PR
+    #    builds, which lint only changed modules, could not see, and TauCeti/ needs fixing. Like bump:
+    #    we repair it and never author one (the daily lint owns opening them, CI owns merging).
+    for p in tended:
+        if not (p.head_ref.startswith(LINT_REPAIR_HEAD_PREFIX) and p.build_failed):
+            continue
+        c = Candidate(p.number, p.head_oid, "lint-repair, build red")
+        per_head = counters.read(f"lint-repair-{p.number}-{p.head_oid[:12]}")
+        per_pr = counters.read(f"lint-repair-pr-{p.number}")
+        # Report whichever budget is the binding one, so a lifetime-capped PR does not read as 0/3.
+        if per_pr >= MAX_LINT_REPAIR_PR_ATTEMPTS:
+            c.attempts, c.budget = per_pr, MAX_LINT_REPAIR_PR_ATTEMPTS
+        else:
+            c.attempts, c.budget = per_head, MAX_LINT_REPAIR_ATTEMPTS
+        if per_head >= MAX_LINT_REPAIR_ATTEMPTS or per_pr >= MAX_LINT_REPAIR_PR_ATTEMPTS:
+            sv.lint_repair.suppressed.append(c)
+        else:
+            sv.lint_repair.actionable.append(c)
 
     # 6) progress: a per-roadmap STATUS.md / PROGRESS.md report is due in TauCetiRoadmap. Unlike every
     #    other kind this is not about a PR of ours, so it carries a single pr=0 candidate whose reason

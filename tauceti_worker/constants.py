@@ -104,6 +104,12 @@ MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across heads
 
 BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
+MAX_LINT_REPAIR_ATTEMPTS = 3  # per-head: stop trying to green a red lint-repair head
+MAX_LINT_REPAIR_PR_ATTEMPTS = 6  # per-PR lifetime backstop for lint repair across heads
+# Branch prefix of the repair PR TauCeti's daily full lint (.github/workflows/lint-full.yml) opens
+# when main carries environment-lint violations that PR builds, which lint only changed modules,
+# could not see.
+LINT_REPAIR_HEAD_PREFIX = "lint-repair/"
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
 # are open.
@@ -267,7 +273,7 @@ CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap"]
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "lint-repair"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
@@ -276,13 +282,13 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # ahead of fleet-wide reviews so author-action work cannot be starved by unrelated reviews. Roadmap
 # is the final fallback and is handled separately after these stages. The durable attempt breaker
 # keeps a stuck or rejected progress report from burning every round.
-AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
+AUTO_STAGES = ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review")
 
 # The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
 # left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
 # rather than touching a PR of ours, and `roadmap` opens a PR that does not exist yet. Both carry a
 # pr=0 candidate, which is why no `--pr` value is allowed to be 0.
-PR_TASKS = ("rebase", "bump", "fix-ci", "fix", "review")
+PR_TASKS = ("rebase", "bump", "lint-repair", "fix-ci", "fix", "review")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
