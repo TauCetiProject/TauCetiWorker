@@ -270,7 +270,7 @@ def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -
 
 
 def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> AuthoringProfile:
-    """Resolve a default Sol profile to Sol or Terra before the real task runs.
+    """Resolve a default Sol profile to Sol or Luna before the real task runs.
 
     Explicit model pins have no fallback and bypass this probe. A confirmed result is cached per worker
     and account; failures that might be transient are never cached and never cause a downgrade.

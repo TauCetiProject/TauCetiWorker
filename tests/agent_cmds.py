@@ -34,9 +34,9 @@ check(
         "exec",
         "--json",
         "--model",
-        "gpt-5.6-sol",
+        "gpt-6-sol",
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="medium"',
         "-c",
         'model_reasoning_summary="detailed"',
         "-c",
@@ -62,9 +62,9 @@ check(
         "stream-json",
         "--verbose",
         "--model",
-        "claude-opus-5",
+        "claude-opus-5-5",
         "--effort",
-        "high",
+        "medium",
         "--dangerously-skip-permissions",
     ],
 )
@@ -297,9 +297,9 @@ try:
         (host_home / ".codex").mkdir()
         (host_home / ".codex" / "config.toml").write_text('model = "gpt-5.6-luna"\n')
         tc.agents._host_home = lambda: host_home
-        check("Codex default ignores host model selection", tc.agents._codex_model(), "gpt-5.6-sol")
+        check("Codex default ignores host model selection", tc.agents._codex_model(), "gpt-6-sol")
         (host_home / ".codex" / "config.toml").write_text("not valid [")
-        check("invalid host model config is irrelevant", tc.agents._codex_model(), "gpt-5.6-sol")
+        check("invalid host model config is irrelevant", tc.agents._codex_model(), "gpt-6-sol")
         os.environ["TAUCETI_CODEX_MODEL"] = "operator-model"
         check("bubble Codex model operator override", tc.agents._codex_model(), "operator-model")
 finally:
@@ -327,9 +327,9 @@ check(
         "stream-json",
         "--verbose",
         "--model",
-        "claude-opus-5",
+        "claude-opus-5-5",
         "--effort",
-        "high",
+        "medium",
         "--dangerously-skip-permissions",
     ],
 )
@@ -346,9 +346,9 @@ check(
         "stream-json",
         "--verbose",
         "--model",
-        "claude-opus-5",
+        "claude-opus-5-5",
         "--effort",
-        "high",
+        "medium",
         "--dangerously-skip-permissions",
     ],
 )
@@ -356,8 +356,8 @@ tc.agents.CLAUDE_CMD = _saved
 check(
     "Bubble Codex inner command",
     tc.agent_inner_cmd("codex"),
-    "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --json --model gpt-5.6-sol "
-    "-c 'model_reasoning_effort=\"high\"' -c 'model_reasoning_summary=\"detailed\"' "
+    "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --json --model gpt-6-sol "
+    "-c 'model_reasoning_effort=\"medium\"' -c 'model_reasoning_summary=\"detailed\"' "
     "-c show_raw_agent_reasoning=false --sandbox danger-full-access --skip-git-repo-check "
     '"$(cat /opt/round/prompt.txt)"',
 )
@@ -365,7 +365,7 @@ check(
     "Bubble Claude inner command",
     tc.agent_inner_cmd("claude"),
     'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
-    "--output-format stream-json --verbose --model claude-opus-5 --effort high "
+    "--output-format stream-json --verbose --model claude-opus-5-5 --effort medium "
     "--dangerously-skip-permissions",
 )
 

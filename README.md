@@ -206,9 +206,9 @@ rather than wandering onto other work.
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex (`gpt-5.6-sol` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
-| `codex` | `gpt-5.6-sol`, high effort; Terra fallback if Sol is unavailable | subscription, paced |
-| `claude` | `claude-opus-5`, high effort | subscription, paced |
+| `auto` (default) | Codex (`gpt-6-sol` → Luna if unavailable, medium) preferred; Claude (`claude-opus-5-5`, medium) fallback | subscription, paced |
+| `codex` | `gpt-6-sol`, medium effort; Luna fallback if Sol is unavailable | subscription, paced |
+| `claude` | `claude-opus-5-5`, medium effort | subscription, paced |
 | `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-5` opt-in | subscription credits, unpaced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
@@ -229,7 +229,7 @@ TauCeti isolates Kiro's browser-login store so the persisted login cannot take
 precedence over the key.
 
 For an explicit provider, `--author-model` and `--author-effort` override the
-profile for one run. Pinning a Codex model also disables the automatic Terra
+profile for one run. Pinning a Codex model also disables the automatic Luna
 fallback. Every authoring launch prints its effective provider, model, effort,
 and sandbox.
 

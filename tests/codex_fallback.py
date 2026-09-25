@@ -13,8 +13,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 
-SOL = "gpt-5.6-sol"
-TERRA = "gpt-5.6-terra"
+SOL = "gpt-6-sol"
+LUNA = "gpt-6-luna"
 fails = 0
 
 
@@ -64,7 +64,7 @@ def run(sequence, *, repeat=False, explicit=False):
             effort="high",
             model_source="--author-model" if explicit else "repository default",
             effort_source="repository default",
-            fallback_model=None if explicit else TERRA,
+            fallback_model=None if explicit else LUNA,
         )
         calls = []
         outcomes = list(sequence)
@@ -108,8 +108,8 @@ check("probe closes stdin", kwargs.get("stdin"), subprocess.DEVNULL)
 check("probe strips API-key billing", "OPENAI_API_KEY" in kwargs.get("env", {}), False)
 
 selected, again, error, calls, remaining = run([UNAVAILABLE, UNAVAILABLE], repeat=True)
-check("two confirmed entitlement misses select Terra", (selected.model, error), (TERRA, None))
-check("Terra decision is cached without a third request", (again.model, len(calls), len(remaining)), (TERRA, 2, 0))
+check("two confirmed entitlement misses select Luna", (selected.model, error), (LUNA, None))
+check("Luna decision is cached without a third request", (again.model, len(calls), len(remaining)), (LUNA, 2, 0))
 check("both confirmations probe Sol only", [c[0][c[0].index("--model") + 1] for c in calls], [SOL, SOL])
 
 selected, _, error, calls, _ = run([UNAVAILABLE, OK])
