@@ -755,7 +755,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if not _still_actionable(stage, w, sv, c):
         return None
     if needs_codex_probe:
-        # Resolve Sol/Terra before the banner and before opening the authoring checkout. The probe is
+        # Resolve Sol/Luna before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.
         opts.authoring_profile = resolve_codex_model_access(w.cfg, profile)
     if needs_kiro_probe:

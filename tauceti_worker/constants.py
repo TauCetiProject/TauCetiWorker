@@ -240,18 +240,19 @@ AGENT_NAMES = {
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
 # selected, host and bubble launchers consume this exact model/effort profile.
 # Review models are configured separately by the review engine.
-CODEX_AUTHORING_FALLBACK_MODEL = "gpt-5.6-terra"
+CODEX_AUTHORING_FALLBACK_MODEL = "gpt-6-luna"
 # A model entitlement normally changes only when an account's subscription changes. Keep the
 # side-effect-free access probe out of every round while still noticing an upgrade promptly.
 CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
-    # Prefer flagship Sol for authoring. A cached preflight probe selects Terra only when Codex confirms
+    # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
     # Pin Claude to the current exact Opus generation, not its moving alias.
-    "codex": ("gpt-5.6-sol", "high"),
-    "claude": ("claude-opus-5", "high"),
+    "codex": ("gpt-6-sol", "high"),
+    "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
     # id (for example claude-opus-5) with the existing --author-model flag.
+    # Kiro does not serve gpt-6-sol yet (https://kiro.dev/changelog/models/).
     "kiro": ("gpt-5.6-sol", "high"),
 }
 
