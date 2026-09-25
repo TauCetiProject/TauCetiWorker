@@ -38,9 +38,9 @@ try:
     codex = tc.resolve_authoring_profile("codex")
     claude = tc.resolve_authoring_profile("claude")
     kiro = tc.resolve_authoring_profile("kiro")
-    check("committed Codex default", (codex.model, codex.effort), ("gpt-6-sol", "medium"))
+    check("committed Codex default", (codex.model, codex.effort), ("gpt-6-sol", "high"))
     check("committed Codex fallback", codex.fallback_model, "gpt-6-luna")
-    check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5-5", "medium"))
+    check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5-5", "high"))
     check("committed Kiro default is exact Sol", (kiro.model, kiro.effort), ("gpt-5.6-sol", "high"))
     default_host, _ = tc.host_agent_argv("PROMPT", codex)
     default_bubble = tc.agent_inner_cmd(codex)
@@ -225,7 +225,7 @@ try:
     check(
         "loop child retains default Codex fallback provenance",
         captured[captured.index("--resolved-author-fallback-model") - 2 :],
-        ["--author-effort", "medium", "--resolved-author-fallback-model", "gpt-6-luna"],
+        ["--author-effort", "high", "--resolved-author-fallback-model", "gpt-6-luna"],
     )
     child_profile = tc.resolve_authoring_profile("codex", cli_model="gpt-6-sol", resolved_fallback_model="gpt-6-luna")
     check("loop child restores fallback eligibility", child_profile.fallback_model, "gpt-6-luna")

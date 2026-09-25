@@ -36,7 +36,7 @@ check(
         "--model",
         "gpt-6-sol",
         "-c",
-        'model_reasoning_effort="medium"',
+        'model_reasoning_effort="high"',
         "-c",
         'model_reasoning_summary="detailed"',
         "-c",
@@ -64,7 +64,7 @@ check(
         "--model",
         "claude-opus-5-5",
         "--effort",
-        "medium",
+        "high",
         "--dangerously-skip-permissions",
     ],
 )
@@ -329,7 +329,7 @@ check(
         "--model",
         "claude-opus-5-5",
         "--effort",
-        "medium",
+        "high",
         "--dangerously-skip-permissions",
     ],
 )
@@ -348,7 +348,7 @@ check(
         "--model",
         "claude-opus-5-5",
         "--effort",
-        "medium",
+        "high",
         "--dangerously-skip-permissions",
     ],
 )
@@ -357,7 +357,7 @@ check(
     "Bubble Codex inner command",
     tc.agent_inner_cmd("codex"),
     "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --json --model gpt-6-sol "
-    "-c 'model_reasoning_effort=\"medium\"' -c 'model_reasoning_summary=\"detailed\"' "
+    "-c 'model_reasoning_effort=\"high\"' -c 'model_reasoning_summary=\"detailed\"' "
     "-c show_raw_agent_reasoning=false --sandbox danger-full-access --skip-git-repo-check "
     '"$(cat /opt/round/prompt.txt)"',
 )
@@ -365,7 +365,7 @@ check(
     "Bubble Claude inner command",
     tc.agent_inner_cmd("claude"),
     'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
-    "--output-format stream-json --verbose --model claude-opus-5-5 --effort medium "
+    "--output-format stream-json --verbose --model claude-opus-5-5 --effort high "
     "--dangerously-skip-permissions",
 )
 

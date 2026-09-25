@@ -248,8 +248,8 @@ AUTHORING_DEFAULTS = {
     # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
     # Pin Claude to the current exact Opus generation, not its moving alias.
-    "codex": ("gpt-6-sol", "medium"),
-    "claude": ("claude-opus-5-5", "medium"),
+    "codex": ("gpt-6-sol", "high"),
+    "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
     # id (for example claude-opus-5) with the existing --author-model flag.
     "kiro": ("gpt-5.6-sol", "high"),
