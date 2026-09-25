@@ -469,12 +469,12 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
 # TAUCETI, and a progress round's PR lands in TauCetiRoadmap, so the guard would report "nothing
 # landed" on every successful report. Its postcondition is `tauceti-progress apply`'s own exit code,
 # which already distinguishes opened / already-in-flight / already-merged.
-PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
+PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "lint-repair", "roadmap"}
 
 
 # Stages whose agent edits the checkout. `review` and `progress` do not, and a bubble round works
 # inside the container, so the host checkout would say nothing about it either way.
-FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
+FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "lint-repair", "roadmap"}
 _MAX_CHANGED_FILES = 25
 
 
@@ -780,6 +780,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "fix-ci": do_fix_ci,
         "rebase": do_rebase,
         "bump": do_bump,
+        "lint-repair": do_lint_repair,
         "progress": do_progress,
         "roadmap": do_roadmap,
     }[stage]
@@ -1137,6 +1138,17 @@ def do_bump(w, sv, c, opts, bubble) -> int | None:
     for key in keys:
         w.counters.incr(key)
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump", charged=keys)
+
+
+def do_lint_repair(w, sv, c, opts, bubble) -> int | None:
+    """Green a red lint-repair PR (TauCeti's daily full lint found violations on main that PR builds
+    could not see). Same shape as a bump: claim the branch, check the PR out, drive the agent on
+    prompts/lint-repair.md to fix TauCeti/ until the PR's full lint passes."""
+    pr, head = c.pr, c.head
+    keys = (f"lint-repair-{pr}-{head[:12]}", f"lint-repair-pr-{pr}")  # counted up front, as for bump
+    for key in keys:
+        w.counters.incr(key)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="lint-repair.md", label="lint-repair", charged=keys)
 
 
 def do_progress(w, sv, c, opts, bubble) -> int | None:

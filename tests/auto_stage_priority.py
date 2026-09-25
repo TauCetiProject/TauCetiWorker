@@ -28,7 +28,7 @@ checks = [
     check(
         "single shared auto order",
         tc.AUTO_STAGES,
-        ("rebase", "bump", "progress", "fix-ci", "fix", "review"),
+        ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review"),
     ),
 ]
 if "TAUCETI_PROGRESS_GAP" not in os.environ:
@@ -121,6 +121,9 @@ checks.append(check("fresh plan re-check records the attempt", writes[0][0], "pr
 # Bumps and rebases remain ahead of reporting.
 busy.bump.actionable.append(candidate)
 checks.append(check("bump beats a due progress report", tc._next_auto_stage(busy), "bump"))
+busy.bump.actionable.clear()
+busy.lint_repair.actionable.append(candidate)
+checks.append(check("lint-repair beats a due progress report", tc._next_auto_stage(busy), "lint-repair"))
 busy.rebaseable.actionable.append(candidate)
 checks.append(check("rebase remains first", tc._next_auto_stage(busy), "rebase"))
 

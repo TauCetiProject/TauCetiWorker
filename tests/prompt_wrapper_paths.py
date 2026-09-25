@@ -45,6 +45,7 @@ CALL_SITES = {
     "fix-ci.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
     "rebase.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
     "bump.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
+    "lint-repair.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
     "roadmap.md": dict(
         ONLY="CFSGStatement",
         SKIP="none",
