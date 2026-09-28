@@ -145,7 +145,30 @@ transcripts already under `logs/` and `state/`. It reports distributions of
 Lean/cache tool time by provider and phase, and exploratory author-orientation
 times from session start to the target claim and first edit. `--json` emits the
 same measurements for notebooks or dashboards; `--limit N` samples the newest
-sessions (`0`, the default, means all available sessions).
+sessions (`0`, the default, means all available sessions). A limited sample cannot
+measure revision sessions per reviewed PR, so it reports phase distributions but
+omits the combined LOC headline unless `--ai-usd-per-changed-loc` is supplied.
+
+The AI section is measured from token counters rather than supplied as a dollar
+constant. Claude rows are de-duplicated by message id (one assistant message is
+normally repeated once per content block), and delegated Claude sessions are
+charged to their parent. Codex is priced request-by-request so its long-context
+tier is applied to the requests that actually cross the threshold. Prompt-cache
+reads and Claude's 5-minute/1-hour cache writes use their distinct displayed
+rates. The default review source is the local canonical TauCetiData checkout at
+`~/.cache/tauceti-review/data/TauCetiData`; use `--review-data-dir` to point at a
+different checkout. Production review records are de-duplicated by their durable
+key, with shadow experiments excluded.
+
+The report gives observed-mix, Sol-only, and Opus-only scenarios. Each combines
+preparation-attempt cost amortized over observed opened PRs, the review archive's
+observed rubric runs per PR, and measured revision sessions per reviewed PR.
+`--ai-family` chooses which scenario feeds the LOC model.
+`--ai-usd-per-changed-loc` remains available only as an explicit override; it has
+no default. Token counts are measurements, while dollar figures are
+API-equivalent conversions of subscription activity at the dated rates printed
+in JSON. Model choice is not randomized, so differences between the Sol and Opus
+samples are descriptive rather than causal.
 
 The CI and R2 sections are a model, not billing telemetry. Their measured
 defaults are dated snapshots and every important assumption is an overridable
@@ -156,9 +179,9 @@ runner equivalent, not a claim about a private Namespace contract, and R2
 request costs are gross marginal costs before the account-wide monthly free
 tier.
 
-The LOC section combines those infrastructure estimates with an overridable
-API-equivalent preparation/review/revision cost. It reports changed LOC and net
-retained LOC separately, using the observed churn ratio, and prints both the
+The LOC section combines those infrastructure estimates with the measured
+API-equivalent preparation/review/revision scenario. It reports changed LOC and
+net retained LOC separately, using the observed churn ratio, and prints both the
 marginal changed-LOC model `C(N)` and the churn-adjusted retained-growth model
 `T_retained(N)` in dollars and scientific notation. The cumulative table labels
 the unadjusted integral as a no-churn baseline rather than treating changed LOC
@@ -173,10 +196,11 @@ correlations of only `0.06` with changed LOC and `0.04` with changed-file count,
 so the touched-code bucket is an accounting proxy rather than a fitted
 touched-files slope.
 Only the repository-wide component and complete-cache R2 reads grow with `N`;
-the other components stay constant per changed LOC. The six component-minute
-flags expose that proxy classification, while `--changed-loc-per-pr`,
+the other components stay constant per changed LOC. The six decomposition
+values are relative weights (the preferred flags end in `-weight`; the old
+`-minutes` spellings remain aliases), while `--changed-loc-per-pr`,
 `--changed-per-net-loc`, `--reference-repo-loc`, and
-`--ai-usd-per-changed-loc` expose the conversion assumptions. JSON output also
+`--ai-family` expose the conversion assumptions. JSON output also
 contains a pessimistic comparison in which all current infrastructure cost
 scales with repository size. Operational improvements and changing PR shape can
 dominate repository growth, so long-range totals—especially `1e8`—should not be

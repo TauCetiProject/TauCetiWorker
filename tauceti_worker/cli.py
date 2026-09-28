@@ -66,8 +66,8 @@ from .constants import (
     WORK_TASKS,
 )
 from .cost_model import analyze as analyze_costs
+from .cost_model import analyze_review_archive, infrastructure_model, loc_cost_model, measured_ai_model
 from .cost_model import format_report as format_cost_report
-from .cost_model import infrastructure_model, loc_cost_model
 from .github import GitHub, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
@@ -566,6 +566,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--logs-dir", type=Path, default=HERE / "logs", help="agent log root")
     c.add_argument("--state-dir", type=Path, default=HERE / "state", help="worker state/transcript root")
     c.add_argument(
+        "--review-data-dir",
+        type=Path,
+        default=Path.home() / ".cache/tauceti-review/data/TauCetiData",
+        help="TauCetiData checkout containing canonical review-run records",
+    )
+    c.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -590,40 +596,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="2-vCPU post-merge runner-minutes per PR (measured default: 14.07)",
     )
     c.add_argument(
+        "--ci-fixed-weight",
         "--ci-fixed-minutes",
+        dest="ci_fixed_weight",
         type=float,
         default=1.86,
-        help="fixed/setup part of a PR build, normalized to its total (sample proxy: 1.86)",
+        help="relative fixed/setup weight in a PR build (sample proxy: 1.86)",
     )
     c.add_argument(
+        "--ci-touched-weight",
         "--ci-touched-minutes",
+        dest="ci_touched_weight",
         type=float,
         default=5.44,
-        help="touched-code part of a PR build, normalized to its total (sample proxy: 5.44)",
+        help="relative candidate-build weight in a PR build (sample proxy: 5.44)",
     )
     c.add_argument(
+        "--ci-repo-weight",
         "--ci-repo-minutes",
+        dest="ci_repo_weight",
         type=float,
         default=1.47,
-        help="repository-wide part of a PR build, normalized to its total (sample proxy: 1.47)",
+        help="relative repository-wide weight in a PR build (sample proxy: 1.47)",
     )
     c.add_argument(
+        "--main-fixed-weight",
         "--main-fixed-minutes",
+        dest="main_fixed_weight",
         type=float,
         default=3.42,
-        help="fixed/setup part of post-merge CI, normalized to its total (sample proxy: 3.42)",
+        help="relative fixed/setup weight in post-merge CI (sample proxy: 3.42)",
     )
     c.add_argument(
+        "--main-touched-weight",
         "--main-touched-minutes",
+        dest="main_touched_weight",
         type=float,
         default=1.15,
-        help="touched-code part of post-merge CI, normalized to its total (sample proxy: 1.15)",
+        help="relative candidate-build weight in post-merge CI (sample proxy: 1.15)",
     )
     c.add_argument(
+        "--main-repo-weight",
         "--main-repo-minutes",
+        dest="main_repo_weight",
         type=float,
         default=9.50,
-        help="repository-wide part of post-merge CI, normalized to its total (sample proxy: 9.50)",
+        help="relative repository-wide weight in post-merge CI (sample proxy: 9.50)",
     )
     c.add_argument(
         "--pr-runner-usd-minute",
@@ -664,8 +682,14 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument(
         "--ai-usd-per-changed-loc",
         type=float,
-        default=0.077,
-        help="preparation, review, and revision API-equivalent cost (default: $7.7e-2)",
+        default=None,
+        help="override measured preparation + review + revision API-equivalent cost",
+    )
+    c.add_argument(
+        "--ai-family",
+        choices=["observed", "sol", "opus"],
+        default="observed",
+        help="measured AI scenario used in the LOC headline (default: observed mix)",
     )
     c.add_argument(
         "--changed-loc-per-pr",
@@ -800,14 +824,15 @@ def cmd_cost_model(args) -> int:
         "--main-runner-usd-minute": args.main_runner_usd_minute,
         "--cache-gib": args.cache_gib,
         "--retained-cache-gib": args.retained_cache_gib,
-        "--ci-fixed-minutes": args.ci_fixed_minutes,
-        "--ci-touched-minutes": args.ci_touched_minutes,
-        "--ci-repo-minutes": args.ci_repo_minutes,
-        "--main-fixed-minutes": args.main_fixed_minutes,
-        "--main-touched-minutes": args.main_touched_minutes,
-        "--main-repo-minutes": args.main_repo_minutes,
-        "--ai-usd-per-changed-loc": args.ai_usd_per_changed_loc,
+        "--ci-fixed-weight": args.ci_fixed_weight,
+        "--ci-touched-weight": args.ci_touched_weight,
+        "--ci-repo-weight": args.ci_repo_weight,
+        "--main-fixed-weight": args.main_fixed_weight,
+        "--main-touched-weight": args.main_touched_weight,
+        "--main-repo-weight": args.main_repo_weight,
     }
+    if args.ai_usd_per_changed_loc is not None:
+        numeric["--ai-usd-per-changed-loc"] = args.ai_usd_per_changed_loc
     if args.merged_prs_month is not None:
         numeric["--merged-prs-month"] = args.merged_prs_month
     for flag, value in numeric.items():
@@ -828,15 +853,17 @@ def cmd_cost_model(args) -> int:
     for flag, value in positive.items():
         if not math.isfinite(value) or value <= 0:
             raise Die(f"{flag} must be a positive finite number")
-    pr_weights = (args.ci_fixed_minutes, args.ci_touched_minutes, args.ci_repo_minutes)
-    main_weights = (args.main_fixed_minutes, args.main_touched_minutes, args.main_repo_minutes)
+    pr_weights = (args.ci_fixed_weight, args.ci_touched_weight, args.ci_repo_weight)
+    main_weights = (args.main_fixed_weight, args.main_touched_weight, args.main_repo_weight)
     if sum(pr_weights) <= 0:
-        raise Die("the three --ci-*-minutes decomposition values may not all be zero")
+        raise Die("the three --ci-*-weight decomposition values may not all be zero")
     if sum(main_weights) <= 0:
-        raise Die("the three --main-*-minutes decomposition values may not all be zero")
+        raise Die("the three --main-*-weight decomposition values may not all be zero")
     pr_shares = tuple(value / sum(pr_weights) for value in pr_weights)
     main_shares = tuple(value / sum(main_weights) for value in main_weights)
     report = analyze_costs(args.logs_dir, args.state_dir, args.limit)
+    report["ai_reviews"] = analyze_review_archive(args.review_data_dir)
+    report["ai_cost_model"] = measured_ai_model(report, report["ai_reviews"], args.changed_loc_per_pr)
     report["infrastructure"] = infrastructure_model(
         pr_builds=args.ci_builds_per_pr,
         pr_runner_minutes=args.ci_minutes_per_build,
@@ -852,14 +879,21 @@ def cmd_cost_model(args) -> int:
         pr_component_shares=pr_shares,
         main_component_shares=main_shares,
     )
-    report["loc_cost"] = loc_cost_model(
-        report["infrastructure"],
-        ai_usd_per_changed_loc=args.ai_usd_per_changed_loc,
-        changed_loc_per_pr=args.changed_loc_per_pr,
-        changed_per_net_loc=args.changed_per_net_loc,
-        reference_repo_loc=args.reference_repo_loc,
-        projection_locs=projections,
-    )
+    measured_ai = report["ai_cost_model"]["scenarios"][args.ai_family]["usd_per_changed_loc"]
+    selected_ai = args.ai_usd_per_changed_loc if args.ai_usd_per_changed_loc is not None else measured_ai
+    report["ai_cost_model"]["selected"] = {
+        "family": "override" if args.ai_usd_per_changed_loc is not None else args.ai_family,
+        "usd_per_changed_loc": selected_ai,
+    }
+    if selected_ai is not None:
+        report["loc_cost"] = loc_cost_model(
+            report["infrastructure"],
+            ai_usd_per_changed_loc=selected_ai,
+            changed_loc_per_pr=args.changed_loc_per_pr,
+            changed_per_net_loc=args.changed_per_net_loc,
+            reference_repo_loc=args.reference_repo_loc,
+            projection_locs=projections,
+        )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
