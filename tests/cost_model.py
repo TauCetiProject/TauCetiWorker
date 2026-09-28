@@ -8,11 +8,17 @@ import tempfile
 from pathlib import Path
 
 from tauceti_worker.cost_model import (
+    _api_cost,
+    _category,
+    _mutates,
+    _parse_claude,
     _parse_codex,
     analyze,
+    analyze_review_archive,
     distribution,
     infrastructure_model,
     loc_cost_model,
+    measured_ai_model,
 )
 
 
@@ -29,7 +35,7 @@ with tempfile.TemporaryDirectory() as raw:
     agent.parent.mkdir(parents=True)
     sid = "01234567-89ab-cdef-0123-456789abcdef"
     agent.write_text(f"[session] codex {sid}\n")
-    roadmap = state / "worker1/refs/roadmap/TauCetiRoadmap/Area/README.md"
+    roadmap = state / "worker1/refs/roadmap/TauCetiRoadmap/ActualArea/README.md"
     roadmap.parent.mkdir(parents=True)
     roadmap.write_text("roadmap\n" * 20)
     transcript = state / "worker1/home/.codex/sessions/2026/01/01" / f"rollout-2026-01-01T00-00-00-{sid}.jsonl"
@@ -45,7 +51,9 @@ with tempfile.TemporaryDirectory() as raw:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": "You are authoring a new pull request. Work ONLY within the `Area` roadmap.",
+                            "text": (
+                                "You are authoring a new pull request. Work ONLY within the `<target-roadmap>` roadmap."
+                            ),
                         }
                     ],
                 },
@@ -57,7 +65,7 @@ with tempfile.TemporaryDirectory() as raw:
                     "type": "function_call",
                     "name": "exec_command",
                     "call_id": "claim",
-                    "arguments": json.dumps({"cmd": 'claim.sh acquire "author/Area/item"'}),
+                    "arguments": json.dumps({"cmd": 'claim.sh acquire "author/ActualArea/item"'}),
                 },
             },
             {
@@ -100,6 +108,7 @@ with tempfile.TemporaryDirectory() as raw:
     assert report["orientation"]["to_claim_seconds"]["median"] == 60
     assert report["orientation"]["to_first_edit_seconds"]["median"] == 120
     assert report["orientation"]["roadmap_bytes"]["median"] == roadmap.stat().st_size
+    assert report["orientation"]["sessions_without_claim_timing"] == 0
 
     modern = root / "modern.jsonl"
     write_jsonl(
@@ -205,13 +214,143 @@ with tempfile.TemporaryDirectory() as raw:
             },
         ],
     )
-    modern_tools, _, _, _ = _parse_codex(modern)
+    modern_parsed = _parse_codex(modern)
+    modern_tools = modern_parsed.tools
     assert len(modern_tools) == 3
     assert modern_tools[0].category is None
     assert modern_tools[0].seconds == 1.3
     assert modern_tools[1].category == "mixed-lean"
     assert modern_tools[1].seconds == 189
     assert modern_tools[2].mutates
+
+    claude = root / "claude.jsonl"
+    duplicate_usage = {
+        "input_tokens": 10,
+        "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 200,
+        "output_tokens": 20,
+        "cache_creation": {"ephemeral_1h_input_tokens": 100, "ephemeral_5m_input_tokens": 0},
+    }
+    write_jsonl(
+        claude,
+        [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "assistant",
+                "requestId": "request-1",
+                "message": {
+                    "id": "message-1",
+                    "model": "claude-opus-5",
+                    "usage": duplicate_usage,
+                    "content": [{"type": "text", "text": "Opened PR #42"}],
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:01Z",
+                "type": "assistant",
+                "requestId": "request-1",
+                "message": {
+                    "id": "message-1",
+                    "model": "claude-opus-5",
+                    "usage": duplicate_usage,
+                    "content": [{"type": "text", "text": "same message, another content block"}],
+                },
+            },
+        ],
+    )
+    claude_parsed = _parse_claude(claude)
+    assert claude_parsed.tokens["input_tokens"] == 10
+    assert claude_parsed.tokens["cache_creation_input_tokens"] == 100
+    assert claude_parsed.opened_pr == 42
+    assert abs(_api_cost("claude", claude_parsed.model, claude_parsed.tokens) - 0.00165) < 1e-12
+
+    review_data = root / "review-data"
+    review_runs = review_data / "records/runs/42"
+    review_runs.mkdir(parents=True)
+    for number, (model, provider, cost, round_no) in enumerate(
+        [("gpt-5.6-sol", "codex", 1.0, 1), ("claude-opus-5", "claude", 2.0, 2)]
+    ):
+        (review_runs / f"run-{number}.json").write_text(
+            json.dumps(
+                {
+                    "arm": "production",
+                    "dedupe_key": f"key-{number}",
+                    "pr": 42,
+                    "round": round_no,
+                    "model": model,
+                    "provider": provider,
+                    "cost_usd": cost,
+                    "cost_estimated": provider == "codex",
+                    "started_at": "2026-07-10T00:00:00Z",
+                    "usage": (
+                        {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
+                        if provider == "codex"
+                        else {"input_tokens": 100, "output_tokens": 10}
+                    ),
+                }
+            )
+        )
+    reviews = analyze_review_archive(review_data)
+    assert reviews["production_runs_priced"] == 2
+    assert reviews["estimated_cost_runs_repriced"] == 1
+    assert reviews["review_usd_per_pr"]["mean"] == 12
+    assert reviews["extra_review_rounds_per_pr"]["mean"] == 1
+
+    synthetic_sessions = {
+        "ai_sessions": {
+            "preparation_prs_observed": 1,
+            "priced_preparation_prs_observed": 1,
+            "groups": {
+                "sol/preparation": {
+                    "priced_sessions": 2,
+                    "prs_observed": 1,
+                    "priced_prs_observed": 1,
+                    "api_equivalent_usd_per_session": {"n": 2, "mean": 5.0},
+                },
+                "sol/revision": {
+                    "priced_sessions": 1,
+                    "prs_observed": 1,
+                    "priced_prs_observed": 1,
+                    "api_equivalent_usd_per_session": {"n": 1, "mean": 2.0},
+                },
+            },
+        }
+    }
+    synthetic_reviews = {
+        "prs": 1,
+        "rubric_runs_per_pr": {"mean": 2.0},
+        "review_usd_per_pr": {"mean": 3.0},
+        "families": {"sol": {"api_equivalent_usd_per_rubric_run": {"mean": 1.0}}},
+    }
+    ai_model = measured_ai_model(synthetic_sessions, synthetic_reviews, 100)
+    assert ai_model["scenarios"]["observed"]["components_usd_per_pr"] == {
+        "preparation": 10.0,
+        "reviews": 3.0,
+        "revisions": 2.0,
+    }
+    assert ai_model["scenarios"]["sol"]["usd_per_changed_loc"] == 0.14
+
+assert not _mutates("exec_command", "printf '#check x' | lake env lean /dev/stdin 2>/dev/null")
+assert not _mutates("exec_command", "echo problem >&2")
+assert _mutates("exec_command", "printf '%s' x > TauCeti/X.lean")
+assert _mutates("MultiEdit", "")
+assert _category("timeout 10m lake build") == "lake-build"
+assert _category("env FOO=bar nice -n 5 lake exe cache get") == "cache-get"
+million_input = {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
+assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-20") == 10
+assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-21") == 8
+assert _api_cost("codex", "gpt-5.6-terra", million_input, "2026-07-30") == 4
+assert _api_cost("codex", "gpt-6-sol", million_input, "2026-09-22") == 4
+assert (
+    _api_cost(
+        "codex",
+        "gpt-6-sol",
+        {"input_tokens": 100_000, "cached_input_tokens": 0, "cache_write_input_tokens": 100_000},
+        "2026-09-22",
+    )
+    == 0.25
+)
+assert _api_cost("claude", "claude-opus-5-5", million_input, "2026-09-22") == 4
 
 assert distribution([1, 100])["median"] == 50.5
 assert distribution([1, 2, 10, 20])["median"] == 6

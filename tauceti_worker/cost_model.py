@@ -17,10 +17,147 @@ from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 
-SESSION_RE = re.compile(r"^\[session\]\s+(codex|claude)\s+([0-9a-f-]+)(?:\s+model=([^\s]+))?", re.M)
 WALL_RE = re.compile(r"Wall time(?::|\s)(?:\s*)([0-9.]+)\s*seconds", re.I)
 PROCESS_RE = re.compile(r"(?:session ID|cell ID)\s+([A-Za-z0-9_-]+)", re.I)
 CLAIM_RE = re.compile(r'claim\.sh\s+acquire\s+["\']author/([^/"\']+)/')
+PR_RE = re.compile(r"pull request\s+#(\d+)", re.I)
+OPENED_PR_RE = re.compile(r"(?:Opened PR\s+#|TauCetiProject/TauCeti/pull/)(\d+)", re.I)
+LONG_CONTEXT_THRESHOLD = 272_000
+
+# API-equivalent list prices in USD / 1M tokens. These are deliberately visible in JSON output
+# and dated: tokens are measured facts, dollars are a conversion at the rate in force when a
+# session ran. A price change adds a window; a model-name change adds a model.
+AI_PRICES = {
+    "gpt-5.5": [
+        {
+            "effective": "2026-01-01",
+            "input": 5.0,
+            "cached_input": 0.5,
+            "cache_write": 6.25,
+            "output": 30.0,
+            "long_context_threshold": 272_000,
+            "long_input": 10.0,
+            "long_cached_input": 1.0,
+            "long_cache_write": 12.5,
+            "long_output": 45.0,
+        }
+    ],
+    "gpt-5.6-sol": [
+        {
+            "effective": "2026-07-09",
+            "input": 5.0,
+            "cached_input": 0.5,
+            "cache_write": 6.25,
+            "output": 30.0,
+            "long_context_threshold": 272_000,
+            "long_input": 10.0,
+            "long_cached_input": 1.0,
+            "long_cache_write": 12.5,
+            "long_output": 45.0,
+        },
+        {
+            "effective": "2026-08-21",
+            "input": 4.0,
+            "cached_input": 0.4,
+            "cache_write": 5.0,
+            "output": 20.0,
+            "long_context_threshold": 272_000,
+            "long_input": 8.0,
+            "long_cached_input": 0.8,
+            "long_cache_write": 10.0,
+            "long_output": 30.0,
+        },
+    ],
+    "gpt-5.6-terra": [
+        {
+            "effective": "2026-07-09",
+            "input": 2.5,
+            "cached_input": 0.25,
+            "cache_write": 3.125,
+            "output": 15.0,
+            "long_context_threshold": 272_000,
+            "long_input": 5.0,
+            "long_cached_input": 0.5,
+            "long_cache_write": 6.25,
+            "long_output": 22.5,
+        },
+        {
+            "effective": "2026-07-30",
+            "input": 2.0,
+            "cached_input": 0.2,
+            "cache_write": 2.5,
+            "output": 12.0,
+            "long_context_threshold": 272_000,
+            "long_input": 4.0,
+            "long_cached_input": 0.4,
+            "long_cache_write": 5.0,
+            "long_output": 18.0,
+        },
+    ],
+    "gpt-6-sol": [
+        {
+            "effective": "2026-09-22",
+            "input": 2.0,
+            "cached_input": 0.2,
+            "cache_write": 2.5,
+            "output": 10.0,
+            "long_context_threshold": 272_000,
+            "long_input": 4.0,
+            "long_cached_input": 0.4,
+            "long_cache_write": 5.0,
+            "long_output": 15.0,
+        }
+    ],
+    "gpt-6-luna": [
+        {
+            "effective": "2026-09-22",
+            "input": 0.1,
+            "cached_input": 0.01,
+            "cache_write": 0.125,
+            "output": 0.5,
+            "long_context_threshold": 272_000,
+            "long_input": 0.2,
+            "long_cached_input": 0.02,
+            "long_cache_write": 0.25,
+            "long_output": 0.75,
+        }
+    ],
+    "claude-opus-4-8": [
+        {
+            "effective": "2026-01-01",
+            "input": 5.0,
+            "cache_write_5m": 6.25,
+            "cache_write_1h": 10.0,
+            "cached_input": 0.5,
+            "output": 25.0,
+        }
+    ],
+    "claude-opus-5": [
+        {
+            "effective": "2026-07-24",
+            "input": 5.0,
+            "cache_write_5m": 6.25,
+            "cache_write_1h": 10.0,
+            "cached_input": 0.5,
+            "output": 25.0,
+        }
+    ],
+    "claude-opus-5-5": [
+        {
+            "effective": "2026-09-22",
+            "input": 4.0,
+            "cache_write_5m": 5.0,
+            "cache_write_1h": 8.0,
+            "cached_input": 0.2,
+            "output": 20.0,
+        }
+    ],
+}
+AI_PRICE_SOURCES = {
+    "openai": "https://developers.openai.com/api/docs/changelog",
+    "anthropic": "https://www.anthropic.com/claude/opus",
+    "cache_policy": "https://developers.openai.com/api/docs/pricing",
+}
 
 
 @dataclasses.dataclass
@@ -39,7 +176,6 @@ class Session:
     session_id: str
     model: str | None
     phase: str
-    agent_log: Path
     transcript: Path | None
     started: dt.datetime | None
     ended: dt.datetime | None
@@ -49,6 +185,18 @@ class Session:
     roadmap_bytes: int | None
     orientation_to_claim_seconds: float | None
     orientation_to_edit_seconds: float | None
+    pr_number: int | None
+    api_equivalent_usd: float | None
+
+
+@dataclasses.dataclass
+class ParsedTranscript:
+    tools: list[ToolCall]
+    tokens: dict[str, int]
+    started: dt.datetime | None
+    ended: dt.datetime | None
+    model: str | None
+    opened_pr: int | None
 
 
 def _time(value: str | None) -> dt.datetime | None:
@@ -116,7 +264,14 @@ def _category(command: str) -> str | None:
         else:
             unquoted.append(char)
     command = "".join(unquoted)
-    start = r"(?:^|[\n;&|])\s*(?:(?:if|then|elif|do)\s+)?!?\s*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]+\s+)*"
+    wrappers = (
+        r"(?:(?:command|time)\s+|"
+        r"(?:env|nice|stdbuf|timeout)(?:\s+(?:-[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+|\d+(?:\.\d+)?[smhd]?))*\s+)*"
+    )
+    start = (
+        r"(?:^|[\n;&|])\s*(?:(?:if|then|elif|do)\s+)?!?\s*"
+        r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]+\s+)*" + wrappers
+    )
     kinds = []
     if re.search(start + r"lake\s+exe\s+cache\s+get!?\b|" + start + r"lake\s+cache\s+get\b", command):
         kinds.append("cache-get")
@@ -132,16 +287,127 @@ def _category(command: str) -> str | None:
 
 
 def _mutates(name: str, command: str) -> bool:
-    if name.lower() in {"edit", "write", "apply_patch", "notebookedit"}:
+    if name.lower() in {"edit", "write", "apply_patch", "notebookedit", "multiedit"}:
         return True
-    return bool(
-        re.search(
-            r"\bapply_patch\b|\bsed\s+-i\b|\bperl\s+-[^\s]*i|\b(?:mv|cp|touch)\s+|"
-            r"(?:^|[;&|]\s*)(?:cat|printf|echo)\b[^\n]*(?:>|\btee\b)|"
-            r"\.write_(?:text|bytes)\s*\(",
-            command,
-        )
-    )
+    if re.search(
+        r"\bapply_patch\b|\bsed\s+-i\b|\bperl\s+-[^\s]*i|\b(?:mv|cp|touch)\s+|"
+        r"\.write_(?:text|bytes)\s*\(",
+        command,
+    ):
+        return True
+
+    # Shell diagnostics commonly contain `2>/dev/null` or `>&2`; neither edits a source file.
+    # Only classify output from a writer primitive when it is redirected to a real path. Strip
+    # quoted text first so an `rg 'echo x > file'` search is not itself an edit.
+    unquoted = []
+    quote = None
+    escaped = False
+    for char in command:
+        if escaped:
+            unquoted.append(" ")
+            escaped = False
+        elif char == "\\":
+            unquoted.append(" ")
+            escaped = True
+        elif quote:
+            unquoted.append(" ")
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            unquoted.append(" ")
+            quote = char
+        else:
+            unquoted.append(char)
+    shell = "".join(unquoted)
+    if not re.search(r"(?:^|[;&|]\s*)(?:cat|printf|echo)\b", shell):
+        return False
+    targets = re.findall(r"(?<![0-9&])(?:>>?|>\|)\s*([^\s;&|]+)", shell)
+    if any(target not in {"/dev/null", "&1", "&2"} for target in targets):
+        return True
+    return bool(re.search(r"\btee(?:\s+-[a-zA-Z]+)*\s+(?!/dev/null\b)[^\s;&|]+", shell))
+
+
+def _model_family(provider: str, model: str | None) -> str | None:
+    value = (model or "").lower()
+    if provider == "codex":
+        if "terra" in value:
+            return "terra"
+        if "luna" in value:
+            return "luna"
+        if not value or "sol" in value or value == "gpt-5.5":
+            return "sol"
+    if provider == "claude" and (not value or "opus" in value):
+        return "opus"
+    return None
+
+
+def _price_window(model: str | None, when: dt.datetime | str | None) -> dict | None:
+    windows = AI_PRICES.get(model or "")
+    if not windows:
+        return None
+    if isinstance(when, dt.datetime):
+        date = when.date().isoformat()
+    else:
+        date = str(when or "9999-12-31")[:10]
+    eligible = [window for window in windows if window["effective"] <= date]
+    return eligible[-1] if eligible else windows[0]
+
+
+def _api_cost(
+    provider: str, model: str | None, tokens: dict[str, int], when: dt.datetime | str | None = None
+) -> float | None:
+    """Price one measured session, preserving provider-specific prompt-cache semantics."""
+    family = _model_family(provider, model)
+    price = _price_window(model, when)
+    if family is None or price is None or not tokens:
+        return None
+    if provider == "codex":
+        have_tiers = "standard_input_tokens" in tokens or "long_input_tokens" in tokens
+        if have_tiers:
+            standard_input = tokens.get("standard_input_tokens", 0)
+            standard_cached = tokens.get("standard_cached_input_tokens", 0)
+            standard_write = tokens.get("standard_cache_write_input_tokens", 0)
+            standard_output = tokens.get("standard_output_tokens", 0)
+            long_input = tokens.get("long_input_tokens", 0)
+            long_cached = tokens.get("long_cached_input_tokens", 0)
+            long_write = tokens.get("long_cache_write_input_tokens", 0)
+            long_output = tokens.get("long_output_tokens", 0)
+        elif tokens.get("input_tokens", 0) > price["long_context_threshold"]:
+            standard_input = standard_cached = standard_write = standard_output = 0
+            long_input = tokens.get("input_tokens", 0)
+            long_cached = tokens.get("cached_input_tokens", 0)
+            long_write = tokens.get("cache_write_input_tokens", 0)
+            long_output = tokens.get("output_tokens", 0)
+        else:
+            standard_input = tokens.get("input_tokens", 0)
+            standard_cached = tokens.get("cached_input_tokens", 0)
+            standard_write = tokens.get("cache_write_input_tokens", 0)
+            standard_output = tokens.get("output_tokens", 0)
+            long_input = long_cached = long_write = long_output = 0
+        return (
+            (standard_input - standard_cached - standard_write) * price["input"]
+            + standard_cached * price["cached_input"]
+            + standard_write * price["cache_write"]
+            + standard_output * price["output"]
+            + (long_input - long_cached - long_write) * price["long_input"]
+            + long_cached * price["long_cached_input"]
+            + long_write * price["long_cache_write"]
+            + long_output * price["long_output"]
+        ) / 1e6
+
+    created = tokens.get("cache_creation_input_tokens", 0)
+    created_1h = tokens.get("cache_creation_1h_input_tokens", 0)
+    created_5m = tokens.get("cache_creation_5m_input_tokens", 0)
+    # Older Claude records do not split cache writes by TTL. Price the unsplit remainder at the
+    # cheaper 5-minute rate instead of silently treating it as ordinary input.
+    unsplit_created = max(0, created - created_1h - created_5m)
+    return (
+        tokens.get("input_tokens", 0) * price["input"]
+        + (created_5m + unsplit_created) * price["cache_write_5m"]
+        + created_1h * price["cache_write_1h"]
+        + tokens.get("cache_read_input_tokens", 0) * price["cached_input"]
+        + tokens.get("output_tokens", 0) * price["output"]
+    ) / 1e6
 
 
 def _command_from_codex(name: str, raw: str) -> str:
@@ -170,13 +436,17 @@ def _output_text(value) -> str:
     return json.dumps(value, default=str)
 
 
-def _parse_codex(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.datetime | None, dt.datetime | None]:
+def _parse_codex(path: Path) -> ParsedTranscript:
     pending: dict[str, tuple[str, str, dt.datetime]] = {}
     process_owner: dict[str, ToolCall] = {}
     tools: list[ToolCall] = []
     tokens: dict[str, int] = {}
+    tier_tokens: defaultdict[str, int] = defaultdict(int)
+    seen_token_totals: set[tuple[tuple[str, int], ...]] = set()
     modern_commands: list[ToolCall] = []
     first = last = None
+    model = None
+    opened_pr = None
     with path.open(errors="replace") as handle:
         for line in handle:
             try:
@@ -189,6 +459,22 @@ def _parse_codex(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.datetim
                 last = when
             payload = row.get("payload") or {}
             typ = payload.get("type")
+            if row.get("type") == "turn_context" and isinstance(payload.get("model"), str):
+                model = payload["model"]
+            if typ == "message" and payload.get("role") == "assistant":
+                content = payload.get("content") or []
+                text = (
+                    content
+                    if isinstance(content, str)
+                    else "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+                )
+                matches = OPENED_PR_RE.findall(text)
+                if matches:
+                    opened_pr = int(matches[-1])
+            elif row.get("type") == "event_msg" and typ == "agent_message":
+                matches = OPENED_PR_RE.findall(str(payload.get("message") or ""))
+                if matches:
+                    opened_pr = int(matches[-1])
             if row.get("type") == "event_msg" and typ == "item_completed":
                 item = payload.get("item") or {}
                 if item.get("type") == "CommandExecution":
@@ -220,8 +506,23 @@ def _parse_codex(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.datetim
                             )
                         )
             if row.get("type") == "event_msg" and typ == "token_count":
-                usage = (payload.get("info") or {}).get("total_token_usage") or {}
+                info = payload.get("info") or {}
+                usage = info.get("total_token_usage") or {}
                 tokens = {k: int(v) for k, v in usage.items() if isinstance(v, (int, float))}
+                signature = tuple(sorted(tokens.items()))
+                last_usage = info.get("last_token_usage") or {}
+                if signature not in seen_token_totals and last_usage:
+                    seen_token_totals.add(signature)
+                    prefix = "long_" if last_usage.get("input_tokens", 0) > LONG_CONTEXT_THRESHOLD else "standard_"
+                    for key in (
+                        "input_tokens",
+                        "cached_input_tokens",
+                        "cache_write_input_tokens",
+                        "output_tokens",
+                    ):
+                        value = last_usage.get(key)
+                        if isinstance(value, (int, float)):
+                            tier_tokens[prefix + key] += int(value)
             if typ in {"function_call", "custom_tool_call"} and when:
                 call_id = payload.get("call_id")
                 name = str(payload.get("name") or "")
@@ -266,14 +567,19 @@ def _parse_codex(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.datetim
         tools = [tool for tool in tools if tool.name not in duplicated]
     tools.extend(modern_commands)
     tools.sort(key=lambda tool: tool.started)
-    return tools, tokens, first, last
+    if sum(tier_tokens[key] for key in ("standard_input_tokens", "long_input_tokens")) == tokens.get("input_tokens", 0):
+        tokens.update(tier_tokens)
+    return ParsedTranscript(tools, tokens, first, last, model, opened_pr)
 
 
-def _parse_claude(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.datetime | None, dt.datetime | None]:
+def _parse_claude(path: Path) -> ParsedTranscript:
     pending: dict[str, tuple[str, str, dt.datetime]] = {}
     tools: list[ToolCall] = []
     totals: defaultdict[str, int] = defaultdict(int)
+    seen_usage: set[str] = set()
     first = last = None
+    model = None
+    opened_pr = None
     with path.open(errors="replace") as handle:
         for line in handle:
             try:
@@ -287,11 +593,34 @@ def _parse_claude(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.dateti
             message = row.get("message") or {}
             usage = message.get("usage") or {}
             if row.get("type") == "assistant":
-                for key, value in usage.items():
-                    if isinstance(value, (int, float)):
-                        totals[key] += int(value)
+                candidate_model = message.get("model")
+                if isinstance(candidate_model, str) and candidate_model != "<synthetic>":
+                    model = candidate_model
+                # Claude writes one assistant row per content block and repeats the complete
+                # message usage on each row. Count a message id once; requestId is the fallback
+                # for older rows. The numeric counters are identical across repeated rows.
+                usage_id = str(message.get("id") or row.get("requestId") or row.get("uuid"))
+                if usage and usage_id not in seen_usage:
+                    seen_usage.add(usage_id)
+                    for key, value in usage.items():
+                        if isinstance(value, (int, float)):
+                            totals[key] += int(value)
+                    cache_creation = usage.get("cache_creation") or {}
+                    if isinstance(cache_creation, dict):
+                        one_hour = cache_creation.get("ephemeral_1h_input_tokens")
+                        five_minute = cache_creation.get("ephemeral_5m_input_tokens")
+                        if isinstance(one_hour, (int, float)):
+                            totals["cache_creation_1h_input_tokens"] += int(one_hour)
+                        if isinstance(five_minute, (int, float)):
+                            totals["cache_creation_5m_input_tokens"] += int(five_minute)
                 for item in message.get("content") or []:
-                    if not isinstance(item, dict) or item.get("type") != "tool_use" or not when:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "text":
+                        matches = OPENED_PR_RE.findall(str(item.get("text") or ""))
+                        if matches:
+                            opened_pr = int(matches[-1])
+                    if item.get("type") != "tool_use" or not when:
                         continue
                     inp = item.get("input") or {}
                     command = str(inp.get("command") or inp.get("patch") or inp)
@@ -306,7 +635,22 @@ def _parse_claude(path: Path) -> tuple[list[ToolCall], dict[str, int], dt.dateti
                     name, command, started = pending.pop(tool_id)
                     seconds = max(0.0, (when - started).total_seconds())
                     tools.append(ToolCall(command, name, started, seconds, _category(command), _mutates(name, command)))
-    return tools, dict(totals), first, last
+    # Claude stores delegated agents below <session-id>/subagents rather than in the main JSONL.
+    # Their tokens are part of the cost of the parent Tau Ceti round, and their edits/builds are
+    # part of its observed work. Recursing also handles a delegated agent spawning another one.
+    subagents = path.with_suffix("") / "subagents"
+    if subagents.is_dir():
+        for child in subagents.glob("*.jsonl"):
+            parsed = _parse_claude(child)
+            tools.extend(parsed.tools)
+            for key, value in parsed.tokens.items():
+                totals[key] += value
+            if parsed.started and (first is None or parsed.started < first):
+                first = parsed.started
+            if parsed.ended and (last is None or parsed.ended > last):
+                last = parsed.ended
+    tools.sort(key=lambda tool: tool.started)
+    return ParsedTranscript(tools, dict(totals), first, last, model, opened_pr)
 
 
 def _transcript_index(state_dir: Path) -> dict[str, Path]:
@@ -375,7 +719,9 @@ def _roadmap_area(text: str) -> str | None:
     ):
         match = re.search(pattern, text, re.S | re.I)
         if match:
-            return match.group(1)
+            area = match.group(1)
+            if "<" not in area and ">" not in area:
+                return area
     return None
 
 
@@ -397,63 +743,62 @@ def _roadmap_size(state_dir: Path, worker: str, area: str | None) -> int | None:
 def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
     index = _transcript_index(state_dir)
     candidates = []
-    for path in logs_dir.glob("*/agent-*.log"):
+    for session_id, transcript in index.items():
         try:
-            with path.open(errors="replace") as handle:
-                head = handle.read(262_144)
-            stat = path.stat()
+            candidates.append((transcript.stat().st_mtime, session_id, transcript))
         except OSError:
             continue
-        match = SESSION_RE.search(head)
-        if not match:
-            continue
-        candidates.append((stat.st_mtime, path, head, match))
     candidates.sort(reverse=True, key=lambda row: row[0])
     if limit:
         candidates = candidates[:limit]
 
     sessions: list[Session] = []
-    missing = 0
-    for _, path, head, match in candidates:
-        provider, session_id, model = match.groups()
-        transcript = index.get(session_id)
-        if transcript is None:
-            missing += 1
-            continue
+    unreadable = 0
+    for _, session_id, transcript in candidates:
+        provider = "codex" if ".codex" in transcript.parts else "claude"
         try:
             parsed = _parse_codex(transcript) if provider == "codex" else _parse_claude(transcript)
         except OSError:
-            missing += 1
+            unreadable += 1
             continue
-        tools, tokens, started, ended = parsed
         prompt = _initial_prompt(transcript, provider)
-        phase = _phase(prompt or head)
-        area = _roadmap_area(prompt or head) if phase == "preparation" else None
-        if phase == "preparation" and (not area or area.lower() in {"any", "auto", "none"}):
-            for tool in tools:
+        phase = _phase(prompt)
+        area = None
+        if phase == "preparation":
+            # The command that actually acquired the claim is authoritative. Prompts contain
+            # examples such as author/<target-roadmap>/..., which must never become an area.
+            for tool in parsed.tools:
                 claim = CLAIM_RE.search(tool.command)
                 if claim:
                     area = claim.group(1)
                     break
-        worker = path.parent.name
-        claim_times = [t.started for t in tools if "claim.sh acquire" in t.command]
-        edit_times = [t.started for t in tools if t.mutates]
+            area = area or _roadmap_area(prompt)
+        try:
+            worker = transcript.relative_to(state_dir).parts[0]
+        except (ValueError, IndexError):
+            worker = "default"
+        claim_times = [t.started for t in parsed.tools if CLAIM_RE.search(t.command)]
+        edit_times = [t.started for t in parsed.tools if t.mutates]
+        prompt_pr = PR_RE.search(prompt)
+        pr_number = parsed.opened_pr if phase == "preparation" else int(prompt_pr.group(1)) if prompt_pr else None
+        api_cost = _api_cost(provider, parsed.model, parsed.tokens, parsed.started)
         sessions.append(
             Session(
                 provider,
                 session_id,
-                model,
+                parsed.model,
                 phase,
-                path,
                 transcript,
-                started,
-                ended,
-                tools,
-                tokens,
+                parsed.started,
+                parsed.ended,
+                parsed.tools,
+                parsed.tokens,
                 area,
                 _roadmap_size(state_dir, worker, area),
-                (claim_times[0] - started).total_seconds() if started and claim_times else None,
-                (edit_times[0] - started).total_seconds() if started and edit_times else None,
+                (claim_times[0] - parsed.started).total_seconds() if parsed.started and claim_times else None,
+                (edit_times[0] - parsed.started).total_seconds() if parsed.started and edit_times else None,
+                pr_number,
+                api_cost,
             )
         )
 
@@ -476,12 +821,37 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
                 (s.ended - s.started).total_seconds() / 60 for s in rows if s.started and s.ended
             ),
             "lean_tool_seconds_per_session": distribution(lean_seconds),
+            "api_equivalent_usd_per_session": distribution(
+                s.api_equivalent_usd for s in rows if s.api_equivalent_usd is not None
+            ),
             "tools": categories,
+        }
+
+    ai_groups = {}
+    for (family, phase), rows in _group(
+        [s for s in sessions if _model_family(s.provider, s.model)],
+        lambda s: (_model_family(s.provider, s.model), s.phase),
+    ).items():
+        priced = [s for s in rows if s.api_equivalent_usd is not None]
+        token_totals: defaultdict[str, int] = defaultdict(int)
+        for session in priced:
+            for key, value in session.tokens.items():
+                token_totals[key] += value
+        ai_groups[f"{family}/{phase}"] = {
+            "sessions": len(rows),
+            "priced_sessions": len(priced),
+            "prs_observed": len({s.pr_number for s in rows if s.pr_number is not None}),
+            "priced_prs_observed": len({s.pr_number for s in priced if s.pr_number is not None}),
+            "api_equivalent_usd_per_session": distribution(s.api_equivalent_usd for s in priced),
+            "token_totals": dict(token_totals),
         }
 
     prep = [s for s in sessions if s.phase == "preparation"]
     orientation = {
         "sessions": len(prep),
+        "sessions_without_claim_timing": sum(s.orientation_to_claim_seconds is None for s in prep),
+        "sessions_without_first_edit_timing": sum(s.orientation_to_edit_seconds is None for s in prep),
+        "sessions_without_roadmap_size": sum(s.roadmap_bytes is None for s in prep),
         "to_claim_seconds": distribution(
             s.orientation_to_claim_seconds for s in prep if s.orientation_to_claim_seconds is not None
         ),
@@ -515,14 +885,25 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
     }
 
     return {
-        "schema": 1,
+        "schema": 2,
         "coverage": {
-            "agent_logs_considered": len(candidates),
+            "transcripts_available": len(index),
+            "transcripts_considered": len(candidates),
             "sessions_parsed": len(sessions),
-            "missing_transcripts": missing,
+            "unreadable_transcripts": unreadable,
+            "agent_logs_available": sum(1 for _ in logs_dir.glob("*/agent-*.log")),
             "limit": limit,
         },
         "groups": groups,
+        "ai_sessions": {
+            "pricing": {"usd_per_million_tokens": AI_PRICES, "sources": AI_PRICE_SOURCES},
+            "groups": ai_groups,
+            "preparation_prs_observed": len({s.pr_number for s in prep if s.pr_number is not None}),
+            "priced_preparation_prs_observed": len(
+                {s.pr_number for s in prep if s.pr_number is not None and s.api_equivalent_usd is not None}
+            ),
+            "note": "tokens measured from local transcripts; dollars imputed at the displayed cache-aware rates",
+        },
         "orientation": orientation,
     }
 
@@ -558,6 +939,206 @@ def _spearman(pairs: list[tuple[float, float]]) -> dict[str, float | int | None]
     numerator = sum((x - mx) * (y - my) for x, y in zip(rx, ry, strict=True))
     denominator = math.sqrt(sum((x - mx) ** 2 for x in rx) * sum((y - my) ** 2 for y in ry))
     return {"n": len(pairs), "rho": numerator / denominator if denominator else None}
+
+
+def analyze_review_archive(data_dir: Path | None) -> dict:
+    """Aggregate the canonical production review records already present on this machine."""
+    runs_dir = data_dir / "records" / "runs" if data_dir else None
+    if runs_dir is None or not runs_dir.is_dir():
+        return {
+            "available": False,
+            "data_dir": str(data_dir) if data_dir else None,
+            "note": "no TauCetiData records/runs archive found; pass --review-data-dir",
+        }
+
+    seen: set[str] = set()
+    pr_costs: defaultdict[int, float] = defaultdict(float)
+    pr_runs: defaultdict[int, int] = defaultdict(int)
+    pr_rounds: defaultdict[int, int] = defaultdict(int)
+    family_costs: defaultdict[str, list[float]] = defaultdict(list)
+    family_tokens: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
+    records = priced = estimated = repriced = skipped_shadow = skipped_duplicate = malformed = 0
+    dates = []
+    for path in runs_dir.glob("*/*.json"):
+        records += 1
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            malformed += 1
+            continue
+        if not isinstance(row, dict):
+            malformed += 1
+            continue
+        if (row.get("arm") or "production") != "production":
+            skipped_shadow += 1
+            continue
+        key = str(row.get("dedupe_key") or row.get("run_id") or path)
+        if key in seen:
+            skipped_duplicate += 1
+            continue
+        seen.add(key)
+        try:
+            pr = int(row["pr"])
+            round_no = int(row.get("round") or 0)
+            cost = float(row["cost_usd"])
+        except (KeyError, TypeError, ValueError):
+            malformed += 1
+            continue
+        if not math.isfinite(cost) or cost < 0:
+            malformed += 1
+            continue
+        model = str(row.get("model") or "")
+        provider = str(row.get("provider") or "")
+        is_estimated = bool(row.get("cost_estimated"))
+        usage = row.get("usage") or {}
+        if is_estimated and isinstance(usage, dict):
+            normalized = {key: int(value) for key, value in usage.items() if isinstance(value, (int, float))}
+            cache_creation = usage.get("cache_creation") or {}
+            if isinstance(cache_creation, dict):
+                normalized["cache_creation_1h_input_tokens"] = int(cache_creation.get("ephemeral_1h_input_tokens") or 0)
+                normalized["cache_creation_5m_input_tokens"] = int(cache_creation.get("ephemeral_5m_input_tokens") or 0)
+            measured_cost = _api_cost(
+                "codex" if provider == "codex" else "claude",
+                model,
+                normalized,
+                str(row.get("started_at") or ""),
+            )
+            if measured_cost is not None:
+                cost = measured_cost
+                repriced += 1
+        priced += 1
+        estimated += is_estimated
+        pr_costs[pr] += cost
+        pr_runs[pr] += 1
+        pr_rounds[pr] = max(pr_rounds[pr], round_no)
+        family = _model_family("codex" if provider == "codex" else "claude", model)
+        if family:
+            family_costs[family].append(cost)
+            for name, value in (row.get("usage") or {}).items():
+                if isinstance(value, (int, float)):
+                    family_tokens[family][name] += int(value)
+        started = str(row.get("started_at") or "")[:10]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", started):
+            dates.append(started)
+
+    total_runs_per_pr = distribution(float(value) for value in pr_runs.values())
+    review_usd_per_pr = distribution(pr_costs.values())
+    extra_rounds_per_pr = distribution(float(max(0, value - 1)) for value in pr_rounds.values())
+    families = {}
+    for family, costs in sorted(family_costs.items()):
+        families[family] = {
+            "rubric_runs": len(costs),
+            "api_equivalent_usd_per_rubric_run": distribution(costs),
+            "token_totals": dict(family_tokens[family]),
+        }
+    return {
+        "available": True,
+        "data_dir": str(data_dir),
+        "records_seen": records,
+        "production_runs_priced": priced,
+        "estimated_cost_runs": estimated,
+        "estimated_cost_runs_repriced": repriced,
+        "provider_reported_cost_runs": priced - estimated,
+        "shadow_runs_excluded": skipped_shadow,
+        "duplicates_excluded": skipped_duplicate,
+        "malformed_or_unpriced": malformed,
+        "prs": len(pr_costs),
+        "date_range": [min(dates), max(dates)] if dates else None,
+        "rubric_runs_per_pr": total_runs_per_pr,
+        "review_usd_per_pr": review_usd_per_pr,
+        "extra_review_rounds_per_pr": extra_rounds_per_pr,
+        "families": families,
+        "note": (
+            "tokens and production-run membership are measured in TauCetiData; Claude costs are provider-reported "
+            "where available and estimated costs are recomputed from tokens at the displayed dated prices"
+        ),
+    }
+
+
+def measured_ai_model(session_report: dict, review_report: dict, changed_loc_per_pr: float) -> dict:
+    """Combine measured phase samples into observed, Sol-only, and Opus-only per-PR scenarios."""
+
+    def group_mean(family: str | None, phase: str) -> float | None:
+        groups = session_report["ai_sessions"]["groups"]
+        selected = [
+            group
+            for name, group in groups.items()
+            if name.endswith("/" + phase) and (family is None or name.startswith(family + "/"))
+        ]
+        distributions = [item["api_equivalent_usd_per_session"] for item in selected]
+        n = sum(int(item["n"]) for item in distributions)
+        if not n:
+            return None
+        total = sum(float(item["mean"]) * int(item["n"]) for item in distributions)
+        if phase == "preparation":
+            if family is None:
+                denominator = session_report["ai_sessions"]["priced_preparation_prs_observed"]
+            else:
+                denominator = sum(int(item["priced_prs_observed"]) for item in selected)
+            if denominator:
+                return total / denominator
+        return total / n
+
+    runs_per_pr = (review_report.get("rubric_runs_per_pr") or {}).get("mean")
+    reviewed_prs = review_report.get("prs") or 0
+    complete_transcript_history = not session_report.get("coverage", {}).get("limit", 0)
+    revision_sessions = sum(
+        group["priced_sessions"]
+        for name, group in session_report["ai_sessions"]["groups"].items()
+        if name.endswith("/revision")
+    )
+    revision_sessions_per_pr = (
+        revision_sessions / reviewed_prs if reviewed_prs and complete_transcript_history else None
+    )
+    scenarios = {}
+    for family in ("observed", "sol", "opus"):
+        selected = None if family == "observed" else family
+        preparation = group_mean(selected, "preparation")
+        revision_session = group_mean(selected, "revision")
+        if family == "observed":
+            review = (review_report.get("review_usd_per_pr") or {}).get("mean")
+        else:
+            review_run = (
+                review_report.get("families", {})
+                .get(family, {})
+                .get("api_equivalent_usd_per_rubric_run", {})
+                .get("mean")
+            )
+            review = review_run * runs_per_pr if review_run is not None and runs_per_pr is not None else None
+        revision = (
+            revision_session * revision_sessions_per_pr
+            if revision_session is not None and revision_sessions_per_pr is not None
+            else None
+        )
+        components = {"preparation": preparation, "reviews": review, "revisions": revision}
+        if all(value is not None for value in components.values()):
+            total = sum(components.values())
+            scenarios[family] = {
+                "usd_per_pr": total,
+                "usd_per_changed_loc": total / changed_loc_per_pr,
+                "components_usd_per_pr": components,
+            }
+        else:
+            scenarios[family] = {
+                "usd_per_pr": None,
+                "usd_per_changed_loc": None,
+                "components_usd_per_pr": components,
+                "note": "insufficient local samples for every phase",
+            }
+    return {
+        "changed_loc_per_pr": changed_loc_per_pr,
+        "revision_sessions_per_reviewed_pr": revision_sessions_per_pr,
+        "scenarios": scenarios,
+        "method": (
+            "preparation-attempt cost amortized over observed opened PRs + mean review lifecycle cost + "
+            "mean revision-session cost times observed revision sessions per reviewed PR; divided by measured "
+            "mean changed LOC per PR"
+        ),
+        "caveat": (
+            "API-equivalent pricing of subscription usage; phase samples and review archive are observational "
+            "and do not prove that model choice causes the observed cost difference"
+        ),
+    }
 
 
 def infrastructure_model(
@@ -746,9 +1327,44 @@ def format_report(report: dict) -> str:
     lines = []
     coverage = report["coverage"]
     lines.append(
-        f"local sample: {coverage['sessions_parsed']}/{coverage['agent_logs_considered']} sessions parsed"
-        + (f" ({coverage['missing_transcripts']} transcript(s) missing)" if coverage["missing_transcripts"] else "")
+        f"local sample: {coverage['sessions_parsed']}/{coverage['transcripts_considered']} transcripts parsed"
+        + (f" ({coverage['unreadable_transcripts']} unreadable)" if coverage["unreadable_transcripts"] else "")
     )
+    lines.append("")
+    lines.append("AI API-equivalent cost measured from tokens:")
+    for name, group in sorted(report["ai_sessions"]["groups"].items()):
+        if not (name.endswith("/preparation") or name.endswith("/revision")):
+            continue
+        dist = group["api_equivalent_usd_per_session"]
+        if dist["n"]:
+            coverage_note = f"/{group['sessions']} priced" if group["priced_sessions"] != group["sessions"] else ""
+            lines.append(
+                f"  {name}: n={dist['n']}{coverage_note}, median=${dist['median']:.2f}, "
+                f"p90=${dist['p90']:.2f}, mean=${dist['mean']:.2f} per session"
+            )
+    review = report.get("ai_reviews") or {}
+    if review.get("available"):
+        dist = review["review_usd_per_pr"]
+        lines.append(
+            f"  production reviews: {review['production_runs_priced']:,} rubric runs / {review['prs']:,} PRs; "
+            f"median=${dist['median']:.2f}, p90=${dist['p90']:.2f}, mean=${dist['mean']:.2f} per PR"
+        )
+    ai_model = report.get("ai_cost_model")
+    if ai_model:
+        lines.append("  measured per-PR scenarios:")
+        complete = 0
+        for name, scenario in ai_model["scenarios"].items():
+            if scenario["usd_per_pr"] is None:
+                continue
+            complete += 1
+            components = scenario["components_usd_per_pr"]
+            lines.append(
+                f"    {name}: ${scenario['usd_per_pr']:.2f}/PR = preparation ${components['preparation']:.2f} + "
+                f"reviews ${components['reviews']:.2f} + revisions ${components['revisions']:.2f}; "
+                f"${scenario['usd_per_changed_loc']:.3e}/changed LOC"
+            )
+        if not complete:
+            lines.append("    unavailable: use the full transcript history or supply an explicit AI-cost override")
     lines.append("")
     lines.append("local Lean/cache wall time per session:")
     for name, group in sorted(report["groups"].items()):
@@ -761,6 +1377,11 @@ def format_report(report: dict) -> str:
     orient = report["orientation"]
     lines.append("")
     lines.append("author orientation (preparation sessions):")
+    lines.append(
+        f"  coverage: {orient['sessions'] - orient['sessions_without_claim_timing']}/{orient['sessions']} claim, "
+        f"{orient['sessions'] - orient['sessions_without_first_edit_timing']}/{orient['sessions']} first-edit, "
+        f"{orient['sessions'] - orient['sessions_without_roadmap_size']}/{orient['sessions']} roadmap-size"
+    )
     for label, key in (("to target claim", "to_claim_seconds"), ("to first edit", "to_first_edit_seconds")):
         dist = orient[key]
         if dist["n"]:
