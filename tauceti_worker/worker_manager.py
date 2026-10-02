@@ -440,8 +440,13 @@ def _write_worker_specs(path: Path, specs: list[WorkerSpec]) -> None:
     lines = ["# Managed by `tauceti workers`; edit while the manager is running and it will reconcile.", "version = 1"]
     for spec in specs:
         lines += ["", "[[workers]]"]
-        for key, value in spec.as_dict().items():
+        fields = spec.as_dict()
+        worker_env = fields.pop("env", {})
+        for key, value in fields.items():
             lines.append(f"{key} = {_toml_value(value)}")
+        if worker_env:
+            lines += ["", "[workers.env]"]
+            lines.extend(f"{key} = {_toml_value(value)}" for key, value in worker_env.items())
     path.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(lines) + "\n"
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
