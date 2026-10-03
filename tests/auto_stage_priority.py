@@ -118,6 +118,71 @@ with tempfile.TemporaryDirectory() as tmp:
 checks.append(check("fresh not-due plan returns the fallthrough signal", progress_result, None))
 checks.append(check("fresh plan re-check records the attempt", writes[0][0], "progress-attempt-ts"))
 
+# Starting a progress attempt consumes the cached due verdict even when the fresh plan fails. Without
+# this, the cache is consulted before the eight-hour attempt gap and the worker can spend its whole
+# three-error breaker in a few minutes retrying the identical failure.
+with tempfile.TemporaryDirectory() as tmp:
+    state = Path(tmp)
+    due_cache = state / "cache" / "progress-due.json"
+    due_cache.parent.mkdir(parents=True)
+    due_cache.write_text('{"due": true, "reason": "due"}')
+    counters = tc.Counters(SimpleNamespace(state=state))
+    progress_worker = SimpleNamespace(
+        cfg=SimpleNamespace(state=state, checkout=state / "code", logdir=state / "logs"),
+        counters=counters,
+    )
+
+    def failing_plan(argv, *_a, **_k):
+        if "plan" in argv:
+            return SimpleNamespace(returncode=1, stdout="", stderr="broken plan")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    tc.work_units.prepare_checkout = lambda _cfg: True
+    tc.work_units.subprocess.run = failing_plan
+    try:
+        try:
+            tc.work_units._do_progress_inner(progress_worker, None)
+        except tc.Die:
+            pass
+        else:
+            checks.append(check("a failed progress plan raises Die", False, True))
+    finally:
+        tc.work_units.prepare_checkout = saved_prepare_checkout
+        tc.work_units.subprocess.run = saved_run
+    checks.append(check("a failed attempt consumes the cached due verdict", due_cache.exists(), False))
+    checks.append(check("a failed plan still charges the error breaker", counters.read("progress-err"), 1))
+    due, reason = tc.progress_due(progress_worker.cfg, counters)
+    checks.append(
+        check(
+            "the next survey observes the attempt gap instead of retrying cached due work",
+            due is False and "waiting out the attempt gap" in reason,
+            True,
+        )
+    )
+
+# If no requested phase can run, a focused progress worker must retain the survey's suppression reason
+# for its manager/status output instead of collapsing it into the generic no-eligible-work fallback.
+suppressed = tc.Survey(worker_id="test")
+suppressed.progress.suppressed.append(tc.Candidate(0, "", "progress rounds have failed 3x; clear the breaker"))
+saved_survey = tc.work_units.survey
+tc.work_units.survey = lambda *_a, **_k: suppressed
+try:
+    try:
+        tc.work_units.run_round(worker, SimpleNamespace(only=["bump", "progress"], dry_run=True))
+    except tc.NoProgress as exc:
+        suppressed_reason = str(exc)
+    else:
+        suppressed_reason = ""
+finally:
+    tc.work_units.survey = saved_survey
+checks.append(
+    check(
+        "focused progress no-work preserves its suppression reason",
+        suppressed_reason,
+        "progress: progress rounds have failed 3x; clear the breaker",
+    )
+)
+
 # Bumps and rebases remain ahead of reporting.
 busy.bump.actionable.append(candidate)
 checks.append(check("bump beats a due progress report", tc._next_auto_stage(busy), "bump"))
