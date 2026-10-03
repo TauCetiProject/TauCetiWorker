@@ -460,6 +460,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             f"nothing actionable on the requested PR(s) {', '.join(f'#{n}' for n in opts.prs)} this "
             f"round ({scope}) — see the per-PR reasons above; no unrelated work was done"
         )
+    # A focused progress worker otherwise throws away the survey's useful suppression reason here
+    # and the manager can only display the generic fallback below. Keep unrestricted auto mode quiet:
+    # progress is commonly not due there and roadmap/review contention can legitimately fall through.
+    if opts.only and "progress" in opts.only and sv.progress.suppressed:
+        reason = sv.progress.suppressed[0].reason
+        if reason:
+            raise NoProgress(f"progress: {reason}")
     raise NoProgress(f"no eligible work this round under {scope}")
 
 
@@ -1285,6 +1292,11 @@ def _do_progress_inner(w, opts) -> int | None:
     # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
     # round, for ever.
     w.counters.write("progress-attempt-ts", int(time.time()))
+    # Consume the survey's cached verdict as soon as this worker commits to the attempt. In particular,
+    # a failure must not leave a cached `due=true` ahead of the attempt-gap/error checks in
+    # progress_due(): that used to launch the same broken plan every few minutes until all three error
+    # slots were spent. The next survey now observes the durable attempt timestamp and waits eight hours.
+    bust_progress_cache(w.cfg)
 
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
