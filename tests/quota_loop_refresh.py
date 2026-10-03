@@ -288,4 +288,85 @@ status_ok = (
 )
 print(f"[{'OK ' if status_ok else 'XX '}] backoff preserves the child diagnostic: {backoff['detail']!r}")
 
-sys.exit(0 if ok and semantic_ok and race_ok and frozen_ok and cache_ok and driver_ok and status_ok else 1)
+# An automatic worker must keep polling an unresolved alternative provider even when the other
+# provider has a known, distant pacing recovery. The Claude bootstrap may become visible on the very
+# next read; Codex's weekly pacing clock says nothing about when that will happen.
+wait_at = time.time()
+waiting_cases = [
+    (
+        "an idle alternative keeps the normal poll",
+        "auto",
+        {
+            "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
+            "claude": tc.Provider(
+                "claude",
+                False,
+                None,
+                [tc.Window("session", None, None, None, "idle", detail="bootstrap attempted; awaiting fresh usage")],
+            ),
+        },
+        tc.POLL,
+    ),
+    (
+        "an unreadable alternative keeps the normal poll",
+        "auto",
+        {
+            "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
+            "claude": tc.Provider("claude", False, None, error="usage unavailable"),
+        },
+        tc.POLL,
+    ),
+    (
+        "all alternatives with known recovery may sleep to the earliest",
+        "auto",
+        {
+            "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 2000),
+            "claude": tc.Provider("claude", False, None, next_eligible=wait_at + 1000),
+        },
+        1005,
+    ),
+    (
+        "a forced provider retains the hourly cap",
+        "codex",
+        {"codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600)},
+        3600,
+    ),
+    (
+        "an alternative's Retry-After is still respected",
+        "auto",
+        {
+            "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
+            "claude": tc.Provider("claude", False, None, error="usage HTTP 429", retry_after=1200),
+        },
+        1200,
+    ),
+]
+wait_ok = True
+saved_choose = tc.loop.choose_model
+saved_sleep = tc.loop.time.sleep
+saved_clock = tc.loop.time.time
+saved_report = tc.loop.report_runtime
+try:
+    tc.loop.time.time = lambda: wait_at
+    tc.loop.report_runtime = lambda *_a, **_k: None
+    for label, agent, snap, expected in waiting_cases:
+        sleeps = []
+        tc.loop.choose_model = lambda *_a, snapshot=snap, **_k: (None, snapshot)
+
+        def record_wait(seconds, recorded=sleeps):
+            recorded.append(seconds)
+            raise KeyboardInterrupt
+
+        tc.loop.time.sleep = record_wait
+        args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None, source=None)
+        tc.loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent=agent)
+        passed = sleeps == [expected]
+        wait_ok &= passed
+        print(f"[{'OK ' if passed else 'XX '}] {label}: got={sleeps!r} want={[expected]!r}")
+finally:
+    tc.loop.choose_model = saved_choose
+    tc.loop.time.sleep = saved_sleep
+    tc.loop.time.time = saved_clock
+    tc.loop.report_runtime = saved_report
+
+sys.exit(0 if ok and semantic_ok and race_ok and frozen_ok and cache_ok and driver_ok and status_ok and wait_ok else 1)
