@@ -139,7 +139,7 @@ def main():
     check("progress is not in scope", "progress" not in tc.work_units.FILE_CHANGE_STAGES)
     check(
         "roadmap and the fix-likes are",
-        {"roadmap", "fix", "fix-ci", "rebase", "bump"} == tc.work_units.FILE_CHANGE_STAGES,
+        {"roadmap", "fix", "fix-ci", "rebase", "bump", "lint-repair"} == tc.work_units.FILE_CHANGE_STAGES,
     )
     check("a bubble round is skipped", "stage in FILE_CHANGE_STAGES and not bubble" in src)
 

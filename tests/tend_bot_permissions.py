@@ -27,6 +27,7 @@ RAW = [
     pr(1, "me", failed=True),
     pr(2, "review-bot", bot=True, owner=survey_mod.TAUCETI_OWNER, failed=True, conflicting=True),
     pr(3, "review-bot", bot=True, owner=survey_mod.TAUCETI_OWNER, head="bump-mathlib/test", failed=True),
+    pr(6, "review-bot", bot=True, owner=survey_mod.TAUCETI_OWNER, head="lint-repair/main", failed=True),
     pr(4, "external-bot", bot=True, owner="external", conflicting=True),
     pr(5, "peer", owner=survey_mod.TAUCETI_OWNER, conflicting=True),
 ]
@@ -53,14 +54,15 @@ def classify(access, raw=RAW):
             "rebase": [c.pr for c in sv.rebaseable.actionable],
             "fix-ci": [c.pr for c in sv.red_ci.actionable],
             "bump": [c.pr for c in sv.bump.actionable],
+            "lint-repair": [c.pr for c in sv.lint_repair.actionable],
         }
     finally:
         survey_mod.me, survey_mod.can_push = saved_me, saved_can_push
 
 
 def main():
-    expected_own = {"rebase": [], "fix-ci": [1], "bump": []}
-    expected_with_bot = {"rebase": [2], "fix-ci": [1, 2], "bump": [3]}
+    expected_own = {"rebase": [], "fix-ci": [1], "bump": [], "lint-repair": []}
+    expected_with_bot = {"rebase": [2], "fix-ci": [1, 2], "bump": [3], "lint-repair": [6]}
     checks = [
         ("denied", classify(False), expected_own),
         ("unknown", classify(None), expected_own),

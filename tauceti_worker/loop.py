@@ -142,7 +142,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     nap = max(POLL, max((p.retry_after or 0 for p in snap.values()), default=0))
                     if not any(p.retry_after for p in snap.values()):
                         eligible = [p.next_eligible for p in snap.values() if p.next_eligible]
-                        if eligible:
+                        # A known pacing recovery only justifies a longer sleep when EVERY candidate
+                        # provider has a recovery clock. An idle/unknown alternative may become usable
+                        # at the next poll; another provider's distant reset must not hide that change.
+                        if eligible and all(p.next_eligible for p in snap.values()):
                             # A forced refresh is valuable before a launch, not every five minutes
                             # throughout a known multi-hour wait. Recheck at least hourly so sibling
                             # workers or operator activity are still observed reasonably promptly. A

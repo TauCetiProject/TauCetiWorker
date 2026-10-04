@@ -47,7 +47,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "dbb229dec0434fd7faaa18a79c776b18f18a8252")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "b7d96c7a41cbfe11c1380cb7de70fff48298e9dc")
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
@@ -104,6 +104,12 @@ MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across heads
 
 BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
+MAX_LINT_REPAIR_ATTEMPTS = 3  # per-head: stop trying to green a red lint-repair head
+MAX_LINT_REPAIR_PR_ATTEMPTS = 6  # per-PR lifetime backstop for lint repair across heads
+# Branch prefix of the repair PR TauCeti's daily full lint (.github/workflows/lint-full.yml) opens
+# when main carries environment-lint violations that PR builds, which lint only changed modules,
+# could not see.
+LINT_REPAIR_HEAD_PREFIX = "lint-repair/"
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
 # are open.
@@ -199,6 +205,16 @@ CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every
 
 SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached scoreboard meta stays fresh
 
+# How long a cached comment read may be served on the strength of the PR's `updatedAt` alone (see
+# ReviewState.observe). Nothing about a PR's comments can change without GitHub bumping that clock —
+# measured over 179 in-place scoreboard edits, none landed newer than their PR's `updatedAt` — with the
+# one exception it cannot express: a DELETED comment leaves no timestamp behind. This backstop is the
+# bound on that blind spot, so a deleted or forged scoreboard is refetched within half an hour even
+# though nothing announced it. Deliberately not "until the next reset": a heuristic we cannot verify
+# gets a ceiling. A read served under this rule is `assumed`, never `fresh`, and cannot authorize a
+# mutation; see dispatch()'s revalidation of the one PR a round acts on.
+SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
+
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
 # (scoreboard meta + in-flight marker share one read); << the round/dashboard cadence
@@ -230,18 +246,19 @@ AGENT_NAMES = {
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
 # selected, host and bubble launchers consume this exact model/effort profile.
 # Review models are configured separately by the review engine.
-CODEX_AUTHORING_FALLBACK_MODEL = "gpt-5.6-terra"
+CODEX_AUTHORING_FALLBACK_MODEL = "gpt-6-luna"
 # A model entitlement normally changes only when an account's subscription changes. Keep the
 # side-effect-free access probe out of every round while still noticing an upgrade promptly.
 CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
-    # Prefer flagship Sol for authoring. A cached preflight probe selects Terra only when Codex confirms
+    # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
     # Pin Claude to the current exact Opus generation, not its moving alias.
-    "codex": ("gpt-5.6-sol", "high"),
-    "claude": ("claude-opus-5", "high"),
+    "codex": ("gpt-6.1-sol", "high"),
+    "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
     # id (for example claude-opus-5) with the existing --author-model flag.
+    # Kiro does not serve gpt-6-sol yet (https://kiro.dev/changelog/models/).
     "kiro": ("gpt-5.6-sol", "high"),
 }
 
@@ -256,7 +273,7 @@ CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap"]
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "lint-repair"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
@@ -265,13 +282,13 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # ahead of fleet-wide reviews so author-action work cannot be starved by unrelated reviews. Roadmap
 # is the final fallback and is handled separately after these stages. The durable attempt breaker
 # keeps a stuck or rejected progress report from burning every round.
-AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
+AUTO_STAGES = ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review")
 
 # The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
 # left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
 # rather than touching a PR of ours, and `roadmap` opens a PR that does not exist yet. Both carry a
 # pr=0 candidate, which is why no `--pr` value is allowed to be 0.
-PR_TASKS = ("rebase", "bump", "fix-ci", "fix", "review")
+PR_TASKS = ("rebase", "bump", "lint-repair", "fix-ci", "fix", "review")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted

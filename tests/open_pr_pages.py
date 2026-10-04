@@ -44,6 +44,7 @@ def node(number, *, build=None, author="kim", bot=False, labels=("awaiting-revie
         "headRefName": f"branch-{number}",
         "headRepositoryOwner": {"login": "kim"},
         "headRepository": {"name": "TauCeti"},
+        "updatedAt": "2026-09-17T01:00:00Z",
         "author": {"login": author, "__typename": "Bot" if bot else "User"},
         "labels": {"nodes": [{"name": n} for n in labels]},
         "commits": {"nodes": [{"commit": {"status": {"contexts": contexts} if contexts else None}}]},
@@ -78,6 +79,9 @@ pr = tc.PRInfo.from_json(gh.open_prs()[0])
 check("a green head reads as build_success", (pr.build_success, pr.build_failed), (True, False))
 check("the build status timestamp survives", pr.build_status_at, 1788921256)
 check("labels come out of their connection", pr.labels, ("awaiting-review", "roadmap/X"))
+# The freshness key ReviewState reads is carried by this query and nothing else: if it stops arriving,
+# every per-PR comment read silently falls back to the plain TTL and the survey goes linear again.
+check("the PR's updatedAt survives into PRInfo", pr.updated_at, "2026-09-17T01:00:00Z")
 check(
     "head fields carry through",
     (pr.head_oid, pr.head_ref, pr.head_owner, pr.head_repo),

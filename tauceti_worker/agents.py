@@ -77,7 +77,10 @@ def _validate_kiro_model_pin(model: str, source: str) -> str:
 def _reject_retired_opus(model: str, source: str) -> None:
     """Keep direct Claude and Kiro dispatches off the replaced Opus generation."""
     if model.lower() in {"claude-opus-4.8", "claude-opus-4-8"}:
-        raise Die(f"Claude Opus 4.8 from {source} is retired; use the exact claude-opus-5 model")
+        raise Die(
+            f"Claude Opus 4.8 from {source} is retired; use a current exact Opus model "
+            "(claude-opus-5-5 for Claude, claude-opus-5 on Kiro)"
+        )
 
 
 def resolve_authoring_profile(
@@ -270,7 +273,7 @@ def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -
 
 
 def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> AuthoringProfile:
-    """Resolve a default Sol profile to Sol or Terra before the real task runs.
+    """Resolve a default Sol profile to Sol or Luna before the real task runs.
 
     Explicit model pins have no fallback and bypass this probe. A confirmed result is cached per worker
     and account; failures that might be transient are never cached and never cause a downgrade.

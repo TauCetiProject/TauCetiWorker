@@ -89,7 +89,7 @@ configuration (first that is set wins):
   tauceti workers import workers.conf         import the legacy line-oriented format once
 
 full reference:
-  https://github.com/kim-em/TauCetiWorker/blob/main/docs/workers.md
+  https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/workers.md
 """
 
 

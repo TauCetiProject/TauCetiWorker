@@ -33,6 +33,7 @@ RUN_STDLIB=(
   codex_account.py
   codex_fallback.py
   contest_claim.py
+  dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
   github_failure_reason.py
@@ -71,6 +72,7 @@ RUN_STDLIB=(
   review_diagnostics.py
   review_provider_down.py
   review_scheduling.py
+  review_state_freshness.py
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py

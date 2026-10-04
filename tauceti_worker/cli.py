@@ -5,7 +5,8 @@ Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the wo
 
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and
 treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
-of work, chosen in priority order: rebase → bump → progress → fix-ci → fix → review → roadmap.
+of work, chosen in priority order: rebase → bump → lint-repair → progress → fix-ci → fix → review →
+roadmap.
 The `bump` step adapts a red bump-mathlib PR (the review bot opens those; the worker
 never authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI,
 not the worker.
@@ -86,6 +87,7 @@ WORK_EPILOG = """\
 the cascade (priority order; a round does the first that applies):
   rebase    bring our open PRs up to date with their base branch
   bump      adapt a red bump-mathlib PR (the worker never authors one)
+  lint-repair  fix what TauCeti's daily full lint found on main, on its red lint-repair PR
   progress  write a roadmap's STATUS.md / PROGRESS.md report (globally paced at 8h)
   fix-ci    fix red CI on one of our PRs
   fix       address review feedback on one of our PRs
@@ -134,7 +136,7 @@ environment (flags win; full reference linked below):
                          TauCeti its own Codex account without disturbing your interactive one
 
 full reference:
-  https://github.com/kim-em/TauCetiWorker/blob/main/docs/reference.md
+  https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/reference.md
 """
 
 
@@ -513,7 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Run 'tauceti work -h' for work units and examples, or 'tauceti workers -h'\n"
         "for persistent workers. Guide and reference:\n"
-        "  https://github.com/kim-em/TauCetiWorker",
+        "  https://github.com/TauCetiProject/TauCetiWorker",
     )
     sub = p.add_subparsers(dest="cmd")
 
