@@ -23,7 +23,11 @@ The PR body and its comments list the violations the daily lint found, but alway
 ## Rules of the repo (hard constraints)
 - Fix code under `TauCeti/` only. Do NOT edit `scripts/` (including `scripts/lint-baseline.txt` and `scripts/lint-nolints-allowlist.txt`), `.github/`, the lakefile, or the Lake pins. Do NOT add `@[nolint ...]`: every nolint must be allowlisted in a human-owned file, so CI rejects it. If a violation genuinely should be an exception, stop and say so in your report instead of silencing it.
 - Do NOT edit the root `TauCeti.lean`: it is intentionally empty.
-- Everything under `namespace TauCeti`. Tau Ceti does not preserve backwards compatibility: if you rename or restate a lemma, update every use in the repository in the same change.
+- Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
+  existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
+  `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
+  Tau Ceti does not preserve backwards compatibility: if you rename or restate a lemma, update every
+  use in the repository in the same change.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), and no `set_option` in `TauCeti/` at all (CI rejects it; it is how `maxHeartbeats` overrides and linter silencing happen).
 
