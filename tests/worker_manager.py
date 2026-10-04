@@ -71,13 +71,22 @@ def start_manager(config):
 config = wm.default_workers_config()
 assert config.is_relative_to(root), f"test configuration escaped its temporary root: {config}"
 specs = [
-    wm.WorkerSpec(id="worker1"),
+    wm.WorkerSpec(
+        id="worker1",
+        env=(("AWS_REGION", "us-east-1"), ("NOTE", 'spaces, "quotes", backslash\\, newline\nand τ')),
+    ),
     wm.WorkerSpec(id="worker2", agent="codex", only=("review",)),
-    wm.WorkerSpec(id="worker3", only=("roadmap",), roadmap_only="RepresentationTheory"),
+    wm.WorkerSpec(
+        id="worker3",
+        only=("roadmap",),
+        roadmap_only="RepresentationTheory",
+        env=(("REVIEW_EXPERIMENT", "separate-worker"),),
+    ),
 ]
 manager = None
 try:
     wm.save_worker_specs(config, specs)
+    # Each environment table must stay attached to its worker, including escaped string values.
     assert wm.load_worker_specs(config) == specs
 
     # Bare `tauceti workers` is the documented shorthand for `workers status`.
@@ -378,8 +387,15 @@ worker3 — backing off
     # Disabling is persistent desired state and stops that worker without disturbing peers.
     wm.set_worker_enabled(config, "worker3", False)
     wait_for(lambda: not wm.runner_status("worker3").get("alive"))
-    assert wm.load_worker_specs(config)[2].enabled is False
+    assert wm.load_worker_specs(config) == [*specs[:2], dataclasses.replace(specs[2], enabled=False)]
     assert wm.runner_status("worker1").get("wrapper_pid") == pids["worker1"]
+
+    # Re-enabling also rewrites the whole file and must preserve every worker's environment.
+    wm.set_worker_enabled(config, "worker3", True)
+    assert wm.load_worker_specs(config) == specs
+    assert wm.runner_status("worker1").get("wrapper_pid") == pids["worker1"]
+    wm.set_worker_enabled(config, "worker3", False)
+    wait_for(lambda: not wm.runner_status("worker3").get("alive"))
 
     # A changed definition restarts only the changed worker.
     current = wm.load_worker_specs(config)
