@@ -18,8 +18,25 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   lake build
   lake exe axioms
   lake exe module-system
-  bash scripts/lint-env.sh
   ```
+  The `build` check also runs the environment lint, on the TauCeti modules the PR changes. Run it
+  locally scoped the same way:
+  ```
+  lint_modules="$(mktemp)"
+  {
+    git diff --name-only --diff-filter=d origin/main...HEAD -- 'TauCeti/*.lean'
+    # Only if the PR carries the `full-lint` label (see below):
+    # for name in <last component of each declaration the failing log flags>; do
+    #   grep -rlw --include='*.lean' -- "$name" TauCeti
+    # done
+  } | sed 's/\.lean$//; s|/|.|g' | sort -u > "$lint_modules"
+  LINT_ONLY_MODULES="$lint_modules" bash scripts/lint-env.sh
+  ```
+  Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it.
+  If the PR carries the `full-lint` label, CI lints the whole library instead, so the changed
+  modules are not enough: uncomment the loop above, listing the last name component of each
+  declaration the failing log flags (`<linter> <declaration>`), so their defining modules are
+  linted too.
   If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
   overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
 
@@ -48,8 +65,8 @@ rm -f "$base_shims"; rm -rf "$base_root"
 lake build
 lake exe axioms
 lake exe module-system
-bash scripts/lint-env.sh
 ```
+Then run the scoped environment lint above and confirm it prints `LINT-ENV: PASS`.
 Iterate until every one is green. A green `lake build` alone is NOT enough — the `build` check also
 fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). Never push red.
 
