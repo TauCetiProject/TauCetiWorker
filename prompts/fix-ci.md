@@ -28,6 +28,9 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   LINT_ONLY_MODULES="$lint_modules" bash scripts/lint-env.sh
   ```
   Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it.
+  If the PR carries the `full-lint` label, CI lints the whole library instead, so also append to
+  `$lint_modules` the modules that define the declarations the failing log flags (find them with
+  `grep -rlw --include='*.lean' -- <declaration's last name component> TauCeti`).
   If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
   overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
 
