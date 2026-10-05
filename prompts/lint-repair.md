@@ -15,7 +15,11 @@ If the merge conflicts, resolve it (conflicts can only be in `TauCeti/`), or sto
 
 Repair existing declarations only: restate, re-annotate, or (if redundant) remove them. Do NOT add new lemmas or definitions: new mathematics needs a roadmap target, which a repair PR does not have. If a violation can only be fixed by adding one, stop and say so in your report.
 
-The PR body and its comments list the violations the daily lint found, but always work from the current full lint: `bash scripts/lint-env.sh` with `LINT_ONLY_MODULES` unset lints the whole library and prints each new violation with the linter's explanation.
+The PR body and its comments list the violations the daily lint found, and this PR's CI build lints the whole library, so its failing log is the current list: each violation with the linter's explanation. Work from that list, and from the latest daily-lint comment if it is newer than the last build. Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it. To check your repairs locally, lint only the modules that contain the flagged declarations: list them, one module name per line (for example `TauCeti.Foo.Bar`), in a file, then run
+```
+LINT_ONLY_MODULES=<that file> bash scripts/lint-env.sh
+```
+CI re-runs the full lint when you push.
 
 - For a failing check's CI logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and everything below passes locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
@@ -41,10 +45,10 @@ lake build --iofail
 lake env lean --run scripts/DuplicateDeclarations.lean
 lake exe axioms
 lake exe module-system
-bash scripts/lint-env.sh
+LINT_ONLY_MODULES=<the file of flagged modules> bash scripts/lint-env.sh
 bash scripts/lint-style.sh
 ```
-Iterate until every one is green, and `lint-env.sh` prints `LINT-ENV: PASS`. Never push red.
+Iterate until every one is green, and the scoped `lint-env.sh` prints `LINT-ENV: PASS`. Never push red.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
