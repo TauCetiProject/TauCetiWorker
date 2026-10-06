@@ -19,12 +19,12 @@ import tomllib
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import oauth as credential_refresh
 from .config import Config, log
-from .constants import CLAUDE_CMD
+from .constants import CLAUDE_CMD, POLL
 from .github import GitHubError, _parse_retry_after
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -38,6 +38,10 @@ SESSION_WINDOW_S = 5 * 3600
 WEEK_WINDOW_S = 7 * 24 * 3600
 
 QUOTA_TTL = {"codex": 600, "claude": 3600}
+
+# The longest a usage endpoint's HTTP 429 keeps us from asking again. Its Retry-After often asks for an
+# hour, which idled workers that still had quota; a fetch every 15 minutes costs the endpoint little.
+RATE_LIMIT_RECHECK_MAX_S = 15 * 60
 
 # Tolerance on a Claude reset clock that reads as already elapsed. Inside it we still treat the window
 # as live (it is about to roll); beyond it the endpoint is describing a window that has already ended,
@@ -370,6 +374,9 @@ class Provider:
     # Nothing acts on it except the explicit launch-stage call; reads never spend.
     bootstrap_eligible: bool = False
     pending_bootstrap: list[str] = field(default_factory=list)  # the idle windows a bootstrap would open
+    # The usage endpoint answered HTTP 429 (or we are still in the cooldown one started). Set whether the
+    # verdict came from a cached reading or not, so the latest fetch's outcome is never lost to the cache.
+    rate_limited: bool = False
 
 
 def _finite_num(x: object) -> bool:
@@ -1176,6 +1183,26 @@ class Quota:
             entry["valid_until"] = valid_until
         (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
 
+    def _cooldown_left(self, provider: str, fp: str | None) -> float:
+        """Seconds until this account's usage endpoint may be asked again after an HTTP 429, else 0.
+
+        Kept on disk beside the cache, so it binds every caller: an `auto` loop re-reads both providers
+        before each round, and without this a healthy codex kept the loop busy while it re-asked a
+        rate-limited Claude endpoint after every round."""
+        d = _read_json_file(self.cache_dir / f"ratelimit-{provider}.json")
+        until = d.get("until") if d and d.get("fp") == fp else None
+        if not _finite_num(until):
+            return 0.0
+        left = until - time.time()
+        # A cooldown longer than any we write is corrupt or from a clock jump; never let it park us longer.
+        return left if 0 < left <= RATE_LIMIT_RECHECK_MAX_S else 0.0
+
+    def _start_cooldown(self, provider: str, fp: str | None, retry_after: float | None) -> None:
+        """After an HTTP 429, hold off for its Retry-After (else one poll), but never past the cap."""
+        wait = min(retry_after or POLL, RATE_LIMIT_RECHECK_MAX_S)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / f"ratelimit-{provider}.json").write_text(json.dumps({"fp": fp, "until": time.time() + wait}))
+
     def _forget_raw(self, provider: str) -> None:
         """Drop a provider's cached payload so the next read must go to the network. Used after a
         bootstrap request: whatever we hold predates the request that was meant to change it."""
@@ -1466,6 +1493,18 @@ class Quota:
         cached = self._cached_codex(fp)
         if cached is not None and not refresh:
             return self._codex_from_payload(*cached)
+        cooling = self._cooldown_left("codex", fp)
+        if cooling:
+            if cached is not None:
+                return replace(self._codex_from_payload(*cached), rate_limited=True)
+            return Provider(
+                "codex",
+                False,
+                None,
+                error="codex usage HTTP 429 (cooling down)",
+                retry_after=cooling,
+                rate_limited=True,
+            )
         tok = (auth.get("tokens") or {}).get("access_token")
         if not tok:
             return Provider("codex", False, None, error="no codex access_token")
@@ -1492,11 +1531,13 @@ class Quota:
         # access token simply reads as unavailable until the operator's external refresher rotates it
         # and mirror_creds picks it up next cycle.
         if code != 200 or not payload:
+            if code == 429:
+                self._start_cooldown("codex", fp, retry_after)
             still = self._cached_codex(fp) if code != 401 else None
             if still is not None:
-                return self._codex_from_payload(*still)
+                return replace(self._codex_from_payload(*still), rate_limited=code == 429)
             err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
-            return Provider("codex", False, None, error=err, retry_after=retry_after)
+            return Provider("codex", False, None, error=err, retry_after=retry_after, rate_limited=code == 429)
         # Cache ONLY a payload whose windows say when they roll, and only until the first of those. The
         # endpoint reports time REMAINING, so re-reading an entry later would otherwise re-anchor every
         # window to the new present: the reset slides away, and past its real reset the entry describes a
@@ -1746,6 +1787,13 @@ class Quota:
         cached = self._cached_claude(fp)
         if cached is not None and not refresh:
             return self._from_cached_claude(cached)
+        cooling = self._cooldown_left("claude", fp)
+        if cooling:
+            if cached is not None:
+                prov, readings = self._from_cached_claude(cached)
+                return replace(prov, rate_limited=True), readings
+            err = "claude usage HTTP 429 (usage endpoint rate-limited; cooling down)"
+            return Provider("claude", False, None, error=err, retry_after=cooling, rate_limited=True), None
         if not tok:
             return Provider("claude", False, None, error="no claude accessToken"), None
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
@@ -1766,9 +1814,12 @@ class Quota:
         # survives into. Always name the status code: an auth failure, a rate-limited endpoint and a
         # server error are different problems with different fixes, and none of them is "usage unknown".
         if code != 200 or not payload:
+            if code == 429:
+                self._start_cooldown("claude", fp, retry_after)
             still = self._cached_claude(fp) if code != 401 else None
             if still is not None:
-                return self._from_cached_claude(still)
+                prov, readings = self._from_cached_claude(still)
+                return replace(prov, rate_limited=code == 429), readings
             err = f"claude usage HTTP {code}"
             if code == 401:
                 err += " (access token expired or rejected; log in again)"
@@ -1776,7 +1827,7 @@ class Quota:
                 err += " (usage endpoint rate-limited)"
             elif code == 200:
                 err = "claude usage response empty"
-            return Provider("claude", False, None, error=err, retry_after=retry_after), None
+            return Provider("claude", False, None, error=err, retry_after=retry_after, rate_limited=code == 429), None
         # A response that is not a JSON object is not a quota verdict — and .get() on it would raise
         # inside the pacer. Name it and fail closed.
         problem = _claude_payload_problem(payload)
@@ -1894,7 +1945,9 @@ class Quota:
             else w
             for w in prov.windows
         ]
-        return Provider("claude", False, None, wins, prov.error, prov.next_eligible, prov.retry_after, False, [])
+        return Provider(
+            "claude", False, None, wins, prov.error, prov.next_eligible, prov.retry_after, False, [], prov.rate_limited
+        )
 
     # --- the bounded post-reset bootstrap -----------------------------------
     def _idle_notes(self, readings: list[Reading]) -> tuple[dict[str, str], bool]:

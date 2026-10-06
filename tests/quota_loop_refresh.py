@@ -58,6 +58,7 @@ payload = {
     "seven_day": {"utilization": 1, "resets_at": reset_weekly},
 }
 q = tc.Quota.__new__(tc.Quota)
+q.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-stub-"))
 q._cached_claude = lambda _fp: (payload, time.time())
 q._idle_notes = lambda _readings: ({}, False)
 stores = []
@@ -336,20 +337,20 @@ waiting_cases = [
         "auto",
         {
             "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
-            "claude": tc.Provider("claude", False, None, error="usage HTTP 429", retry_after=1200),
+            "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=1200),
         },
         900,
     ),
     (
         "a short HTTP 429 Retry-After is still respected",
         "claude",
-        {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", retry_after=580)},
+        {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=580)},
         580,
     ),
     (
         "an HTTP 429 without Retry-After keeps the normal poll",
         "claude",
-        {"claude": tc.Provider("claude", False, None, error="usage HTTP 429")},
+        {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True)},
         tc.POLL,
     ),
     (
@@ -357,6 +358,24 @@ waiting_cases = [
         "claude",
         {"claude": tc.Provider("claude", False, None, error="usage HTTP 503", retry_after=3600)},
         3600,
+    ),
+    (
+        "a rate-limited provider does not hide another's earlier recovery",
+        "auto",
+        {
+            "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 60),
+            "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600),
+        },
+        tc.POLL,
+    ),
+    (
+        "another provider's long Retry-After does not delay a rate-limited recheck",
+        "auto",
+        {
+            "codex": tc.Provider("codex", False, None, error="usage HTTP 503", retry_after=3600),
+            "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600),
+        },
+        900,
     ),
 ]
 wait_ok = True
@@ -369,9 +388,9 @@ try:
     tc.loop.report_runtime = lambda *_a, **_k: None
     for label, agent, snap, expected in waiting_cases + [
         (
-            "an unpaced Claude worker caps HTTP 429 Retry-After at 15 minutes",
+            "an --ignore-quota Claude worker caps HTTP 429 Retry-After at 15 minutes",
             "claude",
-            {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", retry_after=3600)},
+            {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600)},
             900,
         )
     ]:
@@ -383,7 +402,9 @@ try:
             raise KeyboardInterrupt
 
         tc.loop.time.sleep = record_wait
-        args = SimpleNamespace(ignore_quota=label.startswith("an unpaced"), bubble=False, quota_cmd=None, source=None)
+        args = SimpleNamespace(
+            ignore_quota=label.startswith("an --ignore-quota"), bubble=False, quota_cmd=None, source=None
+        )
         tc.loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent=agent)
         passed = sleeps == [expected]
         wait_ok &= passed
@@ -394,4 +415,92 @@ finally:
     tc.loop.time.time = saved_clock
     tc.loop.report_runtime = saved_report
 
-sys.exit(0 if ok and semantic_ok and race_ok and frozen_ok and cache_ok and driver_ok and status_ok and wait_ok else 1)
+# The 15-minute cap on a 429 recheck holds even when the operator polls less often than that.
+saved_poll = tc.loop.POLL
+try:
+    tc.loop.POLL = 1800
+    limited = tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600)
+    long_poll = tc.loop._recheck_in(limited, wait_at)
+    slow_other = tc.loop._recheck_in(tc.Provider("codex", False, None), wait_at)
+finally:
+    tc.loop.POLL = saved_poll
+poll_ok = (long_poll, slow_other) == (900, 1800)
+print(f"[{'OK ' if poll_ok else 'XX '}] a long POLL does not stretch a 429 recheck: got={(long_poll, slow_other)!r}")
+
+# A 429 starts a cooldown on disk: until it ends, a forced read does not ask the endpoint again. It
+# reuses a still-valid cached reading, marked rate-limited, or else reports the 429 with the time left.
+cool = tc.Quota.__new__(tc.Quota)
+cool.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-cooldown-"))
+cool._idle_notes = lambda _readings: ({}, False)
+cool_fetches = []
+saved_http = tc.quota._http_get_json
+try:
+    tc.quota._http_get_json = lambda *_a, **_k: cool_fetches.append("fetch") or (429, {}, 3600)
+    first, _ = cool._claude_pass("fp", "token", refresh=True)
+    second, _ = cool._claude_pass("fp", "token", refresh=True)
+    other_account = cool._cooldown_left("claude", "other-fp")
+    cool._store_raw("claude", payload, "fp", time.time() + 7200, time.time())
+    cached, _ = cool._claude_pass("fp", "token", refresh=True)
+    (cool.cache_dir / "ratelimit-claude.json").write_text(json.dumps({"fp": "fp", "until": time.time() + 86400}))
+    corrupt = cool._cooldown_left("claude", "fp")
+finally:
+    tc.quota._http_get_json = saved_http
+cooldown_ok = (
+    cool_fetches == ["fetch"]
+    and first.rate_limited
+    and second.rate_limited
+    and 0 < second.retry_after <= tc.RATE_LIMIT_RECHECK_MAX_S
+    and other_account == 0
+    and cached.available
+    and cached.rate_limited
+    and corrupt == 0
+)
+print(
+    f"[{'OK ' if cooldown_ok else 'XX '}] a 429 cooldown stops re-asking the endpoint: fetches={cool_fetches!r} "
+    f"second={second.retry_after!r} other_account={other_account!r} cached=({cached.available}, "
+    f"{cached.rate_limited}) corrupt={corrupt!r}"
+)
+shutil.rmtree(cool.cache_dir, ignore_errors=True)
+
+# The same cooldown guards the codex endpoint.
+cx = tc.Quota.__new__(tc.Quota)
+cx.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-codex-cooldown-"))
+cx._codex_credentials_store = lambda: None
+cx._codex_creds = lambda: {"tokens": {"access_token": "token", "account_id": "acct"}}
+cx_fetches = []
+saved_http, saved_mirror = tc.quota._http_get_json, tc.quota.mirror_creds
+try:
+    tc.quota.mirror_creds = lambda _cfg: None
+    cx.cfg = None
+    tc.quota._http_get_json = lambda *_a, **_k: cx_fetches.append("fetch") or (429, {}, 1200)
+    cx_first = cx.codex(refresh=True)
+    cx_second = cx.codex(refresh=True)
+finally:
+    tc.quota._http_get_json, tc.quota.mirror_creds = saved_http, saved_mirror
+codex_cooldown_ok = (
+    cx_fetches == ["fetch"]
+    and cx_first.rate_limited
+    and cx_second.rate_limited
+    and 0 < cx_second.retry_after <= tc.RATE_LIMIT_RECHECK_MAX_S
+)
+print(
+    f"[{'OK ' if codex_cooldown_ok else 'XX '}] codex's 429 cooldown stops re-asking too: fetches={cx_fetches!r} "
+    f"second={cx_second.error!r}/{cx_second.retry_after!r}"
+)
+shutil.rmtree(cx.cache_dir, ignore_errors=True)
+
+sys.exit(
+    0
+    if ok
+    and semantic_ok
+    and race_ok
+    and frozen_ok
+    and cache_ok
+    and driver_ok
+    and status_ok
+    and wait_ok
+    and poll_ok
+    and cooldown_ok
+    and codex_cooldown_ok
+    else 1
+)
