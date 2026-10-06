@@ -515,6 +515,27 @@ try:
         cool_fetches.count("fetch") == 5 and not waited.rate_limited and 1700 < waited.retry_after <= 1800
     )
 
+    disk = cooldown_quota("disk")
+    responses[:] = [(429, {}, 600), (429, {}, 60)]
+    disk._claude_pass("t", "token", refresh=True, account="acct")
+    tc.quota._COOLDOWNS.clear()  # what another process sees: the record on disk alone
+    persisted = disk._cooldown("claude", "acct")[0]
+    disk._start_cooldown("claude", "acct", 429, 60)
+    tc.quota._COOLDOWNS.clear()
+    cool_checks["the cooldown persists on disk, and a shorter one does not replace it"] = 590 < persisted and (
+        590 < disk._cooldown("claude", "acct")[0]
+    )
+    responses[:] = []
+
+    rejected = cooldown_quota("401")
+    rejected._store_raw("claude", payload, "t", time.time() + 7200, time.time())
+    responses[:] = [(401, {}, 600), (200, payload, None)]
+    denied, _ = rejected._claude_pass("t", "token", refresh=True, account="acct")
+    again, _ = rejected._claude_pass("t", "token", refresh=True, account="acct")
+    cool_checks["a 401 never cools down, so its cached reading cannot answer for it"] = (
+        not denied.available and rejected._cooldown("claude", "acct")[0] == 0 and responses == []
+    )
+
     bare = cooldown_quota("headerless")
     tc.quota.POLL = 1800
     responses[:] = [(429, {}, None)]

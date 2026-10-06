@@ -749,6 +749,20 @@ def _read_json_file(path: Path) -> dict | None:
         return None
 
 
+def _cooldown_left(record: object) -> tuple[float, int | None]:
+    """(seconds left, the HTTP status that started it) for one usage-endpoint cooldown record, or
+    (0, None) for an expired, absent or corrupt one."""
+    if not isinstance(record, dict):
+        return 0.0, None
+    until, wait, code = record.get("until"), record.get("wait"), record.get("code")
+    if not (_finite_num(until) and _finite_num(wait) and 0 < wait <= RETRY_AFTER_MAX_S):
+        return 0.0, None  # corrupt: never let it park us
+    # A wall clock stepped backwards makes the remainder look longer than the wait itself; that is still
+    # a cooldown, just one we can only bound by its own length.
+    left = min(until - time.time(), wait)
+    return (left, code if isinstance(code, int) else None) if left > 0 else (0.0, None)
+
+
 def _safe_exists(path: Path) -> bool:
     """Path.exists() that never raises. A permission-denied probe (EPERM/EACCES — e.g. a sandbox or
     macOS data protection that walls off ~/.codex or ~/.claude) degrades to False instead of crashing,
@@ -1201,46 +1215,53 @@ class Quota:
         Kept on disk beside the cache, one record per account, so it binds every caller sharing this
         cache: an `auto` loop re-reads both providers before each round, and without this a healthy
         codex kept the loop busy while it re-asked a rate-limited Claude endpoint after every round."""
-        records = [_COOLDOWNS.get((str(self.cache_dir), provider, key or ""))]
-        records.append(_read_json_file(self._cooldown_path(provider, key)))
-        best: tuple[float, int | None] = (0.0, None)
-        now = time.time()
-        for d in records:
-            if not isinstance(d, dict):
-                continue
-            until, wait, code = d.get("until"), d.get("wait"), d.get("code")
-            if not (_finite_num(until) and _finite_num(wait) and 0 < wait <= RETRY_AFTER_MAX_S):
-                continue  # corrupt: never let it park us, and never let it shorten a real one
-            # A wall clock stepped backwards makes the remainder look longer than the wait itself; that
-            # is still a cooldown, just one we can only bound by its own length.
-            left = min(until - now, wait)
-            if left > best[0]:
-                best = (left, code if isinstance(code, int) else None)
-        return best
+        memory = _cooldown_left(_COOLDOWNS.get((str(self.cache_dir), provider, key or "")))
+        disk = _cooldown_left(_read_json_file(self._cooldown_path(provider, key)))
+        return max(memory, disk, key=lambda left_code: left_code[0])
 
     def _start_cooldown(self, provider: str, key: str | None, code: int, retry_after: float | None) -> None:
         """Hold off after an HTTP 429 for its Retry-After (else one poll), at most
         RATE_LIMIT_RECHECK_MAX_S; after any other status that sent a Retry-After, for that long.
-        Never shortens a longer cooldown already running."""
+        Never shortens a longer cooldown already running.
+
+        Never after a 401: that rejects the credential, which a wait does not fix, and a cooldown would
+        let a cached reading taken under the rejected credential answer for it again."""
+        if code == 401:
+            return
         if code == 429:
             wait = min(retry_after or POLL, RATE_LIMIT_RECHECK_MAX_S)
         elif retry_after:
             wait = min(retry_after, RETRY_AFTER_MAX_S)
         else:
             return
-        if wait <= 0 or self._cooldown(provider, key)[0] >= wait:
+        if wait <= 0:
             return
         record = {"until": time.time() + wait, "wait": wait, "code": code}
-        _COOLDOWNS[(str(self.cache_dir), provider, key or "")] = record
+        mem = (str(self.cache_dir), provider, key or "")
+        if _cooldown_left(_COOLDOWNS.get(mem))[0] < wait:
+            _COOLDOWNS[mem] = record
         path = self._cooldown_path(provider, key)
+        fd = None
         try:
-            # Write-then-rename, so a concurrent reader never sees a truncated record as "no cooldown".
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            # Re-check and write under a lock, so two callers answering at once cannot replace a longer
+            # cooldown with a shorter one; write-then-rename, so a reader never sees a truncated record.
+            fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if _cooldown_left(_read_json_file(path))[0] >= wait:
+                return
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(record))
             os.replace(tmp, path)
         except OSError as e:
             log(f"{provider} quota: could not record the usage endpoint's cooldown ({e}); this process still honors it")
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _cooling_provider(self, provider: str, left: float, code: int | None) -> Provider:
         """The verdict while a cooldown holds and no usable cached reading exists: the status that
@@ -1765,7 +1786,7 @@ class Quota:
         # re-fetch); an external same-account refresh also changes it, costing one harmless extra fetch.
         # The bootstrap RESERVATION deliberately does not use this — see _claude_account_key.
         fp = self._fingerprint(oauth.get("accessToken"))
-        account = self._claude_account_key()
+        account = self._claude_account_key(oauth)  # from the same snapshot as the token it fetches with
         prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh, account=account)
         if renew and _claude_unauthorized(prov):
             # The stored expiry said the token was live and the endpoint disagreed — a clock skew, a
@@ -1777,7 +1798,7 @@ class Quota:
                 if oauth:
                     fp = self._fingerprint(oauth.get("accessToken"))
                     prov, _readings = self._claude_pass(
-                        fp, oauth.get("accessToken"), refresh=True, account=self._claude_account_key()
+                        fp, oauth.get("accessToken"), refresh=True, account=self._claude_account_key(oauth)
                     )
         return prov
 
@@ -2025,8 +2046,10 @@ class Quota:
         src = _read_marker(d / ".tauceti-creds-source")
         return Path(src) if src else d
 
-    def _claude_account_key(self) -> str:
-        """A stable identity for the Claude ACCOUNT, used to scope the shared bootstrap reservation.
+    def _claude_account_key(self, oauth: dict | None = None) -> str:
+        """A stable identity for the Claude ACCOUNT, used to scope the shared bootstrap reservation and
+        the usage endpoint's cooldown (see _cooldown). `oauth` is the credential snapshot the caller is
+        already acting on; without it the credential is read afresh.
 
         Deliberately NOT the access-token fingerprint the cache uses: an ordinary token refresh rotates
         that without changing either the account or the reset episode, which would silently hand every
@@ -2035,7 +2058,8 @@ class Quota:
         canonical credential-source PATH. LIMITATION of that fallback: it serializes workers that share
         a credential file (the fleet case this exists for), but two hosts with separate copies of the
         same account cannot see each other's reservations and may each spend one bootstrap request."""
-        oauth, _kc = self._claude_creds()
+        if oauth is None:
+            oauth, _kc = self._claude_creds()
         for key in ("accountUuid", "account_uuid", "accountId", "organizationUuid", "emailAddress"):
             val = (oauth or {}).get(key)
             if isinstance(val, str) and val:
