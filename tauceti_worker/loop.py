@@ -12,7 +12,7 @@ from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
-from .quota import Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
+from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
@@ -21,10 +21,23 @@ class _LoopTerminated(KeyboardInterrupt):
     """SIGTERM translated to the same teardown path as Ctrl-C, with the right exit code."""
 
 
-def _quota_retry_after(prov: Provider) -> float:
-    """Recheck a rate-limited usage endpoint within 15 minutes, even with a longer Retry-After."""
-    delay = prov.retry_after or 0
-    return min(delay, 15 * 60) if prov.error and "HTTP 429" in prov.error else delay
+def _recheck_in(prov: Provider | None, now: float) -> int:
+    """How long until it is worth reading this provider's usage again, while waiting for quota.
+
+    A rate-limited endpoint (HTTP 429): its Retry-After, capped at RATE_LIMIT_RECHECK_MAX_S, and that
+    cap beats even a longer POLL. Any other Retry-After is honored as given. Otherwise the moment a
+    blocking window frees (hourly at most, so sibling workers and operator activity are still
+    observed), else the next poll. Never sooner than POLL: the next read would only re-trip a limit."""
+    if prov is None:
+        return POLL
+    if prov.rate_limited and prov.error:  # no usable reading; a cached one waits on its own clock below
+        cap = RATE_LIMIT_RECHECK_MAX_S
+        return int(max(min(POLL, cap), min(prov.retry_after or POLL, cap)))
+    if prov.retry_after:
+        return int(max(POLL, prov.retry_after))
+    if prov.next_eligible:
+        return max(POLL, min(int(prov.next_eligible - now) + 5, 3600))
+    return POLL
 
 
 def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
@@ -120,11 +133,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     verdict, pending_init = "run", True
                 if verdict == "wait":
                     why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
-                    # Cap a usage-endpoint 429 wait at 15 minutes; otherwise honor Retry-After or
-                    # the blocking window's recovery clock. Never poll sooner than POLL.
-                    nap = max(POLL, int(_quota_retry_after(prov)) if prov else 0)
-                    if prov and not prov.retry_after and prov.next_eligible:
-                        nap = max(nap, min(int(prov.next_eligible - time.time()) + 5, 3600))
+                    nap = _recheck_in(prov, time.time())
                     # A loop DOES wait this out, so the wording stays — but a rejected credential is not
                     # something waiting fixes, and an unattended loop can poll on one indefinitely, so
                     # name the command that ends it here too.
@@ -143,20 +152,15 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 if model is None and claude_pending_init(snap):
                     model, pending_init = "claude", True
                 if model is None:
-                    # Keep short Retry-After waits, but recheck a usage-endpoint 429 within 15 minutes.
-                    nap = max(POLL, max((_quota_retry_after(p) for p in snap.values()), default=0))
-                    if not any(p.retry_after for p in snap.values()):
-                        eligible = [p.next_eligible for p in snap.values() if p.next_eligible]
-                        # A known pacing recovery only justifies a longer sleep when EVERY candidate
-                        # provider has a recovery clock. An idle/unknown alternative may become usable
-                        # at the next poll; another provider's distant reset must not hide that change.
-                        if eligible and all(p.next_eligible for p in snap.values()):
-                            # A forced refresh is valuable before a launch, not every five minutes
-                            # throughout a known multi-hour wait. Recheck at least hourly so sibling
-                            # workers or operator activity are still observed reasonably promptly. A
-                            # pace-blocked window reports when the budget overtakes its usage, which is
-                            # usually well before its reset, so this sleeps to the line, not past it.
-                            nap = max(nap, min(int(min(eligible) - time.time()) + 5, 3600))
+                    # Wake for whichever provider can change first. An idle/unknown alternative may
+                    # become usable at the next poll, so another provider's distant reset or long
+                    # Retry-After must not hide that. Waking early for one provider cannot re-trip
+                    # another's rate limit: the pacer will not ask an endpoint that is still cooling
+                    # down after a 429 (Quota._cooldown_left), it reuses the last answer instead. A
+                    # pace-blocked window reports when the budget overtakes its usage, which is usually
+                    # well before its reset, so a long wait sleeps to the line, not past it.
+                    now = time.time()
+                    nap = min((_recheck_in(p, now) for p in snap.values()), default=POLL)
                     # Neither destination renders Rich markup: log() writes to stderr and a file, and a
                     # runtime-status detail is read back as data.
                     waiting = _wait_quota_line(snap, markup=False)
