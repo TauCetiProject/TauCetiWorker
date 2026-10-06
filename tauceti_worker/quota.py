@@ -43,6 +43,14 @@ QUOTA_TTL = {"codex": 600, "claude": 3600}
 # hour, which idled workers that still had quota; a fetch every 15 minutes costs the endpoint little.
 RATE_LIMIT_RECHECK_MAX_S = 15 * 60
 
+# The longest any usage endpoint's Retry-After is honored (_parse_retry_after caps at this too).
+RETRY_AFTER_MAX_S = 3600
+
+# This process's copy of every cooldown it started, keyed (cache dir, provider, account key) and holding
+# {until, wait, code}. The on-disk record is what other callers see; this keeps the protection when the
+# cache directory cannot be written.
+_COOLDOWNS: dict[tuple[str, str, str], dict] = {}
+
 # Tolerance on a Claude reset clock that reads as already elapsed. Inside it we still treat the window
 # as live (it is about to roll); beyond it the endpoint is describing a window that has already ended,
 # so its usage figure no longer paces the current one (see _claude_record_state).
@@ -1183,25 +1191,66 @@ class Quota:
             entry["valid_until"] = valid_until
         (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
 
-    def _cooldown_left(self, provider: str, fp: str | None) -> float:
-        """Seconds until this account's usage endpoint may be asked again after an HTTP 429, else 0.
+    def _cooldown_path(self, provider: str, key: str | None) -> Path:
+        return self.cache_dir / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"
 
-        Kept on disk beside the cache, so it binds every caller: an `auto` loop re-reads both providers
-        before each round, and without this a healthy codex kept the loop busy while it re-asked a
-        rate-limited Claude endpoint after every round."""
-        d = _read_json_file(self.cache_dir / f"ratelimit-{provider}.json")
-        until = d.get("until") if d and d.get("fp") == fp else None
-        if not _finite_num(until):
-            return 0.0
-        left = until - time.time()
-        # A cooldown longer than any we write is corrupt or from a clock jump; never let it park us longer.
-        return left if 0 < left <= RATE_LIMIT_RECHECK_MAX_S else 0.0
+    def _cooldown(self, provider: str, key: str | None) -> tuple[float, int | None]:
+        """(seconds until this account's usage endpoint may be asked again, the HTTP status that started
+        the wait), or (0, None) when nothing holds it back.
 
-    def _start_cooldown(self, provider: str, fp: str | None, retry_after: float | None) -> None:
-        """After an HTTP 429, hold off for its Retry-After (else one poll), but never past the cap."""
-        wait = min(retry_after or POLL, RATE_LIMIT_RECHECK_MAX_S)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        (self.cache_dir / f"ratelimit-{provider}.json").write_text(json.dumps({"fp": fp, "until": time.time() + wait}))
+        Kept on disk beside the cache, one record per account, so it binds every caller sharing this
+        cache: an `auto` loop re-reads both providers before each round, and without this a healthy
+        codex kept the loop busy while it re-asked a rate-limited Claude endpoint after every round."""
+        records = [_COOLDOWNS.get((str(self.cache_dir), provider, key or ""))]
+        records.append(_read_json_file(self._cooldown_path(provider, key)))
+        best: tuple[float, int | None] = (0.0, None)
+        now = time.time()
+        for d in records:
+            if not isinstance(d, dict):
+                continue
+            until, wait, code = d.get("until"), d.get("wait"), d.get("code")
+            if not (_finite_num(until) and _finite_num(wait) and 0 < wait <= RETRY_AFTER_MAX_S):
+                continue  # corrupt: never let it park us, and never let it shorten a real one
+            # A wall clock stepped backwards makes the remainder look longer than the wait itself; that
+            # is still a cooldown, just one we can only bound by its own length.
+            left = min(until - now, wait)
+            if left > best[0]:
+                best = (left, code if isinstance(code, int) else None)
+        return best
+
+    def _start_cooldown(self, provider: str, key: str | None, code: int, retry_after: float | None) -> None:
+        """Hold off after an HTTP 429 for its Retry-After (else one poll), at most
+        RATE_LIMIT_RECHECK_MAX_S; after any other status that sent a Retry-After, for that long.
+        Never shortens a longer cooldown already running."""
+        if code == 429:
+            wait = min(retry_after or POLL, RATE_LIMIT_RECHECK_MAX_S)
+        elif retry_after:
+            wait = min(retry_after, RETRY_AFTER_MAX_S)
+        else:
+            return
+        if wait <= 0 or self._cooldown(provider, key)[0] >= wait:
+            return
+        record = {"until": time.time() + wait, "wait": wait, "code": code}
+        _COOLDOWNS[(str(self.cache_dir), provider, key or "")] = record
+        path = self._cooldown_path(provider, key)
+        try:
+            # Write-then-rename, so a concurrent reader never sees a truncated record as "no cooldown".
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(record))
+            os.replace(tmp, path)
+        except OSError as e:
+            log(f"{provider} quota: could not record the usage endpoint's cooldown ({e}); this process still honors it")
+
+    def _cooling_provider(self, provider: str, left: float, code: int | None) -> Provider:
+        """The verdict while a cooldown holds and no usable cached reading exists: the status that
+        started it, and how long remains."""
+        err = f"{provider} usage HTTP {code or 429}"
+        if code == 429 and provider == "claude":
+            err += " (usage endpoint rate-limited; cooling down)"
+        else:
+            err += " (cooling down)"
+        return Provider(provider, False, None, error=err, retry_after=left, rate_limited=code == 429)
 
     def _forget_raw(self, provider: str) -> None:
         """Drop a provider's cached payload so the next read must go to the network. Used after a
@@ -1491,20 +1540,11 @@ class Quota:
         # token itself when no id is available.
         fp = self._codex_account_id(auth) or self._fingerprint((auth.get("tokens") or {}).get("access_token"))
         cached = self._cached_codex(fp)
-        if cached is not None and not refresh:
-            return self._codex_from_payload(*cached)
-        cooling = self._cooldown_left("codex", fp)
-        if cooling:
-            if cached is not None:
-                return replace(self._codex_from_payload(*cached), rate_limited=True)
-            return Provider(
-                "codex",
-                False,
-                None,
-                error="codex usage HTTP 429 (cooling down)",
-                retry_after=cooling,
-                rate_limited=True,
-            )
+        left, cooled_by = self._cooldown("codex", fp)
+        if cached is not None and (left or not refresh):
+            return replace(self._codex_from_payload(*cached), rate_limited=cooled_by == 429)
+        if left:
+            return self._cooling_provider("codex", left, cooled_by)
         tok = (auth.get("tokens") or {}).get("access_token")
         if not tok:
             return Provider("codex", False, None, error="no codex access_token")
@@ -1531,8 +1571,7 @@ class Quota:
         # access token simply reads as unavailable until the operator's external refresher rotates it
         # and mirror_creds picks it up next cycle.
         if code != 200 or not payload:
-            if code == 429:
-                self._start_cooldown("codex", fp, retry_after)
+            self._start_cooldown("codex", fp, code, retry_after)
             still = self._cached_codex(fp) if code != 401 else None
             if still is not None:
                 return replace(self._codex_from_payload(*still), rate_limited=code == 429)
@@ -1726,7 +1765,8 @@ class Quota:
         # re-fetch); an external same-account refresh also changes it, costing one harmless extra fetch.
         # The bootstrap RESERVATION deliberately does not use this — see _claude_account_key.
         fp = self._fingerprint(oauth.get("accessToken"))
-        prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh)
+        account = self._claude_account_key()
+        prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh, account=account)
         if renew and _claude_unauthorized(prov):
             # The stored expiry said the token was live and the endpoint disagreed — a clock skew, a
             # server-side revocation, or a credential rotated behind our back. Believe the endpoint over
@@ -1736,7 +1776,9 @@ class Quota:
                 oauth, _from_keychain = self._claude_creds()
                 if oauth:
                     fp = self._fingerprint(oauth.get("accessToken"))
-                    prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=True)
+                    prov, _readings = self._claude_pass(
+                        fp, oauth.get("accessToken"), refresh=True, account=self._claude_account_key()
+                    )
         return prov
 
     def authorize_claude_launch(self) -> Provider:
@@ -1774,7 +1816,7 @@ class Quota:
         return self.claude(renew=True)  # the fresh telemetry decides, including whether there is headroom to spend
 
     def _claude_pass(
-        self, fp: str | None, tok: str | None, *, refresh: bool = False
+        self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
     ) -> tuple[Provider, list[Reading] | None]:
         """One read of the usage endpoint (cache-aware) turned into a Provider. Returns readings=None
         when no payload was obtained at all, so the caller can tell "the endpoint would not answer"
@@ -1784,16 +1826,16 @@ class Quota:
         Usage only rises inside a window, so a stale figure is a lower bound; pacing it against a budget
         that has meanwhile climbed would let a reading that was over pace when taken authorize a launch
         purely because time passed, with nothing fresh to say the quota is still there."""
+        # The cooldown belongs to the ACCOUNT (see _claude_account_key), not the token the cache is keyed
+        # by: renewing the token must not license asking a rate-limited endpoint again.
+        account = account or fp
         cached = self._cached_claude(fp)
-        if cached is not None and not refresh:
-            return self._from_cached_claude(cached)
-        cooling = self._cooldown_left("claude", fp)
-        if cooling:
-            if cached is not None:
-                prov, readings = self._from_cached_claude(cached)
-                return replace(prov, rate_limited=True), readings
-            err = "claude usage HTTP 429 (usage endpoint rate-limited; cooling down)"
-            return Provider("claude", False, None, error=err, retry_after=cooling, rate_limited=True), None
+        left, cooled_by = self._cooldown("claude", account)
+        if cached is not None and (left or not refresh):
+            prov, readings = self._from_cached_claude(cached)
+            return replace(prov, rate_limited=cooled_by == 429), readings
+        if left:
+            return self._cooling_provider("claude", left, cooled_by), None
         if not tok:
             return Provider("claude", False, None, error="no claude accessToken"), None
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
@@ -1814,8 +1856,7 @@ class Quota:
         # survives into. Always name the status code: an auth failure, a rate-limited endpoint and a
         # server error are different problems with different fixes, and none of them is "usage unknown".
         if code != 200 or not payload:
-            if code == 429:
-                self._start_cooldown("claude", fp, retry_after)
+            self._start_cooldown("claude", account, code, retry_after)
             still = self._cached_claude(fp) if code != 401 else None
             if still is not None:
                 prov, readings = self._from_cached_claude(still)

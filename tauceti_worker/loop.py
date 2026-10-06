@@ -30,9 +30,9 @@ def _recheck_in(prov: Provider | None, now: float) -> int:
     observed), else the next poll. Never sooner than POLL: the next read would only re-trip a limit."""
     if prov is None:
         return POLL
-    if prov.rate_limited and prov.retry_after:
+    if prov.rate_limited and prov.error:  # no usable reading; a cached one waits on its own clock below
         cap = RATE_LIMIT_RECHECK_MAX_S
-        return int(max(min(POLL, cap), min(prov.retry_after, cap)))
+        return int(max(min(POLL, cap), min(prov.retry_after or POLL, cap)))
     if prov.retry_after:
         return int(max(POLL, prov.retry_after))
     if prov.next_eligible:
