@@ -763,6 +763,12 @@ def _cooldown_left(record: object) -> tuple[float, int | None]:
     return (left, code if isinstance(code, int) else None) if left > 0 else (0.0, None)
 
 
+def _outlasts(record: object, until: float) -> bool:
+    """Whether a live cooldown record already runs to `until` or beyond. Deadline against deadline, so
+    the answer does not depend on how long the caller took to get here."""
+    return time.time() + _cooldown_left(record)[0] >= until
+
+
 def _safe_exists(path: Path) -> bool:
     """Path.exists() that never raises. A permission-denied probe (EPERM/EACCES — e.g. a sandbox or
     macOS data protection that walls off ~/.codex or ~/.claude) degrades to False instead of crashing,
@@ -1238,7 +1244,7 @@ class Quota:
             return
         record = {"until": time.time() + wait, "wait": wait, "code": code}
         mem = (str(self.cache_dir), provider, key or "")
-        if _cooldown_left(_COOLDOWNS.get(mem))[0] < wait:
+        if not _outlasts(_COOLDOWNS.get(mem), record["until"]):
             _COOLDOWNS[mem] = record
         path = self._cooldown_path(provider, key)
         fd = None
@@ -1248,7 +1254,7 @@ class Quota:
             # cooldown with a shorter one; write-then-rename, so a reader never sees a truncated record.
             fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
-            if _cooldown_left(_read_json_file(path))[0] >= wait:
+            if _outlasts(_read_json_file(path), record["until"]):
                 return
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(record))

@@ -527,6 +527,28 @@ try:
     )
     responses[:] = []
 
+    # Two writers interleaved: A builds a 60s cooldown at t=100 (until 160), then waits for the lock
+    # while B records a 70s one at t=110 (until 180). At t=130 B has only 50s left, less than A's 60, but
+    # its deadline is later, so A must not replace it.
+    race = cooldown_quota("race")
+    clock = [100.0]
+    saved_time, saved_flock = tc.quota.time.time, tc.quota.fcntl.flock
+
+    def b_writes_first(fd, op):
+        if op == tc.quota.fcntl.LOCK_EX:
+            race._cooldown_path("claude", "acct").write_text(json.dumps({"until": 180.0, "wait": 70, "code": 429}))
+            clock[0] = 130.0
+        return saved_flock(fd, op)
+
+    try:
+        tc.quota.time.time = lambda: clock[0]
+        tc.quota.fcntl.flock = b_writes_first
+        race._start_cooldown("claude", "acct", 429, 60)
+    finally:
+        tc.quota.time.time, tc.quota.fcntl.flock = saved_time, saved_flock
+    on_disk = json.loads(race._cooldown_path("claude", "acct").read_text())
+    cool_checks["a concurrent writer cannot pull a later deadline earlier"] = on_disk["until"] == 180.0
+
     rejected = cooldown_quota("401")
     rejected._store_raw("claude", payload, "t", time.time() + 7200, time.time())
     responses[:] = [(401, {}, 600), (200, payload, None)]
