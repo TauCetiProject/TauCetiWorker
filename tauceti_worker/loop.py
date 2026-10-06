@@ -21,6 +21,12 @@ class _LoopTerminated(KeyboardInterrupt):
     """SIGTERM translated to the same teardown path as Ctrl-C, with the right exit code."""
 
 
+def _quota_retry_after(prov: Provider) -> float:
+    """Recheck a rate-limited usage endpoint within 15 minutes, even with a longer Retry-After."""
+    delay = prov.retry_after or 0
+    return min(delay, 15 * 60) if prov.error and "HTTP 429" in prov.error else delay
+
+
 def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
     """Render the immediate pacing bottleneck when it defers an otherwise-initializable idle window.
 
@@ -114,9 +120,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     verdict, pending_init = "run", True
                 if verdict == "wait":
                     why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
-                    # Honor the endpoint's Retry-After, else wait until the blocking window is next
-                    # eligible (capped), else poll. Never sooner than POLL, so we don't re-trip a 429.
-                    nap = max(POLL, int(prov.retry_after) if (prov and prov.retry_after) else 0)
+                    # Cap a usage-endpoint 429 wait at 15 minutes; otherwise honor Retry-After or
+                    # the blocking window's recovery clock. Never poll sooner than POLL.
+                    nap = max(POLL, int(_quota_retry_after(prov)) if prov else 0)
                     if prov and not prov.retry_after and prov.next_eligible:
                         nap = max(nap, min(int(prov.next_eligible - time.time()) + 5, 3600))
                     # A loop DOES wait this out, so the wording stays — but a rejected credential is not
@@ -137,9 +143,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 if model is None and claude_pending_init(snap):
                     model, pending_init = "claude", True
                 if model is None:
-                    # Honor a provider's Retry-After (e.g. a 429 asking for 580s) over the fixed poll, so
-                    # we don't re-trip a rate limit by polling sooner than the server asked.
-                    nap = max(POLL, max((p.retry_after or 0 for p in snap.values()), default=0))
+                    # Keep short Retry-After waits, but recheck a usage-endpoint 429 within 15 minutes.
+                    nap = max(POLL, max((_quota_retry_after(p) for p in snap.values()), default=0))
                     if not any(p.retry_after for p in snap.values()):
                         eligible = [p.next_eligible for p in snap.values() if p.next_eligible]
                         # A known pacing recovery only justifies a longer sleep when EVERY candidate
