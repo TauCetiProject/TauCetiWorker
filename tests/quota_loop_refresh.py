@@ -332,13 +332,31 @@ waiting_cases = [
         3600,
     ),
     (
-        "an alternative's Retry-After is still respected",
+        "an alternative's HTTP 429 Retry-After is capped at 15 minutes",
         "auto",
         {
             "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
             "claude": tc.Provider("claude", False, None, error="usage HTTP 429", retry_after=1200),
         },
-        1200,
+        900,
+    ),
+    (
+        "a short HTTP 429 Retry-After is still respected",
+        "claude",
+        {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", retry_after=580)},
+        580,
+    ),
+    (
+        "an HTTP 429 without Retry-After keeps the normal poll",
+        "claude",
+        {"claude": tc.Provider("claude", False, None, error="usage HTTP 429")},
+        tc.POLL,
+    ),
+    (
+        "a non-429 Retry-After remains unchanged",
+        "claude",
+        {"claude": tc.Provider("claude", False, None, error="usage HTTP 503", retry_after=3600)},
+        3600,
     ),
 ]
 wait_ok = True
@@ -349,7 +367,14 @@ saved_report = tc.loop.report_runtime
 try:
     tc.loop.time.time = lambda: wait_at
     tc.loop.report_runtime = lambda *_a, **_k: None
-    for label, agent, snap, expected in waiting_cases:
+    for label, agent, snap, expected in waiting_cases + [
+        (
+            "an unpaced Claude worker caps HTTP 429 Retry-After at 15 minutes",
+            "claude",
+            {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", retry_after=3600)},
+            900,
+        )
+    ]:
         sleeps = []
         tc.loop.choose_model = lambda *_a, snapshot=snap, **_k: (None, snapshot)
 
@@ -358,7 +383,7 @@ try:
             raise KeyboardInterrupt
 
         tc.loop.time.sleep = record_wait
-        args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None, source=None)
+        args = SimpleNamespace(ignore_quota=label.startswith("an unpaced"), bubble=False, quota_cmd=None, source=None)
         tc.loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent=agent)
         passed = sleeps == [expected]
         wait_ok &= passed
