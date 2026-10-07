@@ -20,6 +20,9 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
     LINT_REPAIR_HEAD_PREFIX,
+    LOST_BUILD_CANCEL_GRACE_S,
+    LOST_BUILD_GRACE_S,
+    LOST_BUILD_TTL,
     MAX_BUMP_ATTEMPTS,
     MAX_BUMP_PR_ATTEMPTS,
     MAX_CI_ATTEMPTS,
@@ -124,6 +127,9 @@ class PRInfo:
     # changed since it last read its comments (see ReviewState.observe). Free in the query we already
     # make; "" when unknown, which reads as "cannot tell" and falls back to the plain TTL.
     updated_at: str = ""
+    # Whether the head carries any `build` status at all. Without one a PR is pending, unless its
+    # build finished without posting one (see lost_builds).
+    build_reported: bool = False
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -159,6 +165,7 @@ class PRInfo:
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
+            build_reported=bool(build_states),
         )
 
 
@@ -566,6 +573,83 @@ def bust_progress_cache(cfg: Config) -> None:
         pass
 
 
+def build_lost(runs: list[dict], now: float) -> bool:
+    """Whether pr-build has finished with a head for good without posting its `build` status, given
+    that head's pr-build runs (GitHub.pr_build_runs).
+
+    The same test as TauCeti's stuck-PR watchdog (missing-status in scripts/pr_status/stuck_alerts.py):
+    a run still queued or in progress is the ordinary wait, and a cancelled or skipped run never reaches
+    its report step by design, so a finished run that reached a verdict proves the status should exist.
+    The grace covers a status that is merely slow to appear. A head whose runs were all cancelled or
+    skipped is lost only after LOST_BUILD_CANCEL_GRACE_S, since a superseding run ordinarily follows."""
+    if not runs or any(r.get("status") != "completed" for r in runs):
+        return False
+    verdicts = [r.get("updated_at") for r in runs if r.get("conclusion") not in ("cancelled", "skipped")]
+    finished = [t for t in map(_parse_iso8601, verdicts) if t is not None]
+    if finished:
+        return now - max(finished) >= LOST_BUILD_GRACE_S
+    ended = [t for t in map(_parse_iso8601, (r.get("updated_at") for r in runs)) if t is not None]
+    return bool(ended) and now - max(ended) >= LOST_BUILD_CANCEL_GRACE_S
+
+
+def dispatch_pending(dispatches: list[dict], pr: int, now: float) -> bool:
+    """Whether a manually dispatched pr-build (GitHub.pr_build_dispatches) may still post `pr`'s `build`
+    status: one titled for the PR that is running or finished within the grace, or a running one titled
+    plain `pr-build`, as pr-build titled every run before it began naming the PR (TauCeti#11541)."""
+    for d in dispatches:
+        title = d.get("display_title") or ""
+        if title not in ("pr-build", f"pr-build {pr}"):
+            continue
+        if d.get("status") != "completed":
+            return True
+        done = _parse_iso8601(d.get("updated_at"))
+        if title != "pr-build" and done is not None and now - done < LOST_BUILD_GRACE_S:
+            return True
+    return False
+
+
+def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[int]:
+    """The PRs among `prs` whose head finished pr-build without a `build` status (see build_lost).
+
+    The open-PR query reads statuses only (_OPEN_PRS_QUERY in github.py says why), so this costs a REST
+    call per head. It is paid only for a head with no status whose PR has not moved for the grace
+    period, and a verdict is cached per head for LOST_BUILD_TTL. A replacement build dispatched by PR
+    number is keyed to another commit, so whenever a head looks lost one more call reads the recent
+    dispatches (dispatch_pending). Never raises: a failed read counts as not lost, and is retried next
+    round."""
+    cache = cfg.state / "cache" / "lost-builds.json"
+    try:
+        seen = json.loads(cache.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    kept: dict[str, dict] = {}
+    lost: set[int] = set()
+    for p in prs:
+        updated = _parse_iso8601(p.updated_at)
+        if p.build_reported or updated is None or now - updated < LOST_BUILD_GRACE_S:
+            continue
+        entry = seen.get(p.head_oid) if isinstance(seen, dict) else None
+        if not (isinstance(entry, dict) and now - float(entry.get("at", 0)) < LOST_BUILD_TTL):
+            runs = gh.pr_build_runs(p.head_oid)
+            if runs is None:
+                continue
+            entry = {"lost": build_lost(runs, now), "at": now}
+        kept[p.head_oid] = entry
+        if entry.get("lost"):
+            lost.add(p.number)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(kept))
+    except OSError:
+        pass
+    if not lost:
+        return lost
+    dispatches = gh.pr_build_dispatches()
+    if dispatches is None:
+        return set()
+    return {n for n in lost if not dispatch_pending(dispatches, n, now)}
+
+
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
     """Classify every open PR per work-kind. Read-only — performs no actions.
 
@@ -765,11 +849,15 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     # 4) fix-ci: tended (ours or bot-authored), build FAILED at head, under budgets. A red bump PR is
     #    the bump stage's job (its adaptation prompt knows mathlib moved), and a red lint-repair PR is
     #    the lint-repair stage's, so fix-ci defers those; it picks up only other red PRs (ours, or
-    #    any other bot-authored one).
-    for p in tended:
-        if not p.build_failed or p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX)):
+    #    any other bot-authored one). A head whose build finished without posting a status counts as
+    #    red too (deep only: finding one costs REST calls).
+    fixable = [p for p in tended if not p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX))]
+    lost = lost_builds(cfg, gh, fixable, time.time()) if deep else set()
+    for p in fixable:
+        if not (p.build_failed or p.number in lost):
             continue
-        c = Candidate(p.number, p.head_oid, "build failed at head")
+        reason = "build failed at head" if p.build_failed else "build finished without a `build` status"
+        c = Candidate(p.number, p.head_oid, reason)
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"ci-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS

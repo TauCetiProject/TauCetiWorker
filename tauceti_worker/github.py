@@ -517,6 +517,32 @@ class GitHub:
             return None
         return json.loads(p.stdout or "{}")
 
+    def pr_build_runs(self, head: str) -> list[dict] | None:
+        """pr-build's workflow runs for one head commit, newest first, as {status, conclusion,
+        updated_at}. None on fetch failure (distinct from no runs)."""
+        path = f"/repos/{self.repo}/actions/workflows/pr-build.yml/runs?head_sha={head}&per_page=20"
+        p = self._gh(["api", path, "--jq", "[.workflow_runs[] | {status, conclusion, updated_at}]"])
+        if p.returncode != 0:
+            return None
+        try:
+            return json.loads(p.stdout or "[]")
+        except ValueError:
+            return None
+
+    def pr_build_dispatches(self) -> list[dict] | None:
+        """pr-build's recent manually dispatched runs, newest first, as {status, conclusion, updated_at,
+        display_title}. A dispatched run is keyed to the commit it was dispatched from (usually main),
+        not to the PR head it builds, so pr_build_runs cannot see it; its title names the PR. None on
+        fetch failure."""
+        path = f"/repos/{self.repo}/actions/workflows/pr-build.yml/runs?event=workflow_dispatch&per_page=20"
+        p = self._gh(["api", path, "--jq", "[.workflow_runs[] | {status, conclusion, updated_at, display_title}]"])
+        if p.returncode != 0:
+            return None
+        try:
+            return json.loads(p.stdout or "[]")
+        except ValueError:
+            return None
+
     @staticmethod
     def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
         detail = (
