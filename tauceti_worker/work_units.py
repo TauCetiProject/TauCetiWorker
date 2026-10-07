@@ -812,7 +812,16 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
-    rc = fn(w, sv, c, opts, bubble)
+    from .budget import BudgetError
+    from .claude_api import api_context, api_mode
+
+    try:
+        with api_context(w.cfg.wid if api_mode() else "", stage):
+            rc = fn(w, sv, c, opts, bubble)
+    except (BudgetError, OSError) as error:
+        if not api_mode():
+            raise
+        raise NoProgress(f"API funding/accounting: {error}") from None
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
@@ -868,6 +877,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     "--no-sync",
                     "--reviewer",
                     reviewers,
+                    *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
                     "--expect-head",
                     head,
                     "--max-rounds-per-day",

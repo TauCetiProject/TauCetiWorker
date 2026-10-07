@@ -3,12 +3,14 @@ timeout, then settle (short pause if productive, escalating back-off otherwise).
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
 import time
 
 from .agents import resolve_authoring_profile
+from .claude_api import api_mode
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
@@ -78,7 +80,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
     round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
     rate-limited GitHub."""
-    unpaced = agent in OPENROUTER_MODELS or agent == "kiro"
+    unpaced = agent in OPENROUTER_MODELS or agent == "kiro" or api_mode()
     ignore_quota = getattr(args, "ignore_quota", False)
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
@@ -192,6 +194,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
             tail = ["--worker-id", cfg.wid]
+            if api_mode():
+                tail += ["--claude-billing", "api"]
+                if os.environ.get("TAUCETI_USE_BUDGET") == "1":
+                    tail.append("--budget")
+                if keyfile := os.environ.get("TAUCETI_ANTHROPIC_KEY_FILE"):
+                    tail += ["--anthropic-api-key-file", keyfile]
             if only:
                 tail += ["--only", ",".join(only)]
             # --pr must travel to the child for the same reason --account does: the child is what

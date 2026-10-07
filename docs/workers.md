@@ -101,6 +101,9 @@ other top-level key is an error, as is any unrecognized field inside a
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
 | `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`, `lint-repair`. Empty means the whole cascade |
+| `claude_billing` | string | `"subscription"` | `"api"` requires `agent = "claude"`; API mode bypasses subscription quota polling |
+| `budget` | bool | `false` | Admit API sessions through the shared local grant ledger; active sessions are never cut off by funding |
+| `anthropic_api_key_file` | string | unset | Private key-file path for API mode; otherwise use `ANTHROPIC_API_KEY`; never store a raw key in config |
 | `sandbox` | string | `"host"` | `host` or `bubble`. Progress-report rounds always run on the host |
 | `ignore_quota` | bool | `false` | Skip soft pacing. Provider hard limits still apply; an `auto` worker cannot launch with this enabled |
 | `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
@@ -160,7 +163,10 @@ entry with `enabled = true`.
 | `worker_id` | `id`; omit it for the next free `workerN` |
 | `--agent AGENT` | `agent` |
 | `--only TASKS` | `only`, as a comma-separated list |
-| `--sandbox {host,bubble}` | `sandbox` |
+| `--sandbox {host,bubble}` | `claude_billing` | string | `"subscription"` | `"api"` requires `agent = "claude"`; API mode bypasses subscription quota polling |
+| `budget` | bool | `false` | Admit API sessions through the shared local grant ledger; active sessions are never cut off by funding |
+| `anthropic_api_key_file` | string | unset | Private key-file path for API mode; otherwise use `ANTHROPIC_API_KEY`; never store a raw key in config |
+| `sandbox` |
 | `--ignore-quota` | `ignore_quota`; use with an explicit subscription agent |
 | `--auto-refresh` | `auto_refresh` |
 | `--roadmap-only AREA` | `roadmap_only` |

@@ -19,6 +19,7 @@ FAIL_FAST=0
 
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
+  api_budget.py
   agent_cmds.py
   agent_transcript.py
   auto_stage_priority.py

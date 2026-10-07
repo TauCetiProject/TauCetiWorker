@@ -58,6 +58,9 @@ _WORKER_KEYS = {
     "isolate_home",
     "restart",
     "env",
+    "claude_billing",
+    "budget",
+    "anthropic_api_key_file",
 }
 
 WORKERS_EPILOG = """\
@@ -247,6 +250,9 @@ class WorkerSpec:
     sandbox: str = "host"
     ignore_quota: bool = False
     auto_refresh: bool = False
+    claude_billing: str = "subscription"
+    budget: bool = False
+    anthropic_api_key_file: str | None = None
     roadmap_only: str | None = None
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
@@ -295,6 +301,11 @@ class WorkerSpec:
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
             auto_refresh=_boolean(raw.get("auto_refresh", False), f"workers[{index}].auto_refresh"),
+            claude_billing=_string(raw.get("claude_billing", "subscription"), f"workers[{index}].claude_billing"),
+            budget=_boolean(raw.get("budget", False), f"workers[{index}].budget"),
+            anthropic_api_key_file=_string(
+                raw.get("anthropic_api_key_file"), f"workers[{index}].anthropic_api_key_file", optional=True
+            ),
             roadmap_only=_string(raw.get("roadmap_only"), f"workers[{index}].roadmap_only", optional=True),
             roadmap_skip=_strings(raw.get("roadmap_skip", []), f"workers[{index}].roadmap_skip"),
             roadmap_extra_identities=_strings(
@@ -314,6 +325,13 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
+        if spec.claude_billing not in ("subscription", "api"):
+            raise WorkersError("claude_billing must be subscription or api")
+        if spec.claude_billing == "api":
+            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or spec.pace:
+                raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
+        elif spec.budget or spec.anthropic_api_key_file:
+            raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
         return spec
 
     def as_dict(self) -> dict:
@@ -328,6 +346,12 @@ class WorkerSpec:
             value["ignore_quota"] = True
         if self.auto_refresh:
             value["auto_refresh"] = True
+        if self.claude_billing != "subscription":
+            value["claude_billing"] = self.claude_billing
+        if self.budget:
+            value["budget"] = True
+        if self.anthropic_api_key_file:
+            value["anthropic_api_key_file"] = self.anthropic_api_key_file
         if self.roadmap_only is not None:
             value["roadmap_only"] = self.roadmap_only
         if self.roadmap_skip:
@@ -358,6 +382,12 @@ class WorkerSpec:
 
     def work_argv(self) -> list[str]:
         argv = self_argv("work", "--loop", "--worker-id", self.id)
+        if self.claude_billing == "api":
+            argv += ["--claude-billing", "api"]
+        if self.budget:
+            argv.append("--budget")
+        if self.anthropic_api_key_file:
+            argv += ["--anthropic-api-key-file", str(Path(self.anthropic_api_key_file).expanduser().resolve())]
         if self.only:
             argv += ["--only", ",".join(self.only)]
         if self.agent != "auto":
@@ -1164,6 +1194,14 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
     agent = str(spec.get("agent") or item.get("agent") or "auto")
     sandbox = str(spec.get("sandbox") or item.get("sandbox") or "host")
     lines.extend(_status_field("agent", [f"{agent} · {sandbox} sandbox"], width))
+    if spec.get("claude_billing") == "api":
+        lines.extend(
+            _status_field(
+                "billing",
+                ["Claude API · " + ("shared local grants" if spec.get("budget") else "no local budget")],
+                width,
+            )
+        )
 
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
     if spec.get("pace"):
@@ -1259,6 +1297,17 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
         if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
             label = "retry" if state == "backoff" else "recheck"
             lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))
+        if budget := item.get("budget"):
+            lines.extend(
+                _status_field(
+                    "budget",
+                    [
+                        f"${float(budget['balance']):.2f} balance · "
+                        f"${float(budget['pending']):.2f} pending · ${float(budget['grant_rate']):.2f}/hour"
+                    ],
+                    width,
+                )
+            )
         if state == "backoff":
             lines.extend(_status_field("logs", [f"tauceti workers logs {item['id']}"], width))
     return lines
@@ -1679,6 +1728,9 @@ def add_workers_parser(subparsers) -> None:
         item = actions.add_parser(action, help=descriptions[action])
         item.add_argument("worker_id", help="worker id")
     add = actions.add_parser("add", help="add an enabled persistent worker definition")
+    add.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
+    add.add_argument("--budget", action="store_true")
+    add.add_argument("--anthropic-api-key-file")
     add.add_argument("worker_id", nargs="?", help="stable id (default: next free workerN)")
     add.add_argument("--agent", choices=AGENTS, default="auto", help="agent for each round (default: auto)")
     add.add_argument("--only", default="", help="comma-separated work phases (default: full cascade)")
@@ -1785,6 +1837,9 @@ def cmd_workers(args) -> int:
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
+                    "claude_billing": args.claude_billing,
+                    "budget": args.budget,
+                    "anthropic_api_key_file": args.anthropic_api_key_file,
                 }
                 for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
                     value = getattr(args, key)

@@ -219,3 +219,22 @@ Flags win over these. Most are tuning knobs with sane defaults.
 Worker configuration paths (`TAUCETI_WORKERS_CONFIG`, `TAUCETI_CONFIG_HOME`,
 `TAUCETI_WORKERS_STATE_DIR`, `TAUCETI_RUNTIME_DIR`) are documented in
 [the workers documentation](workers.md).
+
+## Claude API billing and grants
+
+`work --agent claude --claude-billing api` selects API-key authentication instead
+of subscription quota pacing. Supply `ANTHROPIC_API_KEY` or
+`--anthropic-api-key-file PATH`. Add `--budget` to consult the user-level grant
+ledger immediately before each paid Claude invocation. These settings are
+propagated through loop children, managed workers, reviewers, and Bubble.
+
+`tauceti budget --grant USD` adds credit; `--set-grant USD` sets the current
+balance through an adjustment; `--grant-rate USD_PER_HOUR` changes automatic
+replenishment. `budget` queries current state, `--json` emits structured state,
+and `--log` shows accounting history. Corrections use
+`--reconcile INVOCATION --cost USD --note TEXT`.
+
+Grants never interrupt active sessions. Completed costs may create a deficit,
+and estimated pending costs reduce the amount available for new admissions.
+See [the complete budget design](api-budget-plan.md) for state paths, recovery,
+and estimated-cost semantics.
