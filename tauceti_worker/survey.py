@@ -20,6 +20,7 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
     LINT_REPAIR_HEAD_PREFIX,
+    LOST_BUILD_CANCEL_GRACE_S,
     LOST_BUILD_GRACE_S,
     LOST_BUILD_TTL,
     MAX_BUMP_ATTEMPTS,
@@ -578,13 +579,33 @@ def build_lost(runs: list[dict], now: float) -> bool:
 
     The same test as TauCeti's stuck-PR watchdog (missing-status in scripts/pr_status/stuck_alerts.py):
     a run still queued or in progress is the ordinary wait, and a cancelled or skipped run never reaches
-    its report step by design, so only a finished run that reached a verdict proves the status should
-    exist. The grace covers a status that is merely slow to appear."""
+    its report step by design, so a finished run that reached a verdict proves the status should exist.
+    The grace covers a status that is merely slow to appear. A head whose runs were all cancelled or
+    skipped is lost only after LOST_BUILD_CANCEL_GRACE_S, since a superseding run ordinarily follows."""
     if not runs or any(r.get("status") != "completed" for r in runs):
         return False
     verdicts = [r.get("updated_at") for r in runs if r.get("conclusion") not in ("cancelled", "skipped")]
     finished = [t for t in map(_parse_iso8601, verdicts) if t is not None]
-    return bool(finished) and now - max(finished) >= LOST_BUILD_GRACE_S
+    if finished:
+        return now - max(finished) >= LOST_BUILD_GRACE_S
+    ended = [t for t in map(_parse_iso8601, (r.get("updated_at") for r in runs)) if t is not None]
+    return bool(ended) and now - max(ended) >= LOST_BUILD_CANCEL_GRACE_S
+
+
+def dispatch_pending(dispatches: list[dict], pr: int, now: float) -> bool:
+    """Whether a manually dispatched pr-build (GitHub.pr_build_dispatches) may still post `pr`'s `build`
+    status: one titled for the PR that is running or finished within the grace, or a running one titled
+    plain `pr-build`, as pr-build titled every run before it began naming the PR (TauCeti#11541)."""
+    for d in dispatches:
+        title = d.get("display_title") or ""
+        if title not in ("pr-build", f"pr-build {pr}"):
+            continue
+        if d.get("status") != "completed":
+            return True
+        done = _parse_iso8601(d.get("updated_at"))
+        if title != "pr-build" and done is not None and now - done < LOST_BUILD_GRACE_S:
+            return True
+    return False
 
 
 def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[int]:
@@ -592,8 +613,10 @@ def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[i
 
     The open-PR query reads statuses only (_OPEN_PRS_QUERY in github.py says why), so this costs a REST
     call per head. It is paid only for a head with no status whose PR has not moved for the grace
-    period, and a verdict is cached per head for LOST_BUILD_TTL. Never raises: a failed read counts as
-    not lost, and is retried next round."""
+    period, and a verdict is cached per head for LOST_BUILD_TTL. A replacement build dispatched by PR
+    number is keyed to another commit, so whenever a head looks lost one more call reads the recent
+    dispatches (dispatch_pending). Never raises: a failed read counts as not lost, and is retried next
+    round."""
     cache = cfg.state / "cache" / "lost-builds.json"
     try:
         seen = json.loads(cache.read_text())
@@ -619,7 +642,12 @@ def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[i
         cache.write_text(json.dumps(kept))
     except OSError:
         pass
-    return lost
+    if not lost:
+        return lost
+    dispatches = gh.pr_build_dispatches()
+    if dispatches is None:
+        return set()
+    return {n for n in lost if not dispatch_pending(dispatches, n, now)}
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:

@@ -99,8 +99,11 @@ MAX_CI_PR_ATTEMPTS = 5  # per-PR lifetime backstop for red-CI fixing
 
 # A pr-build run that ends without posting the `build` status leaves its head pending for ever, since
 # TauCeti re-runs pr-build only on a push. That happens when the runner dies before the report step,
-# most often because the build ran it out of memory. After this long, fix-ci treats such a head as red.
+# for instance because the build ran it out of memory. After this long, fix-ci treats such a head as red.
 LOST_BUILD_GRACE_S = 1800
+# A head whose builds were all cancelled is ordinarily rebuilt by the run that superseded them; after a
+# day, nothing is coming (TauCeti's stuck-PR watchdog uses the same 24 hours).
+LOST_BUILD_CANCEL_GRACE_S = 86400
 LOST_BUILD_TTL = 600  # seconds a per-head lost-build verdict stays fresh
 
 MAX_REBASE_ATTEMPTS = 3  # per-PR: stop trying to rebase a conflicting PR
