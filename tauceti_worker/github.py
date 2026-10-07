@@ -517,6 +517,18 @@ class GitHub:
             return None
         return json.loads(p.stdout or "{}")
 
+    def pr_build_runs(self, head: str) -> list[dict] | None:
+        """pr-build's workflow runs for one head commit, newest first, as {status, conclusion,
+        updated_at}. None on fetch failure (distinct from no runs)."""
+        path = f"/repos/{self.repo}/actions/workflows/pr-build.yml/runs?head_sha={head}&per_page=20"
+        p = self._gh(["api", path, "--jq", "[.workflow_runs[] | {status, conclusion, updated_at}]"])
+        if p.returncode != 0:
+            return None
+        try:
+            return json.loads(p.stdout or "[]")
+        except ValueError:
+            return None
+
     @staticmethod
     def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
         detail = (

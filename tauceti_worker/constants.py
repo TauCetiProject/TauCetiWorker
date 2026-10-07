@@ -97,6 +97,12 @@ MAX_CI_ATTEMPTS = 3  # per-head: stop trying to green a red-CI head
 
 MAX_CI_PR_ATTEMPTS = 5  # per-PR lifetime backstop for red-CI fixing
 
+# A pr-build run that ends without posting the `build` status leaves its head pending for ever, since
+# TauCeti re-runs pr-build only on a push. That happens when the runner dies before the report step,
+# most often because the build ran it out of memory. After this long, fix-ci treats such a head as red.
+LOST_BUILD_GRACE_S = 1800
+LOST_BUILD_TTL = 600  # seconds a per-head lost-build verdict stays fresh
+
 MAX_REBASE_ATTEMPTS = 3  # per-PR: stop trying to rebase a conflicting PR
 
 MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
