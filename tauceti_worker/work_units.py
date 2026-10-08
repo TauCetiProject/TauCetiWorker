@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .agents import (
     AuthoringProfile,
+    BuildCacheUnavailable,
     _codex_review_model_override,
     _kiro_review_model,
     fetch_git_source,
@@ -1143,7 +1144,14 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
-        rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+        try:
+            rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+        except BuildCacheUnavailable:
+            # Unlike a transcript-derived provider failure, we know the agent never started.
+            # A persistent cache outage must not exhaust the bounded provider-refund allowance.
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            raise
     if rc == 0:
         w.rs.bust(pr)
     else:

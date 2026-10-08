@@ -1081,6 +1081,10 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
     needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s != "review")
+    if needs_host_build:
+        from .agents import lake_cache_max_revs
+
+        lake_cache_max_revs(os.environ)
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die(
             "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
@@ -1183,7 +1187,7 @@ def cli_main() -> int:
         return EX_ADMISSION_WAIT
     except NoProgress as e:
         log(str(e))
-        report_failure(str(e), code=EX_NOPROGRESS)
+        report_failure(str(e), code=EX_NOPROGRESS, log_file=getattr(e, "log_file", None))
         return EX_NOPROGRESS
     except WorkersError as e:
         print(f"tauceti workers: {e}", file=sys.stderr)
