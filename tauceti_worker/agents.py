@@ -1035,21 +1035,28 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 return "ready"
             # Preserve real outages even when Lake also wraps them in a dependency-fetch error.
             transport_error = re.search(
-                r"(?i)(?:HTTP|status(?: code)?|response)[^\n]*\b(?:401|403|429|5\d\d)\b|"
+                r"(?i)(?:\bHTTP\b|status(?: code)?|response)[^\n]*\b(?:401|403|429|5\d\d)\b|"
                 r"could not resolve host|connection (?:reset|refused|timed out)|"
-                r"SSL certificate|TLS|authentication failed|network is unreachable",
+                r"SSL certificate|\bTLS\b|authentication failed|network is unreachable",
                 detail,
             )
             # These errors precede artifact transfer and can be repaired in the checked-out PR.
             workspace_error = re.search(
                 r"(?im)^error:.*(?:lakefile\.(?:toml|lean)|lake-manifest\.json|"
                 r"could not resolve revision|unknown revision|invalid manifest|"
-                r"failed to fetch (?:the )?package revision|invalid toolchain name|"
+                r"invalid toolchain name|"
                 r"no (?:such release|release found)|could not download nonexistent lean version)|"
                 r"(?im:couldn't find remote ref|unknown package)",
                 detail,
             )
-            if workspace_error and not transport_error:
+            # Lake wraps every failed git fetch with the same dependency error. Only positive
+            # evidence of a missing ref/repository belongs to repair; unknown failures stay outages.
+            missing_dependency = re.search(r"failed to fetch (?:the )?package revision", detail) and re.search(
+                r"(?i)not our ref|unadvertised object|repository ['\"][^\n]*['\"] not found|"
+                r"couldn't find remote ref",
+                detail,
+            )
+            if (workspace_error or missing_dependency) and not transport_error:
                 log(f"warning: {label} cache cannot load this workspace; leaving it to the repair agent")
                 for line in detail.splitlines()[-8:]:
                     log("  cache: " + line)

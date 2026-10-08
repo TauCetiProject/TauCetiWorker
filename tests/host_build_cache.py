@@ -44,8 +44,15 @@ if mode == 'miss' and label == 'TauCeti':
  print('error: TauCetiProject/TauCeti: no outputs found in 100 revisions from HEAD'); sys.exit(1)
 if mode == 'timeout':
  import time; time.sleep(20)
-if mode in ('dependency-error', 'dependency-network'):
- if mode == 'dependency-network': print('HTTP response status code 503')
+if mode == 'dependency-error' or mode.startswith('dependency-network'):
+ if mode == 'dependency-error': print('info: fatal: not our ref abc')
+ errors={'dependency-network':'HTTP response status code 503',
+         'dependency-network-connect':"Failed to connect to github.com port 443: Couldn't connect to server",
+         'dependency-network-timeout':'Operation timed out after 30000 milliseconds',
+         'dependency-network-eof':'fatal: the remote end hung up unexpectedly; early EOF',
+         'dependency-network-empty':'Empty reply from server',
+         'dependency-network-unknown':'unrecognized git failure'}
+ if mode in errors: print(errors[mode])
  print('error: mathlib: failed to fetch the package revision abc from the Git repository at https://example.invalid/mathlib')
  sys.exit(1)
 if mode == 'invalid-toolchain':
@@ -141,8 +148,16 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     for mode in ("dependency-error", "invalid-toolchain"):
         rc, records, _ = run(mode)
         assert rc == 0 and len(launched) == 1 and len(records) == 1
-    rc, records, _ = run("dependency-network")
-    assert rc == 75 and not launched
+    for mode in (
+        "dependency-network",
+        "dependency-network-connect",
+        "dependency-network-timeout",
+        "dependency-network-eof",
+        "dependency-network-empty",
+        "dependency-network-unknown",
+    ):
+        rc, records, _ = run(mode)
+        assert rc == 75 and not launched
     print("[OK] broken manifests, revisions and toolchains reach repair; wrapped transport failures still block")
 
     rc, records, _ = run(LAKE_ARTIFACT_CACHE="false")
