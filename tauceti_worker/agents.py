@@ -1826,6 +1826,16 @@ def run_in_bubble(
     return rc
 
 
+def _claude_review_model(reviewers: str) -> str | None:
+    """Pin direct Claude reviews to the shared default unless explicitly overridden."""
+    if "claude" not in [r.strip() for r in reviewers.split(",")]:
+        return None
+    configured = (os.environ.get("TAUCETI_CLAUDE_MODEL") or "").strip()
+    model = configured or AUTHORING_DEFAULTS["claude"][0]
+    _reject_retired_opus(model, "$TAUCETI_CLAUDE_MODEL" if configured else "repository default")
+    return model
+
+
 def _codex_review_model_override(reviewers: str) -> str | None:
     """Independent review-model override, or None for the engine's own policy."""
     m = os.environ.get("TAUCETI_REVIEW_CODEX_MODEL")
@@ -1876,6 +1886,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     # uses --repo-dir for its files and an absolute temp workdir).
     import shlex
 
+    claude_model = _claude_review_model(reviewers)
+    claude_flag = f" --claude-model {shlex.quote(claude_model)}" if claude_model else ""
     cm = _codex_review_model_override(reviewers)
     codex_flag = f" --codex-model {shlex.quote(cm)}" if cm else ""  # operator override; else engine default
     km = _kiro_review_model(reviewers)
@@ -1885,7 +1897,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
         f"--no-mathlib --no-sync --store /opt/review-store --post "
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
-        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}{kiro_flag}"
+        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
+        f"{claude_flag}{codex_flag}{kiro_flag}"
     )
     if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":
         inner += " --auth api"

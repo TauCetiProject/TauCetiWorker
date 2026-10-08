@@ -20,6 +20,7 @@ from pathlib import Path
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
+    _claude_review_model,
     _codex_review_model_override,
     _kiro_review_model,
     fetch_git_source,
@@ -806,6 +807,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         what = c.reason or (c.head[:12] if c.head else "")
     if stage == "review":
         detail = f"provider={opts.work_model}, sandbox={where}"
+        review_model = _claude_review_model(opts.work_model)
+        if review_model:
+            detail += f", model={review_model}"
     else:
         profile = _effective_authoring_profile(opts)
         effort = profile.effort or "none"
@@ -824,7 +828,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                     w.cfg.wid if api_mode() else "",
                     stage,
                     host=not bubble or stage == "progress",
-                    model=profile.model if profile else None,
+                    model=profile.model if profile else (review_model if stage == "review" else None),
                 )
             )
         except (BudgetError, OSError) as error:
@@ -875,6 +879,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
+            claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
             rc = run_to_logfile(
                 [
@@ -896,6 +901,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     str(REVIEW_DAILY_CAP),
                     "--submitted-by",
                     me(),
+                    *(["--claude-model", claude_model] if claude_model else []),
                     *(["--codex-model", cm] if cm else []),
                     *(["--kiro-model", km] if km else []),
                 ],
