@@ -232,6 +232,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
 | `TAUCETI_MATHLIB_POOL` | `$XDG_CACHE_HOME/mathlib`, else login user's `~/.cache/mathlib` | The pool those hardlinks go to and come from. |
 | `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Lake's own build-output cache. Per-worker: unlike a toolchain install it is written throughout a build. |
+| `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main. |
 | `LAKE_ARTIFACT_CACHE` | `1` | Keep local build outputs in Lake's artifact store so later rounds can reuse them. |
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |

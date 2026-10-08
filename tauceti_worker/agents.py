@@ -3,11 +3,13 @@ argv path and the repo-scoped bubble sandbox path (plus per-worker $HOME isolati
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -641,22 +643,32 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
 def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
+    if any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+        prompt += (
+            "\n\nBuild cache preparation: the worker warmed Mathlib and TauCeti artifacts for this "
+            "checkout and current main. The public `tauceti-public` Lake service remains configured "
+            "during this run. After merging/rebasing, changing the toolchain or dependencies, or "
+            "repairing a malformed workspace, fetch both caches before building:\n"
+            "lake exe cache get\n"
+            f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
+            f"--max-revs={lake_cache_max_revs(os.environ)}\n"
+            "A transport or incomplete-artifact download failure is infrastructure trouble: report "
+            "it instead of falling back to a full source compilation."
+        )
     argv, env = host_agent_argv(prompt, profile)
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    _LAST_AGENT_FAILURE = warm_host_build_caches(cwd, env, logdir)
-    if _LAST_AGENT_FAILURE:
-        report_failure(_LAST_AGENT_FAILURE, code=75)
-        return 75
-    rc = run_agent_proc(
-        argv,
-        env=env,
-        cwd=cwd,
-        logdir=logdir,
-        label=f"agent-{profile.provider}",
-        provider=profile.provider,
-    )
+    _LAST_AGENT_FAILURE = None
+    with host_build_cache_context(cwd, env, logdir):
+        rc = run_agent_proc(
+            argv,
+            env=env,
+            cwd=cwd,
+            logdir=logdir,
+            label=f"agent-{profile.provider}",
+            provider=profile.provider,
+        )
     if rc == 75:
         from .claude_api import blocked_reason
 
@@ -911,21 +923,27 @@ TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
 TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
 
 
-def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> str | None:
-    """Fetch both caches on the selected branch before spending an agent invocation.
+class BuildCacheUnavailable(NoProgress):
+    """A known pre-agent outage, never chargeable to a PR's attempt budget."""
 
-    Progress writers have no Lean workspace and need no downloads. A real cache outage must not
-    silently turn a coding round into a full-library compilation. Lake verifies and atomically
-    installs downloads, so retries keep good artifacts but a partial fetch never reaches the agent.
-    """
+
+HOST_CACHE_TIMEOUT = 1200
+_LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
+
+
+def lake_cache_max_revs(env: dict) -> str:
+    value = env.get("LAKE_CACHE_MAX_REVS", "100")
+    if not re.fullmatch(r"[0-9]+", value):
+        raise Die("LAKE_CACHE_MAX_REVS must be a natural number")
+    return value
+
+
+@contextlib.contextmanager
+def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
+    """Keep the public service available through repairs, merges and dependency changes."""
     if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
-        return None
-    max_revs = env.get("LAKE_CACHE_MAX_REVS", "100")
-    if not re.fullmatch(r"[0-9]+", max_revs):
-        return "build cache preparation: LAKE_CACHE_MAX_REVS must be a natural number"
-    logdir.mkdir(parents=True, exist_ok=True)
-    logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
+        yield
+        return
     with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
         config = Path(tmp) / "lake.toml"
         config.write_text(
@@ -933,69 +951,136 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> str | None:
             f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
             f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
         )
-        cache_env = {**env, "LAKE_CONFIG": str(config)}
-        cache_env.setdefault("LAKE_ARTIFACT_CACHE", "1")
-        cache_env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
-        commands = [
-            ("Mathlib", ["lake", "exe", "cache", "get"], env),
-            (
-                "TauCeti",
-                [
-                    "lake",
-                    "cache",
-                    "get",
-                    "--service",
-                    TAUCETI_CACHE_SERVICE,
-                    "--repo",
-                    TAUCETI,
-                    f"--max-revs={max_revs}",
-                ],
-                cache_env,
-            ),
-        ]
-        for label, command, command_env in commands:
-            if label == "TauCeti" and env.get("LAKE_ARTIFACT_CACHE", "1").lower() in ("0", "false"):
-                log("host build caches: TauCeti downloads explicitly disabled by LAKE_ARTIFACT_CACHE")
-                continue
-            for attempt in range(1, 3):
-                with logf.open("ab") as output:
-                    offset = output.tell()
-                    output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
-                    output.flush()
-                    try:
-                        result = subprocess.run(
-                            command,
-                            cwd=cwd,
-                            env=command_env,
-                            stdout=output,
-                            stderr=subprocess.STDOUT,
-                            timeout=1800,
-                        )
-                        rc = result.returncode
-                    except (OSError, subprocess.TimeoutExpired) as e:
-                        output.write(f"cache command failed: {e}\n".encode())
-                        rc = 1
-                with logf.open("rb") as output:
-                    output.seek(offset)
-                    detail = output.read().decode(errors="replace")
-                if rc == 0:
-                    log(f"host build caches: {label} cache ready")
-                    break
-                if label == "TauCeti" and "no outputs found" in detail:
-                    log(
-                        "warning: TauCeti cache has no outputs for this toolchain/revision history; "
-                        "uncached modules will compile from source"
-                    )
-                    break
-                if attempt == 1:
-                    log(f"host build caches: {label} fetch failed; retrying verified downloads")
-                    continue
-                for line in detail.splitlines()[-12:]:
+        env["LAKE_CONFIG"] = str(config)
+        env.setdefault("LAKE_ARTIFACT_CACHE", "1")
+        env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
+        warm_host_build_caches(cwd, env, logdir)
+        yield
+
+
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+    """Terminate the whole downloader group on timeout, including curl children."""
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        raise
+
+
+def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
+    """Fetch both caches on the selected branch; warm main too for subsequent rebases.
+
+    Genuine workspace errors must reach repair agents. Transport, publication and partial-download
+    failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
+    retain successful downloads. All fetches together have one twenty-minute deadline.
+    """
+    max_revs = lake_cache_max_revs(env)
+    logdir.mkdir(parents=True, exist_ok=True)
+    logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
+    log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
+
+    def unavailable(reason: str):
+        message = f"{reason}; agent not started (see {logf})"
+        log(message)
+        report_failure(message, code=75, log_file=logf)
+        raise BuildCacheUnavailable(message)
+
+    def fetch(label: str, command: list[str]) -> str:
+        for attempt in range(1, 3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                unavailable("build cache preparation deadline exceeded")
+            with logf.open("ab") as output:
+                offset = output.tell()
+                output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
+                output.flush()
+                try:
+                    rc = _cache_fetch(command, cwd, env, output, remaining)
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    output.write(f"cache command failed: {e}\n".encode())
+                    rc = 1
+            with logf.open("rb") as output:
+                output.seek(offset)
+                detail = output.read().decode(errors="replace")
+            if rc == 0:
+                log(f"host build caches: {label} cache ready")
+                return "ready"
+            # These errors precede cache transfer and belong to the checked-out PR, not the service.
+            if re.search(
+                r"(?im)^error:.*(?:lakefile\.(?:toml|lean)|lake-manifest\.json|"
+                r"could not resolve revision|unknown revision|invalid manifest)|"
+                r"(?im:couldn't find remote ref|unknown package)",
+                detail,
+            ):
+                log(f"warning: {label} cache cannot load this workspace; leaving it to the repair agent")
+                for line in detail.splitlines()[-8:]:
                     log("  cache: " + line)
-                reason = f"{label} build cache download failed; agent not started (see {logf})"
-                log(reason)
-                return reason
-    return None
+                return "workspace-error"
+            # Lake's CLI emits these only after all revision lookups returned 404 (Main.lean).
+            if label != "Mathlib" and re.search(
+                r"^error:.*(?:no outputs found|outputs not found for revision)", detail, re.M
+            ):
+                return "miss"
+            if attempt == 1:
+                log(f"host build caches: {label} fetch failed; retrying verified downloads")
+                continue
+            for line in detail.splitlines()[-12:]:
+                log("  cache: " + line)
+            unavailable(f"{label} build cache download failed")
+        raise AssertionError("unreachable")
+
+    if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
+        return
+    if env.get("LAKE_ARTIFACT_CACHE", "1").lower() in _LAKE_FALSE:
+        log("host build caches: TauCeti artifact caching explicitly disabled by LAKE_ARTIFACT_CACHE")
+        return
+    base = ["lake", "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI]
+    result = fetch("TauCeti", [*base, f"--max-revs={max_revs}"])
+    if result == "workspace-error":
+        return
+
+    def git(*args: str) -> str:
+        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        return p.stdout.strip() if p.returncode == 0 else ""
+
+    main = git("rev-parse", "--verify", "origin/main")
+    head = git("rev-parse", "HEAD")
+    if main and main != head:
+        # An explicit toolchain fetch also primes the store for a rebase that changes Lean versions.
+        toolchain = git("show", "origin/main:lean-toolchain")
+        revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), "origin/main")
+        for revision in revisions.splitlines():
+            status = fetch(
+                "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])]
+            )
+            if status != "miss":
+                if status == "workspace-error":
+                    return
+                break
+        else:
+            unavailable("TauCeti main cache has no published outputs in the requested history")
+    elif result == "miss":
+        unavailable("TauCeti main cache has no published outputs in the requested history")
+    if result == "miss":
+        log("warning: PR history is uncached; current main artifacts are ready for the rebase")
 
 
 def bubble_cmd() -> list[str]:

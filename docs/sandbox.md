@@ -51,11 +51,19 @@ build; `LAKE_CACHE_MAX_REVS` overrides that limit (`0` searches the complete his
 The build restores matching artifacts and compiles changed modules and their
 affected dependents. Progress-writing and review jobs do not need this bootstrap.
 
-Host downloads retry once. An infrastructure or partial-download failure stops
-the round before the agent starts; it does not silently rebuild the library.
-A genuinely unpublished toolchain/revision history emits an explicit warning
-and allows source compilation. An explicit `LAKE_ARTIFACT_CACHE=false` opts out
-of TauCeti artifact downloads. The detailed fetch log is in
+For PR branches the worker also fetches artifacts from current `origin/main`,
+searching its history for a published build. This primes the store for rebases,
+including ones that change the Lean toolchain. The public service stays configured
+throughout the agent invocation; after changing Git history, dependencies or
+repairing a malformed workspace, the agent is instructed to fetch both caches again.
+
+Host downloads retry once, with one twenty-minute deadline for the entire
+bootstrap. A transport, publication or partial-download failure stops the round
+before the agent starts and never consumes a PR's attempt budget or its bounded
+provider-refund allowance. Missing published main outputs also stop the round
+rather than compiling the whole library. Workspace or manifest errors reach the
+repair agent. An explicit false value for `LAKE_ARTIFACT_CACHE` opts out of
+TauCeti artifact caching and downloads. The detailed fetch log is in
 `logs/<worker>/build-cache-<timestamp>.log`.
 
 Bubble also runs an advisory `lake build` after fetching both caches. A red tree
