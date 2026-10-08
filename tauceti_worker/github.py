@@ -39,6 +39,35 @@ def validate_github_account(value: str) -> str:
     return value
 
 
+_SELECTION_BASE = "_TAUCETI_GITHUB_BASE_ENV"
+_SELECTION_KEYS = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_HOST",
+    "TAUCETI_GITHUB_ACCOUNT",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+)
+
+
+def unselected_github_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Undo process-local selection before spawning the shared manager or unrelated workers."""
+    result = dict(os.environ if env is None else env)
+    baseline = result.pop(_SELECTION_BASE, None)
+    if baseline:
+        original = json.loads(baseline)
+        for key in list(result):
+            if key in _SELECTION_KEYS or key.startswith("GIT_CONFIG_"):
+                result.pop(key, None)
+        result.update(original)
+    # Persistent worker selection belongs to its spec, never the manager's launching shell.
+    result.pop("TAUCETI_GITHUB_ACCOUNT", None)
+    result.pop("_TAUCETI_PINNED_GITHUB_ACCOUNT", None)
+    return result
+
+
 def pin_github_account(account: str) -> str:
     """Select an account without changing gh's active login, before HOME isolation.
 
@@ -73,13 +102,30 @@ def pin_github_account(account: str) -> str:
             )
         env = {**os.environ, "GH_TOKEN": token, "GH_HOST": "github.com"}
         env.pop("GITHUB_TOKEN", None)
-        identity = subprocess.run(
-            ["gh", "api", "--hostname", "github.com", "user"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        waited = 0
+        for attempt in range(GH_TRANSIENT_TRIES + 1):
+            identity = subprocess.run(
+                ["gh", "api", "--hostname", "github.com", "user"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if identity.returncode == 0 or attempt == GH_TRANSIENT_TRIES:
+                break
+            error = (identity.stderr or "") + "\n" + (identity.stdout or "")
+            kind = _gh_rate_kind(error)
+            if kind == "secondary":
+                nap = _gh_secondary_wait(error, attempt)
+            elif kind is None and _gh_transient(error):
+                nap = GH_TRANSIENT_BASE << attempt
+            else:
+                break
+            if waited + nap > 60:
+                break
+            log(f"GitHub account {account}: temporary verification failure; retrying in {nap}s")
+            time.sleep(nap)
+            waited += nap
     except (OSError, subprocess.TimeoutExpired):
         raise Die(
             f"could not authenticate GitHub account {account}; check gh installation, login, and connectivity"
@@ -97,6 +143,10 @@ def pin_github_account(account: str) -> str:
         raise Die(f"could not read the authenticated GitHub identity for {account}") from None
     if login.lower() != account.lower():
         raise Die(f"requested GitHub account {account}, but the credential belongs to {login}; log in as {account}")
+    if _SELECTION_BASE not in os.environ:
+        os.environ[_SELECTION_BASE] = json.dumps(
+            {key: value for key, value in os.environ.items() if key in _SELECTION_KEYS or key.startswith("GIT_CONFIG_")}
+        )
     os.environ["GH_TOKEN"] = token
     os.environ.pop("GITHUB_TOKEN", None)
     os.environ["GH_HOST"] = "github.com"
@@ -130,6 +180,7 @@ def _pin_git_identity(login: str, user_id: int, *, configure_helper: bool) -> No
         ("credential.https://github.com.helper", ""),  # clear other accounts' helpers
         ("credential.https://github.com.helper", f"!{shlex.quote(gh)} auth git-credential"),
         ("credential.https://github.com.username", login),
+        ("http.https://github.com/.extraHeader", ""),  # clear another account's Authorization header
         ("url.https://github.com/.insteadOf", "git@github.com:"),
         ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
     )

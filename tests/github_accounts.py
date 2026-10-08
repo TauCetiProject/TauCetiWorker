@@ -7,6 +7,7 @@ All GitHub calls hit a temporary fake gh executable; no real credentials or netw
 import dataclasses
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -104,7 +105,17 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         # Git must ignore an existing helper for another account, while preserving unrelated config.
         gitdir = root / "checkout"
         subprocess.run(["git", "init", "-q", str(gitdir)], check=True)
-        subprocess.run(["git", "-C", str(gitdir), "config", "credential.helper", "!false"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(gitdir),
+                "config",
+                "credential.helper",
+                "!f() { printf 'username=bob\npassword=test-bob\n'; }; f",
+            ],
+            check=True,
+        )
         credential = subprocess.run(
             ["git", "-C", str(gitdir), "credential", "fill"],
             input="protocol=https\nhost=github.com\n\n",
@@ -117,6 +128,49 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         author = subprocess.check_output(["git", "-C", str(gitdir), "log", "-1", "--format=%an:%ae:%ce"], text=True)
         assert author.strip() == "alice:11+alice@users.noreply.github.com:11+alice@users.noreply.github.com"
 
+        # Managers and unselected workers undo selection, including Git config and attribution.
+        restored = github.unselected_github_env()
+        assert restored["GH_TOKEN"] == "test-bob" and restored["GITHUB_TOKEN"] == "test-bob"
+        assert restored["GIT_CONFIG_COUNT"] == "1"
+        assert restored["GIT_CONFIG_VALUE_0"] == "preserved"
+        assert "GIT_CONFIG_KEY_1" not in restored and "GIT_AUTHOR_EMAIL" not in restored
+        assert "TAUCETI_GITHUB_ACCOUNT" not in restored
+        assert "_TAUCETI_PINNED_GITHUB_ACCOUNT" not in restored
+        assert "_TAUCETI_GITHUB_BASE_ENV" not in restored
+        with patch.object(wm.subprocess, "Popen") as spawn:
+            wm._launch_runner(wm.WorkerSpec(id="unset"), root / "state", root / "runtime")
+            assert spawn.call_args.kwargs["env"]["GH_TOKEN"] == "test-bob"
+            assert "TAUCETI_GITHUB_ACCOUNT" not in spawn.call_args.kwargs["env"]
+
+        # A real managed-run child must not reselect the dashboard's account.
+        captured_env = root / "managed-env.json"
+        command = [
+            sys.executable,
+            "-c",
+            f"import os,json; open({str(captured_env)!r}, 'w').write(json.dumps(dict(os.environ)))",
+        ]
+        runner_env = {**os.environ, "TAUCETI_MANAGER_TEST_COMMAND": shlex.join(command)}
+        subprocess.run(
+            wm.self_argv(
+                "_managed-run",
+                "--spec",
+                wm._encode_spec(wm.WorkerSpec(id="unset")),
+                "--state-dir",
+                root / "managed-state",
+                "--runtime-dir",
+                root / "managed-runtime",
+            ),
+            env=runner_env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        managed = json.loads(captured_env.read_text())
+        assert managed["GH_TOKEN"] == "test-bob"
+        assert managed["GIT_CONFIG_COUNT"] == "1"
+        assert "TAUCETI_GITHUB_ACCOUNT" not in managed and "GIT_AUTHOR_NAME" not in managed
+
         # A fresh named selection must invalidate cached me/fork/claims decisions and attribution.
         assert github.pin_github_account("bob") == "bob"
         assert github.me() == "bob"
@@ -127,6 +181,21 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         rejected(lambda: github.pin_github_account(""), "GitHub account")
         os.environ.pop("GH_TOKEN")
         rejected(lambda: github.pin_github_account("charlie"), "no GitHub credential")
+
+    with patch.dict(os.environ, clean, clear=True):
+        responses = [
+            SimpleNamespace(returncode=0, stdout="test-alice", stderr=""),
+            SimpleNamespace(returncode=1, stdout="", stderr="HTTP 503 secret-material"),
+            SimpleNamespace(returncode=0, stdout='{"login":"alice","id":11}', stderr=""),
+        ]
+        with (
+            patch.object(github.subprocess, "run", side_effect=responses),
+            patch.object(github.time, "sleep") as pause,
+            patch.object(github, "log") as logger,
+        ):
+            assert github.pin_github_account("alice") == "alice"
+            pause.assert_called_once_with(github.GH_TRANSIENT_BASE)
+            assert "secret-material" not in str(logger.call_args_list)
 
     # Concurrent workers select independent accounts; neither changes a global gh active account.
     driver = (
@@ -154,6 +223,8 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
             ["status", "--github-account", "alice"],
             ["doctor", "--github-account", "alice"],
             ["_round", "--github-account", "alice"],
+            ["--github-account", "alice", "workers", "add", "foo"],
+            ["workers", "add", "foo", "--github-account", "alice"],
         ):
             assert cli.build_parser().parse_args(argv).github_account == "alice"
         with patch.object(cli, "cmd_status", return_value=0):

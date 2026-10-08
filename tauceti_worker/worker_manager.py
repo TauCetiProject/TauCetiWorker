@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from .constants import AGENTS, ALLOWED_TASKS
-from .github import validate_github_account
+from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
@@ -706,7 +706,7 @@ def cmd_managed_runner(args) -> int:
             # that discovery while the PYTHONPATH the child needs to import itself is still prepended
             # rather than replaced. The manager's own variables are assigned last and are reserved, so
             # nothing here can shadow them.
-            env = self_env({**os.environ, **dict(spec.env)})
+            env = self_env(unselected_github_env({**unselected_github_env(), **dict(spec.env)}))
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
@@ -831,7 +831,7 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
             runtime_dir,
         ),
         cwd=HERE,
-        env=self_env(),
+        env=self_env(unselected_github_env()),
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
@@ -1048,7 +1048,7 @@ def ensure_manager(config: Path) -> bool:
                     spawned = subprocess.Popen(
                         self_argv("workers", "--config", config, "manager"),
                         cwd=HERE,
-                        env=self_env(),
+                        env=self_env(unselected_github_env()),
                         stdin=subprocess.DEVNULL,
                         stdout=log,
                         stderr=subprocess.STDOUT,
@@ -1756,7 +1756,11 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--anthropic-api-key-file")
     add.add_argument("worker_id", nargs="?", help="stable id (default: next free workerN)")
     add.add_argument("--agent", choices=AGENTS, default="auto", help="agent for each round (default: auto)")
-    add.add_argument("--github-account", help="GitHub login for this worker (independent of its agent account)")
+    add.add_argument(
+        "--github-account",
+        default=argparse.SUPPRESS,
+        help="GitHub login for this worker (independent of its agent account)",
+    )
     add.add_argument("--only", default="", help="comma-separated work phases (default: full cascade)")
     add.add_argument(
         "--sandbox", choices=("host", "bubble"), default="host", help="where eligible phases run (default: host)"
@@ -1868,7 +1872,7 @@ def cmd_workers(args) -> int:
                     else None,
                 }
                 for key in ("github_account", "roadmap_only", "source", "author_model", "author_effort", "pace"):
-                    value = getattr(args, key)
+                    value = getattr(args, key, None)
                     if value is not None:
                         raw[key] = value
                 spec = WorkerSpec.from_dict(raw, len(specs))

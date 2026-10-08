@@ -154,7 +154,9 @@ The selected token lives in the worker's environment and is inherited by loop
 rounds, review tools, host agents, and Git's `gh auth git-credential` helper.
 Tokens are absent from command arguments, logs, and `workers.toml`. Git helper
 selection and author/committer name and noreply email are process-local;
-your global Git configuration is unchanged. GitHub SSH URLs are routed through
+your global Git configuration is unchanged. Signing remains configured as before;
+ensure your signing key covers the selected account's noreply email if you require
+verified signed commits. GitHub SSH URLs are routed through
 HTTPS so an unrelated SSH key cannot choose another account.
 
 Each worker tends its selected account's PRs and resolves that account's fork.
@@ -168,7 +170,10 @@ The dashboard displays the selected login and includes it in copied launch
 commands and persistent worker definitions. Choose it when opening the dashboard,
 for example `tauceti --github-account alice`. In `workers.toml`, set
 `github_account = "alice"` per worker; changing it changes the worker definition
-fingerprint and causes the manager to restart the worker.
+fingerprint and causes the manager to restart the worker. The shared manager
+removes dashboard account selection before spawning workers; a worker with no
+`github_account` uses the original host credentials. This also applies when the
+manager is started from a shell with `TAUCETI_GITHUB_ACCOUNT` set.
 
 Bubble mode requires `--github-account` support in Bubble's `open` command and
 the `github-account` capability in its running proxy. The companion implementation

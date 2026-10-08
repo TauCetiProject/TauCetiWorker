@@ -1103,7 +1103,7 @@ def ensure_fork_proxy_current() -> None:
     `gh proxy start`. The refresh is serialized under a host-global file lock so concurrent TauCeti workers
     do not race; Bubble separately serializes all service installers. Fail-CLOSED throughout: if the refresh
     cannot publish a fresh endpoint we Die rather than burn a long round that cannot authenticate. Call this
-    ONLY for rounds that push to a fork — a review-only worker must not be blocked by it."""
+    for fork authoring or an explicitly selected GitHub account, including selected-account reviews."""
     import fcntl
 
     # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails.
@@ -1120,7 +1120,7 @@ def ensure_fork_proxy_current() -> None:
             if _bubble_proxy_endpoint_healthy():
                 return
             raise Die(
-                "preflight: fork authoring needs Bubble installed at a stable path; the uvx fallback "
+                "preflight: fork authoring and GitHub account selection need Bubble installed at a stable path; the uvx fallback "
                 "cannot safely own a host-global launchd/systemd daemon. Install dev-bubble or set "
                 "$TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
             )
@@ -1134,22 +1134,22 @@ def ensure_fork_proxy_current() -> None:
             detail = (e.stderr or e.stdout or "").strip()[-500:]
             suffix = f"\n  Bubble said: {detail}" if detail else ""
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}{suffix}"
             ) from e
         except (OSError, subprocess.SubprocessError) as e:
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}\n"
                 "  Restart it yourself with `bubble gh proxy start`, then re-run."
             ) from e
         if not _wait_bubble_proxy_endpoint_healthy(newer_than=endpoint_mtime, expected_version=version or None):
             raise Die(
                 "preflight: `bubble gh proxy start` returned success but did not publish a reachable "
-                "fresh auth-proxy endpoint with fork-push support. Check ~/.bubble/auth-proxy.log and "
+                "fresh auth-proxy endpoint with the required GitHub capabilities. Check ~/.bubble/auth-proxy.log and "
                 "/tmp/bubble-auth-proxy.log, then re-run."
             )
-        log("bubble auth-proxy: restarted daemon with fork --allow-push support")
+        log("bubble auth-proxy: restarted daemon with the required GitHub capabilities")
     finally:
         if lockf is not None:
             try:
