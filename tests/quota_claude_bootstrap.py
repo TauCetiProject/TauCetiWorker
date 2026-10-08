@@ -454,7 +454,8 @@ os.environ.update(
     }
 )
 argv, env, cwd = q._bootstrap_spec()
-check("the request is one minimal `claude -p` turn", (argv[-2], len(argv)), ("-p", 3))
+check("the request is one minimal `claude -p` turn", (argv[1], len(argv)), ("-p", 5))
+check("the bootstrap uses exact Opus 5.5", argv[argv.index("--model") + 1], "claude-opus-5-5")
 for var in (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",

@@ -241,6 +241,9 @@ rather than wandering onto other work.
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
 
+Claude authoring and reviews both default to exact `claude-opus-5-5`, on the host and in Bubble.
+Set `TAUCETI_CLAUDE_MODEL` to override reviews independently of the authoring profile.
+
 Set a default with `TAUCETI_AGENT`. Kiro and the OpenRouter agents are unpaced
 and never run on their own; you have to ask for them by name. Kiro always passes
 an exact model ID and first checks that the logged-in account advertises it—its

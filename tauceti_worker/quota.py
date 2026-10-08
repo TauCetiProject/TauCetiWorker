@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import oauth as credential_refresh
 from .config import Config, log
-from .constants import CLAUDE_CMD, POLL
+from .constants import AUTHORING_DEFAULTS, CLAUDE_CMD, POLL
 from .github import GitHubError, _parse_retry_after
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -2203,7 +2203,13 @@ class Quota:
         import shlex
         import tempfile
 
-        argv = [*(shlex.split(CLAUDE_CMD) or ["claude"]), "-p", CLAUDE_BOOTSTRAP_PROMPT]
+        argv = [
+            *(shlex.split(CLAUDE_CMD) or ["claude"]),
+            "-p",
+            CLAUDE_BOOTSTRAP_PROMPT,
+            "--model",
+            AUTHORING_DEFAULTS["claude"][0],
+        ]
         env = {k: v for k, v in os.environ.items() if k not in CLAUDE_BOOTSTRAP_DROP_ENV}
         return argv, env, tempfile.mkdtemp(prefix="tauceti-quota-bootstrap-")
 
