@@ -34,6 +34,7 @@ from .agents import (
     KIRO_BUBBLE_MIN_VERSION,
     bubble_cmd_is_disposable,
     bubble_supports_allow_push,
+    bubble_supports_github_account,
     bubble_supports_lake_cache_service,
     bubble_version_meets_minimum,
     ensure_fork_proxy_current,
@@ -71,13 +72,13 @@ from .constants import (
     TAUCETI,
     WORK_TASKS,
 )
-from .github import GitHub, shared_claims_granted
+from .github import GitHub, pin_github_account, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
-from .runtime_status import report_failure
+from .runtime_status import report_failure, report_runtime
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
 from .usage import kiro_data_dir, usage_snapshot
@@ -135,6 +136,7 @@ environment (flags win; full reference linked below):
   TAUCETI_STREAM=1       same as --stream
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
+  TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
   CODEX_HOME             Codex config/credential source; point it at a private directory to give
@@ -145,10 +147,21 @@ full reference:
 """
 
 
+def add_github_account_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--github-account",
+        default=argparse.SUPPRESS,
+        metavar="LOGIN",
+        help="use this GitHub login without changing gh's active account; defaults to "
+        "$TAUCETI_GITHUB_ACCOUNT, otherwise current gh authentication. Independent of --account (Codex)",
+    )
+
+
 def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
     p.add_argument("--budget", action="store_true", help="admit Claude API sessions through shared local grants")
     p.add_argument("--anthropic-api-key-file", metavar="PATH", help="private API key file; otherwise ANTHROPIC_API_KEY")
+    add_github_account_flag(p)
     p.add_argument(
         "--loop",
         action="store_true",
@@ -525,6 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
         "for persistent workers. Guide and reference:\n"
         "  https://github.com/TauCetiProject/TauCetiWorker",
     )
+    add_github_account_flag(p)
     sub = p.add_subparsers(dest="cmd")
 
     w = sub.add_parser(
@@ -542,6 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", help="read-only survey of available work + quota")
     s.add_argument("--json", action="store_true", help="emit the survey as JSON")
     s.add_argument("--worker-id", dest="worker_id", default=None)
+    add_github_account_flag(s)
 
     u = sub.add_parser("usage", help="read Kiro/OpenRouter credits without sending a model prompt")
     u.add_argument(
@@ -565,7 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     u.add_argument("--timeout", type=float, default=30.0, help="per-provider query timeout in seconds")
 
-    sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
+    doctor = sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
+    add_github_account_flag(doctor)
 
     add_workers_parser(sub)
     add_budget_parser(sub)
@@ -578,6 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
     hb.add_argument("--ppipe", type=int, default=None)
     ep = sub.add_parser("_egress-probe", add_help=False)
     ep.add_argument("--worker-id", dest="worker_id", default=None)
+    add_github_account_flag(ep)
     mr = sub.add_parser("_managed-run", add_help=False)
     mr.add_argument("--spec", required=True)
     mr.add_argument("--state-dir", required=True)
@@ -626,6 +643,11 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_budget(args)
         except (BudgetError, OSError) as error:
             raise Die(str(error)) from None
+    if cmd in (None, "status", "doctor", "work", "_round", "_egress-probe"):
+        account = getattr(args, "github_account", os.environ.get("TAUCETI_GITHUB_ACCOUNT"))
+        if account is not None:
+            args.github_account = pin_github_account(account)
+            report_runtime(github_account=args.github_account)
 
     if cmd is None:
         return cmd_tui(args)
@@ -988,7 +1010,9 @@ def cmd_doctor(args) -> int:
     rows.append(("uv/uvx", _have("uvx"), "required (runs tauceti and fetches the review engine)"))
     rows.append(("jq", _have("jq"), "claim.sh needs it"))
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
-    rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
+    github_account = os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    gh_note = f"GitHub account: {github_account}" if github_account else "current gh authentication"
+    rows.append(("gh auth", gh_auth, gh_note + "; its PRs are the ones the worker tends"))
     # Which claim namespace this account gets, and therefore how far its de-duplication reaches. The
     # row is not a failure: the fork always works, it just does not coordinate beyond your own fleet.
     # Deliberately does not resolve the fork, so `doctor` never creates one as a side effect.
@@ -1086,6 +1110,11 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "  or set $TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
         )
     if uses_bubble and not opts.dry_run:
+        if os.environ.get("TAUCETI_GITHUB_ACCOUNT") and not bubble_supports_github_account():
+            raise Die(
+                "preflight: --github-account with --bubble requires account-aware Bubble "
+                "(--github-account support in both the CLI and auth proxy). Use host mode or update Bubble."
+            )
         bubble_version = installed_bubble_version()
         minimum = KIRO_BUBBLE_MIN_VERSION if opts.work_model == "kiro" else BUBBLE_MIN_VERSION
         if not bubble_version_meets_minimum(bubble_version, minimum):
@@ -1129,8 +1158,8 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             )
     # The CLI may advertise --allow-push while an older live daemon keeps rejecting fork pushes (403).
     # Require a reachable endpoint that advertises the capability, and refresh it safely when needed.
-    # Fork-pushing rounds only (a stale daemon must not block review).
-    if uses_fork and not opts.dry_run:
+    # Account-selected reviews also require the account-aware daemon.
+    if (uses_fork or (uses_bubble and os.environ.get("TAUCETI_GITHUB_ACCOUNT"))) and not opts.dry_run:
         ensure_fork_proxy_current()
 
 

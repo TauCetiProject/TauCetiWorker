@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from .constants import AGENTS, ALLOWED_TASKS
+from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
@@ -40,6 +41,7 @@ DEFAULT_INTERVAL = 2.0
 TMUX_SESSION = "tauceti-workers"
 _WORKER_KEYS = {
     "id",
+    "github_account",
     "enabled",
     "agent",
     "only",
@@ -244,6 +246,7 @@ def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
+    github_account: str | None = None
     enabled: bool = True
     agent: str = "auto"
     only: tuple[str, ...] = ()
@@ -297,6 +300,7 @@ class WorkerSpec:
             id=wid,
             enabled=enabled,
             agent=agent,
+            github_account=_string(raw.get("github_account"), f"workers[{index}].github_account", optional=True),
             only=only,
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
@@ -321,6 +325,11 @@ class WorkerSpec:
             restart=restart,
             env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
+        if spec.github_account is not None:
+            try:
+                validate_github_account(spec.github_account)
+            except ValueError as e:
+                raise WorkersError(f"workers[{index}].github_account: {e}") from None
         if spec.source is not None and ("roadmap" not in spec.only or not spec.roadmap_only):
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
@@ -360,7 +369,7 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if not self.respect_claims:
             value["respect_claims"] = False
-        for name in ("source", "author_model", "author_effort", "pace"):
+        for name in ("github_account", "source", "author_model", "author_effort", "pace"):
             item = getattr(self, name)
             if item is not None:
                 value[name] = item
@@ -407,6 +416,7 @@ class WorkerSpec:
         if not self.respect_claims:
             argv.append("--ignore-claims")
         for field, flag in (
+            (self.github_account, "--github-account"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -696,7 +706,7 @@ def cmd_managed_runner(args) -> int:
             # that discovery while the PYTHONPATH the child needs to import itself is still prepended
             # rather than replaced. The manager's own variables are assigned last and are reserved, so
             # nothing here can shadow them.
-            env = self_env({**os.environ, **dict(spec.env)})
+            env = self_env(unselected_github_env({**unselected_github_env(), **dict(spec.env)}))
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
@@ -714,6 +724,7 @@ def cmd_managed_runner(args) -> int:
                 instance=uuid.uuid4().hex,
                 spec_hash=spec.fingerprint(),
                 agent=spec.agent,
+                github_account=spec.github_account,
                 only=list(spec.only),
                 sandbox=spec.sandbox,
                 log_file=str(log_path),
@@ -820,7 +831,7 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
             runtime_dir,
         ),
         cwd=HERE,
-        env=self_env(),
+        env=self_env(unselected_github_env()),
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
@@ -1037,7 +1048,7 @@ def ensure_manager(config: Path) -> bool:
                     spawned = subprocess.Popen(
                         self_argv("workers", "--config", config, "manager"),
                         cwd=HERE,
-                        env=self_env(),
+                        env=self_env(unselected_github_env()),
                         stdin=subprocess.DEVNULL,
                         stdout=log,
                         stderr=subprocess.STDOUT,
@@ -1202,6 +1213,9 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
                 width,
             )
         )
+    github_account = spec.get("github_account") or item.get("github_account")
+    if github_account:
+        lines.extend(_status_field("github", [str(github_account)], width))
 
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
     if spec.get("pace"):
@@ -1364,7 +1378,14 @@ def _remove_spec(config: Path, wid: str) -> None:
 
 
 def add_dashboard_worker(
-    config: Path, *, only: str | None, agent: str, bubble: bool, roadmap_only: str | None, roadmap_skip: str | None
+    config: Path,
+    *,
+    only: str | None,
+    agent: str,
+    bubble: bool,
+    roadmap_only: str | None,
+    roadmap_skip: str | None,
+    github_account: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1375,6 +1396,7 @@ def add_dashboard_worker(
             specs = []
         spec = WorkerSpec(
             id=next_worker_id(specs),
+            github_account=github_account,
             agent=agent,
             only=(only,) if only else (),
             sandbox="bubble" if bubble else "host",
@@ -1677,6 +1699,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             key = {
                 "--worker-id": "id",
                 "--agent": "agent",
+                "--github-account": "github_account",
                 "--only": "only",
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
@@ -1733,6 +1756,11 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--anthropic-api-key-file")
     add.add_argument("worker_id", nargs="?", help="stable id (default: next free workerN)")
     add.add_argument("--agent", choices=AGENTS, default="auto", help="agent for each round (default: auto)")
+    add.add_argument(
+        "--github-account",
+        default=argparse.SUPPRESS,
+        help="GitHub login for this worker (independent of its agent account)",
+    )
     add.add_argument("--only", default="", help="comma-separated work phases (default: full cascade)")
     add.add_argument(
         "--sandbox", choices=("host", "bubble"), default="host", help="where eligible phases run (default: host)"
@@ -1843,8 +1871,8 @@ def cmd_workers(args) -> int:
                     if args.anthropic_api_key_file
                     else None,
                 }
-                for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
-                    value = getattr(args, key)
+                for key in ("github_account", "roadmap_only", "source", "author_model", "author_effort", "pace"):
+                    value = getattr(args, key, None)
                     if value is not None:
                         raw[key] = value
                 spec = WorkerSpec.from_dict(raw, len(specs))

@@ -130,6 +130,8 @@ def render_survey(
     titles = {p.number: p.title for p in sv.open_prs}
 
     header = f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   open: {sv.status_label_line()}"
+    if account := os.environ.get("TAUCETI_GITHUB_ACCOUNT"):
+        header += "\ngithub: " + escape(account)
     if quota_snap is not None:
         header += "\nquota: " + quota_line(quota_snap)
     console.print(Panel(header, title="tauceti"))
@@ -163,6 +165,7 @@ def launch_cmd(
     loop: bool,
     roadmap_only: str | None = None,
     roadmap_skip: str | None = None,
+    github_account: str | None = None,
 ) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
     `roadmap_only`/`roadmap_skip` (the raw env values for the current roadmap dials) are embedded as
@@ -170,6 +173,9 @@ def launch_cmd(
     silently reverting to the shell default. They are passed through verbatim (an explicit empty string
     is meaningful and overrides an inherited env var), and only omitted when unset (None)."""
     cmd = entry_cmd() + ["work"]
+    account = github_account if github_account is not None else os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    if account is not None:
+        cmd += ["--github-account", account]
     if loop:
         cmd.append("--loop")
     if only:
@@ -485,6 +491,8 @@ def _dashboard_app(cfg, loader=None):
             head = Text()
             head.append(TAUCETI, style="bold")
             head.append(f"   worker: {sv.worker_id}   open: {sv.status_label_line()}")
+            if account := os.environ.get("TAUCETI_GITHUB_ACCOUNT"):
+                head.append(f"\ngithub: {account}")
             if self.quota is not None:
                 head.append("\nquota: ")
                 head.append_text(Text.from_markup(quota_line(self.quota)))
@@ -816,6 +824,7 @@ def _dashboard_app(cfg, loader=None):
                         bubble=self.bubble,
                         roadmap_only=roadmap_only(),
                         roadmap_skip=skip,
+                        github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",

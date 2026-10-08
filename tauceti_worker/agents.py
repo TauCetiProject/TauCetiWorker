@@ -935,6 +935,11 @@ def bubble_supports_allow_push() -> bool:
     return "--allow-push" in _bubble_open_help()
 
 
+def bubble_supports_github_account() -> bool:
+    """Account selection must reach the shared proxy, not just the Bubble CLI process."""
+    return re.search(r"(?<![\w-])--github-account(?=[\s=,]|$)", _bubble_open_help()) is not None
+
+
 def bubble_supports_lake_cache_service() -> bool:
     """Does the resolved Bubble support its host-global, download-only Lake cache proxy?"""
     import re
@@ -1040,6 +1045,8 @@ def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_ve
         capabilities = endpoint.get("capabilities")
         if not isinstance(capabilities, list) or "allow-push" not in capabilities:
             return False
+        if os.environ.get("TAUCETI_GITHUB_ACCOUNT") and "github-account" not in capabilities:
+            return False
         if expected_version is not None and endpoint.get("bubble_version") != expected_version:
             return False
         pid = endpoint.get("pid")
@@ -1096,7 +1103,7 @@ def ensure_fork_proxy_current() -> None:
     `gh proxy start`. The refresh is serialized under a host-global file lock so concurrent TauCeti workers
     do not race; Bubble separately serializes all service installers. Fail-CLOSED throughout: if the refresh
     cannot publish a fresh endpoint we Die rather than burn a long round that cannot authenticate. Call this
-    ONLY for rounds that push to a fork — a review-only worker must not be blocked by it."""
+    for fork authoring or an explicitly selected GitHub account, including selected-account reviews."""
     import fcntl
 
     # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails.
@@ -1113,7 +1120,7 @@ def ensure_fork_proxy_current() -> None:
             if _bubble_proxy_endpoint_healthy():
                 return
             raise Die(
-                "preflight: fork authoring needs Bubble installed at a stable path; the uvx fallback "
+                "preflight: fork authoring and GitHub account selection need Bubble installed at a stable path; the uvx fallback "
                 "cannot safely own a host-global launchd/systemd daemon. Install dev-bubble or set "
                 "$TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
             )
@@ -1127,22 +1134,22 @@ def ensure_fork_proxy_current() -> None:
             detail = (e.stderr or e.stdout or "").strip()[-500:]
             suffix = f"\n  Bubble said: {detail}" if detail else ""
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}{suffix}"
             ) from e
         except (OSError, subprocess.SubprocessError) as e:
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}\n"
                 "  Restart it yourself with `bubble gh proxy start`, then re-run."
             ) from e
         if not _wait_bubble_proxy_endpoint_healthy(newer_than=endpoint_mtime, expected_version=version or None):
             raise Die(
                 "preflight: `bubble gh proxy start` returned success but did not publish a reachable "
-                "fresh auth-proxy endpoint with fork-push support. Check ~/.bubble/auth-proxy.log and "
+                "fresh auth-proxy endpoint with the required GitHub capabilities. Check ~/.bubble/auth-proxy.log and "
                 "/tmp/bubble-auth-proxy.log, then re-run."
             )
-        log("bubble auth-proxy: restarted daemon with fork --allow-push support")
+        log("bubble auth-proxy: restarted daemon with the required GitHub capabilities")
     finally:
         if lockf is not None:
             try:
@@ -1422,6 +1429,13 @@ def run_in_bubble(
     import shlex
 
     cfg, wm = w.cfg, opts.work_model
+    github_account = os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    if github_account and not os.environ.get("TAUCETI_AGENT_ECHO"):
+        if not bubble_supports_github_account():
+            raise Die(
+                "--github-account with --bubble requires account-aware Bubble; this install has no --github-account"
+            )
+        ensure_fork_proxy_current()
     # Review/probe commands bring their own model policy. Do not let an unrelated authoring override
     # (including a malformed effort value) prevent those isolated commands from running.
     profile = getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm) if inner_cmd is None else None
@@ -1487,6 +1501,9 @@ def run_in_bubble(
     # fork gets git only. (For a PR target, bubble also auto-derives the head fork, so this is belt-and-
     # suspenders for maintenance and the sole grant for authoring, which has no PR to derive from.)
     push_flags = ["--allow-push", allow_push] if allow_push else []
+    account_flags = ["--github-account", github_account] if github_account else []
+    if github_account:
+        account_flags += ["--git-name", os.environ["GIT_AUTHOR_NAME"], "--git-email", os.environ["GIT_AUTHOR_EMAIL"]]
 
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
@@ -1538,6 +1555,7 @@ def run_in_bubble(
         "--github-security",
         "allowlist-write-graphql",
         *push_flags,
+        *account_flags,
         *cache_flags,
         *mount_flags,
         *(

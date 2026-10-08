@@ -16,6 +16,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--author-model MODEL` | Exact authoring model for an explicit provider (CLI > provider environment > committed default). |
 | `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex, Claude, or Kiro provider. |
 | `--account EMAIL_OR_ID` | Require the Codex credential to be this account (email, or the workspace UUID `tauceti doctor` prints) and refuse to run otherwise. Checks only; never switches. Needs an explicit `--agent codex`. |
+| `--github-account LOGIN` | Select the GitHub login for this process and its children; verifies the credential before work and leaves gh's active account unchanged. Also accepted by the dashboard, `status`, and `doctor`. |
 | `--bubble` | Run code and review agents inside the Bubble sandbox instead of directly on the host. The outer survey and coordination, plus all progress-report rounds, remain on the host. |
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
@@ -138,6 +139,51 @@ Kiro usage comes from the CLI's ACP extension and retains fractional credit
 values. OpenRouter's inference key reports key usage/limits; an optional
 `OPENROUTER_MANAGEMENT_KEY` adds account-wide purchased-credit telemetry.
 
+## GitHub accounts
+
+Use `--github-account LOGIN` or `TAUCETI_GITHUB_ACCOUNT` to bind a worker to one
+GitHub account. With neither set, existing `gh` authentication behavior is
+unchanged. Selection occurs before per-worker HOME isolation. TauCeti reads
+`gh auth token --hostname github.com --user LOGIN` with inherited token overrides
+removed, then verifies the resulting credential against GitHub's `/user` API.
+When no named credential is stored, an inherited `GH_TOKEN` or `GITHUB_TOKEN`
+may be used, with the same identity check. Missing, rejected, or mismatched
+credentials stop the command; TauCeti never switches to another account.
+
+The selected token lives in the worker's environment and is inherited by loop
+rounds, review tools, host agents, and Git's `gh auth git-credential` helper.
+Tokens are absent from command arguments, logs, and `workers.toml`. Git helper
+selection and author/committer name and noreply email are process-local;
+your global Git configuration is unchanged. Signing remains configured as before;
+ensure your signing key covers the selected account's noreply email if you require
+verified signed commits. GitHub SSH URLs are routed through
+HTTPS. SSH Git transport is disabled in the selected worker, so conflicting
+operator URL rewrites fail closed instead of choosing an unrelated SSH key.
+
+Each worker tends its selected account's PRs and resolves that account's fork.
+`TAUCETI_FORK` and `CLAIM_REPO` remain explicit overrides. Workers using different
+forks coordinate only if all accounts can write the same claim repository.
+`--roadmap-extra-identities` affects intentions ownership, not authentication
+or PR maintenance. The GitHub login is independent of the agent's subscription
+account selected or checked through provider credentials and `--account`.
+
+The dashboard displays the selected login and includes it in copied launch
+commands and persistent worker definitions. Choose it when opening the dashboard,
+for example `tauceti --github-account alice`. In `workers.toml`, set
+`github_account = "alice"` per worker; changing it changes the worker definition
+fingerprint and causes the manager to restart the worker. The shared manager
+removes dashboard account selection before spawning workers; a worker with no
+`github_account` uses the original host credentials. This also applies when the
+manager is started from a shell with `TAUCETI_GITHUB_ACCOUNT` set.
+
+Bubble mode requires `--github-account` support in Bubble's `open` command and
+the `github-account` capability in its running proxy. The companion implementation
+binds each scoped container token to its selected credential in the host's private
+proxy registry. The real GitHub token stays on the host. Old installations fail
+before an agent starts. After credential rotation or revocation, restart the
+worker to obtain a replacement; a running worker never falls back to the active
+`gh` account.
+
 ## Codex accounts
 
 `--account EMAIL_OR_ID` (or `TAUCETI_ACCOUNT`) requires the Codex credential to
@@ -168,6 +214,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | --- | --- | --- |
 | `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
 | `TAUCETI_ACCOUNT` | _(unset)_ | Default for `--account`. |
+| `TAUCETI_GITHUB_ACCOUNT` | _(unset)_ | GitHub login to select and verify for the dashboard, status, doctor, and work commands. |
 | `CODEX_HOME` | `~/.codex` | Codex config/credential source. Point it at a private directory to give TauCeti its own Codex account without disturbing the one your interactive `codex` uses. |
 | `TAUCETI_WORKER_ID` | _(unset)_ | Pin the id; when unset, `work` takes the lowest free `workerN`. |
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |

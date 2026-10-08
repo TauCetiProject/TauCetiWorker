@@ -25,6 +25,21 @@ also run their cache downloads and advisory `lake build` there.
 
 That isolation matters most for review, where the agent reads untrusted PRs.
 
+## Multiple GitHub accounts
+
+`--github-account LOGIN --bubble` requires the companion account-aware Bubble
+CLI and auth proxy. TauCeti checks the CLI flag and the daemon's advertised
+`github-account` capability before starting a model, and passes the login and
+commit attribution to `bubble open`. The proxy binds each container's scoped
+token to its own selected GitHub credential; the raw credential stays in the
+host's private registry and is removed when that container's token is revoked.
+Different containers can therefore use different accounts concurrently.
+
+An older Bubble installation rejects this combination. Update to an
+account-aware build and restart its proxy with `bubble gh proxy start`.
+Restart the worker after replacing a GitHub credential; the proxy never
+refreshes a selected container through another account's active login.
+
 ## Lake caches
 
 Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
