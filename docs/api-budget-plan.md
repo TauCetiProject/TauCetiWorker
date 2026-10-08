@@ -128,7 +128,7 @@ change affects this wall-clock policy and should be visible in the history.
 
 Malformed records, sequence gaps, or a torn final write block new admissions and
 report the problem. For a torn final write, `budget --repair-ledger --note TEXT` archives the
-original bytes, rebuilds the verified complete prefix, and appends an unresolved
+original bytes, atomically replaces the ledger with the verified prefix plus an unresolved
 repair entry naming the archive. Admissions remain blocked until that entry is
 reconciled after investigation. Complete invalid records require manual
 investigation; they are never silently skipped. A valid transaction whose acknowledgement
@@ -158,12 +158,16 @@ signal in response to local budget state. Operator stops and existing unrelated
 timeout behavior retain their existing meaning.
 
 Check admission immediately before a concrete paid launch, after survey and
-non-model preflight. Finding no work costs nothing. Waiting loops recheck the
-shared ledger after a bounded sleep and use calculated funding wake times where
-possible. One-shot commands report the funding block and exit without launching.
+non-model preflight. Finding no work costs nothing. Funding waits happen in the
+outer loop, outside the round timeout, with rechecks at most 60 seconds apart and
+a projected deficit recovery time when available. The shim never waits for
+funding inside a round. One-shot commands report the block without launching.
 Show balance, active estimates, admission threshold, and waiting reason; avoid
 describing estimates as already billed costs. Serialize waiting admissions and
-use a fair queue so one fast loop cannot repeatedly win all newly earned funds.
+use a queue for funding waits within each model. Waiting liveness lives in a
+disposable state file; only changes of waiting reason go into the audit ledger.
+Stale tickets expire after 120 seconds. Cooldowns on other models do not hold up
+funded admissions.
 
 ## API credentials and cost recording
 
@@ -178,8 +182,13 @@ Managed workers should use a key-file path; store that path rather than the key.
 
 Bubble uses a private, read-only key handoff and loads the key inside the
 container. It must not require subscription credentials in API mode. The host
-owns the ledger; the container receives an invocation ID, not writable access
-to the whole budget. Key staging is cleaned up after the invocation.
+owns the ledger and issues invocation IDs. The container has a read-write
+requests/receipts mailbox and read-only replies/heartbeat mount, without access
+to the host shim, host key, or ledger. Host reads reject symlinks and oversized
+messages. Cost receipts remain self-reported: this is local accounting, not an
+attestation against a deliberately dishonest container. Key staging is cleaned
+up after the invocation. Raw keys are injected only into Claude and the external
+review engine's API-authentication path, not unrelated host/build subprocesses.
 
 Capture structured result data before transcript normalization. Persist a
 minimal cost receipt for each invocation separately from readable narration;
@@ -193,6 +202,11 @@ Claude's cost figures are local estimates, not authoritative Console charges.
 Missing or crash-zeroed results do not establish zero spending. Preserve the
 receipt and mark the invocation unresolved; block further admissions until the
 cost is recovered or an operator records a correction with an explanation.
+`budget --recover --note TEXT` reads durable receipts from stopped bridges and
+removes their staged keys. It skips live bridges. `--reconcile` refuses a
+running session with a live heartbeat. A native process that could not be
+started settles at zero; a process that ran without a reliable result remains
+unresolved.
 Do not release a pending estimate merely because its process disappeared or a
 timer expired. If logging fails during an active session, let it finish, retain
 its cost receipt, and block subsequent admissions pending reconciliation.
@@ -213,10 +227,11 @@ coverage. Inspect Progress and other external runners for the same requirement.
 
 API mode bypasses subscription usage polling, OAuth refresh, and quota bootstrap.
 It still respects actual API throttling. Keep throughput limits separate from
-dollar funding: keys do not multiply organization capacity. Record shared
-cooldowns, honor provider retry hints, stagger worker starts and retries, and
-reduce new admissions under sustained throttling. Distinguish exhausted credit
-or spend limits from transient throughput errors. The local budget never kills
+dollar funding: keys do not multiply organization capacity. Claude handles its
+native request retries; observed 429 retry events produce shared model
+cooldowns for new admissions. Cooldown recording does not block draining an
+active session's output. Provider errors remain visible in the transcript;
+local funding and provider throughput waits have separate reasons. The local budget never kills
 a session; provider refusal can still prevent it from making another request.
 See Anthropic's [API rate limits](https://platform.claude.com/docs/en/api/rate-limits).
 

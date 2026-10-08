@@ -639,12 +639,13 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
 
 
 def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path) -> int:
+    global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     argv, env = host_agent_argv(prompt, profile)
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(
+    rc = run_agent_proc(
         argv,
         env=env,
         cwd=cwd,
@@ -652,6 +653,12 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
         label=f"agent-{profile.provider}",
         provider=profile.provider,
     )
+    if rc == 75:
+        from .claude_api import blocked_reason
+
+        if reason := blocked_reason():
+            _LAST_AGENT_FAILURE = "local API admission unavailable: " + reason
+    return rc
 
 
 # Provider statuses that mean "the service could not serve this request right now", as opposed to
@@ -843,12 +850,16 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     detail that belongs in a subsidiary per-review log, not the orchestration stream. TAUCETI_STREAM=1
     streams to the terminal instead. Tails logf to the main log on a non-zero exit so failures aren't
     silent. The caller logs a one-line pointer to logf so the detail is discoverable."""
+    from .claude_api import review_environment
+
+    api_env = review_environment()
+    env_kwargs = {"env": api_env} if api_env is not None else {}
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv).returncode
+        return subprocess.run(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
-        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
+        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
@@ -1459,7 +1470,14 @@ def run_in_bubble(
         settings = json.loads((bridge / "bin/config.json").read_text())
         settings.update(command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge")
         atomic(api_bin / "config.json", settings)
-        mount_flags += ["--mount", f"{api_bin}:/opt/api-bin:ro", "--mount", f"{bridge}:/opt/api-bridge:rw"]
+        mount_flags += [
+            "--mount",
+            f"{api_bin}:/opt/api-bin:ro",
+            "--mount",
+            f"{bridge / 'inbox'}:/opt/api-bridge/inbox:rw",
+            "--mount",
+            f"{bridge / 'outbox'}:/opt/api-bridge/outbox:ro",
+        ]
     for m in mounts or []:
         mount_flags += ["--mount", m]
 
@@ -1476,7 +1494,9 @@ def run_in_bubble(
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
     tcenv = "env PATH=/opt/round:$PATH"
     if api_bridge and _uses_claude_credentials(cred_model):
-        tcenv = 'env PATH=/opt/api-bin:/opt/round:$PATH ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
+        tcenv = "env PATH=/opt/api-bin:/opt/round:$PATH"
+        if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
+            tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",

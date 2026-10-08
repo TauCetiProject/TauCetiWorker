@@ -10,6 +10,7 @@ import sys
 import time
 
 from .agents import resolve_authoring_profile
+from .budget import Budget, BudgetError, money
 from .claude_api import api_mode
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
@@ -101,6 +102,19 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
+                try:
+                    snapshot = Budget().snapshot()
+                    blocked = snapshot["unresolved"] or money(snapshot["available"]) <= 0
+                    reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
+                except (BudgetError, OSError) as error:
+                    blocked, reason, snapshot = True, str(error), {}
+                if blocked:
+                    wake = snapshot.get("balance_zero_at")
+                    nap = max(1, min(60, (wake - time.time() + 1) if wake else 60))
+                    report_runtime("waiting-budget", detail=reason, budget=snapshot, next_action_at=time.time() + nap)
+                    time.sleep(nap)
+                    continue
             report_runtime(
                 "checking-quota",
                 detail="checking provider availability",

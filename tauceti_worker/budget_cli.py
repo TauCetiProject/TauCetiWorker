@@ -18,12 +18,13 @@ def add_budget_parser(sub):
     parser.add_argument("--cost", metavar="USD", help="reconciled cost")
     parser.add_argument("--note", default="", help="explanation required for reconciliation or ledger repair")
     parser.add_argument("--repair-ledger", action="store_true", help="archive a torn write and audit recovery")
+    parser.add_argument("--recover", action="store_true", help="recover receipts from stopped accounting bridges")
 
 
 def cmd_budget(args):
     budget = Budget()
     changes = any(v is not None for v in (args.grant, args.set_grant, args.grant_rate))
-    if sum((changes, bool(args.reconcile), args.repair_ledger, args.log)) > 1:
+    if sum((changes, bool(args.reconcile), args.repair_ledger, args.recover, args.log)) > 1:
         raise BudgetError("choose one of grant changes, reconciliation, repair, or history")
     if args.cost is not None and not args.reconcile:
         raise BudgetError("--cost requires --reconcile")
@@ -36,6 +37,8 @@ def cmd_budget(args):
         snapshot = budget.snapshot()
     elif args.repair_ledger:
         snapshot = budget.repair(args.note)
+    elif args.recover:
+        snapshot = budget.recover(args.note)
     elif args.log:
         with budget.locked():
             records = budget.records()

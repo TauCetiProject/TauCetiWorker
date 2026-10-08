@@ -396,8 +396,8 @@ tauceti work --agent claude --claude-billing api --budget --loop \
 the replenishment rate and costs still owed by running sessions. Setting
 `--grant-rate 0` stops replenishment; there is no accumulation ceiling or
 per-session spending cap. Active sessions carry estimates of pending costs so
-parallel workers do
-not all start against the same funds. Estimates only affect new admissions.
+parallel workers do not all start against the same funds. Estimates only affect
+new admissions. Funding waits happen outside the timed round.
 
 The append-only ledger lives at
 `$XDG_STATE_HOME/tauceti/budget/events.jsonl` (normally
@@ -413,7 +413,9 @@ settlement, use `tauceti budget --reconcile INVOCATION --cost USD --note TEXT`;
 the correction is appended to history. A cold model runs one calibration
 session before parallel admissions use learned cost estimates. Unknown costs
 block new sessions until reconciled. No local budget amount is passed as
-Claude's `--max-budget-usd`.
+Claude's `--max-budget-usd`. After a crashed worker, first try
+`tauceti budget --recover --note "worker crash"` to recover its durable receipts
+and remove stale staged keys. Costs without a receipt still require reconciliation.
 
 Managed workers accept the same flags through `workers add`, or the
 `claude_billing = "api"`, `budget = true`, and `anthropic_api_key_file` fields

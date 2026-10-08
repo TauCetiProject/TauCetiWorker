@@ -1839,7 +1839,9 @@ def cmd_workers(args) -> int:
                     "isolate_home": args.isolate_home,
                     "claude_billing": args.claude_billing,
                     "budget": args.budget,
-                    "anthropic_api_key_file": args.anthropic_api_key_file,
+                    "anthropic_api_key_file": str(Path(args.anthropic_api_key_file).expanduser().resolve())
+                    if args.anthropic_api_key_file
+                    else None,
                 }
                 for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
                     value = getattr(args, key)

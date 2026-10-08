@@ -163,10 +163,10 @@ entry with `enabled = true`.
 | `worker_id` | `id`; omit it for the next free `workerN` |
 | `--agent AGENT` | `agent` |
 | `--only TASKS` | `only`, as a comma-separated list |
-| `--sandbox {host,bubble}` | `claude_billing` | string | `"subscription"` | `"api"` requires `agent = "claude"`; API mode bypasses subscription quota polling |
-| `budget` | bool | `false` | Admit API sessions through the shared local grant ledger; active sessions are never cut off by funding |
-| `anthropic_api_key_file` | string | unset | Private key-file path for API mode; otherwise use `ANTHROPIC_API_KEY`; never store a raw key in config |
-| `sandbox` |
+| `--sandbox {host,bubble}` | `sandbox` |
+| `--claude-billing {subscription,api}` | `claude_billing` |
+| `--budget` | `budget` |
+| `--anthropic-api-key-file PATH` | `anthropic_api_key_file` |
 | `--ignore-quota` | `ignore_quota`; use with an explicit subscription agent |
 | `--auto-refresh` | `auto_refresh` |
 | `--roadmap-only AREA` | `roadmap_only` |

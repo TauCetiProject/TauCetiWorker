@@ -816,7 +816,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     from .claude_api import api_context, api_mode
 
     try:
-        with api_context(w.cfg.wid if api_mode() else "", stage):
+        with api_context(w.cfg.wid if api_mode() else "", stage, host=not bubble or stage == "progress"):
             rc = fn(w, sv, c, opts, bubble)
     except (BudgetError, OSError) as error:
         if not api_mode():
@@ -891,6 +891,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"review #{pr}",
             )
         log(f"  review #{pr}: engine rc={rc}")
+        from .claude_api import blocked_reason
+
+        if rc != 0 and (reason := blocked_reason()):
+            raise NoProgress(f"review #{pr}: {reason}; local admission failure is not charged to the PR")
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without posting a verdict" streak up front — BEFORE the publish step, which is
@@ -1045,6 +1049,12 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
     per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
     """
+    from .claude_api import blocked_reason
+
+    if reason := blocked_reason():
+        for key in charged:
+            w.counters.write(key, max(0, w.counters.read(key) - 1))
+        raise NoProgress(f"{label} #{c.pr}: {reason}; local admission failure is not charged to the PR")
     reason = take_last_agent_infra_failure()
     if not reason:
         return
@@ -1410,6 +1420,10 @@ def _do_progress_inner(w, opts) -> int | None:
     )
     rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
     if rc != 0:
+        from .claude_api import blocked_reason
+
+        if reason := blocked_reason():
+            raise NoProgress(f"progress: {reason}; local admission failure is not charged")
         w.counters.incr("progress-err")
         raise Die(f"the writing agent exited {rc}")
     for f in (status_body, section_body):
