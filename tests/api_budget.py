@@ -261,8 +261,14 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.envir
             receipt = next(context.inbox.glob("*.receipt"))
             self.assertNotIn("fake-api-key", receipt.read_text())
         with ClaudeAPIContext("reviewer", "review"):
-            result = self.run_claude(env={**os.environ, "FAKE_COST": "15"})
+            result = subprocess.run(
+                ["claude", "-p", "hello", "--model=opus", "--resume=resumable-session", "--output-format=json"],
+                env={**os.environ, "FAKE_COST": "15"},
+                capture_output=True,
+                text=True,
+            )
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["total_cost_usd"], 15)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 15)
 
     def test_crash_freezes_future_admissions(self):
