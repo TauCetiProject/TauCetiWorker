@@ -221,9 +221,30 @@ class Budget:
         with self.locked():
             state = self.replay()
             queue = self.waiting_state(state)
-            if worker in queue:
+            if worker in queue and self.clock() - queue[worker].get("seen", 0) < 120:
                 queue[worker]["seen"] = self.clock()
                 self.save_waiting(queue)
+
+    def wait_for_funding(self, worker, model, phase):
+        with self.locked():
+            state = self.replay()
+            queue = self.waiting_state(state)
+            previous = queue.get(worker, {})
+            now = self.clock()
+            if now - previous.get("seen", 0) >= 120:
+                previous = {}
+            estimate = self.estimate(state, model, phase)[1]
+            queue[worker] = dict(
+                type="wait",
+                worker=worker,
+                model=model,
+                ticket=previous.get("ticket", uuid.uuid4().hex),
+                since=previous.get("since", now),
+                seen=now,
+                reason="waiting for funding",
+                estimate=str(estimate),
+            )
+            self.save_waiting(queue)
 
     def estimate(self, state, model, phase=None):
         costs = state["samples"].get(model + ":" + phase, []) if phase else []
@@ -257,9 +278,6 @@ class Budget:
                 threshold = money(previous["estimate"])
             elif model:
                 threshold = self.estimate(state, model, phase)[1]
-            else:
-                models = {s["model"] for s in state["sessions"].values() if phase is None or s["phase"] == phase}
-                threshold = max((self.estimate(state, m, phase)[1] for m in models), default=Decimal(0))
         funding_at = None
         if worker is not None and state["rate"] > 0 and available < max(threshold, Decimal("0.000000001")):
             funding_at = now + float((max(threshold, Decimal("0.000000001")) - available) * 3600 / state["rate"])
@@ -439,8 +457,10 @@ class Budget:
             raise BudgetError("receipt is missing cost totals")
         totals = receipt["totals"]
         if totals is not None:
-            if not isinstance(totals, dict) or any(
-                not isinstance(k, str) or not isinstance(v, str) for k, v in totals.items()
+            if (
+                not isinstance(totals, dict)
+                or not totals
+                or any(not isinstance(k, str) or not isinstance(v, str) for k, v in totals.items())
             ):
                 raise BudgetError("receipt totals must map provider IDs to decimal strings")
             if any(money(v) < 0 for v in totals.values()):
@@ -483,10 +503,14 @@ class Budget:
             except FileNotFoundError:
                 pass
             invocation = session["id"]
-            if len(invocation) != 32 or any(c not in "0123456789abcdef" for c in invocation):
-                raise BudgetError("invalid receipt invocation ID")
-            receipt = bridge / "inbox" / (invocation + ".receipt")
             try:
+                if (
+                    not isinstance(invocation, str)
+                    or len(invocation) != 32
+                    or any(c not in "0123456789abcdef" for c in invocation)
+                ):
+                    raise BudgetError("invalid receipt invocation ID")
+                receipt = bridge / "inbox" / (invocation + ".receipt")
                 if receipt.exists():
                     value = safe_message(receipt)
                     if not isinstance(value, dict) or value.get("id") != invocation:

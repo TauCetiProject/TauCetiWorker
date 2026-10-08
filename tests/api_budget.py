@@ -504,7 +504,33 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.envir
         ):
             with patch.object(loop.time, "sleep", side_effect=sleep):
                 loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude")
-        self.assertEqual(waits, [5, 5])
+        self.assertEqual(waits, [5, 10])
+
+    def test_loop_queue_refresh_failure_is_recoverable(self):
+        from tauceti_worker.constants import EX_ADMISSION_WAIT
+
+        args = build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--budget", "--loop"])
+        with (
+            patch.object(loop, "run_round_subprocess", return_value=EX_ADMISSION_WAIT),
+            patch.object(loop, "github_budget", return_value={}),
+        ):
+            with (
+                patch.object(Budget, "refresh_waiter", side_effect=BudgetError("damaged ledger")),
+                patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+            ):
+                self.assertEqual(loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude"), 130)
+
+    def test_auth_failure_uses_normal_backoff_and_stale_ticket_expires(self):
+        from tauceti_worker.claude_api import admission_failure
+        from tauceti_worker.config import AdmissionUnavailable, NoProgress
+
+        self.assertIs(type(admission_failure("Claude API authentication unavailable")), NoProgress)
+        self.assertIs(type(admission_failure("waiting for funding")), AdmissionUnavailable)
+        self.budget.configure(set_grant=0)
+        self.budget.admit("wait", "worker1", "opus", "fix")
+        self.budget.clock = lambda: time.time() + 121
+        self.budget.refresh_waiter("worker1")
+        self.assertEqual(self.budget.snapshot()["waiting"], [])
 
     def test_bubble_key_bridge_without_subscription_credentials(self):
         native_bin = self.root / "real-bin"

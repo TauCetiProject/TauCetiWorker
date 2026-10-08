@@ -168,8 +168,9 @@ describing estimates as already billed costs. Serialize waiting admissions and
 use a queue for funding waits within each model. Waiting liveness lives in a
 disposable state file; only changes of waiting reason go into the audit ledger.
 Stale tickets expire after 120 seconds. Cooldowns on other models do not hold up
-funded admissions. Local denials have a distinct round exit code and a five-second
-outer retry, without increasing the no-progress backoff; funding waits refresh
+funded admissions. Local denials have a distinct round exit code and outer retries
+that back off from five to at most 60 seconds, separately from no-progress backoff;
+authentication and launch failures use normal failure backoff. Funding waits refresh
 queue liveness while they recheck.
 
 ## API credentials and cost recording

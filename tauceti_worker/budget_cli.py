@@ -53,7 +53,7 @@ def cmd_budget(args):
         snapshot = budget.snapshot()
     if args.json:
         print(json.dumps(snapshot, indent=2))
-        return 0
+        return 1 if snapshot.get("recovery_errors") else 0
     print("Local budget (USD, estimated session costs)")
     for label, field in (
         ("Balance", "balance"),
@@ -77,4 +77,4 @@ def cmd_budget(args):
     for error in snapshot.get("recovery_errors", []):
         print("  Unresolved recovery: " + error)
     print(f"  Ledger                     {snapshot['ledger']}")
-    return 0
+    return 1 if snapshot.get("recovery_errors") else 0

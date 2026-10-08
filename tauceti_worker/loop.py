@@ -3,6 +3,7 @@ timeout, then settle (short pause if productive, escalating back-off otherwise).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -101,6 +102,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     )
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
+    admission_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -273,12 +275,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
             if rc == EX_ADMISSION_WAIT:
                 streak = 0
-                Budget().refresh_waiter(cfg.wid)
+                admission_streak += 1
+                nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))
+                with contextlib.suppress(BudgetError, OSError):
+                    Budget().refresh_waiter(cfg.wid)
                 report_runtime(
-                    "waiting-budget", detail="rechecking local API admission", next_action_at=time.time() + 5
+                    "waiting-budget", detail="rechecking local API admission", next_action_at=time.time() + nap
                 )
-                time.sleep(5)
+                time.sleep(nap)
                 continue
+            admission_streak = 0
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
             if rc == 0:

@@ -25,6 +25,13 @@ def blocked_reason():
     return CURRENT_CONTEXT.blocked_reason if CURRENT_CONTEXT is not None else None
 
 
+def admission_failure(message):
+    from .config import AdmissionUnavailable, NoProgress
+
+    waiting = message.startswith(("waiting", "unresolved", "API throughput", "provider session already"))
+    return AdmissionUnavailable(message) if waiting else NoProgress(message)
+
+
 def review_environment():
     if not api_mode() or CURRENT_CONTEXT is None:
         return None
@@ -132,6 +139,8 @@ class ClaudeAPIContext:
                 or money(snapshot["available"]) < money(snapshot["admission_threshold"])
             ):
                 reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
+                if not snapshot["unresolved"] and self.model:
+                    self.budget.wait_for_funding(self.worker, self.model, self.phase)
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
                 raise BudgetError(reason)
         self.directory.mkdir(parents=True, mode=0o700)
