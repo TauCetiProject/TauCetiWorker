@@ -37,6 +37,7 @@ RUN_STDLIB=(
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
+  github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
   host_agent_preflight.py

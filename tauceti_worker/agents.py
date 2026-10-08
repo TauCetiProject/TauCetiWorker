@@ -935,6 +935,11 @@ def bubble_supports_allow_push() -> bool:
     return "--allow-push" in _bubble_open_help()
 
 
+def bubble_supports_github_account() -> bool:
+    """Account selection must reach the shared proxy, not just the Bubble CLI process."""
+    return re.search(r"(?<![\w-])--github-account(?=[\s=,]|$)", _bubble_open_help()) is not None
+
+
 def bubble_supports_lake_cache_service() -> bool:
     """Does the resolved Bubble support its host-global, download-only Lake cache proxy?"""
     import re
@@ -1039,6 +1044,8 @@ def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_ve
         host, port = tcp["host"], tcp["port"]
         capabilities = endpoint.get("capabilities")
         if not isinstance(capabilities, list) or "allow-push" not in capabilities:
+            return False
+        if os.environ.get("TAUCETI_GITHUB_ACCOUNT") and "github-account" not in capabilities:
             return False
         if expected_version is not None and endpoint.get("bubble_version") != expected_version:
             return False
@@ -1422,6 +1429,13 @@ def run_in_bubble(
     import shlex
 
     cfg, wm = w.cfg, opts.work_model
+    github_account = os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    if github_account and not os.environ.get("TAUCETI_AGENT_ECHO"):
+        if not bubble_supports_github_account():
+            raise Die(
+                "--github-account with --bubble requires account-aware Bubble; this install has no --github-account"
+            )
+        ensure_fork_proxy_current()
     # Review/probe commands bring their own model policy. Do not let an unrelated authoring override
     # (including a malformed effort value) prevent those isolated commands from running.
     profile = getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm) if inner_cmd is None else None
@@ -1487,6 +1501,9 @@ def run_in_bubble(
     # fork gets git only. (For a PR target, bubble also auto-derives the head fork, so this is belt-and-
     # suspenders for maintenance and the sole grant for authoring, which has no PR to derive from.)
     push_flags = ["--allow-push", allow_push] if allow_push else []
+    account_flags = ["--github-account", github_account] if github_account else []
+    if github_account:
+        account_flags += ["--git-name", os.environ["GIT_AUTHOR_NAME"], "--git-email", os.environ["GIT_AUTHOR_EMAIL"]]
 
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
@@ -1538,6 +1555,7 @@ def run_in_bubble(
         "--github-security",
         "allowlist-write-graphql",
         *push_flags,
+        *account_flags,
         *cache_flags,
         *mount_flags,
         *(

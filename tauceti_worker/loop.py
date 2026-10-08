@@ -265,6 +265,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             account = getattr(args, "account", None)
             if account:
                 tail += ["--account", account]
+            github_account = getattr(args, "github_account", None)
+            if github_account:
+                tail += ["--github-account", github_account]
             if bubble:
                 tail.append("--bubble")
             source = getattr(args, "source", None)

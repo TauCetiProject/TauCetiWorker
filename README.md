@@ -58,6 +58,33 @@ Ctrl-C stops the current round and exits. From a clone you can run `./tauceti`
 instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
 
+### Multiple GitHub accounts
+
+Log each account into `gh`, then select a login for each worker:
+
+```bash
+tauceti work --worker-id alice-review --github-account alice --only review --loop
+tauceti work --worker-id bob-author --github-account bob --only roadmap --loop
+tauceti --github-account alice                 # dashboard and its launches
+tauceti doctor --github-account bob            # verify a selected account
+tauceti workers add alice-review --github-account alice --only review
+```
+
+`--github-account` (or `TAUCETI_GITHUB_ACCOUNT`) selects the named stored `gh`
+credential without changing your active `gh` login. A supplied `GH_TOKEN` or
+`GITHUB_TOKEN` can serve as a fallback when there is no stored credential, but
+must authenticate as the requested login. Loop children inherit and verify the
+selected credential. GitHub API calls, HTTPS Git operations, commit attribution,
+fork resolution, and PR maintenance all use that identity. Changing a persistent
+worker's `github_account` setting restarts it. `--account` still checks the
+Codex subscription account independently.
+
+Accounts coordinate across their forks only when they use the same writable
+claim repository: give each access to the shared namespace, or set `CLAIM_REPO`
+to a repository they can all write. Bubble mode requires the companion
+account-aware Bubble CLI and proxy; older installations reject the combination
+before launching an agent. See [GitHub accounts](docs/reference.md#github-accounts).
+
 ## The dashboard
 
 Bare `tauceti` opens an interactive dashboard ([Textual](https://textual.textualize.io/)).
