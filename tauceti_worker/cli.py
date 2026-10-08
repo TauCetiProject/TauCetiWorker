@@ -43,7 +43,11 @@ from .agents import (
     run_in_bubble,
     tauceti_cache_unreachable_reason,
 )
+from .budget import BudgetError
+from .budget_cli import add_budget_parser, cmd_budget
+from .claude_api import api_mode, configure_api
 from .config import (
+    AdmissionUnavailable,
     Config,
     Die,
     NoProgress,
@@ -60,6 +64,7 @@ from .constants import (
     AGENTS,
     ALLOWED_TASKS,
     CLAIMS,
+    EX_ADMISSION_WAIT,
     EX_NOPROGRESS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -141,6 +146,9 @@ full reference:
 
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
+    p.add_argument("--budget", action="store_true", help="admit Claude API sessions through shared local grants")
+    p.add_argument("--anthropic-api-key-file", metavar="PATH", help="private API key file; otherwise ANTHROPIC_API_KEY")
     p.add_argument(
         "--loop",
         action="store_true",
@@ -560,6 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
 
     add_workers_parser(sub)
+    add_budget_parser(sub)
 
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
@@ -611,6 +620,12 @@ def main(argv: list[str] | None = None) -> int:
     cmd = args.cmd
 
     resolve_pace(cmd, args)
+
+    if cmd == "budget":
+        try:
+            return cmd_budget(args)
+        except (BudgetError, OSError) as error:
+            raise Die(str(error)) from None
 
     if cmd is None:
         return cmd_tui(args)
@@ -752,6 +767,10 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
+    try:
+        configure_api(args, agent)
+    except (BudgetError, OSError) as error:
+        raise Die(str(error)) from None
     # --host used to opt OUT of the bubble sandbox; running on the host is now the default, so the flag
     # is a no-op we only warn about. --bubble is the way to opt back INTO the sandbox.
     if getattr(args, "host", False):
@@ -890,9 +909,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
         # rather than refuse the round on a cached verdict that may be an hour old.
-        work_model, pending_init = resolve_work_model(
-            cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd, fresh=not one_round
-        )
+        if api_mode():
+            work_model, pending_init = "claude", False
+        else:
+            work_model, pending_init = resolve_work_model(
+                cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd, fresh=not one_round
+            )
         authoring_profile = None
         if work_model != "auto":
             authoring_profile = resolve_authoring_profile(
@@ -1126,6 +1148,10 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
+    except AdmissionUnavailable as e:
+        log(str(e))
+        report_failure(str(e), code=EX_ADMISSION_WAIT)
+        return EX_ADMISSION_WAIT
     except NoProgress as e:
         log(str(e))
         report_failure(str(e), code=EX_NOPROGRESS)

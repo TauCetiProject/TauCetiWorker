@@ -3,14 +3,27 @@ timeout, then settle (short pause if productive, escalating back-off otherwise).
 
 from __future__ import annotations
 
+import contextlib
+import os
 import signal
 import subprocess
 import sys
 import time
 
 from .agents import resolve_authoring_profile
+from .budget import Budget, BudgetError, money
+from .claude_api import api_mode
 from .config import Config, NoProgress, log
-from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
+from .constants import (
+    BACKOFF_BASE,
+    BACKOFF_MAX,
+    EX_ADMISSION_WAIT,
+    EX_NOPROGRESS,
+    GH_MIN_BUDGET,
+    INTERROUND,
+    OPENROUTER_MODELS,
+    POLL,
+)
 from .github import github_budget
 from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
@@ -78,7 +91,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
     round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
     rate-limited GitHub."""
-    unpaced = agent in OPENROUTER_MODELS or agent == "kiro"
+    unpaced = agent in OPENROUTER_MODELS or agent == "kiro" or api_mode()
     ignore_quota = getattr(args, "ignore_quota", False)
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
@@ -89,6 +102,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     )
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
+    admission_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -99,6 +113,25 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
+                try:
+                    snapshot = Budget().snapshot(worker=cfg.wid)
+                    blocked = (
+                        snapshot["unresolved"]
+                        or money(snapshot["available"]) <= 0
+                        or money(snapshot["available"]) < money(snapshot["admission_threshold"])
+                    )
+                    if blocked:
+                        Budget().refresh_waiter(cfg.wid)
+                    reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
+                except (BudgetError, OSError) as error:
+                    blocked, reason, snapshot = True, str(error), {}
+                if blocked:
+                    wake = snapshot.get("funding_at")
+                    nap = max(1, min(60, (wake - time.time() + 1) if wake else 60))
+                    report_runtime("waiting-budget", detail=reason, budget=snapshot, next_action_at=time.time() + nap)
+                    time.sleep(nap)
+                    continue
             report_runtime(
                 "checking-quota",
                 detail="checking provider availability",
@@ -192,6 +225,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
             tail = ["--worker-id", cfg.wid]
+            if api_mode():
+                tail += ["--claude-billing", "api"]
+                if os.environ.get("TAUCETI_USE_BUDGET") == "1":
+                    tail.append("--budget")
+                if keyfile := os.environ.get("TAUCETI_ANTHROPIC_KEY_FILE"):
+                    tail += ["--anthropic-api-key-file", keyfile]
             if only:
                 tail += ["--only", ",".join(only)]
             # --pr must travel to the child for the same reason --account does: the child is what
@@ -233,6 +272,19 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 tail += ["--source", source]
             report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
             rc = run_round_subprocess(tail)
+
+            if rc == EX_ADMISSION_WAIT:
+                streak = 0
+                admission_streak += 1
+                nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))
+                with contextlib.suppress(BudgetError, OSError):
+                    Budget().refresh_waiter(cfg.wid)
+                report_runtime(
+                    "waiting-budget", detail="rechecking local API admission", next_action_at=time.time() + nap
+                )
+                time.sleep(nap)
+                continue
+            admission_streak = 0
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
             if rc == 0:

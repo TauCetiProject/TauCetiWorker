@@ -85,3 +85,22 @@ file aside once so the review can fall back to the live Keychain. A headless
 worker whose Keychain cannot be unlocked still needs a file fallback: point
 `CLAUDE_CONFIG_DIR` at a dedicated directory holding a current
 `.credentials.json` instead of moving away its only credential source.
+
+## Claude API billing
+
+With `--claude-billing api`, Bubble receives a private read-only API key file
+and a Claude shim. The host bridge controls admission and records costs through
+a read-write requests/receipts mount and a separate read-only replies/heartbeat
+mount. The host shim, host key file, and budget ledger are not mounted. Subscription
+credentials are not seeded. Keys are removed after the round and on normal
+signal cleanup. SIGKILL may leave private staging files requiring cleanup, as
+with other abruptly interrupted filesystem work.
+
+The same shim intercepts review-engine Claude calls even when the engine
+constructs a clean subprocess environment. The review engine runs in API
+authentication mode. Local grants never terminate an admitted session.
+Costs reported inside the sandbox are self-reported accounting estimates. The
+mailbox prevents access to host credential files and the ledger; it is not an
+independent attestation of the container's spending. After a crash, use
+`tauceti budget --recover --note TEXT` to recover durable receipts and remove
+stale keys for recorded sessions.

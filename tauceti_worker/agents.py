@@ -627,7 +627,10 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
         env.pop("ANTHROPIC_API_KEY", None)
-        base = shlex_split(CLAUDE_CMD) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
+        command = (
+            os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
+        )
+        base = shlex_split(command) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
         argv = [*base, "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", profile.model]
         if profile.effort:
             argv += ["--effort", profile.effort]
@@ -636,12 +639,13 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
 
 
 def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path) -> int:
+    global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     argv, env = host_agent_argv(prompt, profile)
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(
+    rc = run_agent_proc(
         argv,
         env=env,
         cwd=cwd,
@@ -649,6 +653,12 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
         label=f"agent-{profile.provider}",
         provider=profile.provider,
     )
+    if rc == 75:
+        from .claude_api import blocked_reason
+
+        if reason := blocked_reason():
+            _LAST_AGENT_FAILURE = "local API admission unavailable: " + reason
+    return rc
 
 
 # Provider statuses that mean "the service could not serve this request right now", as opposed to
@@ -840,12 +850,16 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     detail that belongs in a subsidiary per-review log, not the orchestration stream. TAUCETI_STREAM=1
     streams to the terminal instead. Tails logf to the main log on a non-zero exit so failures aren't
     silent. The caller logs a one-line pointer to logf so the detail is discoverable."""
+    from .claude_api import review_environment
+
+    api_env = review_environment()
+    env_kwargs = {"env": api_env} if api_env is not None else {}
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv).returncode
+        return subprocess.run(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
-        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
+        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
@@ -1440,6 +1454,30 @@ def run_in_bubble(
     _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
 
     mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
+    if api_bridge and _uses_claude_credentials(cred_model):
+        from .claude_api_client import atomic
+
+        bridge = Path(api_bridge)
+        api_bin = rounddir / "api-bin"
+        api_bin.mkdir(mode=0o700)
+        shutil.copy(Path(__file__).with_name("claude_api_client.py"), api_bin / "claude")
+        (api_bin / "claude").chmod(0o700)
+        keyfile = rounddir / "anthropic.key"
+        keyfile.write_text((bridge / "key").read_text())
+        keyfile.chmod(0o600)
+        w.rc.add_cleanup(lambda: keyfile.unlink(missing_ok=True))
+        settings = json.loads((bridge / "bin/config.json").read_text())
+        settings.update(command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge")
+        atomic(api_bin / "config.json", settings)
+        mount_flags += [
+            "--mount",
+            f"{api_bin}:/opt/api-bin:ro",
+            "--mount",
+            f"{bridge / 'inbox'}:/opt/api-bridge/inbox:rw",
+            "--mount",
+            f"{bridge / 'outbox'}:/opt/api-bridge/outbox:ro",
+        ]
     for m in mounts or []:
         mount_flags += ["--mount", m]
 
@@ -1455,6 +1493,10 @@ def run_in_bubble(
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
     tcenv = "env PATH=/opt/round:$PATH"
+    if api_bridge and _uses_claude_credentials(cred_model):
+        tcenv = "env PATH=/opt/api-bin:/opt/round:$PATH"
+        if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
+            tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
@@ -1498,13 +1540,18 @@ def run_in_bubble(
         *push_flags,
         *cache_flags,
         *mount_flags,
-        *agent_cred_flags(cred_model),
+        *(
+            ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+            if api_bridge and _uses_claude_credentials(cred_model)
+            else agent_cred_flags(cred_model)
+        ),
         "--command",
         command,
     ]
 
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print("BUBBLE " + " ".join(_shq(a) for a in argv))
+        (rounddir / "anthropic.key").unlink(missing_ok=True)
         return 0
 
     if allow_push and not _wait_bubble_proxy_endpoint_healthy(timeout=5):
@@ -1528,7 +1575,7 @@ def run_in_bubble(
     # and override only Bubble's subprocess env (done after the echo path so a dry-run never prompts the
     # Keychain). Register cleanup before launch for signals; the normal finally removes it promptly too.
     claude_seed: Path | None = None
-    if _uses_claude_credentials(cred_model):
+    if _uses_claude_credentials(cred_model) and not api_bridge:
         claude_seed = _stage_claude_creds_for_bubble(cfg)
         if claude_seed is not None:
             env = {**env, "CLAUDE_CONFIG_DIR": str(claude_seed)}
@@ -1553,6 +1600,7 @@ def run_in_bubble(
         finally:
             if claude_seed is not None:
                 shutil.rmtree(claude_seed, ignore_errors=True)
+            (rounddir / "anthropic.key").unlink(missing_ok=True)
     return rc
 
 
@@ -1617,6 +1665,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}{kiro_flag}"
     )
+    if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":
+        inner += " --auth api"
     if km:
         # The review engine creates another clean reviewer HOME. Seed this
         # container's provider-only credential first so that clean-room copy has

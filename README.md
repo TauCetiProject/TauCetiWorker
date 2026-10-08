@@ -369,6 +369,58 @@ window has room.
 [The quota notes](docs/quota.md) cover credential sources, the macOS Keychain,
 and that bootstrap in detail.
 
+## Claude API grants
+
+Use explicit API billing with `--claude-billing api` and `--agent claude`.
+Enable `--budget` to share local grants across workers. The
+[budget design](docs/api-budget-plan.md) covers accounting and recovery.
+
+API workers share one persistent local budget, including across worker
+restarts and different checkouts. The budget controls when sessions start. It
+never cuts off a running session; completed costs can take the balance negative,
+and automatic grants repay that deficit before more work starts.
+
+```bash
+tauceti budget --grant 100          # add $100 to the current balance
+tauceti budget --set-grant 50       # set the current balance to $50
+tauceti budget --grant-rate 20      # replenish at $20/hour, even while stopped
+tauceti budget                     # balance, rate, pending costs, and ledger path
+tauceti budget --log                # append-only accounting history
+
+# API key is supplied through ANTHROPIC_API_KEY or a private key file.
+tauceti work --agent claude --claude-billing api --budget --loop \
+  --worker-id worker1 --anthropic-api-key-file /path/to/anthropic.key
+```
+
+`--set-grant` records an adjustment rather than erasing history. It preserves
+the replenishment rate and costs still owed by running sessions. Setting
+`--grant-rate 0` stops replenishment; there is no accumulation ceiling or
+per-session spending cap. Active sessions carry estimates of pending costs so
+parallel workers do not all start against the same funds. Estimates only affect
+new admissions. Funding waits happen outside the timed round.
+
+The append-only ledger lives at
+`$XDG_STATE_HOME/tauceti/budget/events.jsonl` (normally
+`~/.local/state/tauceti/budget/events.jsonl` on Linux), with a macOS equivalent
+and an explicit `TAUCETI_BUDGET_DIR` override. Grants, rate changes, balance
+adjustments, session admissions, and cost settlements remain auditable. Unknown
+costs block subsequent starts until reconciled; API throttling is handled
+separately from funding. Local accounting uses Claude's reported cost estimates
+and does not represent the actual credit balance in Anthropic Console.
+
+Use `tauceti budget --json` for scripts. To recover a missing cost or correct a
+settlement, use `tauceti budget --reconcile INVOCATION --cost USD --note TEXT`;
+the correction is appended to history. A cold model runs one calibration
+session before parallel admissions use learned cost estimates. Unknown costs
+block new sessions until reconciled. No local budget amount is passed as
+Claude's `--max-budget-usd`. After a crashed worker, first try
+`tauceti budget --recover --note "worker crash"` to recover its durable receipts
+and remove stale staged keys. Costs without a receipt still require reconciliation.
+
+Managed workers accept the same flags through `workers add`, or the
+`claude_billing = "api"`, `budget = true`, and `anthropic_api_key_file` fields
+in `workers.toml`. Keep the raw API key out of that file.
+
 ## Further documentation
 
 - [Persistent workers](docs/workers.md): the `workers.toml` schema, every
@@ -377,6 +429,8 @@ and that bootstrap in detail.
   variable.
 - [Quota and pacing](docs/quota.md): credential sources, Claude's two windows,
   and the window bootstrap.
+- [Claude API grants design](docs/api-budget-plan.md): shared local
+  budget, append-only ledger, and API worker integration.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.

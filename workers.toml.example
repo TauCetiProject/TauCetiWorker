@@ -18,3 +18,11 @@ enabled = true
 only = ["roadmap", "fix", "fix-ci"]
 roadmap_only = "RepresentationTheory"
 source = "https://github.com/FormalFrontier/Etingof-RepresentationTheory-draft1"
+
+# Claude API worker sharing the local grant ledger:
+# [[workers]]
+# id = "science"
+# agent = "claude"
+# claude_billing = "api"
+# budget = true
+# anthropic_api_key_file = "/absolute/path/to/anthropic.key"
