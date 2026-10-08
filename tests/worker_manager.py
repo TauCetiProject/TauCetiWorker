@@ -142,6 +142,13 @@ try:
     assert envd.env == (("A", "b"), ("LAKE_ARTIFACT_CACHE", "1")), "normalized to sorted pairs"
     assert envd.as_dict()["env"] == {"A": "b", "LAKE_ARTIFACT_CACHE": "1"}
     assert wm._decode_spec(wm._encode_spec(envd)) == envd, "env survives the runner handoff"
+    # It must also survive being WRITTEN back: every `enable`, `disable`, `add` and `remove`
+    # rewrites the whole file, so a value the writer cannot encode turns the next such command into
+    # a hard failure — with the fleet left in whatever state it was in when it ran.
+    roundtrip = root / "env-roundtrip.toml"
+    wm.save_worker_specs(roundtrip, [envd])
+    assert wm.load_worker_specs(roundtrip) == [envd], "env survives a config rewrite"
+    assert 'env = { A = "b", LAKE_ARTIFACT_CACHE = "1" }' in roundtrip.read_text()
     assert wm.WorkerSpec(id="plain").as_dict().get("env") is None, "absent unless configured"
     # Order in the file must not restart a worker; a changed value must.
     assert (
