@@ -44,6 +44,7 @@ _SELECTION_KEYS = (
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "GH_HOST",
+    "GIT_ALLOW_PROTOCOL",
     "TAUCETI_GITHUB_ACCOUNT",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
@@ -165,6 +166,11 @@ def _pin_git_identity(login: str, user_id: int, *, configure_helper: bool) -> No
     for role in ("AUTHOR", "COMMITTER"):
         os.environ[f"GIT_{role}_NAME"] = login
         os.environ[f"GIT_{role}_EMAIL"] = f"{user_id}+{login}@users.noreply.github.com"
+    # Git's environment allowlist overrides protocol.ssh.allow. Preserve its other restrictions.
+    if "GIT_ALLOW_PROTOCOL" in os.environ:
+        os.environ["GIT_ALLOW_PROTOCOL"] = ":".join(
+            protocol for protocol in os.environ["GIT_ALLOW_PROTOCOL"].split(":") if protocol != "ssh"
+        )
     if not configure_helper:
         return
     gh = shutil.which("gh")

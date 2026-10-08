@@ -73,12 +73,14 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         # An inherited token for Bob must not override a requested stored Alice credential.
         os.environ["GH_TOKEN"] = "test-bob"
         os.environ["GITHUB_TOKEN"] = "test-bob"
+        os.environ["GIT_ALLOW_PROTOCOL"] = "ssh:https:file"
         os.environ["GIT_CONFIG_COUNT"] = "1"
         os.environ["GIT_CONFIG_KEY_0"] = "test.operator"
         os.environ["GIT_CONFIG_VALUE_0"] = "preserved"
         assert github.pin_github_account("ALICE") == "alice"
         assert os.environ["GH_TOKEN"] == "test-alice"
         assert "GITHUB_TOKEN" not in os.environ
+        assert os.environ["GIT_ALLOW_PROTOCOL"] == "https:file"
         assert os.environ["GIT_CONFIG_KEY_0"] == "test.operator"
         assert github.me() == "alice"
         assert github.me.cache_info().currsize == 1
@@ -141,6 +143,7 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         # Managers and unselected workers undo selection, including Git config and attribution.
         restored = github.unselected_github_env()
         assert restored["GH_TOKEN"] == "test-bob" and restored["GITHUB_TOKEN"] == "test-bob"
+        assert restored["GIT_ALLOW_PROTOCOL"] == "ssh:https:file"
         assert restored["GIT_CONFIG_COUNT"] == "1"
         assert restored["GIT_CONFIG_VALUE_0"] == "preserved"
         assert "GIT_CONFIG_KEY_1" not in restored and "GIT_AUTHOR_EMAIL" not in restored
