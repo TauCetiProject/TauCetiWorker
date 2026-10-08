@@ -1187,7 +1187,7 @@ def cli_main() -> int:
         return EX_ADMISSION_WAIT
     except NoProgress as e:
         log(str(e))
-        report_failure(str(e), code=EX_NOPROGRESS)
+        report_failure(str(e), code=EX_NOPROGRESS, log_file=getattr(e, "log_file", None))
         return EX_NOPROGRESS
     except WorkersError as e:
         print(f"tauceti workers: {e}", file=sys.stderr)

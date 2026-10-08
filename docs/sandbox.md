@@ -53,16 +53,17 @@ affected dependents. Progress-writing and review jobs do not need this bootstrap
 
 For PR branches the worker also fetches artifacts from current `origin/main`,
 searching its history for a published build. This primes the store for rebases,
-including ones that change the Lean toolchain. The public service stays configured
-throughout the agent invocation; after changing Git history, dependencies or
+including ones that change the Lean toolchain. The worker uses its own temporary `LAKE_CONFIG` during host coding rounds,
+replacing the operator’s Lake service configuration for that invocation. The public
+service stays configured throughout the agent invocation; after changing Git history, dependencies or
 repairing a malformed workspace, the agent is instructed to fetch both caches again.
 
 Host downloads retry once, with one twenty-minute deadline for the entire
 bootstrap. A transport, publication or partial-download failure stops the round
 before the agent starts and never consumes a PR's attempt budget or its bounded
 provider-refund allowance. Missing published main outputs also stop the round
-rather than compiling the whole library. Workspace or manifest errors reach the
-repair agent. An explicit false value for `LAKE_ARTIFACT_CACHE` opts out of
+rather than compiling the whole library. Workspace, dependency revision and invalid-toolchain errors reach the
+repair agent; transport errors wrapped by a dependency failure still stop the round. An explicit false value for `LAKE_ARTIFACT_CACHE` opts out of
 TauCeti artifact caching and downloads. The detailed fetch log is in
 `logs/<worker>/build-cache-<timestamp>.log`.
 

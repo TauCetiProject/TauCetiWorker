@@ -645,7 +645,7 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
     profile = _authoring_profile(profile)
     if any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         prompt += (
-            "\n\nBuild cache preparation: the worker warmed Mathlib and TauCeti artifacts for this "
+            "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
             "checkout and current main. The public `tauceti-public` Lake service remains configured "
             "during this run. After merging/rebasing, changing the toolchain or dependencies, or "
             "repairing a malformed workspace, fetch both caches before building:\n"
@@ -654,6 +654,8 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
             f"--max-revs={lake_cache_max_revs(os.environ)}\n"
             "A transport or incomplete-artifact download failure is infrastructure trouble: report "
             "it instead of falling back to a full source compilation."
+            " If TAUCETI_PR_CACHE_MISS=1, your PR history is uncached: merge/rebase onto current main "
+            "and fetch again before building; if that cannot be done, report the cache miss and stop."
         )
     argv, env = host_agent_argv(prompt, profile)
     if os.environ.get("TAUCETI_AGENT_ECHO"):
@@ -926,6 +928,10 @@ TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
 class BuildCacheUnavailable(NoProgress):
     """A known pre-agent outage, never chargeable to a PR's attempt budget."""
 
+    def __init__(self, message: str, *, log_file: Path | None = None):
+        super().__init__(message)
+        self.log_file = log_file
+
 
 HOST_CACHE_TIMEOUT = 1200
 _LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
@@ -952,6 +958,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
         )
         env["LAKE_CONFIG"] = str(config)
+        env.pop("TAUCETI_PR_CACHE_MISS", None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         warm_host_build_caches(cwd, env, logdir)
@@ -959,7 +966,10 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
-    """Terminate the whole downloader group on timeout, including curl children."""
+    """Terminate downloader children on timeout or interruption (including round SIGTERM).
+
+    SIGKILL cannot run Python cleanup; normal manager/round shutdown sends SIGTERM first.
+    """
     proc = subprocess.Popen(
         command,
         cwd=cwd,
@@ -970,7 +980,7 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
     )
     try:
         return proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGTERM)
         try:
@@ -1001,7 +1011,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
         message = f"{reason}; agent not started (see {logf})"
         log(message)
         report_failure(message, code=75, log_file=logf)
-        raise BuildCacheUnavailable(message)
+        raise BuildCacheUnavailable(message, log_file=logf)
 
     def fetch(label: str, command: list[str]) -> str:
         for attempt in range(1, 3):
@@ -1023,13 +1033,23 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
             if rc == 0:
                 log(f"host build caches: {label} cache ready")
                 return "ready"
-            # These errors precede cache transfer and belong to the checked-out PR, not the service.
-            if re.search(
+            # Preserve real outages even when Lake also wraps them in a dependency-fetch error.
+            transport_error = re.search(
+                r"(?i)(?:HTTP|status(?: code)?|response)[^\n]*\b(?:401|403|429|5\d\d)\b|"
+                r"could not resolve host|connection (?:reset|refused|timed out)|"
+                r"SSL certificate|TLS|authentication failed|network is unreachable",
+                detail,
+            )
+            # These errors precede artifact transfer and can be repaired in the checked-out PR.
+            workspace_error = re.search(
                 r"(?im)^error:.*(?:lakefile\.(?:toml|lean)|lake-manifest\.json|"
-                r"could not resolve revision|unknown revision|invalid manifest)|"
+                r"could not resolve revision|unknown revision|invalid manifest|"
+                r"failed to fetch (?:the )?package revision|invalid toolchain name|"
+                r"no (?:such release|release found)|could not download nonexistent lean version)|"
                 r"(?im:couldn't find remote ref|unknown package)",
                 detail,
-            ):
+            )
+            if workspace_error and not transport_error:
                 log(f"warning: {label} cache cannot load this workspace; leaving it to the repair agent")
                 for line in detail.splitlines()[-8:]:
                     log("  cache: " + line)
@@ -1080,6 +1100,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
     elif result == "miss":
         unavailable("TauCeti main cache has no published outputs in the requested history")
     if result == "miss":
+        env["TAUCETI_PR_CACHE_MISS"] = "1"
         log("warning: PR history is uncached; current main artifacts are ready for the rebase")
 
 

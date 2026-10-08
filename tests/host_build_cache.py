@@ -44,6 +44,12 @@ if mode == 'miss' and label == 'TauCeti':
  print('error: TauCetiProject/TauCeti: no outputs found in 100 revisions from HEAD'); sys.exit(1)
 if mode == 'timeout':
  import time; time.sleep(20)
+if mode in ('dependency-error', 'dependency-network'):
+ if mode == 'dependency-network': print('HTTP response status code 503')
+ print('error: mathlib: failed to fetch the package revision abc from the Git repository at https://example.invalid/mathlib')
+ sys.exit(1)
+if mode == 'invalid-toolchain':
+ print("error: could not download nonexistent lean version 'leanprover-lean4-v0.bad'"); sys.exit(1)
 if mode == 'workspace-error':
  print('error: lakefile.toml: expected string'); sys.exit(1)
 if mode == 'rebase' and '--rev' in a and a[a.index('--rev')+1] == 'b'*40:
@@ -132,7 +138,12 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert records[3]["args"][-4:] == ["--rev", "c" * 40, "--toolchain", "leanprover/lean4:v4.35.0-rc3"]
     rc, records, text = run("workspace-error")
     assert rc == 0 and len(launched) == 1 and len(records) == 1
-    print("[OK] main ancestry is warmed for rebases; broken workspace reaches the repair agent")
+    for mode in ("dependency-error", "invalid-toolchain"):
+        rc, records, _ = run(mode)
+        assert rc == 0 and len(launched) == 1 and len(records) == 1
+    rc, records, _ = run("dependency-network")
+    assert rc == 75 and not launched
+    print("[OK] broken manifests, revisions and toolchains reach repair; wrapped transport failures still block")
 
     rc, records, _ = run(LAKE_ARTIFACT_CACHE="false")
     assert rc == 0 and len(records) == 1 and records[0]["label"] == "Mathlib"
@@ -212,3 +223,27 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert worker.counters.read(key) == 0
     assert worker.counters.read("infra-fix-ci-1434") == 99
     print("[OK] fix checkout precedes warming; even an exhausted provider-refund allowance cannot charge cache outages")
+
+    waits = []
+    signals = []
+
+    def interrupted_wait(**kwargs):
+        waits.append(kwargs)
+        if len(waits) == 1:
+            raise SystemExit(143)  # RoundContext's SIGTERM handler
+        return 0
+
+    proc = SimpleNamespace(pid=12345, wait=interrupted_wait)
+    with (
+        patch.object(agents.subprocess, "Popen", lambda *a, **kw: proc),
+        patch.object(agents.os, "killpg", lambda pid, sig: signals.append((pid, sig))),
+        (root / "interrupt.log").open("ab") as output,
+    ):
+        try:
+            agents._cache_fetch(["lake"], co, env, output, 10)
+        except SystemExit as e:
+            assert e.code == 143
+        else:
+            raise AssertionError("round interruption must propagate")
+    assert signals == [(12345, agents.signal.SIGTERM), (12345, agents.signal.SIGKILL)]
+    print("[OK] round interruption cleans up the complete downloader process group")
