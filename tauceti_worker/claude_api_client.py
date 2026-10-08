@@ -110,7 +110,7 @@ def main():
             invocation = admission["id"]
             break
         if admission["reason"] != previous_reason:
-            print("tauceti budget: " + admission["reason"], file=sys.stderr)
+            print("tauceti-local-admission: " + admission["reason"], file=sys.stderr)
             previous_reason = admission["reason"]
         return 75  # Funding waits belong to the outer loop, outside the round timeout.
     output_format = "text"
@@ -129,6 +129,7 @@ def main():
     rc = 1
     try:
         proc = subprocess.Popen(real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
+        outcome = "started"
         assert proc.stdout is not None
         try:
             for line in proc.stdout:
@@ -201,5 +202,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (OSError, ValueError, RuntimeError) as error:
-        print(f"tauceti Claude API: {error}", file=sys.stderr)
+        print(f"tauceti-local-admission: {error}", file=sys.stderr)
         sys.exit(75)

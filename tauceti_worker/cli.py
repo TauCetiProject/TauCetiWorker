@@ -47,6 +47,7 @@ from .budget import BudgetError
 from .budget_cli import add_budget_parser, cmd_budget
 from .claude_api import api_mode, configure_api
 from .config import (
+    AdmissionUnavailable,
     Config,
     Die,
     NoProgress,
@@ -63,6 +64,7 @@ from .constants import (
     AGENTS,
     ALLOWED_TASKS,
     CLAIMS,
+    EX_ADMISSION_WAIT,
     EX_NOPROGRESS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -1146,6 +1148,10 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
+    except AdmissionUnavailable as e:
+        log(str(e))
+        report_failure(str(e), code=EX_ADMISSION_WAIT)
+        return EX_ADMISSION_WAIT
     except NoProgress as e:
         log(str(e))
         report_failure(str(e), code=EX_NOPROGRESS)

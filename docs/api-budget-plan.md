@@ -160,14 +160,17 @@ timeout behavior retain their existing meaning.
 Check admission immediately before a concrete paid launch, after survey and
 non-model preflight. Finding no work costs nothing. Funding waits happen in the
 outer loop, outside the round timeout, with rechecks at most 60 seconds apart and
-a projected deficit recovery time when available. The shim never waits for
+a projected funding time for the learned estimate when available. Stage preflight
+uses the same learned estimate, or the worker's live queue estimate. The shim never waits for
 funding inside a round. One-shot commands report the block without launching.
 Show balance, active estimates, admission threshold, and waiting reason; avoid
 describing estimates as already billed costs. Serialize waiting admissions and
 use a queue for funding waits within each model. Waiting liveness lives in a
 disposable state file; only changes of waiting reason go into the audit ledger.
 Stale tickets expire after 120 seconds. Cooldowns on other models do not hold up
-funded admissions.
+funded admissions. Local denials have a distinct round exit code and a five-second
+outer retry, without increasing the no-progress backoff; funding waits refresh
+queue liveness while they recheck.
 
 ## API credentials and cost recording
 
@@ -216,7 +219,9 @@ See Anthropic's [cost tracking documentation](https://code.claude.com/docs/en/ag
 Claude runners reach the same standalone shim through PATH. The shim keeps
 its private configuration beside its executable so a clean reviewer environment
 cannot lose the credentials or bridge. The engine runs with `--auth api`;
-no upstream engine change is needed for its existing literal `claude` calls. Every independent paid session, including parallel reviewers and
+its literal `claude` calls reach the shim. The engine recognizes the shim's stable
+`tauceti-local-admission:` marker and aborts before posting a scoreboard on local
+denials. Every independent paid session, including parallel reviewers and
 retries, needs its own invocation record. A session already admitted includes
 its internal Claude subagents and tool loop. A new independent invocation needs
 another admission. Budgeted review must fail before spending if the engine

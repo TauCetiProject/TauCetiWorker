@@ -332,6 +332,16 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.envir
                 self.fail("stage started without API authentication")
         self.assertEqual(self.budget.snapshot()["active_sessions"], [])
 
+    def test_stage_requires_learned_threshold_and_reports_funding_time(self):
+        self.budget.admit("seed", "seed", "opus", "fix")
+        self.budget.settle("seed", 10)
+        self.budget.configure(set_grant=1, rate=10)
+        snapshot = self.budget.snapshot(worker="worker1", model="opus", phase="fix")
+        self.assertEqual(Decimal(snapshot["admission_threshold"]), 10)
+        self.assertGreater(snapshot["funding_at"], time.time() + 3200)
+        with self.assertRaises(BudgetError), ClaudeAPIContext("worker1", "fix", model="opus"):
+            self.fail("stage began below the learned admission estimate")
+
     def test_launch_failure_costs_zero_and_does_not_freeze(self):
         with ClaudeAPIContext("worker1", "fix"):
             result = self.run_claude(env={**os.environ, "FAKE_UNLINK_AFTER_AUTH": "1"})
@@ -359,6 +369,10 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.envir
             (context.inbox / ("c" * 32 + ".receipt")).write_text("{}")
             with self.assertRaises(BudgetError):
                 context.handle(dict(action="cooldown", id="forged", model="opus", seconds=3600))
+            admitted = context.handle(dict(action="admit", id="d" * 32, model="sonnet"))
+            with self.assertRaises(BudgetError):
+                context.handle(dict(action="settle", id=admitted["id"], totals="malformed", outcome="exit:0"))
+            context.handle(dict(action="settle", id=admitted["id"], totals={"unused": "0"}, outcome="exit:0"))
             result = self.run_claude()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(sentinel.read_text(), "private host file")
@@ -472,6 +486,25 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.envir
         self.assertEqual(child.anthropic_api_key_file, str(keyfile))
         self.assertTrue(child.ignore_quota)
         configure_api(child, "claude")
+
+    def test_local_admission_wait_does_not_escalate_no_progress_backoff(self):
+        from tauceti_worker.constants import EX_ADMISSION_WAIT
+
+        args = build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--budget", "--loop"])
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            if len(waits) == 2:
+                raise KeyboardInterrupt
+
+        with (
+            patch.object(loop, "run_round_subprocess", return_value=EX_ADMISSION_WAIT),
+            patch.object(loop, "github_budget", return_value={}),
+        ):
+            with patch.object(loop.time, "sleep", side_effect=sleep):
+                loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude")
+        self.assertEqual(waits, [5, 5])
 
     def test_bubble_key_bridge_without_subscription_credentials(self):
         native_bin = self.root / "real-bin"

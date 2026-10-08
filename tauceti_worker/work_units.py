@@ -3,6 +3,7 @@ its work unit (review/fix/fix-ci/rebase/bump/roadmap) on the host or in a bubble
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -814,14 +815,25 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
     from .budget import BudgetError
     from .claude_api import api_context, api_mode
+    from .config import AdmissionUnavailable
 
-    try:
-        with api_context(w.cfg.wid if api_mode() else "", stage, host=not bubble or stage == "progress"):
-            rc = fn(w, sv, c, opts, bubble)
-    except (BudgetError, OSError) as error:
-        if not api_mode():
-            raise
-        raise NoProgress(f"API funding/accounting: {error}") from None
+    with contextlib.ExitStack() as stack:
+        try:
+            api = stack.enter_context(
+                api_context(
+                    w.cfg.wid if api_mode() else "",
+                    stage,
+                    host=not bubble or stage == "progress",
+                    model=profile.model if profile else None,
+                )
+            )
+        except (BudgetError, OSError) as error:
+            if not api_mode():
+                raise
+            raise AdmissionUnavailable(f"API funding/accounting: {error}") from None
+        rc = fn(w, sv, c, opts, bubble)
+        if api is not None and api.blocked_reason:
+            raise AdmissionUnavailable(api.blocked_reason)
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
@@ -894,7 +906,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         from .claude_api import blocked_reason
 
         if rc != 0 and (reason := blocked_reason()):
-            raise NoProgress(f"review #{pr}: {reason}; local admission failure is not charged to the PR")
+            from .config import AdmissionUnavailable
+
+            raise AdmissionUnavailable(f"review #{pr}: {reason}; local admission failure is not charged to the PR")
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without posting a verdict" streak up front — BEFORE the publish step, which is
@@ -1054,7 +1068,9 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     if reason := blocked_reason():
         for key in charged:
             w.counters.write(key, max(0, w.counters.read(key) - 1))
-        raise NoProgress(f"{label} #{c.pr}: {reason}; local admission failure is not charged to the PR")
+        from .config import AdmissionUnavailable
+
+        raise AdmissionUnavailable(f"{label} #{c.pr}: {reason}; local admission failure is not charged to the PR")
     reason = take_last_agent_infra_failure()
     if not reason:
         return
@@ -1423,7 +1439,9 @@ def _do_progress_inner(w, opts) -> int | None:
         from .claude_api import blocked_reason
 
         if reason := blocked_reason():
-            raise NoProgress(f"progress: {reason}; local admission failure is not charged")
+            from .config import AdmissionUnavailable
+
+            raise AdmissionUnavailable(f"progress: {reason}; local admission failure is not charged")
         w.counters.incr("progress-err")
         raise Die(f"the writing agent exited {rc}")
     for f in (status_body, section_body):

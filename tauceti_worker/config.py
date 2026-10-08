@@ -247,3 +247,7 @@ class Die(Exception):
 
 class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
+
+
+class AdmissionUnavailable(NoProgress):
+    """Local API admission needs a bounded recheck, without no-progress backoff."""

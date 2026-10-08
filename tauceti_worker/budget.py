@@ -217,7 +217,23 @@ class Budget:
             json.dump(queue, file)
         os.replace(temporary, self.directory / "waiting.json")
 
-    def snapshot(self):
+    def refresh_waiter(self, worker):
+        with self.locked():
+            state = self.replay()
+            queue = self.waiting_state(state)
+            if worker in queue:
+                queue[worker]["seen"] = self.clock()
+                self.save_waiting(queue)
+
+    def estimate(self, state, model, phase=None):
+        costs = state["samples"].get(model + ":" + phase, []) if phase else []
+        costs = costs or [
+            money(s["cost"]) for s in state["sessions"].values() if s["model"] == model and s["status"] == "settled"
+        ]
+        costs = sorted(costs[-20:])
+        return costs, costs[math.ceil(len(costs) * 0.75) - 1] if costs else Decimal(0)
+
+    def snapshot(self, *, worker=None, model=None, phase=None):
         with self.locked():
             state = self.replay()
             self.accrue(state)
@@ -234,6 +250,19 @@ class Budget:
         zero_at = None
         if state["balance"] < 0 and state["rate"] > 0:
             zero_at = now + float(-state["balance"] * 3600 / state["rate"])
+        threshold = Decimal(0)
+        if worker is not None:
+            previous = next((v for v in waiting if v["worker"] == worker), None)
+            if previous:
+                threshold = money(previous["estimate"])
+            elif model:
+                threshold = self.estimate(state, model, phase)[1]
+            else:
+                models = {s["model"] for s in state["sessions"].values() if phase is None or s["phase"] == phase}
+                threshold = max((self.estimate(state, m, phase)[1] for m in models), default=Decimal(0))
+        funding_at = None
+        if worker is not None and state["rate"] > 0 and available < max(threshold, Decimal("0.000000001")):
+            funding_at = now + float((max(threshold, Decimal("0.000000001")) - available) * 3600 / state["rate"])
         return dict(
             balance=str(state["balance"]),
             grant_rate=str(state["rate"]),
@@ -244,6 +273,8 @@ class Budget:
             unresolved=[s["id"] for s in active if s["status"] == "unresolved"],
             waiting=waiting,
             balance_zero_at=zero_at,
+            admission_threshold=str(threshold),
+            funding_at=funding_at,
             clock_backwards=money(now) < state["watermark"],
             ledger=str(self.ledger),
             cooldowns=state["cooldowns"],
@@ -268,11 +299,7 @@ class Budget:
                     if orphaned:
                         session["status"] = "unresolved"
                         events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
-            costs = state["samples"].get(model + ":" + phase) or [
-                money(s["cost"]) for s in state["sessions"].values() if s["model"] == model and s["status"] == "settled"
-            ]
-            costs = sorted(costs[-20:])
-            estimate = costs[math.ceil(len(costs) * 0.75) - 1] if costs else Decimal(0)
+            costs, estimate = self.estimate(state, model, phase)
             available = state["balance"] - sum((money(s["estimate"]) for s in active), Decimal(0))
             now = self.clock()
             queue = self.waiting_state(state)
@@ -402,7 +429,22 @@ class Budget:
             self.append(state, events)
 
     def settle_receipt(self, receipt, *, note=None):
+        if (
+            not isinstance(receipt, dict)
+            or not isinstance(receipt.get("id"), str)
+            or not isinstance(receipt.get("outcome"), str)
+        ):
+            raise BudgetError("invalid receipt identity or outcome")
+        if "totals" not in receipt:
+            raise BudgetError("receipt is missing cost totals")
         totals = receipt["totals"]
+        if totals is not None:
+            if not isinstance(totals, dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) for k, v in totals.items()
+            ):
+                raise BudgetError("receipt totals must map provider IDs to decimal strings")
+            if any(money(v) < 0 for v in totals.values()):
+                raise BudgetError("receipt totals cannot be negative")
         cost = None
         with self.locked():
             state = self.replay()
@@ -430,6 +472,7 @@ class Budget:
 
         with self.locked():
             sessions = self.replay()["sessions"]
+        errors = []
         for session in sessions.values():
             if session["status"] == "settled" or not session.get("bridge"):
                 continue
@@ -443,15 +486,19 @@ class Budget:
             if len(invocation) != 32 or any(c not in "0123456789abcdef" for c in invocation):
                 raise BudgetError("invalid receipt invocation ID")
             receipt = bridge / "inbox" / (invocation + ".receipt")
-            if receipt.exists():
-                value = safe_message(receipt)
-                if value["id"] != invocation:
-                    raise BudgetError("receipt invocation mismatch")
-                self.settle_receipt(value, note=note)
-            else:
-                self.settle(invocation, None, "orphaned without receipt", note=note)
+            try:
+                if receipt.exists():
+                    value = safe_message(receipt)
+                    if not isinstance(value, dict) or value.get("id") != invocation:
+                        raise BudgetError("receipt invocation mismatch")
+                    self.settle_receipt(value, note=note)
+                else:
+                    self.settle(invocation, None, "orphaned without receipt", note=note)
+            except Exception as error:
+                errors.append(f"{invocation}: {error}")
+                self.settle(invocation, None, "invalid recovered receipt", note=note)
             (bridge / "key").unlink(missing_ok=True)
-        return self.snapshot()
+        return dict(self.snapshot(), recovery_errors=errors)
 
     def cooldown(self, model, seconds):
         with self.locked():

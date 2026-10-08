@@ -74,5 +74,7 @@ def cmd_budget(args):
         print("  Balance reaches zero       " + datetime.fromtimestamp(snapshot["balance_zero_at"], UTC).isoformat())
     if snapshot["clock_backwards"]:
         print("  Clock moved backward; accrual waits for the persisted watermark")
+    for error in snapshot.get("recovery_errors", []):
+        print("  Unresolved recovery: " + error)
     print(f"  Ledger                     {snapshot['ledger']}")
     return 0

@@ -87,10 +87,11 @@ def api_mode():
 
 
 class ClaudeAPIContext:
-    def __init__(self, worker, phase, *, host=True):
+    def __init__(self, worker, phase, *, host=True, model=None):
         self.worker = worker
         self.phase = phase
         self.host = host
+        self.model = model
         self.budget = Budget()
         self.enabled = os.environ.get("TAUCETI_USE_BUDGET") == "1"
         self.directory = self.budget.directory / "bridges" / uuid.uuid4().hex
@@ -124,8 +125,12 @@ class ClaudeAPIContext:
     def start(self):
         global CURRENT_CONTEXT
         if self.enabled:
-            snapshot = self.budget.snapshot()
-            if snapshot["unresolved"] or money(snapshot["available"]) <= 0:
+            snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
+            if (
+                snapshot["unresolved"]
+                or money(snapshot["available"]) <= 0
+                or money(snapshot["available"]) < money(snapshot["admission_threshold"])
+            ):
                 reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
                 raise BudgetError(reason)
@@ -245,7 +250,7 @@ class ClaudeAPIContext:
                 try:
                     message = safe_message(path)
                     response = self.handle(message)
-                except (BudgetError, OSError, KeyError, ValueError, TypeError, OverflowError) as error:
+                except Exception as error:
                     response = dict(error=str(error))
                     message = {}
                     self.errors.append(str(error))
@@ -279,7 +284,7 @@ class ClaudeAPIContext:
         for path in self.inbox.glob("*.receipt"):
             try:
                 self.record(safe_message(path))
-            except (BudgetError, OSError, ValueError, KeyError, TypeError) as error:
+            except Exception as error:
                 self.errors.append(str(error))
         if self.enabled:
             try:
@@ -308,5 +313,5 @@ class ClaudeAPIContext:
                 os.environ[variable] = old
 
 
-def api_context(worker, phase, *, host=True):
-    return ClaudeAPIContext(worker, phase, host=host) if api_mode() else contextlib.nullcontext()
+def api_context(worker, phase, *, host=True, model=None):
+    return ClaudeAPIContext(worker, phase, host=host, model=model) if api_mode() else contextlib.nullcontext()
