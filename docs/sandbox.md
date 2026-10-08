@@ -44,8 +44,22 @@ refreshes a selected container through another account's active login.
 
 Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
 `lake exe cache get`, fetches TauCeti's own main-built outputs with
-`lake cache get`, and runs an advisory `lake build`. A red tree still reaches the
-repair agent.
+`lake cache get`. Host coding rounds do this after selecting the target branch,
+using the anonymous public service at `cache.taucetiproject.org` and a private
+per-worker artifact store. Lake searches up to 100 revisions for a published
+build; `LAKE_CACHE_MAX_REVS` overrides that limit (`0` searches the complete history).
+The build restores matching artifacts and compiles changed modules and their
+affected dependents. Progress-writing and review jobs do not need this bootstrap.
+
+Host downloads retry once. An infrastructure or partial-download failure stops
+the round before the agent starts; it does not silently rebuild the library.
+A genuinely unpublished toolchain/revision history emits an explicit warning
+and allows source compilation. An explicit `LAKE_ARTIFACT_CACHE=false` opts out
+of TauCeti artifact downloads. The detailed fetch log is in
+`logs/<worker>/build-cache-<timestamp>.log`.
+
+Bubble also runs an advisory `lake build` after fetching both caches. A red tree
+still reaches the repair agent.
 
 Bubble routes both download-only caches through its host-global proxy, so
 TauCeti's public R2 host is never reachable from inside the container. The exact

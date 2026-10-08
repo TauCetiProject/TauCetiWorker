@@ -645,6 +645,10 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
+    _LAST_AGENT_FAILURE = warm_host_build_caches(cwd, env, logdir)
+    if _LAST_AGENT_FAILURE:
+        report_failure(_LAST_AGENT_FAILURE, code=75)
+        return 75
     rc = run_agent_proc(
         argv,
         env=env,
@@ -905,6 +909,93 @@ TAUCETI_CACHE_DOMAIN = "cache.taucetiproject.org"
 TAUCETI_CACHE_SERVICE = "tauceti-public"
 TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
 TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
+
+
+def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> str | None:
+    """Fetch both caches on the selected branch before spending an agent invocation.
+
+    Progress writers have no Lean workspace and need no downloads. A real cache outage must not
+    silently turn a coding round into a full-library compilation. Lake verifies and atomically
+    installs downloads, so retries keep good artifacts but a partial fetch never reaches the agent.
+    """
+    if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+        return None
+    max_revs = env.get("LAKE_CACHE_MAX_REVS", "100")
+    if not re.fullmatch(r"[0-9]+", max_revs):
+        return "build cache preparation: LAKE_CACHE_MAX_REVS must be a natural number"
+    logdir.mkdir(parents=True, exist_ok=True)
+    logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
+    with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
+        config = Path(tmp) / "lake.toml"
+        config.write_text(
+            f'[[cache.service]]\nname = "{TAUCETI_CACHE_SERVICE}"\nkind = "s3"\n'
+            f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
+            f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
+        )
+        cache_env = {**env, "LAKE_CONFIG": str(config)}
+        cache_env.setdefault("LAKE_ARTIFACT_CACHE", "1")
+        cache_env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
+        commands = [
+            ("Mathlib", ["lake", "exe", "cache", "get"], env),
+            (
+                "TauCeti",
+                [
+                    "lake",
+                    "cache",
+                    "get",
+                    "--service",
+                    TAUCETI_CACHE_SERVICE,
+                    "--repo",
+                    TAUCETI,
+                    f"--max-revs={max_revs}",
+                ],
+                cache_env,
+            ),
+        ]
+        for label, command, command_env in commands:
+            if label == "TauCeti" and env.get("LAKE_ARTIFACT_CACHE", "1").lower() in ("0", "false"):
+                log("host build caches: TauCeti downloads explicitly disabled by LAKE_ARTIFACT_CACHE")
+                continue
+            for attempt in range(1, 3):
+                with logf.open("ab") as output:
+                    offset = output.tell()
+                    output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
+                    output.flush()
+                    try:
+                        result = subprocess.run(
+                            command,
+                            cwd=cwd,
+                            env=command_env,
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
+                            timeout=1800,
+                        )
+                        rc = result.returncode
+                    except (OSError, subprocess.TimeoutExpired) as e:
+                        output.write(f"cache command failed: {e}\n".encode())
+                        rc = 1
+                with logf.open("rb") as output:
+                    output.seek(offset)
+                    detail = output.read().decode(errors="replace")
+                if rc == 0:
+                    log(f"host build caches: {label} cache ready")
+                    break
+                if label == "TauCeti" and "no outputs found" in detail:
+                    log(
+                        "warning: TauCeti cache has no outputs for this toolchain/revision history; "
+                        "uncached modules will compile from source"
+                    )
+                    break
+                if attempt == 1:
+                    log(f"host build caches: {label} fetch failed; retrying verified downloads")
+                    continue
+                for line in detail.splitlines()[-12:]:
+                    log("  cache: " + line)
+                reason = f"{label} build cache download failed; agent not started (see {logf})"
+                log(reason)
+                return reason
+    return None
 
 
 def bubble_cmd() -> list[str]:
