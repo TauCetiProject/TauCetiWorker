@@ -128,6 +128,16 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         author = subprocess.check_output(["git", "-C", str(gitdir), "log", "-1", "--format=%an:%ae:%ce"], text=True)
         assert author.strip() == "alice:11+alice@users.noreply.github.com:11+alice@users.noreply.github.com"
 
+        # Operator HTTPS-to-SSH rewrites must fail closed for fetch and push.
+        for setting, operation in (("insteadOf", "ls-remote"), ("pushInsteadOf", "push")):
+            command = ["git", "-C", str(gitdir), "-c", f"url.git@github.com:.{setting}=https://github.com/", operation]
+            if operation == "push":
+                command += ["--dry-run", "https://github.com/alice/repo", "HEAD"]
+            else:
+                command += ["https://github.com/alice/repo"]
+            attempt = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            assert attempt.returncode != 0 and "transport 'ssh' not allowed" in attempt.stderr
+
         # Managers and unselected workers undo selection, including Git config and attribution.
         restored = github.unselected_github_env()
         assert restored["GH_TOKEN"] == "test-bob" and restored["GITHUB_TOKEN"] == "test-bob"

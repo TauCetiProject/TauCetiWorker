@@ -157,7 +157,8 @@ selection and author/committer name and noreply email are process-local;
 your global Git configuration is unchanged. Signing remains configured as before;
 ensure your signing key covers the selected account's noreply email if you require
 verified signed commits. GitHub SSH URLs are routed through
-HTTPS so an unrelated SSH key cannot choose another account.
+HTTPS. SSH Git transport is disabled in the selected worker, so conflicting
+operator URL rewrites fail closed instead of choosing an unrelated SSH key.
 
 Each worker tends its selected account's PRs and resolves that account's fork.
 `TAUCETI_FORK` and `CLAIM_REPO` remain explicit overrides. Workers using different

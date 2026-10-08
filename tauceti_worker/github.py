@@ -180,6 +180,7 @@ def _pin_git_identity(login: str, user_id: int, *, configure_helper: bool) -> No
         ("credential.https://github.com.helper", ""),  # clear other accounts' helpers
         ("credential.https://github.com.helper", f"!{shlex.quote(gh)} auth git-credential"),
         ("credential.https://github.com.username", login),
+        ("protocol.ssh.allow", "never"),  # conflicting operator rewrites must not use an SSH key
         ("http.https://github.com/.extraHeader", ""),  # clear another account's Authorization header
         ("url.https://github.com/.insteadOf", "git@github.com:"),
         ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
