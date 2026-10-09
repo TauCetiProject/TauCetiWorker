@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+USER_AGENT = "tauceti-worker (+https://github.com/kim-em/TauCetiWorker)"
 CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers"
@@ -272,7 +273,9 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int = 15) -> tuple[in
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        # Cloudflare fronts both token endpoints and answers 403 (error 1010) to Python's default
+        # `Python-urllib/x.y` agent; identify the worker so a refresh is not mistaken for a bot.
+        headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": USER_AGENT},
         method="POST",
     )
     # http.client raises its own exception tree for a truncated or malformed response (IncompleteRead,
