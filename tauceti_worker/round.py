@@ -203,7 +203,8 @@ class Claims:
         os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
         if rc == 0:
             self.held = (key, claim_repo)
-            # Keep this scoped to the push arbiter: unrelated agent-invoked claims remain canonical.
+            # TAUCETI_CLAIM_REPO names the lease git-safe-push renews before pushing. An agent-invoked
+            # claim.sh reads $CLAIM_REPO instead, which do_roadmap points at this same namespace.
             os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
             os.environ["TAUCETI_CLAIM_KEY"] = key
             self.ctx.add_cleanup(self.release)

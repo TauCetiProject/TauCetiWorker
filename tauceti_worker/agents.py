@@ -1713,6 +1713,10 @@ def run_in_bubble(
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
+    # CLAIM_REPO does cross, for the agent's own [COOP] target claim (roadmap): without it claim.sh
+    # falls back to canonical, which the container cannot push to. It can only reach the claim repo
+    # when --allow-push covers it (the fork, not the shared namespace); when it does not, claim.sh
+    # still exits 2 and the agent proceeds unclaimed, exactly as before, so this cannot regress.
     tcenv = "env PATH=/opt/round:$PATH"
     if api_bridge and _uses_claude_credentials(cred_model):
         tcenv = "env PATH=/opt/api-bin:/opt/round:$PATH"
@@ -1724,6 +1728,7 @@ def run_in_bubble(
         "TAUCETI_PUSH_REMOTE",
         "TAUCETI_TARGET_MARKER",
         "TAUCETI_REQUIRE_TARGET_MARKER",
+        "CLAIM_REPO",
     ):
         val = os.environ.get(var)
         if val:
