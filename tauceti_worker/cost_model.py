@@ -21,7 +21,14 @@ WALL_RE = re.compile(r"Wall time(?::|\s)(?:\s*)([0-9.]+)\s*seconds", re.I)
 PROCESS_RE = re.compile(r"(?:session ID|cell ID)\s+([A-Za-z0-9_-]+)", re.I)
 CLAIM_RE = re.compile(r'claim\.sh\s+acquire\s+["\']author/([^/"\']+)/')
 PR_RE = re.compile(r"pull request\s+#(\d+)", re.I)
-OPENED_PR_RE = re.compile(r"(?:Opened PR\s+#|TauCetiProject/TauCeti/pull/)(\d+)", re.I)
+OPENED_PR_RE = re.compile(r"\bopened(?:\s+and)?\s+\[?PR\s+#(\d+)", re.I)
+OPENED_PR_URL_RE = re.compile(
+    r"(?:opened.{0,80}?|PR\s+is\s+(?:now\s+)?open\s+at\s+`?)(?:https://github.com/)?"
+    r"TauCetiProject/TauCeti/pull/(\d+)",
+    re.I | re.S,
+)
+PR_URL_RE = re.compile(r"TauCetiProject/TauCeti/pull/(\d+)", re.I)
+CREATE_PR_CMD_RE = re.compile(r"(?:\bgh\s+pr\s+create|gh-safe-pr-create)\b")
 LONG_CONTEXT_THRESHOLD = 272_000
 
 # API-equivalent list prices in USD / 1M tokens. These are deliberately visible in JSON output
@@ -348,9 +355,9 @@ def _model_family(provider: str, model: str | None) -> str | None:
             return "terra"
         if "luna" in value:
             return "luna"
-        if not value or "sol" in value or value == "gpt-5.5":
+        if "sol" in value or value == "gpt-5.5":
             return "sol"
-    if provider == "claude" and (not value or "opus" in value):
+    if provider == "claude" and "opus" in value:
         return "opus"
     return None
 
@@ -386,13 +393,10 @@ def _api_cost(
             long_cached = tokens.get("long_cached_input_tokens", 0)
             long_write = tokens.get("long_cache_write_input_tokens", 0)
             long_output = tokens.get("long_output_tokens", 0)
-        elif tokens.get("input_tokens", 0) > price["long_context_threshold"]:
-            standard_input = standard_cached = standard_write = standard_output = 0
-            long_input = tokens.get("input_tokens", 0)
-            long_cached = tokens.get("cached_input_tokens", 0)
-            long_write = tokens.get("cache_write_input_tokens", 0)
-            long_output = tokens.get("output_tokens", 0)
         else:
+            # Aggregate session/run totals cannot reveal whether any individual request crossed
+            # the long-context threshold. Treat unknown tiers as standard-rate usage; callers
+            # report this as a lower-bound assumption rather than silently doubling whole runs.
             standard_input = tokens.get("input_tokens", 0)
             standard_cached = tokens.get("cached_input_tokens", 0)
             standard_write = tokens.get("cache_write_input_tokens", 0)
@@ -461,6 +465,7 @@ def _parse_codex(path: Path) -> ParsedTranscript:
     first = last = None
     model = None
     opened_pr = None
+    command_opened_pr = None
     with path.open(errors="replace") as handle:
         for line in handle:
             try:
@@ -482,11 +487,12 @@ def _parse_codex(path: Path) -> ParsedTranscript:
                     if isinstance(content, str)
                     else "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
                 )
-                matches = OPENED_PR_RE.findall(text)
+                matches = OPENED_PR_RE.findall(text) + OPENED_PR_URL_RE.findall(text)
                 if matches:
                     opened_pr = int(matches[-1])
             elif row.get("type") == "event_msg" and typ == "agent_message":
-                matches = OPENED_PR_RE.findall(str(payload.get("message") or ""))
+                message = str(payload.get("message") or "")
+                matches = OPENED_PR_RE.findall(message) + OPENED_PR_URL_RE.findall(message)
                 if matches:
                     opened_pr = int(matches[-1])
             if row.get("type") == "event_msg" and typ == "item_completed":
@@ -522,6 +528,8 @@ def _parse_codex(path: Path) -> ParsedTranscript:
             if row.get("type") == "event_msg" and typ == "token_count":
                 info = payload.get("info") or {}
                 usage = info.get("total_token_usage") or {}
+                if not usage:
+                    continue
                 tokens = {k: int(v) for k, v in usage.items() if isinstance(v, (int, float))}
                 signature = tuple(sorted(tokens.items()))
                 last_usage = info.get("last_token_usage") or {}
@@ -553,9 +561,12 @@ def _parse_codex(path: Path) -> ParsedTranscript:
                     if nested:
                         name = f"wrapped-{nested.group(1)}"
                 out = _output_text(payload.get("output"))
+                if CREATE_PR_CMD_RE.search(command := _command_from_codex(name, raw)):
+                    matches = PR_URL_RE.findall(out)
+                    if matches:
+                        command_opened_pr = int(matches[-1])
                 wall = WALL_RE.search(out)
                 seconds = float(wall.group(1)) if wall else max(0.0, (when - started).total_seconds())
-                command = _command_from_codex(name, raw)
                 # Polls belong to the original long-running command, not to a new tool category.
                 poll_id = None
                 if name in {"write_stdin", "wait", "wrapped-write_stdin", "wrapped-wait"}:
@@ -583,7 +594,7 @@ def _parse_codex(path: Path) -> ParsedTranscript:
     tools.sort(key=lambda tool: tool.started)
     if sum(tier_tokens[key] for key in ("standard_input_tokens", "long_input_tokens")) == tokens.get("input_tokens", 0):
         tokens.update(tier_tokens)
-    return ParsedTranscript(tools, tokens, first, last, model, opened_pr)
+    return ParsedTranscript(tools, tokens, first, last, model, command_opened_pr or opened_pr)
 
 
 def _parse_claude(path: Path) -> ParsedTranscript:
@@ -594,6 +605,7 @@ def _parse_claude(path: Path) -> ParsedTranscript:
     first = last = None
     model = None
     opened_pr = None
+    command_opened_pr = None
     with path.open(errors="replace") as handle:
         for line in handle:
             try:
@@ -631,7 +643,8 @@ def _parse_claude(path: Path) -> ParsedTranscript:
                     if not isinstance(item, dict):
                         continue
                     if item.get("type") == "text":
-                        matches = OPENED_PR_RE.findall(str(item.get("text") or ""))
+                        text = str(item.get("text") or "")
+                        matches = OPENED_PR_RE.findall(text) + OPENED_PR_URL_RE.findall(text)
                         if matches:
                             opened_pr = int(matches[-1])
                     if item.get("type") != "tool_use" or not when:
@@ -647,6 +660,10 @@ def _parse_claude(path: Path) -> ParsedTranscript:
                     if tool_id not in pending:
                         continue
                     name, command, started = pending.pop(tool_id)
+                    if CREATE_PR_CMD_RE.search(command):
+                        matches = PR_URL_RE.findall(_output_text(item.get("content")))
+                        if matches:
+                            command_opened_pr = int(matches[-1])
                     seconds = max(0.0, (when - started).total_seconds())
                     tools.append(ToolCall(command, name, started, seconds, _category(command), _mutates(name, command)))
     # Claude stores delegated agents below <session-id>/subagents rather than in the main JSONL.
@@ -664,7 +681,7 @@ def _parse_claude(path: Path) -> ParsedTranscript:
             if parsed.ended and (last is None or parsed.ended > last):
                 last = parsed.ended
     tools.sort(key=lambda tool: tool.started)
-    return ParsedTranscript(tools, dict(totals), first, last, model, opened_pr)
+    return ParsedTranscript(tools, dict(totals), first, last, model, command_opened_pr or opened_pr)
 
 
 def _transcript_index(state_dir: Path) -> dict[str, Path]:
@@ -871,6 +888,25 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
         ai_model_groups[f"{provider}/{model}/{phase}"] = summarize_ai_rows(rows)
 
     prep = [s for s in sessions if s.phase == "preparation"]
+    priced_prepared_prs = {
+        s.pr_number for s in prep if s.pr_number is not None and s.api_equivalent_usd is not None
+    }
+    priced_revisions_for_prepared_prs = [
+        s
+        for s in sessions
+        if s.phase == "revision"
+        and s.pr_number in priced_prepared_prs
+        and s.api_equivalent_usd is not None
+    ]
+    transcript_dates = [s.started.date().isoformat() for s in sessions if s.started]
+    aggregate_only_codex = [
+        s
+        for s in sessions
+        if s.provider == "codex"
+        and s.tokens
+        and "standard_input_tokens" not in s.tokens
+        and "long_input_tokens" not in s.tokens
+    ]
     orientation = {
         "sessions": len(prep),
         "sessions_without_claim_timing": sum(s.orientation_to_claim_seconds is None for s in prep),
@@ -925,9 +961,21 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
             "model_groups": ai_model_groups,
             "preparation_prs_observed": len({s.pr_number for s in prep if s.pr_number is not None}),
             "priced_preparation_prs_observed": len(
-                {s.pr_number for s in prep if s.pr_number is not None and s.api_equivalent_usd is not None}
+                priced_prepared_prs
             ),
-            "note": "tokens measured from local transcripts; dollars imputed at the displayed cache-aware rates",
+            "priced_revision_sessions_for_prepared_prs": len(priced_revisions_for_prepared_prs),
+            "revision_sessions_per_prepared_pr": (
+                len(priced_revisions_for_prepared_prs) / len(priced_prepared_prs) if priced_prepared_prs else None
+            ),
+            "transcript_date_range": [min(transcript_dates), max(transcript_dates)] if transcript_dates else None,
+            "codex_aggregate_only_sessions": len(aggregate_only_codex),
+            "codex_aggregate_only_sessions_above_long_context_threshold": sum(
+                s.tokens.get("input_tokens", 0) > LONG_CONTEXT_THRESHOLD for s in aggregate_only_codex
+            ),
+            "note": (
+                "tokens measured from local transcripts; dollars imputed at the displayed cache-aware rates; "
+                "aggregate-only Codex totals use standard-context prices as a lower bound"
+            ),
         },
         "orientation": orientation,
     }
@@ -966,6 +1014,21 @@ def _spearman(pairs: list[tuple[float, float]]) -> dict[str, float | int | None]
     return {"n": len(pairs), "rho": numerator / denominator if denominator else None}
 
 
+def _normalized_usage(usage: object) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return {}
+    normalized = {key: int(value) for key, value in usage.items() if isinstance(value, (int, float))}
+    cache_creation = usage.get("cache_creation") or {}
+    if isinstance(cache_creation, dict):
+        normalized["cache_creation_1h_input_tokens"] = int(
+            cache_creation.get("ephemeral_1h_input_tokens") or 0
+        )
+        normalized["cache_creation_5m_input_tokens"] = int(
+            cache_creation.get("ephemeral_5m_input_tokens") or 0
+        )
+    return normalized
+
+
 def analyze_review_archive(data_dir: Path | None, state_dir: Path | None = None) -> dict:
     """Aggregate canonical and not-yet-archived local production review records."""
     runs_dir = data_dir / "records" / "runs" if data_dir else None
@@ -996,6 +1059,7 @@ def analyze_review_archive(data_dir: Path | None, state_dir: Path | None = None)
     model_costs: defaultdict[str, list[float]] = defaultdict(list)
     source_records: defaultdict[str, int] = defaultdict(int)
     records = priced = estimated = repriced = skipped_shadow = skipped_duplicate = malformed = 0
+    aggregate_priced_standard = aggregate_above_threshold = attempts_without_usage = 0
     dates = []
     paths = ((source, path) for source, source_paths in sources for path in source_paths)
     for source, path in paths:
@@ -1016,7 +1080,6 @@ def analyze_review_archive(data_dir: Path | None, state_dir: Path | None = None)
         if key in seen:
             skipped_duplicate += 1
             continue
-        seen.add(key)
         try:
             pr = int(row["pr"])
             round_no = int(row.get("round") or 0)
@@ -1027,25 +1090,44 @@ def analyze_review_archive(data_dir: Path | None, state_dir: Path | None = None)
         if not math.isfinite(cost) or cost < 0:
             malformed += 1
             continue
+        seen.add(key)
         model = str(row.get("model") or "")
         provider = str(row.get("provider") or "")
         is_estimated = bool(row.get("cost_estimated"))
-        usage = row.get("usage") or {}
-        if is_estimated and isinstance(usage, dict):
-            normalized = {key: int(value) for key, value in usage.items() if isinstance(value, (int, float))}
-            cache_creation = usage.get("cache_creation") or {}
-            if isinstance(cache_creation, dict):
-                normalized["cache_creation_1h_input_tokens"] = int(cache_creation.get("ephemeral_1h_input_tokens") or 0)
-                normalized["cache_creation_5m_input_tokens"] = int(cache_creation.get("ephemeral_5m_input_tokens") or 0)
-            measured_cost = _api_cost(
-                "codex" if provider == "codex" else "claude",
-                model,
-                normalized,
-                str(row.get("started_at") or ""),
-            )
-            if measured_cost is not None:
-                cost = measured_cost
+        raw_attempts = row.get("attempts") or []
+        attempts = [attempt for attempt in raw_attempts if isinstance(attempt, dict)] or [row]
+        usages = [_normalized_usage(attempt.get("usage")) for attempt in attempts]
+        if is_estimated:
+            measured_attempt_costs = []
+            run_aggregate_priced_standard = run_aggregate_above_threshold = 0
+            repricing_failed = False
+            for attempt, normalized in zip(attempts, usages, strict=True):
+                if "usage" not in attempt:
+                    attempts_without_usage += 1
+                    continue
+                attempt_model = str(attempt.get("model") or model)
+                attempt_provider = str(attempt.get("provider") or provider)
+                measured = _api_cost(
+                    "codex" if attempt_provider == "codex" else "claude",
+                    attempt_model,
+                    normalized,
+                    str(attempt.get("started_at") or row.get("started_at") or ""),
+                )
+                if measured is None:
+                    repricing_failed = True
+                    break
+                measured_attempt_costs.append(measured)
+                if attempt_provider == "codex" and not (
+                    "standard_input_tokens" in normalized or "long_input_tokens" in normalized
+                ):
+                    run_aggregate_priced_standard += 1
+                    if normalized.get("input_tokens", 0) > LONG_CONTEXT_THRESHOLD:
+                        run_aggregate_above_threshold += 1
+            if measured_attempt_costs and not repricing_failed:
+                cost = sum(measured_attempt_costs)
                 repriced += 1
+                aggregate_priced_standard += run_aggregate_priced_standard
+                aggregate_above_threshold += run_aggregate_above_threshold
         priced += 1
         estimated += is_estimated
         pr_costs[pr] += cost
@@ -1054,9 +1136,9 @@ def analyze_review_archive(data_dir: Path | None, state_dir: Path | None = None)
         family = _model_family("codex" if provider == "codex" else "claude", model)
         if family:
             family_costs[family].append(cost)
-            for name, value in (row.get("usage") or {}).items():
-                if isinstance(value, (int, float)):
-                    family_tokens[family][name] += int(value)
+            for normalized in usages:
+                for name, value in normalized.items():
+                    family_tokens[family][name] += value
         model_costs[model or "<unknown>"].append(cost)
         started = str(row.get("started_at") or "")[:10]
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", started):
@@ -1081,6 +1163,9 @@ def analyze_review_archive(data_dir: Path | None, state_dir: Path | None = None)
         "production_runs_priced": priced,
         "estimated_cost_runs": estimated,
         "estimated_cost_runs_repriced": repriced,
+        "aggregate_attempts_priced_at_standard_rate": aggregate_priced_standard,
+        "aggregate_attempts_above_long_context_threshold": aggregate_above_threshold,
+        "attempts_without_usage": attempts_without_usage,
         "provider_reported_cost_runs": priced - estimated,
         "shadow_runs_excluded": skipped_shadow,
         "duplicates_excluded": skipped_duplicate,
@@ -1131,15 +1216,11 @@ def measured_ai_model(session_report: dict, review_report: dict, changed_loc_per
         return total / n
 
     runs_per_pr = (review_report.get("rubric_runs_per_pr") or {}).get("mean")
-    reviewed_prs = review_report.get("prs") or 0
     complete_transcript_history = not session_report.get("coverage", {}).get("limit", 0)
-    revision_sessions = sum(
-        group["priced_sessions"]
-        for name, group in session_report["ai_sessions"]["groups"].items()
-        if name.endswith("/revision")
-    )
     revision_sessions_per_pr = (
-        revision_sessions / reviewed_prs if reviewed_prs and complete_transcript_history else None
+        session_report["ai_sessions"].get("revision_sessions_per_prepared_pr")
+        if complete_transcript_history
+        else None
     )
     scenarios = {}
     for family in ("observed", "sol", "opus"):
@@ -1210,17 +1291,25 @@ def measured_ai_model(session_report: dict, review_report: dict, changed_loc_per
             }
     return {
         "changed_loc_per_pr": changed_loc_per_pr,
-        "revision_sessions_per_reviewed_pr": revision_sessions_per_pr,
+        "revision_sessions_per_prepared_pr": revision_sessions_per_pr,
+        "revision_rate_sample": {
+            "prepared_prs": session_report["ai_sessions"].get("priced_preparation_prs_observed", 0),
+            "revision_sessions": session_report["ai_sessions"].get(
+                "priced_revision_sessions_for_prepared_prs", 0
+            ),
+            "transcript_date_range": session_report["ai_sessions"].get("transcript_date_range"),
+        },
         "scenarios": scenarios,
         "model_scenarios": model_scenarios,
         "method": (
             "preparation-attempt cost amortized over observed opened PRs + mean review lifecycle cost + "
-            "mean revision-session cost times observed revision sessions per reviewed PR; divided by measured "
+            "mean revision-session cost times local revision sessions per locally prepared PR; divided by measured "
             "mean changed LOC per PR"
         ),
         "caveat": (
             "API-equivalent pricing of subscription usage; phase samples and review archive are observational "
-            "and do not prove that model choice causes the observed cost difference"
+            "and do not prove that model choice causes the observed cost difference; the local revision rate is "
+            "a lower bound because other hosts and not-yet-revised recent PRs are not observed"
         ),
     }
 
@@ -1437,15 +1526,37 @@ def format_report(report: dict) -> str:
                 f"  {name}: n={dist['n']}{coverage_note}, median=${dist['median']:.2f}, "
                 f"p90=${dist['p90']:.2f}, mean=${dist['mean']:.2f} per session"
             )
+    aggregate_sessions = report["ai_sessions"]["codex_aggregate_only_sessions"]
+    if aggregate_sessions:
+        lines.append(
+            f"  Codex aggregate-only fallback: {aggregate_sessions:,} sessions use standard-context prices "
+            f"as a lower bound; {report['ai_sessions']['codex_aggregate_only_sessions_above_long_context_threshold']:,} "
+            "have aggregate input above the per-request threshold"
+        )
     review = report.get("ai_reviews") or {}
     if review.get("available"):
         dist = review["review_usd_per_pr"]
+        if dist["n"]:
+            lines.append(
+                f"  production reviews: {review['production_runs_priced']:,} rubric runs / {review['prs']:,} PRs; "
+                f"median=${dist['median']:.2f}, p90=${dist['p90']:.2f}, mean=${dist['mean']:.2f} per PR"
+            )
+        else:
+            lines.append("  production reviews: no priced production runs")
         lines.append(
-            f"  production reviews: {review['production_runs_priced']:,} rubric runs / {review['prs']:,} PRs; "
-            f"median=${dist['median']:.2f}, p90=${dist['p90']:.2f}, mean=${dist['mean']:.2f} per PR"
+            f"  review aggregate-only fallback: {review['aggregate_attempts_priced_at_standard_rate']:,} attempts "
+            f"use standard-context prices as a lower bound; "
+            f"{review['aggregate_attempts_above_long_context_threshold']:,} exceed the per-request threshold in aggregate; "
+            f"{review['attempts_without_usage']:,} failed attempts had no usage and contribute no measured token cost"
         )
     ai_model = report.get("ai_cost_model")
     if ai_model:
+        sample = ai_model["revision_rate_sample"]
+        lines.append(
+            f"  revision rate: {sample['revision_sessions']:,} priced sessions / "
+            f"{sample['prepared_prs']:,} locally prepared PRs over {sample['transcript_date_range']} "
+            "(local lower-bound sample)"
+        )
         lines.append("  measured per-PR scenarios:")
         complete = 0
         for name, scenario in ai_model["scenarios"].items():
@@ -1495,7 +1606,7 @@ def format_report(report: dict) -> str:
     infra = report["infrastructure"]
     lines.append("")
     lines.append(
-        "CI model: "
+        f"CI model at calibration N={report['loc_cost']['reference_repo_loc']:.3e}: "
         f"{infra['ci']['runner_minutes_per_merged_pr']:.1f} runner-min/merged PR, "
         f"{infra['ci']['vcpu_hours_per_merged_pr']:.2f} vCPU-h, "
         f"${infra['ci']['equivalent_usd_per_merged_pr']:.2f} equivalent compute"
@@ -1555,7 +1666,7 @@ def format_report(report: dict) -> str:
             f"  T_retained(N) = ${scaling['retained_integrated_linear_usd']:.3e} N + "
             f"${scaling['retained_integrated_quadratic_usd']:.3e} N^2"
         )
-        lines.append("  target retained LOC    no-churn baseline    retained-growth total")
+        lines.append("  hypothetical total from N=0    no-churn baseline    retained-growth total")
         for projection in loc["projections"]:
             lines.append(
                 f"  {projection['repository_loc']:.3e}    "

@@ -223,6 +223,35 @@ with tempfile.TemporaryDirectory() as raw:
     assert modern_tools[1].seconds == 189
     assert modern_tools[2].mutates
 
+    token_events = root / "token-events.jsonl"
+    write_jsonl(
+        token_events,
+        [
+            {
+                "timestamp": "2026-09-29T00:00:00Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-6.1-sol"},
+            },
+            {
+                "timestamp": "2026-09-29T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {"input_tokens": 100, "output_tokens": 10},
+                        "last_token_usage": {"input_tokens": 100, "output_tokens": 10},
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-09-29T00:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": None},
+            },
+        ],
+    )
+    assert _parse_codex(token_events).tokens["input_tokens"] == 100
+
     claude = root / "claude.jsonl"
     duplicate_usage = {
         "input_tokens": 10,
@@ -256,12 +285,55 @@ with tempfile.TemporaryDirectory() as raw:
                     "content": [{"type": "text", "text": "same message, another content block"}],
                 },
             },
+            {
+                "timestamp": "2026-01-01T00:00:02Z",
+                "type": "assistant",
+                "message": {
+                    "id": "message-2",
+                    "model": "claude-opus-5",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "create-pr",
+                            "name": "Bash",
+                            "input": {"command": "scripts/gh-safe-pr-create --repo TauCetiProject/TauCeti"},
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:03Z",
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "create-pr",
+                            "content": "https://github.com/TauCetiProject/TauCeti/pull/43",
+                        }
+                    ]
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:04Z",
+                "type": "assistant",
+                "message": {
+                    "id": "message-3",
+                    "model": "claude-opus-5",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Submitted: https://github.com/TauCetiProject/TauCeti/pull/43",
+                        }
+                    ],
+                },
+            },
         ],
     )
     claude_parsed = _parse_claude(claude)
     assert claude_parsed.tokens["input_tokens"] == 10
     assert claude_parsed.tokens["cache_creation_input_tokens"] == 100
-    assert claude_parsed.opened_pr == 42
+    assert claude_parsed.opened_pr == 43
     assert abs(_api_cost("claude", claude_parsed.model, claude_parsed.tokens) - 0.00165) < 1e-12
 
     review_data = root / "review-data"
@@ -283,9 +355,24 @@ with tempfile.TemporaryDirectory() as raw:
                     "cost_estimated": provider == "codex",
                     "started_at": "2026-07-10T00:00:00Z",
                     "usage": (
-                        {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
+                        {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
                         if provider == "codex"
                         else {"input_tokens": 100, "output_tokens": 10}
+                    ),
+                    "attempts": (
+                        [
+                            {"cost_estimated": True, "returncode": 1, "error_kind": "transient"},
+                            {
+                                "cost_estimated": True,
+                                "usage": {"input_tokens": 600_000, "cached_input_tokens": 0, "output_tokens": 0},
+                            },
+                            {
+                                "cost_estimated": True,
+                                "usage": {"input_tokens": 400_000, "cached_input_tokens": 0, "output_tokens": 0},
+                            },
+                        ]
+                        if provider == "codex"
+                        else []
                     ),
                 }
             )
@@ -293,7 +380,10 @@ with tempfile.TemporaryDirectory() as raw:
     reviews = analyze_review_archive(review_data)
     assert reviews["production_runs_priced"] == 2
     assert reviews["estimated_cost_runs_repriced"] == 1
-    assert reviews["review_usd_per_pr"]["mean"] == 12
+    assert reviews["review_usd_per_pr"]["mean"] == 7
+    assert reviews["aggregate_attempts_priced_at_standard_rate"] == 2
+    assert reviews["aggregate_attempts_above_long_context_threshold"] == 2
+    assert reviews["attempts_without_usage"] == 1
     assert reviews["extra_review_rounds_per_pr"]["mean"] == 1
 
     local_run_dir = (
@@ -339,6 +429,9 @@ with tempfile.TemporaryDirectory() as raw:
         "ai_sessions": {
             "preparation_prs_observed": 1,
             "priced_preparation_prs_observed": 1,
+            "priced_revision_sessions_for_prepared_prs": 1,
+            "revision_sessions_per_prepared_pr": 1.0,
+            "transcript_date_range": ["2026-01-01", "2026-01-02"],
             "groups": {
                 "sol/preparation": {
                     "priced_sessions": 2,
@@ -396,11 +489,20 @@ assert _mutates("MultiEdit", "")
 assert _category("timeout 10m lake build") == "lake-build"
 assert _category("env FOO=bar nice -n 5 lake exe cache get") == "cache-get"
 million_input = {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
-assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-20") == 10
-assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-21") == 8
-assert _api_cost("codex", "gpt-5.6-terra", million_input, "2026-07-30") == 4
-assert _api_cost("codex", "gpt-6-sol", million_input, "2026-09-22") == 4
-assert _api_cost("codex", "gpt-6.1-sol", million_input, "2026-09-29") == 4
+assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-20") == 5
+assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-21") == 4
+assert _api_cost("codex", "gpt-5.6-terra", million_input, "2026-07-30") == 2
+assert _api_cost("codex", "gpt-6-sol", million_input, "2026-09-22") == 2
+assert _api_cost("codex", "gpt-6.1-sol", million_input, "2026-09-29") == 2
+assert (
+    _api_cost(
+        "codex",
+        "gpt-5.6-sol",
+        {"long_input_tokens": 1_000_000, "long_cached_input_tokens": 0, "long_output_tokens": 0},
+        "2026-08-20",
+    )
+    == 10
+)
 assert (
     _api_cost(
         "codex",

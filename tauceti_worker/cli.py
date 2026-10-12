@@ -738,7 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--current-repo-loc",
         type=float,
         default=2.7e6,
-        help="repository size at which to evaluate the headline marginal cost (default: 2.7e6)",
+        help="repository size at which to evaluate the headline marginal cost (2026-10-12 snapshot: 2.7e6)",
     )
     c.add_argument(
         "--projection-loc",
