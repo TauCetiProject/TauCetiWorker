@@ -888,15 +888,11 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
         ai_model_groups[f"{provider}/{model}/{phase}"] = summarize_ai_rows(rows)
 
     prep = [s for s in sessions if s.phase == "preparation"]
-    priced_prepared_prs = {
-        s.pr_number for s in prep if s.pr_number is not None and s.api_equivalent_usd is not None
-    }
+    priced_prepared_prs = {s.pr_number for s in prep if s.pr_number is not None and s.api_equivalent_usd is not None}
     priced_revisions_for_prepared_prs = [
         s
         for s in sessions
-        if s.phase == "revision"
-        and s.pr_number in priced_prepared_prs
-        and s.api_equivalent_usd is not None
+        if s.phase == "revision" and s.pr_number in priced_prepared_prs and s.api_equivalent_usd is not None
     ]
     transcript_dates = [s.started.date().isoformat() for s in sessions if s.started]
     aggregate_only_codex = [
@@ -960,9 +956,7 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
             "groups": ai_groups,
             "model_groups": ai_model_groups,
             "preparation_prs_observed": len({s.pr_number for s in prep if s.pr_number is not None}),
-            "priced_preparation_prs_observed": len(
-                priced_prepared_prs
-            ),
+            "priced_preparation_prs_observed": len(priced_prepared_prs),
             "priced_revision_sessions_for_prepared_prs": len(priced_revisions_for_prepared_prs),
             "revision_sessions_per_prepared_pr": (
                 len(priced_revisions_for_prepared_prs) / len(priced_prepared_prs) if priced_prepared_prs else None
@@ -1020,12 +1014,8 @@ def _normalized_usage(usage: object) -> dict[str, int]:
     normalized = {key: int(value) for key, value in usage.items() if isinstance(value, (int, float))}
     cache_creation = usage.get("cache_creation") or {}
     if isinstance(cache_creation, dict):
-        normalized["cache_creation_1h_input_tokens"] = int(
-            cache_creation.get("ephemeral_1h_input_tokens") or 0
-        )
-        normalized["cache_creation_5m_input_tokens"] = int(
-            cache_creation.get("ephemeral_5m_input_tokens") or 0
-        )
+        normalized["cache_creation_1h_input_tokens"] = int(cache_creation.get("ephemeral_1h_input_tokens") or 0)
+        normalized["cache_creation_5m_input_tokens"] = int(cache_creation.get("ephemeral_5m_input_tokens") or 0)
     return normalized
 
 
@@ -1218,9 +1208,7 @@ def measured_ai_model(session_report: dict, review_report: dict, changed_loc_per
     runs_per_pr = (review_report.get("rubric_runs_per_pr") or {}).get("mean")
     complete_transcript_history = not session_report.get("coverage", {}).get("limit", 0)
     revision_sessions_per_pr = (
-        session_report["ai_sessions"].get("revision_sessions_per_prepared_pr")
-        if complete_transcript_history
-        else None
+        session_report["ai_sessions"].get("revision_sessions_per_prepared_pr") if complete_transcript_history else None
     )
     scenarios = {}
     for family in ("observed", "sol", "opus"):
@@ -1294,9 +1282,7 @@ def measured_ai_model(session_report: dict, review_report: dict, changed_loc_per
         "revision_sessions_per_prepared_pr": revision_sessions_per_pr,
         "revision_rate_sample": {
             "prepared_prs": session_report["ai_sessions"].get("priced_preparation_prs_observed", 0),
-            "revision_sessions": session_report["ai_sessions"].get(
-                "priced_revision_sessions_for_prepared_prs", 0
-            ),
+            "revision_sessions": session_report["ai_sessions"].get("priced_revision_sessions_for_prepared_prs", 0),
             "transcript_date_range": session_report["ai_sessions"].get("transcript_date_range"),
         },
         "scenarios": scenarios,
