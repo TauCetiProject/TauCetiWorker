@@ -136,4 +136,17 @@ with tempfile.TemporaryDirectory() as directory:
             pass
     assert counters.read("rebase-pr-18") == 2
 
+    # Corrupt bytes and Unicode digit-like text must use the same bounded
+    # diagnostic path as ordinary malformed counters, rather than crashing
+    # the repository survey before it can classify unrelated work.
+    counter = state / "rebase-pr-19"
+    for invalid in (b"\xff", "\u00b2".encode(), "\u0663".encode()):
+        counter.write_bytes(invalid)
+        try:
+            counters.read("rebase-pr-19")
+        except survey_mod.RebaseBudgetUnavailable:
+            pass
+        else:
+            raise AssertionError("corrupt counter bytes must fail closed with a diagnostic")
+
 print("PASS: rebase budget renewal requires distinct exact-head green and mergeable evidence")
