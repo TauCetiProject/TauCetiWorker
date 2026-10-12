@@ -16,6 +16,7 @@ from tauceti_worker.cost_model import (
     analyze,
     analyze_review_archive,
     distribution,
+    format_report,
     infrastructure_model,
     loc_cost_model,
     measured_ai_model,
@@ -621,6 +622,56 @@ assert (
 )
 assert abs(at_current["ci_repository"] - 2 * at_reference["ci_repository"]) < 1e-12
 assert abs(at_current["r2_repository"] - 2 * at_reference["r2_repository"]) < 1e-12
+current_ci = loc["current_ci"]
+for key in ("runner_minutes_per_merged_pr", "vcpu_hours_per_merged_pr", "equivalent_usd_per_merged_pr"):
+    assert abs(current_ci[key] - infra["ci"][key] - infra["ci"]["decomposition"]["repository"][key]) < 1e-12
+assert (
+    abs(
+        current_ci["equivalent_usd_per_merged_pr"]
+        - 100 * sum(at_current[key] for key in ("ci_fixed", "ci_touched", "ci_repository"))
+    )
+    < 1e-12
+)
+for name in ("fixed", "touched"):
+    assert (
+        current_ci["decomposition"][name]["runner_minutes_per_merged_pr"]
+        == infra["ci"]["decomposition"][name]["runner_minutes_per_merged_pr"]
+    )
+
+model_groups = {
+    "codex/gpt-6-sol/preparation": {
+        "sessions": 1,
+        "priced_sessions": 1,
+        "api_equivalent_usd_per_session": distribution([1]),
+    },
+    "codex/gpt-6.1-sol/preparation": {
+        "sessions": 1,
+        "priced_sessions": 1,
+        "api_equivalent_usd_per_session": distribution([9]),
+    },
+    "claude/<unknown>/revision": {
+        "sessions": 1,
+        "priced_sessions": 0,
+        "api_equivalent_usd_per_session": distribution([]),
+    },
+}
+formatted = format_report(
+    {
+        **report,
+        "ai_sessions": {**report["ai_sessions"], "model_groups": model_groups},
+        "ai_reviews": {"available": False},
+        "ai_cost_model": None,
+        "infrastructure": infra,
+        "loc_cost": loc,
+    }
+)
+assert "codex/gpt-6-sol/preparation: n=1, median=$1.00" in formatted
+assert "codex/gpt-6.1-sol/preparation: n=1, median=$9.00" in formatted
+assert "claude/<unknown>/revision: 0/1 sessions priced" in formatted
+assert "  sol/preparation:" not in formatted
+assert "CI model at current N=2.000e+06:" in formatted
+assert "calibration N=" not in formatted
+assert f"${current_ci['equivalent_usd_per_merged_pr']:.2f} equivalent compute" in formatted
 projection = loc["projections"][0]
 expected_total = scaling["integrated_linear_usd"] * 1_000_000 + scaling["integrated_quadratic_usd"] * 1_000_000**2
 assert abs(projection["changed_loc"]["no_churn_cumulative_usd"] - expected_total) < 1e-9

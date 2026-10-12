@@ -1353,6 +1353,7 @@ def infrastructure_model(
         postmerge_minutes = main_runner_minutes * main_share
         decomposition[name] = {
             "runner_minutes_per_merged_pr": branch_minutes + postmerge_minutes,
+            "vcpu_hours_per_merged_pr": (branch_minutes * pr_runner_vcpus + postmerge_minutes * main_runner_vcpus) / 60,
             "equivalent_usd_per_merged_pr": (
                 branch_minutes * pr_runner_usd_minute + postmerge_minutes * main_runner_usd_minute
             ),
@@ -1425,6 +1426,24 @@ def loc_cost_model(
     all_infra_at_reference = sum(per_changed.values()) + cache_per_changed
     upper_slope = all_infra_at_reference / reference_repo_loc
     current_scale = current_repo_loc / reference_repo_loc
+    current_ci = {
+        key: sum(
+            component[key] * (current_scale if name == "repository" else 1) for name, component in decomposition.items()
+        )
+        for key in (
+            "runner_minutes_per_merged_pr",
+            "vcpu_hours_per_merged_pr",
+            "equivalent_usd_per_merged_pr",
+        )
+    }
+    current_ci["decomposition"] = {
+        name: {
+            key: value * (current_scale if name == "repository" else 1)
+            for key, value in component.items()
+            if key.endswith("per_merged_pr")
+        }
+        for name, component in decomposition.items()
+    }
 
     projections = []
     for loc in projection_locs:
@@ -1447,6 +1466,7 @@ def loc_cost_model(
     return {
         "reference_repo_loc": reference_repo_loc,
         "current_repo_loc": current_repo_loc,
+        "current_ci": current_ci,
         "changed_loc_per_pr": changed_loc_per_pr,
         "changed_per_net_loc": changed_per_net_loc,
         "current_usd_per_changed_loc": {
@@ -1501,8 +1521,8 @@ def format_report(report: dict) -> str:
         + (f" ({coverage['unreadable_transcripts']} unreadable)" if coverage["unreadable_transcripts"] else "")
     )
     lines.append("")
-    lines.append("AI API-equivalent cost measured from tokens:")
-    for name, group in sorted(report["ai_sessions"]["groups"].items()):
+    lines.append("AI API-equivalent cost measured from tokens, by exact model:")
+    for name, group in sorted(report["ai_sessions"]["model_groups"].items()):
         if not (name.endswith("/preparation") or name.endswith("/revision")):
             continue
         dist = group["api_equivalent_usd_per_session"]
@@ -1512,6 +1532,8 @@ def format_report(report: dict) -> str:
                 f"  {name}: n={dist['n']}{coverage_note}, median=${dist['median']:.2f}, "
                 f"p90=${dist['p90']:.2f}, mean=${dist['mean']:.2f} per session"
             )
+        else:
+            lines.append(f"  {name}: 0/{group['sessions']} sessions priced (cost unavailable)")
     aggregate_sessions = report["ai_sessions"]["codex_aggregate_only_sessions"]
     if aggregate_sessions:
         lines.append(
@@ -1543,9 +1565,10 @@ def format_report(report: dict) -> str:
             f"{sample['prepared_prs']:,} locally prepared PRs over {sample['transcript_date_range']} "
             "(local lower-bound sample)"
         )
-        lines.append("  measured per-PR scenarios:")
+        lines.append("  per-PR cost scenarios by exact model (shared review/revision rates; plus observed mix):")
         complete = 0
-        for name, scenario in ai_model["scenarios"].items():
+        scenarios = {"observed mix": ai_model["scenarios"]["observed"], **ai_model["model_scenarios"]}
+        for name, scenario in scenarios.items():
             if scenario["usd_per_pr"] is None:
                 continue
             complete += 1
@@ -1590,14 +1613,15 @@ def format_report(report: dict) -> str:
             f"  prior local sessions in area vs claim time: Spearman rho={corr['rho']:.2f} (n={corr['n']}; exploratory)"
         )
     infra = report["infrastructure"]
+    current_ci = report["loc_cost"]["current_ci"]
     lines.append("")
     lines.append(
-        f"CI model at calibration N={report['loc_cost']['reference_repo_loc']:.3e}: "
-        f"{infra['ci']['runner_minutes_per_merged_pr']:.1f} runner-min/merged PR, "
-        f"{infra['ci']['vcpu_hours_per_merged_pr']:.2f} vCPU-h, "
-        f"${infra['ci']['equivalent_usd_per_merged_pr']:.2f} equivalent compute"
+        f"CI model at current N={report['loc_cost']['current_repo_loc']:.3e}: "
+        f"{current_ci['runner_minutes_per_merged_pr']:.1f} runner-min/merged PR, "
+        f"{current_ci['vcpu_hours_per_merged_pr']:.2f} vCPU-h, "
+        f"${current_ci['equivalent_usd_per_merged_pr']:.2f} equivalent compute"
     )
-    decomposition = infra["ci"]["decomposition"]
+    decomposition = current_ci["decomposition"]
     lines.append(
         "  proxy decomposition: "
         f"fixed={decomposition['fixed']['runner_minutes_per_merged_pr']:.1f}, "
