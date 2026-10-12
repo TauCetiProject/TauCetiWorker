@@ -341,6 +341,16 @@ assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-20") == 10
 assert _api_cost("codex", "gpt-5.6-sol", million_input, "2026-08-21") == 8
 assert _api_cost("codex", "gpt-5.6-terra", million_input, "2026-07-30") == 4
 assert _api_cost("codex", "gpt-6-sol", million_input, "2026-09-22") == 4
+assert _api_cost("codex", "gpt-6.1-sol", million_input, "2026-09-29") == 4
+assert (
+    _api_cost(
+        "codex",
+        "gpt-6.1-sol",
+        {"input_tokens": 100_000, "cached_input_tokens": 50_000, "output_tokens": 10_000},
+        "2026-09-29",
+    )
+    == 0.205
+)
 assert (
     _api_cost(
         "codex",

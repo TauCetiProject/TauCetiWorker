@@ -108,6 +108,20 @@ AI_PRICES = {
             "long_output": 15.0,
         }
     ],
+    "gpt-6.1-sol": [
+        {
+            "effective": "2026-09-29",
+            "input": 2.0,
+            "cached_input": 0.1,
+            "cache_write": 2.5,
+            "output": 10.0,
+            "long_context_threshold": 272_000,
+            "long_input": 4.0,
+            "long_cached_input": 0.2,
+            "long_cache_write": 5.0,
+            "long_output": 15.0,
+        }
+    ],
     "gpt-6-luna": [
         {
             "effective": "2026-09-22",
@@ -827,17 +841,13 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
             "tools": categories,
         }
 
-    ai_groups = {}
-    for (family, phase), rows in _group(
-        [s for s in sessions if _model_family(s.provider, s.model)],
-        lambda s: (_model_family(s.provider, s.model), s.phase),
-    ).items():
+    def summarize_ai_rows(rows: list[Session]) -> dict:
         priced = [s for s in rows if s.api_equivalent_usd is not None]
         token_totals: defaultdict[str, int] = defaultdict(int)
         for session in priced:
             for key, value in session.tokens.items():
                 token_totals[key] += value
-        ai_groups[f"{family}/{phase}"] = {
+        return {
             "sessions": len(rows),
             "priced_sessions": len(priced),
             "prs_observed": len({s.pr_number for s in rows if s.pr_number is not None}),
@@ -845,6 +855,20 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
             "api_equivalent_usd_per_session": distribution(s.api_equivalent_usd for s in priced),
             "token_totals": dict(token_totals),
         }
+
+    ai_groups = {}
+    for (family, phase), rows in _group(
+        [s for s in sessions if _model_family(s.provider, s.model)],
+        lambda s: (_model_family(s.provider, s.model), s.phase),
+    ).items():
+        ai_groups[f"{family}/{phase}"] = summarize_ai_rows(rows)
+
+    ai_model_groups = {}
+    for (provider, model, phase), rows in _group(
+        sessions,
+        lambda s: (s.provider, s.model or "<unknown>", s.phase),
+    ).items():
+        ai_model_groups[f"{provider}/{model}/{phase}"] = summarize_ai_rows(rows)
 
     prep = [s for s in sessions if s.phase == "preparation"]
     orientation = {
@@ -898,6 +922,7 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
         "ai_sessions": {
             "pricing": {"usd_per_million_tokens": AI_PRICES, "sources": AI_PRICE_SOURCES},
             "groups": ai_groups,
+            "model_groups": ai_model_groups,
             "preparation_prs_observed": len({s.pr_number for s in prep if s.pr_number is not None}),
             "priced_preparation_prs_observed": len(
                 {s.pr_number for s in prep if s.pr_number is not None and s.api_equivalent_usd is not None}
