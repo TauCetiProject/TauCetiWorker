@@ -1,0 +1,93 @@
+{
+  "measured_source_size": {
+    "repo": "TauCetiProject/TauCeti",
+    "commit": "a65deaded1cae2fdc20c06b7cd5fef04c8e80d6c",
+    "measured_at": "2026-10-12T20:51:04.062898+00:00",
+    "loc": 2842170,
+    "files": 13430,
+    "source_bytes": 143787421,
+    "definition": "Lines including comments and blank lines in tracked TauCeti/**/*.lean and TauCeti.lean, excluding dependencies and build artifacts"
+  },
+  "cost_report_revision": "53e23afab23f5852bc4b8b285ba891af326f0d34",
+  "coverage": {
+    "agent_logs_available": 8500,
+    "limit": 0,
+    "sessions_parsed": 8540,
+    "transcripts_available": 8540,
+    "transcripts_considered": 8540,
+    "unreadable_transcripts": 0
+  },
+  "current_ci_model": {
+    "runner_minutes_per_merged_pr": 52.967959691111105,
+    "vcpu_hours_per_merged_pr": 5.6053718477037044,
+    "equivalent_usd_per_merged_pr": 0.93217146876,
+    "decomposition": {
+      "fixed": {
+        "equivalent_usd_per_merged_pr": 0.1981128,
+        "runner_minutes_per_merged_pr": 11.4924,
+        "vcpu_hours_per_merged_pr": 1.19032
+      },
+      "repository": {
+        "equivalent_usd_per_merged_pr": 0.20774746875999997,
+        "runner_minutes_per_merged_pr": 16.71595969111111,
+        "vcpu_hours_per_merged_pr": 1.2287718477037035
+      },
+      "touched": {
+        "equivalent_usd_per_merged_pr": 0.5263112,
+        "runner_minutes_per_merged_pr": 24.7596,
+        "vcpu_hours_per_merged_pr": 3.1862800000000004
+      }
+    }
+  },
+  "ci_sample_note": "proxy classification, not a causal fit: fixed/setup, candidate build work, and whole-repository checks from 40 PR jobs and 20 post-merge jobs sampled 2026-09-18; a 97-run cross-check found wall-time Pearson correlations of 0.06 with changed LOC and 0.04 with changed-file count",
+  "stress_scenarios": [
+    {
+      "arrival_multiplier": 1,
+      "size_multiplier": 1,
+      "runner_minutes_per_merged_pr": 52.967959691111105,
+      "aggregate_runner_capacity_multiplier": 1.0,
+      "full_cache_transfer_multiplier": 1
+    },
+    {
+      "arrival_multiplier": 10,
+      "size_multiplier": 1,
+      "runner_minutes_per_merged_pr": 52.967959691111105,
+      "aggregate_runner_capacity_multiplier": 10.0,
+      "full_cache_transfer_multiplier": 10
+    },
+    {
+      "arrival_multiplier": 1,
+      "size_multiplier": 100,
+      "runner_minutes_per_merged_pr": 1707.8479691111108,
+      "aggregate_runner_capacity_multiplier": 32.24303860429262,
+      "full_cache_transfer_multiplier": 100
+    },
+    {
+      "arrival_multiplier": 10,
+      "size_multiplier": 100,
+      "runner_minutes_per_merged_pr": 1707.8479691111108,
+      "aggregate_runner_capacity_multiplier": 322.4303860429262,
+      "full_cache_transfer_multiplier": 1000
+    }
+  ],
+  "assumptions": "Constant PR size, retry frequency, hardware, fixed/touched work, full-cache fetches per PR, and cache bytes per source line; repository-wide work scales linearly. Scenarios are not capacity guarantees.",
+  "historical_api_window": {
+    "end_utc": "2026-10-12T05:56:16Z",
+    "hours": 4,
+    "workers": 9,
+    "rest_attempts": 18944,
+    "graphql_http_attempts": 3045,
+    "known_graphql_points": 2508,
+    "limitations": "Incomplete GraphQL cost attribution; direct HTTP and controller probes excluded; prior to shared-service rollout."
+  },
+  "service_dense_scenario": {
+    "open_prs": 5000,
+    "hot_prs": 800,
+    "changes_per_hour": 200,
+    "reaction_comments_per_hot_pr": 20,
+    "rest_per_hour": 3273,
+    "graphql_points_per_hour": 3783,
+    "observed_separate_pool_limit_per_hour": 5600,
+    "limitations": "Modeled workload, not production load test; pagination, recovery bursts, write limits and infrastructure costs require validation."
+  }
+}
