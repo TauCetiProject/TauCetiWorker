@@ -97,7 +97,7 @@ MAX_CI_ATTEMPTS = 3  # per-head: stop trying to green a red-CI head
 
 MAX_CI_PR_ATTEMPTS = 5  # per-PR lifetime backstop for red-CI fixing
 
-MAX_REBASE_ATTEMPTS = 3  # per-PR: stop trying to rebase a conflicting PR
+MAX_REBASE_ATTEMPTS = 3  # conflict attempts per verified progress checkpoint; handoffs keep a per-PR cap
 
 MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 

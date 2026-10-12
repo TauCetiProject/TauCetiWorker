@@ -5,6 +5,31 @@ Persistent workers are declarative. You describe the workers you want in
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
 
+## Rebase retry budget
+
+For genuine Git conflicts, a tended PR gets three rebase attempts between verified progress checkpoints.
+The ordinary survey records a checkpoint when the current head has a successful
+`build` status, GitHub reports it mergeable, and it has no `needs-rebase` label.
+A distinct green head can renew the allowance once; rebuilding or repeatedly
+observing the same head cannot.
+Unverified pushes, comments, agent exit codes, failed or pending CI, unknown
+mergeability, drafts and hold labels do not renew it.
+
+Trusted merge-sweep handoffs retain the existing three-attempt per-PR cap. A
+handoff can start from a branch that is already green and mergeable, so another
+green push does not establish that the reconciliation succeeded. A missing or
+failed handoff-comment read never bypasses the `needs-rebase` label's hold on
+budget renewal.
+
+The evidence comes from the existing survey, without extra GitHub reads or agent
+sessions. Each worker keeps its checkpoints with its existing counters. A round
+charges and refunds the allowance it selected even if another survey observes
+new progress while that round is running. Old integer counter files remain
+intact; PRs with no verified checkpoint keep their existing allowance. This is
+a per-worker bound, as before, not a fleet-wide attempt limit.
+Unreadable or malformed checkpoint/counter evidence suppresses rebase work with
+a diagnostic reason. Counter and checkpoint writes use atomic, synced replacement.
+
 ## Quickstart
 
 Nothing needs to exist first. `workers add` creates the config, writes the

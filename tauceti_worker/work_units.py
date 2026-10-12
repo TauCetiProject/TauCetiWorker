@@ -1064,7 +1064,7 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     persistent PR-specific failure ever matches the transient patterns.
 
     That bound is keyed on the PR, NOT the head. Some of the counters refunded here are per-PR and
-    lifetime (`ci-pr-`, `bump-pr-`, `rebase-pr-`), so a head-keyed allowance would reset on every
+    lifetime or progress-scoped (`ci-pr-`, `bump-pr-`, rebase budgets), so a head-keyed allowance would reset on every
     push while still handing those back, and a persistent false positive could evade the lifetime
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
     per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
@@ -1181,7 +1181,9 @@ def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
 
 
 def do_rebase(w, sv, c, opts, bubble) -> int | None:
-    key = f"rebase-pr-{c.pr}"
+    key = c.rebase_budget_key
+    if not key:
+        raise Die("rebase candidate has no selected retry budget; survey it again")
     w.counters.incr(key)
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
 

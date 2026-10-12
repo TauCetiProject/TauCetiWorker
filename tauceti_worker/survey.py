@@ -3,11 +3,14 @@ picker, `status`, and the TUI all consume."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import random
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import UTC
@@ -49,8 +52,12 @@ from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
 from .review_state import Meta, ReviewState
 
 # ============================================================================
-# Counters — state/<wid>/... single-integer counter files.
+# Counters — existing integer files plus atomic rebase progress checkpoints.
 # ============================================================================
+
+
+class RebaseBudgetUnavailable(ValueError):
+    """Existing retry evidence could not be read safely."""
 
 
 class Counters:
@@ -60,18 +67,99 @@ class Counters:
     def read(self, name: str) -> int:
         try:
             txt = (self.state / name).read_text().strip()
-        except OSError:
+        except FileNotFoundError:
             return 0
+        except OSError:
+            if name.startswith("rebase-pr-"):
+                raise RebaseBudgetUnavailable("rebase counter is unreadable") from None
+            return 0
+        if not txt.isdigit() and name.startswith("rebase-pr-"):
+            raise RebaseBudgetUnavailable("rebase counter is malformed")
         return int(txt) if txt.isdigit() else 0
 
     def write(self, name: str, value: int) -> None:
+        self._atomic_write(name, str(value))
+
+    def _atomic_write(self, name: str, text: str) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
-        (self.state / name).write_text(str(value))
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=self.state, prefix=f".{name}-", delete=False) as target:
+                temporary = Path(target.name)
+                target.write(text)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, self.state / name)
+            directory = os.open(self.state, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def incr(self, name: str) -> int:
         v = self.read(name) + 1
         self.write(name, v)
         return v
+
+    def _rebase_progress(self, pr: int) -> dict | None:
+        try:
+            value = json.loads((self.state / f"rebase-progress-{pr}.json").read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as error:
+            raise RebaseBudgetUnavailable("rebase checkpoint is unreadable") from error
+        if not isinstance(value, dict) or value.get("schema") != "tauceti-rebase-progress/v1":
+            raise RebaseBudgetUnavailable("rebase checkpoint has an unsupported schema")
+        checkpoint = value.get("checkpoint")
+        if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("head"), str):
+            raise RebaseBudgetUnavailable("rebase checkpoint has invalid evidence")
+        at = checkpoint.get("build_status_at")
+        if not checkpoint["head"] or (at is not None and (type(at) is not int or at <= 0)):
+            raise RebaseBudgetUnavailable("rebase checkpoint has invalid evidence")
+        return {"head": checkpoint["head"]}
+
+    def rebase_budget_key(self, pr: int) -> str:
+        checkpoint = self._rebase_progress(pr)
+        if checkpoint is None:
+            return f"rebase-pr-{pr}"
+        proof = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"))
+        epoch = hashlib.sha256(proof.encode()).hexdigest()[:20]
+        return f"rebase-pr-{pr}-{epoch}"
+
+    def observe_rebase_progress(self, patch: PRInfo, *, handoff: bool) -> None:
+        # A successful process, comment, push, unknown mergeability or ongoing
+        # reconciliation request is insufficient. Reuse exact-head CI and
+        # mergeability evidence already obtained by the ordinary survey.
+        if (
+            patch.is_draft
+            or handoff
+            or patch.mergeable != "MERGEABLE"
+            or not patch.build_success
+            or not patch.head_oid
+            or {name.lower() for name in patch.labels}
+            & {"needs-rebase", "keep", "hold", "wip", "human", "do-not-close"}
+        ):
+            return
+        at = patch.build_status_at
+        if at is not None and (type(at) is not int or at <= 0):
+            return
+        checkpoint = {"head": patch.head_oid}
+        if self._rebase_progress(patch.number) == checkpoint:
+            return
+        try:
+            self._atomic_write(
+                f"rebase-progress-{patch.number}.json",
+                json.dumps({"schema": "tauceti-rebase-progress/v1", "checkpoint": checkpoint}),
+            )
+        except OSError:
+            # If the checkpoint cannot be persisted, retain the existing budget.
+            return
 
 
 # ============================================================================
@@ -173,6 +261,7 @@ class Candidate:
     contest_reply_id: int = 0  # the review-comment id of the contesting reply (the 👀 claim anchor)
     ready_at: int | None = None  # when this exact review unit became actionable
     preferred_reviewer: str = ""  # latest scoreboard publisher; gets a short first refusal
+    rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
 
 
 @dataclass
@@ -567,7 +656,9 @@ def bust_progress_cache(cfg: Config) -> None:
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
-    """Classify every open PR per work-kind. Read-only — performs no actions.
+    """Classify every open PR per work-kind, without GitHub writes or model work.
+
+    Local cache and verified rebase-progress checkpoints may be updated.
 
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
     always uses deep=True.
@@ -614,7 +705,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login)
 
     # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
-    #    this exact head, under the existing per-PR rebase-attempt budget.
+    #    this exact head, under the per-PR budget since last verified progress.
     #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
     #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
     #    is rebased until it merges or CI retires it.
@@ -622,15 +713,35 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         labels = {label.lower() for label in p.labels}
         if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
             continue
+        handoff = (
+            p.mergeable != "CONFLICTING" and "needs-rebase" in labels and gh.rebase_requested(p.number, p.head_oid)
+        )
+        # Healthy tended PRs must be observed too: they replenish the budget
+        # before a later main change makes them conflicting again. Test doubles
+        # without persistent state retain the legacy counter interface.
+        budget_error = None
+        try:
+            if observe := getattr(counters, "observe_rebase_progress", None):
+                observe(p, handoff="needs-rebase" in labels)
+        except RebaseBudgetUnavailable as error:
+            budget_error = str(error)
         reason = "conflicting"
         if p.mergeable != "CONFLICTING":
-            if "needs-rebase" not in labels:
-                continue
-            if not gh.rebase_requested(p.number, p.head_oid):
+            if not handoff:
                 continue
             reason = "merge-sweep requested branch reconciliation"
         c = Candidate(p.number, p.head_oid, reason)
-        c.attempts = counters.read(f"rebase-pr-{p.number}")
+        try:
+            if budget_error:
+                raise RebaseBudgetUnavailable(budget_error)
+            key_for = getattr(counters, "rebase_budget_key", None)
+            # A handoff can start from an already green, mergeable PR. Another
+            # green push cannot prove it succeeded; retain its per-PR cap.
+            c.rebase_budget_key = key_for(p.number) if key_for and not handoff else f"rebase-pr-{p.number}"
+            c.attempts = counters.read(c.rebase_budget_key)
+        except RebaseBudgetUnavailable as error:
+            c.reason = f"{reason}; {error}"
+            c.attempts = MAX_REBASE_ATTEMPTS
         c.budget = MAX_REBASE_ATTEMPTS
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
