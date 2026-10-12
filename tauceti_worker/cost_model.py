@@ -1264,6 +1264,7 @@ def loc_cost_model(
     changed_loc_per_pr: float,
     changed_per_net_loc: float,
     reference_repo_loc: float,
+    current_repo_loc: float,
     projection_locs: Iterable[float],
 ) -> dict:
     """Turn the per-PR infrastructure estimate into an explicit LOC scaling scenario.
@@ -1289,6 +1290,7 @@ def loc_cost_model(
     # of present-day CI and cache cost grows with repository size.
     all_infra_at_reference = sum(per_changed.values()) + cache_per_changed
     upper_slope = all_infra_at_reference / reference_repo_loc
+    current_scale = current_repo_loc / reference_repo_loc
 
     projections = []
     for loc in projection_locs:
@@ -1310,9 +1312,18 @@ def loc_cost_model(
 
     return {
         "reference_repo_loc": reference_repo_loc,
+        "current_repo_loc": current_repo_loc,
         "changed_loc_per_pr": changed_loc_per_pr,
         "changed_per_net_loc": changed_per_net_loc,
         "current_usd_per_changed_loc": {
+            "ai_preparation_review_revision": ai_usd_per_changed_loc,
+            "ci_fixed": per_changed["fixed"],
+            "ci_touched": per_changed["touched"],
+            "ci_repository": per_changed["repository"] * current_scale,
+            "r2_repository": cache_per_changed * current_scale,
+            "total": intercept + slope * current_repo_loc,
+        },
+        "reference_usd_per_changed_loc": {
             "ai_preparation_review_revision": ai_usd_per_changed_loc,
             "ci_fixed": per_changed["fixed"],
             "ci_touched": per_changed["touched"],
@@ -1462,9 +1473,9 @@ def format_report(report: dict) -> str:
     if loc:
         components = loc["current_usd_per_changed_loc"]
         lines.append("")
-        lines.append("LOC cost at the reference repository size:")
+        lines.append("LOC cost at the current repository size:")
         lines.append(
-            f"  N={loc['reference_repo_loc']:.3e}: ${components['total']:.3e}/changed LOC "
+            f"  N={loc['current_repo_loc']:.3e}: ${components['total']:.3e}/changed LOC "
             f"(${components['total'] * loc['changed_per_net_loc']:.3e}/net retained LOC)"
         )
         lines.append(

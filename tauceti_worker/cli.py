@@ -732,7 +732,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference-repo-loc",
         type=float,
         default=1.3e6,
-        help="repository size at which current infrastructure was measured (default: 1.3e6)",
+        help="repository size at which infrastructure was measured (calibration default: 1.3e6)",
+    )
+    c.add_argument(
+        "--current-repo-loc",
+        type=float,
+        default=2.7e6,
+        help="repository size at which to evaluate the headline marginal cost (default: 2.7e6)",
     )
     c.add_argument(
         "--projection-loc",
@@ -885,6 +891,7 @@ def cmd_cost_model(args) -> int:
         "--changed-loc-per-pr": args.changed_loc_per_pr,
         "--changed-per-net-loc": args.changed_per_net_loc,
         "--reference-repo-loc": args.reference_repo_loc,
+        "--current-repo-loc": args.current_repo_loc,
     }
     projections = args.projection_loc or [1e6, 1e7, 1e8]
     for i, value in enumerate(projections):
@@ -931,6 +938,7 @@ def cmd_cost_model(args) -> int:
             changed_loc_per_pr=args.changed_loc_per_pr,
             changed_per_net_loc=args.changed_per_net_loc,
             reference_repo_loc=args.reference_repo_loc,
+            current_repo_loc=args.current_repo_loc,
             projection_locs=projections,
         )
     if args.json:

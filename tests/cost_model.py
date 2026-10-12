@@ -435,10 +435,11 @@ loc = loc_cost_model(
     changed_loc_per_pr=100,
     changed_per_net_loc=1.1,
     reference_repo_loc=1_000_000,
+    current_repo_loc=2_000_000,
     projection_locs=[1_000_000, 10_000_000],
 )
 scaling = loc["best_scaling_scenario"]
-at_reference = loc["current_usd_per_changed_loc"]
+at_reference = loc["reference_usd_per_changed_loc"]
 assert (
     abs(
         scaling["marginal_intercept_usd"]
@@ -447,6 +448,18 @@ assert (
     )
     < 1e-12
 )
+at_current = loc["current_usd_per_changed_loc"]
+assert loc["current_repo_loc"] == 2_000_000
+assert (
+    abs(
+        scaling["marginal_intercept_usd"]
+        + scaling["marginal_slope_usd_per_existing_loc"] * 2_000_000
+        - at_current["total"]
+    )
+    < 1e-12
+)
+assert abs(at_current["ci_repository"] - 2 * at_reference["ci_repository"]) < 1e-12
+assert abs(at_current["r2_repository"] - 2 * at_reference["r2_repository"]) < 1e-12
 projection = loc["projections"][0]
 expected_total = scaling["integrated_linear_usd"] * 1_000_000 + scaling["integrated_quadratic_usd"] * 1_000_000**2
 assert abs(projection["changed_loc"]["no_churn_cumulative_usd"] - expected_total) < 1e-9

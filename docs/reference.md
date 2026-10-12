@@ -245,7 +245,7 @@ Only the repository-wide component and complete-cache R2 reads grow with `N`;
 the other components stay constant per changed LOC. The six decomposition
 values are relative weights (the preferred flags end in `-weight`; the old
 `-minutes` spellings remain aliases), while `--changed-loc-per-pr`,
-`--changed-per-net-loc`, `--reference-repo-loc`, and
+`--changed-per-net-loc`, `--reference-repo-loc`, `--current-repo-loc`, and
 `--ai-family` expose the conversion assumptions. JSON output also
 contains a pessimistic comparison in which all current infrastructure cost
 scales with repository size. Operational improvements and changing PR shape can
