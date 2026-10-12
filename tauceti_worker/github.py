@@ -526,6 +526,11 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
                 "waits out the hourly reset (waiting in-round would exceed the round timeout)"
             )
             return p
+        if not _gh_read_only(argv):
+            log(
+                "gh: secondary rate limit after an ambiguous write — preserving the error without replaying the command"
+            )
+            return p
         nap = _gh_secondary_wait(text, attempt)
         if waited + nap > max_wait:
             log(

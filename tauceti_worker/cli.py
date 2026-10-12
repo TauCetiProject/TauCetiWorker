@@ -5,8 +5,7 @@ Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the wo
 
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and
 treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
-of work, chosen in priority order: rebase → bump → lint-repair → progress → fix-ci → fix → review →
-roadmap.
+of work, chosen in priority order: rebase → bump → lint-repair → progress → fix-ci → fix → review → overlap-fix → overlap-scan → roadmap.
 The `bump` step adapts a red bump-mathlib PR (the review bot opens those; the worker
 never authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI,
 not the worker.
@@ -101,12 +100,14 @@ the cascade (priority order; a round does the first that applies):
   fix-ci    fix red CI on one of our PRs
   fix       address review feedback on one of our PRs
   review    review an open PR (runs the tauceti-review engine)
+  overlap-fix   adopt Mathlib APIs identified by labelled overlap issues
+  overlap-scan  investigate consecutive Mathlib commits up to Tau Ceti's pin
   roadmap   open a new PR for a roadmap item
 
   With no --only a round walks the whole cascade; --only pins it to a subset,
   --skip drops a subset (and the two combine by subtraction). --pr narrows the
   same round to named pull requests: it filters what the round would already
-  have done, so progress and roadmap (which name no existing PR) drop out.
+  have done, so progress, roadmap, and overlap phases drop out.
 
 examples:
   tauceti work                          one round: auto agent, on the host
@@ -140,6 +141,8 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
+  TAUCETI_OVERLAP_BATCH_COMMITS  commits per scan session (default 160)
+  TAUCETI_MAX_OPEN_PRS   open PR authoring cutoff (default 8)
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
   CODEX_HOME             Codex config/credential source; point it at a private directory to give
@@ -161,6 +164,20 @@ def add_github_account_flag(p: argparse.ArgumentParser) -> None:
 
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
+    from .config import positive_integer
+
+    p.add_argument(
+        "--max-open-prs",
+        type=positive_integer,
+        default=None,
+        help="open PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 8)",
+    )
+    p.add_argument(
+        "--overlap-batch-commits",
+        type=positive_integer,
+        default=None,
+        help="Mathlib commits per overlap-scan session (env TAUCETI_OVERLAP_BATCH_COMMITS; default 160)",
+    )
     p.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
     p.add_argument("--budget", action="store_true", help="admit Claude API sessions through shared local grants")
     p.add_argument("--anthropic-api-key-file", metavar="PATH", help="private API key file; otherwise ANTHROPIC_API_KEY")
@@ -556,6 +573,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_work_flags(w)
 
+    overlap = sub.add_parser("overlap", help="initialize the shared Mathlib overlap cursor")
+    add_github_account_flag(overlap)
+    overlap_sub = overlap.add_subparsers(dest="overlap_cmd", required=True)
+    init = overlap_sub.add_parser("init", help="create the cursor without overwriting existing state")
+    init.add_argument("--mathlib-commit", required=True)
+    init.add_argument("--worker-id", default="overlap-init")
+    add_github_account_flag(init)
+
     s = sub.add_parser("status", help="read-only survey of available work + quota")
     s.add_argument("--json", action="store_true", help="emit the survey as JSON")
     s.add_argument("--worker-id", dest="worker_id", default=None)
@@ -804,6 +829,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cmd = args.cmd
 
+    from .config import max_open_prs
+    from .overlaps import batch_size
+
+    for field, variable in (
+        ("overlap_batch_commits", "TAUCETI_OVERLAP_BATCH_COMMITS"),
+        ("max_open_prs", "TAUCETI_MAX_OPEN_PRS"),
+    ):
+        if getattr(args, field, None) is not None:
+            os.environ[variable] = str(getattr(args, field))
+    try:
+        batch_size()
+        max_open_prs()
+    except ValueError as error:
+        raise Die(str(error)) from None
+
     resolve_pace(cmd, args)
 
     if cmd == "budget":
@@ -811,12 +851,16 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_budget(args)
         except (BudgetError, OSError) as error:
             raise Die(str(error)) from None
-    if cmd in (None, "status", "doctor", "work", "_round", "_egress-probe"):
+    if cmd in (None, "status", "doctor", "work", "_round", "_egress-probe", "overlap"):
         account = getattr(args, "github_account", os.environ.get("TAUCETI_GITHUB_ACCOUNT"))
         if account is not None:
             args.github_account = pin_github_account(account)
             report_runtime(github_account=args.github_account)
 
+    if cmd == "overlap":
+        from .overlaps import initialize
+
+        return initialize(Config.resolve(args.worker_id), args.mathlib_commit)
     if cmd is None:
         return cmd_tui(args)
     if cmd == "status":
@@ -1338,7 +1382,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # Only authoring/fixing stages build with lake on the host; review runs the fetched-on-demand review
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
-    needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s != "review")
+    needs_host_build = any(
+        (not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan")
+    )
     if needs_host_build:
         from .agents import lake_cache_max_revs
 
@@ -1354,7 +1400,7 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     uses_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
     # Rounds that may push to the contributor's fork (everything except review, which only reads/comments).
     # The fork-PR preflight below is scoped to these so a `--only review` worker is never blocked by it.
-    uses_fork = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s) and s != "review")
+    uses_fork = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan"))
     if uses_bubble and not opts.dry_run and not _have("incus"):
         raise Die(
             "preflight: the bubble sandbox needs a working Incus runtime, but `incus` is not on PATH.\n"

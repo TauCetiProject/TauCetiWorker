@@ -12,10 +12,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .constants import ROADMAP
+from .constants import MAX_OPEN_PRS, ROADMAP
 from .paths import HERE
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
+
+
+def positive_integer(value) -> int:
+    """Strict positive policy integer, shared by CLI, environment and TOML."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not re.fullmatch(r"[0-9]+", str(value)):
+        raise ValueError("must be a positive integer")
+    result = int(value)
+    if result < 1:
+        raise ValueError("must be a positive integer")
+    return result
+
+
+def max_open_prs() -> int:
+    return positive_integer(os.environ.get("TAUCETI_MAX_OPEN_PRS", MAX_OPEN_PRS))
 
 
 def is_git_url(value: str) -> bool:

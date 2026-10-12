@@ -465,3 +465,7 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
+
+The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
+adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
+for initialization, coordination, and the live calibration results.

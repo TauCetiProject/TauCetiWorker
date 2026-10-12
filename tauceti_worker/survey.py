@@ -17,6 +17,7 @@ from datetime import UTC
 from pathlib import Path
 
 from .config import Config, log, roadmap_only, roadmap_skip
+from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
     BUMP_HEAD_PREFIX,
@@ -30,7 +31,6 @@ from .constants import (
     MAX_FIX_ATTEMPTS,
     MAX_LINT_REPAIR_ATTEMPTS,
     MAX_LINT_REPAIR_PR_ATTEMPTS,
-    MAX_OPEN_PRS,
     MAX_PROGRESS_ERRORS,
     MAX_REBASE_ATTEMPTS,
     MAX_REVIEW_CONTESTS,
@@ -296,6 +296,8 @@ class Survey:
     bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
     lint_repair: WorkKind = field(default_factory=lambda: WorkKind("lint-repair"))  # full-lint repair PRs
     progress: WorkKind = field(default_factory=lambda: WorkKind("progress"))  # a roadmap report is due
+    overlap_scan: WorkKind = field(default_factory=lambda: WorkKind("overlap-scan"))
+    overlap_fix: WorkKind = field(default_factory=lambda: WorkKind("overlap-fix"))
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -303,6 +305,7 @@ class Survey:
     # not the number of every PR we have open across the project.
     n_mine_open: int = 0
     roadmap_backpressure: bool = False
+    max_open_prs: int = field(default_factory=configured_max_open_prs)
     next_auto_stage: str | None = None
     github_failed: bool = False
     errors: list[str] = field(default_factory=list)
@@ -346,12 +349,14 @@ class Survey:
             "bump": self.bump,
             "lint-repair": self.lint_repair,
             "progress": self.progress,
+            "overlap-scan": self.overlap_scan,
+            "overlap-fix": self.overlap_fix,
         }[name]
 
     def rescope_roadmap(self) -> None:
         """Recompute authoring pressure after roadmap-only/skip changes, including live TUI dials."""
         self.n_mine_open = roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
-        self.roadmap_backpressure = self.n_mine_open >= MAX_OPEN_PRS
+        self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
         self.next_auto_stage = _next_auto_stage(self)
 
     def status_label_line(self) -> str:
@@ -935,6 +940,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         c = Candidate(0, "", reason or "progress report")
         (sv.progress.actionable if due else sv.progress.suppressed).append(c)
 
+    if deep:
+        from .overlaps import survey_overlaps
+
+        survey_overlaps(cfg, gh, sv)
     sv.next_auto_stage = _next_auto_stage(sv)
     return sv
 

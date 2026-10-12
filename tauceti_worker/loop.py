@@ -210,7 +210,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # until the later of their resets. The rate_limit probe is itself exempt, so this is free
             # when we are flush.
             gb = github_budget()
-            low = {k: v for k, v in (gb or {}).items() if v[0] < GH_MIN_BUDGET}
+            buckets = ("core",) if set(only) == {"overlap-scan"} else ("core", "graphql")
+            low = {k: v for k, v in (gb or {}).items() if k in buckets and v[0] < GH_MIN_BUDGET}
             if low:
                 reset = max(v[1] for v in low.values())
                 nap = max(POLL, min(reset - int(time.time()) + 5, 3600))
@@ -225,6 +226,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
             tail = ["--worker-id", cfg.wid]
+            if overlap_batch := os.environ.get("TAUCETI_OVERLAP_BATCH_COMMITS"):
+                tail += ["--overlap-batch-commits", overlap_batch]
             if api_mode():
                 tail += ["--claude-billing", "api"]
                 if os.environ.get("TAUCETI_USE_BUDGET") == "1":

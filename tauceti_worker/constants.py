@@ -275,7 +275,18 @@ CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "lint-repair"]
+ALLOWED_TASKS = [
+    "rebase",
+    "review",
+    "fix-ci",
+    "fix",
+    "bump",
+    "progress",
+    "roadmap",
+    "lint-repair",
+    "overlap-scan",
+    "overlap-fix",
+]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
@@ -284,18 +295,17 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # ahead of fleet-wide reviews so author-action work cannot be starved by unrelated reviews. Roadmap
 # is the final fallback and is handled separately after these stages. The durable attempt breaker
 # keeps a stuck or rejected progress report from burning every round.
-AUTO_STAGES = ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review")
+AUTO_STAGES = ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review", "overlap-fix", "overlap-scan")
 
-# The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
-# left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
-# rather than touching a PR of ours, and `roadmap` opens a PR that does not exist yet. Both carry a
+# The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The
+# others write reports, investigate Mathlib commits or open new PRs. They carry a
 # pr=0 candidate, which is why no `--pr` value is allowed to be 0.
 PR_TASKS = ("rebase", "bump", "lint-repair", "fix-ci", "fix", "review")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
 # runtime priority. Keeping those concepts separate avoids silently rebinding established digit keys.
-KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> "rebase", ...
+KIND_KEYS = {key: name for key, name in zip("1234567890", ALLOWED_TASKS, strict=True)}
 
 KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}  # "rebase" -> "1", ...
 
@@ -307,6 +317,7 @@ SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 # than a working tree to roam. Its remaining exposure — merged PR descriptions reaching the model — is
 # bounded by the merge gate, which only ever admits two markdown files in one directory.
 SANDBOX_DEFAULT["progress"] = False
+SANDBOX_DEFAULT["overlap-scan"] = False  # host investigation; publication stays outside the model
 
 
 AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]

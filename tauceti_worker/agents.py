@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, replace
@@ -640,7 +641,7 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
     return argv, env
 
 
-def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path) -> int:
+def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path, *, cancel_event=None) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     if any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
@@ -670,6 +671,7 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
             logdir=logdir,
             label=f"agent-{profile.provider}",
             provider=profile.provider,
+            cancel_event=cancel_event,
         )
     if rc == 75:
         from .claude_api import blocked_reason
@@ -764,6 +766,20 @@ def take_last_agent_infra_failure() -> str | None:
     return reason
 
 
+_PARENT_BOUND_AGENT = """
+import os, signal, subprocess, sys, threading
+fd = int(sys.argv[1])
+def parent_gone():
+    while os.read(fd, 1):
+        pass
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+threading.Thread(target=parent_gone, daemon=True).start()
+child = subprocess.Popen(sys.argv[2:], close_fds=True)
+rc = child.wait()
+os._exit(rc if rc >= 0 else 128 - rc)
+"""
+
+
 def run_agent_proc(
     argv: list[str],
     *,
@@ -772,6 +788,7 @@ def run_agent_proc(
     label: str,
     provider: str,
     cwd: Path | None = None,
+    cancel_event=None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -781,6 +798,7 @@ def run_agent_proc(
     """
     global _LAST_AGENT_FAILURE
     _LAST_AGENT_FAILURE = None
+    telemetry_stamp = time.strftime("%Y%m%d-%H%M%S")
     cwds = str(cwd) if cwd is not None else None
     # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
     # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
@@ -799,30 +817,91 @@ def run_agent_proc(
         tail.extend(rendered.splitlines())
 
     def run_rendered(destination) -> int:
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwds,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            bufsize=1,
-        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise NoProgress("shared lease lost before agent launch")
+        # A separate group permits lease-loss cancellation without signalling
+        # the worker's caller. Bind its life to the worker through a pipe: even
+        # SIGKILL closes the parent's only writer and kills the detached group.
+        reader = writer = None
+        command = argv
+        if cancel_event is not None:
+            reader, writer = os.pipe()
+            command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *argv]
+        try:
+            proc = subprocess.Popen(
+                command,
+                cwd=cwds,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                bufsize=1,
+                start_new_session=cancel_event is not None,
+                pass_fds=() if reader is None else (reader,),
+            )
+        except BaseException:
+            if writer is not None:
+                os.close(writer)
+            raise
+        finally:
+            if reader is not None:
+                os.close(reader)
         assert proc.stdout is not None
+        finished = threading.Event()
+
+        def cancel_on_lease_loss():
+            while not finished.wait(0.5):
+                if cancel_event.is_set():
+                    # This agent owns a separate process group, so tools cannot
+                    # outlive a lost lease and continue publishing afterwards.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    if not finished.wait(2):
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                    return
+
+        monitor = None
+        if cancel_event is not None:
+            monitor = threading.Thread(target=cancel_on_lease_loss, daemon=True)
+            monitor.start()
         try:
             for line in proc.stdout:
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
         except BaseException:
-            proc.kill()
+            if cancel_event is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
             proc.wait()
             raise
         finally:
             proc.stdout.close()
+            finished.set()
+            if writer is not None:
+                os.close(writer)
+            if monitor is not None:
+                monitor.join(3)
         rc = proc.wait()
+        if cancel_event is not None:
+            from .round import reap_round_group
+
+            reap_round_group(proc.pid)
+        from .overlap_support import atomic
+
+        telemetry = {
+            "provider": provider,
+            "compactions": renderer.compactions,
+            "usage": renderer.usage,
+            "usage_note": "Provider totals; cumulative input is not peak context occupancy.",
+        }
+        atomic(logdir / f"{label}-{telemetry_stamp}-telemetry.json", telemetry)
+        atomic(logdir / f"{label}-telemetry.json", telemetry)
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
         return rc
@@ -1626,6 +1705,7 @@ def run_in_bubble(
     inner_cmd: str | None = None,
     cred_model: str | None = None,
     allow_push: str | None = None,
+    cancel_event=None,
 ) -> int:
     """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
     work agent (agent_inner_cmd) seeding the work model's credential; pass inner_cmd / cred_model to run
@@ -1813,6 +1893,7 @@ def run_in_bubble(
                 logdir=cfg.logdir,
                 label=f"agent-{wm}",
                 provider=profile.provider,
+                cancel_event=cancel_event,
             )
         else:  # review engine / probe — leave its output inline
             rc = subprocess.run(argv, env=env).returncode

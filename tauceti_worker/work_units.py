@@ -57,7 +57,6 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
     MAX_INFRA_REFUNDS,
-    MAX_OPEN_PRS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_REF,
@@ -107,6 +106,11 @@ from .survey import (
 def want(only: list[str], task: str) -> bool:
     """Is this work-unit stage enabled? Empty `only` ⇒ everything (do-whatever-is-helpful)."""
     return (not only) or (task in only)
+
+
+def round_stages(opts):
+    """The predictor and runtime share the same stage priority."""
+    return AUTO_STAGES
 
 
 @dataclass
@@ -294,7 +298,7 @@ def focus_prs(sv: Survey, opts) -> None:
     if not wanted:
         return
     keep = set(wanted)
-    for stage in AUTO_STAGES:
+    for stage in round_stages(opts):
         kind = sv.kind(stage)
         kind.actionable = [c for c in kind.actionable if stage in PR_TASKS and c.pr in keep]
     log(f"--pr: this round considers only {', '.join(f'#{n}' for n in wanted)}")
@@ -315,7 +319,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # credential mirror.
     if not opts.dry_run:
         mirror_creds(w.cfg)
-    sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
+    if opts.only and set(opts.only) <= {"overlap-scan", "overlap-fix"}:
+        from .overlaps import survey_overlaps
+
+        sv = Survey(worker_id=w.cfg.wid)
+        survey_overlaps(w.cfg, w.gh, sv, repair="overlap-fix" in opts.only)
+    else:
+        sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
@@ -388,8 +398,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # workers starting together don't all pick the lowest-numbered PR and spend a branch-claim round-trip
     # discovering the clash. Reviews get their affinity + age-weighted order below. This only reorders
     # WITHIN a stage — the cascade's priority is unchanged — and the real claims remain the backstop.
-    for stage in AUTO_STAGES:
-        if stage == "review":
+    for stage in round_stages(opts):
+        if stage in ("review", "overlap-scan", "overlap-fix"):
             continue
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
@@ -430,7 +440,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
-    for stage in AUTO_STAGES:
+    for stage in round_stages(opts):
         if not want(opts.only, stage):
             continue
         for c in sv.kind(stage).actionable:
@@ -445,7 +455,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if sv.roadmap_backpressure:
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
-                f"(>= {MAX_OPEN_PRS}) — backpressure, not authoring"
+                f"(>= {sv.max_open_prs}) — backpressure, not authoring"
             )
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
@@ -470,6 +480,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         reason = sv.progress.suppressed[0].reason
         if reason:
             raise NoProgress(f"progress: {reason}")
+    for stage in ("overlap-fix", "overlap-scan"):
+        if stage in opts.only and sv.kind(stage).suppressed:
+            raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
     raise NoProgress(f"no eligible work this round under {scope}")
 
 
@@ -793,6 +806,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "lint-repair": do_lint_repair,
         "progress": do_progress,
         "roadmap": do_roadmap,
+        "overlap-scan": do_overlap_scan,
+        "overlap-fix": do_overlap_fix,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
     # with which agent and sandbox — the same line for every stage.
@@ -854,6 +869,18 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
 
 # --- the work units (each runs on the host by default, or in bubble with --bubble) ---
+
+
+def do_overlap_scan(w, sv, c, opts, bubble):
+    from .overlaps import do_scan
+
+    return do_scan(w, sv, c, opts, bubble)
+
+
+def do_overlap_fix(w, sv, c, opts, bubble):
+    from .overlaps import do_fix
+
+    return do_fix(w, sv, c, opts, bubble)
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
