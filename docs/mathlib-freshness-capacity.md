@@ -44,10 +44,11 @@ staging or promotion failures with backoff. It reuses the native queue.
 Recovery processes a bounded number of candidates per tick and honors
 withdrawals, holds, head changes, and genuine individual integration failures.
 
-The audited legacy bootstrap recorded 56 approvals and automatically
-readmitted 53 PRs. Three subsequent withdrawals or review changes stopped
-re-admission; a repeated bootstrap changed no rows, and the original 133 active
-memberships remained represented. The canary,
+At the initial 09:29 UTC verification, the audited legacy bootstrap had recorded
+56 approvals and automatically readmitted 53 PRs. Three subsequent withdrawals
+or review changes stopped re-admission; a repeated bootstrap changed no rows,
+and the original 133 active memberships remained represented. Later repaired
+heads can obtain fresh approvals through the normal gate. The canary,
 [PR 14684](https://github.com/TauCetiProject/TauCeti/pull/14684), survived failed
 integration attempts and remained in retry batch 562 at 20:55 UTC. A successful
 canary landing remains necessary to finish the production pilot. A failed
