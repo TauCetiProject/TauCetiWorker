@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .agents import _shq
 from .config import Config, _only_label, _skip_label, roadmap_areas, roadmap_only, roadmap_skip
-from .constants import ALLOWED_TASKS, KIND_BY_NAME, KIND_KEYS, MAX_OPEN_PRS, TAUCETI
+from .constants import ALLOWED_TASKS, KIND_BY_NAME, KIND_KEYS, TAUCETI
 from .github import GitHub
 from .paths import entry_cmd
 from .quota import Quota, _read_json_file, quota_line
@@ -31,7 +31,7 @@ from .worker_manager import (
 
 
 def _sample(cands: list[Candidate], n: int = 3) -> str:
-    nums = [f"#{c.pr}" for c in cands]
+    nums = [f"#{c.pr}" if c.pr else c.reason for c in cands]
     head = " ".join(nums[:n])
     return head + (f" +{len(nums) - n}" if len(nums) > n else "")
 
@@ -55,7 +55,7 @@ def _kind_note(sv: Survey, name: str) -> tuple[str, str]:
         note = "no broken bump-mathlib PR"
     if name == "lint-repair" and not wk.actionable and not wk.suppressed:
         note = "no red lint-repair PR"
-    if name == "progress":
+    if name in ("progress", "overlap-scan", "overlap-fix"):
         # Not about a PR of ours, so the candidate carries pr=0 and _sample's "#0" says nothing. The
         # cadence verdict is the useful cell, whether a report is due or not.
         cands = wk.actionable or wk.suppressed
@@ -70,7 +70,7 @@ def _roadmap_note(sv: Survey, esc=lambda s: s) -> tuple[str, str]:
     skip_note = f"  (skip: {esc(', '.join(sv.roadmap_skip))})" if sv.roadmap_skip else ""
     only = esc(sv.roadmap_only)
     if sv.roadmap_backpressure:
-        return "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open in scope  (only: {only}){skip_note}"
+        return "⛔", f"backpressure: {sv.n_mine_open}/{sv.max_open_prs} open in scope  (only: {only}){skip_note}"
     return "∞", f"only: {only}{skip_note}"
 
 
@@ -97,7 +97,8 @@ def _expansion_rows(sv: Survey, name: str, titles: dict, areas: list | None) -> 
     rows = []
     for c, supp in cands:
         title = titles.get(c.pr) or c.reason or ""
-        rows.append((f"    └ #{c.pr}", title + ("  (past-budget)" if supp else "")))
+        label = f"    └ #{c.pr}" if c.pr else "    └ " + (c.head or name)
+        rows.append((label, title + ("  (suppressed)" if supp else "")))
     return rows
 
 
@@ -130,6 +131,8 @@ def render_survey(
     titles = {p.number: p.title for p in sv.open_prs}
 
     header = f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   open: {sv.status_label_line()}"
+    if account := os.environ.get("TAUCETI_GITHUB_ACCOUNT"):
+        header += "\ngithub: " + escape(account)
     if quota_snap is not None:
         header += "\nquota: " + quota_line(quota_snap)
     console.print(Panel(header, title="tauceti"))
@@ -146,6 +149,8 @@ def render_survey(
         style = "reverse" if is_sel else None  # the arrow-key cursor
         kind_cell = ("▸ " if is_sel else "  ") + name  # marker survives even without color
         ready, note = _roadmap_note(sv, escape) if name == "roadmap" else _kind_note(sv, name)
+        if name in ("overlap-scan", "overlap-fix"):
+            note = escape(note)
         t.add_row(num, kind_cell, ready, note, style=style)
         if name in expanded:  # tree-style PR / area list under the expanded kind
             for label, tag in _expansion_rows(sv, name, titles, areas):
@@ -163,6 +168,7 @@ def launch_cmd(
     loop: bool,
     roadmap_only: str | None = None,
     roadmap_skip: str | None = None,
+    github_account: str | None = None,
 ) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
     `roadmap_only`/`roadmap_skip` (the raw env values for the current roadmap dials) are embedded as
@@ -170,6 +176,9 @@ def launch_cmd(
     silently reverting to the shell default. They are passed through verbatim (an explicit empty string
     is meaningful and overrides an inherited env var), and only omitted when unset (None)."""
     cmd = entry_cmd() + ["work"]
+    account = github_account if github_account is not None else os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    if account is not None:
+        cmd += ["--github-account", account]
     if loop:
         cmd.append("--loop")
     if only:
@@ -485,6 +494,8 @@ def _dashboard_app(cfg, loader=None):
             head = Text()
             head.append(TAUCETI, style="bold")
             head.append(f"   worker: {sv.worker_id}   open: {sv.status_label_line()}")
+            if account := os.environ.get("TAUCETI_GITHUB_ACCOUNT"):
+                head.append(f"\ngithub: {account}")
             if self.quota is not None:
                 head.append("\nquota: ")
                 head.append_text(Text.from_markup(quota_line(self.quota)))
@@ -618,6 +629,11 @@ def _dashboard_app(cfg, loader=None):
                 status.append("[space] enable/disable   [ctrl+r] restart   [enter] follow log", style="bold")
                 if item.get("detail"):
                     status.append(f"\n{item['detail']}")
+                if budget := item.get("budget"):
+                    status.append(
+                        f"\nAPI budget: ${float(budget['balance']):.2f} balance · "
+                        f"${float(budget['pending']):.2f} pending · ${float(budget['grant_rate']):.2f}/hour"
+                    )
                 # A worker carrying extra environment is running a different experiment from its
                 # peers; without this the dashboard shows it as identical to them. Names only, as in
                 # the CLI status — the values live in workers.toml.
@@ -811,6 +827,7 @@ def _dashboard_app(cfg, loader=None):
                         bubble=self.bubble,
                         roadmap_only=roadmap_only(),
                         roadmap_skip=skip,
+                        github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",

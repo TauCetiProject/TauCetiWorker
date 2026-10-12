@@ -49,6 +49,7 @@ tauceti doctor                     # report the tools and credentials this host 
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
 tauceti usage --json               # prompt-free Kiro/OpenRouter credit telemetry
+tauceti cost-model                 # agent, CI, cache, and marginal/cumulative LOC-cost estimates
 tauceti work --only review         # one round of a specific kind of work, then exit
 tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / roadmap / ...)
 tauceti work --loop                # fully automatic: keep picking the most useful job
@@ -57,6 +58,33 @@ tauceti work --loop                # fully automatic: keep picking the most usef
 Ctrl-C stops the current round and exits. From a clone you can run `./tauceti`
 instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
+
+### Multiple GitHub accounts
+
+Log each account into `gh`, then select a login for each worker:
+
+```bash
+tauceti work --worker-id alice-review --github-account alice --only review --loop
+tauceti work --worker-id bob-author --github-account bob --only roadmap --loop
+tauceti --github-account alice                 # dashboard and its launches
+tauceti doctor --github-account bob            # verify a selected account
+tauceti workers add alice-review --github-account alice --only review
+```
+
+`--github-account` (or `TAUCETI_GITHUB_ACCOUNT`) selects the named stored `gh`
+credential without changing your active `gh` login. A supplied `GH_TOKEN` or
+`GITHUB_TOKEN` can serve as a fallback when there is no stored credential, but
+must authenticate as the requested login. Loop children inherit and verify the
+selected credential. GitHub API calls, HTTPS Git operations, commit attribution,
+fork resolution, and PR maintenance all use that identity. Changing a persistent
+worker's `github_account` setting restarts it. `--account` still checks the
+Codex subscription account independently.
+
+Accounts coordinate across their forks only when they use the same writable
+claim repository: give each access to the shared namespace, or set `CLAIM_REPO`
+to a repository they can all write. Bubble mode requires the companion
+account-aware Bubble CLI and proxy; older installations reject the combination
+before launching an agent. See [GitHub accounts](docs/reference.md#github-accounts).
 
 ## The dashboard
 
@@ -95,7 +123,7 @@ A round does exactly one unit of work: the first of these that applies.
 
 | Step | What it does |
 |------|--------------|
-| **Rebase** | Reconcile one of our conflicting PRs, or a fork update requested by the merge sweep for the current head. Both use the existing per-PR rebase-attempt cap; `keep` pauses recovery. |
+| **Rebase** | Reconcile one of our conflicting PRs, or a fork update requested by the merge sweep for the current head. Genuine conflict retries renew after a distinct head builds and becomes mergeable; sweep handoffs keep their per-PR cap. Hold labels pause recovery. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Lint repair** | Fix `TauCeti/` on a red `lint-repair/` PR. PR builds lint only the modules a change touches, so TauCeti's daily full lint opens one of these when main carries environment-lint violations elsewhere (for example, a new simp lemma that takes an older one out of simp normal form). The worker never opens one itself. |
 | **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
@@ -213,6 +241,9 @@ rather than wandering onto other work.
 | `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-5` opt-in | subscription credits, unpaced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
+
+Claude authoring and reviews both default to exact `claude-opus-5-5`, on the host and in Bubble.
+Set `TAUCETI_CLAUDE_MODEL` to override reviews independently of the authoring profile.
 
 Set a default with `TAUCETI_AGENT`. Kiro and the OpenRouter agents are unpaced
 and never run on their own; you have to ask for them by name. Kiro always passes
@@ -369,6 +400,58 @@ window has room.
 [The quota notes](docs/quota.md) cover credential sources, the macOS Keychain,
 and that bootstrap in detail.
 
+## Claude API grants
+
+Use explicit API billing with `--claude-billing api` and `--agent claude`.
+Enable `--budget` to share local grants across workers. The
+[budget design](docs/api-budget-plan.md) covers accounting and recovery.
+
+API workers share one persistent local budget, including across worker
+restarts and different checkouts. The budget controls when sessions start. It
+never cuts off a running session; completed costs can take the balance negative,
+and automatic grants repay that deficit before more work starts.
+
+```bash
+tauceti budget --grant 100          # add $100 to the current balance
+tauceti budget --set-grant 50       # set the current balance to $50
+tauceti budget --grant-rate 20      # replenish at $20/hour, even while stopped
+tauceti budget                     # balance, rate, pending costs, and ledger path
+tauceti budget --log                # append-only accounting history
+
+# API key is supplied through ANTHROPIC_API_KEY or a private key file.
+tauceti work --agent claude --claude-billing api --budget --loop \
+  --worker-id worker1 --anthropic-api-key-file /path/to/anthropic.key
+```
+
+`--set-grant` records an adjustment rather than erasing history. It preserves
+the replenishment rate and costs still owed by running sessions. Setting
+`--grant-rate 0` stops replenishment; there is no accumulation ceiling or
+per-session spending cap. Active sessions carry estimates of pending costs so
+parallel workers do not all start against the same funds. Estimates only affect
+new admissions. Funding waits happen outside the timed round.
+
+The append-only ledger lives at
+`$XDG_STATE_HOME/tauceti/budget/events.jsonl` (normally
+`~/.local/state/tauceti/budget/events.jsonl` on Linux), with a macOS equivalent
+and an explicit `TAUCETI_BUDGET_DIR` override. Grants, rate changes, balance
+adjustments, session admissions, and cost settlements remain auditable. Unknown
+costs block subsequent starts until reconciled; API throttling is handled
+separately from funding. Local accounting uses Claude's reported cost estimates
+and does not represent the actual credit balance in Anthropic Console.
+
+Use `tauceti budget --json` for scripts. To recover a missing cost or correct a
+settlement, use `tauceti budget --reconcile INVOCATION --cost USD --note TEXT`;
+the correction is appended to history. A cold model runs one calibration
+session before parallel admissions use learned cost estimates. Unknown costs
+block new sessions until reconciled. No local budget amount is passed as
+Claude's `--max-budget-usd`. After a crashed worker, first try
+`tauceti budget --recover --note "worker crash"` to recover its durable receipts
+and remove stale staged keys. Costs without a receipt still require reconciliation.
+
+Managed workers accept the same flags through `workers add`, or the
+`claude_billing = "api"`, `budget = true`, and `anthropic_api_key_file` fields
+in `workers.toml`. Keep the raw API key out of that file.
+
 ## Further documentation
 
 - [Persistent workers](docs/workers.md): the `workers.toml` schema, every
@@ -377,6 +460,12 @@ and that bootstrap in detail.
   variable.
 - [Quota and pacing](docs/quota.md): credential sources, Claude's two windows,
   and the window bootstrap.
+- [Claude API grants design](docs/api-budget-plan.md): shared local
+  budget, append-only ledger, and API worker integration.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
+
+The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
+adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
+for initialization, coordination, and the live calibration results.

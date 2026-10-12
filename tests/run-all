@@ -19,6 +19,7 @@ FAIL_FAST=0
 
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
+  api_budget.py
   agent_cmds.py
   agent_transcript.py
   auto_stage_priority.py
@@ -33,12 +34,15 @@ RUN_STDLIB=(
   codex_account.py
   codex_fallback.py
   contest_claim.py
+  cost_model.py
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
+  github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
   host_agent_preflight.py
+  host_build_cache.py
   ignore_quota_hardblock.py
   infra_failure_budget.py
   inflight_review.py
@@ -52,6 +56,7 @@ RUN_STDLIB=(
   mirror_creds_macos.py
   oauth_refresh_loop.py
   open_pr_pages.py
+  overlaps.py
   pace_curve.py
   pr_targeting.py
   preflight_review_lake.py
@@ -62,6 +67,7 @@ RUN_STDLIB=(
   quota_cache_fp.py
   quota_loop_refresh.py
   rebase_handoff.py
+  rebase_budget.py
   review_sync_failure.py
   quota_claude_bootstrap.py
   quota_claude_windows.py

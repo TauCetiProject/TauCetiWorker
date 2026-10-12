@@ -1,0 +1,70 @@
+local sample: 8540/8540 transcripts parsed
+
+AI API-equivalent cost measured from tokens, by exact model:
+  claude/<unknown>/preparation: 0/9 sessions priced (cost unavailable)
+  claude/<unknown>/revision: 0/72 sessions priced (cost unavailable)
+  claude/claude-opus-4-8/preparation: n=82, median=$4.68, p90=$8.34, mean=$5.14 per session
+  claude/claude-opus-4-8/revision: n=324, median=$1.26, p90=$3.00, mean=$1.63 per session
+  claude/claude-opus-5-5/preparation: n=570, median=$6.15, p90=$13.04, mean=$7.17 per session
+  claude/claude-opus-5-5/revision: n=847, median=$0.51, p90=$1.34, mean=$0.68 per session
+  claude/claude-opus-5/preparation: n=404, median=$10.80, p90=$19.01, mean=$11.79 per session
+  claude/claude-opus-5/revision: n=1642, median=$1.89, p90=$4.83, mean=$2.44 per session
+  codex/gpt-5.5/preparation: n=53, median=$2.69, p90=$4.25, mean=$3.06 per session
+  codex/gpt-5.5/revision: n=377, median=$0.81, p90=$1.64, mean=$0.99 per session
+  codex/gpt-5.6-sol/preparation: n=231, median=$5.24, p90=$9.85, mean=$5.60 per session
+  codex/gpt-5.6-sol/revision: n=1134, median=$0.92, p90=$2.54, mean=$1.30 per session
+  codex/gpt-5.6-terra/preparation: n=13, median=$1.76, p90=$2.55, mean=$1.88 per session
+  codex/gpt-5.6-terra/revision: n=61, median=$0.38, p90=$0.99, mean=$0.51 per session
+  codex/gpt-6.1-sol/preparation: n=490, median=$1.42, p90=$2.00, mean=$1.33 per session
+  codex/gpt-6.1-sol/revision: n=529, median=$0.36, p90=$0.59, mean=$0.39 per session
+  production reviews: 108,396 rubric runs / 4,699 PRs; median=$3.70, p90=$14.80, mean=$6.39 per PR
+  review aggregate-only fallback: 79,966 attempts use standard-context prices as a lower bound; 3,311 exceed the per-request threshold in aggregate; 40 failed attempts had no usage and contribute no measured token cost
+  revision rate: 4,376 priced sessions / 1,626 locally prepared PRs over ['2026-07-05', '2026-10-12'] (local lower-bound sample)
+  per-PR cost scenarios by exact model (shared review/revision rates; plus observed mix):
+    observed mix: $17.35/PR = preparation $7.01 + reviews $6.39 + revisions $3.94; $6.299e-02/changed LOC
+    claude-opus-4-8: $16.88/PR = preparation $5.62 + reviews $6.86 + revisions $4.39; $6.127e-02/changed LOC
+    claude-opus-5: $50.49/PR = preparation $12.87 + reviews $31.06 + revisions $6.55; $1.833e-01/changed LOC
+    claude-opus-5-5: $13.33/PR = preparation $7.75 + reviews $3.74 + revisions $1.84; $4.841e-02/changed LOC
+    gpt-5.5: $11.53/PR = preparation $3.06 + reviews $5.81 + revisions $2.66; $4.185e-02/changed LOC
+    gpt-5.6-sol: $14.08/PR = preparation $5.86 + reviews $4.71 + revisions $3.51; $5.113e-02/changed LOC
+
+local Lean/cache wall time per session:
+  claude/bump: n=64, median=256.5s, p90=706.0s, mean=382.0s
+  claude/fix-ci: n=518, median=31.6s, p90=194.0s, mean=80.9s
+  claude/other: n=131, median=0.0s, p90=73.0s, mean=42.5s
+  claude/preparation: n=1065, median=114.8s, p90=337.9s, mean=170.1s
+  claude/rebase: n=107, median=94.6s, p90=620.1s, mean=163.7s
+  claude/revision: n=2885, median=45.3s, p90=146.5s, mean=69.5s
+  codex/bump: n=39, median=56.0s, p90=404.8s, mean=158.0s
+  codex/fix-ci: n=641, median=25.6s, p90=343.1s, mean=119.8s
+  codex/other: n=145, median=36.2s, p90=353.1s, mean=108.0s
+  codex/preparation: n=787, median=92.4s, p90=317.9s, mean=150.6s
+  codex/rebase: n=57, median=239.2s, p90=916.1s, mean=432.7s
+  codex/revision: n=2101, median=41.5s, p90=158.0s, mean=71.2s
+
+author orientation (preparation sessions):
+  coverage: 449/1852 claim, 1699/1852 first-edit, 1717/1852 roadmap-size
+  to target claim: n=449, median=3.8m, p90=8.5m, mean=4.5m
+  to first edit: n=1699, median=5.8m, p90=12.1m, mean=6.4m
+  roadmap bytes vs claim time: Spearman rho=-0.17 (n=447; exploratory)
+  prior local sessions in area vs claim time: Spearman rho=0.32 (n=449; exploratory)
+
+CI model at current N=2.842e+06: 53.0 runner-min/merged PR, 5.61 vCPU-h, $0.93 equivalent compute
+  proxy decomposition: fixed=11.5, touched-code=24.8, repository-wide=16.7 runner-min/merged PR
+R2 full cache fetch: 5,787 objects, 0.162 GiB, $0.0021 gross reads, $0 R2 egress
+  CI multiplier: 5.34 fetches/merged PR = 0.865 GiB and $0.0111 gross reads
+R2 retained storage estimate: 1.90 GiB, $0.031/month gross, $0.00/month after the Standard free tier
+
+LOC cost at the current repository size:
+  N=2.842e+06: $6.642e-02/changed LOC ($7.101e-02/net retained LOC)
+  changed-LOC split: AI=$6.299e-02, fixed CI=$7.193e-04, touched-code CI=$1.911e-03, repository CI+R2=$7.968e-04
+
+LOC scaling scenario (N = existing repository LOC):
+  C(N) = $6.562e-02 + $2.804e-10 N
+  T_retained(N) = $7.016e-02 N + $1.499e-10 N^2
+  hypothetical total from N=0    no-churn baseline    retained-growth total
+  2.842e+06    $1.876e+05             $2.006e+05
+  2.842e+07    $1.978e+06             $2.115e+06
+  2.842e+08    $2.997e+07             $3.205e+07
+  all-infrastructure-scales comparison: C(N) = $6.299e-02 + $1.255e-09 N
+  caveat: scaling scenario, not a forecast; CI architecture, cache behavior, PR size, model prices, and agent behavior are held fixed

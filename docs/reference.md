@@ -16,6 +16,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--author-model MODEL` | Exact authoring model for an explicit provider (CLI > provider environment > committed default). |
 | `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex, Claude, or Kiro provider. |
 | `--account EMAIL_OR_ID` | Require the Codex credential to be this account (email, or the workspace UUID `tauceti doctor` prints) and refuse to run otherwise. Checks only; never switches. Needs an explicit `--agent codex`. |
+| `--github-account LOGIN` | Select the GitHub login for this process and its children; verifies the credential before work and leaves gh's active account unchanged. Also accepted by the dashboard, `status`, and `doctor`. |
 | `--bubble` | Run code and review agents inside the Bubble sandbox instead of directly on the host. The outer survey and coordination, plus all progress-report rounds, remain on the host. |
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
@@ -138,6 +139,119 @@ Kiro usage comes from the CLI's ACP extension and retains fractional credit
 values. OpenRouter's inference key reports key usage/limits; an optional
 `OPENROUTER_MANAGEMENT_KEY` adds account-wide purchased-credit telemetry.
 
+## GitHub accounts
+
+Use `--github-account LOGIN` or `TAUCETI_GITHUB_ACCOUNT` to bind a worker to one
+GitHub account. With neither set, existing `gh` authentication behavior is
+unchanged. Selection occurs before per-worker HOME isolation. TauCeti reads
+`gh auth token --hostname github.com --user LOGIN` with inherited token overrides
+removed, then verifies the resulting credential against GitHub's `/user` API.
+When no named credential is stored, an inherited `GH_TOKEN` or `GITHUB_TOKEN`
+may be used, with the same identity check. Missing, rejected, or mismatched
+credentials stop the command; TauCeti never switches to another account.
+
+The selected token lives in the worker's environment and is inherited by loop
+rounds, review tools, host agents, and Git's `gh auth git-credential` helper.
+Tokens are absent from command arguments, logs, and `workers.toml`. Git helper
+selection and author/committer name and noreply email are process-local;
+your global Git configuration is unchanged. Signing remains configured as before;
+ensure your signing key covers the selected account's noreply email if you require
+verified signed commits. GitHub SSH URLs are routed through
+HTTPS. SSH Git transport is disabled in the selected worker, so conflicting
+operator URL rewrites fail closed instead of choosing an unrelated SSH key.
+
+Each worker tends its selected account's PRs and resolves that account's fork.
+`TAUCETI_FORK` and `CLAIM_REPO` remain explicit overrides. Workers using different
+forks coordinate only if all accounts can write the same claim repository.
+`--roadmap-extra-identities` affects intentions ownership, not authentication
+or PR maintenance. The GitHub login is independent of the agent's subscription
+account selected or checked through provider credentials and `--account`.
+
+The dashboard displays the selected login and includes it in copied launch
+commands and persistent worker definitions. Choose it when opening the dashboard,
+for example `tauceti --github-account alice`. In `workers.toml`, set
+`github_account = "alice"` per worker; changing it changes the worker definition
+fingerprint and causes the manager to restart the worker. The shared manager
+removes dashboard account selection before spawning workers; a worker with no
+`github_account` uses the original host credentials. This also applies when the
+manager is started from a shell with `TAUCETI_GITHUB_ACCOUNT` set.
+
+Bubble mode requires `--github-account` support in Bubble's `open` command and
+the `github-account` capability in its running proxy. The companion implementation
+binds each scoped container token to its selected credential in the host's private
+proxy registry. The real GitHub token stays on the host. Old installations fail
+before an agent starts. After credential rotation or revocation, restart the
+worker to obtain a replacement; a running worker never falls back to the active
+`gh` account.
+
+## Cost model
+
+`tauceti cost-model` is a read-only analysis of the agent logs and provider
+transcripts already under `logs/` and `state/`. It reports distributions of
+Lean/cache tool time by provider and phase, and exploratory author-orientation
+times from session start to the target claim and first edit. `--json` emits the
+same measurements for notebooks or dashboards; `--limit N` samples the newest
+sessions (`0`, the default, means all available sessions). A limited sample cannot
+measure revision sessions per reviewed PR, so it reports phase distributions but
+omits the combined LOC headline unless `--ai-usd-per-changed-loc` is supplied.
+
+The AI section is measured from token counters rather than supplied as a dollar
+constant. Claude rows are de-duplicated by message id (one assistant message is
+normally repeated once per content block), and delegated Claude sessions are
+charged to their parent. Codex is priced request-by-request so its long-context
+tier is applied to the requests that actually cross the threshold. Prompt-cache
+reads and Claude's 5-minute/1-hour cache writes use their distinct displayed
+rates. The default review source is the local canonical TauCetiData checkout at
+`~/.cache/tauceti-review/data/TauCetiData`; use `--review-data-dir` to point at a
+different checkout. Production review records are de-duplicated by their durable
+key, with shadow experiments excluded.
+
+The report gives observed-mix, Sol-only, and Opus-only scenarios. Each combines
+preparation-attempt cost amortized over observed opened PRs, the review archive's
+observed rubric runs per PR, and measured revision sessions per reviewed PR.
+`--ai-family` chooses which scenario feeds the LOC model.
+`--ai-usd-per-changed-loc` remains available only as an explicit override; it has
+no default. Token counts are measurements, while dollar figures are
+API-equivalent conversions of subscription activity at the dated rates printed
+in JSON. Model choice is not randomized, so differences between the Sol and Opus
+samples are descriptive rather than causal.
+
+The CI and R2 sections are a model, not billing telemetry. Their measured
+defaults are dated snapshots and every important assumption is an overridable
+flag: builds per PR, runner minutes and comparison prices, cache object count,
+compressed transfer size, and retained storage. Run `tauceti cost-model -h` for
+the full list. In particular, the displayed runner price is a public GitHub
+runner equivalent, not a claim about a private Namespace contract, and R2
+request costs are gross marginal costs before the account-wide monthly free
+tier.
+
+The LOC section combines those infrastructure estimates with the measured
+API-equivalent preparation/review/revision scenario. It reports changed LOC and
+net retained LOC separately, using the observed churn ratio, and prints both the
+marginal changed-LOC model `C(N)` and the churn-adjusted retained-growth model
+`T_retained(N)` in dollars and scientific notation. The cumulative table labels
+the unadjusted integral as a no-churn baseline rather than treating changed LOC
+as repository size. By default it projects to `1e6`, `1e7`, and `1e8` retained
+LOC; repeat `--projection-loc N` to choose other targets.
+
+The scaling coefficient is explicitly a scenario rather than a forecast. The
+default decomposition uses a 2026-09-18 sample of 40 PR jobs and 20 post-merge
+jobs to classify runner time as fixed/setup, touched-code, or repository-wide.
+In a separate 97-run cross-check, total PR-build wall time had Pearson
+correlations of only `0.06` with changed LOC and `0.04` with changed-file count,
+so the touched-code bucket is an accounting proxy rather than a fitted
+touched-files slope.
+Only the repository-wide component and complete-cache R2 reads grow with `N`;
+the other components stay constant per changed LOC. The six decomposition
+values are relative weights (the preferred flags end in `-weight`; the
+`-minutes` spellings remain aliases), while `--changed-loc-per-pr`,
+`--changed-per-net-loc`, `--reference-repo-loc`, `--current-repo-loc`, and
+`--ai-family` expose the conversion assumptions. JSON output also
+contains a pessimistic comparison in which all current infrastructure cost
+scales with repository size. Operational improvements and changing PR shape can
+dominate repository growth, so long-range totals, especially `1e8`, should not be
+read as predictions.
+
 ## Codex accounts
 
 `--account EMAIL_OR_ID` (or `TAUCETI_ACCOUNT`) requires the Codex credential to
@@ -168,6 +282,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | --- | --- | --- |
 | `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
 | `TAUCETI_ACCOUNT` | _(unset)_ | Default for `--account`. |
+| `TAUCETI_GITHUB_ACCOUNT` | _(unset)_ | GitHub login to select and verify for the dashboard, status, doctor, and work commands. |
 | `CODEX_HOME` | `~/.codex` | Codex config/credential source. Point it at a private directory to give TauCeti its own Codex account without disturbing the one your interactive `codex` uses. |
 | `TAUCETI_WORKER_ID` | _(unset)_ | Pin the id; when unset, `work` takes the lowest free `workerN`. |
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
@@ -185,12 +300,14 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
 | `TAUCETI_MATHLIB_POOL` | `$XDG_CACHE_HOME/mathlib`, else login user's `~/.cache/mathlib` | The pool those hardlinks go to and come from. |
 | `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Lake's own build-output cache. Per-worker: unlike a toolchain install it is written throughout a build. |
+| `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main. |
 | `LAKE_ARTIFACT_CACHE` | `1` | Keep local build outputs in Lake's artifact store so later rounds can reuse them. |
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_INHERIT_CLAUDE_CONFIG` | _(unset)_ | `1` gives an isolated worker your own `CLAUDE.md`, `settings.json`, and skills instead of its own. Off by default: a round should not depend on whose config dir it ran from, and personal instructions can contradict the task prompt. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-6.1-sol` (Luna fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
+| `TAUCETI_CLAUDE_MODEL` | `claude-opus-5-5` | Claude review-model override. Host and Bubble reviews explicitly pass the same default model as authoring; authoring overrides remain independent. |
 | `TAUCETI_AUTHORING_KIRO_MODEL` / `TAUCETI_AUTHORING_KIRO_EFFORT` | `gpt-5.6-sol` / `high` | Exact Kiro authoring profile. `claude-opus-5` selects Opus; Kiro Auto is never used. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin, independent of the authoring model. Unset preserves the review engine's own default and fallback. |
 | `TAUCETI_REVIEW_KIRO_MODEL` | `gpt-5.6-sol` | Exact Kiro review-model pin, independent of authoring. |
@@ -219,3 +336,22 @@ Flags win over these. Most are tuning knobs with sane defaults.
 Worker configuration paths (`TAUCETI_WORKERS_CONFIG`, `TAUCETI_CONFIG_HOME`,
 `TAUCETI_WORKERS_STATE_DIR`, `TAUCETI_RUNTIME_DIR`) are documented in
 [the workers documentation](workers.md).
+
+## Claude API billing and grants
+
+`work --agent claude --claude-billing api` selects API-key authentication instead
+of subscription quota pacing. Supply `ANTHROPIC_API_KEY` or
+`--anthropic-api-key-file PATH`. Add `--budget` to consult the user-level grant
+ledger immediately before each paid Claude invocation. These settings are
+propagated through loop children, managed workers, reviewers, and Bubble.
+
+`tauceti budget --grant USD` adds credit; `--set-grant USD` sets the current
+balance through an adjustment; `--grant-rate USD_PER_HOUR` changes automatic
+replenishment. `budget` queries current state, `--json` emits structured state,
+and `--log` shows accounting history. Corrections use
+`--reconcile INVOCATION --cost USD --note TEXT`.
+
+Grants never interrupt active sessions. Completed costs may create a deficit,
+and estimated pending costs reduce the amount available for new admissions.
+See [the complete budget design](api-budget-plan.md) for state paths, recovery,
+and estimated-cost semantics.

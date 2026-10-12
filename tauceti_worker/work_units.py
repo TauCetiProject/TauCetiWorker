@@ -3,6 +3,7 @@ its work unit (review/fix/fix-ci/rebase/bump/roadmap) on the host or in a bubble
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -18,6 +19,8 @@ from pathlib import Path
 
 from .agents import (
     AuthoringProfile,
+    BuildCacheUnavailable,
+    _claude_review_model,
     _codex_review_model_override,
     _kiro_review_model,
     fetch_git_source,
@@ -54,7 +57,6 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
     MAX_INFRA_REFUNDS,
-    MAX_OPEN_PRS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_REF,
@@ -104,6 +106,11 @@ from .survey import (
 def want(only: list[str], task: str) -> bool:
     """Is this work-unit stage enabled? Empty `only` ⇒ everything (do-whatever-is-helpful)."""
     return (not only) or (task in only)
+
+
+def round_stages(opts):
+    """The predictor and runtime share the same stage priority."""
+    return AUTO_STAGES
 
 
 @dataclass
@@ -291,7 +298,7 @@ def focus_prs(sv: Survey, opts) -> None:
     if not wanted:
         return
     keep = set(wanted)
-    for stage in AUTO_STAGES:
+    for stage in round_stages(opts):
         kind = sv.kind(stage)
         kind.actionable = [c for c in kind.actionable if stage in PR_TASKS and c.pr in keep]
     log(f"--pr: this round considers only {', '.join(f'#{n}' for n in wanted)}")
@@ -312,7 +319,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # credential mirror.
     if not opts.dry_run:
         mirror_creds(w.cfg)
-    sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
+    if opts.only and set(opts.only) <= {"overlap-scan", "overlap-fix"}:
+        from .overlaps import survey_overlaps
+
+        sv = Survey(worker_id=w.cfg.wid)
+        survey_overlaps(w.cfg, w.gh, sv, repair="overlap-fix" in opts.only)
+    else:
+        sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
@@ -385,8 +398,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # workers starting together don't all pick the lowest-numbered PR and spend a branch-claim round-trip
     # discovering the clash. Reviews get their affinity + age-weighted order below. This only reorders
     # WITHIN a stage — the cascade's priority is unchanged — and the real claims remain the backstop.
-    for stage in AUTO_STAGES:
-        if stage == "review":
+    for stage in round_stages(opts):
+        if stage in ("review", "overlap-scan", "overlap-fix"):
             continue
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
@@ -427,7 +440,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
-    for stage in AUTO_STAGES:
+    for stage in round_stages(opts):
         if not want(opts.only, stage):
             continue
         for c in sv.kind(stage).actionable:
@@ -442,7 +455,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if sv.roadmap_backpressure:
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
-                f"(>= {MAX_OPEN_PRS}) — backpressure, not authoring"
+                f"(>= {sv.max_open_prs}) — backpressure, not authoring"
             )
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
@@ -467,6 +480,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         reason = sv.progress.suppressed[0].reason
         if reason:
             raise NoProgress(f"progress: {reason}")
+    for stage in ("overlap-fix", "overlap-scan"):
+        if stage in opts.only and sv.kind(stage).suppressed:
+            raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
     raise NoProgress(f"no eligible work this round under {scope}")
 
 
@@ -790,6 +806,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "lint-repair": do_lint_repair,
         "progress": do_progress,
         "roadmap": do_roadmap,
+        "overlap-scan": do_overlap_scan,
+        "overlap-fix": do_overlap_fix,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
     # with which agent and sandbox — the same line for every stage.
@@ -804,6 +822,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         what = c.reason or (c.head[:12] if c.head else "")
     if stage == "review":
         detail = f"provider={opts.work_model}, sandbox={where}"
+        review_model = _claude_review_model(opts.work_model)
+        if review_model:
+            detail += f", model={review_model}"
     else:
         profile = _effective_authoring_profile(opts)
         effort = profile.effort or "none"
@@ -812,7 +833,26 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
-    rc = fn(w, sv, c, opts, bubble)
+    from .budget import BudgetError
+    from .claude_api import admission_failure, api_context, api_mode
+
+    with contextlib.ExitStack() as stack:
+        try:
+            api = stack.enter_context(
+                api_context(
+                    w.cfg.wid if api_mode() else "",
+                    stage,
+                    host=not bubble or stage == "progress",
+                    model=profile.model if profile else (review_model if stage == "review" else None),
+                )
+            )
+        except (BudgetError, OSError) as error:
+            if not api_mode():
+                raise
+            raise admission_failure(str(error)) from None
+        rc = fn(w, sv, c, opts, bubble)
+        if rc != 0 and api is not None and api.blocked_reason:
+            raise admission_failure(api.blocked_reason)
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
@@ -829,6 +869,18 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
 
 # --- the work units (each runs on the host by default, or in bubble with --bubble) ---
+
+
+def do_overlap_scan(w, sv, c, opts, bubble):
+    from .overlaps import do_scan
+
+    return do_scan(w, sv, c, opts, bubble)
+
+
+def do_overlap_fix(w, sv, c, opts, bubble):
+    from .overlaps import do_fix
+
+    return do_fix(w, sv, c, opts, bubble)
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
@@ -854,6 +906,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
+            claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
             rc = run_to_logfile(
                 [
@@ -868,12 +921,14 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     "--no-sync",
                     "--reviewer",
                     reviewers,
+                    *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
                     "--expect-head",
                     head,
                     "--max-rounds-per-day",
                     str(REVIEW_DAILY_CAP),
                     "--submitted-by",
                     me(),
+                    *(["--claude-model", claude_model] if claude_model else []),
                     *(["--codex-model", cm] if cm else []),
                     *(["--kiro-model", km] if km else []),
                 ],
@@ -881,6 +936,12 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"review #{pr}",
             )
         log(f"  review #{pr}: engine rc={rc}")
+        from .claude_api import blocked_reason
+
+        if rc != 0 and (reason := blocked_reason()):
+            from .claude_api import admission_failure
+
+            raise admission_failure(reason)
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without posting a verdict" streak up front — BEFORE the publish step, which is
@@ -1030,11 +1091,19 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     persistent PR-specific failure ever matches the transient patterns.
 
     That bound is keyed on the PR, NOT the head. Some of the counters refunded here are per-PR and
-    lifetime (`ci-pr-`, `bump-pr-`, `rebase-pr-`), so a head-keyed allowance would reset on every
+    lifetime or progress-scoped (`ci-pr-`, `bump-pr-`, rebase budgets), so a head-keyed allowance would reset on every
     push while still handing those back, and a persistent false positive could evade the lifetime
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
     per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
     """
+    from .claude_api import blocked_reason
+
+    if reason := blocked_reason():
+        for key in charged:
+            w.counters.write(key, max(0, w.counters.read(key) - 1))
+        from .claude_api import admission_failure
+
+        raise admission_failure(reason)
     reason = take_last_agent_infra_failure()
     if not reason:
         return
@@ -1108,7 +1177,14 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
-        rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+        try:
+            rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+        except BuildCacheUnavailable:
+            # Unlike a transcript-derived provider failure, we know the agent never started.
+            # A persistent cache outage must not exhaust the bounded provider-refund allowance.
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            raise
     if rc == 0:
         w.rs.bust(pr)
     else:
@@ -1132,7 +1208,9 @@ def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
 
 
 def do_rebase(w, sv, c, opts, bubble) -> int | None:
-    key = f"rebase-pr-{c.pr}"
+    key = c.rebase_budget_key
+    if not key:
+        raise Die("rebase candidate has no selected retry budget; survey it again")
     w.counters.incr(key)
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
 
@@ -1400,6 +1478,12 @@ def _do_progress_inner(w, opts) -> int | None:
     )
     rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
     if rc != 0:
+        from .claude_api import blocked_reason
+
+        if reason := blocked_reason():
+            from .claude_api import admission_failure
+
+            raise admission_failure(reason)
         w.counters.incr("progress-err")
         raise Die(f"the writing agent exited {rc}")
     for f in (status_body, section_body):

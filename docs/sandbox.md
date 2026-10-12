@@ -25,12 +25,50 @@ also run their cache downloads and advisory `lake build` there.
 
 That isolation matters most for review, where the agent reads untrusted PRs.
 
+## Multiple GitHub accounts
+
+`--github-account LOGIN --bubble` requires the companion account-aware Bubble
+CLI and auth proxy. TauCeti checks the CLI flag and the daemon's advertised
+`github-account` capability before starting a model, and passes the login and
+commit attribution to `bubble open`. The proxy binds each container's scoped
+token to its own selected GitHub credential; the raw credential stays in the
+host's private registry and is removed when that container's token is revoked.
+Different containers can therefore use different accounts concurrently.
+
+An older Bubble installation rejects this combination. Update to an
+account-aware build and restart its proxy with `bubble gh proxy start`.
+Restart the worker after replacing a GitHub credential; the proxy never
+refreshes a selected container through another account's active login.
+
 ## Lake caches
 
 Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
 `lake exe cache get`, fetches TauCeti's own main-built outputs with
-`lake cache get`, and runs an advisory `lake build`. A red tree still reaches the
-repair agent.
+`lake cache get`. Host coding rounds do this after selecting the target branch,
+using the anonymous public service at `cache.taucetiproject.org` and a private
+per-worker artifact store. Lake searches up to 100 revisions for a published
+build; `LAKE_CACHE_MAX_REVS` overrides that limit (`0` searches the complete history).
+The build restores matching artifacts and compiles changed modules and their
+affected dependents. Progress-writing and review jobs do not need this bootstrap.
+
+For PR branches the worker also fetches artifacts from current `origin/main`,
+searching its history for a published build. This primes the store for rebases,
+including ones that change the Lean toolchain. The worker uses its own temporary `LAKE_CONFIG` during host coding rounds,
+replacing the operator’s Lake service configuration for that invocation. The public
+service stays configured throughout the agent invocation; after changing Git history, dependencies or
+repairing a malformed workspace, the agent is instructed to fetch both caches again.
+
+Host downloads retry once, with one twenty-minute deadline for the entire
+bootstrap. A transport, publication or partial-download failure stops the round
+before the agent starts and never consumes a PR's attempt budget or its bounded
+provider-refund allowance. Missing published main outputs also stop the round
+rather than compiling the whole library. Workspace, dependency revision and invalid-toolchain errors reach the
+repair agent; transport errors wrapped by a dependency failure still stop the round. An explicit false value for `LAKE_ARTIFACT_CACHE` opts out of
+TauCeti artifact caching and downloads. The detailed fetch log is in
+`logs/<worker>/build-cache-<timestamp>.log`.
+
+Bubble also runs an advisory `lake build` after fetching both caches. A red tree
+still reaches the repair agent.
 
 Bubble routes both download-only caches through its host-global proxy, so
 TauCeti's public R2 host is never reachable from inside the container. The exact
@@ -85,3 +123,22 @@ file aside once so the review can fall back to the live Keychain. A headless
 worker whose Keychain cannot be unlocked still needs a file fallback: point
 `CLAUDE_CONFIG_DIR` at a dedicated directory holding a current
 `.credentials.json` instead of moving away its only credential source.
+
+## Claude API billing
+
+With `--claude-billing api`, Bubble receives a private read-only API key file
+and a Claude shim. The host bridge controls admission and records costs through
+a read-write requests/receipts mount and a separate read-only replies/heartbeat
+mount. The host shim, host key file, and budget ledger are not mounted. Subscription
+credentials are not seeded. Keys are removed after the round and on normal
+signal cleanup. SIGKILL may leave private staging files requiring cleanup, as
+with other abruptly interrupted filesystem work.
+
+The same shim intercepts review-engine Claude calls even when the engine
+constructs a clean subprocess environment. The review engine runs in API
+authentication mode. Local grants never terminate an admitted session.
+Costs reported inside the sandbox are self-reported accounting estimates. The
+mailbox prevents access to host credential files and the ledger; it is not an
+independent attestation of the container's spending. After a crash, use
+`tauceti budget --recover --note TEXT` to recover durable receipts and remove
+stale keys for recorded sessions.

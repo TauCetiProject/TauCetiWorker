@@ -106,7 +106,7 @@ LOST_BUILD_GRACE_S = 1800
 LOST_BUILD_CANCEL_GRACE_S = 86400
 LOST_BUILD_TTL = 600  # seconds a per-head lost-build verdict stays fresh
 
-MAX_REBASE_ATTEMPTS = 3  # per-PR: stop trying to rebase a conflicting PR
+MAX_REBASE_ATTEMPTS = 3  # conflict attempts per verified progress checkpoint; handoffs keep a per-PR cap
 
 MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 
@@ -150,6 +150,7 @@ ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min h
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
+EX_ADMISSION_WAIT = 76  # API funding/queue/throughput wait, outside the round timeout
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -254,7 +255,7 @@ AGENT_NAMES = {
 
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
 # selected, host and bubble launchers consume this exact model/effort profile.
-# Review models are configured separately by the review engine.
+# Claude reviews share this default; other review models follow the review engine's policy.
 CODEX_AUTHORING_FALLBACK_MODEL = "gpt-6-luna"
 # A model entitlement normally changes only when an account's subscription changes. Keep the
 # side-effect-free access probe out of every round while still noticing an upgrade promptly.
@@ -262,8 +263,9 @@ CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
     # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
-    # Pin Claude to the current exact Opus generation, not its moving alias.
     "codex": ("gpt-6.1-sol", "high"),
+    # Pin Claude authoring, reviews and quota bootstrap to an exact model, not the moving opus alias.
+    # The review engine must price a new model first, so update TauCetiReview before this default.
     "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
     # id (for example claude-opus-5) with the existing --author-model flag.
@@ -282,7 +284,18 @@ CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "lint-repair"]
+ALLOWED_TASKS = [
+    "rebase",
+    "review",
+    "fix-ci",
+    "fix",
+    "bump",
+    "progress",
+    "roadmap",
+    "lint-repair",
+    "overlap-scan",
+    "overlap-fix",
+]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
@@ -291,18 +304,17 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # ahead of fleet-wide reviews so author-action work cannot be starved by unrelated reviews. Roadmap
 # is the final fallback and is handled separately after these stages. The durable attempt breaker
 # keeps a stuck or rejected progress report from burning every round.
-AUTO_STAGES = ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review")
+AUTO_STAGES = ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review", "overlap-fix", "overlap-scan")
 
-# The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
-# left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
-# rather than touching a PR of ours, and `roadmap` opens a PR that does not exist yet. Both carry a
+# The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The
+# others write reports, investigate Mathlib commits or open new PRs. They carry a
 # pr=0 candidate, which is why no `--pr` value is allowed to be 0.
 PR_TASKS = ("rebase", "bump", "lint-repair", "fix-ci", "fix", "review")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
 # runtime priority. Keeping those concepts separate avoids silently rebinding established digit keys.
-KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> "rebase", ...
+KIND_KEYS = {key: name for key, name in zip("1234567890", ALLOWED_TASKS, strict=True)}
 
 KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}  # "rebase" -> "1", ...
 
@@ -314,6 +326,7 @@ SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 # than a working tree to roam. Its remaining exposure — merged PR descriptions reaching the model — is
 # bounded by the merge gate, which only ever admits two markdown files in one directory.
 SANDBOX_DEFAULT["progress"] = False
+SANDBOX_DEFAULT["overlap-scan"] = False  # host investigation; publication stays outside the model
 
 
 AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]
