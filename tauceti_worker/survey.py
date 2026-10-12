@@ -69,11 +69,11 @@ class Counters:
             txt = (self.state / name).read_text().strip()
         except FileNotFoundError:
             return 0
-        except OSError:
+        except (OSError, UnicodeError):
             if name.startswith("rebase-pr-"):
                 raise RebaseBudgetUnavailable("rebase counter is unreadable") from None
             return 0
-        if not txt.isdigit() and name.startswith("rebase-pr-"):
+        if (not txt.isascii() or not txt.isdigit()) and name.startswith("rebase-pr-"):
             raise RebaseBudgetUnavailable("rebase counter is malformed")
         return int(txt) if txt.isdigit() else 0
 
