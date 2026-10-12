@@ -895,7 +895,9 @@ def run_agent_proc(
         from .overlap_support import atomic
 
         telemetry = {
-            "provider": provider, "compactions": renderer.compactions, "usage": renderer.usage,
+            "provider": provider,
+            "compactions": renderer.compactions,
+            "usage": renderer.usage,
             "usage_note": "Provider totals; cumulative input is not peak context occupancy.",
         }
         atomic(logdir / f"{label}-{telemetry_stamp}-telemetry.json", telemetry)

@@ -209,9 +209,18 @@ class AgentTranscriptRenderer:
             return _line("compaction", f"{self.provider}; count={self.compactions}")
         if kind in {"turn.completed", "result"} and isinstance(event.get("usage"), dict):
             self.usage = {
-                key: value for key, value in event["usage"].items()
-                if key in {"input_tokens", "output_tokens", "cached_input_tokens", "reasoning_output_tokens",
-                           "cache_read_input_tokens", "cache_creation_input_tokens"} and type(value) is int
+                key: value
+                for key, value in event["usage"].items()
+                if key
+                in {
+                    "input_tokens",
+                    "output_tokens",
+                    "cached_input_tokens",
+                    "reasoning_output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                }
+                and type(value) is int
             }
 
         try:

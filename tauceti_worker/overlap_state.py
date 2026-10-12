@@ -25,7 +25,9 @@ SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def git(*args: str, cwd: Path | None = None, data: str | None = None, check: bool = True, env=None):
-    result = subprocess.run(["git", *map(str, args)], cwd=cwd, input=data, capture_output=True, text=True, timeout=180, env=env)
+    result = subprocess.run(
+        ["git", *map(str, args)], cwd=cwd, input=data, capture_output=True, text=True, timeout=180, env=env
+    )
     if check and result.returncode:
         raise Die(f"overlap git failed: {(result.stderr or result.stdout).strip()[-600:]}")
     return result

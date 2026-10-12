@@ -3,6 +3,7 @@
 API reads are token-scoped and complete before caching. Fresh reads bypass caches
 before publication; a generation change invalidates peer cursors after a CAS.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -139,7 +140,6 @@ def shared_read(key, fetch, *, ttl: float = 30, identity=None, immutable: bool =
         cm.__exit__(None, None, None)
 
 
-
 def _git(*args) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *map(str, args)], capture_output=True, text=True, timeout=120)
 
@@ -209,7 +209,10 @@ def snapshot(repo: str, *, ttl: int = 3600) -> Path | None:
                 result = _git("clone", "--no-local", "--depth=1", "--branch=snapshot", "--", mirror, temporary)
                 if result.returncode or not _valid_snapshot(temporary, state["sha"], repo):
                     return None
-                for name, value in (("remote.origin.url", "https://github.com/" + repo), ("remote.origin.pushurl", "no_push")):
+                for name, value in (
+                    ("remote.origin.url", "https://github.com/" + repo),
+                    ("remote.origin.pushurl", "no_push"),
+                ):
                     if _git("-C", temporary, "config", name, value).returncode:
                         return None
                 for directory, _, files in os.walk(temporary, topdown=False):

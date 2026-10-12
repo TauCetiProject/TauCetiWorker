@@ -28,9 +28,15 @@ class CacheTests(unittest.TestCase):
     def test_fresh_read_and_credential_boundary(self):
         from tauceti_worker import overlap_support as support
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "alice"}):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "alice"}),
+        ):
             values = iter([1, 2, 3, 4])
-            fetch = lambda: next(values)
+
+            def fetch():
+                return next(values)
+
             self.assertEqual(support.shared_read(["cursor"], fetch), 1)
             self.assertEqual(support.shared_read(["cursor"], fetch), 1)
             with support.read_context(fresh=True):
@@ -43,14 +49,21 @@ class CacheTests(unittest.TestCase):
     def test_failed_and_invalidated_reads_are_not_cached(self):
         from tauceti_worker import overlap_support as support
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "alice"}):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "alice"}),
+        ):
+
             def fail():
                 raise Die("incomplete inventory")
+
             with self.assertRaises(Die):
                 support.shared_read(["inventory"], fail)
+
             def concurrent_write():
                 support.invalidate()
                 return [1]
+
             self.assertEqual(support.shared_read(["inventory"], concurrent_write), [1])
             self.assertEqual(support.shared_read(["inventory"], lambda: [2]), [2])
 
@@ -63,11 +76,19 @@ class CacheTests(unittest.TestCase):
             git("init", fixture)
             (fixture / "lake-manifest.json").write_text('{"packages": []}')
             git("add", ".", cwd=fixture)
-            with environment({"GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@invalid", "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@invalid"}):
+            with environment(
+                {
+                    "GIT_AUTHOR_NAME": "test",
+                    "GIT_AUTHOR_EMAIL": "test@invalid",
+                    "GIT_COMMITTER_NAME": "test",
+                    "GIT_COMMITTER_EMAIL": "test@invalid",
+                }
+            ):
                 git("commit", "-m", "fixture", cwd=fixture)
             sha = git("rev-parse", "HEAD", cwd=fixture).stdout.strip()
             runner = support._git
             attempts = []
+
             def clone_failure(*args):
                 args = list(args)
                 if "https://github.com/TauCetiProject/TauCeti" in args:
@@ -79,6 +100,7 @@ class CacheTests(unittest.TestCase):
                         (Path(args[-1]) / "partial").write_text("interrupted clone")
                         return subprocess.CompletedProcess(args, 1, "", "clone failed")
                 return runner(*args)
+
             with patch.object(support, "_git", side_effect=clone_failure):
                 self.assertIsNone(support.snapshot("TauCetiProject/TauCeti", ttl=3600))
                 self.assertFalse(attempts[0].exists())
@@ -101,11 +123,17 @@ class CacheTests(unittest.TestCase):
             git("init", fixture)
             (fixture / "lake-manifest.json").write_text('{"packages": []}')
             git("add", ".", cwd=fixture)
-            identity = {"GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@invalid", "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@invalid"}
+            identity = {
+                "GIT_AUTHOR_NAME": "test",
+                "GIT_AUTHOR_EMAIL": "test@invalid",
+                "GIT_COMMITTER_NAME": "test",
+                "GIT_COMMITTER_EMAIL": "test@invalid",
+            }
             with environment(identity):
                 git("commit", "-m", "A", cwd=fixture)
             runner = support._git
             fail_refresh = False
+
             def scripted(*args):
                 args = list(args)
                 if "https://github.com/TauCetiProject/TauCeti" in args:
@@ -113,6 +141,7 @@ class CacheTests(unittest.TestCase):
                 if "fetch" in args and fail_refresh:
                     return subprocess.CompletedProcess(args, 1, "", "network unavailable")
                 return runner(*args)
+
             with patch.object(support, "_git", side_effect=scripted):
                 first = support.snapshot("TauCetiProject/TauCeti", ttl=0)
                 (fixture / "additional.lean").write_text("-- commit B")
@@ -200,7 +229,10 @@ class StateTests(unittest.TestCase):
     def test_release_failure_does_not_mask_successful_body(self):
         lease = Lease(self.a, "scan", "alice", "test")
         self.assertTrue(lease.acquire())
-        with patch.object(lease, "acquire", return_value=True), patch.object(self.a, "read", side_effect=Die("network unavailable")):
+        with (
+            patch.object(lease, "acquire", return_value=True),
+            patch.object(self.a, "read", side_effect=Die("network unavailable")),
+        ):
             with lease:
                 completed = True
         self.assertTrue(completed)
@@ -209,11 +241,13 @@ class StateTests(unittest.TestCase):
     def test_commit_identity_is_subprocess_local(self):
         names = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
         run = self.a.run
+
         def inspect(*args, **kwargs):
             if "commit-tree" in args:
                 self.assertTrue(all(name not in os.environ for name in names))
                 self.assertTrue(all(name in kwargs["env"] for name in names))
             return run(*args, **kwargs)
+
         with environment({name: None for name in names}), patch.object(self.a, "run", side_effect=inspect):
             self.assertTrue(self.a.advance("", "a" * 40))
             self.assertTrue(all(name not in os.environ for name in names))
@@ -285,7 +319,9 @@ class InvestigationTests(unittest.TestCase):
                     return SimpleNamespace(returncode=1, stdout="", stderr="interrupted")
                 body = json.loads(Path(argv[argv.index("--input") + 1]).read_text())["body"]
                 number = 100 + len(published)
-                published.append({"number": number, "body": body, "state": "closed", "labels": [{"name": overlaps.LABEL}]})
+                published.append(
+                    {"number": number, "body": body, "state": "closed", "labels": [{"name": overlaps.LABEL}]}
+                )
                 return SimpleNamespace(returncode=0, stdout=json.dumps(published[-1]), stderr="")
 
             gh = SimpleNamespace(_gh=invoke)
@@ -302,9 +338,11 @@ class InvestigationTests(unittest.TestCase):
             fingerprint = overlaps.issue_id(self.finding)
             row = {"number": 123, "body": overlaps.marker(fingerprint), "labels": []}
             calls = []
+
             def invoke(argv):
                 calls.append(argv)
                 return SimpleNamespace(returncode=0, stdout=json.dumps(row), stderr="")
+
             gh = SimpleNamespace(_gh=invoke)
             lease = SimpleNamespace(state=SimpleNamespace(directory=Path(tmp) / "state.git"), require=lambda: None)
             with patch.object(overlaps, "issues", return_value=[]):
@@ -321,13 +359,16 @@ class InvestigationTests(unittest.TestCase):
 
     def test_unlabelled_issue_does_not_advance_retained_scan_cursor(self):
         from contextlib import nullcontext
+
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / "overlap-runs" / "prior"
             work.mkdir(parents=True)
             packet = {**self.batch, "pin": "p" * 40}
             (work / "batch.json").write_text(json.dumps(packet))
             (work / "result.json").write_text(json.dumps(self.result))
-            state = SimpleNamespace(cursor=lambda: ("checkpoint", self.batch["from"]), advance=Mock(), directory=Path(tmp) / "state.git")
+            state = SimpleNamespace(
+                cursor=lambda: ("checkpoint", self.batch["from"]), advance=Mock(), directory=Path(tmp) / "state.git"
+            )
             lease = SimpleNamespace(require=lambda: None, state=state)
             row = {"number": 123, "body": overlaps.marker(overlaps.issue_id(self.finding)), "labels": []}
             gh = SimpleNamespace(_gh=lambda *args: SimpleNamespace(returncode=0, stdout=json.dumps(row), stderr=""))
@@ -434,6 +475,7 @@ class DispatchTests(unittest.TestCase):
 
     def test_scan_requires_label_rights_without_blocking_fork_repairs(self):
         from tauceti_worker import agents
+
         state = SimpleNamespace(cursor=lambda: ("checkpoint", "a" * 40))
         worker = SimpleNamespace(cfg=SimpleNamespace(wid="test"), gh=None)
         row = {"number": 123, "title": "overlap", "body": overlaps.marker("f" * 64), "state": "open", "labels": []}
@@ -457,7 +499,9 @@ class DispatchTests(unittest.TestCase):
 
     def test_invalid_range_declines_automatic_scan_but_focused_scan_is_loud(self):
         from contextlib import nullcontext
+
         from tauceti_worker import agents
+
         state = SimpleNamespace(cursor=lambda: ("checkpoint", "a" * 40))
         lease = SimpleNamespace(require=lambda: None)
         worker = SimpleNamespace(cfg=SimpleNamespace(wid="test"), gh=None)
@@ -477,11 +521,17 @@ class DispatchTests(unittest.TestCase):
             sv.overlap_scan.actionable.append(Candidate(0, "cursor", "pin changed"))
             worker.rs = worker.counters = None
             stages = []
+
             def dispatch(stage, current, survey, candidate, opts):
                 stages.append(stage)
                 return overlaps.do_scan(current, survey, candidate, opts, False) if stage == "overlap-scan" else 0
+
             opts = SimpleNamespace(only=[], dry_run=True, prs=(), work_model="codex", sandbox_host=True)
-            with patch.object(work_units, "survey", return_value=sv), patch.object(work_units, "dispatch", side_effect=dispatch), patch.object(work_units, "throttle_review"):
+            with (
+                patch.object(work_units, "survey", return_value=sv),
+                patch.object(work_units, "dispatch", side_effect=dispatch),
+                patch.object(work_units, "throttle_review"),
+            ):
                 self.assertEqual(work_units.run_round(worker, opts), 0)
             self.assertEqual(stages, ["overlap-scan", "roadmap"])
             with self.assertRaisesRegex(overlaps.HistoryRangeError, "pin reverted"):

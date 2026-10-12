@@ -166,9 +166,18 @@ def add_github_account_flag(p: argparse.ArgumentParser) -> None:
 def add_work_flags(p: argparse.ArgumentParser) -> None:
     from .config import positive_integer
 
-    p.add_argument("--max-open-prs", type=positive_integer, default=None, help="open PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 8)")
-    p.add_argument("--overlap-batch-commits", type=positive_integer, default=None,
-                   help="Mathlib commits per overlap-scan session (env TAUCETI_OVERLAP_BATCH_COMMITS; default 160)")
+    p.add_argument(
+        "--max-open-prs",
+        type=positive_integer,
+        default=None,
+        help="open PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 8)",
+    )
+    p.add_argument(
+        "--overlap-batch-commits",
+        type=positive_integer,
+        default=None,
+        help="Mathlib commits per overlap-scan session (env TAUCETI_OVERLAP_BATCH_COMMITS; default 160)",
+    )
     p.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
     p.add_argument("--budget", action="store_true", help="admit Claude API sessions through shared local grants")
     p.add_argument("--anthropic-api-key-file", metavar="PATH", help="private API key file; otherwise ANTHROPIC_API_KEY")
@@ -820,10 +829,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cmd = args.cmd
 
-    from .overlaps import batch_size
     from .config import max_open_prs
+    from .overlaps import batch_size
 
-    for field, variable in (("overlap_batch_commits", "TAUCETI_OVERLAP_BATCH_COMMITS"), ("max_open_prs", "TAUCETI_MAX_OPEN_PRS")):
+    for field, variable in (
+        ("overlap_batch_commits", "TAUCETI_OVERLAP_BATCH_COMMITS"),
+        ("max_open_prs", "TAUCETI_MAX_OPEN_PRS"),
+    ):
         if getattr(args, field, None) is not None:
             os.environ[variable] = str(getattr(args, field))
     try:
@@ -1370,7 +1382,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # Only authoring/fixing stages build with lake on the host; review runs the fetched-on-demand review
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
-    needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan"))
+    needs_host_build = any(
+        (not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan")
+    )
     if needs_host_build:
         from .agents import lake_cache_max_revs
 
