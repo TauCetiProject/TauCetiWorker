@@ -966,14 +966,25 @@ def _spearman(pairs: list[tuple[float, float]]) -> dict[str, float | int | None]
     return {"n": len(pairs), "rho": numerator / denominator if denominator else None}
 
 
-def analyze_review_archive(data_dir: Path | None) -> dict:
-    """Aggregate the canonical production review records already present on this machine."""
+def analyze_review_archive(data_dir: Path | None, state_dir: Path | None = None) -> dict:
+    """Aggregate canonical and not-yet-archived local production review records."""
     runs_dir = data_dir / "records" / "runs" if data_dir else None
-    if runs_dir is None or not runs_dir.is_dir():
+    sources: list[tuple[str, Iterable[Path]]] = []
+    if runs_dir is not None and runs_dir.is_dir():
+        sources.append(("canonical_archive", runs_dir.glob("*/*.json")))
+    if state_dir is not None and state_dir.is_dir():
+        sources.append(
+            (
+                "worker_outboxes",
+                state_dir.glob("*/home/.cache/tauceti-review/*/store/*/outbox/records/runs/*/*.json"),
+            )
+        )
+    if not sources:
         return {
             "available": False,
             "data_dir": str(data_dir) if data_dir else None,
-            "note": "no TauCetiData records/runs archive found; pass --review-data-dir",
+            "state_dir": str(state_dir) if state_dir else None,
+            "note": "no TauCetiData records/runs archive or worker review outboxes found",
         }
 
     seen: set[str] = set()
@@ -982,10 +993,14 @@ def analyze_review_archive(data_dir: Path | None) -> dict:
     pr_rounds: defaultdict[int, int] = defaultdict(int)
     family_costs: defaultdict[str, list[float]] = defaultdict(list)
     family_tokens: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
+    model_costs: defaultdict[str, list[float]] = defaultdict(list)
+    source_records: defaultdict[str, int] = defaultdict(int)
     records = priced = estimated = repriced = skipped_shadow = skipped_duplicate = malformed = 0
     dates = []
-    for path in runs_dir.glob("*/*.json"):
+    paths = ((source, path) for source, source_paths in sources for path in source_paths)
+    for source, path in paths:
         records += 1
+        source_records[source] += 1
         try:
             row = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
@@ -1042,6 +1057,7 @@ def analyze_review_archive(data_dir: Path | None) -> dict:
             for name, value in (row.get("usage") or {}).items():
                 if isinstance(value, (int, float)):
                     family_tokens[family][name] += int(value)
+        model_costs[model or "<unknown>"].append(cost)
         started = str(row.get("started_at") or "")[:10]
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", started):
             dates.append(started)
@@ -1059,6 +1075,8 @@ def analyze_review_archive(data_dir: Path | None) -> dict:
     return {
         "available": True,
         "data_dir": str(data_dir),
+        "state_dir": str(state_dir) if state_dir else None,
+        "sources": dict(source_records),
         "records_seen": records,
         "production_runs_priced": priced,
         "estimated_cost_runs": estimated,
@@ -1073,9 +1091,17 @@ def analyze_review_archive(data_dir: Path | None) -> dict:
         "review_usd_per_pr": review_usd_per_pr,
         "extra_review_rounds_per_pr": extra_rounds_per_pr,
         "families": families,
+        "models": {
+            model: {
+                "rubric_runs": len(costs),
+                "api_equivalent_usd_per_rubric_run": distribution(costs),
+            }
+            for model, costs in sorted(model_costs.items())
+        },
         "note": (
-            "tokens and production-run membership are measured in TauCetiData; Claude costs are provider-reported "
-            "where available and estimated costs are recomputed from tokens at the displayed dated prices"
+            "production runs are merged from TauCetiData and worker-local outboxes by durable run key; Claude "
+            "costs are provider-reported where available and estimated costs are recomputed from tokens at the "
+            "displayed dated prices"
         ),
     }
 
@@ -1150,10 +1176,43 @@ def measured_ai_model(session_report: dict, review_report: dict, changed_loc_per
                 "components_usd_per_pr": components,
                 "note": "insufficient local samples for every phase",
             }
+
+    model_scenarios = {}
+    for model, review_group in review_report.get("models", {}).items():
+        provider = "claude" if model.startswith("claude-") else "codex"
+        model_groups = session_report["ai_sessions"].get("model_groups", {})
+        preparation_group = model_groups.get(f"{provider}/{model}/preparation", {})
+        revision_group = model_groups.get(f"{provider}/{model}/revision", {})
+        preparation_dist = preparation_group.get("api_equivalent_usd_per_session", {})
+        revision_dist = revision_group.get("api_equivalent_usd_per_session", {})
+        preparation_prs = preparation_group.get("priced_prs_observed") or 0
+        preparation = (
+            preparation_dist.get("mean") * preparation_dist.get("n") / preparation_prs
+            if preparation_dist.get("mean") is not None and preparation_prs
+            else None
+        )
+        review_run = (review_group.get("api_equivalent_usd_per_rubric_run") or {}).get("mean")
+        review = review_run * runs_per_pr if review_run is not None and runs_per_pr is not None else None
+        revision_session = revision_dist.get("mean")
+        revision = (
+            revision_session * revision_sessions_per_pr
+            if revision_session is not None and revision_sessions_per_pr is not None
+            else None
+        )
+        components = {"preparation": preparation, "reviews": review, "revisions": revision}
+        if all(value is not None for value in components.values()):
+            total = sum(components.values())
+            model_scenarios[model] = {
+                "usd_per_pr": total,
+                "usd_per_changed_loc": total / changed_loc_per_pr,
+                "components_usd_per_pr": components,
+                "review_rubric_runs": review_group.get("rubric_runs"),
+            }
     return {
         "changed_loc_per_pr": changed_loc_per_pr,
         "revision_sessions_per_reviewed_pr": revision_sessions_per_pr,
         "scenarios": scenarios,
+        "model_scenarios": model_scenarios,
         "method": (
             "preparation-attempt cost amortized over observed opened PRs + mean review lifecycle cost + "
             "mean revision-session cost times observed revision sessions per reviewed PR; divided by measured "

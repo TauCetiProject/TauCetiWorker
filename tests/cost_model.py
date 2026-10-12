@@ -296,6 +296,45 @@ with tempfile.TemporaryDirectory() as raw:
     assert reviews["review_usd_per_pr"]["mean"] == 12
     assert reviews["extra_review_rounds_per_pr"]["mean"] == 1
 
+    local_run_dir = (
+        root
+        / "state"
+        / "science"
+        / "home"
+        / ".cache"
+        / "tauceti-review"
+        / "account"
+        / "store"
+        / "TauCetiProject__TauCeti"
+        / "outbox"
+        / "records"
+        / "runs"
+        / "43"
+    )
+    local_run_dir.mkdir(parents=True)
+    # A durable-key duplicate of an archived run is excluded.
+    (local_run_dir / "duplicate.json").write_text((review_runs / "run-0.json").read_text())
+    (local_run_dir / "opus55.json").write_text(
+        json.dumps(
+            {
+                "arm": "production",
+                "dedupe_key": "local-opus55",
+                "pr": 43,
+                "round": 1,
+                "model": "claude-opus-5-5",
+                "provider": "claude",
+                "cost_usd": 4.0,
+                "started_at": "2026-10-12T00:00:00Z",
+                "usage": {"input_tokens": 100, "output_tokens": 10},
+            }
+        )
+    )
+    reviews_with_local = analyze_review_archive(review_data, root / "state")
+    assert reviews_with_local["production_runs_priced"] == 3
+    assert reviews_with_local["duplicates_excluded"] == 1
+    assert reviews_with_local["sources"] == {"canonical_archive": 2, "worker_outboxes": 2}
+    assert reviews_with_local["models"]["claude-opus-5-5"]["rubric_runs"] == 1
+
     synthetic_sessions = {
         "ai_sessions": {
             "preparation_prs_observed": 1,
@@ -314,6 +353,15 @@ with tempfile.TemporaryDirectory() as raw:
                     "api_equivalent_usd_per_session": {"n": 1, "mean": 2.0},
                 },
             },
+            "model_groups": {
+                "claude/claude-opus-5-5/preparation": {
+                    "priced_prs_observed": 1,
+                    "api_equivalent_usd_per_session": {"n": 2, "mean": 4.0},
+                },
+                "claude/claude-opus-5-5/revision": {
+                    "api_equivalent_usd_per_session": {"n": 1, "mean": 1.0},
+                },
+            },
         }
     }
     synthetic_reviews = {
@@ -321,6 +369,12 @@ with tempfile.TemporaryDirectory() as raw:
         "rubric_runs_per_pr": {"mean": 2.0},
         "review_usd_per_pr": {"mean": 3.0},
         "families": {"sol": {"api_equivalent_usd_per_rubric_run": {"mean": 1.0}}},
+        "models": {
+            "claude-opus-5-5": {
+                "rubric_runs": 10,
+                "api_equivalent_usd_per_rubric_run": {"mean": 0.5},
+            }
+        },
     }
     ai_model = measured_ai_model(synthetic_sessions, synthetic_reviews, 100)
     assert ai_model["scenarios"]["observed"]["components_usd_per_pr"] == {
@@ -329,6 +383,11 @@ with tempfile.TemporaryDirectory() as raw:
         "revisions": 2.0,
     }
     assert ai_model["scenarios"]["sol"]["usd_per_changed_loc"] == 0.14
+    assert ai_model["model_scenarios"]["claude-opus-5-5"]["components_usd_per_pr"] == {
+        "preparation": 8.0,
+        "reviews": 1.0,
+        "revisions": 1.0,
+    }
 
 assert not _mutates("exec_command", "printf '#check x' | lake env lean /dev/stdin 2>/dev/null")
 assert not _mutates("exec_command", "echo problem >&2")

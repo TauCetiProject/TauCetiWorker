@@ -908,7 +908,7 @@ def cmd_cost_model(args) -> int:
     pr_shares = tuple(value / sum(pr_weights) for value in pr_weights)
     main_shares = tuple(value / sum(main_weights) for value in main_weights)
     report = analyze_costs(args.logs_dir, args.state_dir, args.limit)
-    report["ai_reviews"] = analyze_review_archive(args.review_data_dir)
+    report["ai_reviews"] = analyze_review_archive(args.review_data_dir, args.state_dir)
     report["ai_cost_model"] = measured_ai_model(report, report["ai_reviews"], args.changed_loc_per_pr)
     report["infrastructure"] = infrastructure_model(
         pr_builds=args.ci_builds_per_pr,
