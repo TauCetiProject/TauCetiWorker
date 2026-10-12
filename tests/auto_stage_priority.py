@@ -28,7 +28,7 @@ checks = [
     check(
         "single shared auto order",
         tc.AUTO_STAGES,
-        ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review"),
+        ("rebase", "bump", "lint-repair", "progress", "fix-ci", "fix", "review", "overlap-fix", "overlap-scan"),
     ),
 ]
 if "TAUCETI_PROGRESS_GAP" not in os.environ:
@@ -201,6 +201,12 @@ checks.append(check("progress beats roadmap authoring", tc._next_auto_stage(quie
 # And when no report is due, the fallback is roadmap authoring as before.
 idle = tc.Survey(worker_id="test")
 checks.append(check("no report due falls back to roadmap", tc._next_auto_stage(idle), "roadmap"))
+idle.overlap_scan.actionable.append(tc.Candidate(0, "cursor", "behind pin"))
+checks.append(check("Mathlib scan beats new roadmap authoring", tc._next_auto_stage(idle), "overlap-scan"))
+idle.overlap_fix.actionable.append(tc.Candidate(0, "123", "overlap issue"))
+checks.append(check("overlap repair beats further scanning", tc._next_auto_stage(idle), "overlap-fix"))
+idle.reviewable.actionable.append(candidate)
+checks.append(check("existing PR review still beats overlap work", tc._next_auto_stage(idle), "review"))
 
 sv.red_ci.actionable.append(candidate)
 checks.append(check("red CI beats review findings", tc._next_auto_stage(sv), "fix-ci"))
