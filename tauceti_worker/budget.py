@@ -18,6 +18,15 @@ class BudgetError(ValueError):
     pass
 
 
+def admission_pause(snapshot):
+    """Preflight funding and ledger integrity; missing receipts are audit work."""
+    if snapshot.get("ledger_repair_required"):
+        return "ledger repair requires reconciliation"
+    if money(snapshot["available"]) <= 0 or money(snapshot["available"]) < money(snapshot["admission_threshold"]):
+        return "waiting for funding"
+    return None
+
+
 def money(value) -> Decimal:
     try:
         number = Decimal(str(value))
@@ -289,6 +298,7 @@ class Budget:
             available=str(available),
             active_sessions=active,
             unresolved=[s["id"] for s in active if s["status"] == "unresolved"],
+            ledger_repair_required=any(s.get("archive") for s in active),
             waiting=waiting,
             balance_zero_at=zero_at,
             admission_threshold=str(threshold),
@@ -318,6 +328,7 @@ class Budget:
                         session["status"] = "unresolved"
                         events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
             costs, estimate = self.estimate(state, model, phase)
+            live = [s for s in active if s["status"] == "active"]
             available = state["balance"] - sum((money(s["estimate"]) for s in active), Decimal(0))
             now = self.clock()
             queue = self.waiting_state(state)
@@ -337,13 +348,13 @@ class Budget:
                 default=None,
             )
             reason = None
-            if any(s["status"] == "unresolved" for s in active):
-                reason = "unresolved session cost; use budget --reconcile"
-            elif resume and any(s.get("resume") == resume for s in active):
+            if any(s.get("archive") for s in active):
+                reason = "ledger repair requires reconciliation"
+            elif resume and any(s.get("resume") == resume for s in live):
                 reason = "provider session already being resumed"
             elif state["cooldowns"].get(model, 0) > now:
                 reason = "API throughput cooldown"
-            elif not costs and any(s["model"] == model for s in active):
+            elif not costs and any(s["model"] == model for s in live):
                 reason = "waiting for calibration session cost"
             elif available <= 0 or available < estimate:
                 reason = "waiting for funding"

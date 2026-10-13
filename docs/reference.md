@@ -353,5 +353,8 @@ and `--log` shows accounting history. Corrections use
 
 Grants never interrupt active sessions. Completed costs may create a deficit,
 and estimated pending costs reduce the amount available for new admissions.
+A missing receipt stays unresolved with its existing estimate reserved for later
+reconciliation; it does not independently block funded workers or replacement
+calibration sessions.
 See [the complete budget design](api-budget-plan.md) for state paths, recovery,
 and estimated-cost semantics.

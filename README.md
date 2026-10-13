@@ -435,15 +435,17 @@ The append-only ledger lives at
 `~/.local/state/tauceti/budget/events.jsonl` on Linux), with a macOS equivalent
 and an explicit `TAUCETI_BUDGET_DIR` override. Grants, rate changes, balance
 adjustments, session admissions, and cost settlements remain auditable. Unknown
-costs block subsequent starts until reconciled; API throttling is handled
-separately from funding. Local accounting uses Claude's reported cost estimates
+costs remain visible for reconciliation and retain their pending estimates.
+Workers continue whenever available funds cover the next admission; API
+throttling is handled separately from funding. Local accounting uses Claude's reported cost estimates
 and does not represent the actual credit balance in Anthropic Console.
 
 Use `tauceti budget --json` for scripts. To recover a missing cost or correct a
 settlement, use `tauceti budget --reconcile INVOCATION --cost USD --note TEXT`;
 the correction is appended to history. A cold model runs one calibration
-session before parallel admissions use learned cost estimates. Unknown costs
-block new sessions until reconciled. No local budget amount is passed as
+session before parallel admissions use learned cost estimates. If that session
+loses its receipt, another calibration session can run; missing costs never
+pause the fleet merely because reconciliation is outstanding. No local budget amount is passed as
 Claude's `--max-budget-usd`. After a crashed worker, first try
 `tauceti budget --recover --note "worker crash"` to recover its durable receipts
 and remove stale staged keys. Costs without a receipt still require reconciliation.

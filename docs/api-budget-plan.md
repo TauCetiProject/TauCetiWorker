@@ -145,8 +145,9 @@ so workers cannot all launch against the same uncommitted funds.
 Estimates are scheduling hints, not allowances enforced against a running agent.
 Learn them from completed sessions by model and phase, using a conservative
 recent percentile. With no usable recorded settlements, admit one calibration session for a model when the
-balance is positive; other sessions for that model wait for its first cost
-result. Thereafter, multiple workers can run whenever the balance covers their
+balance is positive; other sessions for that model wait while its calibration
+session is active. If that session loses its receipt, admit a replacement instead
+of waiting for reconciliation. Thereafter, multiple workers can run whenever the balance covers their
 estimates. This avoids introducing a user-facing per-session cap.
 
 On completion, replace the pending estimate with the reported cost in one
@@ -204,8 +205,11 @@ not be summed. Session resets require accounting for each segment separately.
 
 Claude's cost figures are local estimates, not authoritative Console charges.
 Missing or crash-zeroed results do not establish zero spending. Preserve the
-receipt and mark the invocation unresolved; block further admissions until the
-cost is recovered or an operator records a correction with an explanation.
+receipt and mark the invocation unresolved. Retain its existing pending estimate
+until the cost is recovered or an operator records a correction with an
+explanation. Unresolved costs are audit work, not a fleet-wide admission pause;
+funded workers continue, and orphaned sessions do not occupy calibration or
+resumption slots.
 `budget --recover --note TEXT` reads durable receipts from stopped bridges and
 removes their staged keys. It skips live bridges. `--reconcile` refuses a
 running session with a live heartbeat. A native process that could not be
@@ -213,7 +217,9 @@ started settles at zero; a process that ran without a reliable result remains
 unresolved.
 Do not release a pending estimate merely because its process disappeared or a
 timer expired. If logging fails during an active session, let it finish, retain
-its cost receipt, and block subsequent admissions pending reconciliation.
+its cost receipt, and keep the original reservation pending reconciliation.
+Other workers continue against the available balance. Corrupt ledger bytes and
+an unaudited ledger-repair marker remain separate integrity blockers.
 See Anthropic's [cost tracking documentation](https://code.claude.com/docs/en/agent-sdk/cost-tracking).
 
 `tauceti-review` is a separate launch path. Its host and Bubble
@@ -290,5 +296,8 @@ There must be no budget-triggered termination or Claude budget-cap argument.
 Verify API credentials and cost receipts across host, Bubble, `_round`, manager,
 reviewer, and external runner paths, including secrets redaction and cleanup.
 Verify cumulative/subagent costs are counted once, failures can incur spending,
-and missing costs require reconciliation. Exercise provider cooldowns separately
+and missing costs remain visible for reconciliation without pausing funded
+workers. Verify orphaned calibration sessions can be replaced, unresolved
+estimates remain reserved, and ledger-repair markers still require audit.
+Exercise provider cooldowns separately
 from funding waits. Retain existing subscription behavior and its checks.

@@ -14,7 +14,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from .budget import Budget, BudgetError, budget_dir, money
+from .budget import Budget, BudgetError, admission_pause, budget_dir
 from .claude_api_client import api_environment, atomic, authenticate
 from .runtime_status import report_runtime
 
@@ -133,13 +133,9 @@ class ClaudeAPIContext:
         global CURRENT_CONTEXT
         if self.enabled:
             snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
-            if (
-                snapshot["unresolved"]
-                or money(snapshot["available"]) <= 0
-                or money(snapshot["available"]) < money(snapshot["admission_threshold"])
-            ):
-                reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
-                if not snapshot["unresolved"] and self.model:
+            reason = admission_pause(snapshot)
+            if reason:
+                if reason == "waiting for funding" and self.model:
                     self.budget.wait_for_funding(self.worker, self.model, self.phase)
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
                 raise BudgetError(reason)
