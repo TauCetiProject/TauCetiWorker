@@ -35,7 +35,7 @@ from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
-from .runtime_status import STATUS_ENV, read_json, update_status
+from .runtime_status import STATUS_ENV, StatusPublisher, read_json, update_status
 
 CONFIG_VERSION = 1
 DEFAULT_INTERVAL = 2.0
@@ -724,9 +724,9 @@ def cmd_managed_runner(args) -> int:
         parent_pipe_write: int | None = None
         started = time.time()
         prior = read_json(state)
+        publisher = StatusPublisher(state)
         restart_count = int(prior.get("restart_count", 0)) + 1 if prior.get("spec_hash") == spec.fingerprint() else 0
         log_dir = state_dir / "logs" / spec.id
-        log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"work-{time.strftime('%Y%m%d-%H%M%S')}.log"
 
         def stop(_signum=None, _frame=None) -> None:
@@ -746,9 +746,12 @@ def cmd_managed_runner(args) -> int:
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
             env["TAUCETI_LOG_FILE"] = os.devnull
-            logf = log_path.open("ab", buffering=0)
-            update_status(
-                state,
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                logf = log_path.open("ab", buffering=0)
+            except OSError:
+                logf = sys.stderr  # Retain console/journal output if file logging fails.
+            publisher.update(
                 id=spec.id,
                 state="starting",
                 alive=True,
@@ -765,7 +768,7 @@ def cmd_managed_runner(args) -> int:
                 github_account=spec.github_account,
                 only=list(spec.only),
                 sandbox=spec.sandbox,
-                log_file=str(log_path),
+                log_file=str(log_path) if logf is not sys.stderr else None,
                 started_at=started,
                 heartbeat_at=time.time(),
                 activity_at=started,
@@ -791,13 +794,13 @@ def cmd_managed_runner(args) -> int:
             )
             os.close(parent_pipe_read)
             parent_pipe_read = None
-            update_status(state, child_pid=child.pid, process_group=child.pid)
+            publisher.update(child_pid=child.pid, process_group=child.pid)
 
             def request(req: dict) -> dict:
                 nonlocal stopping
                 action = req.get("action")
                 if action == "status":
-                    return read_json(state)
+                    return publisher.snapshot()
                 if action == "stop":
                     stopping = True
                     return {"ok": True}
@@ -809,10 +812,10 @@ def cmd_managed_runner(args) -> int:
                 if ready:
                     _serve_one(server, request)
                 if time.monotonic() - last_heartbeat >= 2:
-                    update_status(state, alive=True, heartbeat_at=time.time(), child_pid=child.pid)
+                    publisher.update(alive=True, heartbeat_at=time.time(), child_pid=child.pid)
                     last_heartbeat = time.monotonic()
             if stopping and child.poll() is None:
-                update_status(state, state="stopping", activity_at=time.time())
+                publisher.update(state="stopping", activity_at=time.time())
                 signal_group(child.pid, signal.SIGTERM)
                 deadline = time.monotonic() + 20
                 while child.poll() is None and time.monotonic() < deadline:
@@ -824,8 +827,8 @@ def cmd_managed_runner(args) -> int:
                     child.wait()
             rc = child.wait()
             final = "stopped" if stopping else ("exited" if rc == 0 else "failed")
-            update_status(
-                state,
+            publisher.update(
+                timeout=1,
                 state=final,
                 alive=False,
                 heartbeat_at=time.time(),
@@ -927,6 +930,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
         stop_workers = False
         restart_ids: set[str] = set()
         children: dict[str, subprocess.Popen] = {}
+        child_generations: dict[str, str] = {}
+        exit_outcomes: dict[str, tuple[str, int]] = {}
         launch_failures: dict[str, tuple[str, int, float]] = {}
         last_good: list[WorkerSpec] | None = None
         last_error: str | None = None
@@ -983,13 +988,15 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 for wid, process in list(children.items()):
                     if process.poll() is not None:
                         children.pop(wid, None)
+                        generation = child_generations.pop(wid)
+                        exit_outcomes[wid] = (generation, process.returncode)
                         status = read_json(status_path(wid, state_dir))
                         terminal = (
                             status.get("wrapper_pid") == process.pid
                             and not status.get("alive")
                             and status.get("stopped_at") is not None
                         )
-                        if not terminal:
+                        if not terminal and process.returncode != 0:
                             spec = wanted.get(wid)
                             fingerprint = spec.fingerprint() if spec else "removed"
                             previous = launch_failures.get(wid)
@@ -1013,7 +1020,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     should_run = bool(spec and spec.enabled)
                     changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
                     if changed and should_run and wid not in restart_ids and _defer_read_policy_reload(spec, live):
-                        update_status(status_path(wid, state_dir), pending_read_policy=spec.fingerprint())
+                        StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=spec.fingerprint())
                         continue
                     if (
                         is_live
@@ -1021,7 +1028,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         and int(live.get("restart_count", 0))
                         and time.time() - float(live.get("started_at") or time.time()) >= 300
                     ):
-                        update_status(status_path(wid, state_dir), restart_count=0)
+                        StatusPublisher(status_path(wid, state_dir)).update(restart_count=0)
                         launch_failures.pop(wid, None)
                     if is_live and (not should_run or changed or wid in restart_ids):
                         _stop_runner(wid, runtime_dir)
@@ -1039,6 +1046,10 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         continue
                     prior = read_json(status_path(wid, state_dir))
                     forced = wid in restart_ids
+                    outcome = exit_outcomes.get(wid)
+                    if not forced and outcome and outcome[0] == spec.fingerprint():
+                        if spec.restart == "never" or spec.restart == "on-failure" and outcome[1] == 0:
+                            continue  # Parent-observed exits remain authoritative if reporting fails.
                     if (
                         not forced
                         and spec.restart == "never"
@@ -1067,6 +1078,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     if not forced and max(float(prior.get("stopped_at") or 0) + delay, manager_retry_at) > time.time():
                         continue
                     children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    child_generations[wid] = spec.fingerprint()
+                    exit_outcomes.pop(wid, None)
                     restart_ids.discard(wid)
                 ready, _, _ = select.select([server], [], [], max(0.1, interval))
                 if ready:

@@ -377,6 +377,21 @@ which also catches short-lived children between samples. Neither is proportional
 set size (PSS). Container workloads in Bubble are outside these host measurements.
 Historical tree peaks before recording started cannot be reconstructed.
 
+Reporting does not control whether useful work may continue. Status lock waits
+are bounded and unsent fields retry on a later update; a failed status write leaves the supervisor's identity available
+over its control socket and retries the pending fields on a later heartbeat.
+Unavailable log files fall back to console output. Optional GitHub identity caches,
+CLI instrumentation and endpoint metrics may also fail without rejecting an
+authenticated request. A temporary CLI launcher preserves quota handling when
+the normal launcher directory is unavailable, without moving retained publications.
+Under these failures, retained metrics can be incomplete and worker status marks
+degraded instrumentation.
+
+A final cost-receipt write failure preserves the native agent's exit status and
+result. The accounting bridge still attempts settlement, while missing receipts
+retain their spending reservations until recovery. Actual funding admission and
+provider quota handling continue to apply independently of reporting.
+
 ## tmux is a viewer, not the supervisor
 
 `tauceti workers tmux` opens one dashboard window plus one log-following window
