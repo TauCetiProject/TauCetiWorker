@@ -59,6 +59,7 @@ from .constants import (
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
     PR_TASKS,
+    PROGRESS_ERROR_KEY,
     PROGRESS_REF,
     PROGRESS_TOOL_LINE,
     PROGRESS_TOOL_TAIL,
@@ -1440,7 +1441,7 @@ def _do_progress_inner(w, opts) -> int | None:
         bust_progress_cache(w.cfg)
         return None
     if proc.returncode != 0:
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "plan", proc))
     plan = json.loads(plan_file.read_text())
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
@@ -1452,7 +1453,7 @@ def _do_progress_inner(w, opts) -> int | None:
         ).returncode
         != 0
     ):
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die("tauceti-progress facts failed")
 
     # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
@@ -1463,7 +1464,7 @@ def _do_progress_inner(w, opts) -> int | None:
     # one versioned thing. No new failure mode: `plan` and `facts` above already ran from that build.
     proc = run_tool("prompt", "progress", capture=True)
     if proc.returncode != 0 or not proc.stdout.strip():
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "prompt", proc))
     prompt_file.write_text(proc.stdout, encoding="utf-8")
     prompt = fill_prompt(
@@ -1484,11 +1485,11 @@ def _do_progress_inner(w, opts) -> int | None:
             from .claude_api import admission_failure
 
             raise admission_failure(reason)
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(f"the writing agent exited {rc}")
     for f in (status_body, section_body):
         if not f.is_file() or not f.read_text().strip():
-            w.counters.incr("progress-err")
+            w.counters.incr(PROGRESS_ERROR_KEY)
             raise Die(f"the agent did not write {f.name}")
 
     # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
@@ -1511,7 +1512,7 @@ def _do_progress_inner(w, opts) -> int | None:
     # A failure logs its own tail and saves the whole output, so it must be handled BEFORE the
     # excerpt below — otherwise the same text lands in the log twice, once uselessly clipped.
     if proc.returncode not in (0, EX_NOPROGRESS):
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "apply", proc))
     log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
     if proc.returncode == EX_NOPROGRESS:
@@ -1521,7 +1522,7 @@ def _do_progress_inner(w, opts) -> int | None:
     # A report landed (as a PR). Clear the error streak, and drop the cached "due" verdict immediately:
     # otherwise this same worker would still read `due` from cache on its next round, minutes from now,
     # and open a second report before the first one merged.
-    w.counters.write("progress-err", 0)
+    w.counters.write(PROGRESS_ERROR_KEY, 0)
     bust_progress_cache(w.cfg)
     return 0
 

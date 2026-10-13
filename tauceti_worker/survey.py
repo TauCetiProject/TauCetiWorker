@@ -38,6 +38,7 @@ from .constants import (
     MAX_REVIEW_ERRORS,
     PROGRESS,
     PROGRESS_ATTEMPT_GAP,
+    PROGRESS_ERROR_KEY,
     PROGRESS_REF,
     PROGRESS_TTL,
     REVIEW_AFFINITY_GRACE_S,
@@ -617,10 +618,10 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     if last_attempt and (time.time() - last_attempt) < PROGRESS_ATTEMPT_GAP:
         gap_h = (time.time() - last_attempt) / 3600.0
         return False, f"a progress round was attempted {gap_h:.1f}h ago; waiting out the attempt gap"
-    if counters.read("progress-err") >= MAX_PROGRESS_ERRORS:
+    if counters.read(PROGRESS_ERROR_KEY) >= MAX_PROGRESS_ERRORS:
         return False, (
-            f"progress rounds have failed {counters.read('progress-err')}x; "
-            f"backing off (clear state/progress-err to retry)"
+            f"progress rounds have failed {counters.read(PROGRESS_ERROR_KEY)}x; "
+            f"backing off (clear state/{PROGRESS_ERROR_KEY} to retry)"
         )
 
     try:
