@@ -216,6 +216,11 @@ class Authority(unittest.TestCase):
                 self.assertEqual(credentials["tokens"]["refresh_token"], sa.CODEX_RT_PLACEHOLDER)
                 self.assertNotIn("real-refresh-secret", json.dumps(credentials))
                 self.assertIn("--output-schema", argv)
+                catalog = json.loads((kwargs["cwd"] / "model-catalog.json").read_text())["models"][0]
+                self.assertIsNone(catalog["apply_patch_tool_type"])
+                self.assertEqual(catalog["shell_type"], "disabled")
+                self.assertEqual(catalog["experimental_supported_tools"], [])
+                self.assertTrue(any(a.startswith("model_catalog_json=") for a in argv))
                 events = [
                     {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(verdict)}},
                     {"type": "turn.completed"},
