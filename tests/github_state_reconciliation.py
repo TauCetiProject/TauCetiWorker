@@ -40,6 +40,13 @@ rest_job = {
 }
 webhook_job = {**rest_job, "run_attempt": 2, "head_branch": "staging"}
 assert shadow.fingerprints("workflow_jobs", [rest_job]) == shadow.fingerprints("workflow_jobs", [webhook_job])
+status = {"context": "build", "state": "SUCCESS", "startedAt": "2026-10-13T00:36:03+00:00"}
+assert shadow.fingerprints("statuses", [status]) == shadow.fingerprints(
+    "statuses", [{**status, "startedAt": "2026-10-13T00:36:03Z"}]
+)
+assert shadow.fingerprints("statuses", [status]) != shadow.fingerprints(
+    "statuses", [{**status, "startedAt": "2026-10-13T00:36:04Z"}]
+)
 assert shadow.fingerprints("workflow_jobs", [{**rest_job, "conclusion": "failure"}]) != shadow.fingerprints(
     "workflow_jobs", [webhook_job]
 )

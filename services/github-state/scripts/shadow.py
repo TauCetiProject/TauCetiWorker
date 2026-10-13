@@ -63,7 +63,15 @@ def canonical(operation, row):
     if operation == "reactions":
         return {"id": str(row.get("id")), "content": row.get("content")}
     if operation == "statuses":
-        return {k: row.get(k) for k in ("context", "state", "startedAt")}
+        result = {k: row.get(k) for k in ("context", "state", "startedAt")}
+        if isinstance(result["startedAt"], str):
+            try:
+                stamp = datetime.datetime.fromisoformat(result["startedAt"].replace("Z", "+00:00"))
+                if stamp.tzinfo is not None:
+                    result["startedAt"] = stamp.astimezone(datetime.UTC).isoformat(timespec="microseconds")
+            except ValueError:
+                pass
+        return result
     if operation in ("checks", "workflow_runs", "workflow_jobs"):
         fields = ("id", "name", "status", "conclusion", "head_sha")
         if operation == "workflow_runs":
