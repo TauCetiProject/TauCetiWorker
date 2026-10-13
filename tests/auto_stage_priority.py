@@ -150,7 +150,7 @@ with tempfile.TemporaryDirectory() as tmp:
         tc.work_units.prepare_checkout = saved_prepare_checkout
         tc.work_units.subprocess.run = saved_run
     checks.append(check("a failed attempt consumes the cached due verdict", due_cache.exists(), False))
-    checks.append(check("a failed plan still charges the error breaker", counters.read("progress-err"), 1))
+    checks.append(check("a failed plan still charges the error breaker", counters.read(tc.PROGRESS_ERROR_KEY), 1))
     due, reason = tc.progress_due(progress_worker.cfg, counters)
     checks.append(
         check(
@@ -159,6 +159,34 @@ with tempfile.TemporaryDirectory() as tmp:
             True,
         )
     )
+
+# Upgrading the progress tool must recover workers latched by the previous release, while
+# repeated failures of the current release still trip the breaker without another tool call.
+with tempfile.TemporaryDirectory() as tmp:
+    state = Path(tmp)
+    cfg = SimpleNamespace(state=state)
+    counters = tc.Counters(cfg)
+    counters.write("progress-err", tc.MAX_PROGRESS_ERRORS)  # legacy unversioned state
+    counters.write("progress-err-old-release", tc.MAX_PROGRESS_ERRORS)
+    calls = []
+
+    def due_tool(argv, *_a, **_k):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="due", stderr="")
+
+    tc.work_units.subprocess.run = due_tool
+    try:
+        due, reason = tc.progress_due(cfg, counters)
+        checks.append(check("old progress failures do not suppress an upgraded tool", due, True))
+        for _ in range(tc.MAX_PROGRESS_ERRORS):
+            counters.incr(tc.PROGRESS_ERROR_KEY)
+        tc.bust_progress_cache(cfg)
+        due, reason = tc.progress_due(cfg, counters)
+        checks.append(check("current progress failures still trip the breaker", due, False))
+        checks.append(check("the breaker names the current counter file", tc.PROGRESS_ERROR_KEY in reason, True))
+        checks.append(check("a latched current release does not launch the tool", len(calls), 1))
+    finally:
+        tc.work_units.subprocess.run = saved_run
 
 # If no requested phase can run, a focused progress worker must retain the survey's suppression reason
 # for its manager/status output instead of collapsing it into the generic no-eligible-work fallback.

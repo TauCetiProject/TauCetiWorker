@@ -47,7 +47,10 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "b7d96c7a41cbfe11c1380cb7de70fff48298e9dc")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "13a0727aa7b7200f766c5c95ea5033afebe4a955")
+# A repaired tool gets a fresh error budget. Failures of an older pinned release must not
+# permanently suppress progress after an upgrade; the attempt gap still limits retries.
+PROGRESS_ERROR_KEY = f"progress-err-{PROGRESS_REF}"
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
