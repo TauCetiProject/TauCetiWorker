@@ -356,7 +356,9 @@ and estimated pending costs reduce the amount available for new admissions.
 A missing receipt stays unresolved with its existing estimate reserved for later
 reconciliation; it does not independently block funded workers or replacement
 calibration sessions. Cold-model reservations use at least $1 or the largest
-of the last 20 recorded costs. A missing cumulative receipt pauses only explicit
-resumption of that same provider session until its accounting baseline is known.
+of the last 20 recorded costs across all models. An unsettled resumed invocation
+pauses only explicit resumption of that same provider session. Recover its
+cumulative receipt before resuming; cost-only reconciliation does not restore
+its cumulative accounting baseline.
 See [the complete budget design](api-budget-plan.md) for state paths, recovery,
 and estimated-cost semantics.

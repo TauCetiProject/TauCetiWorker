@@ -212,8 +212,11 @@ receipt and mark the invocation unresolved. Retain its existing pending estimate
 until the cost is recovered or an operator records a correction with an
 explanation. Unresolved costs are audit work, not a fleet-wide admission pause;
 funded workers continue, and orphaned sessions do not occupy calibration slots.
-An unresolved resumed invocation holds only that provider session’s resumption
-slot until its cumulative receipt is recovered, preventing double-counting.
+An unsettled resumed invocation holds only that provider session's resumption
+slot. Recovering its cumulative receipt prevents double-counting on subsequent
+resumes. A cost-only manual reconciliation releases the hold without restoring
+the cumulative baseline, so it is insufficient to resume that provider session
+with accurate accounting.
 On Linux, recorded bridge process identities include boot and process start
 markers. A live owner prevents orphan detection, receipt recovery or active
 reconciliation based solely on a delayed heartbeat.

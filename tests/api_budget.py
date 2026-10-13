@@ -209,6 +209,25 @@ class BudgetTests(unittest.TestCase):
             self.assertTrue(self.budget.admit(f"next-{i}", "next", f"model-{i}", "fix")["allowed"])
             self.assertIn(f"lost-{i}", self.budget.snapshot()["unresolved"])
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
+    def test_receipt_recovery_does_not_remove_key_for_live_owner(self):
+        self.budget.configure(grant=100)
+        bridge = self.directory / "live-bridge"
+        bridge.mkdir()
+        key = bridge / "key"
+        key.write_text("fake-key")
+        invocation = "a" * 32
+        self.budget.admit(invocation, "worker", "opus", "fix", bridge=str(bridge), owner=process_identity())
+        self.budget.settle(invocation, None, "missing result while bridge still alive")
+        inbox = bridge / "inbox"
+        inbox.mkdir()
+        (inbox / (invocation + ".receipt")).write_text(
+            json.dumps({"id": invocation, "totals": {"provider": "5"}, "outcome": "completed"})
+        )
+        self.assertEqual(self.budget.recover("recover pending receipt without a fresh heartbeat")["unresolved"], [])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 5)
+        self.assertTrue(key.exists())
+
     def test_resumption_baseline_and_fair_waiting(self):
         self.budget.configure(grant=30)
         self.assertTrue(self.budget.admit("seed", "seed", "opus", "fix")["allowed"])
@@ -545,7 +564,8 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.envir
         self.assertEqual(len(self.budget.snapshot()["unresolved"]), 1)
         os.utime(context.outbox / "heartbeat", (1, 1))
         (context.directory / "key").write_text("left by crash")
-        snapshot = self.budget.recover("recover durable receipt after worker crash")
+        with patch("tauceti_worker.budget.bridge_owner_alive", return_value=False):
+            snapshot = self.budget.recover("recover durable receipt after worker crash")
         self.assertEqual(snapshot["unresolved"], [])
         self.assertEqual(Decimal(snapshot["spent"]), 12)
         self.assertFalse((context.directory / "key").exists())

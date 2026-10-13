@@ -573,7 +573,8 @@ class Budget:
             except Exception as error:
                 errors.append(f"{invocation}: {error}")
                 self.settle(invocation, None, "invalid recovered receipt", note=note)
-            (bridge / "key").unlink(missing_ok=True)
+            if not bridge_owner_alive(session.get("owner")):
+                (bridge / "key").unlink(missing_ok=True)
         return dict(self.snapshot(), recovery_errors=errors)
 
     def cooldown(self, model, seconds):
