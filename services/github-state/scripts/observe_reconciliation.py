@@ -108,6 +108,7 @@ def main():
             sample["health"] = health(args.environment)
         except Exception as error:
             sample["error_type"] = type(error).__name__
+            sample["http_status"] = getattr(error, "code", None)
         current = sample.get("health", {})
         ready = all(
             current.get(role, {}).get("reconciliation_version") == 2
