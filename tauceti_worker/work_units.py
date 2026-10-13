@@ -107,6 +107,8 @@ from .survey import (
 
 def want(only: list[str], task: str) -> bool:
     """Is this work-unit stage enabled? Empty `only` ⇒ everything (do-whatever-is-helpful)."""
+    if task == "security-audit":
+        return task in only
     return (not only) or (task in only)
 
 
@@ -311,6 +313,10 @@ def focus_prs(sv: Survey, opts) -> None:
 
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
+    if "security-audit" in opts.only:
+        from .security_audit import run
+
+        return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
     # before any work runs. The quota pacer does this too, and every paced path now reaches it — but the
     # unpaced ones (kiro, the OpenRouter providers, --dry-run's early return) do not, and host-mode

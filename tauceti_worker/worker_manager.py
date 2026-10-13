@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from .config import positive_integer
-from .constants import AGENTS, ALLOWED_TASKS, MAX_OPEN_PRS
+from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
@@ -294,7 +294,7 @@ class WorkerSpec:
         if agent not in AGENTS:
             raise WorkersError(f"workers[{index}].agent must be one of: {', '.join(AGENTS)}")
         only = _strings(raw.get("only", []), f"workers[{index}].only")
-        bad_tasks = [task for task in only if task not in ALLOWED_TASKS]
+        bad_tasks = [task for task in only if task not in (*ALLOWED_TASKS, *EXPLICIT_TASKS)]
         if bad_tasks:
             raise WorkersError(f"workers[{index}].only has unknown task(s): {', '.join(bad_tasks)}")
         sandbox = _string(raw.get("sandbox", "host"), f"workers[{index}].sandbox")
