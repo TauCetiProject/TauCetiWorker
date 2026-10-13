@@ -155,7 +155,15 @@ class Budget:
                         key = session["model"] + ":" + session["phase"]
                         state["samples"].setdefault(key, []).append(cost)
                     elif kind == "unresolved":
-                        state["sessions"][event["id"]]["status"] = "unresolved"
+                        session = state["sessions"][event["id"]]
+                        session["status"] = "provisional" if event.get("provisional") else "unresolved"
+                        if event.get("provisional"):
+                            session.update(
+                                reserve=event["reserve"],
+                                lower_bound_cost=event["lower_bound_cost"],
+                                lower_bound_totals=event["lower_bound_totals"],
+                                outcome=event["outcome"],
+                            )
                     elif kind == "cooldown":
                         state["cooldowns"][event["model"]] = event["until"]
                     else:
@@ -284,13 +292,19 @@ class Budget:
             )
             self.save_waiting(queue)
 
-    def estimate(self, state, model, phase=None):
+    def estimate(self, state, model, phase=None, *, include_provisional=True):
         costs = [c for c in state["samples"].get(model + ":" + phase, []) if c > 0] if phase else []
         costs = costs or [
             money(s["cost"])
             for s in state["sessions"].values()
             if s["model"] == model and s["status"] == "settled" and money(s["cost"]) > 0
         ]
+        if not costs and include_provisional:
+            costs = [
+                money(s["reserve"])
+                for s in state["sessions"].values()
+                if s["model"] == model and s["status"] == "provisional" and money(s["reserve"]) > 0
+            ]
         costs = sorted(costs[-20:])
         if costs:
             return costs, costs[math.ceil(len(costs) * 0.75) - 1]
@@ -303,7 +317,7 @@ class Budget:
             self.accrue(state)
             state["waiting"] = self.waiting_state(state)
         active = [s for s in state["sessions"].values() if s["status"] != "settled"]
-        pending = sum((money(s["estimate"]) for s in active), Decimal(0))
+        pending = sum((money(s.get("reserve", s["estimate"])) for s in active), Decimal(0))
         now = self.clock()
         available = state["balance"] - pending
         waiting = [item for item in state["waiting"].values() if now - item["seen"] < 120]
@@ -333,6 +347,10 @@ class Budget:
             active_sessions=active,
             unresolved=[s["id"] for s in active if s["status"] == "unresolved"],
             ledger_repair_required=any(s.get("archive") for s in active),
+            provisional=[s["id"] for s in active if s["status"] == "provisional"],
+            provisional_lower_bound_usd=str(
+                sum((money(s["lower_bound_cost"]) for s in active if s["status"] == "provisional"), Decimal(0))
+            ),
             waiting=waiting,
             balance_zero_at=zero_at,
             admission_threshold=str(threshold),
@@ -363,7 +381,7 @@ class Budget:
                         events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
             costs, estimate = self.estimate(state, model, phase)
             live = [s for s in active if s["status"] == "active"]
-            available = state["balance"] - sum((money(s["estimate"]) for s in active), Decimal(0))
+            available = state["balance"] - sum((money(s.get("reserve", s["estimate"])) for s in active), Decimal(0))
             now = self.clock()
             queue = self.waiting_state(state)
             previous = queue.get(worker, {})
@@ -468,7 +486,7 @@ class Budget:
             session = state["sessions"].get(invocation)
             if not session:
                 raise BudgetError("unknown invocation")
-            if session["status"] == "active" and session.get("bridge"):
+            if session["status"] != "settled" and session.get("bridge"):
                 try:
                     live = self.clock() - (Path(session["bridge"]) / "outbox/heartbeat").stat().st_mtime <= 30
                 except FileNotFoundError:
@@ -506,6 +524,17 @@ class Budget:
         if "totals" not in receipt:
             raise BudgetError("receipt is missing cost totals")
         totals = receipt["totals"]
+        provisional = receipt.get("provisional") or "process has not exited" in receipt["outcome"]
+        lower = receipt.get("lower_bound_totals", totals if provisional else None)
+        if lower:
+            if not isinstance(lower, dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) or money(v) < 0 for k, v in lower.items()
+            ):
+                raise BudgetError("invalid provisional cost evidence")
+        if provisional:
+            # A native result is lower-bound evidence until process termination:
+            # a further request may have begun before its next stream event.
+            totals = None
         if totals is not None:
             if (
                 not isinstance(totals, dict)
@@ -529,6 +558,37 @@ class Budget:
                     continue
                 for provider_id, value in prior.get("totals", {}).items():
                     baseline[provider_id] = max(baseline.get(provider_id, Decimal(0)), money(value))
+            if provisional and totals is None and lower:
+                differences = [money(v) - baseline.get(k, Decimal(0)) for k, v in lower.items()]
+                if all(v >= 0 for v in differences):
+                    known = sum(differences, Decimal(0))
+                    # Admission uses estimates, not a per-invocation hard cap.
+                    # Keep the known lower bound plus a full additional estimate
+                    # reserved; uncertainty is visible without freezing peers.
+                    tail = max(
+                        money(session["estimate"]),
+                        self.estimate(state, session["model"], session["phase"], include_provisional=False)[1],
+                        known,
+                    )
+                    reserve = max(money(session.get("reserve", "0")), known + tail)
+                    if (
+                        session["status"] == "provisional"
+                        and session.get("lower_bound_totals") == lower
+                        and money(session["reserve"]) == reserve
+                    ):
+                        return
+                    event = dict(
+                        type="unresolved",
+                        id=receipt["id"],
+                        provisional=True,
+                        reserve=str(reserve),
+                        lower_bound_cost=str(known),
+                        lower_bound_totals=lower,
+                        outcome=receipt["outcome"],
+                        note=note,
+                    )
+                    self.append(state, [self.accrue(state), event])
+                    return
             if totals is not None:
                 differences = [money(v) - baseline.get(k, Decimal(0)) for k, v in totals.items()]
                 if all(v >= 0 for v in differences):

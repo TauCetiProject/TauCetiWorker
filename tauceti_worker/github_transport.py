@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 _fresh = contextvars.ContextVar("github_fresh", default=False)
+_direct = contextvars.ContextVar("github_direct", default=False)
 _revision = contextvars.ContextVar("github_revision", default="")
 _cache_hit = contextvars.ContextVar("github_cache_hit", default=False)
 _request_context = contextvars.ContextVar("github_request_context", default=None)
@@ -68,16 +69,22 @@ def register_principal(user_id: int, login: str, env=None):
 
 
 @contextlib.contextmanager
-def read_context(*, fresh: bool = False, revision: str = ""):
+def read_context(*, fresh: bool = False, revision: str = "", direct: bool = False):
     a = _fresh.set(_fresh.get() or fresh)
     b = _revision.set(revision or _revision.get())
     c = _cache_hit.set(False)
+    d = _direct.set(_direct.get() or direct)
     try:
         yield
     finally:
         _fresh.reset(a)
         _revision.reset(b)
         _cache_hit.reset(c)
+        _direct.reset(d)
+
+
+def direct_reads():
+    return _direct.get()
 
 
 def cache_hit():
@@ -252,19 +259,23 @@ def record_block(resource, reset, identity=None):
         pass
 
 
-def blocked_since(start):
+def blocking_event_since(start):
     identity = quota_scope(scope())
     if not identity:
-        return False
+        return None
     worker = hashlib.sha256(os.environ.get("TAUCETI_WORKER_ID", "unknown").encode()).hexdigest()
     try:
         r = json.loads((root() / "blocked" / identity / (worker + ".json")).read_text())
         # A failed stage can finish after the reset (engine cleanup, bounded waits, or
         # publishing). The request still failed due to quota; expiry must not turn that
         # infrastructure pause into a charged PR failure. Admission uses observed_budget.
-        return r["time"] >= start
+        return r if r["time"] >= start else None
     except (OSError, ValueError, KeyError, TypeError):
-        return False
+        return None
+
+
+def blocked_since(start):
+    return blocking_event_since(start) is not None
 
 
 def observed_budget(env=None):
@@ -308,7 +319,39 @@ def cooldown(env=None, *, until=None):
 def parse_trace(stderr: str, *, identity=None, records=None) -> str:
     """Consume gh's private debug blocks; retain ordinary error text for existing retry logic."""
     clean, record, active = [], None, False
+    body = ""
+
+    def inspect_body(payload):
+        if not isinstance(payload, dict):
+            return
+        if isinstance(payload.get("query"), str):
+            record["graphql_operation"] = (
+                "read" if proxy_readonly(["api", "graphql", "-f", "query=" + payload["query"]]) else "mutation"
+            )
+        data = payload.get("data") or {}
+        limit = data.get("rateLimit") or {} if isinstance(data, dict) else {}
+        charge = limit.get("cost") if isinstance(limit, dict) else None
+        if isinstance(charge, int):
+            record["graphql_cost"] = charge
+
     for line in stderr.splitlines(keepends=True):
+        # gh pretty-prints both request and response JSON. Keep these bodies
+        # private, bounded, and in memory; export only allow-listed metadata.
+        if (
+            active
+            and record.get("endpoint") == "/graphql"
+            and (body or line.lstrip().startswith("{"))
+            and not line.startswith(("* ", "< ", "> "))
+        ):
+            body += line
+            try:
+                inspect_body(json.loads(body))
+                body = ""
+            except ValueError:
+                if len(body) > 2_000_000:
+                    body = ""
+            continue
+        body = ""
         if line.startswith("* Request at "):
             active, record = True, {"kind": "http"}
         elif active and line.startswith("* Request to "):
@@ -331,14 +374,6 @@ def parse_trace(stderr: str, *, identity=None, records=None) -> str:
                 record[field] = int(value.strip()) if value.strip().isdigit() else value.strip()
         elif active and line.lower().startswith("< retry-after:"):
             record["retry_after"] = line.partition(":")[2].strip()
-        elif active and record.get("endpoint") == "/graphql" and line.lstrip().startswith("{"):
-            try:
-                response = json.loads(line)
-                charge = (response.get("data") or {}).get("rateLimit", {}).get("cost")
-                if isinstance(charge, int):
-                    record["graphql_cost"] = charge
-            except (ValueError, AttributeError):
-                pass
         elif active and line.startswith("* Request took "):
             duration = re.search(r"([0-9.]+)(ms|s)", line)
             if duration:
@@ -365,9 +400,22 @@ def execute(argv, *, env=None, wait: bool = False, **kwargs):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from tauceti_worker import github_outbox
 
+    args = argv[1:]
+    stdin_body = any(
+        a in ("--input", "--body-file", "-F") and i + 1 < len(args) and args[i + 1] == "-" for i, a in enumerate(args)
+    ) or any(a.endswith("=@-") for a in args)
+    if stdin_body and kwargs.get("input") is None and not sys.stdin.isatty():
+        kwargs["input"] = sys.stdin.read()
     intent = github_outbox.prepare(argv, effective, kwargs.get("cwd"), kwargs.get("input"))
     try:
-        result = _execute(argv, env=env, wait=wait, **kwargs)
+        if intent and not github_outbox.may_send(intent):
+            from .config import GitHubUnavailable
+
+            raise GitHubUnavailable(
+                "GitHub publication already retained; reconciling before another attempt",
+                retry_at=github_outbox.retry_at(intent),
+            )
+        result = _execute(argv, env=env, wait=wait, _intent=intent, **kwargs)
         if intent:
             # The HTTP ledger is deliberately separate from private intent bodies.
             github_outbox.finish(
@@ -381,7 +429,7 @@ def execute(argv, *, env=None, wait: bool = False, **kwargs):
         _request_context.reset(context)
 
 
-def _execute(argv, *, env=None, wait: bool = False, **kwargs):
+def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
     effective = dict(os.environ if env is None else env)
     effective["GH_DEBUG"] = "api"
     args = argv[1:]
@@ -421,6 +469,8 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
     )
     started = time.monotonic()
     ceiling = min(900, max(0, int(effective.get("TAUCETI_GH_PROXY_WAIT", "900"))))
+    sent_intent = False
+    observed_resource = endpoint is not None
     while True:
         cooling = cooldown(effective)
         if cooling and not quota_probe:
@@ -433,7 +483,11 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
                 return blocked
             time.sleep(cooling)
         known = observed_budget(effective).get(resource)
-        delay = max(1, known[1] - time.time() + 2) if known and known[0] == 0 and not quota_probe else 0
+        delay = (
+            max(1, known[1] - time.time() + 2)
+            if observed_resource and known and known[0] == 0 and not quota_probe
+            else 0
+        )
         if delay:
             if not wait or time.monotonic() - started + delay > ceiling:
                 record_block(resource, known[1], scope(effective))
@@ -446,6 +500,11 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
             time.sleep(delay)
         records = []
         try:
+            if _intent and not sent_intent:
+                from .github_outbox import sending
+
+                sending(_intent)
+                sent_intent = True
             p = subprocess.run(argv, env=effective, capture_output=True, text=True, **kwargs)
         except subprocess.TimeoutExpired as e:
             raw = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else e.stderr or ""
@@ -473,7 +532,7 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
                 if isinstance(payload, dict) and payload.get("errors"):
                     p.returncode = 1
                     if any(
-                        e.get("type") in ("RATE_LIMIT", "RATE_LIMITED")
+                        (e.get("type") or e.get("extensions", {}).get("code")) in ("RATE_LIMIT", "RATE_LIMITED")
                         for e in payload["errors"]
                         if isinstance(e, dict)
                     ):
@@ -489,7 +548,14 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
         # An opaque write command may have local side effects even without a successful API
         # response. Only read commands or one explicitly rejected API request can be replayed.
         retryable = readonly or (args[:1] == ["api"] and len(records) == 1 and "--paginate" not in args)
-        rejected = retryable and records and all(r.get("status") in (403, 429) for r in records)
+        rejected = retryable and (
+            records
+            and all(r.get("status") in (403, 429) for r in records)
+            or readonly
+            and gql
+            and p.returncode
+            and "API rate limit exceeded (graphql)" in p.stderr
+        )
         p.github_retry_safe = bool(rejected)
         primary = any(r.get("remaining") == 0 for r in records)
         text = (p.stderr or "") + "\n" + (p.stdout or "")
@@ -537,6 +603,8 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
         if p.returncode and (primary or secondary):
             if primary:
                 actual = {r.get("resource", resource) for r in records if r.get("remaining") == 0} or {resource}
+                resource = next((r.get("resource") for r in reversed(records) if r.get("remaining") == 0), resource)
+                observed_resource = True
                 for bucket in actual:
                     quota_type("primary:" + bucket, records, effective)
             if secondary:

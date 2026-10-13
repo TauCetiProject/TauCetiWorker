@@ -7,6 +7,7 @@ import { Lane, LANES, laneAt, settings } from './reconciliation';
 export class RepositoryState extends DurableObject<Env> {
   private inflightQueries=new Map<string,Promise<Result>>();
   private completedQueries=new Map<string,{result:Result,expires:number}>();
+  private snapshotFlight?:Promise<void>;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
@@ -20,6 +21,7 @@ export class RepositoryState extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS jobs_due ON jobs(due,priority);
       CREATE TABLE IF NOT EXISTS demand(key TEXT PRIMARY KEY,at INTEGER);
       CREATE TABLE IF NOT EXISTS cursors(id TEXT PRIMARY KEY,expires INTEGER,payload TEXT);
+      CREATE TABLE IF NOT EXISTS retired_objects(key TEXT PRIMARY KEY,at INTEGER);
       CREATE TABLE IF NOT EXISTS head_prs(sha TEXT,number TEXT,PRIMARY KEY(sha,number));`);
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS repair_metrics(at INTEGER,event TEXT,lane TEXT,operation TEXT,value INTEGER DEFAULT 1);
       CREATE INDEX IF NOT EXISTS repair_metrics_at ON repair_metrics(at);
@@ -75,6 +77,12 @@ export class RepositoryState extends DurableObject<Env> {
     if (!fromEvent && old?.observed > started) return false;
     if (old?.updated && updated && old.updated > updated) return false;
     if (old?.updated && updated===old.updated && old.tombstone && !deleted) return false;
+    if(kind==='pr' && old && data?.headRefOid) {
+      const prior=await this.decode(old.data);
+      if(prior.headRefOid===data.headRefOid && prior.baseRefOid===data.baseRefOid)
+        data={...prior,...Object.fromEntries(Object.entries(data).filter(([,v])=>v!==undefined))};
+      else if(data.mergeable===undefined) data={...data,mergeable:'UNKNOWN'};
+    }
     const encoded = await this.encode(data);
     // R2 encoding yields: repeat the guard against events received during that await.
     old=this.ctx.storage.sql.exec<any>('SELECT * FROM resources WHERE kind=? AND id=?',kind,id).toArray()[0];
@@ -311,8 +319,10 @@ export class RepositoryState extends DurableObject<Env> {
     for (const row of members) {
       const data=await this.decode(row.data);
       if (q.operation==='workflow_jobs' && Number(data.run_attempt || 1)!==(this.meta('workflow_attempt:'+q.args?.id) || 1)) continue;
-      if (q.operation==='open_prs') {
+      if (q.operation==='open_prs' || q.operation==='open_issues') {
         if (data.state && data.state!=='OPEN') continue;
+      }
+      if (q.operation==='open_prs') {
         const statuses=await this.rows({repository:q.repository,operation:'statuses',args:{sha:data.headRefOid}});
         data.statusCheckRollup=Array.isArray(statuses)?statuses:[];
       }
@@ -340,8 +350,9 @@ export class RepositoryState extends DurableObject<Env> {
     }
     let rows:any;
     if (q.operation==='progress') {
-      const prs=await this.rows({repository:q.repository,operation:'open_prs'});
-      const p=Array.isArray(prs)?prs.find(p=>p.number===Number(q.args?.number)):null;
+      const detail={...q,operation:'pr'};
+      const p=await this.rows(detail);
+      await this.noteDemand(detail);if(!this.complete(detail)) await this.enqueue(detail,5);
       const cs=await this.rows({...q,operation:'issue_comments'}), rcs=await this.rows({...q,operation:'review_comments'});
       for (const operation of ['issue_comments','review_comments']) { const child={...q,operation};await this.noteDemand(child);if (!this.complete(child)) await this.enqueue(child,5); }
       rows=p && cs && rcs ? {head:p.headRefOid,ncomments:cs.length+rcs.length,revision:this.revision()}:null;
@@ -561,8 +572,16 @@ export class RepositoryState extends DurableObject<Env> {
       }
       // Keep newer webhook membership when the reconciliation began before that event.
       const prior=this.ctx.storage.sql.exec<any>('SELECT m.id,r.observed FROM members m LEFT JOIN resources r ON r.kind=? AND r.id=m.id WHERE m.collection=?',kind,job.key).toArray();
-      for (const row of prior) if (q.operation!=='workflow_runs' && !memberIDs.has(row.id) && row.observed<=started && this.ctx.storage.sql.exec<any>('SELECT observed FROM resources WHERE kind=? AND id=?',kind,row.id).toArray()[0]?.observed<=started) this.membership(job.key,row.id,false);
-      for (const id of memberIDs) this.membership(job.key,id,true);
+      // A REST offset can shift when another PR closes between pages. Absence
+      // from that traversal cannot delete a previously observed open resource;
+      // webhooks and delta surveys supply actual state changes instead.
+      const openInventory=['open_prs','open_issues'].includes(q.operation);
+      for (const row of prior) if (q.operation!=='workflow_runs' && !(openInventory && result.api==='core') && !memberIDs.has(row.id) && row.observed<=started && this.ctx.storage.sql.exec<any>('SELECT observed FROM resources WHERE kind=? AND id=?',kind,row.id).toArray()[0]?.observed<=started) this.membership(job.key,row.id,false);
+      for (const id of memberIDs) {
+        const current=openInventory?this.ctx.storage.sql.exec<any>('SELECT data,tombstone FROM resources WHERE kind=? AND id=?',kind,id).toArray()[0]:null;
+        if(current && (current.tombstone || (await this.decode(current.data)).state!=='OPEN')) continue;
+        this.membership(job.key,id,true);
+      }
     }
     if (job.lease_id && this.ctx.storage.sql.exec<any>('SELECT lease_id FROM jobs WHERE key=?',job.key).toArray()[0]?.lease_id!==job.lease_id) return;
     if (!this.ctx.storage.sql.exec('SELECT key FROM collections WHERE key=? AND complete=1',job.key).toArray().length) this.nextRevision('collection',job.key);
@@ -629,10 +648,37 @@ export class RepositoryState extends DurableObject<Env> {
     this.ctx.storage.sql.exec('DELETE FROM changes WHERE at<?',now-7*86400000);
     this.ctx.storage.sql.exec('DELETE FROM cursors WHERE expires<?',now);
     this.ctx.storage.sql.exec('DELETE FROM repair_metrics WHERE at<?',now-7*86400000);
-    if (now-(this.meta('last_snapshot') || 0)>86400000) {
-      const key=`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}.json`;
-      const snapshot={version:1,at:now,meta:this.ctx.storage.sql.exec('SELECT * FROM meta').toArray(),resources:this.ctx.storage.sql.exec('SELECT * FROM resources').toArray(),collections:this.ctx.storage.sql.exec('SELECT * FROM collections').toArray(),members:this.ctx.storage.sql.exec('SELECT * FROM members').toArray()};
-      await this.env.ARCHIVE.put(key,JSON.stringify(snapshot),{customMetadata:{expires:String(now+7*86400000)}}); this.setMeta('last_snapshot',now);
+    this.ctx.storage.sql.exec('DELETE FROM retired_objects WHERE at<?',now-30*86400000);
+    if(!this.snapshotFlight) {
+      const flight=this.snapshotPages(now);this.snapshotFlight=flight;
+      try {await flight;} finally {if(this.snapshotFlight===flight)this.snapshotFlight=undefined;}
+    }
+  }
+  async snapshotPages(now:number): Promise<void> {
+    let state=this.meta('snapshot_pending');
+    if(!state) {
+      if(now-(this.meta('last_snapshot') || 0)<=86400000) return;
+      state={version:2,observational:true,started:now,revision:this.revision(),key:`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}-${crypto.randomUUID()}`,index:0,tables:['meta','resources','collections','members'].map(table=>({table,after:0,pages:0,upper:this.ctx.storage.sql.exec<any>('SELECT COALESCE(MAX(rowid),0) last FROM '+table).one().last}))};
+      this.setMeta('snapshot_pending',state);
+    }
+    // Archive bounded pages and checkpoint each one. Repository mutations can
+    // interleave, so this is an observational archive; DO point-in-time recovery
+    // remains the authoritative database backup.
+    for(let turn=0;turn<5 && state.index<state.tables.length;turn++) {
+      const table=state.tables[state.index];
+      const columns=this.ctx.storage.sql.exec<any>('PRAGMA table_info('+table.table+')').toArray().map(c=>c.name);
+      const size=columns.map(c=>'COALESCE(length(CAST('+c+' AS BLOB)),0)').join('+');
+      const candidates=this.ctx.storage.sql.exec<any>('SELECT rowid AS id,'+size+' AS bytes FROM '+table.table+' WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT 1000',table.after,table.upper).toArray();
+      if(!candidates.length) {state.index++;this.setMeta('snapshot_pending',state);continue;}
+      let bytes=0,last=table.after;
+      for(const row of candidates) {if(last!==table.after && bytes+row.bytes>1000000)break;bytes+=row.bytes;last=row.id;}
+      const rows=this.ctx.storage.sql.exec('SELECT * FROM '+table.table+' WHERE rowid>? AND rowid<=? ORDER BY rowid',table.after,last).toArray();
+      await this.env.ARCHIVE.put(state.key+'/'+table.table+'/'+table.pages+'.json',JSON.stringify(rows),{customMetadata:{expires:String(now+7*86400000)}});
+      table.after=last;table.pages++;this.setMeta('snapshot_pending',state);
+    }
+    if(state.index===state.tables.length) {
+      await this.env.ARCHIVE.put(state.key+'.json',JSON.stringify({...state,finished:Date.now(),final_revision:this.revision()}),{customMetadata:{expires:String(now+7*86400000)}});
+      this.setMeta('last_snapshot',Date.now());this.setMeta('snapshot_pending',null);
     }
   }
   retireUnneeded(job:any): boolean {
@@ -646,6 +692,14 @@ export class RepositoryState extends DurableObject<Env> {
     const now=Date.now(),lease=crypto.randomUUID(),started=job.started || now,generation=job.started?job.start_generation:job.generation;
     this.ctx.storage.sql.exec('UPDATE jobs SET lease_id=?,lease_until=?,started=?,start_generation=? WHERE key=? AND lease_until<=?',lease,now+settings(this.env).lease_ms,started,generation,job.key,now);
     return this.ctx.storage.sql.exec<any>('SELECT * FROM jobs WHERE key=? AND lease_id=?',job.key,lease).toArray()[0];
+  }
+  retryJob(job:any,error:unknown): void {
+    const expired=error instanceof Error && /staging page missing/.test(error.message);
+    const category=expired?'staging_expired':'transport_or_parser';
+    const delay=Math.min(3600000,60000*2**Math.min(job.attempt || 0,6));
+    this.ctx.storage.sql.exec('UPDATE jobs SET due=?,attempt=attempt+1,wait_reason=?'+(expired?',started=NULL,cursor=NULL,page=1,api=NULL,etag=NULL,nested=NULL':'')+' WHERE key=? AND lease_id=?',Date.now()+delay,category,job.key,job.lease_id);
+    this.metric('retry',JSON.parse(job.query),job.lane);
+    this.setMeta('last_upstream_failure',{at:Date.now(),operation:JSON.parse(job.query).operation,category});
   }
   async dispatch(first:any): Promise<void> {
     const q:Query=JSON.parse(first.query),operation=q.operation,repo=this.meta('repository');
@@ -670,18 +724,17 @@ export class RepositoryState extends DurableObject<Env> {
         const response=await stub(this.env.INSTALLATIONS,repo.installation).fetch('https://internal/batch',{method:'POST',body:JSON.stringify({repository:repo,jobs:jobs.map(j=>({key:j.key,query:JSON.parse(j.query),node_id:j.node_id}))})});
         const result:any=await response.json();
         if (result.results) {
-          for(let i=0;i<jobs.length;i++) await this.refresh(jobs[i],result.results[i] || {unavailable:true});
+          for(let i=0;i<jobs.length;i++) {
+            try {await this.refresh(jobs[i],result.results[i] || {unavailable:true});}
+            catch(error) {this.retryJob(jobs[i],error);}
+          }
         } else if (result.deferred && operation!=='review_threads' && result.category!=='capacity' && !String(result.category).startsWith('secondary')) {
           // Retry REST-capable operations in their other pool on the next quantum.
           for(const item of jobs) this.ctx.storage.sql.exec('UPDATE jobs SET api=?,due=? WHERE key=? AND lease_id=?','core',Date.now(),item.key,item.lease_id);
         } else for(const item of jobs) await this.refresh(item,result.deferred?result:{unavailable:true,retry_at:Date.now()+60000});
       } else await this.refresh(first);
-    } catch {
-      for(const item of jobs) {
-        this.ctx.storage.sql.exec('UPDATE jobs SET due=?,attempt=attempt+1,wait_reason=? WHERE key=? AND lease_id=?',Date.now()+60000,'transport_or_parser',item.key,item.lease_id);
-        this.metric('retry',JSON.parse(item.query),item.lane);
-      }
-      this.setMeta('last_upstream_failure',{at:Date.now(),operation,category:'transport_or_parser'});
+    } catch(error) {
+      for(const item of jobs) this.retryJob(item,error);
     } finally {
       for(const item of jobs) this.ctx.storage.sql.exec('UPDATE jobs SET lease_id=NULL,lease_until=0 WHERE key=? AND lease_id=?',item.key,item.lease_id);
     }
@@ -711,6 +764,16 @@ export class RepositoryState extends DurableObject<Env> {
       const path=new URL(req.url).pathname;
       if (path==='/configure') { await this.configure((await req.json() as any).repository); return json({ok:true}); }
       if (path==='/event') { await this.ingest(await req.json() as EventPointer); return json({ok:true}); }
+      if(path==='/retained-object') {
+        const key=new URL(req.url).searchParams.get('key'),encoded=JSON.stringify({$r2:key});
+        const retained=this.ctx.storage.sql.exec('SELECT 1 FROM resources WHERE data=? UNION ALL SELECT 1 FROM cursors WHERE payload=? UNION ALL SELECT 1 FROM jobs WHERE nested=? LIMIT 1',encoded,encoded,encoded).toArray().length>0;
+        if(retained) {this.ctx.storage.sql.exec('DELETE FROM retired_objects WHERE key=?',key);return json({retained:true});}
+        this.ctx.storage.sql.exec('INSERT OR IGNORE INTO retired_objects VALUES(?,?)',key,Date.now());
+        const retired=this.ctx.storage.sql.exec<any>('SELECT at FROM retired_objects WHERE key=?',key).one().at;
+        // Object upload age is not retirement age: a months-old object may
+        // still be referenced by yesterday's seven-day archive.
+        return json({retained:Date.now()-retired<8*86400000});
+      }
       if (path==='/query') {
         const q=await req.json() as Query;
         validateQuery(q);
@@ -741,7 +804,7 @@ export class RepositoryState extends DurableObject<Env> {
         }
         return json(result,200,{ETag:'"'+result.revision+'"'});
       }
-      if (path==='/health') return json({reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),repository:this.meta('repository'),revision:this.revision(),bootstrap_inventory:this.meta('bootstrap_inventory'),last_webhook:this.meta('last_webhook'),webhook_apply_ms:this.meta('webhook_apply_ms'),last_repair:this.meta('last_repair'),last_upstream_failure:this.meta('last_upstream_failure'),coverage:this.ctx.storage.sql.exec('SELECT operation,COUNT(*) resources,SUM(complete) complete,MIN(verified) oldest_verified FROM collections GROUP BY operation').toArray(),jobs:this.ctx.storage.sql.exec('SELECT COUNT(*) total,SUM(due<=?) due,MIN(started) oldest_started FROM jobs',Date.now()).one(),lanes:this.ctx.storage.sql.exec('SELECT lane,COUNT(*) jobs,SUM(due<=? AND lease_until<=?) eligible,SUM(lease_until>?) inflight,MIN(CASE WHEN due<=? AND lease_until<=? THEN due END) oldest_eligible,MIN(requested_at) oldest_requested FROM jobs GROUP BY lane',...Array(5).fill(Date.now())).toArray(),waits:this.ctx.storage.sql.exec('SELECT lane,wait_reason,COUNT(*) jobs FROM jobs WHERE wait_reason IS NOT NULL GROUP BY lane,wait_reason').toArray(),repair_hour:this.ctx.storage.sql.exec('SELECT lane,operation,event,COUNT(*) n,SUM(value) value,MAX(value) maximum FROM repair_metrics WHERE at>? GROUP BY lane,operation,event',Date.now()-3600000).toArray(),requested_latency:this.ctx.storage.sql.exec("SELECT operation,MIN(value) p95_ms,MAX(samples) samples FROM (SELECT operation,value,ROW_NUMBER() OVER(PARTITION BY operation ORDER BY value) rank,COUNT(*) OVER(PARTITION BY operation) samples FROM repair_metrics WHERE event='requested_single_latency_ms' AND at>?) WHERE rank>=MAX(1,CAST((samples*95+99)/100 AS INTEGER)) GROUP BY operation",Date.now()-3600000).toArray(),queries:this.ctx.storage.sql.exec('SELECT * FROM query_metrics').toArray(),repair_operations:this.ctx.storage.sql.exec("SELECT json_extract(query,'$.operation') operation,COUNT(*) jobs,SUM(due<=?) due,MIN(due) next_due,MAX(attempt) attempts FROM jobs GROUP BY operation",Date.now()).toArray()});
+      if (path==='/health') return json({storage_bytes:this.ctx.storage.sql.databaseSize,snapshot_pending:this.meta('snapshot_pending'),reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),repository:this.meta('repository'),revision:this.revision(),bootstrap_inventory:this.meta('bootstrap_inventory'),last_webhook:this.meta('last_webhook'),webhook_apply_ms:this.meta('webhook_apply_ms'),last_repair:this.meta('last_repair'),last_upstream_failure:this.meta('last_upstream_failure'),coverage:this.ctx.storage.sql.exec('SELECT operation,COUNT(*) resources,SUM(complete) complete,MIN(verified) oldest_verified FROM collections GROUP BY operation').toArray(),jobs:this.ctx.storage.sql.exec('SELECT COUNT(*) total,SUM(due<=?) due,MIN(started) oldest_started FROM jobs',Date.now()).one(),lanes:this.ctx.storage.sql.exec('SELECT lane,COUNT(*) jobs,SUM(due<=? AND lease_until<=?) eligible,SUM(lease_until>?) inflight,MIN(CASE WHEN due<=? AND lease_until<=? THEN due END) oldest_eligible,MIN(requested_at) oldest_requested FROM jobs GROUP BY lane',...Array(5).fill(Date.now())).toArray(),waits:this.ctx.storage.sql.exec('SELECT lane,wait_reason,COUNT(*) jobs FROM jobs WHERE wait_reason IS NOT NULL GROUP BY lane,wait_reason').toArray(),repair_hour:this.ctx.storage.sql.exec('SELECT lane,operation,event,COUNT(*) n,SUM(value) value,MAX(value) maximum FROM repair_metrics WHERE at>? GROUP BY lane,operation,event',Date.now()-3600000).toArray(),requested_latency:this.ctx.storage.sql.exec("SELECT operation,MIN(value) p95_ms,MAX(samples) samples FROM (SELECT operation,value,ROW_NUMBER() OVER(PARTITION BY operation ORDER BY value) rank,COUNT(*) OVER(PARTITION BY operation) samples FROM repair_metrics WHERE event='requested_single_latency_ms' AND at>?) WHERE rank>=MAX(1,CAST((samples*95+99)/100 AS INTEGER)) GROUP BY operation",Date.now()-3600000).toArray(),queries:this.ctx.storage.sql.exec('SELECT * FROM query_metrics').toArray(),repair_operations:this.ctx.storage.sql.exec("SELECT json_extract(query,'$.operation') operation,COUNT(*) jobs,SUM(due<=?) due,MIN(due) next_due,MAX(attempt) attempts FROM jobs GROUP BY operation",Date.now()).toArray()});
       if (path==='/changes') { const after=Number(new URL(req.url).searchParams.get('after') || 0); const first=this.ctx.storage.sql.exec<any>('SELECT MIN(revision) AS revision FROM changes').one(); return json({revision:this.revision(),reset:after>0 && first.revision && after<first.revision-1,changes:this.ctx.storage.sql.exec('SELECT * FROM changes WHERE revision>? ORDER BY revision LIMIT 1000',after).toArray()}); }
       if (path==='/tick') { if (!this.meta('repository')) await this.configure((await req.json() as any).repository); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }
       if (path==='/repair') { this.ctx.storage.sql.exec('UPDATE jobs SET due=CASE WHEN wait_reason IS NULL AND attempt=0 THEN ? ELSE due END,dirty=1,generation=generation+1',Date.now()); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }

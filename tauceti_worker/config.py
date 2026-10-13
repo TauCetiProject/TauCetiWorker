@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -103,7 +104,7 @@ def roadmap_areas(gh) -> list[str]:
         tree = snapshot(ROADMAP, ttl=3600)
         if tree:
             return sorted(path.name for path in (tree / "TauCetiRoadmap").iterdir() if path.is_dir())
-    except (OSError, TimeoutError):
+    except (OSError, TimeoutError, subprocess.SubprocessError):
         pass
     out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')
     return sorted(out.splitlines()) if out else []
@@ -273,3 +274,11 @@ class NoProgress(Exception):
 
 class AdmissionUnavailable(NoProgress):
     """Local API admission needs a bounded recheck, without no-progress backoff."""
+
+
+class GitHubUnavailable(NoProgress):
+    """GitHub infrastructure pause; completed work and PR attempt budgets survive."""
+
+    def __init__(self, message: str, *, retry_at: float | None = None):
+        super().__init__(message)
+        self.retry_at = retry_at
