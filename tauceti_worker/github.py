@@ -13,12 +13,12 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import github_transport as transport
 from .config import Die, log, one_line
 from .constants import (
     _GH_PRIMARY_RE,
     _GH_SECONDARY_RE,
     _GH_TRANSIENT_RE,
-    _GQL_MUTATION_RE,
     CLAIMS,
     CONTEST_CLAIM_EMOJI,
     GH_INROUND_WAIT,
@@ -66,10 +66,11 @@ def unselected_github_env(env: dict[str, str] | None = None) -> dict[str, str]:
     # Persistent worker selection belongs to its spec, never the manager's launching shell.
     result.pop("TAUCETI_GITHUB_ACCOUNT", None)
     result.pop("_TAUCETI_PINNED_GITHUB_ACCOUNT", None)
+    result.pop("_TAUCETI_PINNED_GITHUB_SCOPE", None)
     return result
 
 
-def pin_github_account(account: str) -> str:
+def pin_github_account(account: str, *, wait_for_reset: bool = False) -> str:
     """Select an account without changing gh's active login, before HOME isolation.
 
     Children reuse the parent's credential and verify its identity. A fresh worker prefers the
@@ -104,18 +105,61 @@ def pin_github_account(account: str) -> str:
         env = {**os.environ, "GH_TOKEN": token, "GH_HOST": "github.com"}
         env.pop("GITHUB_TOKEN", None)
         waited = 0
-        for attempt in range(GH_TRANSIENT_TRIES + 1):
-            identity = subprocess.run(
-                ["gh", "api", "--hostname", "github.com", "user"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=30,
+        attempt = 0
+        while True:
+            attempts = []
+
+            def verify(attempts=attempts):
+                result = transport.execute(
+                    ["gh", "api", "--hostname", "github.com", "user"],
+                    env=env,
+                    timeout=30,
+                )
+                attempts.append(result)
+                if result.returncode == 0:
+                    try:
+                        user = json.loads(result.stdout)
+                        validate_github_account(user["login"])
+                        uid = user["id"]
+                        if isinstance(uid, int) and not isinstance(uid, bool) and uid > 0:
+                            return result.stdout
+                    except (ValueError, TypeError, KeyError):
+                        pass
+                    result.returncode = 1
+                    result.stderr = "invalid GitHub identity response"
+                return None
+
+            verified = transport.shared_read(
+                ["identity", "github.com"],
+                verify,
+                ttl=3600 if pinned else 0,
+                identity=transport.scope(env),
+                immutable=True,
             )
-            if identity.returncode == 0 or attempt == GH_TRANSIENT_TRIES:
+            identity = attempts[-1] if attempts else subprocess.CompletedProcess([], 0, verified or "", "")
+            if verified is None and transport.observed_budget(env).get("core", (1,))[0] == 0:
+                identity.stderr = "API rate limit exceeded"
+            if identity.returncode == 0:
                 break
             error = (identity.stderr or "") + "\n" + (identity.stdout or "")
             kind = _gh_rate_kind(error)
+            if kind == "primary" and wait_for_reset:
+                from .runtime_status import report_runtime
+
+                remaining = transport.observed_budget(env).get("core")
+                nap = min(60, max(1, remaining[1] - int(time.time()) + 2)) if remaining else 60
+                log(f"GitHub account {account}: REST exhausted; waiting {nap}s before verification")
+                report_runtime(
+                    "waiting-github",
+                    detail="REST exhausted during account verification",
+                    next_action_at=time.time() + nap,
+                    phase=None,
+                    failure_reason=None,
+                )
+                time.sleep(nap)
+                continue
+            if attempt == GH_TRANSIENT_TRIES:
+                break
             if kind == "secondary":
                 nap = _gh_secondary_wait(error, attempt)
             elif kind is None and _gh_transient(error):
@@ -127,12 +171,15 @@ def pin_github_account(account: str) -> str:
             log(f"GitHub account {account}: temporary verification failure; retrying in {nap}s")
             time.sleep(nap)
             waited += nap
+            attempt += 1
     except (OSError, subprocess.TimeoutExpired):
         raise Die(
             f"could not authenticate GitHub account {account}; check gh installation, login, and connectivity"
         ) from None
     if identity.returncode != 0:
         # gh's stderr can contain credential material when debugging is enabled. Do not log it.
+        if _gh_rate_kind((identity.stderr or "") + "\n" + (identity.stdout or "")) == "primary":
+            raise Die(f"GitHub API rate limit exceeded while verifying account {account}; waiting for the hourly reset")
         raise Die(f"could not verify GitHub account {account}; check its credential and GitHub connectivity")
     try:
         user = json.loads(identity.stdout)
@@ -153,6 +200,8 @@ def pin_github_account(account: str) -> str:
     os.environ["GH_HOST"] = "github.com"
     os.environ["TAUCETI_GITHUB_ACCOUNT"] = login
     os.environ["_TAUCETI_PINNED_GITHUB_ACCOUNT"] = login
+    os.environ["_TAUCETI_PINNED_GITHUB_SCOPE"] = transport.scope()
+    transport.register_principal(user_id, login)
     _pin_git_identity(login, user_id, configure_helper=not pinned)
     # These caches describe a credential, not a host or worker id. In particular the dashboard
     # must never retain a previous identity/fork after selecting an account in the same process.
@@ -201,9 +250,18 @@ def _pin_git_identity(login: str, user_id: int, *, configure_helper: bool) -> No
 def me() -> str:
     """The GitHub login the worker is authenticated as (gh). Its PRs are the ones the worker tends
     (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as."""
-    r = gh_run(["gh", "api", "user", "--jq", ".login"])  # waits out a rate limit rather than failing setup
+    selected = os.environ.get("_TAUCETI_PINNED_GITHUB_ACCOUNT")
+    if (
+        selected
+        and selected == os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+        and os.environ.get("_TAUCETI_PINNED_GITHUB_SCOPE") == transport.scope()
+    ):
+        return validate_github_account(selected)
+    r = gh_run(["gh", "api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"])
     login = (r.stdout or "").strip()
-    if not login:
+    if r.returncode != 0 and _gh_rate_kind((r.stderr or "") + (r.stdout or "")):
+        raise Die("GitHub API rate limit exhausted while resolving identity; waiting for reset")
+    if r.returncode != 0 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
         raise Die("could not determine the authenticated GitHub account (run `gh auth login`)")
     return login
 
@@ -211,11 +269,15 @@ def me() -> str:
 def can_push(repo: str) -> bool | None:
     """Does the authenticated account have push (write) access to `repo`? `true`/`false` from GitHub's
     own `permissions.push`, or None when we can't tell (network/rate-limit/parse)."""
-    r = gh_run(["gh", "api", f"repos/{repo}", "--jq", ".permissions.push"])
-    if r.returncode != 0:
-        return None
-    out = (r.stdout or "").strip()
-    return True if out == "true" else False if out == "false" else None
+
+    def fetch():
+        r = gh_run(["gh", "api", f"repos/{repo}", "--jq", ".permissions.push"])
+        if r.returncode != 0:
+            return None
+        out = (r.stdout or "").strip()
+        return True if out == "true" else False if out == "false" else None
+
+    return transport.shared_read(["permissions", repo], fetch)
 
 
 def claims_repo() -> str:
@@ -366,6 +428,11 @@ def run(
     check: bool = False,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess:
+    if argv and Path(argv[0]).name == "gh" and capture:
+        p = transport.execute(argv, cwd=str(cwd) if cwd else None, env=env, input=input_text)
+        if check:
+            p.check_returncode()
+        return p
     return subprocess.run(
         argv,
         cwd=str(cwd) if cwd else None,
@@ -428,29 +495,7 @@ def _gh_read_only(argv: list[str]) -> bool:
     read costs a duplicate query; retrying `issue create` or `api -X PATCH` costs a duplicate issue or a
     change applied twice. So only reads are retried, decided from the command line rather than from a
     flag each caller could forget to pass."""
-    args = [a for a in argv[1:] if a]  # drop the `gh` program name
-    if not args:
-        return False
-    if args[0] == "api":
-        rest = args[1:]
-        if rest[:1] == ["graphql"]:
-            # Every GraphQL call is a POST, so the method says nothing about what it does; the document
-            # does. A `query` reads and may be retried, a `mutation` writes and may not. An invocation
-            # whose document we cannot see (--input, a file) is treated as a write.
-            docs = [a[len("query=") :] for a in rest[1:] if a.startswith("query=")]
-            return bool(docs) and not any(_GQL_MUTATION_RE.search(d) for d in docs)
-        # `gh api` is GET unless told otherwise, and a field/body argument makes it a POST implicitly.
-        for i, a in enumerate(rest):
-            if a in ("-X", "--method"):
-                if i + 1 >= len(rest) or rest[i + 1].upper() != "GET":
-                    return False
-            elif a.startswith("--method="):
-                if a.split("=", 1)[1].upper() != "GET":
-                    return False
-            elif a in ("-f", "-F", "--field", "--raw-field", "--input"):
-                return False
-        return True
-    return len(args) > 1 and args[1] in _GH_READ_VERBS
+    return transport.proxy_readonly([a for a in argv[1:] if a])
 
 
 def github_budget() -> dict | None:
@@ -469,12 +514,17 @@ def github_budget() -> dict | None:
         ]
     )
     if p.returncode != 0:
-        return None
+        return transport.observed_budget() or None
     try:
         d = json.loads(p.stdout)
-        return {k: (int(v[0]), int(v[1])) for k, v in d.items()}
+        budget = {k: (int(v[0]), int(v[1])) for k, v in d.items()}
+        for resource, observed in transport.observed_budget().items():
+            # /rate_limit has returned optimistic values during actual REST exhaustion.
+            if resource not in budget or observed[0] < budget[resource][0]:
+                budget[resource] = observed
+        return budget
     except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
-        return None
+        return transport.observed_budget() or None
 
 
 def _gh_secondary_wait(text: str, attempt: int) -> int:
@@ -526,7 +576,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
                 "waits out the hourly reset (waiting in-round would exceed the round timeout)"
             )
             return p
-        if not _gh_read_only(argv):
+        if not _gh_read_only(argv) and not getattr(p, "github_retry_safe", False):
             log(
                 "gh: secondary rate limit after an ambiguous write — preserving the error without replaying the command"
             )
@@ -602,11 +652,27 @@ def _pr_json_from_graphql(node: dict) -> dict:
 class GitHub:
     def __init__(self, repo: str = TAUCETI):
         self.repo = repo
+        self._review_nodes = {}
 
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
-        return gh_run(["gh", *args])
+        readonly = _gh_read_only(["gh", *args])
+        if not readonly:
+            transport.invalidate()
+        try:
+            return gh_run(["gh", *args])
+        finally:
+            if not readonly:
+                transport.invalidate()
 
     def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
+        from .github_state import read
+
+        available, rows = read(self.repo, "open_prs")
+        if available:
+            return rows
+        return transport.shared_read(["open_prs", self.repo, page], lambda: self._open_prs(page=page), ttl=15)
+
+    def _open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
         """Every open PR, paged, in the same shape `gh pr list --json` returns (so PRInfo.from_json
         reads either).
 
@@ -635,7 +701,10 @@ class GitHub:
             if p.returncode != 0:
                 raise GitHubError(f"open PR query failed: {one_line(p.stderr or p.stdout, 160)}")
             try:
-                conn = json.loads(p.stdout)["data"]["repository"]["pullRequests"]
+                payload = json.loads(p.stdout)
+                if payload.get("errors"):
+                    raise ValueError("GraphQL reported errors")
+                conn = payload["data"]["repository"]["pullRequests"]
             except (ValueError, TypeError, KeyError) as e:
                 raise GitHubError(f"open PR query returned no pull requests ({e})") from e
             for node in conn.get("nodes") or []:
@@ -661,6 +730,16 @@ class GitHub:
         raise GitHubError(f"open PR query exceeded {OPEN_PR_MAX_PAGES} pages of {page} ({len(out)} PRs so far)")
 
     def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open") -> list[dict]:
+        from .github_state import read
+
+        if state == "open":
+            available, rows = read(self.repo, "open_prs")
+            if available and all(all(f in row for f in fields) for row in rows):
+                return [
+                    {f: row[f] for f in fields}
+                    for row in rows
+                    if not author or row.get("author", {}).get("login") == author
+                ]
         args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200", "--json", ",".join(fields)]
         if author:
             args += ["--author", author]
@@ -675,6 +754,16 @@ class GitHub:
         """List issues in `repo` (explicit, since the client is bound to its own repo), filtered by
         ALL of `labels` (repeated --label = AND; gh handles slashes in label names). Each dict has
         the requested `fields`. Raises GitHubError on failure."""
+        from .github_state import read
+
+        if state == "open":
+            available, rows = read(repo, "open_issues")
+            if available and all(all(f in row for f in fields) for row in rows):
+                return [
+                    {f: row[f] for f in fields}
+                    for row in rows
+                    if all(lb in [x.get("name") for x in row.get("labels", [])] for lb in labels or [])
+                ][:limit]
         args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit), "--json", ",".join(fields)]
         for label in labels or []:
             args += ["--label", label]
@@ -684,6 +773,11 @@ class GitHub:
         return json.loads(p.stdout or "[]")
 
     def pr_view(self, pr: int, fields: list[str]) -> dict | None:
+        from .github_state import read
+
+        available, row = read(self.repo, "pr", number=pr)
+        if available and all(f in row for f in fields):
+            return {f: row[f] for f in fields}
         p = self._gh(["pr", "view", str(pr), "--repo", self.repo, "--json", ",".join(fields)])
         if p.returncode != 0:
             return None
@@ -764,49 +858,159 @@ class GitHub:
         """A trusted sweep handoff for this exact head; stale requests spend no attempts."""
         if not re.fullmatch(r"[0-9a-f]{40}", head):
             return False
-        p = self._gh(
-            [
-                "api",
-                "--paginate",
-                f"/repos/{self.repo}/issues/{pr}/comments?per_page=100",
-                "--jq",
-                ".[] | {body, author: .user.login}",
-            ]
-        )
-        if p.returncode != 0:
-            return False
-        try:
-            comments = [json.loads(line) for line in (p.stdout or "").splitlines() if line.strip()]
-        except (ValueError, TypeError):
-            return False
+        comments = self.issue_comments(pr)
         return any(
             isinstance(c, dict)
-            and c.get("author") == "tauceti-review-bot[bot]"
+            and (c.get("user") or {}).get("login") == "tauceti-review-bot[bot]"
             and isinstance(c.get("body"), str)
             and c["body"].startswith("Merge-queue recovery for head `")
             and f"<!--tauceti-rebase:v1 {head}-->" in (c.get("body") or "").splitlines()
-            for c in comments
+            for c in comments or []
         )
 
     def issue_comments(self, pr: int) -> list[dict] | None:
-        """All issue comments for a PR (paginated). None on fetch failure (distinct from empty)."""
-        p = self._gh(["api", "--paginate", f"/repos/{self.repo}/issues/{pr}/comments?per_page=100"])
-        if p.returncode != 0:
-            return None
+        """Complete GraphQL history in REST shape. Cache is triage-only; force reads bypass it."""
+        from .github_state import read
+
+        available, rows = read(self.repo, "issue_comments", number=pr)
+        if available:
+            return rows
+        return transport.shared_read(["issue_comments", self.repo, pr], lambda: self._issue_comments(pr))
+
+    def _query(self, query: str, **variables) -> dict | None:
+        args = ["api", "graphql", "-f", f"query={query}"]
+        for key, value in variables.items():
+            if value is not None:
+                args += ["-F", f"{key}={value}"]
+        p = self._gh(args)
         try:
-            return json.loads(p.stdout or "[]")
-        except json.JSONDecodeError:
+            payload = json.loads(p.stdout)
+            return payload["data"] if p.returncode == 0 and not payload.get("errors") else None
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def _connection(self, query, extract, **variables):
+        """Page one connection; never return partial history on an error or bad cursor."""
+        rows, cursor, cursors = [], None, set()
+        for _ in range(OPEN_PR_MAX_PAGES):
+            data = self._query(query, **variables, cursor=cursor)
+            try:
+                conn = extract(data)
+                rows.extend(conn["nodes"])
+                info = conn["pageInfo"]
+                if not info["hasNextPage"]:
+                    return rows
+                cursor = info["endCursor"]
+                if not cursor or cursor in cursors:
+                    return None
+                cursors.add(cursor)
+            except (TypeError, KeyError):
+                return None
+        return None
+
+    @staticmethod
+    def _comment(node):
+        author = node.get("author") or {}
+        login = author.get("login", "")
+        if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+            login += "[bot]"
+        return {
+            "id": int(node["fullDatabaseId"]),
+            "node_id": node["id"],
+            "body": node["body"],
+            "created_at": node["createdAt"],
+            "updated_at": node["updatedAt"],
+            "user": {"login": login},
+            "author_association": node["authorAssociation"],
+        }
+
+    def _issue_comments(self, pr):
+        from .github_catalog import CATALOG, prefer_rest, rest_collection
+
+        if prefer_rest():
+            return rest_collection(self, "issue_comments", number=pr)
+        owner, name = self.repo.split("/", 1)
+        connection = (
+            "comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{"
+            + CATALOG["fields"]["comment"]
+            + "}}"
+        )
+        query = """query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){issueOrPullRequest(number:$pr){
+            ... on Issue{%s} ... on PullRequest{%s}}}}""" % (connection, connection)
+        nodes = self._connection(
+            query, lambda d: d["repository"]["issueOrPullRequest"]["comments"], owner=owner, name=name, pr=pr
+        )
+        try:
+            return [self._comment(n) for n in nodes] if nodes is not None else None
+        except (KeyError, TypeError, ValueError):
             return None
 
     def review_comments(self, pr: int) -> list[dict] | None:
         """All review (inline / thread) comments for a PR — distinct from issue_comments. A contested
         fix replies on a review thread, so the progress guard must count these too. None on failure."""
-        p = self._gh(["api", "--paginate", f"/repos/{self.repo}/pulls/{pr}/comments?per_page=100"])
-        if p.returncode != 0:
+        from .github_state import read
+
+        available, rows = read(self.repo, "review_comments", number=pr)
+        if not available:
+            rows = transport.shared_read(["review_comments", self.repo, pr], lambda: self._review_comments(pr))
+        if rows is not None:
+            self._review_nodes.update({c["id"]: c["node_id"] for c in rows})
+        return rows
+
+    def _review_comments(self, pr):
+        from .github_catalog import CATALOG, prefer_rest, rest_collection
+
+        if prefer_rest():
+            return rest_collection(self, "review_comments", number=pr)
+        owner, name = self.repo.split("/", 1)
+        # Bound nested pages to 20x20 rather than the 100x100 server-timeout trap. Each
+        # overflowing thread gets its own continuation; deleting a thread must not look empty.
+        fields = CATALOG["fields"]["review_comment"]
+        conn_fields = f"pageInfo{{hasNextPage endCursor}} nodes{{{fields}}}"
+        query = (
+            """query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:20,after:$cursor){
+            pageInfo{hasNextPage endCursor} nodes{id comments(first:20){%s}}
+          }}}} """
+            % conn_fields
+        )
+        threads = self._connection(
+            query, lambda d: d["repository"]["pullRequest"]["reviewThreads"], owner=owner, name=name, pr=pr
+        )
+        if threads is None:
             return None
+        rows = []
         try:
-            return json.loads(p.stdout or "[]")
-        except json.JSONDecodeError:
+            for thread in threads:
+                conn = thread["comments"]
+                nodes = conn["nodes"]
+                if conn["pageInfo"]["hasNextPage"]:
+                    # Re-page only this oversized thread, with a simple, small query.
+                    q = (
+                        """query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{
+                      comments(first:100,after:$cursor){%s}}}}"""
+                        % conn_fields
+                    )
+                    nodes = self._connection(q, lambda d: d["node"]["comments"], id=thread["id"])
+                    if nodes is None:
+                        return None
+                for n in nodes:
+                    c = self._comment(n)
+                    c["in_reply_to_id"] = int(n["replyTo"]["fullDatabaseId"]) if n.get("replyTo") else None
+                    c.update(
+                        {
+                            "path": n.get("path"),
+                            "line": n.get("line"),
+                            "original_line": n.get("originalLine"),
+                            "diff_hunk": n.get("diffHunk"),
+                            "commit_id": (n.get("commit") or {}).get("oid"),
+                            "original_commit_id": (n.get("originalCommit") or {}).get("oid"),
+                        }
+                    )
+                    rows.append(c)
+            return sorted(rows, key=lambda c: c["id"])
+        except (KeyError, TypeError, ValueError):
             return None
 
     def pr_progress_state(self, pr: int) -> dict | None:
@@ -816,6 +1020,11 @@ class GitHub:
         round's GitHub spend. None on any failure (caller treats that as 'can't tell'). Review threads are
         fetched first:100; on the rare PR with more, we fall back to the exact paginated REST count so the
         guard never undercounts a comment that landed on a later thread."""
+        from .github_state import read
+
+        available, row = read(self.repo, "progress", number=pr)
+        if available:
+            return row
         owner, _, name = self.repo.partition("/")
         q = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
@@ -828,7 +1037,10 @@ class GitHub:
         if p.returncode != 0:
             return None
         try:
-            d = json.loads(p.stdout)["data"]["repository"]["pullRequest"]
+            payload = json.loads(p.stdout)
+            if payload.get("errors"):
+                return None
+            d = payload["data"]["repository"]["pullRequest"]
             threads = d["reviewThreads"]
             if threads["totalCount"] > 100:  # beyond one page — get the exact count via REST
                 return self._pr_progress_state_rest(pr, d["headRefOid"])
@@ -840,27 +1052,79 @@ class GitHub:
     def _pr_progress_state_rest(self, pr: int, head: str) -> dict | None:
         """Exact issue + review comment count via the paginated REST endpoints (the pre-GraphQL path),
         for the rare PR with >100 review threads. None if either fetch fails."""
-        cs = self.issue_comments(pr)
-        rcs = self.review_comments(pr)
+        with transport.read_context(fresh=True):
+            cs = self.issue_comments(pr)
+            rcs = self.review_comments(pr)
         if cs is None or rcs is None:
             return None
         return {"head": head, "ncomments": len(cs) + len(rcs)}
 
     def api_jq(self, path: str, jq: str) -> str | None:
-        p = self._gh(["api", path, "--jq", jq])
-        if p.returncode != 0:
-            return None
-        return p.stdout.strip()
+        def fetch():
+            p = self._gh(["api", path, "--jq", jq])
+            return p.stdout.strip() if p.returncode == 0 else None
+
+        immutable = bool(re.search(r"/(git/trees|git/commits|commits)/[a-f0-9]{40}(?:\?|$)", path))
+        if immutable or re.fullmatch(r"/?repos/[^/]+/[^/]+", path):
+            return transport.shared_read(
+                ["api_metadata", path, jq], fetch, ttl=86400 if immutable else 3600, immutable=immutable
+            )
+        return fetch()
 
     def reactions(self, comment_id: int) -> list[dict] | None:
         """Reactions on a pull-request review (thread) comment. Each carries {content, created_at
         (whole-second ISO 8601), user, id}. None on fetch failure (distinct from no reactions)."""
-        p = self._gh(["api", "--paginate", f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions?per_page=100"])
-        if p.returncode != 0:
+
+        from .github_state import read
+
+        available, rows = read(self.repo, "reactions", id=comment_id)
+        if available:
+            return rows
+        from .github_catalog import prefer_rest, rest_collection
+
+        if prefer_rest():
+            return rest_collection(self, "reactions", id=comment_id)
+
+        def resolve_node():
+            if comment_id in self._review_nodes:
+                return self._review_nodes[comment_id]
+            # A cold caller carrying only a REST id needs one lookup. Histories supply node ids
+            # directly; immutable id mappings are safe to share, unlike live claim reactions.
+            p = self._gh(["api", f"/repos/{self.repo}/pulls/comments/{comment_id}", "--jq", ".node_id"])
+            return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else None
+
+        node_id = transport.shared_read(["review_node", self.repo, comment_id], resolve_node, ttl=86400, immutable=True)
+        if not node_id:
             return None
+        query = """query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewComment{
+          reactions(first:100,after:$cursor){pageInfo{hasNextPage endCursor}
+            nodes{databaseId content createdAt user{login}}}}}}"""
+        nodes = self._connection(query, lambda d: d["node"]["reactions"], id=node_id)
+        emojis = {
+            "THUMBS_UP": "+1",
+            "THUMBS_DOWN": "-1",
+            "LAUGH": "laugh",
+            "HOORAY": "hooray",
+            "CONFUSED": "confused",
+            "HEART": "heart",
+            "ROCKET": "rocket",
+            "EYES": "eyes",
+        }
         try:
-            return json.loads(p.stdout or "[]")
-        except json.JSONDecodeError:
+            return (
+                [
+                    {
+                        "id": n["databaseId"],
+                        "content": emojis[n["content"]],
+                        "created_at": n["createdAt"],
+                        "user": n.get("user") or {},
+                    }
+                    for n in nodes
+                ]
+                if nodes is not None
+                else None
+            )
+        except (KeyError, TypeError):
             return None
 
     def fresh_claim_age(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> int | None:

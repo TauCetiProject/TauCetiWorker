@@ -734,6 +734,23 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(len(retained), 1)
             self.assertEqual(json.loads(retained[0].read_text()), telemetry)
 
+    def test_successful_bulk_read_does_not_run_rate_limit_regex(self):
+        from tauceti_worker import github_transport as transport
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "test"}),
+            patch.object(
+                transport.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "pull request " * 50000, ""),
+            ),
+        ):
+            started = time.monotonic()
+            result = transport.execute(["gh", "api", "repos/a/b/pulls"])
+            self.assertEqual(result.returncode, 0)
+            self.assertLess(time.monotonic() - started, 2)
+
     def test_flags_keys_and_targeting(self):
         args = build_parser().parse_args(["work", "--only", "overlap-scan", "--overlap-batch-commits", "40"])
         self.assertEqual(args.overlap_batch_commits, 40)

@@ -18,6 +18,7 @@ if TYPE_CHECKING:  # annotation only; survey is a higher layer
 from .config import Config
 from .constants import COMMENTS_MEMO_S, REVIEW_INPROGRESS_RE, SBCACHE_BACKSTOP_S, SBCACHE_TTL
 from .github import GitHub
+from .github_transport import cache_hit, invalidate, read_context
 
 # ============================================================================
 # ReviewState — the PR scoreboard comment is the multi-agent source of truth; a
@@ -50,6 +51,7 @@ class ReviewState:
         self.sbcache = cfg.sbcache
         self._comments: dict[int, tuple[float, list[dict] | None]] = {}
         self._observed: dict[int, str] = {}
+        self._shared_issue_hit: dict[int, bool] = {}
 
     def observe(self, prs) -> None:
         """Record each PR's `updatedAt` from the survey's own list query, as the freshness key for the
@@ -94,6 +96,10 @@ class ReviewState:
         `<pr>.json` still exists, written after, for the stale-on-fetch-failure path and for an operator
         reading the cache by hand; nothing entitled is ever served out of it. Separate files per reader
         keep two processes sharing a worker id (a round and the dashboard) off each other's half."""
+        # The shared service can observe deletions and reactions without a PR updatedAt change.
+        # Let it answer each pass instead of hiding those changes behind this local age cache.
+        if os.environ.get("TAUCETI_GITHUB_STATE_URL"):
+            return None
         key = self._observed.get(pr)
         if not key:
             return None
@@ -133,7 +139,9 @@ class ReviewState:
         hit = None if force else self._comments.get(pr)
         if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
             return hit[1]
-        cs = self.gh.issue_comments(pr)
+        with read_context(fresh=force, revision=self._observed.get(pr, "")):
+            cs = self.gh.issue_comments(pr)
+            self._shared_issue_hit[pr] = cache_hit()
         self._comments[pr] = (time.time(), cs)
         return cs
 
@@ -181,7 +189,12 @@ class ReviewState:
                 return Meta(sc["meta"], "assumed")
             if sc.get("status") == "missing":
                 return Meta({}, "missing")
-        if not force and not self._observed.get(pr) and cache.exists():
+        if (
+            not force
+            and not os.environ.get("TAUCETI_GITHUB_STATE_URL")
+            and not self._observed.get(pr)
+            and cache.exists()
+        ):
             # No clock to compare against (a caller outside a survey pass): the plain TTL, as before.
             # `assumed`, not `fresh` — it was not read from GitHub during this pass, and `fresh` is the
             # word the mutating path trusts.
@@ -238,7 +251,7 @@ class ReviewState:
             cache.write_text(json.dumps(data) + "\n")
         except OSError:
             pass
-        return Meta(data, "fresh")
+        return Meta(data, "assumed" if self._shared_issue_hit.get(pr) else "fresh")
 
     @staticmethod
     def _load(cache: Path) -> dict | None:
@@ -256,10 +269,12 @@ class ReviewState:
         The memo matters as much as the files. bust() is called right after the worker itself posts,
         and a memo left warm would rebuild the cache from the comments as they were BEFORE that post,
         re-caching the state we just invalidated."""
+        invalidate()
         self._cache_path(pr).unlink(missing_ok=True)
         self._key_path(pr).unlink(missing_ok=True)
         self._contest_path(pr).unlink(missing_ok=True)
         self._comments.pop(pr, None)
+        self._shared_issue_hit.pop(pr, None)
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
@@ -294,7 +309,8 @@ class ReviewState:
         sc = None if force else self._sidecar(self._contest_path(pr), pr)
         if sc is not None and "contest" in sc:
             return sc["contest"]
-        rcs = self.gh.review_comments(pr)
+        with read_context(fresh=force, revision=self._observed.get(pr, "")):
+            rcs = self.gh.review_comments(pr)
         if rcs is None:
             return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
         best = self._newest_contest(rcs)

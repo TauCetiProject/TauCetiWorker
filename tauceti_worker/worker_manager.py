@@ -29,7 +29,8 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-from .constants import AGENTS, ALLOWED_TASKS
+from .config import positive_integer
+from .constants import AGENTS, ALLOWED_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
@@ -40,6 +41,9 @@ CONFIG_VERSION = 1
 DEFAULT_INTERVAL = 2.0
 TMUX_SESSION = "tauceti-workers"
 _WORKER_KEYS = {
+    "max_open_prs",
+    "github_state_url",
+    "github_state_token_file",
     "id",
     "github_account",
     "enabled",
@@ -246,6 +250,9 @@ def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
+    max_open_prs: int = MAX_OPEN_PRS
+    github_state_url: str | None = None
+    github_state_token_file: str | None = None
     github_account: str | None = None
     enabled: bool = True
     agent: str = "auto"
@@ -296,8 +303,19 @@ class WorkerSpec:
         restart = _string(raw.get("restart", "always"), f"workers[{index}].restart")
         if restart not in ("always", "on-failure", "never"):
             raise WorkersError(f"workers[{index}].restart must be 'always', 'on-failure', or 'never'")
+        try:
+            cutoff = positive_integer(raw.get("max_open_prs", MAX_OPEN_PRS))
+        except ValueError as error:
+            raise WorkersError(f"workers[{index}].max_open_prs {error}") from None
+        if not isinstance(raw.get("max_open_prs", MAX_OPEN_PRS), int):
+            raise WorkersError(f"workers[{index}].max_open_prs must be an integer")
         spec = WorkerSpec(
             id=wid,
+            max_open_prs=cutoff,
+            github_state_url=_string(raw.get("github_state_url"), f"workers[{index}].github_state_url", optional=True),
+            github_state_token_file=_string(
+                raw.get("github_state_token_file"), f"workers[{index}].github_state_token_file", optional=True
+            ),
             enabled=enabled,
             agent=agent,
             github_account=_string(raw.get("github_account"), f"workers[{index}].github_account", optional=True),
@@ -345,6 +363,8 @@ class WorkerSpec:
 
     def as_dict(self) -> dict:
         value: dict = {"id": self.id, "enabled": self.enabled}
+        if self.max_open_prs != MAX_OPEN_PRS:
+            value["max_open_prs"] = self.max_open_prs
         if self.agent != "auto":
             value["agent"] = self.agent
         if self.only:
@@ -369,7 +389,15 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if not self.respect_claims:
             value["respect_claims"] = False
-        for name in ("github_account", "source", "author_model", "author_effort", "pace"):
+        for name in (
+            "github_account",
+            "github_state_url",
+            "github_state_token_file",
+            "source",
+            "author_model",
+            "author_effort",
+            "pace",
+        ):
             item = getattr(self, name)
             if item is not None:
                 value[name] = item
@@ -391,6 +419,7 @@ class WorkerSpec:
 
     def work_argv(self) -> list[str]:
         argv = self_argv("work", "--loop", "--worker-id", self.id)
+        argv += ["--max-open-prs", str(self.max_open_prs)]
         if self.claude_billing == "api":
             argv += ["--claude-billing", "api"]
         if self.budget:
@@ -417,6 +446,8 @@ class WorkerSpec:
             argv.append("--ignore-claims")
         for field, flag in (
             (self.github_account, "--github-account"),
+            (self.github_state_url, "--github-state-url"),
+            (self.github_state_token_file, "--github-state-token-file"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -460,10 +491,14 @@ def load_worker_specs(path: Path) -> list[WorkerSpec]:
 def _toml_value(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(_toml_value(key) + " = " + _toml_value(item) for key, item in value.items()) + " }"
     raise WorkersError(f"cannot encode TOML value of type {type(value).__name__}")
 
 
@@ -723,6 +758,9 @@ def cmd_managed_runner(args) -> int:
                 process_group=None,
                 instance=uuid.uuid4().hex,
                 spec_hash=spec.fingerprint(),
+                applied_spec=spec.as_dict(),
+                max_open_prs=spec.max_open_prs,
+                pending_read_policy=None,
                 agent=spec.agent,
                 github_account=spec.github_account,
                 only=list(spec.only),
@@ -838,6 +876,40 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
     )
 
 
+def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
+    """These read-policy edits can wait for a round boundary instead of killing paid work."""
+    applied = live.get("applied_spec")
+    if not isinstance(applied, dict):
+        # Older runners persisted only a hash. Recognize the default read policy by its
+        # actual fingerprint; unknown generations are deferred conservatively.
+        previous = dataclasses.replace(
+            spec, max_open_prs=MAX_OPEN_PRS, github_state_url=None, github_state_token_file=None
+        )
+        if previous.fingerprint() != live.get("spec_hash"):
+            # No trustworthy previous definition: use the same conservative idle/child checks.
+            applied = spec.as_dict()
+        else:
+            applied = previous.as_dict()
+    old = dict(applied)
+    desired = spec.as_dict()
+    for field in ("max_open_prs", "github_state_url", "github_state_token_file"):
+        old.pop(field, None)
+        desired.pop(field, None)
+    if old != desired:
+        return False
+    if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
+        return True
+    if (live.get("next_action_at") or 0) - time.time() < 15:
+        return True
+    pid = live.get("child_pid")
+    if sys.platform == "linux" and isinstance(pid, int):
+        try:
+            return bool(Path(f"/proc/{pid}/task/{pid}/children").read_text().strip())
+        except OSError:
+            return True
+    return False
+
+
 def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
     runtime_dir = workers_runtime_dir()
     state_dir = workers_state_dir()
@@ -940,6 +1012,9 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     is_live = bool(live.get("alive"))
                     should_run = bool(spec and spec.enabled)
                     changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
+                    if changed and should_run and wid not in restart_ids and _defer_read_policy_reload(spec, live):
+                        update_status(status_path(wid, state_dir), pending_read_policy=spec.fingerprint())
+                        continue
                     if (
                         is_live
                         and not changed
@@ -1700,6 +1775,9 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                 "--worker-id": "id",
                 "--agent": "agent",
                 "--github-account": "github_account",
+                "--github-state-url": "github_state_url",
+                "--github-state-token-file": "github_state_token_file",
+                "--max-open-prs": "max_open_prs",
                 "--only": "only",
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
@@ -1711,7 +1789,11 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             }.get(token)
             if key is None:
                 raise WorkersError(f"{path}:{number}: unsupported legacy argument {token}")
-            values[key] = value.split(",") if key in ("only", "roadmap_skip", "roadmap_extra_identities") else value
+            values[key] = (
+                value.split(",")
+                if key in ("only", "roadmap_skip", "roadmap_extra_identities")
+                else (positive_integer(value) if key == "max_open_prs" else value)
+            )
         if not values.get("id"):
             raise WorkersError(f"{path}:{number}: persistent workers need an explicit --worker-id")
         if values.pop("bubble", False):
@@ -1756,6 +1838,9 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--anthropic-api-key-file")
     add.add_argument("worker_id", nargs="?", help="stable id (default: next free workerN)")
     add.add_argument("--agent", choices=AGENTS, default="auto", help="agent for each round (default: auto)")
+    add.add_argument("--max-open-prs", type=positive_integer, default=MAX_OPEN_PRS)
+    add.add_argument("--github-state-url")
+    add.add_argument("--github-state-token-file")
     add.add_argument(
         "--github-account",
         default=argparse.SUPPRESS,
@@ -1857,6 +1942,7 @@ def cmd_workers(args) -> int:
                     raise WorkersError(f"worker already exists: {wid}")
                 raw = {
                     "id": wid,
+                    "max_open_prs": args.max_open_prs,
                     "agent": args.agent,
                     "only": [item for item in args.only.split(",") if item],
                     "sandbox": args.sandbox,
@@ -1871,7 +1957,16 @@ def cmd_workers(args) -> int:
                     if args.anthropic_api_key_file
                     else None,
                 }
-                for key in ("github_account", "roadmap_only", "source", "author_model", "author_effort", "pace"):
+                for key in (
+                    "github_account",
+                    "github_state_url",
+                    "github_state_token_file",
+                    "roadmap_only",
+                    "source",
+                    "author_model",
+                    "author_effort",
+                    "pace",
+                ):
                     value = getattr(args, key, None)
                     if value is not None:
                         raw[key] = value

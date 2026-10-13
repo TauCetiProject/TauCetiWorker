@@ -21,11 +21,14 @@ Pinned here:
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import contextlib
+import os
 import subprocess
 import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -73,6 +76,87 @@ def main():
         root = Path(tmp)
         repo = fresh_repo(root)
         head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        candidate = tc.Candidate(1, head)
+        cfg = types.SimpleNamespace(checkout=repo)
+        check(
+            "an unchanged candidate can yield to other work",
+            tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+        )
+        check(
+            "roadmap work is never discarded as a declined PR",
+            not tc.work_units._candidate_checkout_unchanged(cfg, tc.Candidate(0, head)),
+        )
+        (repo / "unpublished.txt").write_text("retained work\n")
+        check(
+            "uncommitted work prevents declining the candidate",
+            not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+        )
+        git(repo, "add", "unpublished.txt")
+        git(repo, "commit", "-qm", "retained publication")
+        check(
+            "unpublished commits prevent declining the candidate",
+            not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+        )
+        git(repo, "reset", "--hard", head)
+
+        # Exercise the actual dispatch/cascade: a paid no-change fix consumes
+        # its target allowance but does not stop another actionable PR.
+        cfg.wid, cfg.logdir = "test", root / "logs"
+        counts, attempts = {}, []
+        counters = types.SimpleNamespace(
+            read=lambda key: counts.get(key, 0),
+            write=lambda key, value: counts.__setitem__(key, value),
+        )
+        worker = types.SimpleNamespace(cfg=cfg, counters=counters, gh=None, rs=None)
+        survey = tc.Survey(worker_id="test")
+        survey.needs_fix.actionable = [candidate, tc.Candidate(2, head)]
+        opts = tc.RoundOpts(only=["fix"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)
+
+        def fake_fix(_w, _sv, c, _opts, _bubble):
+            attempts.append(c.pr)
+            key = f"fix-{c.pr}-{c.head[:12]}"
+            counters.write(key, counters.read(key) + 1)
+            return 0
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(root / "shared")}),
+            patch.object(tc.work_units, "mirror_creds"),
+            patch.object(tc.work_units, "survey", return_value=survey),
+            patch.object(tc.work_units, "spread_candidates", side_effect=lambda cs: cs),
+            patch.object(tc.work_units, "_still_actionable", return_value=True),
+            patch.object(tc.work_units, "_host_agent_binary", return_value="python3"),
+            patch.object(tc.work_units, "_progress_snapshot", return_value={}),
+            patch.object(tc.work_units, "_progressed", side_effect=lambda _w, c, _pre: c.pr == 2),
+            patch.object(tc.work_units, "do_fix", side_effect=fake_fix),
+            patch("tauceti_worker.github_transport.observed_budget", return_value={}),
+            patch("tauceti_worker.claude_api.api_mode", return_value=False),
+            patch("tauceti_worker.claude_api.api_context", side_effect=lambda *_a, **_k: contextlib.nullcontext()),
+        ):
+            check(
+                "no-change target falls through to another actionable target",
+                tc.work_units.run_round(worker, opts) == 0 and attempts == [1, 2],
+            )
+            check("the no-change target attempt stays charged", counters.read(f"fix-1-{head[:12]}") == 1)
+            # Retain unfinished local edits instead of switching checkouts.
+            (repo / "retained.txt").write_text("unfinished\n")
+            try:
+                tc.work_units.dispatch("fix", worker, survey, candidate, opts)
+            except tc.NoProgress:
+                check("unpublished edits retain the recovery path", True)
+            else:
+                check("unpublished edits retain the recovery path", False)
+            (repo / "retained.txt").unlink()
+            from tauceti_worker.github_outbox import directory
+
+            pending = directory() / "retained.json"
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            pending.write_text("{}")
+            check(
+                "pending publications prevent declining the candidate",
+                not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.unlink()
 
         # 4) a round that changed nothing is silent.
         check("a clean round logs nothing", run(repo, head) == "")

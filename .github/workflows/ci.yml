@@ -13,6 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  github-state:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/github-state
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: services/github-state/package-lock.json
+      - run: npm ci
+      - run: npm test
+
   test:
     runs-on: ubuntu-latest
     env:

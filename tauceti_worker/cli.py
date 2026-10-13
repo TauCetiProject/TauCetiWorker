@@ -154,6 +154,8 @@ full reference:
 
 
 def add_github_account_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--github-state-url", default=argparse.SUPPRESS, help="shared GitHub state service URL")
+    p.add_argument("--github-state-token-file", default=argparse.SUPPRESS, help="private service client token file")
     p.add_argument(
         "--github-account",
         default=argparse.SUPPRESS,
@@ -170,7 +172,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--max-open-prs",
         type=positive_integer,
         default=None,
-        help="open PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 8)",
+        help="open roadmap PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 8)",
     )
     p.add_argument(
         "--overlap-batch-commits",
@@ -756,8 +758,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument(
         "--reference-repo-loc",
         type=float,
-        default=1.3e6,
-        help="repository size at which infrastructure was measured (calibration default: 1.3e6)",
+        default=None,
+        help="CI/R2 baseline size in LOC (default: --current-repo-loc)",
     )
     c.add_argument(
         "--current-repo-loc",
@@ -845,6 +847,21 @@ def main(argv: list[str] | None = None) -> int:
         raise Die(str(error)) from None
 
     resolve_pace(cmd, args)
+    for field, variable in (
+        ("github_state_url", "TAUCETI_GITHUB_STATE_URL"),
+        ("github_state_token_file", "TAUCETI_GITHUB_STATE_TOKEN_FILE"),
+    ):
+        if hasattr(args, field):
+            value = getattr(args, field)
+            os.environ[variable] = str(Path(value).expanduser().resolve()) if field.endswith("file") else value
+    from .config import max_open_prs
+
+    if getattr(args, "max_open_prs", None) is not None:
+        os.environ["TAUCETI_MAX_OPEN_PRS"] = str(args.max_open_prs)
+    try:
+        max_open_prs()
+    except ValueError as error:
+        raise Die(f"TAUCETI_MAX_OPEN_PRS {error}") from None
 
     if cmd == "budget":
         try:
@@ -852,9 +869,20 @@ def main(argv: list[str] | None = None) -> int:
         except (BudgetError, OSError) as error:
             raise Die(str(error)) from None
     if cmd in (None, "status", "doctor", "work", "_round", "_egress-probe", "overlap"):
+        from .github_transport import install_proxy
+
+        if getattr(args, "worker_id", None):
+            os.environ["TAUCETI_WORKER_ID"] = sanitize_wid(args.worker_id)
+        install_proxy()
+        if cmd in ("work", "_round"):
+            report_runtime(max_open_prs=max_open_prs())
+        if cmd == "work" and getattr(args, "loop", False):
+            report_runtime(github_transport_loop_rev=os.environ.get("TAUCETI_GITHUB_TRANSPORT_REV"))
         account = getattr(args, "github_account", os.environ.get("TAUCETI_GITHUB_ACCOUNT"))
         if account is not None:
-            args.github_account = pin_github_account(account)
+            args.github_account = pin_github_account(
+                account, wait_for_reset=cmd == "work" and getattr(args, "loop", False)
+            )
             report_runtime(github_account=args.github_account)
 
     if cmd == "overlap":
@@ -931,10 +959,11 @@ def cmd_cost_model(args) -> int:
         raise Die("--limit must be a non-negative integer")
     if args.cache_objects < 0:
         raise Die("--cache-objects must be a non-negative integer")
+    reference_repo_loc = args.current_repo_loc if args.reference_repo_loc is None else args.reference_repo_loc
     positive = {
         "--changed-loc-per-pr": args.changed_loc_per_pr,
         "--changed-per-net-loc": args.changed_per_net_loc,
-        "--reference-repo-loc": args.reference_repo_loc,
+        "--reference-repo-loc": reference_repo_loc,
         "--current-repo-loc": args.current_repo_loc,
     }
     projections = args.projection_loc or [1e6, 1e7, 1e8]
@@ -981,7 +1010,7 @@ def cmd_cost_model(args) -> int:
             ai_usd_per_changed_loc=selected_ai,
             changed_loc_per_pr=args.changed_loc_per_pr,
             changed_per_net_loc=args.changed_per_net_loc,
-            reference_repo_loc=args.reference_repo_loc,
+            reference_repo_loc=reference_repo_loc,
             current_repo_loc=args.current_repo_loc,
             projection_locs=projections,
         )
@@ -1091,6 +1120,18 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
+    if one_round and not getattr(args, "dry_run", False):
+        from .constants import EX_NOPROGRESS
+        from .github_outbox import drain
+
+        pending = drain()
+        if pending:
+            log(f"GitHub publications awaiting retry or reconciliation: {len(pending)}; retaining completed work")
+            reason = f"{len(pending)} retained GitHub publications awaiting retry or reconciliation"
+            report_failure(reason, code=EX_NOPROGRESS)
+            report_runtime("waiting-github", detail=reason, publication_pending_count=len(pending))
+            return EX_NOPROGRESS
+        report_runtime(publication_pending_count=0)
     try:
         configure_api(args, agent)
     except (BudgetError, OSError) as error:
