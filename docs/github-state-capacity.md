@@ -166,3 +166,10 @@ Replay tests establish scheduling, consistency, and quota accounting; they do
 not prove real Cloudflare/GitHub throughput at $1,500/hour. Replace the model's
 turnover, density, pagination, and fallback assumptions with observations from
 these windows before making that claim.
+
+An October 13 test probe issued 160 cached scalar PR reads from one host. All
+succeeded. With four concurrent requests, throughput was 27.3 reads/second and
+p95 latency was 198 ms; with sixteen, throughput was 73.7 reads/second and p95
+latency was 165 ms. Responses averaged 6.2 kB. These reads exercised the live
+Cloudflare service and its stored PR state. They did not measure large
+inventories, long histories, a sustained fleet workload, or GitHub writes.
