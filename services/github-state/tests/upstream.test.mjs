@@ -143,6 +143,35 @@ test('delivery audit follows busy-repository pages and redelivers failures beyon
   assert.equal(paths.length,3,'completed audit does not poll again before its interval');
  }finally{await mf.dispose();}
 });
+test('one rejected redelivery cannot hide subsequent failed deliveries',async()=>{
+ const attempts=[];
+ const mf=await runtime(async(req,u)=>{
+  if(u.pathname.endsWith('/attempts')) {attempts.push(u.pathname);return response({},'app',4999,u.pathname.includes('/101/')?404:202);}
+  return response([101,102].map(id=>({id,delivered_at:new Date().toISOString(),status_code:500})),'app');
+ });
+ try {
+  const ns=await mf.getDurableObjectNamespace('INSTALLATIONS'),stub=ns.get(ns.idFromName('200'));
+  assert.equal((await send(stub,'/audit',repository)).status,200);
+  assert.deepEqual(attempts,['/app/hook/deliveries/101/attempts','/app/hook/deliveries/102/attempts']);
+  await send(stub,'/audit',repository);assert.equal(attempts.length,2);
+ }finally {await mf.dispose();}
+});
+
+test('redelivery auth errors are visible and deferred without hiding other gaps',async()=>{
+ const attempts=[];
+ const mf=await runtime(async(req,u)=>{
+  if(u.pathname.endsWith('/attempts')) {attempts.push(u.pathname);return response({},'app',4999,u.pathname.includes('/101/')?401:202);}
+  return response([101,102].map(id=>({id,delivered_at:new Date().toISOString(),status_code:500})),'app');
+ });
+ try {
+  const ns=await mf.getDurableObjectNamespace('INSTALLATIONS'),stub=ns.get(ns.idFromName('200'));
+  assert.equal((await send(stub,'/audit',repository)).status,200);
+  assert.deepEqual(attempts,['/app/hook/deliveries/101/attempts','/app/hook/deliveries/102/attempts']);
+  const health=await (await stub.fetch('https://internal/health')).json();assert.equal(health.redelivery_failure.status,401);
+  await send(stub,'/audit',repository);assert.equal(attempts.length,2);
+ }finally {await mf.dispose();}
+});
+
 test('scalar GraphQL recipes declare only variables they use',async()=>{
  const mf=await runtime(async(req,u)=>{
   assert.equal(u.pathname,'/graphql');

@@ -47,4 +47,36 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_SHAR
         assert destination.is_symlink() and destination.resolve() == new
         assert git("-C", destination, "config", "remote.origin.pushurl").stdout.strip() == "no_push"
         assert not (new / ".git/objects/info/alternates").exists()
+
+        def failing_fetch(*args):
+            if "fetch" in args:
+                return subprocess.CompletedProcess(args, 1, "", "offline")
+            return local_git(*args)
+
+        with patch.object(shared, "_git", side_effect=failing_fetch):
+            assert shared.snapshot("org/roadmap", ttl=0) == new, (
+                "fetch failure must not revert to the bare mirror's original HEAD"
+            )
+        (source / "data").write_text("third")
+        git("-C", source, "add", "data")
+        git("-C", source, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "third")
+        third_sha = git("-C", source, "rev-parse", "HEAD").stdout.strip()
+
+        def interrupted_clone(*args):
+            if args[0] == "clone" and "--no-local" in args:
+                Path(args[-1]).mkdir()
+                (Path(args[-1]) / "partial").write_text("incomplete")
+                raise subprocess.TimeoutExpired("git", 120)
+            return local_git(*args)
+
+        with patch.object(shared, "_git", side_effect=interrupted_clone):
+            try:
+                shared.snapshot("org/roadmap", ttl=0)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError("expected interrupted clone")
+        assert not new.with_name(third_sha).exists(), "partial snapshots are never published"
+        assert not list(new.parent.glob(".staging-*"))
+        assert (shared.snapshot("org/roadmap", ttl=0) / "data").read_text() == "third"
 print("PASS: shared snapshot TTL, immutability, old-round retention and self-contained Git metadata")

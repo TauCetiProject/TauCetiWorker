@@ -45,32 +45,54 @@ def snapshot(repo: str, *, ttl: int = 3600) -> Path | None:
             temp.rename(mirror)
             _git("--git-dir", mirror, "config", "remote.origin.pushurl", "no_push")
         if not state.get("sha") or time.time() - state.get("fetched", 0) >= ttl:
-            fetched = _git("--git-dir", mirror, "fetch", "--depth=1", "origin", "HEAD")
-            rev = _git("--git-dir", mirror, "rev-parse", "FETCH_HEAD" if not fetched.returncode else "HEAD")
-            if rev.returncode:
-                return None
-            sha = rev.stdout.strip()
+            try:
+                fetched = _git("--git-dir", mirror, "fetch", "--depth=1", "origin", "HEAD")
+            except (OSError, subprocess.SubprocessError):
+                fetched = subprocess.CompletedProcess([], 1)
+            sha = state.get("sha")
+            if not fetched.returncode or not sha:
+                rev = _git("--git-dir", mirror, "rev-parse", "FETCH_HEAD" if not fetched.returncode else "HEAD")
+                if rev.returncode:
+                    return None
+                sha = rev.stdout.strip()
             if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
                 return None
-            state = {"sha": sha, "fetched": time.time() if fetched.returncode == 0 else 0}
+            state = {**state, "sha": sha, "fetched": time.time() if fetched.returncode == 0 else 0}
             transport.atomic(base / "state.json", state)
         # A linked worktree's .git points outside the mounted tree and breaks inside Bubble.
         # Use a self-contained shallow Git copy; all workers still share one immutable version.
         target = base / "snapshots-v2" / state["sha"]
+        if target.exists() and state.get("snapshot_ready") != state["sha"]:
+            # Validate trees published by older clients which cloned in place.
+            head = _git("-C", target, "rev-parse", "HEAD")
+            clean = _git("-C", target, "diff", "--quiet", "HEAD", "--")
+            if head.returncode or head.stdout.strip() != state["sha"] or clean.returncode:
+                for directory, _, _ in os.walk(target):
+                    Path(directory).chmod(0o700)
+                shutil.rmtree(target)
         if not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
             _git("--git-dir", mirror, "update-ref", "refs/heads/snapshot", state["sha"])
-            result = _git("clone", "--no-local", "--depth=1", "--branch=snapshot", "--", mirror, target)
-            if result.returncode:
-                return None
-            _git("-C", target, "config", "remote.origin.url", "https://github.com/" + repo)
-            _git("-C", target, "config", "remote.origin.pushurl", "no_push")
+            staging = target.with_name(".staging-" + uuid.uuid4().hex)
+            try:
+                result = _git("clone", "--no-local", "--depth=1", "--branch=snapshot", "--", mirror, staging)
+                if result.returncode:
+                    return None
+                _git("-C", staging, "config", "remote.origin.url", "https://github.com/" + repo)
+                _git("-C", staging, "config", "remote.origin.pushurl", "no_push")
+                staging.rename(target)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
             for directory, _, files in os.walk(target, topdown=False):
                 for name in files:
                     item = Path(directory) / name
                     if not item.is_symlink():
                         item.chmod(0o555 if item.stat().st_mode & 0o111 else 0o444)
                 Path(directory).chmod(0o555)
+        if state.get("snapshot_ready") != state["sha"]:
+            state["snapshot_ready"] = state["sha"]
+            transport.atomic(base / "state.json", state)
         # Process leases pin old versions across a refresh. GC only removes unpinned day-old trees.
         transport.atomic(base / "leases" / (str(os.getpid()) + ".json"), {"sha": state["sha"], "time": time.time()})
         pins = {state["sha"]}

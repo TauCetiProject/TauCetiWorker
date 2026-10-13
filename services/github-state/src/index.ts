@@ -60,7 +60,7 @@ export default {
         const input:any=await req.json();
         if (!Array.isArray(input.queries) || input.queries.length>50) return json({error:'invalid_batch'},400);
         const results=[];
-        for (const q of input.queries) { const response=await query(req,env,q); results.push({status:response.status,result:await response.json()}); }
+        for (const q of input.queries) { const response=await query(req,env,q); results.push({status:response.status,result:response.status===304?null:await response.json()}); }
         return json({version:1,results});
       }
       if (['/v1/health','/v1/changes'].includes(url.pathname) && req.method==='GET') {
@@ -114,7 +114,16 @@ export default {
     // Retention is explicit so raw webhook bodies and abandoned staging pages do not accumulate.
     ctx.waitUntil((async()=>{
       const page=await env.ARCHIVE.list({limit:100,include:['customMetadata'],cursor:await env.ARCHIVE.get('retention-cursor').then(o=>o?.text()) || undefined});
-      for (const object of page.objects) if (Number(object.customMetadata?.expires)<Date.now()) await env.ARCHIVE.delete(object.key);
+      for (const object of page.objects) {
+        if(Number(object.customMetadata?.expires)<Date.now()) await env.ARCHIVE.delete(object.key);
+        else if(object.customMetadata?.kind==='resource' && object.uploaded.getTime()<Date.now()-8*86400000) {
+          const repo=repositories(env).find(r=>object.key.startsWith('resources/'+r.id+'/'));
+          if(repo) {
+            const response=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/retained-object?key='+encodeURIComponent(object.key));
+            if(response.ok && (await response.json() as any).retained===false) await env.ARCHIVE.delete(object.key);
+          }
+        }
+      }
       if (page.truncated) await env.ARCHIVE.put('retention-cursor',page.cursor); else await env.ARCHIVE.delete('retention-cursor');
     })());
   }

@@ -107,6 +107,12 @@ request and stalled interval remains bounded. Partial histories never become
 empty results. The direct facade and service share the field/route catalog in
 `tauceti_worker/github_catalog.json`.
 
+Worker surveys use a materialized, roadmap-filtered fact snapshot instead of
+fetching every PR's full comment histories. The scheduling cascade remains in
+the worker for full service-outage fallback. See [compact surveys](../../docs/compact-surveys.md)
+for scope rules, per-history coverage, migration, telemetry, and cross-language
+contract tests.
+
 ```toml
 max_open_prs = 128
 github_state_url = "https://github-state.taucetiproject.org"
@@ -253,3 +259,58 @@ not send notifications or alter worker configuration. A quota-deferred request
 is distinguished from a repair stalled with available quota.
 Use `--resume` after a process or host interruption. Saved samples are retained,
 but gaps longer than twice the sampling interval do not count toward the hour.
+
+## Publication recovery and quota pauses
+
+An actual GitHub quota rejection becomes a `waiting-github` pause with a reset
+or retry time. It does not advance the no-progress backoff or consume a PR's
+retry allowance. Opaque CLI commands may use an available API pool; the proxy
+waits on the pool a request actually exhausts. Mirror-backed stages are not
+parked by an unrelated exhausted search or direct-read quota.
+
+Retained publications are replayed after a definitive rejection, or reconciled
+before replay after an uncertain acknowledgement. Unresolved publications
+hold their own PR target while unrelated work continues. Temporary bodies and
+stdin input remain in the private intent. Local recovery controls are:
+
+```sh
+uv run python -m tauceti_worker.github_outbox list
+uv run python -m tauceti_worker.github_outbox abandon --intent <private-path> --note <reason>
+uv run python -m tauceti_worker.github_outbox retry --intent <private-path> --note <reason> --acknowledge-duplicate-risk
+```
+
+Manual retry only releases an intent for the normal recovery path; it does not
+send a GitHub request immediately. An ambiguous write may already have landed.
+Issue creation and review replies reconcile against retained bodies and authors;
+acknowledgement matching allows five minutes of clock skew. Unknown mutation
+types retain their evidence for operator recovery. Retained duplicate commands
+honor the recovery deadline instead of repeatedly retrying every five seconds.
+Claims and post-write progress acknowledgements use direct reads to avoid
+webhook delivery races; ordinary surveys continue using the freshest service
+data, with no age gate before spending.
+
+Native cost checkpoints are provisional while the process remains alive. If
+termination interrupts the final receipt, the ledger keeps the checkpoint as
+a provisional reservation, covering the known lower bound plus another full
+session estimate. Funded peers can continue; the affected provider session
+still needs a final receipt or explicit reconciliation. These reservations
+are estimates, not hard upper bounds on provider spending. Final receipts with
+missing cost segments remain unresolved, reserving any known lower bound plus
+an estimated tail. Missing evidence retains the original admission reservation.
+They hold only their own provider resumption; other funded work can proceed.
+Provisional costs are excluded from settled expenditure and reported separately. Existing grants and settled ledger events are preserved.
+
+Endpoint accounting consumes multiline `gh` debug bodies privately and records
+measured GraphQL cost and operation type, without exporting request bodies.
+Missing staging pages restart their collection; persistent parser and transport
+errors retain pagination and retry with exponential delays from one minute to
+one hour. Webhook redelivery auth and transport failures remain retryable while
+other gaps proceed; deleted deliveries trigger one broad repair and are skipped.
+
+Daily R2 archives use version-2 manifests and bounded, resumable table pages.
+They record the starting and ending revisions and are observational archives;
+Durable Object point-in-time recovery remains the database backup. Unreferenced
+R2 spill objects can be collected eight days after retirement, leaving seven-day archive
+references and active SQL references intact. SQLite resource rows are retained;
+long-term database growth still needs a cold-storage policy before claiming
+sustained operation at the modeled $1,500/hour scale.

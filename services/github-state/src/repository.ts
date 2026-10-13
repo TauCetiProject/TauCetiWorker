@@ -3,10 +3,12 @@ import { Env, EventPointer, Query, Result, json, queryKey, repository, stub, val
 import { comment, issue, pr, status } from './normalize';
 import { batchLimit } from './catalog';
 import { Lane, LANES, laneAt, settings } from './reconciliation';
+import { SURVEY_CONTRACT, compactPR, issueFragment, reviewFragment, summarizeFragments, inScope, roadmapFocuses } from './survey';
 
 export class RepositoryState extends DurableObject<Env> {
   private inflightQueries=new Map<string,Promise<Result>>();
   private completedQueries=new Map<string,{result:Result,expires:number}>();
+  private snapshotFlight?:Promise<void>;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
@@ -20,7 +22,15 @@ export class RepositoryState extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS jobs_due ON jobs(due,priority);
       CREATE TABLE IF NOT EXISTS demand(key TEXT PRIMARY KEY,at INTEGER);
       CREATE TABLE IF NOT EXISTS cursors(id TEXT PRIMARY KEY,expires INTEGER,payload TEXT);
+      CREATE TABLE IF NOT EXISTS retired_objects(key TEXT PRIMARY KEY,at INTEGER);
       CREATE TABLE IF NOT EXISTS head_prs(sha TEXT,number TEXT,PRIMARY KEY(sha,number));`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS survey_fragments(kind TEXT,id TEXT,parent TEXT,data TEXT,PRIMARY KEY(kind,id));
+      CREATE INDEX IF NOT EXISTS survey_fragment_parent ON survey_fragments(parent,kind);
+      CREATE TABLE IF NOT EXISTS survey_state(number TEXT PRIMARY KEY,data TEXT,revision INTEGER);
+      CREATE TABLE IF NOT EXISTS survey_inventory(number TEXT PRIMARY KEY,data TEXT);
+      CREATE TABLE IF NOT EXISTS survey_hydrated(number TEXT PRIMARY KEY,contract TEXT);
+      CREATE TABLE IF NOT EXISTS survey_dirty(number TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS survey_hydration_failures(number TEXT PRIMARY KEY,retry_at INTEGER);`);
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS repair_metrics(at INTEGER,event TEXT,lane TEXT,operation TEXT,value INTEGER DEFAULT 1);
       CREATE INDEX IF NOT EXISTS repair_metrics_at ON repair_metrics(at);
       CREATE TABLE IF NOT EXISTS query_metrics(operation TEXT,coverage TEXT,requests INTEGER,last_at INTEGER,PRIMARY KEY(operation,coverage));`);
@@ -75,6 +85,12 @@ export class RepositoryState extends DurableObject<Env> {
     if (!fromEvent && old?.observed > started) return false;
     if (old?.updated && updated && old.updated > updated) return false;
     if (old?.updated && updated===old.updated && old.tombstone && !deleted) return false;
+    if(kind==='pr' && old && data?.headRefOid) {
+      const prior=await this.decode(old.data);
+      if(prior.headRefOid===data.headRefOid && prior.baseRefOid===data.baseRefOid)
+        data={...prior,...Object.fromEntries(Object.entries(data).filter(([,v])=>v!==undefined))};
+      else if(data.mergeable===undefined) data={...data,mergeable:'UNKNOWN'};
+    }
     const encoded = await this.encode(data);
     // R2 encoding yields: repeat the guard against events received during that await.
     old=this.ctx.storage.sql.exec<any>('SELECT * FROM resources WHERE kind=? AND id=?',kind,id).toArray()[0];
@@ -86,6 +102,11 @@ export class RepositoryState extends DurableObject<Env> {
     }
     const rev = this.nextRevision(kind,id,deleted);
     this.ctx.storage.sql.exec('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET parent=excluded.parent,data=excluded.data,updated=excluded.updated,observed=excluded.observed,revision=excluded.revision,tombstone=excluded.tombstone',kind,id,parent,encoded,updated,Date.now(),rev,Number(deleted));
+    if(kind==='pr' && /^[1-9][0-9]*$/.test(id)) this.ctx.storage.sql.exec('INSERT INTO survey_inventory VALUES(?,?) ON CONFLICT(number) DO UPDATE SET data=excluded.data',id,JSON.stringify(compactPR(data)));
+    if(['issue_comments','review_comments'].includes(kind)) {
+      try {this.projectSurvey(kind,id,parent,data,deleted);this.dirtySurvey(parent);}
+      catch {this.invalidateSurvey(parent);}
+    }
     return true;
   }
   membership(key:string,id:string,included:boolean): void {
@@ -94,6 +115,94 @@ export class RepositoryState extends DurableObject<Env> {
     if (included) this.ctx.storage.sql.exec('INSERT INTO members VALUES(?,?)',key,id);
     else this.ctx.storage.sql.exec('DELETE FROM members WHERE collection=? AND id=?',key,id);
     this.nextRevision('collection',key);
+    if(key.startsWith('issue_comments:') || key.startsWith('review_comments:')) {
+      const args=JSON.parse(key.slice(key.indexOf(':')+1));
+      if(args.number) this.dirtySurvey(String(args.number));
+    }
+  }
+  projectSurvey(kind:string,id:string,parent:string,data:any,deleted=false): void {
+    if(!parent || !this.ctx.storage.sql.exec("SELECT id FROM resources WHERE kind='pr' AND id=?",parent).toArray().length) return;
+    const fragment=kind==='issue_comments'?issueFragment(data):reviewFragment(data);
+    const useful=kind==='issue_comments'?fragment.meta!==null || fragment.marker || fragment.rebase_heads.length:fragment.root || fragment.parent && fragment.reply;
+    if(deleted || !useful) this.ctx.storage.sql.exec('DELETE FROM survey_fragments WHERE kind=? AND id=?',kind,id);
+    else this.ctx.storage.sql.exec('INSERT INTO survey_fragments VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET parent=excluded.parent,data=excluded.data',kind,id,parent,JSON.stringify(fragment));
+  }
+  rebuildSurvey(number:string): void {
+    const read=(kind:string)=>this.ctx.storage.sql.exec<any>('SELECT f.data FROM survey_fragments f JOIN members m ON m.id=f.id AND m.collection=? WHERE f.kind=? AND f.parent=? ORDER BY CAST(f.id AS INTEGER),f.id',queryKey({operation:kind,args:{number:Number(number)}}),kind,number).toArray().map(row=>JSON.parse(row.data));
+    const data=JSON.stringify(summarizeFragments(read('issue_comments'),read('review_comments')));
+    this.ctx.storage.sql.exec('INSERT INTO survey_state VALUES(?,?,?) ON CONFLICT(number) DO UPDATE SET data=excluded.data,revision=excluded.revision',number,data,this.revision());
+    this.ctx.storage.sql.exec('DELETE FROM survey_dirty WHERE number=?',number);
+  }
+  dirtySurvey(number:string): void {
+    if(number && this.ctx.storage.sql.exec("SELECT id FROM resources WHERE kind='pr' AND id=?",number).toArray().length)
+      this.ctx.storage.sql.exec('INSERT OR IGNORE INTO survey_dirty VALUES(?)',number);
+  }
+  invalidateSurvey(number:string): void {
+    this.ctx.storage.sql.exec('DELETE FROM survey_hydrated WHERE number=?',number);
+    this.ctx.storage.sql.exec('INSERT INTO survey_hydration_failures VALUES(?,?) ON CONFLICT(number) DO UPDATE SET retry_at=excluded.retry_at',number,Date.now()+300000);
+    this.nextRevision('survey_failure',number);
+  }
+  async hydrateSurvey(number:string): Promise<void> {
+    // Existing deployments already have complete histories. Project those
+    // locally once, in bounded batches, without any new GitHub requests.
+    const prRow=this.ctx.storage.sql.exec<any>("SELECT data,revision FROM resources WHERE kind='pr' AND id=?",number).toArray()[0];
+    if(prRow) {
+      const data=await this.decode(prRow.data);
+      if(this.ctx.storage.sql.exec<any>("SELECT revision FROM resources WHERE kind='pr' AND id=?",number).toArray()[0]?.revision===prRow.revision)
+        this.ctx.storage.sql.exec('INSERT INTO survey_inventory VALUES(?,?) ON CONFLICT(number) DO UPDATE SET data=excluded.data',number,JSON.stringify(compactPR(data)));
+    }
+    const rows=this.ctx.storage.sql.exec<any>("SELECT kind,id,parent,data,revision FROM resources WHERE kind IN ('issue_comments','review_comments') AND parent=? AND tombstone=0",number).toArray();
+    for(const row of rows) {
+      const data=await this.decode(row.data);
+      const current=this.ctx.storage.sql.exec<any>('SELECT revision,tombstone FROM resources WHERE kind=? AND id=?',row.kind,row.id).toArray()[0];
+      if(current?.revision===row.revision && !current.tombstone) this.projectSurvey(row.kind,row.id,number,data);
+    }
+    this.rebuildSurvey(number);
+    this.nextRevision('survey',number);
+    this.ctx.storage.sql.exec('INSERT INTO survey_hydrated VALUES(?,?) ON CONFLICT(number) DO UPDATE SET contract=excluded.contract',number,SURVEY_CONTRACT);
+    this.ctx.storage.sql.exec('DELETE FROM survey_hydration_failures WHERE number=?',number);
+  }
+  async surveyRows(q:Query): Promise<{rows:any[],author_counts:Record<string,number>} | null> {
+    const inventory={repository:q.repository,operation:'open_prs'};
+    await this.noteDemand(inventory);
+    if(!this.complete(inventory)) {await this.enqueue(inventory,5);return null;}
+    // Scan compact local metadata, then add statuses only for the selected
+    // roadmap. Descriptions and unrelated comment histories stay in storage.
+    const rows=this.ctx.storage.sql.exec<any>("SELECT COALESCE(s.data,r.data) data FROM members m JOIN resources r ON r.kind='pr' AND r.id=m.id LEFT JOIN survey_inventory s ON s.number=r.id WHERE m.collection=? AND r.tombstone=0 ORDER BY CAST(r.id AS INTEGER),r.id",queryKey(inventory)).toArray();
+    const scope=String(q.args?.roadmap || 'any'),skip=String(q.args?.skip || '').split(',').filter(Boolean),out=[];
+    const author_counts:Record<string,number>={},stages=new Set(String(q.args?.stages ?? 'review,fix,rebase').split(','));
+    for(const storedRow of rows) {
+      const row=compactPR(await this.decode(storedRow.data));
+      if(row.state && row.state!=='OPEN') continue;
+      const areas=roadmapFocuses((row.labels || []).map((label:any)=>label.name),row.target_focuses,row.headRefName);
+      if(!row.isDraft && (areas===null || areas.some(area=>!skip.includes(area)))) {
+        const author=row.author?.login || '';author_counts[author]=(author_counts[author] || 0)+1;
+      }
+      if(q.args?.numbers ? !String(q.args.numbers).split(',').includes(String(row.number)) : !inScope(row,scope,skip)) continue;
+      const number=String(row.number);let hydrated=this.ctx.storage.sql.exec<any>('SELECT contract FROM survey_hydrated WHERE number=?',number).toArray()[0]?.contract===SURVEY_CONTRACT;
+      if(hydrated && this.ctx.storage.sql.exec('SELECT number FROM survey_dirty WHERE number=?',number).toArray().length) {
+        try {this.rebuildSurvey(number);}catch {this.invalidateSurvey(number);hydrated=false;}
+      }
+      const stored=this.ctx.storage.sql.exec<any>('SELECT data FROM survey_state WHERE number=?',number).toArray()[0];
+      const review={...(hydrated && stored?JSON.parse(stored.data):summarizeFragments([],[])),issue_complete:false,review_complete:false};
+      const statuses=await this.rows({repository:q.repository,operation:'statuses',args:{sha:row.headRefOid}});
+      const green=Array.isArray(statuses) && statuses.some(c=>c.context==='build' && c.state==='SUCCESS') && !statuses.some(c=>c.context==='build' && c.state!=='SUCCESS');
+      for(const [operation,field] of [['issue_comments','issue_complete'],['review_comments','review_complete']]) {
+        const child={repository:q.repository,operation,args:{number:row.number}};
+        review[field]=hydrated && this.complete(child);
+        // Demand is deduplicated in the installation scheduler; serving a
+        // snapshot never performs synchronous upstream validation.
+        const needs=operation==='issue_comments'?(green && (stages.has('review') || stages.has('fix'))) || stages.has('rebase') && (row.labels || []).some((l:any)=>l.name==='needs-rebase'):green && (stages.has('review') || stages.has('fix'));
+        if(!row.isDraft && needs && !this.complete(child)) {await this.noteDemand(child);await this.enqueue(child,5);}
+      }
+      out.push({contract:SURVEY_CONTRACT,pr:{...compactPR(row),statusCheckRollup:Array.isArray(statuses)?statuses:[]},review});
+    }
+    return {rows:out,author_counts};
+  }
+  surveyHealth(): any {
+    const counts=this.ctx.storage.sql.exec<any>("SELECT COUNT(*) open_prs,SUM(h.contract=?) hydrated,SUM(s.number IS NOT NULL) materialized FROM members m JOIN resources r ON r.kind='pr' AND r.id=m.id LEFT JOIN survey_hydrated h ON h.number=r.id LEFT JOIN survey_state s ON s.number=r.id WHERE m.collection=? AND r.tombstone=0",SURVEY_CONTRACT,queryKey({operation:'open_prs'})).one();
+    const failures=this.ctx.storage.sql.exec<any>('SELECT COUNT(*) n FROM survey_hydration_failures').one().n;
+    return {contract:SURVEY_CONTRACT,...counts,failures};
   }
   id(operation:string,row:any): string { return String(row.number || row.id || row.node_id || row.ref || row.context || row.sha || row.headRefOid || 'value'); }
   async enqueue(q:Query,priority=20,due=Date.now(),dirty=false): Promise<void> {
@@ -311,8 +420,10 @@ export class RepositoryState extends DurableObject<Env> {
     for (const row of members) {
       const data=await this.decode(row.data);
       if (q.operation==='workflow_jobs' && Number(data.run_attempt || 1)!==(this.meta('workflow_attempt:'+q.args?.id) || 1)) continue;
-      if (q.operation==='open_prs') {
+      if (q.operation==='open_prs' || q.operation==='open_issues') {
         if (data.state && data.state!=='OPEN') continue;
+      }
+      if (q.operation==='open_prs') {
         const statuses=await this.rows({repository:q.repository,operation:'statuses',args:{sha:data.headRefOid}});
         data.statusCheckRollup=Array.isArray(statuses)?statuses:[];
       }
@@ -325,7 +436,7 @@ export class RepositoryState extends DurableObject<Env> {
     const repo=this.meta('repository'); if (!repo) await this.configure(q.repository);
     const key=queryKey(q);
     if(q.operation==='workflow_jobs') this.runAttempt(String(q.args?.id));
-    if (!q.allow_observed) await this.noteDemand(q);
+    if (!q.allow_observed && q.operation!=='survey') await this.noteDemand(q);
     if (q.cursor) {
       const row=this.ctx.storage.sql.exec<any>('SELECT payload FROM cursors WHERE (id=? OR id=?) AND expires>? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END LIMIT 1',q.cursor,q.cursor.split(':')[0],Date.now(),q.cursor).toArray()[0];
       if (!row) return {version:1,repository:q.repository,operation:q.operation,status:'unavailable',revision:this.revision(),complete:false,reason:'cursor_expired'};
@@ -339,9 +450,13 @@ export class RepositoryState extends DurableObject<Env> {
       return this.page(payload.result,payload.rows,id,offset);
     }
     let rows:any;
-    if (q.operation==='progress') {
-      const prs=await this.rows({repository:q.repository,operation:'open_prs'});
-      const p=Array.isArray(prs)?prs.find(p=>p.number===Number(q.args?.number)):null;
+    let author_counts:Record<string,number> | undefined;
+    if(q.operation==='survey') {
+      const snapshot=await this.surveyRows(q);rows=snapshot?.rows ?? null;author_counts=snapshot?.author_counts;
+    } else if (q.operation==='progress') {
+      const detail={...q,operation:'pr'};
+      const p=await this.rows(detail);
+      await this.noteDemand(detail);if(!this.complete(detail)) await this.enqueue(detail,5);
       const cs=await this.rows({...q,operation:'issue_comments'}), rcs=await this.rows({...q,operation:'review_comments'});
       for (const operation of ['issue_comments','review_comments']) { const child={...q,operation};await this.noteDemand(child);if (!this.complete(child)) await this.enqueue(child,5); }
       rows=p && cs && rcs ? {head:p.headRefOid,ncomments:cs.length+rcs.length,revision:this.revision()}:null;
@@ -350,9 +465,10 @@ export class RepositoryState extends DurableObject<Env> {
       rows=await this.rows(q);
     }
     const collection=this.ctx.storage.sql.exec<any>('SELECT * FROM collections WHERE key=?',key).toArray()[0];
-    const complete=rows!==null && (q.operation==='progress' || this.complete(q));
+    const complete=rows!==null && (q.operation==='survey' || q.operation==='progress' || this.complete(q));
     const observed=this.ctx.storage.sql.exec<any>('SELECT MAX(r.observed) at FROM members m JOIN resources r ON r.kind=? AND r.id=m.id WHERE m.collection=?',this.kind(q),key).one().at;
     const result:Result={version:1,repository:q.repository,operation:q.operation,status:rows===null?'unavailable':'ok',revision:this.revision(),observed_at:observed || collection?.verified,verified_at:collection?.verified,complete,coverage:complete?'complete':q.allow_observed?'webhook_observed':undefined};
+    if(q.operation==='survey') {result.contract=SURVEY_CONTRACT;result.author_counts=author_counts;}
     const coverage=rows===null?'unavailable':result.coverage!;
     this.ctx.storage.sql.exec('INSERT INTO query_metrics VALUES(?,?,1,?) ON CONFLICT(operation,coverage) DO UPDATE SET requests=requests+1,last_at=excluded.last_at',q.operation,coverage,Date.now());
     if (rows===null) return {...result,reason:'coverage_unavailable'};
@@ -407,7 +523,7 @@ export class RepositoryState extends DurableObject<Env> {
     return 20;
   }
   async noteDemand(q:Query): Promise<void> {
-    if (q.allow_observed) return;
+    if (q.allow_observed || q.operation==='survey') return;
     const key=queryKey(q),now=Date.now();
     const prior=this.ctx.storage.sql.exec<any>('SELECT at FROM demand WHERE key=?',key).toArray()[0];
     this.ctx.storage.sql.exec('INSERT INTO demand VALUES(?,?) ON CONFLICT(key) DO UPDATE SET at=excluded.at',key,now);
@@ -561,8 +677,16 @@ export class RepositoryState extends DurableObject<Env> {
       }
       // Keep newer webhook membership when the reconciliation began before that event.
       const prior=this.ctx.storage.sql.exec<any>('SELECT m.id,r.observed FROM members m LEFT JOIN resources r ON r.kind=? AND r.id=m.id WHERE m.collection=?',kind,job.key).toArray();
-      for (const row of prior) if (q.operation!=='workflow_runs' && !memberIDs.has(row.id) && row.observed<=started && this.ctx.storage.sql.exec<any>('SELECT observed FROM resources WHERE kind=? AND id=?',kind,row.id).toArray()[0]?.observed<=started) this.membership(job.key,row.id,false);
-      for (const id of memberIDs) this.membership(job.key,id,true);
+      // A REST offset can shift when another PR closes between pages. Absence
+      // from that traversal cannot delete a previously observed open resource;
+      // webhooks and delta surveys supply actual state changes instead.
+      const openInventory=['open_prs','open_issues'].includes(q.operation);
+      for (const row of prior) if (q.operation!=='workflow_runs' && !(openInventory && result.api==='core') && !memberIDs.has(row.id) && row.observed<=started && this.ctx.storage.sql.exec<any>('SELECT observed FROM resources WHERE kind=? AND id=?',kind,row.id).toArray()[0]?.observed<=started) this.membership(job.key,row.id,false);
+      for (const id of memberIDs) {
+        const current=openInventory?this.ctx.storage.sql.exec<any>('SELECT data,tombstone FROM resources WHERE kind=? AND id=?',kind,id).toArray()[0]:null;
+        if(current && (current.tombstone || (await this.decode(current.data)).state!=='OPEN')) continue;
+        this.membership(job.key,id,true);
+      }
     }
     if (job.lease_id && this.ctx.storage.sql.exec<any>('SELECT lease_id FROM jobs WHERE key=?',job.key).toArray()[0]?.lease_id!==job.lease_id) return;
     if (!this.ctx.storage.sql.exec('SELECT key FROM collections WHERE key=? AND complete=1',job.key).toArray().length) this.nextRevision('collection',job.key);
@@ -619,6 +743,13 @@ export class RepositoryState extends DurableObject<Env> {
     this.setMeta('last_repair',Date.now());
   }
   async maintenance(): Promise<void> {
+    const pending=this.ctx.storage.sql.exec<any>('SELECT m.id FROM members m LEFT JOIN survey_hydrated h ON h.number=m.id LEFT JOIN survey_hydration_failures f ON f.number=m.id WHERE m.collection=? AND (h.contract IS NULL OR h.contract!=?) AND (f.retry_at IS NULL OR f.retry_at<=?) LIMIT 20',queryKey({operation:'open_prs'}),SURVEY_CONTRACT,Date.now()).toArray();
+    for(const row of pending) {
+      try {await this.hydrateSurvey(row.id);}catch {this.invalidateSurvey(row.id);}
+    }
+    for(const row of this.ctx.storage.sql.exec<any>('SELECT number FROM survey_dirty LIMIT 20').toArray()) {
+      try {this.rebuildSurvey(row.number);}catch {this.invalidateSurvey(row.number);this.ctx.storage.sql.exec('DELETE FROM survey_dirty WHERE number=?',row.number);}
+    }
     const now=Date.now();
     // Retire queued historical CI even if an old retry placed it far in the future.
     const obsolete="key LIKE 'workflow_jobs:%' AND lease_until<=? AND NOT EXISTS(SELECT 1 FROM demand d WHERE d.key=jobs.key AND d.at>?) AND NOT EXISTS(SELECT 1 FROM resources r WHERE r.kind='workflow_runs' AND r.id=CAST(json_extract(jobs.query,'$.args.id') AS TEXT) AND json_extract(r.data,'$.head_branch') IN ('staging','trying') AND (json_extract(r.data,'$.status')!='completed' OR EXISTS(SELECT 1 FROM meta m WHERE m.key='important_final_pending:' || r.id AND m.value='true')))";
@@ -629,10 +760,37 @@ export class RepositoryState extends DurableObject<Env> {
     this.ctx.storage.sql.exec('DELETE FROM changes WHERE at<?',now-7*86400000);
     this.ctx.storage.sql.exec('DELETE FROM cursors WHERE expires<?',now);
     this.ctx.storage.sql.exec('DELETE FROM repair_metrics WHERE at<?',now-7*86400000);
-    if (now-(this.meta('last_snapshot') || 0)>86400000) {
-      const key=`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}.json`;
-      const snapshot={version:1,at:now,meta:this.ctx.storage.sql.exec('SELECT * FROM meta').toArray(),resources:this.ctx.storage.sql.exec('SELECT * FROM resources').toArray(),collections:this.ctx.storage.sql.exec('SELECT * FROM collections').toArray(),members:this.ctx.storage.sql.exec('SELECT * FROM members').toArray()};
-      await this.env.ARCHIVE.put(key,JSON.stringify(snapshot),{customMetadata:{expires:String(now+7*86400000)}}); this.setMeta('last_snapshot',now);
+    this.ctx.storage.sql.exec('DELETE FROM retired_objects WHERE at<?',now-30*86400000);
+    if(!this.snapshotFlight) {
+      const flight=this.snapshotPages(now);this.snapshotFlight=flight;
+      try {await flight;} finally {if(this.snapshotFlight===flight)this.snapshotFlight=undefined;}
+    }
+  }
+  async snapshotPages(now:number): Promise<void> {
+    let state=this.meta('snapshot_pending');
+    if(!state) {
+      if(now-(this.meta('last_snapshot') || 0)<=86400000) return;
+      state={version:2,observational:true,started:now,revision:this.revision(),key:`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}-${crypto.randomUUID()}`,index:0,tables:['meta','resources','collections','members'].map(table=>({table,after:0,pages:0,upper:this.ctx.storage.sql.exec<any>('SELECT COALESCE(MAX(rowid),0) last FROM '+table).one().last}))};
+      this.setMeta('snapshot_pending',state);
+    }
+    // Archive bounded pages and checkpoint each one. Repository mutations can
+    // interleave, so this is an observational archive; DO point-in-time recovery
+    // remains the authoritative database backup.
+    for(let turn=0;turn<5 && state.index<state.tables.length;turn++) {
+      const table=state.tables[state.index];
+      const columns=this.ctx.storage.sql.exec<any>('PRAGMA table_info('+table.table+')').toArray().map(c=>c.name);
+      const size=columns.map(c=>'COALESCE(length(CAST('+c+' AS BLOB)),0)').join('+');
+      const candidates=this.ctx.storage.sql.exec<any>('SELECT rowid AS id,'+size+' AS bytes FROM '+table.table+' WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT 1000',table.after,table.upper).toArray();
+      if(!candidates.length) {state.index++;this.setMeta('snapshot_pending',state);continue;}
+      let bytes=0,last=table.after;
+      for(const row of candidates) {if(last!==table.after && bytes+row.bytes>1000000)break;bytes+=row.bytes;last=row.id;}
+      const rows=this.ctx.storage.sql.exec('SELECT * FROM '+table.table+' WHERE rowid>? AND rowid<=? ORDER BY rowid',table.after,last).toArray();
+      await this.env.ARCHIVE.put(state.key+'/'+table.table+'/'+table.pages+'.json',JSON.stringify(rows),{customMetadata:{expires:String(now+7*86400000)}});
+      table.after=last;table.pages++;this.setMeta('snapshot_pending',state);
+    }
+    if(state.index===state.tables.length) {
+      await this.env.ARCHIVE.put(state.key+'.json',JSON.stringify({...state,finished:Date.now(),final_revision:this.revision()}),{customMetadata:{expires:String(now+7*86400000)}});
+      this.setMeta('last_snapshot',Date.now());this.setMeta('snapshot_pending',null);
     }
   }
   retireUnneeded(job:any): boolean {
@@ -646,6 +804,14 @@ export class RepositoryState extends DurableObject<Env> {
     const now=Date.now(),lease=crypto.randomUUID(),started=job.started || now,generation=job.started?job.start_generation:job.generation;
     this.ctx.storage.sql.exec('UPDATE jobs SET lease_id=?,lease_until=?,started=?,start_generation=? WHERE key=? AND lease_until<=?',lease,now+settings(this.env).lease_ms,started,generation,job.key,now);
     return this.ctx.storage.sql.exec<any>('SELECT * FROM jobs WHERE key=? AND lease_id=?',job.key,lease).toArray()[0];
+  }
+  retryJob(job:any,error:unknown): void {
+    const expired=error instanceof Error && /staging page missing/.test(error.message);
+    const category=expired?'staging_expired':'transport_or_parser';
+    const delay=Math.min(3600000,60000*2**Math.min(job.attempt || 0,6));
+    this.ctx.storage.sql.exec('UPDATE jobs SET due=?,attempt=attempt+1,wait_reason=?'+(expired?',started=NULL,cursor=NULL,page=1,api=NULL,etag=NULL,nested=NULL':'')+' WHERE key=? AND lease_id=?',Date.now()+delay,category,job.key,job.lease_id);
+    this.metric('retry',JSON.parse(job.query),job.lane);
+    this.setMeta('last_upstream_failure',{at:Date.now(),operation:JSON.parse(job.query).operation,category});
   }
   async dispatch(first:any): Promise<void> {
     const q:Query=JSON.parse(first.query),operation=q.operation,repo=this.meta('repository');
@@ -670,18 +836,17 @@ export class RepositoryState extends DurableObject<Env> {
         const response=await stub(this.env.INSTALLATIONS,repo.installation).fetch('https://internal/batch',{method:'POST',body:JSON.stringify({repository:repo,jobs:jobs.map(j=>({key:j.key,query:JSON.parse(j.query),node_id:j.node_id}))})});
         const result:any=await response.json();
         if (result.results) {
-          for(let i=0;i<jobs.length;i++) await this.refresh(jobs[i],result.results[i] || {unavailable:true});
+          for(let i=0;i<jobs.length;i++) {
+            try {await this.refresh(jobs[i],result.results[i] || {unavailable:true});}
+            catch(error) {this.retryJob(jobs[i],error);}
+          }
         } else if (result.deferred && operation!=='review_threads' && result.category!=='capacity' && !String(result.category).startsWith('secondary')) {
           // Retry REST-capable operations in their other pool on the next quantum.
           for(const item of jobs) this.ctx.storage.sql.exec('UPDATE jobs SET api=?,due=? WHERE key=? AND lease_id=?','core',Date.now(),item.key,item.lease_id);
         } else for(const item of jobs) await this.refresh(item,result.deferred?result:{unavailable:true,retry_at:Date.now()+60000});
       } else await this.refresh(first);
-    } catch {
-      for(const item of jobs) {
-        this.ctx.storage.sql.exec('UPDATE jobs SET due=?,attempt=attempt+1,wait_reason=? WHERE key=? AND lease_id=?',Date.now()+60000,'transport_or_parser',item.key,item.lease_id);
-        this.metric('retry',JSON.parse(item.query),item.lane);
-      }
-      this.setMeta('last_upstream_failure',{at:Date.now(),operation,category:'transport_or_parser'});
+    } catch(error) {
+      for(const item of jobs) this.retryJob(item,error);
     } finally {
       for(const item of jobs) this.ctx.storage.sql.exec('UPDATE jobs SET lease_id=NULL,lease_until=0 WHERE key=? AND lease_id=?',item.key,item.lease_id);
     }
@@ -711,6 +876,16 @@ export class RepositoryState extends DurableObject<Env> {
       const path=new URL(req.url).pathname;
       if (path==='/configure') { await this.configure((await req.json() as any).repository); return json({ok:true}); }
       if (path==='/event') { await this.ingest(await req.json() as EventPointer); return json({ok:true}); }
+      if(path==='/retained-object') {
+        const key=new URL(req.url).searchParams.get('key'),encoded=JSON.stringify({$r2:key});
+        const retained=this.ctx.storage.sql.exec('SELECT 1 FROM resources WHERE data=? UNION ALL SELECT 1 FROM cursors WHERE payload=? UNION ALL SELECT 1 FROM jobs WHERE nested=? LIMIT 1',encoded,encoded,encoded).toArray().length>0;
+        if(retained) {this.ctx.storage.sql.exec('DELETE FROM retired_objects WHERE key=?',key);return json({retained:true});}
+        this.ctx.storage.sql.exec('INSERT OR IGNORE INTO retired_objects VALUES(?,?)',key,Date.now());
+        const retired=this.ctx.storage.sql.exec<any>('SELECT at FROM retired_objects WHERE key=?',key).one().at;
+        // Object upload age is not retirement age: a months-old object may
+        // still be referenced by yesterday's seven-day archive.
+        return json({retained:Date.now()-retired<8*86400000});
+      }
       if (path==='/query') {
         const q=await req.json() as Query;
         validateQuery(q);
@@ -741,7 +916,7 @@ export class RepositoryState extends DurableObject<Env> {
         }
         return json(result,200,{ETag:'"'+result.revision+'"'});
       }
-      if (path==='/health') return json({reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),repository:this.meta('repository'),revision:this.revision(),bootstrap_inventory:this.meta('bootstrap_inventory'),last_webhook:this.meta('last_webhook'),webhook_apply_ms:this.meta('webhook_apply_ms'),last_repair:this.meta('last_repair'),last_upstream_failure:this.meta('last_upstream_failure'),coverage:this.ctx.storage.sql.exec('SELECT operation,COUNT(*) resources,SUM(complete) complete,MIN(verified) oldest_verified FROM collections GROUP BY operation').toArray(),jobs:this.ctx.storage.sql.exec('SELECT COUNT(*) total,SUM(due<=?) due,MIN(started) oldest_started FROM jobs',Date.now()).one(),lanes:this.ctx.storage.sql.exec('SELECT lane,COUNT(*) jobs,SUM(due<=? AND lease_until<=?) eligible,SUM(lease_until>?) inflight,MIN(CASE WHEN due<=? AND lease_until<=? THEN due END) oldest_eligible,MIN(requested_at) oldest_requested FROM jobs GROUP BY lane',...Array(5).fill(Date.now())).toArray(),waits:this.ctx.storage.sql.exec('SELECT lane,wait_reason,COUNT(*) jobs FROM jobs WHERE wait_reason IS NOT NULL GROUP BY lane,wait_reason').toArray(),repair_hour:this.ctx.storage.sql.exec('SELECT lane,operation,event,COUNT(*) n,SUM(value) value,MAX(value) maximum FROM repair_metrics WHERE at>? GROUP BY lane,operation,event',Date.now()-3600000).toArray(),requested_latency:this.ctx.storage.sql.exec("SELECT operation,MIN(value) p95_ms,MAX(samples) samples FROM (SELECT operation,value,ROW_NUMBER() OVER(PARTITION BY operation ORDER BY value) rank,COUNT(*) OVER(PARTITION BY operation) samples FROM repair_metrics WHERE event='requested_single_latency_ms' AND at>?) WHERE rank>=MAX(1,CAST((samples*95+99)/100 AS INTEGER)) GROUP BY operation",Date.now()-3600000).toArray(),queries:this.ctx.storage.sql.exec('SELECT * FROM query_metrics').toArray(),repair_operations:this.ctx.storage.sql.exec("SELECT json_extract(query,'$.operation') operation,COUNT(*) jobs,SUM(due<=?) due,MIN(due) next_due,MAX(attempt) attempts FROM jobs GROUP BY operation",Date.now()).toArray()});
+      if (path==='/health') return json({storage_bytes:this.ctx.storage.sql.databaseSize,snapshot_pending:this.meta('snapshot_pending'),survey:this.surveyHealth(),reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),repository:this.meta('repository'),revision:this.revision(),bootstrap_inventory:this.meta('bootstrap_inventory'),last_webhook:this.meta('last_webhook'),webhook_apply_ms:this.meta('webhook_apply_ms'),last_repair:this.meta('last_repair'),last_upstream_failure:this.meta('last_upstream_failure'),coverage:this.ctx.storage.sql.exec('SELECT operation,COUNT(*) resources,SUM(complete) complete,MIN(verified) oldest_verified FROM collections GROUP BY operation').toArray(),jobs:this.ctx.storage.sql.exec('SELECT COUNT(*) total,SUM(due<=?) due,MIN(started) oldest_started FROM jobs',Date.now()).one(),lanes:this.ctx.storage.sql.exec('SELECT lane,COUNT(*) jobs,SUM(due<=? AND lease_until<=?) eligible,SUM(lease_until>?) inflight,MIN(CASE WHEN due<=? AND lease_until<=? THEN due END) oldest_eligible,MIN(requested_at) oldest_requested FROM jobs GROUP BY lane',...Array(5).fill(Date.now())).toArray(),waits:this.ctx.storage.sql.exec('SELECT lane,wait_reason,COUNT(*) jobs FROM jobs WHERE wait_reason IS NOT NULL GROUP BY lane,wait_reason').toArray(),repair_hour:this.ctx.storage.sql.exec('SELECT lane,operation,event,COUNT(*) n,SUM(value) value,MAX(value) maximum FROM repair_metrics WHERE at>? GROUP BY lane,operation,event',Date.now()-3600000).toArray(),requested_latency:this.ctx.storage.sql.exec("SELECT operation,MIN(value) p95_ms,MAX(samples) samples FROM (SELECT operation,value,ROW_NUMBER() OVER(PARTITION BY operation ORDER BY value) rank,COUNT(*) OVER(PARTITION BY operation) samples FROM repair_metrics WHERE event='requested_single_latency_ms' AND at>?) WHERE rank>=MAX(1,CAST((samples*95+99)/100 AS INTEGER)) GROUP BY operation",Date.now()-3600000).toArray(),queries:this.ctx.storage.sql.exec('SELECT * FROM query_metrics').toArray(),repair_operations:this.ctx.storage.sql.exec("SELECT json_extract(query,'$.operation') operation,COUNT(*) jobs,SUM(due<=?) due,MIN(due) next_due,MAX(attempt) attempts FROM jobs GROUP BY operation",Date.now()).toArray()});
       if (path==='/changes') { const after=Number(new URL(req.url).searchParams.get('after') || 0); const first=this.ctx.storage.sql.exec<any>('SELECT MIN(revision) AS revision FROM changes').one(); return json({revision:this.revision(),reset:after>0 && first.revision && after<first.revision-1,changes:this.ctx.storage.sql.exec('SELECT * FROM changes WHERE revision>? ORDER BY revision LIMIT 1000',after).toArray()}); }
       if (path==='/tick') { if (!this.meta('repository')) await this.configure((await req.json() as any).repository); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }
       if (path==='/repair') { this.ctx.storage.sql.exec('UPDATE jobs SET due=CASE WHEN wait_reason IS NULL AND attempt=0 THEN ? ELSE due END,dirty=1,generation=generation+1',Date.now()); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }

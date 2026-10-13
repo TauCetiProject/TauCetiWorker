@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -45,7 +46,7 @@ def roadmap_only() -> str | None:
     """The single roadmap area the worker steers toward, as the operator set it — read live from the
     env each call so the TUI's [o] key can change it and have both the survey display and any launched
     round pick it up (children inherit TAUCETI_ROADMAP_ONLY). Tri-state: None = unset, so a fresh
-    random area is picked per round (see do_roadmap); "" = all areas; else the area name. There is
+    random area is picked before each work survey; "" = all areas; else the area name. There is
     deliberately no baked-in default, and nothing here consults the dashboard prefs — a bare CLI run
     resolves only from the env + the live area list, never from a saved dashboard preference."""
     return os.environ.get("TAUCETI_ROADMAP_ONLY")
@@ -103,7 +104,7 @@ def roadmap_areas(gh) -> list[str]:
         tree = snapshot(ROADMAP, ttl=3600)
         if tree:
             return sorted(path.name for path in (tree / "TauCetiRoadmap").iterdir() if path.is_dir())
-    except (OSError, TimeoutError):
+    except (OSError, TimeoutError, subprocess.SubprocessError):
         pass
     out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')
     return sorted(out.splitlines()) if out else []
@@ -273,3 +274,11 @@ class NoProgress(Exception):
 
 class AdmissionUnavailable(NoProgress):
     """Local API admission needs a bounded recheck, without no-progress backoff."""
+
+
+class GitHubUnavailable(NoProgress):
+    """GitHub infrastructure pause; completed work and PR attempt budgets survive."""
+
+    def __init__(self, message: str, *, retry_at: float | None = None):
+        super().__init__(message)
+        self.retry_at = retry_at

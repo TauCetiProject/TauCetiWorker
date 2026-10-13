@@ -143,6 +143,18 @@ gh: API rate limit exceeded
         for s in ("private-query", "private-request-body", "private-response-body", "fake-private-token")
     )
     assert records[0]["endpoint"] == "/repos/org/repo/issues/{id}/comments"
+    # Installed gh pretty-prints JSON debug bodies. Account measured costs and
+    # distinguish read POSTs without persisting query text or response bodies.
+    pretty = "* Request at now\n* Request to https://api.github.com/graphql\n> POST /graphql HTTP/1.1\n"
+    pretty += json.dumps({"query": "query{rateLimit{cost} viewer{login}}"}, indent=2) + "\n< HTTP/2.0 200 OK\n"
+    pretty += (
+        json.dumps({"data": {"rateLimit": {"cost": 7}, "viewer": {"login": "private-actor"}}}, indent=2)
+        + "\n* Request took 2ms\n"
+    )
+    gql_records = []
+    assert tr.parse_trace(pretty, records=gql_records) == ""
+    assert gql_records[0]["graphql_operation"] == "read" and gql_records[0]["graphql_cost"] == 7
+    assert "private-actor" not in (Path(tmp) / "requests.jsonl").read_text()
     assert tr.blocked_since(start)
     # An optimistic, late-arriving header cannot restore an exhausted bucket.
     tr.remember_quota({"resource": "core", "remaining": 5000, "reset": reset}, tr.scope())
@@ -152,6 +164,9 @@ gh: API rate limit exceeded
         network.assert_not_called()
         assert tr.execute(["gh", "api", "graphql", "-f", "query=query{viewer{login}}"]).returncode == 0
         assert network.call_count == 1
+    with patch.object(tr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}", "")) as network:
+        assert tr.execute(["gh", "pr", "comment", "9", "--repo", "org/repo", "--body", "gql-write"]).returncode == 0
+        network.assert_called_once()  # An opaque command can use GraphQL while core is exhausted.
     with patch("tauceti_worker.github.run", return_value=subprocess.CompletedProcess([], 0, '{"core":[5000,1]}', "")):
         assert github_budget()["core"] == (0, reset)
     with patch("tauceti_worker.github.run", return_value=subprocess.CompletedProcess([], 1, "", "offline")):
@@ -175,6 +190,25 @@ gh: API rate limit exceeded
             assert tr.execute(["gh", "pr", "create"], wait=True).returncode != 0
             assert tr.execute(["gh", "api", "user"]).returncode != 0
             assert network.call_count == 1 and tr.cooldown() > 0
+    # HTTP-200 GraphQL quota responses are safe to wait/retry for reads, including missing headers.
+    with patch.dict(os.environ, {"GH_TOKEN": "logical-wait-fixture"}):
+        wall = [time.time()]
+        waits = []
+
+        def wait_reset(seconds):
+            waits.append(seconds)
+            wall[0] += seconds
+
+        failure = response(None, errors=[{"extensions": {"code": "RATE_LIMIT"}, "message": "quota"}])
+        with (
+            patch.object(tr.time, "time", side_effect=lambda: wall[0]),
+            patch.object(tr.time, "sleep", side_effect=wait_reset),
+            patch.object(
+                tr.subprocess, "run", side_effect=[failure, response({"viewer": {"login": "peer"}})]
+            ) as network,
+        ):
+            assert tr.execute(["gh", "api", "graphql", "-f", "query=query{viewer{login}}"], wait=True).returncode == 0
+            assert network.call_count == 2 and len(waits) == 1
 
     # GraphQL can fail logically with HTTP 200: quota attribution must still protect PR counters.
     for quota_type in ("RATE_LIMIT", "RATE_LIMITED"):

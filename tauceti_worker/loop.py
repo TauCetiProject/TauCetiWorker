@@ -4,6 +4,7 @@ timeout, then settle (short pause if productive, escalating back-off otherwise).
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import signal
 import subprocess
@@ -18,6 +19,7 @@ from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
     EX_ADMISSION_WAIT,
+    EX_GITHUB_WAIT,
     EX_NOPROGRESS,
     GH_MIN_BUDGET,
     INTERROUND,
@@ -292,6 +294,27 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 time.sleep(nap)
                 continue
             admission_streak = 0
+
+            if rc == EX_GITHUB_WAIT:
+                streak = 0
+                paused = runtime_snapshot()
+                retry_at = paused.get("next_action_at")
+                now = time.time()
+                nap = (
+                    max(1, retry_at - now + 1) if isinstance(retry_at, (int, float)) and math.isfinite(retry_at) else 5
+                )
+                reason = paused.get("detail") or "GitHub publication recovery pending"
+                log(f"github: {reason} — rechecking after {nap:.1f}s")
+                report_runtime(
+                    "waiting-github",
+                    detail=reason,
+                    next_action_at=now + nap,
+                    failure_reason=None,
+                    failure_code=None,
+                    failure_log=None,
+                )
+                time.sleep(nap)
+                continue
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
             if rc == 0:

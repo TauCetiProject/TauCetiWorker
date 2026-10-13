@@ -963,15 +963,10 @@ class GitHub:
         """A trusted sweep handoff for this exact head; stale requests spend no attempts."""
         if not re.fullmatch(r"[0-9a-f]{40}", head):
             return False
+        from .survey_facts import rebase_heads
+
         comments = self.issue_comments(pr)
-        return any(
-            isinstance(c, dict)
-            and (c.get("user") or {}).get("login") == "tauceti-review-bot[bot]"
-            and isinstance(c.get("body"), str)
-            and c["body"].startswith("Merge-queue recovery for head `")
-            and f"<!--tauceti-rebase:v1 {head}-->" in (c.get("body") or "").splitlines()
-            for c in comments or []
-        )
+        return head in rebase_heads(comments)
 
     def issue_comments(self, pr: int) -> list[dict] | None:
         """Complete GraphQL history in REST shape. Cache is triage-only; force reads bypass it."""
@@ -1236,7 +1231,8 @@ class GitHub:
         """Seconds since the newest `emoji` reaction on this comment, or None if there is none (or the
         fetch failed — fail OPEN: a transient API error must not let a stale claim block work forever,
         and the worst case of a missed claim is a rare double-review, which we've accepted)."""
-        rs = self.reactions(comment_id)
+        with transport.read_context(fresh=True, direct=True):
+            rs = self.reactions(comment_id)
         if not rs:
             return None
         newest = 0
@@ -1256,21 +1252,35 @@ class GitHub:
         p = self._gh(
             ["api", "-X", "POST", f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions", "-f", f"content={emoji}"]
         )
+        if p.returncode == 0:
+            try:
+                rid = json.loads(p.stdout)["id"]
+                if not hasattr(self, "_claim_reaction_ids"):
+                    self._claim_reaction_ids = {}
+                self._claim_reaction_ids[(comment_id, emoji)] = rid
+            except (ValueError, KeyError, TypeError):
+                pass
         return p.returncode == 0
 
     def remove_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
         """Remove our own `emoji` reaction from a review comment (releases the claim). Looks up the
         reaction id for THIS login, then deletes it; a no-op (True) if we hold none."""
-        rs = self.reactions(comment_id)
-        if rs is None:
-            return False
-        mine = me()
-        rid = next(
-            (r["id"] for r in rs if r.get("content") == emoji and (r.get("user") or {}).get("login") == mine), None
-        )
+        ids = getattr(self, "_claim_reaction_ids", {})
+        rid = ids.get((comment_id, emoji))
+        if rid is None:
+            with transport.read_context(fresh=True, direct=True):
+                rs = self.reactions(comment_id)
+            if rs is None:
+                return False
+            mine = me()
+            rid = next(
+                (r["id"] for r in rs if r.get("content") == emoji and (r.get("user") or {}).get("login") == mine), None
+            )
         if rid is None:
             return True
         p = self._gh(["api", "-X", "DELETE", f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions/{rid}"])
+        if p.returncode == 0:
+            ids.pop((comment_id, emoji), None)
         return p.returncode == 0
 
 
