@@ -58,7 +58,10 @@ def register_principal(user_id: int, login: str, env=None):
     if not identity:
         return
     primary = hashlib.sha256(("github.com:user:" + str(user_id)).encode()).hexdigest()
-    atomic(root() / "identities" / (identity + ".json"), {"quota_scope": primary, "principal": login})
+    try:
+        atomic(root() / "identities" / (identity + ".json"), {"quota_scope": primary, "principal": login})
+    except OSError:
+        return  # Verified authentication does not depend on the optional local cache.
     for path in (root() / "quota" / identity).glob("*.json"):
         try:
             record = json.loads(path.read_text())
@@ -146,7 +149,7 @@ def event(value: dict):
             **(_request_context.get() or {}),
             **value,
         }
-        with locked(root() / "accounting.lock"):
+        with locked(root() / "accounting.lock", timeout=0.05):
             path = root() / "requests.jsonl"
             # Keep bounded evidence on long-running hosts; reports cover retained records only.
             if path.exists() and path.stat().st_size > 64 * 1024 * 1024:
@@ -729,6 +732,32 @@ def quota_type(category: str, records: list, env=None):
 
 
 def install_proxy():
+    from .config import log
+    from .runtime_status import report_runtime
+
+    try:
+        _install_proxy()
+    except OSError:
+        event({"kind": "instrumentation_unavailable", "component": "gh_proxy"})
+        # Keep quota handling in the CLI path even when its normal bin directory
+        # is unavailable. Never relocate the durable publication outbox.
+        import atexit
+        import tempfile
+
+        try:
+            temporary_bin = Path(tempfile.mkdtemp(prefix="tauceti-gh-"))
+            atexit.register(shutil.rmtree, temporary_bin, ignore_errors=True)
+            _install_proxy(bindir=temporary_bin)
+        except OSError:
+            log("GitHub CLI instrumentation unavailable; endpoint accounting coverage is incomplete")
+        else:
+            log("GitHub CLI instrumentation uses a temporary launcher; endpoint accounting may be incomplete")
+        report_runtime(github_instrumentation_degraded=True)
+    else:
+        report_runtime(github_instrumentation_degraded=False)
+
+
+def _install_proxy(*, bindir=None):
     """Make host review/authoring subprocess gh traffic visible too; preserve real gh credentials."""
     os.environ.setdefault("TAUCETI_GITHUB_SHARED_DIR", str(root().resolve()))
     if not os.environ.get("TAUCETI_REAL_GH"):
@@ -737,7 +766,7 @@ def install_proxy():
             return
         os.environ["TAUCETI_REAL_GH"] = real
     # A stable directory survives HOME isolation and uvx's interpreter changes.
-    bindir = root() / "bin"
+    bindir = bindir or root() / "bin"
     bindir.mkdir(parents=True, exist_ok=True, mode=0o700)
     proxy = bindir / "gh"
     import shlex

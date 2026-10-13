@@ -248,7 +248,10 @@ def one_line(text: str, limit: int = 200) -> str:
 
 def log(msg: str) -> None:
     line = f"{time.strftime('%F %T')} tauceti: {msg}"
-    print(line, file=sys.stderr, flush=True)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
     if _LOG_FH is not None:
         try:
             _LOG_FH.write(_ANSI_RE.sub("", line) + "\n")
