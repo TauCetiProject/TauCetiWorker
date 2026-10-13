@@ -174,7 +174,7 @@ It advances TauCeti's protected `security-audit` branch through main's first-par
 history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
 Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
 Each session receives complete per-commit diffs and before/after file contents,
-up to 20 commits and 128 KiB of input. Luna/Haiku receives no GitHub credential or
+up to 20 commits and 256 KiB of input. Luna/Haiku receives no GitHub credential or
 command/edit tools; trusted Worker code alone verifies ancestry and moves the ref.
 No Lean builds or candidate scripts run. A finding, incomplete inspection, oversized
 commit or model error stops advancement. Read the retained `security-audit/blocked.json`

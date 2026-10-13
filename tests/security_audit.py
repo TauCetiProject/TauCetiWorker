@@ -84,6 +84,21 @@ class History(unittest.TestCase):
         batch = sa.plan_batch(self.repo, self.base, head)
         self.assertEqual([c["sha"] for c in batch["commits"]], [small])
 
+    def test_normal_multifile_edit_fits_with_complete_images(self):
+        content = "-- A reasonably sized mathematical file with explanation\n" * 800
+        self.commit("large baseline", "TauCeti/A.lean", content)
+        baseline = self.commit("another file", "TauCeti/B.lean", content)
+        for name in ("A", "B"):
+            (self.root / f"TauCeti/{name}.lean").write_text(content + "theorem x : True := trivial\n")
+        self.command("add", ".")
+        self.command("commit", "-qm", "edit both")
+        batch = sa.plan_batch(self.repo, baseline, self.command("rev-parse", "HEAD"))
+        self.assertGreater(len(sa.serialize(batch).encode()), 128 * 1024)
+        self.assertEqual(len(batch["commits"][0]["files"]), 2)
+        for f in batch["commits"][0]["files"]:
+            self.assertEqual(f["before"], content)
+            self.assertEqual(f["after"], content + "theorem x : True := trivial\n")
+
     def test_symlink_and_binary_are_blocked(self):
         p = self.root / "TauCeti/Link.lean"
         p.symlink_to("../../scripts/file")
