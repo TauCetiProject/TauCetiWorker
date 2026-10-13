@@ -344,6 +344,10 @@ def parse_trace(stderr: str, *, identity=None, records=None) -> str:
             and not line.startswith(("* ", "< ", "> "))
         ):
             body += line
+            if not (line.rstrip() == "}" or line.lstrip().startswith("{") and line.rstrip().endswith("}")):
+                if len(body) > 2_000_000:
+                    body = ""
+                continue
             try:
                 inspect_body(json.loads(body))
                 body = ""

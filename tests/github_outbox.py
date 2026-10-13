@@ -241,5 +241,14 @@ with (
     published[0][0]["created_at"] = now
     with patch.object(tr, "execute", return_value=subprocess.CompletedProcess([], 0, json.dumps(published), "")):
         assert outbox.reconcile(legacy, separate) is True
+    # Unpinned clients resolve their actual author once in their credential scope.
+    unpinned = {k: v for k, v in separate.items() if k != "TAUCETI_GITHUB_ACCOUNT"}
+    published[0][0]["body"] = issue_body.replace("\n", "\r\n") + "\n"
+    viewer = subprocess.CompletedProcess([], 0, json.dumps({"data": {"viewer": {"login": "author"}}}), "")
+    listing = subprocess.CompletedProcess([], 0, json.dumps(published), "")
+    with patch.object(tr, "execute", side_effect=[viewer, listing]) as read:
+        assert outbox.reconcile(value, unpinned) is True and read.call_count == 2
+    with patch.object(tr, "execute", return_value=listing) as read:
+        assert outbox.reconcile(value, unpinned) is True and read.call_count == 1
     assert "paid-result" not in (Path(tmp) / "requests.jsonl").read_text()
 print("PASS: quota deferral, durable publication and ambiguous-write reconciliation")

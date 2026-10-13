@@ -285,6 +285,33 @@ def resolution(args):
     return next((a[3:] for a in args if a.startswith("id=")), None)
 
 
+def actor(env):
+    if env.get("TAUCETI_GITHUB_ACCOUNT"):
+        return env["TAUCETI_GITHUB_ACCOUNT"].lower()
+
+    def fetch():
+        result = tr.execute(
+            ["gh", "api", "graphql", "-f", "query=query{viewer{login}}"], env={**env, "TAUCETI_OUTBOX_REPLAY": "1"}
+        )
+        if result.returncode:
+            return None
+        try:
+            login = json.loads(result.stdout)["data"]["viewer"]["login"]
+            return login.lower() if isinstance(login, str) and login else None
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    return tr.shared_read(["publication-actor"], fetch, ttl=3600, identity=tr.scope(env), immutable=True)
+
+
+def same_body(left, right):
+    return (
+        isinstance(left, str)
+        and isinstance(right, str)
+        and left.replace("\r\n", "\n").strip() == right.replace("\r\n", "\n").strip()
+    )
+
+
 def reconcile(value, env):
     args = value["argv"]
     replay = {**env, "TAUCETI_OUTBOX_REPLAY": "1"}
@@ -379,13 +406,15 @@ def reconcile(value, env):
             except (ValueError, TypeError, AttributeError):
                 pass
         body = body or next((a[5:] for a in args if a.startswith("body=")), None)
-        actor = env.get("TAUCETI_GITHUB_ACCOUNT", "")
-        if not isinstance(body, str) or not actor:
+        who = actor(env)
+        if not isinstance(body, str) or not who:
             return None
         from urllib.parse import urlencode
 
-        since = datetime.datetime.fromtimestamp(value.get("created", 0) - 300, datetime.UTC).isoformat()
-        listing = endpoint + "?" + urlencode({"state": "all", "creator": actor, "since": since, "per_page": 100})
+        since = datetime.datetime.fromtimestamp(value.get("created", 0) - 300, datetime.UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        listing = endpoint + "?" + urlencode({"state": "all", "creator": who, "since": since, "per_page": 100})
         result = tr.execute(["gh", "api", listing, "--paginate", "--slurp"], env=replay)
         if result.returncode:
             return None
@@ -393,8 +422,8 @@ def reconcile(value, env):
             pages = json.loads(result.stdout)
             return any(
                 not c.get("pull_request")
-                and c.get("body") == body
-                and (c.get("user") or {}).get("login", "").lower() == actor.lower()
+                and same_body(c.get("body"), body)
+                and (c.get("user") or {}).get("login", "").lower() == who
                 and datetime.datetime.fromisoformat(c["created_at"].replace("Z", "+00:00")).timestamp()
                 >= value.get("created", 0) - 300
                 for page in pages
@@ -415,8 +444,8 @@ def reconcile(value, env):
             return None
         reply = re.search(r"/comments/(\d+)/replies$", endpoint)
         listing = re.sub(r"/comments/\d+/replies$", "/comments", endpoint)
-        actor = env.get("TAUCETI_GITHUB_ACCOUNT", "").lower()
-        if not actor:
+        who = actor(env)
+        if not who:
             return None
         r = tr.execute(["gh", "api", listing + "?per_page=100", "--paginate", "--slurp"], env=replay)
         if r.returncode:
@@ -434,8 +463,8 @@ def reconcile(value, env):
                 return when >= int(value.get("created", 0)) - 300
 
             return any(
-                c.get("body") == body
-                and (c.get("user") or {}).get("login", "").lower() == actor
+                same_body(c.get("body"), body)
+                and (c.get("user") or {}).get("login", "").lower() == who
                 and (not reply or str(c.get("in_reply_to_id")) == reply[1])
                 and recent(c)
                 for page in pages

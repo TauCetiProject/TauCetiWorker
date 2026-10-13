@@ -289,8 +289,8 @@ a provisional reservation, covering the known lower bound plus another full
 session estimate. Funded peers can continue; the affected provider session
 still needs a final receipt or explicit reconciliation. These reservations
 are estimates, not hard upper bounds on provider spending. Final receipts with
-missing cost segments, and interruptions with no usable lower-bound evidence,
-remain unresolved with their admission estimate reserved for later audit.
+missing cost segments remain unresolved, reserving any known lower bound plus
+an estimated tail. Missing evidence retains the original admission reservation.
 They hold only their own provider resumption; other funded work can proceed.
 Provisional costs are excluded from settled expenditure and reported separately. Existing grants and settled ledger events are preserved.
 

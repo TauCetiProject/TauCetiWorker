@@ -157,7 +157,7 @@ class Budget:
                     elif kind == "unresolved":
                         session = state["sessions"][event["id"]]
                         session["status"] = "provisional" if event.get("provisional") else "unresolved"
-                        if event.get("provisional"):
+                        if "reserve" in event:
                             session.update(
                                 reserve=event["reserve"],
                                 lower_bound_cost=event["lower_bound_cost"],
@@ -292,18 +292,18 @@ class Budget:
             )
             self.save_waiting(queue)
 
-    def estimate(self, state, model, phase=None, *, include_provisional=True):
+    def estimate(self, state, model, phase=None, *, include_pending=True):
         costs = [c for c in state["samples"].get(model + ":" + phase, []) if c > 0] if phase else []
         costs = costs or [
             money(s["cost"])
             for s in state["sessions"].values()
             if s["model"] == model and s["status"] == "settled" and money(s["cost"]) > 0
         ]
-        if not costs and include_provisional:
+        if not costs and include_pending:
             costs = [
                 money(s["reserve"])
                 for s in state["sessions"].values()
-                if s["model"] == model and s["status"] == "provisional" and money(s["reserve"]) > 0
+                if s["model"] == model and s["status"] != "settled" and money(s.get("reserve", "0")) > 0
             ]
         costs = sorted(costs[-20:])
         if costs:
@@ -558,7 +558,7 @@ class Budget:
                     continue
                 for provider_id, value in prior.get("totals", {}).items():
                     baseline[provider_id] = max(baseline.get(provider_id, Decimal(0)), money(value))
-            if provisional and totals is None and lower:
+            if totals is None and lower:
                 differences = [money(v) - baseline.get(k, Decimal(0)) for k, v in lower.items()]
                 if all(v >= 0 for v in differences):
                     known = sum(differences, Decimal(0))
@@ -567,12 +567,12 @@ class Budget:
                     # reserved; uncertainty is visible without freezing peers.
                     tail = max(
                         money(session["estimate"]),
-                        self.estimate(state, session["model"], session["phase"], include_provisional=False)[1],
+                        self.estimate(state, session["model"], session["phase"], include_pending=False)[1],
                         known,
                     )
                     reserve = max(money(session.get("reserve", "0")), known + tail)
                     if (
-                        session["status"] == "provisional"
+                        session["status"] == ("provisional" if provisional else "unresolved")
                         and session.get("lower_bound_totals") == lower
                         and money(session["reserve"]) == reserve
                     ):
@@ -580,7 +580,7 @@ class Budget:
                     event = dict(
                         type="unresolved",
                         id=receipt["id"],
-                        provisional=True,
+                        provisional=bool(provisional),
                         reserve=str(reserve),
                         lower_bound_cost=str(known),
                         lower_bound_totals=lower,

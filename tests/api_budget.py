@@ -531,6 +531,8 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             result = self.run_claude(env={**os.environ, "FAKE_EVENTS": json.dumps(events)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.budget.snapshot()["unresolved"]), 1)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertGreaterEqual(Decimal(self.budget.snapshot()["pending"]), 14)
 
     def test_flags_managed_serialization_and_key_file(self):
         parser = build_parser()
