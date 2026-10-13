@@ -113,11 +113,12 @@ export class InstallationScheduler extends DurableObject<Env> {
     this.ctx.storage.sql.exec('INSERT INTO accounting(at,operation,api,method,endpoint,status,points,latency,bytes,shape,batch_size,predicted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',Date.now(),operation,api,method,path.split('?')[0].replace(/\/\d+(?=\/|$)/g,'/{id}'),response.status,points,Date.now()-started,text.length,shape,batchSize,predicted);
     if (!quotaHeaders.has('x-ratelimit-remaining')) this.ctx.storage.sql.exec('UPDATE budgets SET remaining=MAX(0,remaining-?) WHERE resource=?',points ?? predicted,resource);
     const errors = parsed.errors || [];
-    const logicalQuota=errors.some((e:any)=>e.type==='RATE_LIMITED' || e.extensions?.code==='RATE_LIMITED');
+    const logicalQuota=errors.some((e:any)=>['RATE_LIMIT','RATE_LIMITED'].includes(e.type) || ['RATE_LIMIT','RATE_LIMITED'].includes(e.extensions?.code));
     const failed = response.status === 403 || response.status === 429 || logicalQuota;
     if (failed) {
       const msg = String(parsed.message || errors.map((e:any)=>e.message).join(' ')).toLowerCase();
-      const primary = response.headers.get('x-ratelimit-remaining') === '0' || logicalQuota && !/secondary|abuse|content creation|concurr|cpu|compute|points per minute/.test(msg);
+      const secondaryEvidence=/secondary|abuse|content creation|concurr|cpu|compute|points per minute/.test(msg);
+      const primary = !secondaryEvidence && (response.headers.get('x-ratelimit-remaining') === '0' || logicalQuota);
       const bucket=api==='app' || api==='authentication'?'app-core':api;
       const category = primary ? 'primary:' + bucket : /content|creation|spam/.test(msg) ? 'secondary:content' : /concurr/.test(msg) ? 'secondary:concurrency' : /cpu|compute|processing time/.test(msg)?'secondary:compute':/points per minute|point limit/.test(msg)?'secondary:points': /secondary|abuse|too many|rate/.test(msg) || response.status===429 ? 'secondary:unspecified' : 'permission';
       if (category !== 'permission') {

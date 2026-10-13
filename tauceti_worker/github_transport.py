@@ -472,7 +472,11 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
                 )
                 if isinstance(payload, dict) and payload.get("errors"):
                     p.returncode = 1
-                    if any(e.get("type") == "RATE_LIMITED" for e in payload["errors"] if isinstance(e, dict)):
+                    if any(
+                        e.get("type") in ("RATE_LIMIT", "RATE_LIMITED")
+                        for e in payload["errors"]
+                        if isinstance(e, dict)
+                    ):
                         p.stderr += "\ngh: API rate limit exceeded (graphql)\n"
             except (ValueError, AttributeError):
                 event({"kind": "graphql_charge", "points": traced, "measured": isinstance(traced, int)})
@@ -518,7 +522,7 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
             p.returncode
             and not primary
             and not secondary
-            and "api rate limit exceeded" in ((p.stderr or "") + (p.stdout or "")).lower()
+            and re.search(r"\bapi rate limit(?: already)? exceeded\b", text, re.I)
         ):
             # Proxies/network failures can strip the headers. Pause briefly and recheck rather
             # than inventing an hourly reset or hammering an endpoint with an optimistic probe.
@@ -526,7 +530,7 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
             remember_quota({"resource": resource, "remaining": 0, "reset": reset, "status": 403}, scope(effective))
             record_block(resource, reset, scope(effective))
             primary = True
-        if secondary and not primary:
+        if secondary:
             delay = int(retry) if retry and retry.isdigit() else 60
             cooldown(effective, until=time.time() + max(1, delay))
             record_block("secondary", time.time() + max(1, delay), scope(effective))
@@ -535,7 +539,7 @@ def _execute(argv, *, env=None, wait: bool = False, **kwargs):
                 actual = {r.get("resource", resource) for r in records if r.get("remaining") == 0} or {resource}
                 for bucket in actual:
                     quota_type("primary:" + bucket, records, effective)
-            else:
+            if secondary:
                 quota_type("secondary:pr-creation-cap" if creation_cap else secondary_type(text), records, effective)
         if wait and p.returncode and secondary and rejected and not primary:
             delay = int(retry) if retry and retry.isdigit() else 60

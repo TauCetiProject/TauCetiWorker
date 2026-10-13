@@ -74,12 +74,12 @@ test('mid-pagination exhaustion restarts in the other pool without mixing cursor
   assert.equal(complete.api,'graphql');assert.deepEqual(complete.data,[]);
  }finally{await mf.dispose();}
 });
-test('GraphQL HTTP-200 quota error defers its pool; 401 renews token once',async()=>{
+for(const quotaType of ['RATE_LIMITED','RATE_LIMIT']) test('GraphQL HTTP-200 '+quotaType+' defers its pool; 401 renews token once',async()=>{
  let attempts=0;
  const mf=await runtime(async(req,u)=>{
   attempts++;
   if(attempts===1)return response({message:'bad token'},'graphql',5000,401);
-  if(u.pathname==='/graphql')return response({errors:[{type:'RATE_LIMITED',message:'API rate limit exceeded'}]},'graphql',0,200);
+  if(u.pathname==='/graphql')return response({errors:[{type:quotaType,message:'API rate limit already exceeded'}]},'graphql',0,200);
   return response([], 'core',4999);
  });
  try{
@@ -88,9 +88,9 @@ test('GraphQL HTTP-200 quota error defers its pool; 401 renews token once',async
   assert.equal(result.api,'core');assert.deepEqual(result.data,[]);assert.equal(attempts,3);
  }finally{await mf.dispose();}
 });
-test('secondary limit pauses both pools and reports new category',async()=>{
+for(const remaining of [100,0]) test('secondary limit pauses both pools even with '+remaining+' primary points',async()=>{
  let calls=0;
- const mf=await runtime(async()=>{calls++;return Response.json({message:'secondary rate limit: content creation'},{status:429,headers:{'retry-after':'120','x-ratelimit-resource':'graphql','x-ratelimit-remaining':'100'}});});
+ const mf=await runtime(async()=>{calls++;return Response.json({message:'secondary rate limit: content creation'},{status:429,headers:{'retry-after':'120','x-ratelimit-resource':'graphql','x-ratelimit-remaining':String(remaining)}});});
  try{
   const ns=await mf.getDurableObjectNamespace('INSTALLATIONS'),stub=ns.get(ns.idFromName('200'));
   const a=await (await send(stub,'/read',{repository,query:{operation:'issue_comments',args:{number:7}},page:1})).json();assert.equal(a.deferred,true);

@@ -177,6 +177,29 @@ gh: API rate limit exceeded
             assert network.call_count == 1 and tr.cooldown() > 0
 
     # GraphQL can fail logically with HTTP 200: quota attribution must still protect PR counters.
+    for quota_type in ("RATE_LIMIT", "RATE_LIMITED"):
+        with patch.dict(os.environ, {"GH_TOKEN": "headerless-" + quota_type}):
+            logical_error = {
+                "data": None,
+                "errors": [{"type": quota_type, "message": "API rate limit already exceeded"}],
+            }
+            start = time.time()
+            with patch.object(
+                tr.subprocess, "run", return_value=response(None, errors=logical_error["errors"])
+            ) as network:
+                assert tr.execute(["gh", "api", "graphql", "-f", "query=query{viewer{login}}"]).returncode != 0
+                assert tr.blocked_since(start)
+                assert tr.execute(["gh", "api", "graphql", "-f", "query=query{viewer{login}}"]).returncode != 0
+                assert network.call_count == 1
+    with patch.dict(os.environ, {"GH_TOKEN": "secondary-and-primary-token"}):
+        secondary_zero = trace.replace("403 Forbidden", "429 Too Many Requests")
+        secondary_seen = json.loads((Path(tmp) / "quota-types.json").read_text())["secondary:unspecified"]["count"]
+        with patch.object(tr.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", secondary_zero)):
+            assert tr.execute(["gh", "api", "user"]).returncode != 0
+            assert tr.cooldown() > 0
+        assert (
+            json.loads((Path(tmp) / "quota-types.json").read_text())["secondary:unspecified"]["count"] > secondary_seen
+        )
     with patch.dict(os.environ, {"GH_TOKEN": "graphql-exhausted-token"}):
         tr.remember_quota({"resource": "graphql", "remaining": 5000, "reset": reset + 1000}, tr.scope())
         gql_trace = trace.replace("403 Forbidden", "200 OK").replace("Resource: core", "Resource: graphql")
