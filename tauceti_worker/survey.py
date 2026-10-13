@@ -20,7 +20,7 @@ from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
-    BUMP_HEAD_PREFIX,
+    BUMP_HEAD_PREFIXES,
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
     LINT_REPAIR_HEAD_PREFIX,
@@ -213,6 +213,9 @@ class PRInfo:
     # changed since it last read its comments (see ReviewState.observe). Free in the query we already
     # make; "" when unknown, which reads as "cannot tell" and falls back to the plain TTL.
     updated_at: str = ""
+    base_oid: str = ""
+    bors_failed: bool = False
+    bors_status_at: int | None = None
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -248,6 +251,17 @@ class PRInfo:
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
+            base_oid=str(d.get("baseRefOid") or ""),
+            bors_failed=any(c.get("context") == "bors" and c.get("state") in BUILD_FAIL for c in rollup),
+            bors_status_at=max(
+                [
+                    t
+                    for c in rollup
+                    if c.get("context") == "bors"
+                    if (t := _parse_iso8601(c.get("startedAt"))) is not None
+                ],
+                default=None,
+            ),
         )
 
 
@@ -263,6 +277,7 @@ class Candidate:
     ready_at: int | None = None  # when this exact review unit became actionable
     preferred_reviewer: str = ""  # latest scoreboard publisher; gets a short first refusal
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
+    bump_recovery_key: str = ""  # deterministic recovery; no provider launch or source-repair charge
 
 
 @dataclass
@@ -884,7 +899,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    the lint-repair stage's, so fix-ci defers those; it picks up only other red PRs (ours, or
     #    any other bot-authored one).
     for p in tended:
-        if not p.build_failed or p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX)):
+        if not p.build_failed or p.head_ref.startswith((*BUMP_HEAD_PREFIXES, LINT_REPAIR_HEAD_PREFIX)):
             continue
         c = Candidate(p.number, p.head_oid, "build failed at head")
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
@@ -901,7 +916,23 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
     #    fix still owns its review findings).
     for p in tended:
-        if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
+        if not p.head_ref.startswith(BUMP_HEAD_PREFIXES):
+            continue
+        if {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close"}:
+            continue
+        if p.build_success and p.bors_failed and p.base_oid:
+            key = f"bump-refresh-{p.number}-{p.head_oid[:12]}-{p.base_oid[:12]}-{p.bors_status_at}"
+            c = Candidate(
+                p.number,
+                p.head_oid,
+                "integration-failed bump; check advanced main without AI",
+                attempts=counters.read(key),
+                budget=1,
+                bump_recovery_key=key,
+            )
+            (sv.bump.suppressed if c.attempts else sv.bump.actionable).append(c)
+            continue
+        if not p.build_failed:
             continue
         c = Candidate(p.number, p.head_oid, "bump-mathlib, build red")
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")

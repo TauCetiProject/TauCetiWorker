@@ -113,6 +113,8 @@ MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across heads
 
 BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
+BUMP_HEAD_PREFIXES = (BUMP_HEAD_PREFIX, "hopscotch/lkg-bump")
+MAX_BUMP_REFRESHES = 3  # distinct integration-failed heads, shared through Bors history
 MAX_LINT_REPAIR_ATTEMPTS = 3  # per-head: stop trying to green a red lint-repair head
 MAX_LINT_REPAIR_PR_ATTEMPTS = 6  # per-PR lifetime backstop for lint repair across heads
 # Branch prefix of the repair PR TauCeti's daily full lint (.github/workflows/lint-full.yml) opens

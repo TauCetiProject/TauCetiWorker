@@ -609,7 +609,7 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
     pullRequests(states:OPEN,first:$n,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){
       pageInfo{hasNextPage endCursor}
       nodes{
-        number title body isDraft mergeable updatedAt headRefOid headRefName
+        number title body isDraft mergeable updatedAt headRefOid headRefName baseRefOid
         headRepositoryOwner{login} headRepository{name}
         author{login __typename}
         labels(first:50){totalCount nodes{name}}
@@ -636,7 +636,17 @@ def _pr_json_from_graphql(node: dict) -> dict:
     return {
         **{
             k: node.get(k)
-            for k in ("number", "title", "body", "isDraft", "mergeable", "updatedAt", "headRefOid", "headRefName")
+            for k in (
+                "number",
+                "title",
+                "body",
+                "isDraft",
+                "mergeable",
+                "updatedAt",
+                "headRefOid",
+                "headRefName",
+                "baseRefOid",
+            )
         },
         "headRepositoryOwner": node.get("headRepositoryOwner") or {},
         "headRepository": node.get("headRepository") or {},

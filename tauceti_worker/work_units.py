@@ -766,7 +766,9 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "fix": (f"fix-{pr}-{head}",),
         "fix-ci": (f"ci-{pr}-{head}", f"ci-pr-{pr}"),
         "rebase": (rebase_key,),
-        "bump": (f"bump-{pr}-{head}", f"bump-pr-{pr}"),
+        "bump": (
+            (c.bump_recovery_key,) if getattr(c, "bump_recovery_key", "") else (f"bump-{pr}-{head}", f"bump-pr-{pr}")
+        ),
         "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
         "progress": ("progress-err",),
     }.get(stage, ())
@@ -811,6 +813,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     ):
         raise NoProgress("GitHub API exhausted — waiting for reset before launching paid work")
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
+    if stage == "bump" and getattr(c, "bump_recovery_key", ""):
+        from .bump_recovery import recover
+
+        report_runtime("running", phase="bump", target=f"PR #{c.pr}", detail="integration recovery without AI")
+        return _run_github_stage(stage, recover, w, sv, c, opts, bubble)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
