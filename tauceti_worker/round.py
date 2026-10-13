@@ -54,6 +54,14 @@ class RoundContext:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        # Register first: LIFO cleanup records resources after claim/build teardown.
+        try:
+            from .resources import RoundResources
+
+            monitor = RoundResources(self.cfg).start()
+            self.add_cleanup(monitor.finish)
+        except Exception as error:
+            log(f"resources: could not start sampling ({type(error).__name__}: {error})")
         return self
 
     def add_cleanup(self, fn) -> None:

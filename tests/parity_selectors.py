@@ -37,7 +37,8 @@ FIELDS = [
     "mergeable",
 ]
 try:
-    ME = tc.me()
+    # A committed/supplied snapshot is an offline test, including identity resolution.
+    ME = "tauceti-ci-placeholder" if len(sys.argv) > 1 else tc.me()
 except tc.Die:
     # This harness compares jq-vs-Python agreement, not specific PRs, so it holds for any login.
     # When `gh` isn't authenticated (e.g. in CI), fall back to a placeholder so it still runs; the

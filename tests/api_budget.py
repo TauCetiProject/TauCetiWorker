@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -204,9 +205,11 @@ if os.environ.get('FAKE_CRASH'):
 if os.environ.get('FAKE_EVENTS'):
     for event in json.loads(os.environ['FAKE_EVENTS']):
         print(json.dumps(event), flush=True)
+    time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
     sys.exit(0)
 print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.environ.get('FAKE_SESSION', str(os.getpid())),
                   'total_cost_usd': float(os.environ.get('FAKE_COST', '10')), 'result': 'done'}), flush=True)
+time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
 """)
         self.native.chmod(0o700)
         self.env = patch.dict(
@@ -396,6 +399,54 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': os.envir
         self.assertEqual(Decimal(snapshot["spent"]), 12)
         self.assertFalse((context.directory / "key").exists())
         self.assertEqual(Decimal(self.budget.recover("idempotent retry")["spent"]), 12)
+
+    def test_result_cost_survives_sigterm_before_native_exit(self):
+        events = [dict(type="result", session_id="completed-model", total_cost_usd=12)]
+        with ClaudeAPIContext("worker1", "roadmap") as context:
+            proc = subprocess.Popen(
+                ["claude", "-p", "hello", "--model=opus", "--output-format=stream-json"],
+                env={**os.environ, "FAKE_EVENTS": json.dumps(events), "FAKE_POST_RESULT_DELAY": "30"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                self.assertEqual(json.loads(proc.stdout.readline())["type"], "system")
+                self.assertEqual(json.loads(proc.stdout.readline())["type"], "result")
+                self.assertIsNone(proc.poll())
+                receipt = json.loads(next(context.inbox.glob("*.receipt")).read_text())
+                self.assertEqual(receipt["totals"], {"completed-model": "12"})
+                self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+            finally:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.communicate(timeout=5)
+        self.assertEqual(self.budget.snapshot()["unresolved"], [])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 12)
+
+    def test_new_inference_invalidates_previous_cost_checkpoint(self):
+        events = [
+            dict(type="result", session_id="continued-model", total_cost_usd=12),
+            dict(type="assistant", session_id="continued-model", message={"usage": {"output_tokens": 1}}),
+        ]
+        with ClaudeAPIContext("worker1", "roadmap") as context:
+            proc = subprocess.Popen(
+                ["claude", "-p", "hello", "--model=opus", "--output-format=stream-json"],
+                env={**os.environ, "FAKE_EVENTS": json.dumps(events), "FAKE_POST_RESULT_DELAY": "30"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                for expected in ("system", "result", "assistant"):
+                    self.assertEqual(json.loads(proc.stdout.readline())["type"], expected)
+                self.assertIsNone(json.loads(next(context.inbox.glob("*.receipt")).read_text())["totals"])
+            finally:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.communicate(timeout=5)
+        self.assertEqual(len(self.budget.snapshot()["unresolved"]), 1)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
 
     def test_bubble_does_not_require_host_claude_binary(self):
         with patch.dict(os.environ, {"TAUCETI_CLAUDE_CMD": "missing-host-claude"}):

@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO))
 from tauceti_worker import agents, cli, github, loop, tui
 from tauceti_worker import worker_manager as wm
 from tauceti_worker.config import Die
+from tauceti_worker.github_transport import read_context
 
 FAKE_GH = """#!/usr/bin/env python3
 import json, os, sys
@@ -68,6 +69,7 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         "PYTHONPATH": str(REPO),
         "TEST_GH_LOG": str(root / "gh.jsonl"),
         "TAUCETI_CONFIG_HOME": str(root / "config"),
+        "TAUCETI_GITHUB_SHARED_DIR": str(root / "github-shared"),
     }
     with patch.dict(os.environ, clean, clear=True):
         # An inherited token for Bob must not override a requested stored Alice credential.
@@ -243,6 +245,17 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         with patch.object(cli, "cmd_status", return_value=0):
             assert cli.main(["status", "--github-account", "alice"]) == 0
             assert os.environ["GH_TOKEN"] == "test-alice"
+        # A depleted REST bucket is a rate-limit wait, not an invalid credential.
+        with (
+            read_context(fresh=True),
+            patch.object(
+                github.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="HTTP 403: API rate limit exceeded"),
+            ),
+        ):
+            rejected(lambda: github.pin_github_account("alice"), "GitHub API rate limit exceeded")
+        assert os.environ["GH_TOKEN"] == "test-alice"
         assert "--github-account" in tui.launch_cmd(None, "auto", False, False)
 
         alice = wm.WorkerSpec.from_dict({"id": "review-alice", "github_account": "alice"}, 0)

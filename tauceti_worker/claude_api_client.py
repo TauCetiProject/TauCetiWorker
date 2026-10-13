@@ -127,24 +127,50 @@ def main():
     final = None
     outcome = "launch-failed"
     rc = 1
+
+    def checkpoint():
+        # A native result can precede process exit by a long background-task
+        # wait. Persist its cost before forwarding it, so round teardown can
+        # recover the receipt even if SIGTERM prevents this shim's finally.
+        # This does not settle an active session or release its reservation.
+        receipt = dict(
+            id=invocation,
+            totals=totals if totals and not unknown_segments else None,
+            outcome="result observed; process has not exited",
+        )
+        try:
+            atomic(bridge / "inbox" / (invocation + ".receipt"), receipt)
+        except OSError as error:
+            print(f"tauceti budget: receipt checkpoint pending: {error}", file=sys.stderr)
+
     try:
         proc = subprocess.Popen(real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
         outcome = "started"
         assert proc.stdout is not None
         try:
             for line in proc.stdout:
-                if output_format == "stream-json":
-                    try:
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                    except (OSError, UnicodeError):
-                        pass  # Keep draining Claude even if the transcript consumer disappeared.
                 try:
                     event = json.loads(line)
                 except ValueError:
-                    continue
+                    event = None
                 if not isinstance(event, dict):
+                    if output_format == "stream-json":
+                        try:
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                        except (OSError, UnicodeError):
+                            pass
                     continue
+                if final is not None and (
+                    event.get("type") == "assistant"
+                    or event.get("type") == "system"
+                    and event.get("subtype") == "api_retry"
+                ):
+                    # Further inference after a result invalidates its complete
+                    # cost until the next result supplies updated totals.
+                    segment = event.get("session_id") or final.get("session_id") or invocation
+                    unknown_segments.add(segment if isinstance(segment, str) else invocation)
+                    checkpoint()
                 if event.get("type") == "result":
                     final = event
                     segment = event.get("session_id") or invocation
@@ -166,6 +192,7 @@ def main():
                         unknown_segments.discard(segment)
                     else:
                         unknown_segments.add(segment)
+                    checkpoint()
                 if event.get("type") == "system" and event.get("subtype") == "api_retry":
                     if event.get("error_status") == 429:
                         try:
@@ -173,6 +200,12 @@ def main():
                             request(bridge, "cooldown", id=invocation, model=model, seconds=delay, wait=False)
                         except (OSError, RuntimeError, ValueError, TypeError, OverflowError):
                             pass  # Accounting failure must not interrupt the already admitted session.
+                if output_format == "stream-json":
+                    try:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    except (OSError, UnicodeError):
+                        pass  # Keep draining Claude even if the transcript consumer disappeared.
         finally:
             proc.stdout.close()
         rc = proc.wait()

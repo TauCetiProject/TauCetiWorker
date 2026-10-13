@@ -437,7 +437,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # change what it means.
     focus_prs(sv, opts)
 
-    # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
+    # The cascade: first actionable stage wins, does one useful unit, returns its rc. A candidate that is
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
@@ -511,6 +511,28 @@ def _checkout_head(cfg: Config) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return p.stdout.strip() or None if p.returncode == 0 else None
+
+
+def _candidate_checkout_unchanged(cfg: Config, c: Candidate) -> bool:
+    """Only decline a no-change PR attempt when no local publication work would be discarded."""
+    if not c.pr or not c.head or _checkout_head(cfg) != c.head:
+        return False
+    from .github_outbox import directory
+    from .github_transport import root, scope
+
+    pending = (
+        directory(),
+        root() / "outbox" / (scope() or "unselected") / os.environ.get("TAUCETI_WORKER_ID", "unknown"),
+    )
+    if any(next(path.glob("*.json"), None) is not None for path in pending):
+        return False
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(cfg.checkout), "status", "--porcelain"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return status.returncode == 0 and not status.stdout.strip()
 
 
 def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
@@ -727,9 +749,53 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     return True
 
 
+def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
+    """Quota failures in any stage are infrastructure pauses, including checkout and publishing.
+
+    Restore only this stage's attempt counters. Provider costs already settled remain costs, and
+    successful work is never rolled back just because a later cleanup request hit a limit.
+    """
+    from .github_transport import blocked_since
+
+    pr, head = c.pr, c.head[:12]
+    rebase_key = c.rebase_budget_key if stage == "rebase" else None
+    if stage == "rebase" and not rebase_key:
+        raise Die("rebase candidate has no selected retry budget; survey it again")
+    keys = {
+        "review": (f"review-err-{pr}",),
+        "fix": (f"fix-{pr}-{head}",),
+        "fix-ci": (f"ci-{pr}-{head}", f"ci-pr-{pr}"),
+        "rebase": (rebase_key,),
+        "bump": (f"bump-{pr}-{head}", f"bump-pr-{pr}"),
+        "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
+        "progress": ("progress-err",),
+    }.get(stage, ())
+    before = {key: w.counters.read(key) for key in keys}
+    started = time.time()
+
+    def pause():
+        for key, value in before.items():
+            # Another infrastructure handler may already have refunded this attempt.
+            w.counters.write(key, min(value, w.counters.read(key)))
+        raise NoProgress(f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR")
+
+    try:
+        rc = fn(w, sv, c, opts, bubble)
+    except Exception:
+        if blocked_since(started):
+            pause()
+        raise
+    if rc != 0 and blocked_since(started):
+        pause()
+    return rc
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
-    """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
-    (caller tries the next candidate). Dry-run logs the intent and returns 0."""
+    """Perform one stage. Return its rc, or None to decline this candidate and try another.
+
+    A paid PR attempt that changes neither GitHub nor its checkout is declined too;
+    its expenditure and attempt counter remain charged. Dry-run returns 0.
+    """
     bubble = _bubble(stage, opts)
     if opts.dry_run:
         target = f"#{c.pr}" if c.pr else (c.head[:12] if c.head else c.reason)
@@ -738,6 +804,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    from .github_transport import observed_budget
+
+    if stage not in ("overlap-scan", "overlap-fix") and any(
+        remaining == 0 for remaining, _ in observed_budget().values()
+    ):
+        raise NoProgress("GitHub API exhausted — waiting for reset before launching paid work")
+    os.environ["TAUCETI_GITHUB_PHASE"] = stage
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -834,6 +907,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
+    # Fresh candidate/claim reads can exhaust a bucket after the initial dispatch preflight.
+    if stage not in ("overlap-scan", "overlap-fix") and any(
+        remaining == 0 for remaining, _ in observed_budget().values()
+    ):
+        raise NoProgress("GitHub API exhausted during revalidation — waiting before launching paid work")
     from .budget import BudgetError
     from .claude_api import admission_failure, api_context, api_mode
 
@@ -851,7 +929,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             if not api_mode():
                 raise
             raise admission_failure(str(error)) from None
-        rc = fn(w, sv, c, opts, bubble)
+        rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
         if rc != 0 and api is not None and api.blocked_reason:
             raise admission_failure(api.blocked_reason)
     if stage in FILE_CHANGE_STAGES and not bubble:
@@ -861,11 +939,21 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
     if rc == 0 and stage in PROGRESS_GUARDED and not _progressed(w, c, pre):
         tgt = f" #{c.pr}" if c.pr else ""
-        raise NoProgress(
+        reason = (
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment). Most often another worker pushed the branch first (safe-push declines rather "
             f"than clobber) or the agent declined to act — not a failure. Transcript: {w.cfg.logdir}"
         )
+        if not bubble and _candidate_checkout_unchanged(w.cfg, c):
+            log(reason + "; checkout unchanged — selecting another candidate")
+            report_runtime(
+                "surveying",
+                phase=None,
+                target=None,
+                detail="previous PR attempt unchanged; selecting another candidate",
+            )
+            return None
+        raise NoProgress(reason)
     return rc
 
 
@@ -885,6 +973,9 @@ def do_overlap_fix(w, sv, c, opts, bubble):
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
+    from .github_transport import blocked_since
+
+    github_started = time.time()
     pr, head = c.pr, c.head
     reviewers = opts.work_model
     if reviewers in ("auto", ""):
@@ -973,6 +1064,8 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
+        elif blocked_since(github_started):
+            raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
             # The engine stopped because the reviewer's provider is unusable — a revoked credential or
             # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).

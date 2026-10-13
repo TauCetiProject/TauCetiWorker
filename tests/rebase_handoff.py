@@ -2,7 +2,6 @@
 """A trusted head-bound request reaches only the tending worker, with bounded retries."""
 
 import importlib
-import json
 import sys
 import tempfile
 from pathlib import Path
@@ -22,8 +21,7 @@ def request(head=HEAD, author="tauceti-review-bot[bot]"):
 
 def test_trusted_paginated_comments():
     gh = GitHub()
-    response = SimpleNamespace(returncode=0, stdout="")
-    with patch.object(gh, "_gh", return_value=response) as call:
+    with patch.object(gh, "issue_comments") as call:
         for rows, expected in [
             ([request(author="peer"), request()], True),
             ([request(author="peer")], False),
@@ -34,13 +32,11 @@ def test_trusted_paginated_comments():
             ([{"author": "tauceti-review-bot[bot]", "body": []}], False),
             ([None, [], request()], True),
         ]:
-            response.stdout = "\n".join(json.dumps(row) for row in rows)
+            call.return_value = [
+                {**row, "user": {"login": row["author"]}} if isinstance(row, dict) else row for row in rows
+            ]
             assert gh.rebase_requested(1, HEAD) is expected, rows
-        assert "--paginate" in call.call_args.args[0]
-        response.stdout = "not json"
-        assert not gh.rebase_requested(1, HEAD)
-        response.stdout = json.dumps(request())
-        response.returncode = 1
+        call.return_value = None
         assert not gh.rebase_requested(1, HEAD)
         call.reset_mock()
         assert not gh.rebase_requested(1, "invalid")
@@ -73,13 +69,14 @@ def test_survey_ownership_head_pause_and_budget():
         pr(8, labels=("hold",), conflicting=True),
     ]
     gh = GitHub()
-    response = SimpleNamespace(returncode=0, stdout=json.dumps(request()))
     counters = SimpleNamespace(read=lambda name: survey_mod.MAX_REBASE_ATTEMPTS if name == "rebase-pr-6" else 0)
     with (
         patch.object(survey_mod, "me", return_value="me"),
         patch.object(survey_mod, "can_push", side_effect=AssertionError("no canonical bot PRs")),
         patch.object(gh, "open_prs", return_value=raw),
-        patch.object(gh, "_gh", return_value=response) as calls,
+        patch.object(
+            gh, "issue_comments", return_value=[{**request(), "user": {"login": request()["author"]}}]
+        ) as calls,
     ):
         sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False)
     assert [c.pr for c in sv.rebaseable.actionable] == [1, 7]

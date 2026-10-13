@@ -588,6 +588,10 @@ def _fetch_shallow(url: str, dir: Path) -> bool:
 
 def fetch_ref(repo: str, dir: Path) -> bool:
     """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+    if repo in (ROADMAP, REVIEW):
+        from .shared_repositories import attach
+
+        return attach(repo, dir, ttl=3600 if repo == ROADMAP else 900)
     return _fetch_shallow(f"https://github.com/{repo}", dir)
 
 
@@ -950,6 +954,8 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     from .claude_api import review_environment
 
     api_env = review_environment()
+    if label.startswith("review #"):
+        api_env = {**(os.environ if api_env is None else api_env), "TAUCETI_GITHUB_HISTORY_BRIDGE": "1"}
     env_kwargs = {"env": api_env} if api_env is not None else {}
     if os.environ.get("TAUCETI_STREAM"):
         return subprocess.run(argv, **env_kwargs).returncode
