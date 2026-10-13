@@ -514,7 +514,7 @@ def protections() -> list[dict]:
             "security-audit-admins",
             "branch",
             "refs/heads/security-audit",
-            [{"type": "creation"}, {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}],
+            [{"type": "creation"}, {"type": "update"}],
             True,
         ),
         ruleset(
@@ -528,7 +528,7 @@ def protections() -> list[dict]:
             "toolchain-tags-immutable",
             "tag",
             "refs/tags/v*",
-            [{"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}, {"type": "deletion"}],
+            [{"type": "update"}, {"type": "deletion"}],
         ),
     ]
 

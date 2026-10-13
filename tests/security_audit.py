@@ -224,6 +224,29 @@ class Authority(unittest.TestCase):
             sa.api("repos/example/repo/git/refs/heads/security-audit", method="PATCH", body={"sha": "a" * 40})
         self.assertEqual(execute.call_args.kwargs["env"]["TAUCETI_OUTBOX_REPLAY"], "1")
 
+    def test_setup_accepts_github_normalized_existing_rules(self):
+        protections = sa.protections()
+        rules = [{"name": r["name"], "id": i} for i, r in enumerate(protections)]
+
+        def response(path, **kwargs):
+            self.assertFalse(kwargs, "idempotent setup must not write")
+            if "?per_page=" in path:
+                return rules
+            if "/rulesets/" in path:
+                rule_id = int(path.rsplit("/", 1)[1])
+                return {**protections[rule_id], "id": rule_id, "source_type": "Repository"}
+            return [{"ref": "refs/heads/security-audit"}]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(sa, "require_admin"),
+            patch.object(sa, "remote_sha", return_value=sa.BOOTSTRAP),
+            patch.object(sa, "refresh"),
+            patch.object(sa, "validate_history"),
+            patch.object(sa, "api", side_effect=response),
+        ):
+            sa.setup(Path(tmp))
+
 
 class Run(unittest.TestCase):
     def setUp(self):
