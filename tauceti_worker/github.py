@@ -924,15 +924,10 @@ class GitHub:
         """A trusted sweep handoff for this exact head; stale requests spend no attempts."""
         if not re.fullmatch(r"[0-9a-f]{40}", head):
             return False
+        from .survey_facts import rebase_heads
+
         comments = self.issue_comments(pr)
-        return any(
-            isinstance(c, dict)
-            and (c.get("user") or {}).get("login") == "tauceti-review-bot[bot]"
-            and isinstance(c.get("body"), str)
-            and c["body"].startswith("Merge-queue recovery for head `")
-            and f"<!--tauceti-rebase:v1 {head}-->" in (c.get("body") or "").splitlines()
-            for c in comments or []
-        )
+        return head in rebase_heads(comments)
 
     def issue_comments(self, pr: int) -> list[dict] | None:
         """Complete GraphQL history in REST shape. Cache is triage-only; force reads bypass it."""

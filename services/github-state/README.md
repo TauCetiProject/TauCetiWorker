@@ -107,6 +107,12 @@ request and stalled interval remains bounded. Partial histories never become
 empty results. The direct facade and service share the field/route catalog in
 `tauceti_worker/github_catalog.json`.
 
+Worker surveys use a materialized, roadmap-filtered fact snapshot instead of
+fetching every PR's full comment histories. The scheduling cascade remains in
+the worker for full service-outage fallback. See [compact surveys](../../docs/compact-surveys.md)
+for scope rules, per-history coverage, migration, telemetry, and cross-language
+contract tests.
+
 ```toml
 max_open_prs = 128
 github_state_url = "https://github-state.taucetiproject.org"
