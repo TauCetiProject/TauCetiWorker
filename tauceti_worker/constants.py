@@ -105,6 +105,9 @@ LOST_BUILD_GRACE_S = 1800
 # day, nothing is coming (TauCeti's stuck-PR watchdog uses the same 24 hours).
 LOST_BUILD_CANCEL_GRACE_S = 86400
 LOST_BUILD_TTL = 600  # seconds a per-head lost-build verdict stays fresh
+# A dispatched build that finished within the grace started at most GitHub's 24-hour queue limit plus
+# pr-build's 6-hour default job limit before that, so two days of dispatch history covers it.
+DISPATCH_LOOKBACK_S = 2 * 86400
 
 MAX_REBASE_ATTEMPTS = 3  # conflict attempts per verified progress checkpoint; handoffs keep a per-PR cap
 

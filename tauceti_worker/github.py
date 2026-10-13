@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import urllib.parse
 from pathlib import Path
 
 from .config import Die, log, one_line
@@ -599,6 +600,10 @@ def _pr_json_from_graphql(node: dict) -> dict:
     }
 
 
+# The workflow-run statuses of a run that has not finished, each a separate filter on the runs listing.
+_ACTIVE_RUN_STATUSES = ("requested", "waiting", "pending", "queued", "in_progress")
+
+
 class GitHub:
     def __init__(self, repo: str = TAUCETI):
         self.repo = repo
@@ -701,19 +706,27 @@ class GitHub:
         except ValueError:
             return None
 
-    def pr_build_dispatches(self) -> list[dict] | None:
-        """pr-build's recent manually dispatched runs, newest first, as {status, conclusion, updated_at,
-        display_title}. A dispatched run is keyed to the commit it was dispatched from (usually main),
-        not to the PR head it builds, so pr_build_runs cannot see it; its title names the PR. None on
-        fetch failure."""
-        path = f"/repos/{self.repo}/actions/workflows/pr-build.yml/runs?event=workflow_dispatch&per_page=20"
-        p = self._gh(["api", path, "--jq", "[.workflow_runs[] | {status, conclusion, updated_at, display_title}]"])
-        if p.returncode != 0:
-            return None
-        try:
-            return json.loads(p.stdout or "[]")
-        except ValueError:
-            return None
+    def pr_build_dispatches(self, created_since: str) -> list[dict] | None:
+        """pr-build's manually dispatched runs that may still post a status, as {status, conclusion,
+        updated_at, display_title}: every one still queued or running, and every one created since
+        `created_since` (ISO 8601). A dispatched run is keyed to the commit it was dispatched from
+        (usually main), not to the PR head it builds, so pr_build_runs cannot see it; its title names
+        the PR. Every listing is read to its last page, and None if any page fails, since a partial
+        list could hide the very run this looks for."""
+        base = f"/repos/{self.repo}/actions/workflows/pr-build.yml/runs?event=workflow_dispatch&per_page=100"
+        since = urllib.parse.quote(f">={created_since}", safe="")
+        listings = [f"{base}&status={s}" for s in _ACTIVE_RUN_STATUSES] + [f"{base}&created={since}"]
+        jq = ".workflow_runs[] | {status, conclusion, updated_at, display_title}"
+        runs: list[dict] = []
+        for path in listings:
+            p = self._gh(["api", "--paginate", path, "--jq", jq])
+            if p.returncode != 0:
+                return None
+            try:
+                runs += [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+            except ValueError:
+                return None
+        return runs
 
     @staticmethod
     def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:

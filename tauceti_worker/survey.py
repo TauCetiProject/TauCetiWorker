@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import Config, log, roadmap_only, roadmap_skip
@@ -22,6 +22,7 @@ from .constants import (
     AUTO_STAGES,
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
+    DISPATCH_LOOKBACK_S,
     EX_NOPROGRESS,
     LINT_REPAIR_HEAD_PREFIX,
     LOST_BUILD_CANCEL_GRACE_S,
@@ -667,6 +668,11 @@ def bust_progress_cache(cfg: Config) -> None:
         pass
 
 
+# The fix-ci reason for a head found by lost_builds; work_units re-checks such a candidate before it
+# spends (confirm_lost_build).
+LOST_BUILD_REASON = "build finished without a `build` status"
+
+
 def build_lost(runs: list[dict], now: float) -> bool:
     """Whether pr-build has finished with a head for good without posting its `build` status, given
     that head's pr-build runs (GitHub.pr_build_runs).
@@ -707,10 +713,10 @@ def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[i
 
     The open-PR query reads statuses only (_OPEN_PRS_QUERY in github.py says why), so this costs a REST
     call per head. It is paid only for a head with no status whose PR has not moved for the grace
-    period, and a verdict is cached per head for LOST_BUILD_TTL. A replacement build dispatched by PR
-    number is keyed to another commit, so whenever a head looks lost one more call reads the recent
-    dispatches (dispatch_pending). Never raises: a failed read counts as not lost, and is retried next
-    round."""
+    period, and a verdict is cached per head for LOST_BUILD_TTL. This is discovery only: a cached
+    verdict can miss a rerun started since, and dispatched replacements are not consulted, so
+    confirm_lost_build re-checks a head before anything is spent on it. Never raises: a failed read
+    counts as not lost, and is retried next round."""
     cache = cfg.state / "cache" / "lost-builds.json"
     try:
         seen = json.loads(cache.read_text())
@@ -736,12 +742,25 @@ def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[i
         cache.write_text(json.dumps(kept))
     except OSError:
         pass
-    if not lost:
-        return lost
-    dispatches = gh.pr_build_dispatches()
-    if dispatches is None:
-        return set()
-    return {n for n in lost if not dispatch_pending(dispatches, n, now)}
+    return lost
+
+
+def confirm_lost_build(gh: GitHub, pr: int, head: str, now: float) -> bool:
+    """A live, complete re-check of a head lost_builds reported, made before a fixer is spent on it:
+    the PR is still open at that head with no `build` status, the head's own runs are still lost (a
+    rerun of them may have started since a cached verdict), and no dispatched replacement may still
+    report (dispatch_pending). Any failed read answers no."""
+    live = gh.pr_view(pr, ["headRefOid", "isDraft", "state", "statusCheckRollup"])
+    if not live or live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != head:
+        return False
+    if any(c.get("context") == "build" for c in live.get("statusCheckRollup") or []):
+        return False
+    runs = gh.pr_build_runs(head)
+    if runs is None or not build_lost(runs, now):
+        return False
+    since = datetime.fromtimestamp(now - DISPATCH_LOOKBACK_S, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dispatches = gh.pr_build_dispatches(since)
+    return dispatches is not None and not dispatch_pending(dispatches, pr, now)
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
@@ -972,7 +991,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     for p in fixable:
         if not (p.build_failed or p.number in lost):
             continue
-        reason = "build failed at head" if p.build_failed else "build finished without a `build` status"
+        reason = "build failed at head" if p.build_failed else LOST_BUILD_REASON
         c = Candidate(p.number, p.head_oid, reason)
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"ci-pr-{p.number}")
