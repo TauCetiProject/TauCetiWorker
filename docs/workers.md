@@ -397,3 +397,22 @@ tauceti workers import workers.conf
 
 Anything the legacy parser does not recognize is an error naming the file, line,
 and token, so a partial migration is never silently accepted.
+
+## Integration-only dependency repairs
+
+Bors retries an unchanged automatically reviewed bump after main advances, with
+three retries per head. This uses the existing Bors heartbeat and leaves the
+branch and its reviews intact. Workers do not request queue retries.
+
+Bors durably hands a confirmed singleton failure to proof repair when no retry
+is currently possible or its budget is exhausted, then publishes
+`bump-integration`. Later main advances cannot retry that handed-off head.
+The bump phase recognizes that status alongside a green standalone build. Before
+spending on an editor, it checks the live exact-head PR and Bors `bump_repairs`
+handoff. Pending or active queue work, withdrawals, draft/closed PRs and holds
+are excluded. A second check after taking the normal branch claim closes the
+selection gap. Failed observations decline the candidate and leave unrelated
+work available. Normal bump editing budgets apply. The repair session fetches
+and merges current main, diagnoses the actual integration failure, preserves
+the dependency target and verifies its changes before pushing. Healthy surveys
+make no additional API calls.

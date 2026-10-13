@@ -213,6 +213,7 @@ class PRInfo:
     # changed since it last read its comments (see ReviewState.observe). Free in the query we already
     # make; "" when unknown, which reads as "cannot tell" and falls back to the plain TTL.
     updated_at: str = ""
+    bump_integration_failed: bool = False
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -248,6 +249,9 @@ class PRInfo:
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
+            bump_integration_failed=any(
+                c.get("context") == "bump-integration" and c.get("state") in BUILD_FAIL for c in rollup
+            ),
         )
 
 
@@ -263,6 +267,7 @@ class Candidate:
     ready_at: int | None = None  # when this exact review unit became actionable
     preferred_reviewer: str = ""  # latest scoreboard publisher; gets a short first refusal
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
+    bump_integration_failure: bool = False
 
 
 @dataclass
@@ -901,9 +906,18 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
     #    fix still owns its review findings).
     for p in tended:
-        if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
+        integration = p.build_success and p.bump_integration_failed
+        branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
+        if not (branch and (p.build_failed or integration)):
             continue
-        c = Candidate(p.number, p.head_oid, "bump-mathlib, build red")
+        if {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close", "needs-rebase"}:
+            continue
+        c = Candidate(
+            p.number,
+            p.head_oid,
+            "bump-mathlib, singleton integration failed" if integration else "bump-mathlib, build red",
+            bump_integration_failure=integration,
+        )
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
