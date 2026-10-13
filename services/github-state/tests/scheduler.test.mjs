@@ -31,6 +31,85 @@ function fixture(){
  return {state,db,insert,env,objects,ctx};
 }
 
+test('compact roadmap snapshot updates on comment edit/delete without reading full histories',async()=>{
+ const {state,db}=fixture();try {
+  const repo='org/repo';state.setMeta('repository',{id:'100',name:repo,installation:'200'});
+  const complete=(operation,args={})=>{const key=operation+':'+JSON.stringify(args);db.prepare('INSERT OR REPLACE INTO collections VALUES(?,?,?,?,?,?,?)').run(key,operation,JSON.stringify(args),1,Date.now(),state.revision(),null);};
+  complete('open_prs');
+  for(const [number,area] of [[7,'PDE'],[8,'Topology']]) {
+   await state.put('pr',String(number),{number,state:'OPEN',headRefOid:'a'.repeat(40),labels:[{name:'roadmap/'+area}],body:'private description '.repeat(2000)});
+   state.membership('open_prs:{}',String(number),true);complete('issue_comments',{number});complete('review_comments',{number});
+  }
+  const board={id:'100',body:'<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 '+JSON.stringify({head_sha:'a'.repeat(40),runs:[{provider:'claude',verdict:'approve',tok:{in:200}}]})+'-->',updated_at:'2026-10-13T00:00:00Z'};
+  await state.put('issue_comments','100',board,Date.now(),false,'7');state.membership('issue_comments:{"number":7}','100',true);
+  await state.put('review_comments','101',{id:'101',body:'<!--tauceti-rubric:reuse -->'},Date.now(),false,'7');state.membership('review_comments:{"number":7}','101',true);
+  await state.put('review_comments','102',{id:'102',in_reply_to_id:'101',body:'contest',created_at:'now'},Date.now(),false,'7');state.membership('review_comments:{"number":7}','102',true);
+  await state.hydrateSurvey('7');
+  const q={repository:repo,operation:'survey',args:{roadmap:'PDE',skip:'',numbers:''}};
+  let result=await state.query(q);assert.equal(result.data.length,1);assert.equal(result.data[0].pr.number,7);
+  assert.equal(result.data[0].review.meta.head_sha,'a'.repeat(40));assert.equal(result.data[0].review.contest.id,'102');
+  assert.equal(result.data[0].review.issue_complete,true);assert.equal(JSON.stringify(result).includes('private description'),false);
+  assert.equal(JSON.stringify(result).includes('"tok"'),false);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM demand WHERE key LIKE '%comments:%'").get().n,0,'complete projections must not promote every history to frequent verification');
+  assert.equal(result.author_counts[''],2,'automatic caps count all known roadmap PRs');
+  const explicit=await state.query({...q,args:{roadmap:'PDE',skip:'Topology',numbers:'8'}});assert.equal(explicit.data[0].pr.number,8,'explicit PR overrides roadmap and skips');
+  const prior=result.revision;
+  await state.put('issue_comments','100',{...board,updated_at:'2026-10-13T01:00:00Z',body:'edited; scoreboard removed'},Date.now(),false,'7');
+  await state.put('review_comments','101',{id:'101',body:'<!--tauceti-rubric:reuse -->'},Date.now(),true,'7');
+  result=await state.query(q);assert.ok(result.revision>prior);assert.equal(result.data[0].review.meta,null);assert.equal(result.data[0].review.contest,null);
+  const rows=state.rows.bind(state);state.rows=async(query)=>{assert.ok(!['issue_comments','review_comments'].includes(query.operation),'full histories were read by a warm query');return rows(query);};
+  await state.query(q);
+ }finally{db.close();}
+});
+
+test('large inventory filters before statuses and serves compact facts in one page',async()=>{
+ const {state,db}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  db.prepare('INSERT INTO collections VALUES(?,?,?,?,?,?,?)').run('open_prs:{}','open_prs','{}',1,Date.now(),0,null);
+  const resource=db.prepare('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?)'),inventory=db.prepare('INSERT INTO survey_inventory VALUES(?,?)'),member=db.prepare('INSERT INTO members VALUES(?,?)');
+  const hydrated=db.prepare('INSERT INTO survey_hydrated VALUES(?,?)');
+  for(let i=1;i<=5000;i++) {
+   const row={number:i,state:'OPEN',headRefOid:'a'.repeat(40),labels:[{name:'roadmap/'+(i<=20?'PDE':'Topology')}],target_focuses:[]},data=JSON.stringify(row);
+   resource.run('pr',String(i),'',data,'',Date.now(),0,0);inventory.run(String(i),data);member.run('open_prs:{}',String(i));hydrated.run(String(i),'tauceti-survey-facts/v1');
+  }
+  let statusReads=0;const rows=state.rows.bind(state);state.rows=async q=>{if(q.operation==='statuses')statusReads++;return rows(q);};
+  const result=await state.query({repository:'org/repo',operation:'survey',args:{roadmap:'PDE'}});
+  assert.equal(result.data.length,20);assert.equal(statusReads,20);assert.equal(result.cursor,undefined);assert.ok(JSON.stringify(result).length<20000);
+ }finally{db.close();}
+});
+
+test('migration is outside requests and one missing resource cannot block other PRs or maintenance',async()=>{
+ const {state,db}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});state.setMeta('last_snapshot',Date.now());
+  db.prepare('INSERT INTO collections VALUES(?,?,?,?,?,?,?)').run('open_prs:{}','open_prs','{}',1,Date.now(),0,null);
+  for(const number of [7,8]) {await state.put('pr',String(number),{number,labels:[{name:'roadmap/PDE'}]});state.membership('open_prs:{}',String(number),true);}
+  await state.put('issue_comments','100',{id:'100'},Date.now(),false,'7');
+  db.prepare("UPDATE resources SET data=? WHERE kind='issue_comments' AND id='100'").run(JSON.stringify({$r2:'missing'}));
+  const q={repository:'org/repo',operation:'survey',args:{roadmap:'PDE'}};
+  const result=await state.query(q);assert.equal(result.data.length,2);assert.ok(result.data.every(r=>!r.review.issue_complete));
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM survey_hydrated').get().n,0,'query must not scan existing histories to hydrate');
+  await state.maintenance();
+  assert.deepEqual(db.prepare('SELECT number FROM survey_hydrated').all().map(r=>r.number),['8']);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM survey_hydration_failures').get().n,1);
+  await state.maintenance();assert.equal((await state.query(q)).status,'ok');
+ }finally{db.close();}
+});
+
+test('comment bursts coalesce projection rebuilds and malformed reply IDs do not block ingestion',async()=>{
+ const {state,db}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  await state.put('pr','7',{number:7,labels:[{name:'roadmap/PDE'}]});state.membership('open_prs:{}','7',true);
+  db.prepare('INSERT INTO collections VALUES(?,?,?,?,?,?,?)').run('open_prs:{}','open_prs','{}',1,Date.now(),0,null);
+  await state.hydrateSurvey('7');let rebuilds=0;const rebuild=state.rebuildSurvey.bind(state);state.rebuildSurvey=n=>{rebuilds++;rebuild(n);};
+  await state.put('review_comments','100',{id:'100',body:'<!--tauceti-rubric:reuse -->'},Date.now(),false,'7');state.membership('review_comments:{"number":7}','100',true);
+  for(let i=101;i<121;i++) {await state.put('review_comments',String(i),{id:String(i),in_reply_to_id:'100',body:'contest'},Date.now(),false,'7');state.membership('review_comments:{"number":7}',String(i),true);}
+  await state.put('review_comments','null',{id:null,in_reply_to_id:'100',body:'contest'},Date.now(),false,'7');state.membership('review_comments:{"number":7}','null',true);
+  assert.equal(rebuilds,0);const q={repository:'org/repo',operation:'survey',args:{roadmap:'PDE'}};
+  const result=await state.query(q);assert.equal(rebuilds,1);assert.equal(result.data[0].review.contest.id,'120');
+  state.membership('review_comments:{"number":7}','100',false);assert.equal((await state.query(q)).data[0].review.contest,null);
+ }finally{db.close();}
+});
+
 test('partial PR payloads retain mergeability only for the same head and base',async()=>{
  const {state,db}=fixture();try {
   await state.put('pr','7',{number:7,headRefOid:'a',baseRefOid:'b',mergeable:'CONFLICTING',updatedAt:'2026-10-12T00:00:00Z'});

@@ -47,7 +47,7 @@ def _wire(data, operation):
     return data
 
 
-def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=False, **args):
+def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=False, _optional=False, **args):
     """Return (available, data). Failed transport/config/coverage falls back; bad queries raise."""
     if _allow_observed and operation != "workflow_jobs":
         raise StateQueryError("observed coverage is available only for workflow jobs")
@@ -124,6 +124,15 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         etag = cached.get("etag")
                         unchanged = True
                     elif error.code == 400:
+                        if _optional:
+                            transport.event(
+                                {
+                                    "kind": "gateway_fallback",
+                                    "operation": operation,
+                                    "reason": "unsupported_service_version",
+                                }
+                            )
+                            return False, None
                         raise StateQueryError(
                             "state service rejected the query; check the client/service protocol versions"
                         ) from None
@@ -229,3 +238,83 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
 def read_workflow_jobs(repo: str, run_id: int | str, *, allow_observed=False):
     """Return (available, result-with-coverage); observed jobs never imply a complete list."""
     return read(repo, "workflow_jobs", id=str(run_id), _allow_observed=allow_observed, _with_metadata=True)
+
+
+class SurveyRows(list):
+    """Compact rows with small inventory-wide counts for automatic authoring limits."""
+
+    def __init__(self, rows, author_counts):
+        super().__init__(rows)
+        self.author_counts = author_counts
+
+
+def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None):
+    from .survey_facts import CONTRACT
+
+    available, result = read(
+        repo,
+        "survey",
+        roadmap=roadmap,
+        skip=",".join(skip),
+        numbers=",".join(map(str, numbers)),
+        stages=",".join(stages if stages is not None else ("review", "fix", "rebase")),
+        _optional=True,
+        _with_metadata=True,
+    )
+    if not available:
+        return False, None
+    try:
+        if result.get("contract") != CONTRACT:
+            raise ValueError("incompatible survey contract")
+        rows = result["data"]
+        if not isinstance(rows, list):
+            raise ValueError("invalid survey")
+        for row in rows:
+            if row["contract"] != CONTRACT or not isinstance(row["pr"], dict) or not isinstance(row["review"], dict):
+                raise ValueError("incompatible survey facts")
+            facts = row["review"]
+            if (
+                facts.get("meta") is not None
+                and not isinstance(facts["meta"], dict)
+                or not isinstance(facts.get("markers"), list)
+                or not isinstance(facts.get("rebase_heads"), list)
+            ):
+                raise ValueError("invalid survey facts")
+            if (
+                type(row["pr"]["number"]) is not int
+                or type(facts["issue_complete"]) is not bool
+                or type(facts["review_complete"]) is not bool
+            ):
+                raise ValueError("invalid survey coverage")
+            if facts.get("contest"):
+                facts["contest"]["id"] = int(facts["contest"]["id"])
+            pr = row["pr"]
+            for field in ("author", "headRepository", "headRepositoryOwner"):
+                if pr.get(field) is not None and not isinstance(pr[field], dict):
+                    raise ValueError("invalid survey PR")
+            for field in ("labels", "statusCheckRollup"):
+                if not isinstance(pr.get(field, []), list) or any(
+                    not isinstance(value, dict) for value in pr.get(field, [])
+                ):
+                    raise ValueError("invalid survey PR collection")
+            if not isinstance(pr.get("target_focuses", []), list) or any(
+                not isinstance(value, str) for value in pr.get("target_focuses", [])
+            ):
+                raise ValueError("invalid survey targets")
+            for marker in facts["markers"]:
+                if (
+                    not isinstance(marker, dict)
+                    or type(marker.get("expires_at")) is not int
+                    or not isinstance(marker.get("providers"), list)
+                    or any(not isinstance(provider, str) for provider in marker["providers"])
+                ):
+                    raise ValueError("invalid survey claim")
+        counts = result.get("author_counts")
+        if counts is not None and (
+            not isinstance(counts, dict) or any(type(count) is not int or count < 0 for count in counts.values())
+        ):
+            raise ValueError("invalid survey author counts")
+        return True, SurveyRows(rows, counts)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        transport.event({"kind": "gateway_fallback", "operation": "survey", "reason": "survey_contract_mismatch"})
+        return False, None

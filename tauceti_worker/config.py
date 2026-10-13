@@ -46,7 +46,7 @@ def roadmap_only() -> str | None:
     """The single roadmap area the worker steers toward, as the operator set it — read live from the
     env each call so the TUI's [o] key can change it and have both the survey display and any launched
     round pick it up (children inherit TAUCETI_ROADMAP_ONLY). Tri-state: None = unset, so a fresh
-    random area is picked per round (see do_roadmap); "" = all areas; else the area name. There is
+    random area is picked before each work survey; "" = all areas; else the area name. There is
     deliberately no baked-in default, and nothing here consults the dashboard prefs — a bare CLI run
     resolves only from the env + the live area list, never from a saved dashboard preference."""
     return os.environ.get("TAUCETI_ROADMAP_ONLY")

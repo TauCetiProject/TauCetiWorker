@@ -47,6 +47,7 @@ from .config import (
     one_line,
     respect_claims,
     roadmap_areas,
+    roadmap_only,
     roadmap_skip,
     warn_red,
 )
@@ -326,7 +327,25 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         sv = Survey(worker_id=w.cfg.wid)
         survey_overlaps(w.cfg, w.gh, sv, repair="overlap-fix" in opts.only)
     else:
-        sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
+        scope = roadmap_only()
+        if getattr(opts, "prs", ()):
+            scope = "any"  # explicit targets override the ambient roadmap
+        elif scope is None and not opts.dry_run and want(opts.only, "roadmap"):
+            all_areas = roadmap_areas(w.gh)
+            areas = [area for area in all_areas if area not in roadmap_skip()]
+            scope = random.choice(areas) if areas else ("auto" if all_areas else "any")
+            log(f"survey roadmap: {scope} (selected before PR history reads)")
+        sv = survey(
+            w.cfg,
+            w.gh,
+            w.rs,
+            w.counters,
+            deep=True,
+            stages=[stage for stage in round_stages(opts) if want(opts.only, stage)],
+            selected_roadmap=scope,
+            numbers=getattr(opts, "prs", ()),
+            count_all_roadmaps=roadmap_only() is None,
+        )
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken

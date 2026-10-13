@@ -15,6 +15,8 @@ export interface Result {
   data?: unknown; revision: number; observed_at?: number; verified_at?: number; complete: boolean; cursor?: string;
   reason?: string;
   coverage?: 'complete' | 'webhook_observed';
+  contract?: string;
+  author_counts?: Record<string,number>;
 }
 export function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return Response.json(value, { status, headers: { 'Cache-Control': 'private, no-cache', ...headers } });
@@ -57,11 +59,16 @@ export async function validSignature(body: ArrayBuffer, signature: string | null
   const expected = 'sha256=' + Array.from(new Uint8Array(mac), b => b.toString(16).padStart(2, '0')).join('');
   return constantEqual(expected, signature!);
 }
-export const OPERATIONS = new Set(['open_prs', 'open_issues', 'recent_prs', 'recent_issues', 'pr', 'files', 'issue_comments', 'review_comments', 'review_threads', 'reviews', 'reactions', 'statuses', 'checks', 'workflow_runs', 'workflow_jobs', 'refs', 'repository', 'progress']);
+export const OPERATIONS = new Set(['survey', 'open_prs', 'open_issues', 'recent_prs', 'recent_issues', 'pr', 'files', 'issue_comments', 'review_comments', 'review_threads', 'reviews', 'reactions', 'statuses', 'checks', 'workflow_runs', 'workflow_jobs', 'refs', 'repository', 'progress']);
 export function validateQuery(q: Query): void {
   if (!q || typeof q.repository !== 'string' || !OPERATIONS.has(q.operation) || (q.args && (typeof q.args !== 'object' || Array.isArray(q.args)))) throw new Error('invalid query');
   if (q.allow_observed!==undefined && (typeof q.allow_observed!=='boolean' || q.operation!=='workflow_jobs')) throw new Error('invalid observed coverage preference');
   for (const [key, value] of Object.entries(q.args || {})) {
+    if(q.operation==='survey') {
+      if(!['roadmap','skip','numbers','stages'].includes(key) || typeof value!=='string' || value.length>4096) throw new Error('invalid survey scope');
+      if(key==='numbers' && !/^(?:[1-9][0-9]*(?:,[1-9][0-9]*)*)?$/.test(value)) throw new Error('invalid survey targets');
+      continue;
+    }
     if (!['number', 'id', 'sha'].includes(key)) throw new Error('unsupported argument');
     if (key === 'sha' ? !/^[a-f0-9]{40}$/.test(String(value)) : !/^[1-9][0-9]*$/.test(String(value))) throw new Error('invalid argument');
   }

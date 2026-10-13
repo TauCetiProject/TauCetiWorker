@@ -35,6 +35,7 @@ RUN_STDLIB=(
   codex_account.py
   codex_fallback.py
   contest_claim.py
+  compact_surveys.py
   cost_model.py
   dispatch_revalidation.py
   fix_diagnostic.py
