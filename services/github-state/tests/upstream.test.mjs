@@ -98,6 +98,31 @@ for(const remaining of [100,0]) test('secondary limit pauses both pools even wit
   const health=await (await stub.fetch('https://internal/health')).json();assert.equal(health.quota_types[0].category,'secondary:content');
  }finally{await mf.dispose();}
 });
+for(const offset of [-10,60]) test('late primary rejection respects its original reset '+offset,async()=>{
+ let entered,release,calls=0;
+ const started=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+ const oldReset=Math.floor(Date.now()/1000)+offset,newReset=Math.floor(Date.now()/1000)+3600;
+ const mf=await runtime(async(req,u)=>{
+  calls++;
+  if(u.pathname.includes('/pulls/7/')) {
+   entered();await gate;
+   return Response.json({message:'API rate limit exceeded'},{status:403,headers:{'x-ratelimit-resource':'core','x-ratelimit-remaining':'0','x-ratelimit-limit':'5000','x-ratelimit-reset':String(oldReset)}});
+  }
+  return Response.json([],{headers:{'x-ratelimit-resource':'core','x-ratelimit-remaining':'4999','x-ratelimit-limit':'5000','x-ratelimit-reset':String(newReset)}});
+ });
+ try{
+  const ns=await mf.getDurableObjectNamespace('INSTALLATIONS'),stub=ns.get(ns.idFromName('200'));
+  const pending=send(stub,'/read',{repository,query:{operation:'files',args:{number:7}},page:1});await started;
+  const fresh=await (await send(stub,'/read',{repository,query:{operation:'files',args:{number:8}},page:1})).json();assert.deepEqual(fresh.data,[]);
+  release();const late=await (await pending).json();assert.equal(late.deferred,true);
+  const health=await (await stub.fetch('https://internal/health')).json(),core=health.budgets.find(b=>b.resource==='core');
+  assert.equal(core.remaining,4999,'an old rejection cannot exhaust the newer window');
+  assert.equal(core.reset,newReset*1000);assert.ok(late.retry_at<=Math.max(Date.now()+2000,oldReset*1000));
+  const next=await (await send(stub,'/read',{repository,query:{operation:'files',args:{number:9}},page:1})).json();
+  if(offset<0) {assert.deepEqual(next.data,[]);assert.equal(calls,3);}
+  else {assert.equal(next.deferred,true);assert.ok(next.retry_at<=oldReset*1000+1000);assert.equal(calls,2);}
+ }finally{release();await mf.dispose();}
+});
 test('delivery audit follows busy-repository pages and redelivers failures beyond page one',async()=>{
  const paths=[];
  const mf=await runtime(async(req,u)=>{

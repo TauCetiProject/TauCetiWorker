@@ -53,7 +53,12 @@ export class InstallationScheduler extends DurableObject<Env> {
     const remaining = Number(headers.get('x-ratelimit-remaining')), reset = Number(headers.get('x-ratelimit-reset')) * 1000;
     if (!resource || !headers.has('x-ratelimit-remaining') || !Number.isFinite(reset)) return;
     const prior = this.ctx.storage.sql.exec<any>('SELECT * FROM budgets WHERE resource=?',resource).toArray()[0];
-    if (prior?.reset>reset) return;
+    if (prior?.reset>reset) {
+      // Contradictory windows cannot erase a concrete zero before its own
+      // reset, but an expired rejection must not exhaust a newer window.
+      if(remaining===0 && reset>Date.now()) this.ctx.storage.sql.exec('UPDATE budgets SET blocked=MAX(blocked,?) WHERE resource=?',reset,resource);
+      return;
+    }
     const blocked = remaining === 0 ? Math.max(prior?.blocked || 0, reset) : prior?.blocked || 0;
     const effective = prior?.reset === reset ? Math.min(prior.remaining,remaining) : remaining;
     this.ctx.storage.sql.exec('INSERT INTO budgets VALUES(?,?,?,?,?) ON CONFLICT(resource) DO UPDATE SET remaining=excluded.remaining,lim=excluded.lim,reset=excluded.reset,blocked=excluded.blocked',resource,effective,Number(headers.get('x-ratelimit-limit')),reset,blocked);
@@ -124,8 +129,10 @@ export class InstallationScheduler extends DurableObject<Env> {
       if (category !== 'permission') {
         const retry = response.headers.get('retry-after');
         const delta = retry && /^\d+$/.test(retry) ? Number(retry)*1000 : retry ? Math.max(0,Date.parse(retry)-Date.now()) : 60000;
-        const until = primary ? Math.max(Date.now()+1000,this.budget(bucket)?.reset || Date.now()+60000) : Date.now()+delta;
-        if (primary) this.ctx.storage.sql.exec('INSERT INTO budgets VALUES(?,?,?,?,?) ON CONFLICT(resource) DO UPDATE SET remaining=0,reset=MAX(reset,excluded.reset),blocked=MAX(blocked,excluded.blocked)',bucket,0,this.budget(bucket)?.lim || 5000,until,until);
+        const reportedReset=Number(response.headers.get('x-ratelimit-reset'))*1000,current=this.budget(bucket);
+        const olderWindow=primary && reportedReset>0 && current?.reset>reportedReset;
+        const until = primary ? Math.max(Date.now()+1000,olderWindow?reportedReset:current?.reset || Date.now()+60000) : Date.now()+delta;
+        if (primary && !olderWindow) this.ctx.storage.sql.exec('INSERT INTO budgets VALUES(?,?,?,?,?) ON CONFLICT(resource) DO UPDATE SET remaining=0,reset=MAX(reset,excluded.reset),blocked=MAX(blocked,excluded.blocked)',bucket,0,current?.lim || 5000,until,until);
         const evidence = JSON.stringify({operation,api,status:response.status,remaining:response.headers.get('x-ratelimit-remaining'),reset:response.headers.get('x-ratelimit-reset'),retry_after:retry});
         const newType = !this.ctx.storage.sql.exec('SELECT category FROM quota_types WHERE category=?',category).toArray().length;
         this.ctx.storage.sql.exec('INSERT INTO quota_types VALUES(?,?,?,?,?) ON CONFLICT(category) DO UPDATE SET last_seen=excluded.last_seen,count=count+1,evidence=excluded.evidence',category,Date.now(),Date.now(),1,evidence);
@@ -154,8 +161,9 @@ export class InstallationScheduler extends DurableObject<Env> {
       return (!b || b.blocked<=Date.now()) && this.usable(r.api)>=this.estimate(input.query.operation,r.api,undefined,r.cost);
     });
     if (!available.length) {
-      const temporary=candidates.map(r=>this.deferral(r.api,r.cost)).find(d=>d?.category==='capacity');
-      return json(temporary || this.alternate(input) || {deferred:true,category:'primary',retry_at:Math.min(...candidates.map(r=>Math.max(Date.now()+1000,this.budget(r.api)?.reset || Date.now()+60000)))});
+      const stalled=candidates.map(r=>this.deferral(r.api,r.cost)).filter(Boolean);
+      const temporary=stalled.find(d=>d.category==='capacity');
+      return json(temporary || this.alternate(input) || stalled.sort((a,b)=>a.retry_at-b.retry_at)[0] || {deferred:true,category:'primary',retry_at:Date.now()+1000});
     }
     const minimum=Math.min(...available.map(r=>this.pressure(r)));
     // Prefer latency when quota pressure is similar. Large pressure differences
