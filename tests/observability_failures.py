@@ -242,6 +242,14 @@ raise SystemExit(wm.run_manager(pathlib.Path(sys.argv[1]), interval=0.05))
                     time.sleep(0.6)
                     count = len(marker.read_text())
                     self.assertEqual(count, 1) if policy != "always" else self.assertGreater(count, 1)
+                    if policy != "always":
+                        self.assertTrue(
+                            wm._socket_request(wm.manager_socket(runtime), {"action": "enable", "id": "policy"})["ok"]
+                        )
+                        deadline = time.monotonic() + 3
+                        while len(marker.read_text()) == 1 and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                        self.assertEqual(len(marker.read_text()), 2)
                 finally:
                     wm._socket_request(wm.manager_socket(runtime), {"action": "shutdown", "stop_workers": True})
                     try:

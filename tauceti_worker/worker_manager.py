@@ -35,7 +35,8 @@ from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
-from .runtime_status import STATUS_ENV, StatusPublisher, read_json, update_status
+from .runtime_status import STATUS_ENV, StatusPublisher, read_json
+from .runtime_status import update_status as update_status
 
 CONFIG_VERSION = 1
 DEFAULT_INTERVAL = 2.0
@@ -929,6 +930,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
         exiting = False
         stop_workers = False
         restart_ids: set[str] = set()
+        enable_ids: set[str] = set()
         children: dict[str, subprocess.Popen] = {}
         child_generations: dict[str, str] = {}
         exit_outcomes: dict[str, tuple[str, int]] = {}
@@ -954,6 +956,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 if not isinstance(wid, str):
                     return {"ok": False, "error": "restart requires id"}
                 restart_ids.add(wid)
+                return {"ok": True}
+            if action == "enable":
+                wid = req.get("id")
+                if not isinstance(wid, str):
+                    return {"ok": False, "error": "enable requires id"}
+                enable_ids.add(wid)
+                exit_outcomes.pop(wid, None)
+                launch_failures.pop(wid, None)
                 return {"ok": True}
             if action == "shutdown":
                 exiting = True
@@ -1018,6 +1028,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     live = runner_status(wid, state_dir, runtime_dir)
                     is_live = bool(live.get("alive"))
                     should_run = bool(spec and spec.enabled)
+                    if is_live or not should_run:
+                        enable_ids.discard(wid)
                     changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
                     if changed and should_run and wid not in restart_ids and _defer_read_policy_reload(spec, live):
                         StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=spec.fingerprint())
@@ -1045,7 +1057,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                                     pass
                         continue
                     prior = read_json(status_path(wid, state_dir))
-                    forced = wid in restart_ids
+                    forced = wid in restart_ids or wid in enable_ids
                     outcome = exit_outcomes.get(wid)
                     if not forced and outcome and outcome[0] == spec.fingerprint():
                         if spec.restart == "never" or spec.restart == "on-failure" and outcome[1] == 0:
@@ -1081,6 +1093,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     child_generations[wid] = spec.fingerprint()
                     exit_outcomes.pop(wid, None)
                     restart_ids.discard(wid)
+                    enable_ids.discard(wid)
                 ready, _, _ = select.select([server], [], [], max(0.1, interval))
                 if ready:
                     _serve_one(server, handle)
@@ -1439,12 +1452,14 @@ def _mutate_enabled(config: Path, wid: str, enabled: bool) -> None:
     if enabled:
         # Re-enabling is an explicit request to run, even for restart="never" or after a clean
         # on-failure exit. Clear the terminal policy record after persisting desired state.
-        update_status(status_path(wid), stopped_at=None, exit_code=None, state="queued")
+        StatusPublisher(status_path(wid)).update(stopped_at=None, exit_code=None, state="queued")
 
 
 def set_worker_enabled(config: Path, wid: str, enabled: bool) -> None:
     _mutate_enabled(config, wid, enabled)
     ensure_manager(config)
+    if enabled:
+        manager_request("enable", id=wid)
 
 
 def restart_worker(config: Path, wid: str) -> None:
@@ -1939,8 +1954,7 @@ def cmd_workers(args) -> int:
                 ensure_manager(config)
             return 0
         if action in ("enable", "disable"):
-            _mutate_enabled(config, args.worker_id, action == "enable")
-            ensure_manager(config)
+            set_worker_enabled(config, args.worker_id, action == "enable")
             return 0
         if action == "add":
             with _config_lock(config):
