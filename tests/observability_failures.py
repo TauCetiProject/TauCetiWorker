@@ -25,9 +25,23 @@ from tauceti_worker import github_transport as tr
 from tauceti_worker import runtime_status as rs
 from tauceti_worker import worker_manager as wm
 from tauceti_worker.budget import Budget
+from tauceti_worker.claude_api import ClaudeAPIContext
 
 
 class ObservabilityTests(unittest.TestCase):
+    def test_bridge_cleanup_and_error_log_failure_preserve_completed_work(self):
+        context = ClaudeAPIContext("test", "fix")
+        context.enabled = False
+        context.thread = context.heartbeat_thread = SimpleNamespace(join=lambda: None)
+        context.errors.append("receipt settlement pending")
+        broken_stderr = io.StringIO()
+        broken_stderr.close()
+        with (
+            patch.object(Path, "unlink", side_effect=OSError("cleanup storage unavailable")),
+            contextlib.redirect_stderr(broken_stderr),
+        ):
+            context.__exit__(None, None, None)
+
     def test_receipt_failure_preserves_native_result_and_reservation(self):
         for native_rc in (0, 1):
             for settlement_available in (True, False):

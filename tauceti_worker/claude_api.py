@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 
 from .budget import Budget, BudgetError, admission_pause, budget_dir, process_identity
-from .claude_api_client import api_environment, atomic, authenticate
+from .claude_api_client import api_environment, atomic, authenticate, warning
 from .runtime_status import report_runtime
 
 CURRENT_CONTEXT = None
@@ -126,7 +126,7 @@ class ClaudeAPIContext:
                 if thread is not None and thread.is_alive():
                     thread.join()
             self.restore()
-            (self.directory / "key").unlink(missing_ok=True)
+            self.cleanup_key()
             raise
 
     def start(self):
@@ -280,7 +280,13 @@ class ClaudeAPIContext:
             self.finish()
         finally:
             self.restore()
+            self.cleanup_key()
+
+    def cleanup_key(self):
+        try:
             (self.directory / "key").unlink(missing_ok=True)
+        except OSError as error:
+            warning(f"tauceti API accounting: private key cleanup pending ({type(error).__name__})")
 
     def finish(self):
         self.stop.set()
@@ -303,7 +309,7 @@ class ClaudeAPIContext:
             except (BudgetError, OSError) as error:
                 self.errors.append(str(error))
         if self.errors:
-            print("tauceti API accounting: " + "; ".join(self.errors), file=sys.stderr)
+            warning("tauceti API accounting: " + "; ".join(self.errors))
 
     def restore(self):
         global CURRENT_CONTEXT
