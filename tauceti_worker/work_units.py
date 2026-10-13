@@ -600,6 +600,15 @@ def _progress_snapshot(w: Worker, c: Candidate) -> dict | None:
 
 
 def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool:
+    # This post-spend acknowledgement can run before the write's webhook arrives.
+    # Ordinary surveys still use the freshest mirrored data without age gates.
+    from .github_transport import read_context
+
+    with read_context(fresh=True, direct=True):
+        return _progressed_direct(w, c, pre)
+
+
+def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool:
     """True if the round left an observable mark (push / new PR / new issue-or-review comment).
     Conservative: any query failure or ambiguity returns True, so we never falsely discard real work."""
     if pre is None:
@@ -757,7 +766,8 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     Restore only this stage's attempt counters. Provider costs already settled remain costs, and
     successful work is never rolled back just because a later cleanup request hit a limit.
     """
-    from .github_transport import blocked_since
+    from .config import GitHubUnavailable
+    from .github_transport import blocked_since, blocking_event_since
 
     pr, head = c.pr, c.head[:12]
     rebase_key = c.rebase_budget_key if stage == "rebase" else None
@@ -779,10 +789,17 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         for key, value in before.items():
             # Another infrastructure handler may already have refunded this attempt.
             w.counters.write(key, min(value, w.counters.read(key)))
-        raise NoProgress(f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR")
+        event = blocking_event_since(started) or {}
+        raise GitHubUnavailable(
+            f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR", retry_at=event.get("reset")
+        )
 
     try:
         rc = fn(w, sv, c, opts, bubble)
+    except GitHubUnavailable as error:
+        for key, value in before.items():
+            w.counters.write(key, min(value, w.counters.read(key)))
+        raise error
     except Exception:
         if blocked_since(started):
             pause()
@@ -790,6 +807,19 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     if rc != 0 and blocked_since(started):
         pause()
     return rc
+
+
+def _check_stage_read_quota(stage):
+    from .config import GitHubUnavailable
+    from .github_transport import observed_budget
+
+    if os.environ.get("TAUCETI_GITHUB_STATE_URL") or stage in ("overlap-scan", "overlap-fix"):
+        return
+    exhausted = {
+        k: reset for k, (remaining, reset) in observed_budget().items() if k in ("core", "graphql") and remaining == 0
+    }
+    if exhausted:
+        raise GitHubUnavailable("GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()))
 
 
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
@@ -806,12 +836,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
-    from .github_transport import observed_budget
+    from .github_outbox import pending_for
 
-    if stage not in ("overlap-scan", "overlap-fix") and any(
-        remaining == 0 for remaining, _ in observed_budget().values()
-    ):
-        raise NoProgress("GitHub API exhausted — waiting for reset before launching paid work")
+    if c.pr and w is not None and pending_for(getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
+        log(f"  #{c.pr}: retained publication pending; selecting unrelated work")
+        return None
+    os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
+    _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
@@ -910,10 +941,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
     # Fresh candidate/claim reads can exhaust a bucket after the initial dispatch preflight.
-    if stage not in ("overlap-scan", "overlap-fix") and any(
-        remaining == 0 for remaining, _ in observed_budget().values()
-    ):
-        raise NoProgress("GitHub API exhausted during revalidation — waiting before launching paid work")
+    _check_stage_read_quota(stage)
     from .budget import BudgetError
     from .claude_api import admission_failure, api_context, api_mode
 

@@ -16,6 +16,7 @@ export class InstallationScheduler extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS accounting(id INTEGER PRIMARY KEY AUTOINCREMENT,at INTEGER,operation TEXT,api TEXT,method TEXT,endpoint TEXT,status INTEGER,points INTEGER,latency INTEGER,bytes INTEGER);
       CREATE TABLE IF NOT EXISTS quota_types(category TEXT PRIMARY KEY,first_seen INTEGER,last_seen INTEGER,count INTEGER,evidence TEXT);`);
     this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY,resource TEXT,cost INTEGER,expires INTEGER);');
+    this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS redelivery_retries(id TEXT PRIMARY KEY,due INTEGER,attempt INTEGER);');
     const columns=new Set(this.ctx.storage.sql.exec<any>('PRAGMA table_info(accounting)').toArray().map(c=>c.name));
     for(const [name,type] of Object.entries({shape:'TEXT',batch_size:'INTEGER DEFAULT 1',predicted:'INTEGER'})) if(!columns.has(name)) this.ctx.storage.sql.exec('ALTER TABLE accounting ADD COLUMN '+name+' '+type);
   }
@@ -288,8 +289,10 @@ export class InstallationScheduler extends DurableObject<Env> {
     if (this.budget('app-core')?.blocked>Date.now()) return;
     const last = await this.ctx.storage.get<number>('delivery_audit') || 0;
     let scan=await this.ctx.storage.get<any>('delivery_scan');
-    if (!scan && Date.now()-last<300000) return;
+    const retry=this.ctx.storage.sql.exec<any>('SELECT id FROM redelivery_retries WHERE due<=? ORDER BY due LIMIT 1',Date.now()).toArray()[0];
+    if (!scan && !retry && Date.now()-last<300000) return;
     scan ||= {started:Date.now(),since:Math.max(Date.now()-3*86400000,(last || Date.now()-300000)-60000),path:'/app/hook/deliveries?per_page=100',pending:[]};
+    if(retry && !scan.pending.includes(retry.id)) scan.pending.unshift(retry.id);
     const began=Date.now(),token=await this.jwt();
     // Persist pagination and redelivery progress. Busy repositories can exceed
     // one hundred deliveries between audits; a page-one-only scan loses gaps.
@@ -298,9 +301,30 @@ export class InstallationScheduler extends DurableObject<Env> {
       if (scan.pending.length) {
         const id=scan.pending[0],key='redelivery:'+id;
         if (!await this.ctx.storage.get(key)) {
+          const pendingRetry=this.ctx.storage.sql.exec<any>('SELECT due FROM redelivery_retries WHERE id=?',id).toArray()[0];
+          if(pendingRetry?.due>Date.now()) {scan.pending.shift();await this.ctx.storage.put('delivery_scan',scan);continue;}
           const result=await this.http('/app/hook/deliveries/'+id+'/attempts',token,'POST',{},'delivery_redelivery','app');
-          if (result.status!==202) { await this.ctx.storage.put('delivery_scan',scan); return; }
+          if (result.status!==202) {
+            if(result.deferred) {await this.ctx.storage.put('delivery_scan',scan);return;}
+            const failure={id,status:result.status,at:Date.now()};
+            const first=!await this.ctx.storage.get('redelivery_error:'+id);
+            if(first) console.error(JSON.stringify({event:'delivery_redelivery_rejected',...failure}));
+            await this.ctx.storage.put('redelivery_error:'+id,failure);
+            await this.ctx.storage.put('last_redelivery_failure',failure);
+            // Deleted deliveries are terminal. Auth/transport failures remain
+            // retryable without hiding subsequent gaps or causing repair storms.
+            if(result.status===404 || result.status===410) {
+              await this.ctx.storage.put(key,Date.now());
+              this.ctx.storage.sql.exec('DELETE FROM redelivery_retries WHERE id=?',id);
+            } else {
+              const previous=this.ctx.storage.sql.exec<any>('SELECT attempt FROM redelivery_retries WHERE id=?',id).toArray()[0]?.attempt || 0;
+              this.ctx.storage.sql.exec('INSERT INTO redelivery_retries VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET due=excluded.due,attempt=excluded.attempt',id,Date.now()+Math.min(3600000,300000*2**Math.min(previous,4)),previous+1);
+            }
+            if(first) await stub(this.env.REPOSITORIES,repo.id).fetch('https://internal/repair',{method:'POST',body:JSON.stringify({broad:true})});
+            scan.pending.shift();await this.ctx.storage.put('delivery_scan',scan);continue;
+          }
           await this.ctx.storage.put(key,Date.now());
+          this.ctx.storage.sql.exec('DELETE FROM redelivery_retries WHERE id=?',id);
         }
         scan.pending.shift();
       } else if (scan.path) {
@@ -334,7 +358,7 @@ export class InstallationScheduler extends DurableObject<Env> {
         this.auditFlight ||= this.audit(repo).finally(()=>{this.auditFlight=undefined;});
         await this.auditFlight;return json({ok:true});
       }
-      if (path==='/health') return json({reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),inflight:this.ctx.storage.sql.exec('SELECT resource,COUNT(*) requests,SUM(cost) reserved_points FROM reservations WHERE expires>? GROUP BY resource',Date.now()).toArray(),budgets:this.ctx.storage.sql.exec('SELECT * FROM budgets').toArray(),quota_types:this.ctx.storage.sql.exec('SELECT * FROM quota_types').toArray(),hour:this.ctx.storage.sql.exec('SELECT api,operation,COUNT(*) requests,SUM(points) points,SUM(points IS NULL) unmeasured,SUM(bytes) bytes,AVG(latency) latency FROM accounting WHERE at>? GROUP BY api,operation',Date.now()-3600000).toArray(),recipes:this.ctx.storage.sql.exec('SELECT api,operation,shape,batch_size,COUNT(*) requests,SUM(points) points,AVG(points) mean_points,MAX(points) max_points,AVG(predicted) predicted,AVG(latency) latency,MAX(latency) max_latency FROM accounting WHERE at>? GROUP BY api,operation,shape,batch_size',Date.now()-3600000).toArray()});
+      if (path==='/health') return json({redelivery_failure:await this.ctx.storage.get('last_redelivery_failure') || null,reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),inflight:this.ctx.storage.sql.exec('SELECT resource,COUNT(*) requests,SUM(cost) reserved_points FROM reservations WHERE expires>? GROUP BY resource',Date.now()).toArray(),budgets:this.ctx.storage.sql.exec('SELECT * FROM budgets').toArray(),quota_types:this.ctx.storage.sql.exec('SELECT * FROM quota_types').toArray(),hour:this.ctx.storage.sql.exec('SELECT api,operation,COUNT(*) requests,SUM(points) points,SUM(points IS NULL) unmeasured,SUM(bytes) bytes,AVG(latency) latency FROM accounting WHERE at>? GROUP BY api,operation',Date.now()-3600000).toArray(),recipes:this.ctx.storage.sql.exec('SELECT api,operation,shape,batch_size,COUNT(*) requests,SUM(points) points,AVG(points) mean_points,MAX(points) max_points,AVG(predicted) predicted,AVG(latency) latency,MAX(latency) max_latency FROM accounting WHERE at>? GROUP BY api,operation,shape,batch_size',Date.now()-3600000).toArray()});
       return json({error:'not_found'},404);
     } catch (error) {
       if (error instanceof QuotaDeferred) return json(error.result);

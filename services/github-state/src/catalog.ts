@@ -42,9 +42,9 @@ export function recipes(repository: string, q: Query, cursor?: string, page = 1)
   const suffix = `?per_page=100&page=${page}`;
   switch (q.operation) {
     case 'pr_delta': return [gql(`pullRequests(first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){${PAGE} nodes{${PR}}}`,['pullRequests'],pr),rest('/pulls' + suffix + '&state=all&sort=updated&direction=desc',pr)];
-    case 'issue_delta': return [gql(`issues(first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){${PAGE} nodes{number title body state updatedAt createdAt url author{login __typename} labels(first:100){nodes{name}}}}`,['issues'],issue),rest('/issues' + suffix + '&state=all&sort=updated&direction=desc',issue)];
+    case 'issue_delta': return [gql(`issues(first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){${PAGE} nodes{number title body state updatedAt createdAt url author{login __typename} labels(first:100){totalCount nodes{name}}}}`,['issues'],issue),rest('/issues' + suffix + '&state=all&sort=updated&direction=desc',issue)];
     case 'open_prs': return [gql(`pullRequests(states:OPEN,first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){${PAGE} nodes{${PR}}}`,['pullRequests'],pr), rest('/pulls' + suffix + '&state=open&sort=created&direction=asc',pr)];
-    case 'open_issues': return [gql(`issues(states:OPEN,first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){${PAGE} nodes{number title body state updatedAt createdAt url author{login __typename} labels(first:100){nodes{name}}}}`,['issues'],issue),rest('/issues' + suffix + '&state=open&sort=created&direction=asc',issue)];
+    case 'open_issues': return [gql(`issues(states:OPEN,first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){${PAGE} nodes{number title body state updatedAt createdAt url author{login __typename} labels(first:100){totalCount nodes{name}}}}`,['issues'],issue),rest('/issues' + suffix + '&state=open&sort=created&direction=asc',issue)];
     case 'recent_prs': return [rest('/pulls' + suffix + '&state=closed&sort=updated&direction=desc',pr)];
     case 'recent_issues': return [rest('/issues' + suffix + '&state=closed&sort=updated&direction=desc',issue)];
     case 'pr': return [rest('/pulls/' + args.number,pr,false),gql(`pullRequest(number:$number){${PR} additions deletions changedFiles}`,['pullRequest'],pr,false,{number:args.number})];
@@ -58,7 +58,7 @@ export function recipes(repository: string, q: Query, cursor?: string, page = 1)
     case 'reviews': return [rest(`/pulls/${args.number}/reviews` + suffix)];
     case 'files': return [rest(`/pulls/${args.number}/files` + suffix)];
     case 'reactions': return [rest(`/pulls/comments/${args.id}/reactions` + suffix, x=>({...x,id:String(x.id)}))];
-    case 'statuses': return [rest(`/commits/${args.sha}/status`, x => (x.statuses || []).map(status),false),gql(`object(expression:$sha){... on Commit{status{contexts{context state createdAt}}}}`,['object'], x=>(x.status?.contexts || []).map(status),false,{sha:args.sha})];
+    case 'statuses': return [rest(`/commits/${args.sha}/status` + suffix, x => (x.statuses || []).map(status),false),gql(`object(expression:$sha){... on Commit{status{contexts{context state createdAt}}}}`,['object'], x=>(x.status?.contexts || []).map(status),false,{sha:args.sha})];
     case 'checks': return [rest(`/commits/${args.sha}/check-runs` + suffix,x=>x)];
     case 'workflow_runs': return [rest('/actions/runs' + suffix + (args.after?'&created='+encodeURIComponent('>='+args.after):''))];
     case 'workflow_jobs': return [rest(`/actions/runs/${args.id}${args.attempt?'/attempts/'+args.attempt:''}/jobs` + suffix)];

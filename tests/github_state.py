@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Service age independence, conditional results, outage fallback, and cutoff configuration."""
 
+import http.client
 import io
 import json
 import os
@@ -166,4 +167,11 @@ with (
     ):
         available, rows = state.read("org/repo", "issue_comments", number=7)
         assert available and [r["id"] for r in rows] == [1, 2, 3] and clock[0] > 5
+    for i, error in enumerate((http.client.IncompleteRead(b"partial"), http.client.BadStatusLine("invalid"))):
+        Path(tmp + "/token").write_text("broken-http-" + str(i))
+        with patch.object(state.urllib.request, "urlopen", side_effect=error):
+            assert state.read("org/repo", "issue_comments", number=7) == (False, None)
+    Path(tmp + "/token").write_text("malformed-json-client")
+    with patch.object(state.urllib.request, "urlopen", side_effect=lambda *_a, **_kw: Response([])):
+        assert state.read("org/repo", "issue_comments", number=7) == (False, None)
 print("PASS: shared-state freshness, fallback, conditional reads and configurable cutoff")

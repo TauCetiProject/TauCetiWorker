@@ -31,6 +31,98 @@ function fixture(){
  return {state,db,insert,env,objects,ctx};
 }
 
+test('partial PR payloads retain mergeability only for the same head and base',async()=>{
+ const {state,db}=fixture();try {
+  await state.put('pr','7',{number:7,headRefOid:'a',baseRefOid:'b',mergeable:'CONFLICTING',updatedAt:'2026-10-12T00:00:00Z'});
+  await state.put('pr','7',{number:7,headRefOid:'a',baseRefOid:'b',title:'list row',updatedAt:'2026-10-12T00:00:00Z'});
+  assert.equal(JSON.parse(db.prepare("SELECT data FROM resources WHERE kind='pr' AND id='7'").get().data).mergeable,'CONFLICTING');
+  await state.put('pr','7',{number:7,headRefOid:'new',baseRefOid:'b',updatedAt:'2026-10-12T00:01:00Z'});
+  assert.equal(JSON.parse(db.prepare("SELECT data FROM resources WHERE kind='pr' AND id='7'").get().data).mergeable,'UNKNOWN');
+ }finally{db.close();}
+});
+
+test('REST offset inventory gaps retain previously observed open PRs',async()=>{
+ const {state,db}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  const q={repository:'org/repo',operation:'open_prs'},key='open_prs:{}';
+  for(const number of [7,8]) {await state.put('pr',String(number),{number,state:'OPEN'});state.membership(key,String(number),true);}
+  await state.enqueue(q);const job=state.claim(state.nextJob());
+  await state.refresh(job,{data:[{number:8,state:'OPEN'}],api:'core'});
+  assert.deepEqual((await state.rows(q)).map(r=>r.number),[7,8]);
+ }finally{db.close();}
+});
+
+test('a newer close cannot be re-added by an older inventory response',async()=>{
+ const {state,db}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  const q={repository:'org/repo',operation:'open_issues'},key='open_issues:{}';
+  await state.enqueue(q);const job=state.claim(state.nextJob());job.started=Date.now()-10000;
+  await state.put('issue','7',{number:7,state:'CLOSED'},Date.now(),false,'',true);
+  await state.refresh(job,{data:[{number:7,state:'OPEN'}],api:'graphql'});
+  assert.deepEqual(await state.rows(q),[]);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM members WHERE collection=? AND id=?').get(key,'7').n,0);
+ }finally{db.close();}
+});
+
+test('expired staging restarts from page one instead of retrying a missing page forever',async()=>{
+ const {state,db,env}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  env.INSTALLATIONS={idFromName:id=>id,get:()=>({fetch:async()=>Response.json({data:[],api:'core'})})};
+  const q={repository:'org/repo',operation:'files',args:{number:7}};await state.enqueue(q);
+  const key='files:{"number":7}';db.prepare('UPDATE jobs SET started=?,page=2,cursor=? WHERE key=?').run(Date.now()-86400001,'old',key);
+  await state.dispatch(state.claim(state.nextJob()));
+  const row=db.prepare('SELECT * FROM jobs WHERE key=?').get(key);
+  assert.equal(row.started,null);assert.equal(row.page,1);assert.equal(row.cursor,null);assert.equal(row.wait_reason,'staging_expired');
+ }finally{db.close();}
+});
+
+test('one bad batched history does not turn a completed sibling into a retry',async()=>{
+ const {state,db,env}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  env.INSTALLATIONS={idFromName:id=>id,get:()=>({fetch:async()=>Response.json({results:[{data:[],api:'graphql'},{data:[],api:'graphql'}]})})};
+  for(const number of [7,8]) await state.enqueue({repository:'org/repo',operation:'issue_comments',args:{number}});
+  const original=state.refresh.bind(state);state.refresh=async(job,result)=>{if(JSON.parse(job.query).args.number===8)throw new Error('staging page missing');return original(job,result);};
+  await state.dispatch(state.claim(state.nextJob()));
+  const done=db.prepare('SELECT * FROM jobs WHERE key=?').get('issue_comments:{"number":7}');
+  assert.equal(done.attempt,0);assert.equal(done.wait_reason,null);assert.ok(done.due>Date.now()+10000);
+  assert.equal(db.prepare('SELECT wait_reason FROM jobs WHERE key=?').get('issue_comments:{"number":8}').wait_reason,'staging_expired');
+ }finally{db.close();}
+});
+
+test('persistent parser errors keep their pagination and back off without rapid full scans',async()=>{
+ const {state,db}=fixture();try {
+  const q={repository:'org/repo',operation:'files',args:{number:7}};await state.enqueue(q);
+  const key='files:{"number":7}';db.prepare('UPDATE jobs SET started=?,page=2,cursor=? WHERE key=?').run(Date.now()-1000,'cursor',key);
+  let job=state.claim(state.nextJob());state.retryJob(job,new Error('repeated upstream cursor'));
+  let row=db.prepare('SELECT * FROM jobs WHERE key=?').get(key);
+  assert.equal(row.page,2);assert.equal(row.cursor,'cursor');assert.ok(row.started);assert.ok(row.due>=Date.now()+59000);
+  db.prepare('UPDATE jobs SET due=0,lease_until=0 WHERE key=?').run(key);
+  job=state.claim(state.nextJob());state.retryJob(job,new Error('repeated upstream cursor'));
+  row=db.prepare('SELECT * FROM jobs WHERE key=?').get(key);
+  assert.ok(row.due>=Date.now()+119000);assert.equal(row.attempt,2);
+ }finally{db.close();}
+});
+
+test('daily archive checkpoints bounded pages and retains active R2 references',async()=>{
+ const {state,db,objects}=fixture();try {
+  state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  const insert=db.prepare('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?)');
+  for(let i=0;i<1500;i++)insert.run('issue_comments',String(i),'7',JSON.stringify({body:'x'.repeat(2000)}),'',Date.now(),1,0);
+  for(let i=0;i<20 && !state.meta('last_snapshot');i++)await state.snapshotPages(Date.now());
+  assert.ok(state.meta('last_snapshot'));
+  const manifests=[...objects.entries()].filter(([k])=>k.startsWith('snapshots/') && k.endsWith('.json') && !/\/(meta|resources|collections|members)\//.test(k));
+  assert.equal(manifests.length,1);assert.equal(JSON.parse(manifests[0][1]).version,2);
+  const pages=[...objects.entries()].filter(([k])=>k.includes('/resources/'));
+  assert.ok(pages.length>1);assert.equal(pages.reduce((n,[,text])=>n+JSON.parse(text).length,0),1500);
+  assert.ok(pages.every(([,text])=>text.length<1300000));
+  const key='resources/100/retained';insert.run('pr','7','',JSON.stringify({$r2:key}),'',Date.now(),1,0);
+  assert.equal((await (await state.fetch(new Request('https://internal/retained-object?key='+encodeURIComponent(key)))).json()).retained,true);
+  assert.equal((await (await state.fetch(new Request('https://internal/retained-object?key=unused'))).json()).retained,true,'unreferenced objects retain an archive grace period');
+  db.prepare('UPDATE retired_objects SET at=? WHERE key=?').run(Date.now()-9*86400000,'unused');
+  assert.equal((await (await state.fetch(new Request('https://internal/retained-object?key=unused'))).json()).retained,false);
+ }finally{db.close();}
+});
+
 test('large old repair backlog cannot starve fresh deltas and still makes progress',()=>{
  const {state,db,insert}=fixture();
  try{

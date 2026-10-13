@@ -50,6 +50,7 @@ from .config import (
     AdmissionUnavailable,
     Config,
     Die,
+    GitHubUnavailable,
     NoProgress,
     acquire_slot,
     auto_assign_wid,
@@ -65,6 +66,7 @@ from .constants import (
     ALLOWED_TASKS,
     CLAIMS,
     EX_ADMISSION_WAIT,
+    EX_GITHUB_WAIT,
     EX_NOPROGRESS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -1121,17 +1123,16 @@ def cmd_status(args) -> int:
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
     if one_round and not getattr(args, "dry_run", False):
-        from .constants import EX_NOPROGRESS
         from .github_outbox import drain
 
         pending = drain()
         if pending:
             log(f"GitHub publications awaiting retry or reconciliation: {len(pending)}; retaining completed work")
             reason = f"{len(pending)} retained GitHub publications awaiting retry or reconciliation"
-            report_failure(reason, code=EX_NOPROGRESS)
-            report_runtime("waiting-github", detail=reason, publication_pending_count=len(pending))
-            return EX_NOPROGRESS
-        report_runtime(publication_pending_count=0)
+            report_runtime(publication_pending_count=len(pending))
+            log(reason + "; selecting unrelated work while recovery continues")
+        else:
+            report_runtime(publication_pending_count=0)
     try:
         configure_api(args, agent)
     except (BudgetError, OSError) as error:
@@ -1520,9 +1521,30 @@ def cli_main() -> int:
     if ensure_ssl_cert_file() is None:
         log("no system CA bundle found; set SSL_CERT_FILE if TLS verification fails")
     _ensure_scripts_executable()
+    from .github_transport import blocking_event_since
+
+    started = time.time()
+
+    def github_pause(error, retry_at=None):
+        log(str(error))
+        report_runtime(
+            "waiting-github",
+            detail=str(error),
+            next_action_at=retry_at,
+            failure_reason=None,
+            failure_code=None,
+            failure_log=None,
+        )
+        return EX_GITHUB_WAIT
+
     try:
         return main() or 0
+    except GitHubUnavailable as e:
+        return github_pause(e, e.retry_at)
     except Die as e:
+        event = blocking_event_since(started)
+        if event:
+            return github_pause(e, event.get("reset"))
         log(str(e))
         report_failure(str(e), code=1)
         return 1
@@ -1531,6 +1553,9 @@ def cli_main() -> int:
         report_failure(str(e), code=EX_ADMISSION_WAIT)
         return EX_ADMISSION_WAIT
     except NoProgress as e:
+        event = blocking_event_since(started)
+        if event:
+            return github_pause(e, event.get("reset"))
         log(str(e))
         report_failure(str(e), code=EX_NOPROGRESS, log_file=getattr(e, "log_file", None))
         return EX_NOPROGRESS

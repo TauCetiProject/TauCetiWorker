@@ -7,6 +7,7 @@ No installation credentials leave the server. Conditional reads always contact i
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import time
@@ -51,6 +52,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     if _allow_observed and operation != "workflow_jobs":
         raise StateQueryError("observed coverage is available only for workflow jobs")
     began = time.monotonic()
+    if transport.direct_reads():
+        return False, None
     url = _url()
     if not url:
         return False, None
@@ -93,6 +96,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     last = "transport"
     for attempt in range(2):
         rows, cursor, cursors, revision = [], None, set(), None
+        unchanged = False
         try:
             while True:
                 params = {"repository": repo, "operation": operation, "args": json.dumps(args, separators=(",", ":"))}
@@ -118,6 +122,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                     if error.code == 304 and cached:
                         payload = cached["payload"]
                         etag = cached.get("etag")
+                        unchanged = True
                     elif error.code == 400:
                         raise StateQueryError(
                             "state service rejected the query; check the client/service protocol versions"
@@ -127,6 +132,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         raise OSError(last) from None
                     else:
                         raise
+                if not isinstance(payload, dict):
+                    raise OSError("invalid service response")
                 if (
                     payload.get("version") != 1
                     or payload.get("repository") != repo
@@ -160,8 +167,14 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                     result = rows if isinstance(data, list) else data
                     complete = {**payload, "data": result}
                     complete.pop("cursor", None)
-                    transport.atomic(cached_path, {"etag": etag, "payload": complete})
-                    transport.atomic(circuit, {"failures": 0, "until": 0})
+                    try:
+                        if unchanged:
+                            os.utime(cached_path, None)
+                        else:
+                            transport.atomic(cached_path, {"etag": etag, "payload": complete})
+                        transport.atomic(circuit, {"failures": 0, "until": 0})
+                    except OSError:
+                        pass  # A healthy mirror remains usable when the local cache is unavailable.
                     transport.event(
                         {
                             "kind": "gateway_read",
@@ -188,7 +201,15 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 cursor = next_cursor
         except StateQueryError:
             raise
-        except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError):
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            http.client.HTTPException,
+            urllib.error.URLError,
+        ):
             if time.monotonic() >= deadline or last == "client_auth_configuration":
                 break
     try:

@@ -135,7 +135,9 @@ def main():
         # This does not settle an active session or release its reservation.
         receipt = dict(
             id=invocation,
-            totals=totals if totals and not unknown_segments else None,
+            totals=None,
+            provisional=True,
+            lower_bound_totals=dict(totals),
             outcome="result observed; process has not exited",
         )
         try:
@@ -143,6 +145,7 @@ def main():
         except OSError as error:
             print(f"tauceti budget: receipt checkpoint pending: {error}", file=sys.stderr)
 
+    process_exited = False
     try:
         proc = subprocess.Popen(real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
         outcome = "started"
@@ -209,6 +212,7 @@ def main():
         finally:
             proc.stdout.close()
         rc = proc.wait()
+        process_exited = True
         outcome = f"exit:{rc}"
         if output_format == "json" and final is not None:
             print(json.dumps(final))
@@ -222,7 +226,14 @@ def main():
         else:
             raise
     finally:
-        receipt = dict(id=invocation, totals=totals if totals and not unknown_segments else None, outcome=outcome)
+        authoritative = outcome == "launch-failed" or process_exited and 0 <= rc < 128
+        receipt = dict(
+            id=invocation,
+            totals=totals if totals and not unknown_segments and authoritative else None,
+            provisional=not authoritative,
+            lower_bound_totals=dict(totals),
+            outcome=outcome,
+        )
         atomic(bridge / "inbox" / (invocation + ".receipt"), receipt)
         try:
             request(bridge, "settle", **receipt)

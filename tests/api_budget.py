@@ -159,6 +159,64 @@ class BudgetTests(unittest.TestCase):
         self.assertFalse(self.budget.snapshot()["ledger_repair_required"])
         self.assertTrue(self.budget.admit("next", "next", "opus", "fix")["allowed"])
 
+    def test_provisional_reservation_preserves_grants_and_peer_admission(self):
+        self.budget.configure(grant=100, rate=10)
+        self.budget.admit("a", "a", "opus", "fix")
+        receipt = dict(
+            id="a", totals=None, provisional=True, lower_bound_totals={"provider": "12"}, outcome="interrupted"
+        )
+        self.budget.settle_receipt(receipt)
+        snapshot = self.budget.snapshot()
+        self.assertEqual(snapshot["unresolved"], [])
+        self.assertEqual(snapshot["provisional"], ["a"])
+        self.assertEqual(Decimal(snapshot["pending"]), 24)
+        self.assertEqual(Decimal(snapshot["spent"]), 0)
+        recorded = self.budget.ledger.read_bytes()
+        for _ in range(3):
+            self.budget.settle_receipt(receipt)
+        self.assertEqual(
+            self.budget.ledger.read_bytes(), recorded, "re-reading a checkpoint cannot compound its reserve"
+        )
+        self.now += 3600
+        self.assertTrue(self.budget.admit("b", "b", "opus", "fix")["allowed"])
+        self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 110, "grants keep accruing")
+        self.budget.settle_receipt(dict(id="a", totals={"provider": "18"}, outcome="exit:0"))
+        self.budget.settle_receipt(dict(id="a", totals={"provider": "18"}, outcome="exit:0"))
+        snapshot = self.budget.snapshot()
+        self.assertEqual(snapshot["provisional"], [])
+        self.assertEqual(Decimal(snapshot["spent"]), 18)
+        self.assertEqual(Decimal(snapshot["balance"]), 92)
+        self.assertEqual(Decimal(snapshot["pending"]), 24, "only the other worker's reservation remains")
+
+    def test_provisional_reservation_obeys_funding_without_a_global_freeze(self):
+        self.budget.configure(grant=30)
+        self.budget.admit("a", "a", "opus", "fix")
+        self.budget.settle_receipt(
+            dict(id="a", totals=None, provisional=True, lower_bound_totals={"provider": "12"}, outcome="interrupted")
+        )
+        self.assertEqual(self.budget.admit("b", "b", "opus", "fix")["reason"], "waiting for funding")
+        self.budget.configure(grant=20)
+        self.assertTrue(self.budget.admit("b", "b", "opus", "fix")["allowed"])
+
+    def test_increasing_checkpoint_and_resumed_cost_use_cumulative_baseline(self):
+        self.budget.configure(grant=100)
+        self.budget.admit("seed", "seed", "opus", "fix")
+        self.budget.settle("seed", 10, totals={"provider": "10"})
+        self.budget.admit("a", "a", "opus", "fix", resume="provider")
+        for cumulative, reserve in ((12, 12), (20, 20)):
+            self.budget.settle_receipt(
+                dict(
+                    id="a",
+                    totals=None,
+                    provisional=True,
+                    lower_bound_totals={"provider": str(cumulative)},
+                    outcome="interrupted",
+                )
+            )
+            self.assertEqual(Decimal(self.budget.snapshot()["pending"]), reserve)
+        self.budget.settle_receipt(dict(id="a", totals={"provider": "23"}, outcome="exit:0"))
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 23)
+
     def test_interrupted_repair_preserves_authoritative_damaged_ledger(self):
         self.budget.configure(grant=100)
         with self.budget.ledger.open("ab") as file:
@@ -332,7 +390,7 @@ if sys.argv[1:3] == ['auth', 'status']:
         sys.exit(0)
     print(json.dumps({'authMethod': 'api_key'}))
     sys.exit(0)
-print(json.dumps({'type': 'system', 'subtype': 'init'}), flush=True)
+print(json.dumps({'type': 'system', 'subtype': 'init', 'pid': os.getpid()}), flush=True)
 time.sleep(float(os.environ.get('FAKE_DELAY', '0')))
 if os.environ.get('FAKE_CRASH'):
     sys.exit(1)
@@ -473,6 +531,8 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             result = self.run_claude(env={**os.environ, "FAKE_EVENTS": json.dumps(events)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.budget.snapshot()["unresolved"]), 1)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertGreaterEqual(Decimal(self.budget.snapshot()["pending"]), 14)
 
     def test_flags_managed_serialization_and_key_file(self):
         parser = build_parser()
@@ -590,13 +650,34 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 self.assertEqual(json.loads(proc.stdout.readline())["type"], "result")
                 self.assertIsNone(proc.poll())
                 receipt = json.loads(next(context.inbox.glob("*.receipt")).read_text())
-                self.assertEqual(receipt["totals"], {"completed-model": "12"})
+                self.assertIsNone(receipt["totals"])
+                self.assertTrue(receipt["provisional"])
+                self.assertEqual(receipt["lower_bound_totals"], {"completed-model": "12"})
                 self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
             finally:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.communicate(timeout=5)
-        self.assertEqual(self.budget.snapshot()["unresolved"], [])
-        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 12)
+        self.assertEqual(len(self.budget.snapshot()["provisional"]), 1)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+
+    def test_native_signal_after_result_keeps_checkpoint_provisional(self):
+        with ClaudeAPIContext("worker1", "roadmap") as context:
+            proc = subprocess.Popen(
+                ["claude", "-p", "hello", "--model=opus", "--output-format=stream-json"],
+                env={**os.environ, "FAKE_POST_RESULT_DELAY": "30"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            native = json.loads(proc.stdout.readline())["pid"]
+            self.assertEqual(json.loads(proc.stdout.readline())["type"], "result")
+            os.kill(native, signal.SIGTERM)
+            proc.communicate(timeout=5)
+            receipt = json.loads(next(context.inbox.glob("*.receipt")).read_text())
+            self.assertTrue(receipt["provisional"])
+            self.assertIsNone(receipt["totals"])
+        self.assertEqual(len(self.budget.snapshot()["provisional"]), 1)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
 
     def test_new_inference_invalidates_previous_cost_checkpoint(self):
         events = [
@@ -619,7 +700,7 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             finally:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.communicate(timeout=5)
-        self.assertEqual(len(self.budget.snapshot()["unresolved"]), 1)
+        self.assertEqual(len(self.budget.snapshot()["provisional"]), 1)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
 
     def test_bubble_does_not_require_host_claude_binary(self):
