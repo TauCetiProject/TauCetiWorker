@@ -11,7 +11,7 @@ import sys
 import time
 
 from .agents import resolve_authoring_profile
-from .budget import Budget, BudgetError, money
+from .budget import Budget, BudgetError, admission_pause
 from .claude_api import api_mode
 from .config import Config, NoProgress, log
 from .constants import (
@@ -116,14 +116,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
-                    blocked = (
-                        snapshot["unresolved"]
-                        or money(snapshot["available"]) <= 0
-                        or money(snapshot["available"]) < money(snapshot["admission_threshold"])
-                    )
+                    reason = admission_pause(snapshot)
+                    blocked = reason is not None
                     if blocked:
                         Budget().refresh_waiter(cfg.wid)
-                    reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
                 except (BudgetError, OSError) as error:
                     blocked, reason, snapshot = True, str(error), {}
                 if blocked:

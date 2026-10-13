@@ -21,7 +21,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tauceti_worker import agents, loop
-from tauceti_worker.budget import Budget, BudgetError
+from tauceti_worker.budget import Budget, BudgetError, process_identity
 from tauceti_worker.claude_api import ClaudeAPIContext, configure_api
 from tauceti_worker.cli import build_parser
 from tauceti_worker.worker_manager import WorkersError, WorkerSpec
@@ -77,13 +77,66 @@ class BudgetTests(unittest.TestCase):
         self.budget.configure(grant=100)
         self.budget.admit("a", "a", "opus", "fix")
         self.budget.settle("a", None, "crashed")
-        self.assertIn("unresolved", self.budget.admit("b", "b", "opus", "fix")["reason"])
+        self.assertTrue(self.budget.admit("b", "b", "opus", "fix")["allowed"])
+        self.assertEqual(self.budget.snapshot()["unresolved"], ["a"])
+        self.budget.settle("b", 0)
         self.budget.reconcile("a", 23, "recovered cost receipt")
         self.budget.reconcile("a", 25, "Console reconciliation")
         snapshot = self.budget.snapshot()
         self.assertEqual(Decimal(snapshot["balance"]), 75)
         self.assertEqual(Decimal(snapshot["spent"]), 25)
         self.assertEqual(snapshot["unresolved"], [])
+
+    def test_missing_receipt_keeps_reservation_and_funding_limit(self):
+        self.budget.configure(grant=30)
+        self.budget.admit("seed", "seed", "opus", "fix")
+        self.budget.settle("seed", 10)
+        self.budget.admit("lost", "worker", "opus", "fix")
+        self.budget.settle("lost", None, "reboot")
+        snapshot = self.budget.snapshot()
+        self.assertEqual(snapshot["unresolved"], ["lost"])
+        self.assertEqual(Decimal(snapshot["pending"]), 10)
+        self.assertEqual(Decimal(snapshot["available"]), 10)
+        self.assertEqual(Decimal(snapshot["spent"]), 10)
+        self.assertTrue(self.budget.admit("next", "worker", "opus", "fix")["allowed"])
+        self.assertEqual(self.budget.admit("third", "third", "opus", "fix")["reason"], "waiting for funding")
+        self.budget.settle("next", 8)
+        self.budget.reconcile("lost", 12, "recovered receipt after reboot")
+        self.assertEqual(self.budget.snapshot()["unresolved"], [])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 30)
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_missing_calibration_receipt_does_not_block_other_models(self):
+        self.budget.configure(grant=100)
+        self.budget.admit("lost", "first", "opus", "fix")
+        self.budget.settle("lost", None, "crashed")
+        self.assertTrue(self.budget.admit("sonnet", "second", "sonnet", "fix")["allowed"])
+        self.assertTrue(self.budget.admit("replacement", "third", "opus", "fix")["allowed"])
+        self.assertEqual(
+            self.budget.admit("parallel", "fourth", "opus", "fix")["reason"],
+            "waiting for calibration session cost",
+        )
+
+    def test_repeated_missing_calibration_receipts_consume_available_funds(self):
+        self.budget.configure(grant=3)
+        for i in range(3):
+            self.assertTrue(self.budget.admit(str(i), "worker", "cold-model", "fix")["allowed"])
+            self.budget.settle(str(i), None, "crashed")
+            snapshot = self.budget.snapshot()
+            self.assertEqual(Decimal(snapshot["pending"]), i + 1)
+            self.assertEqual(Decimal(snapshot["available"]), 2 - i)
+        self.assertEqual(self.budget.admit("next", "worker", "cold-model", "fix")["reason"], "waiting for funding")
+        self.budget.configure(grant=1)
+        self.assertTrue(self.budget.admit("next", "worker", "cold-model", "fix")["allowed"])
+
+    def test_calibration_uses_recent_costs_and_does_not_learn_from_failed_launches(self):
+        self.budget.configure(grant=100)
+        self.budget.admit("failed", "first", "opus", "fix")
+        self.budget.settle("failed", 0, "launch-failed")
+        self.assertEqual(self.budget.admit("replacement", "first", "opus", "fix")["estimate"], "1")
+        self.assertIn("calibration", self.budget.admit("parallel", "second", "opus", "fix")["reason"])
+        self.budget.settle("replacement", 7)
+        self.assertEqual(self.budget.admit("new-model", "second", "sonnet", "fix")["estimate"], "7")
 
     def test_corruption_and_audited_torn_recovery(self):
         self.budget.configure(grant=100)
@@ -98,6 +151,13 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(archive.read_bytes(), damaged)
         self.assertTrue(self.budget.ledger.read_bytes().startswith(original))
         self.assertEqual(len(snapshot["unresolved"]), 1)
+        self.assertTrue(snapshot["ledger_repair_required"])
+        self.assertEqual(
+            self.budget.admit("next", "next", "opus", "fix")["reason"], "ledger repair requires reconciliation"
+        )
+        self.budget.reconcile(snapshot["unresolved"][0], 0, "verified archived partial write was not a paid session")
+        self.assertFalse(self.budget.snapshot()["ledger_repair_required"])
+        self.assertTrue(self.budget.admit("next", "next", "opus", "fix")["allowed"])
 
     def test_interrupted_repair_preserves_authoritative_damaged_ledger(self):
         self.budget.configure(grant=100)
@@ -117,12 +177,57 @@ class BudgetTests(unittest.TestCase):
         self.budget.configure(grant=100)
         self.budget.admit("a", "a", "opus", "fix", bridge=str(self.directory / "missing"))
         result = self.budget.admit("b", "b", "opus", "fix")
-        self.assertIn("unresolved", result["reason"])
+        self.assertTrue(result["allowed"])
+        self.assertEqual(self.budget.snapshot()["unresolved"], ["a"])
+        self.assertIn("calibration", self.budget.admit("c", "c", "opus", "fix")["reason"])
         self.budget.reconcile("a", 10, "recovered orphan cost")
         self.budget.cooldown("opus", 60)
-        self.assertIn("cooldown", self.budget.admit("b", "b", "opus", "fix")["reason"])
+        self.assertIn("cooldown", self.budget.admit("c", "c", "opus", "fix")["reason"])
         self.now += 61
-        self.assertTrue(self.budget.admit("b", "b", "opus", "fix")["allowed"])
+        self.assertTrue(self.budget.admit("c", "c", "opus", "fix")["allowed"])
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
+    def test_stale_bridge_with_live_owner_keeps_its_calibration_slot(self):
+        self.budget.configure(grant=100)
+        owner = process_identity()
+        self.assertIsNotNone(owner)
+        self.budget.admit("first", "first", "opus", "fix", bridge=str(self.directory / "missing"), owner=owner)
+        self.assertIn("calibration", self.budget.admit("next", "next", "opus", "fix")["reason"])
+        self.assertEqual(self.budget.snapshot()["unresolved"], [])
+        with self.assertRaisesRegex(BudgetError, "live accounting bridge"):
+            self.budget.reconcile("first", 1, "stale heartbeat does not prove a stopped session")
+        self.assertEqual(self.budget.recover("check stale bridge")["unresolved"], [])
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
+    def test_old_boot_or_reused_pid_releases_orphaned_calibration_slot(self):
+        self.budget.configure(grant=100)
+        owner = process_identity()
+        self.assertIsNotNone(owner)
+        for i, stale in enumerate([{**owner, "boot": "previous-boot"}, {**owner, "start": "different-process"}]):
+            self.budget.admit(
+                f"lost-{i}", "worker", f"model-{i}", "fix", bridge=str(self.directory / "missing"), owner=stale
+            )
+            self.assertTrue(self.budget.admit(f"next-{i}", "next", f"model-{i}", "fix")["allowed"])
+            self.assertIn(f"lost-{i}", self.budget.snapshot()["unresolved"])
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
+    def test_receipt_recovery_does_not_remove_key_for_live_owner(self):
+        self.budget.configure(grant=100)
+        bridge = self.directory / "live-bridge"
+        bridge.mkdir()
+        key = bridge / "key"
+        key.write_text("fake-key")
+        invocation = "a" * 32
+        self.budget.admit(invocation, "worker", "opus", "fix", bridge=str(bridge), owner=process_identity())
+        self.budget.settle(invocation, None, "missing result while bridge still alive")
+        inbox = bridge / "inbox"
+        inbox.mkdir()
+        (inbox / (invocation + ".receipt")).write_text(
+            json.dumps({"id": invocation, "totals": {"provider": "5"}, "outcome": "completed"})
+        )
+        self.assertEqual(self.budget.recover("recover pending receipt without a fresh heartbeat")["unresolved"], [])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 5)
+        self.assertTrue(key.exists())
 
     def test_resumption_baseline_and_fair_waiting(self):
         self.budget.configure(grant=30)
@@ -137,6 +242,35 @@ class BudgetTests(unittest.TestCase):
         self.assertTrue(self.budget.admit("first", "first", "opus", "fix", resume="provider-session")["allowed"])
         with self.assertRaises(BudgetError):
             self.budget.admit("unknown", "unknown", "opus", "fix", resume="no-history")
+
+    def test_unresolved_resume_only_holds_its_own_provider_until_receipt_recovery(self):
+        self.budget.configure(grant=100)
+        self.budget.admit("seed", "seed", "opus", "fix")
+        self.budget.settle("seed", 10, totals={"provider-session": "10"})
+        self.budget.admit("lost", "worker", "opus", "fix", resume="provider-session")
+        self.budget.settle("lost", None, "reboot")
+        self.assertEqual(
+            self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["reason"],
+            "provider session cost baseline unresolved",
+        )
+        self.assertTrue(self.budget.admit("unrelated", "other", "opus", "fix")["allowed"])
+        self.budget.settle("unrelated", 2)
+        self.budget.settle_receipt({"id": "lost", "totals": {"provider-session": "20"}, "outcome": "recovered"})
+        self.assertTrue(self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["allowed"])
+        self.assertEqual(
+            self.budget.admit("concurrent", "other", "opus", "fix", resume="provider-session")["reason"],
+            "provider session already being resumed",
+        )
+        self.budget.settle_receipt({"id": "next", "totals": {"provider-session": "25"}, "outcome": "completed"})
+        self.assertEqual(self.budget.snapshot()["unresolved"], [])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 27)
+
+    def test_accounting_integrity_wait_uses_admission_wait_exit(self):
+        from tauceti_worker.claude_api import admission_failure
+        from tauceti_worker.config import AdmissionUnavailable
+
+        for reason in ("ledger repair requires reconciliation", "provider session cost baseline unresolved"):
+            self.assertIsInstance(admission_failure(reason), AdmissionUnavailable)
 
     def test_budget_cli_json_history_and_set_grant(self):
         env = {**os.environ, "TAUCETI_BUDGET_DIR": str(self.directory)}
@@ -274,11 +408,50 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             self.assertEqual(json.loads(result.stdout)["total_cost_usd"], 15)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 15)
 
-    def test_crash_freezes_future_admissions(self):
+    def test_crash_keeps_cost_unresolved_and_allows_next_native_session(self):
         with ClaudeAPIContext("worker1", "fix"):
             crashed = self.run_claude(env={**os.environ, "FAKE_CRASH": "1"})
         self.assertEqual(crashed.returncode, 1)
-        self.assertEqual(len(self.budget.snapshot()["unresolved"]), 1)
+        unresolved = self.budget.snapshot()["unresolved"]
+        self.assertEqual(len(unresolved), 1)
+        with ClaudeAPIContext("worker2", "fix", model="opus"):
+            following = self.run_claude()
+        self.assertEqual(following.returncode, 0, following.stderr)
+        self.assertEqual(self.budget.snapshot()["unresolved"], unresolved)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
+
+    def test_stage_and_loop_continue_with_unresolved_costs(self):
+        self.budget.admit("seed", "seed", "opus", "fix")
+        self.budget.settle("seed", 10)
+        self.budget.admit("lost", "worker1", "opus", "fix")
+        self.budget.settle("lost", None, "reboot")
+        with ClaudeAPIContext("worker2", "fix", model="opus"):
+            result = self.run_claude()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--budget", "--loop"])
+        with (
+            patch.object(loop, "run_round_subprocess", side_effect=KeyboardInterrupt) as round_mock,
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude")
+        round_mock.assert_called_once()
+        self.assertEqual(self.budget.snapshot()["unresolved"], ["lost"])
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 10)
+
+    def test_stage_and_loop_still_pause_for_ledger_repair(self):
+        with self.budget.ledger.open("ab") as file:
+            file.write(b'{"seq":2')
+        self.budget.repair("audit torn transaction")
+        with self.assertRaisesRegex(BudgetError, "ledger repair"), ClaudeAPIContext("worker1", "fix", model="opus"):
+            self.fail("stage started before ledger audit")
+        args = build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--budget", "--loop"])
+        with (
+            patch.object(loop, "run_round_subprocess") as round_mock,
+            patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude")
+        round_mock.assert_not_called()
 
     def test_cumulative_results_and_separate_session_segments(self):
         events = [
@@ -394,7 +567,8 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
         self.assertEqual(len(self.budget.snapshot()["unresolved"]), 1)
         os.utime(context.outbox / "heartbeat", (1, 1))
         (context.directory / "key").write_text("left by crash")
-        snapshot = self.budget.recover("recover durable receipt after worker crash")
+        with patch("tauceti_worker.budget.bridge_owner_alive", return_value=False):
+            snapshot = self.budget.recover("recover durable receipt after worker crash")
         self.assertEqual(snapshot["unresolved"], [])
         self.assertEqual(Decimal(snapshot["spent"]), 12)
         self.assertFalse((context.directory / "key").exists())
