@@ -1262,7 +1262,9 @@ def _do_fixlike(
             f"Verify the checked-out head is still {head}; otherwise stop without edits. "
             "Fetch and merge current origin/main before diagnosing this failure; preserve the bot's "
             "dependency target. Read the linked integration build's actual diagnostics. "
-            "Repair the combined source and verify it before pushing; do not request a manual Bors retry.\n"
+            "Repair the combined source and verify it before pushing; recheck that the PR is open at the "
+            "expected head and that the Bors repair handoff still holds before pushing. "
+            "Do not request a manual Bors retry.\n"
         )
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
@@ -1286,7 +1288,7 @@ def _do_fixlike(
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         checked = rev.stdout.strip() or head
-        if label == "bump" and getattr(c, "bump_integration_failure", False) and checked != head:
+        if label == "bump" and getattr(c, "bump_integration_failure", False) and (rev.returncode or checked != head):
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None

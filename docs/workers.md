@@ -404,7 +404,9 @@ Bors retries an unchanged automatically reviewed bump after main advances, with
 three retries per head. This uses the existing Bors heartbeat and leaves the
 branch and its reviews intact. Workers do not request queue retries.
 
-A confirmed singleton integration build failure publishes `bump-integration`.
+Bors durably hands a confirmed singleton failure to proof repair when no retry
+is currently possible or its budget is exhausted, then publishes
+`bump-integration`. Later main advances cannot retry that handed-off head.
 The bump phase recognizes that status alongside a green standalone build. Before
 spending on an editor, it checks the live exact-head PR and Bors `bump_repairs`
 handoff. Pending or active queue work, withdrawals, draft/closed PRs and holds
