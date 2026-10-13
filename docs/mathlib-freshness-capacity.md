@@ -64,6 +64,20 @@ batch is not evidence that every member has a bad branch: an earlier failed
 reported a ProjectiveLine identifier mismatch, not a failure of every PR in
 the batch.
 
+Cancelled integration CI exposed another failure mode: a generic failed status
+could send a whole batch into bisection and eventually stop an innocent
+singleton's approval. [Bors PR 13](https://github.com/TauCetiProject/bors-ng/pull/13)
+binds the failed status to its trusted Actions run and exact staging attempt.
+Confirmed cancellation creates a native retry child with preserved approvals,
+normal preflight, and backoff; conclusive proof failures still bisect. Pending
+finalizers get a bounded propagation hold. Unavailable metadata retains intent,
+then releases the slot for a retry and alerts on repeated failures. This adds
+at most two failure-path reads per classification and no healthy-CI reads or AI
+session. The source of the observed cancellations remains unknown:
+[TauCeti issue 15699](https://github.com/TauCetiProject/TauCeti/issues/15699).
+The cancellation-specific retry transition is covered by integration tests;
+the successful production canary above verifies the deployed queue recovery.
+
 Workers should edit only a genuine GitHub `CONFLICTING` head or an authenticated
 repair handoff for that exact head. Batch-level failure or a speculative label
 alone must not trigger a rebase. Bors owns unchanged-head requeuing; workers own
