@@ -68,6 +68,7 @@ from .constants import (
     EX_ADMISSION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
+    EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
     TAUCETI,
@@ -198,7 +199,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         default=[],
         metavar="TASKS",
         help="restrict the round to these work units, a comma list of: "
-        + ", ".join(ALLOWED_TASKS)
+        + ", ".join((*ALLOWED_TASKS, *EXPLICIT_TASKS))
         + " (default: walk the whole cascade)",
     )
     p.add_argument(
@@ -412,7 +413,7 @@ def parse_only(values: list[str], flag: str = "--only") -> list[str]:
         for tok in v.replace(" ", "").split(","):
             if not tok:
                 continue
-            if tok not in ALLOWED_TASKS:
+            if tok not in (*ALLOWED_TASKS, *EXPLICIT_TASKS):
                 raise SystemExit(
                     f"unknown {flag} task '{tok}' (valid: {', '.join(ALLOWED_TASKS)})"
                 )  # exit 1; argparse uses 2
@@ -431,7 +432,7 @@ def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
     if not skip:
         return only
     allowed = set(only) if only else set(ALLOWED_TASKS)
-    tasks = [t for t in ALLOWED_TASKS if t in allowed and t not in skip]
+    tasks = [t for t in (*ALLOWED_TASKS, *EXPLICIT_TASKS) if t in allowed and t not in skip]
     if not tasks:
         raise SystemExit("--only/--skip leave no work units enabled")
     return tasks
@@ -1122,6 +1123,18 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
+    if "security-audit" in only:
+        from .security_audit import require_admin
+
+        if only != ["security-audit"] or prs:
+            raise Die("security-audit must run alone, without --pr")
+        if agent not in ("auto", "codex", "claude"):
+            raise Die("security-audit supports Codex Luna or Claude Haiku only")
+        if getattr(args, "author_model", None) or getattr(args, "author_effort", None):
+            raise Die("security-audit uses its dedicated Luna/Haiku profile; omit author-model/effort overrides")
+        if getattr(args, "claude_billing", None) == "api" or api_mode():
+            raise Die("security-audit currently uses paced subscription CLI sessions")
+        require_admin()  # Before quota/model selection, including on the loop-driver path.
     if one_round and not getattr(args, "dry_run", False):
         from .github_outbox import drain
 
@@ -1418,6 +1431,11 @@ def cmd_doctor(args) -> int:
 def preflight(cfg: Config, opts: RoundOpts) -> None:
     """Fail a round early if its chosen mode can't run, rather than partway through. bubble and the
     review engine are fetched on demand, so we don't require them on PATH (only uvx + a runtime)."""
+    if "security-audit" in opts.only:
+        for t in ("gh", "git", opts.work_model):
+            if not _have(t):
+                raise Die(f"security-audit: missing '{t}' on PATH")
+        return  # No Lake, fork, general agent launcher, or GitHub proxy.
     for t in ("gh", "git", "uvx"):
         if not _have(t):
             raise Die(f"preflight: missing '{t}' on PATH")

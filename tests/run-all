@@ -95,6 +95,7 @@ RUN_STDLIB=(
   rubric_bundle.py
   safe_exists.py
   scoreboard_trust.py
+  security_audit.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py
