@@ -355,6 +355,8 @@ Grants never interrupt active sessions. Completed costs may create a deficit,
 and estimated pending costs reduce the amount available for new admissions.
 A missing receipt stays unresolved with its existing estimate reserved for later
 reconciliation; it does not independently block funded workers or replacement
-calibration sessions.
+calibration sessions. Cold-model reservations use at least $1 or the largest
+of the last 20 recorded costs. A missing cumulative receipt pauses only explicit
+resumption of that same provider session until its accounting baseline is known.
 See [the complete budget design](api-budget-plan.md) for state paths, recovery,
 and estimated-cost semantics.

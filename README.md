@@ -443,9 +443,13 @@ and does not represent the actual credit balance in Anthropic Console.
 Use `tauceti budget --json` for scripts. To recover a missing cost or correct a
 settlement, use `tauceti budget --reconcile INVOCATION --cost USD --note TEXT`;
 the correction is appended to history. A cold model runs one calibration
-session before parallel admissions use learned cost estimates. If that session
+session before parallel admissions use learned cost estimates. Its reservation
+is at least $1, or the largest of the last 20 recorded costs if that is higher;
+zero-cost launch failures do not establish a spending estimate. If that session
 loses its receipt, another calibration session can run; missing costs never
-pause the fleet merely because reconciliation is outstanding. No local budget amount is passed as
+pause the fleet merely because reconciliation is outstanding. Resuming the same
+provider session waits for its missing cumulative receipt to avoid counting
+its spending twice; unrelated sessions can run. No local budget amount is passed as
 Claude's `--max-budget-usd`. After a crashed worker, first try
 `tauceti budget --recover --note "worker crash"` to recover its durable receipts
 and remove stale staged keys. Costs without a receipt still require reconciliation.

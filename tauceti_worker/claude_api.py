@@ -14,7 +14,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from .budget import Budget, BudgetError, admission_pause, budget_dir
+from .budget import Budget, BudgetError, admission_pause, budget_dir, process_identity
 from .claude_api_client import api_environment, atomic, authenticate
 from .runtime_status import report_runtime
 
@@ -28,7 +28,7 @@ def blocked_reason():
 def admission_failure(message):
     from .config import AdmissionUnavailable, NoProgress
 
-    waiting = message.startswith(("waiting", "unresolved", "API throughput", "provider session already"))
+    waiting = message.startswith(("waiting", "unresolved", "API throughput", "provider session", "ledger repair"))
     return AdmissionUnavailable(message) if waiting else NoProgress(message)
 
 
@@ -198,6 +198,7 @@ class ClaudeAPIContext:
                     self.phase,
                     bridge=str(self.directory),
                     resume=request.get("resume"),
+                    owner=process_identity(),
                 )
             else:
                 answer = dict(allowed=True)

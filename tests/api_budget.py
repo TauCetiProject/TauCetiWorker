@@ -20,7 +20,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tauceti_worker import agents, loop
-from tauceti_worker.budget import Budget, BudgetError
+from tauceti_worker.budget import Budget, BudgetError, process_identity
 from tauceti_worker.claude_api import ClaudeAPIContext, configure_api
 from tauceti_worker.cli import build_parser
 from tauceti_worker.worker_manager import WorkersError, WorkerSpec
@@ -116,6 +116,27 @@ class BudgetTests(unittest.TestCase):
             "waiting for calibration session cost",
         )
 
+    def test_repeated_missing_calibration_receipts_consume_available_funds(self):
+        self.budget.configure(grant=3)
+        for i in range(3):
+            self.assertTrue(self.budget.admit(str(i), "worker", "cold-model", "fix")["allowed"])
+            self.budget.settle(str(i), None, "crashed")
+            snapshot = self.budget.snapshot()
+            self.assertEqual(Decimal(snapshot["pending"]), i + 1)
+            self.assertEqual(Decimal(snapshot["available"]), 2 - i)
+        self.assertEqual(self.budget.admit("next", "worker", "cold-model", "fix")["reason"], "waiting for funding")
+        self.budget.configure(grant=1)
+        self.assertTrue(self.budget.admit("next", "worker", "cold-model", "fix")["allowed"])
+
+    def test_calibration_uses_recent_costs_and_does_not_learn_from_failed_launches(self):
+        self.budget.configure(grant=100)
+        self.budget.admit("failed", "first", "opus", "fix")
+        self.budget.settle("failed", 0, "launch-failed")
+        self.assertEqual(self.budget.admit("replacement", "first", "opus", "fix")["estimate"], "1")
+        self.assertIn("calibration", self.budget.admit("parallel", "second", "opus", "fix")["reason"])
+        self.budget.settle("replacement", 7)
+        self.assertEqual(self.budget.admit("new-model", "second", "sonnet", "fix")["estimate"], "7")
+
     def test_corruption_and_audited_torn_recovery(self):
         self.budget.configure(grant=100)
         original = self.budget.ledger.read_bytes()
@@ -164,6 +185,30 @@ class BudgetTests(unittest.TestCase):
         self.now += 61
         self.assertTrue(self.budget.admit("c", "c", "opus", "fix")["allowed"])
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
+    def test_stale_bridge_with_live_owner_keeps_its_calibration_slot(self):
+        self.budget.configure(grant=100)
+        owner = process_identity()
+        self.assertIsNotNone(owner)
+        self.budget.admit("first", "first", "opus", "fix", bridge=str(self.directory / "missing"), owner=owner)
+        self.assertIn("calibration", self.budget.admit("next", "next", "opus", "fix")["reason"])
+        self.assertEqual(self.budget.snapshot()["unresolved"], [])
+        with self.assertRaisesRegex(BudgetError, "live accounting bridge"):
+            self.budget.reconcile("first", 1, "stale heartbeat does not prove a stopped session")
+        self.assertEqual(self.budget.recover("check stale bridge")["unresolved"], [])
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
+    def test_old_boot_or_reused_pid_releases_orphaned_calibration_slot(self):
+        self.budget.configure(grant=100)
+        owner = process_identity()
+        self.assertIsNotNone(owner)
+        for i, stale in enumerate([{**owner, "boot": "previous-boot"}, {**owner, "start": "different-process"}]):
+            self.budget.admit(
+                f"lost-{i}", "worker", f"model-{i}", "fix", bridge=str(self.directory / "missing"), owner=stale
+            )
+            self.assertTrue(self.budget.admit(f"next-{i}", "next", f"model-{i}", "fix")["allowed"])
+            self.assertIn(f"lost-{i}", self.budget.snapshot()["unresolved"])
+
     def test_resumption_baseline_and_fair_waiting(self):
         self.budget.configure(grant=30)
         self.assertTrue(self.budget.admit("seed", "seed", "opus", "fix")["allowed"])
@@ -178,18 +223,34 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaises(BudgetError):
             self.budget.admit("unknown", "unknown", "opus", "fix", resume="no-history")
 
-    def test_orphaned_resume_does_not_occupy_a_live_provider_slot(self):
+    def test_unresolved_resume_only_holds_its_own_provider_until_receipt_recovery(self):
         self.budget.configure(grant=100)
         self.budget.admit("seed", "seed", "opus", "fix")
         self.budget.settle("seed", 10, totals={"provider-session": "10"})
         self.budget.admit("lost", "worker", "opus", "fix", resume="provider-session")
         self.budget.settle("lost", None, "reboot")
+        self.assertEqual(
+            self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["reason"],
+            "provider session cost baseline unresolved",
+        )
+        self.assertTrue(self.budget.admit("unrelated", "other", "opus", "fix")["allowed"])
+        self.budget.settle("unrelated", 2)
+        self.budget.settle_receipt({"id": "lost", "totals": {"provider-session": "20"}, "outcome": "recovered"})
         self.assertTrue(self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["allowed"])
         self.assertEqual(
             self.budget.admit("concurrent", "other", "opus", "fix", resume="provider-session")["reason"],
             "provider session already being resumed",
         )
-        self.assertEqual(self.budget.snapshot()["unresolved"], ["lost"])
+        self.budget.settle_receipt({"id": "next", "totals": {"provider-session": "25"}, "outcome": "completed"})
+        self.assertEqual(self.budget.snapshot()["unresolved"], [])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 27)
+
+    def test_accounting_integrity_wait_uses_admission_wait_exit(self):
+        from tauceti_worker.claude_api import admission_failure
+        from tauceti_worker.config import AdmissionUnavailable
+
+        for reason in ("ledger repair requires reconciliation", "provider session cost baseline unresolved"):
+            self.assertIsInstance(admission_failure(reason), AdmissionUnavailable)
 
     def test_budget_cli_json_history_and_set_grant(self):
         env = {**os.environ, "TAUCETI_BUDGET_DIR": str(self.directory)}

@@ -144,8 +144,11 @@ so workers cannot all launch against the same uncommitted funds.
 
 Estimates are scheduling hints, not allowances enforced against a running agent.
 Learn them from completed sessions by model and phase, using a conservative
-recent percentile. With no usable recorded settlements, admit one calibration session for a model when the
-balance is positive; other sessions for that model wait while its calibration
+recent percentile. Zero-cost launch failures do not establish a spending estimate.
+With no positive recorded settlements, a calibration session reserves at least
+$1 or the largest of the last 20 recorded costs, whichever is higher. Admit one
+when the available funds cover that reservation; other sessions for that model
+wait while its calibration
 session is active. If that session loses its receipt, admit a replacement instead
 of waiting for reconciliation. Thereafter, multiple workers can run whenever the balance covers their
 estimates. This avoids introducing a user-facing per-session cap.
@@ -208,8 +211,12 @@ Missing or crash-zeroed results do not establish zero spending. Preserve the
 receipt and mark the invocation unresolved. Retain its existing pending estimate
 until the cost is recovered or an operator records a correction with an
 explanation. Unresolved costs are audit work, not a fleet-wide admission pause;
-funded workers continue, and orphaned sessions do not occupy calibration or
-resumption slots.
+funded workers continue, and orphaned sessions do not occupy calibration slots.
+An unresolved resumed invocation holds only that provider session’s resumption
+slot until its cumulative receipt is recovered, preventing double-counting.
+On Linux, recorded bridge process identities include boot and process start
+markers. A live owner prevents orphan detection, receipt recovery or active
+reconciliation based solely on a delayed heartbeat.
 `budget --recover --note TEXT` reads durable receipts from stopped bridges and
 removes their staged keys. It skips live bridges. `--reconcile` refuses a
 running session with a live heartbeat. A native process that could not be
