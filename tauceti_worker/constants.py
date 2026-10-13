@@ -3,6 +3,7 @@ agent/task tables."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 
@@ -47,10 +48,15 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "13a0727aa7b7200f766c5c95ea5033afebe4a955")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "1feea7926eefd7129089bb060a47c28ae915a877")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
-PROGRESS_ERROR_KEY = f"progress-err-{PROGRESS_REF}"
+# Keep the usual immutable SHA readable, and hash other refs so a branch name containing
+# slashes cannot become a directory path. Mutable refs retain their budget until renamed.
+_PROGRESS_ERROR_REF = (
+    PROGRESS_REF if re.fullmatch(r"[0-9a-f]{40}", PROGRESS_REF) else hashlib.sha256(PROGRESS_REF.encode()).hexdigest()
+)
+PROGRESS_ERROR_KEY = f"progress-err-{_PROGRESS_ERROR_REF}"
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts

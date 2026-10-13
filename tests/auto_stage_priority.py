@@ -2,10 +2,12 @@
 """The unrestricted work predictor and runtime follow the documented priority order."""
 
 import os
+import runpy
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -187,6 +189,17 @@ with tempfile.TemporaryDirectory() as tmp:
         checks.append(check("a latched current release does not launch the tool", len(calls), 1))
     finally:
         tc.work_units.subprocess.run = saved_run
+
+# Branch refs used to trial a release must still produce a writable counter filename.
+with tempfile.TemporaryDirectory() as tmp:
+    with patch.dict(os.environ, {"TAUCETI_PROGRESS_REF": "fix/bors-progress"}):
+        branch_constants = runpy.run_path(str(REPO / "tauceti_worker" / "constants.py"))
+    branch_key = branch_constants["PROGRESS_ERROR_KEY"]
+    counters = tc.Counters(SimpleNamespace(state=Path(tmp)))
+    for _ in range(tc.MAX_PROGRESS_ERRORS):
+        counters.incr(branch_key)
+    checks.append(check("a branch ref can persist its error budget", counters.read(branch_key), tc.MAX_PROGRESS_ERRORS))
+    checks.append(check("a branch ref does not become a counter directory", "/" in branch_key, False))
 
 # If no requested phase can run, a focused progress worker must retain the survey's suppression reason
 # for its manager/status output instead of collapsing it into the generic no-eligible-work fallback.
