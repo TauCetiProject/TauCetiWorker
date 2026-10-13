@@ -413,7 +413,7 @@ def execute(argv, *, env=None, wait: bool = False, **kwargs):
     intent = github_outbox.prepare(argv, effective, kwargs.get("cwd"), kwargs.get("input"))
     try:
         if intent and not github_outbox.may_send(intent):
-            from .config import GitHubUnavailable
+            from tauceti_worker.config import GitHubUnavailable
 
             raise GitHubUnavailable(
                 "GitHub publication already retained; reconciling before another attempt",
@@ -505,7 +505,7 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
         records = []
         try:
             if _intent and not sent_intent:
-                from .github_outbox import sending
+                from tauceti_worker.github_outbox import sending
 
                 sending(_intent)
                 sent_intent = True
@@ -902,8 +902,19 @@ if __name__ == "__main__":
         # retaining a hit after a child command whose write behavior cannot be proved.
         if not readonly:
             invalidate()
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tauceti_worker.config import GitHubUnavailable
+        from tauceti_worker.constants import EX_GITHUB_WAIT
+
         try:
             p = execute(["gh", *args], wait=True)
+        except GitHubUnavailable as error:
+            # The shell caller cannot catch Python exceptions. Preserve the
+            # infrastructure wait marker for its owning worker's stage guard.
+            record_block("publication", error.retry_at or time.time() + 60)
+            p = subprocess.CompletedProcess(
+                args, EX_GITHUB_WAIT, "", f"gh: {error}; publication retained for recovery\n"
+            )
         finally:
             if not readonly:
                 invalidate()

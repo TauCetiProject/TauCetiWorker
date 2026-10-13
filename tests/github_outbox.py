@@ -14,6 +14,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import github_outbox as outbox
 from tauceti_worker import github_transport as tr
 
+with tempfile.TemporaryDirectory() as standalone_tmp:
+    # Agents invoke this file through a generated shell shim, not as an imported
+    # package. Exercise that entry point from an unrelated working directory.
+    work = Path(standalone_tmp)
+    native = work / "gh"
+    native.write_text("""#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ["TAUCETI_TEST_GH_CALLS"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")
+if os.environ.get("TAUCETI_TEST_GH_FAIL"):
+    print("connection reset",file=sys.stderr);sys.exit(1)
+print("{}")
+""")
+    native.chmod(0o700)
+    calls = work / "calls.jsonl"
+    env = {
+        **os.environ,
+        "GH_TOKEN": "standalone-fixture",
+        "TAUCETI_GITHUB_ACCOUNT": "author",
+        "TAUCETI_WORKER_ID": "standalone",
+        "TAUCETI_GITHUB_SHARED_DIR": str(work / "shared"),
+        "TAUCETI_REAL_GH": str(native),
+        "TAUCETI_TEST_GH_CALLS": str(calls),
+    }
+    command = [sys.executable, str(Path(tr.__file__).resolve()), "--proxy"]
+    for args in (
+        ["api", "repos/org/repo/issues/7/comments", "--method", "POST", "-f", "body=one"],
+        ["pr", "comment", "8", "--repo", "org/repo", "--body", "two"],
+    ):
+        result = subprocess.run(command + args, env=env, cwd=work, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 2
+    args = ["api", "repos/org/repo/issues/9/comments", "--method", "POST", "-f", "body=ambiguous"]
+    result = subprocess.run(
+        command + args, env={**env, "TAUCETI_TEST_GH_FAIL": "1"}, cwd=work, capture_output=True, text=True
+    )
+    assert result.returncode == 1 and "publication retained" in result.stderr
+    started = time.time()
+    result = subprocess.run(command + args, env=env, cwd=work, capture_output=True, text=True)
+    assert result.returncode == 77 and "Traceback" not in result.stderr, result.stderr
+    assert len(calls.read_text().splitlines()) == 3, "an ambiguous write cannot be repeated by the shell entry point"
+    with patch.dict(os.environ, env):
+        block = tr.blocking_event_since(started)
+        assert block and block["resource"] == "publication" and block["reset"] > started + 55
+
 with (
     tempfile.TemporaryDirectory() as tmp,
     patch.dict(
