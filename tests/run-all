@@ -28,6 +28,7 @@ RUN_STDLIB=(
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py
+  bump_integration.py
   claude_config_dir.py
   claude_keychain.py
   claims_repo.py
@@ -72,7 +73,6 @@ RUN_STDLIB=(
   quota_loop_refresh.py
   rebase_handoff.py
   rebase_budget.py
-  bump_recovery.py
   review_sync_failure.py
   quota_claude_bootstrap.py
   quota_claude_windows.py

@@ -679,6 +679,8 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     reading normally looks equivalent and is not: the cache directory is shared with `status` and the
     dashboard, either of which can republish an entitled record in the gap, and the read would come
     back `assumed` from a fetch that happened before whatever prompted this re-check."""
+    if stage == "bump" and getattr(c, "bump_integration_failure", False):
+        return bool(w.gh.bump_repair_requested(c.pr, c.head))
     if stage not in ("review", "fix"):
         return True
     # The head the survey saw. A contributor pushing since then makes every verdict below describe a
@@ -766,9 +768,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "fix": (f"fix-{pr}-{head}",),
         "fix-ci": (f"ci-{pr}-{head}", f"ci-pr-{pr}"),
         "rebase": (rebase_key,),
-        "bump": (
-            (c.bump_recovery_key,) if getattr(c, "bump_recovery_key", "") else (f"bump-{pr}-{head}", f"bump-pr-{pr}")
-        ),
+        "bump": (f"bump-{pr}-{head}", f"bump-pr-{pr}"),
         "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
         "progress": ("progress-err",),
     }.get(stage, ())
@@ -813,11 +813,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     ):
         raise NoProgress("GitHub API exhausted — waiting for reset before launching paid work")
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
-    if stage == "bump" and getattr(c, "bump_recovery_key", ""):
-        from .bump_recovery import recover
-
-        report_runtime("running", phase="bump", target=f"PR #{c.pr}", detail="integration recovery without AI")
-        return _run_github_stage(stage, recover, w, sv, c, opts, bubble)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -1253,7 +1248,22 @@ def _do_fixlike(
         return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
+    if label == "bump" and getattr(c, "bump_integration_failure", False):
+        batch = w.gh.bump_repair_requested(pr, head)
+        if not batch:
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            return None
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
+    if label == "bump" and getattr(c, "bump_integration_failure", False):
+        prompt += (
+            f"\nThe exact head {head} failed alone in Bors integration: "
+            f"https://bors.taucetiproject.org/batches/{batch}. Standalone CI is green. "
+            f"Verify the checked-out head is still {head}; otherwise stop without edits. "
+            "Fetch and merge current origin/main before diagnosing this failure; preserve the bot's "
+            "dependency target. Read the linked integration build's actual diagnostics. "
+            "Repair the combined source and verify it before pushing; do not request a manual Bors retry.\n"
+        )
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
@@ -1276,6 +1286,10 @@ def _do_fixlike(
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         checked = rev.stdout.strip() or head
+        if label == "bump" and getattr(c, "bump_integration_failure", False) and checked != head:
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            return None
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
         try:

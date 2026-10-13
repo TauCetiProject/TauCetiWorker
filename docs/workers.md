@@ -30,37 +30,6 @@ a per-worker bound, as before, not a fleet-wide attempt limit.
 Unreadable or malformed checkpoint/counter evidence suppresses rebase work with
 a diagnostic reason. Counter and checkpoint writes use atomic, synced replacement.
 
-## Automatic bump integration recovery
-
-The bump phase also handles a dependency PR whose standalone build is green but
-whose Bors integration failed. It uses the existing survey status contexts and
-base SHA; healthy PRs add no GitHub request. Both `bump-mathlib/` repair branches
-and `hopscotch/lkg-bump` are recognized.
-
-Recovery takes the normal branch claim and rechecks the live head, pause labels,
-and trusted build/scope/bump-guard statuses. The Bors observation must identify a
-failed singleton at that exact head, with no active membership, hold or withdrawal.
-Incomplete observations defer, including a Bors deployment without `queue_stops`.
-Historical attempts without a stored base use the trusted staging commit's first
-parent. Main must have advanced beyond that failed base, and the branch must be
-behind current main. A final Bors read rechecks stops before a normal
-`update-branch` request bound to `expected_head_sha`.
-
-This is deterministic branch maintenance: no AI editor, checkout, forced push,
-Bors approval or direct merge. The resulting head must pass ordinary CI and fresh
-review before Bors admits it. Those CI and review costs remain real. Pending
-bisection members, cancellations and speculative batch failures cannot trigger it.
-
-Each worker examines an observed head/base/status once. Infrastructure failures
-refund that examination; the write CAS makes replay safe after an ambiguous
-response. Bors history supplies a fleet-wide bound: more than three distinct
-integration-failed heads on one PR stops automatic refresh. This conservative
-bound can also count earlier failed parent batches. Failed standalone builds keep
-the existing bump source-repair budget. Exhaustion requires addressing the
-reported failure, rather than resetting counters or repeatedly updating branches.
-Landing a first-known-bad repair is progress through a compatibility boundary;
-only the age of the eventual pin on main establishes the freshness target.
-
 ## Quickstart
 
 Nothing needs to exist first. `workers add` creates the config, writes the
@@ -428,3 +397,20 @@ tauceti workers import workers.conf
 
 Anything the legacy parser does not recognize is an error naming the file, line,
 and token, so a partial migration is never silently accepted.
+
+## Integration-only dependency repairs
+
+Bors retries an unchanged automatically reviewed bump after main advances, with
+three retries per head. This uses the existing Bors heartbeat and leaves the
+branch and its reviews intact. Workers do not request queue retries.
+
+A confirmed singleton integration build failure publishes `bump-integration`.
+The bump phase recognizes that status alongside a green standalone build. Before
+spending on an editor, it checks the live exact-head PR and Bors `bump_repairs`
+handoff. Pending or active queue work, withdrawals, draft/closed PRs and holds
+are excluded. A second check after taking the normal branch claim closes the
+selection gap. Failed observations decline the candidate and leave unrelated
+work available. Normal bump editing budgets apply. The repair session fetches
+and merges current main, diagnoses the actual integration failure, preserves
+the dependency target and verifies its changes before pushing. Healthy surveys
+make no additional API calls.

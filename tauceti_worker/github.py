@@ -4,13 +4,17 @@ GitHub REST rate-limit handling."""
 from __future__ import annotations
 
 import functools
+import http.client
 import json
 import os
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import github_transport as transport
@@ -609,7 +613,7 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
     pullRequests(states:OPEN,first:$n,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){
       pageInfo{hasNextPage endCursor}
       nodes{
-        number title body isDraft mergeable updatedAt headRefOid headRefName baseRefOid
+        number title body isDraft mergeable updatedAt headRefOid headRefName
         headRepositoryOwner{login} headRepository{name}
         author{login __typename}
         labels(first:50){totalCount nodes{name}}
@@ -636,17 +640,7 @@ def _pr_json_from_graphql(node: dict) -> dict:
     return {
         **{
             k: node.get(k)
-            for k in (
-                "number",
-                "title",
-                "body",
-                "isDraft",
-                "mergeable",
-                "updatedAt",
-                "headRefOid",
-                "headRefName",
-                "baseRefOid",
-            )
+            for k in ("number", "title", "body", "isDraft", "mergeable", "updatedAt", "headRefOid", "headRefName")
         },
         "headRepositoryOwner": node.get("headRepositoryOwner") or {},
         "headRepository": node.get("headRepository") or {},
@@ -792,6 +786,68 @@ class GitHub:
         if p.returncode != 0:
             return None
         return json.loads(p.stdout or "{}")
+
+    def bump_repair_requested(self, pr: int, head: str) -> int | None:
+        """Fresh proof of a stopped singleton, never a pending retry or speculative label."""
+        if self.repo != TAUCETI or not re.fullmatch(r"[0-9a-f]{40}", head):
+            return None
+        try:
+            with transport.read_context(fresh=True):
+                result = self._gh(["api", f"repos/{self.repo}/pulls/{pr}"])
+            if result.returncode:
+                return None
+            live = json.loads(result.stdout)
+            if (
+                live.get("state") != "open"
+                or live.get("draft")
+                or live.get("head", {}).get("sha") != head
+                or live.get("base", {}).get("ref") != "main"
+                or live.get("head", {}).get("repo", {}).get("full_name") != self.repo
+                or live.get("user", {}).get("login") != "tauceti-review-bot[bot]"
+                or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
+                & {"keep", "hold", "wip", "human", "do-not-close", "needs-rebase"}
+            ):
+                return None
+            context = ssl.create_default_context()
+            system_ca = Path("/etc/ssl/certs/ca-certificates.crt")
+            if system_ca.is_file():
+                context.load_verify_locations(cafile=str(system_ca))
+            request = urllib.request.Request(
+                "https://bors.taucetiproject.org/repositories/1/active-batches?base=main",
+                headers={"User-Agent": "TauCetiWorker/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=20, context=context) as response:
+                data = json.load(response)
+            if (
+                data.get("schema") != "tauceti-bors.observation/v1"
+                or data.get("repo") != self.repo
+                or data.get("base") != "main"
+                or not isinstance(data.get("bump_repairs"), list)
+            ):
+                return None
+            return next(
+                (
+                    r["batch_id"]
+                    for r in data["bump_repairs"]
+                    if isinstance(r, dict)
+                    and r.get("pr") == pr
+                    and r.get("head_sha") == head
+                    and isinstance(r.get("batch_id"), int)
+                    and r["batch_id"] > 0
+                ),
+                None,
+            )
+        except (
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            OSError,
+            urllib.error.URLError,
+            http.client.HTTPException,
+        ) as error:
+            log(f"bump #{pr}: integration handoff unavailable; leaving it for a later round ({type(error).__name__})")
+            return None
 
     @staticmethod
     def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
