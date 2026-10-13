@@ -44,6 +44,12 @@ in every scope until its area label resolves.
 
 ## The claim namespace
 
+Mathlib overlap phases require the canonical shared namespace and never use its
+private-fork fallback. See [Mathlib overlaps](mathlib-overlaps.md). Initialize with
+`tauceti overlap init --mathlib-commit SHA`; select `overlap-scan` or `overlap-fix`
+with `--only`. `--overlap-batch-commits N` / `TAUCETI_OVERLAP_BATCH_COMMITS`
+controls commits per investigation session.
+
 Two workers must not spend two subscriptions writing the same report or fixing
 the same PR. They avoid it by taking a lease before they start: a custom git ref
 `refs/tauceti-claims/<key>` in some repository both of them can push to, acquired
@@ -206,15 +212,24 @@ rates. The default review source is the local canonical TauCetiData checkout at
 different checkout. Production review records are de-duplicated by their durable
 key, with shadow experiments excluded.
 
-The report gives observed-mix, Sol-only, and Opus-only scenarios. Each combines
+The text report separates preparation and revision costs by exact model ID,
+including session counts and pricing coverage. It gives the observed mix and
+per-model cost scenarios. Each combines
 preparation-attempt cost amortized over observed opened PRs, the review archive's
 observed rubric runs per PR, and measured revision sessions per reviewed PR.
-`--ai-family` chooses which scenario feeds the LOC model.
+The per-model scenarios use the shared observed review and revision rates;
+they are accounting comparisons, not measured model performance. `--ai-family`
+chooses which observed or family scenario feeds the LOC model.
 `--ai-usd-per-changed-loc` remains available only as an explicit override; it has
 no default. Token counts are measurements, while dollar figures are
 API-equivalent conversions of subscription activity at the dated rates printed
 in JSON. Model choice is not randomized, so differences between the Sol and Opus
 samples are descriptive rather than causal.
+
+The CI and R2 model uses the current repository size, defaulting to 2.7 million
+LOC. The baseline follows `--current-repo-loc`; an explicit
+`--reference-repo-loc` selects a different baseline for a growth scenario.
+The CI headline and component breakdown show the estimate at the current size.
 
 The CI and R2 sections are a model, not billing telemetry. Their measured
 defaults are dated snapshots and every important assumption is an overridable
@@ -251,6 +266,54 @@ contains a pessimistic comparison in which all current infrastructure cost
 scales with repository size. Operational improvements and changing PR shape can
 dominate repository growth, so long-range totals, especially `1e8`, should not be
 read as predictions.
+
+## GitHub request accounting and shared reads
+
+Workers account for actual `gh` HTTP requests, including pagination and retries, in
+`state/github-shared/requests.jsonl`. Records contain worker, phase, endpoint, method, status,
+and rate-limit headers; tokens, query parameters, bodies and raw debug traces are excluded.
+Inspect the retained trailing hour with:
+
+```sh
+python3 tauceti_worker/github_transport.py --hours 1
+```
+
+Counts measure requests, not GraphQL point charges. Host engine and agent calls are instrumented
+through an inherited `gh` wrapper. Commands bypassing that PATH, direct HTTP clients, and Bubble's
+separate proxy are outside this accounting. The current science fleet runs on the host.
+The log rotates at 64 MiB and retains one previous file.
+
+Complete open-PR inventories share a 15-second cache; comment histories and permission reads
+share a 30-second cache. Keys include credential fingerprints and PR revision hints. Per-key
+file locks coalesce concurrent misses. Failed or incomplete histories never enter the cache.
+Writes invalidate cached reads. Dispatch checks, progress checks, engine ownership/claim checks,
+and reaction leases remain live. Child rounds reuse verified identity for up to an hour under
+the same credential; fresh named selection still verifies the token.
+
+Issue comments, inline thread histories and reaction reads use paginated GraphQL, preserving
+REST comment IDs, bot logins and reply links. Host review-engine complete-history REST commands are
+translated for its known projections (`.[]`, `.[] | @json`, and the scoreboard ownership filter, with local `jq`);
+unsupported forms pass through unchanged. Cold reaction callers carrying only a REST numeric
+ID may need one REST lookup for its immutable GraphQL node ID. Publishing writes remain REST.
+
+Observed response headers override optimistic `/rate_limit` readings. A live zero reading also
+blocks optimistic responses with contradictory reset windows until the observed exhaustion resets.
+GraphQL logical failures with HTTP 200 are attributed to quota too, and failure attribution survives
+a reset that occurs while an engine is exiting. An exhausted bucket
+blocks further requests until reset while allowing direct reads from the other bucket. Secondary
+cooldowns are shared too. Loop startup waits during exhausted identity verification. Host child
+calls wait at most 900 seconds; longer waits return a quota error so the loop can pause before
+another paid round. Ambiguous writes are never automatically replayed. GitHub exhaustion during
+checkout, review, repair, or progress publishing is a machine-wide pause and does not consume
+that stage's PR attempt allowance. Already settled provider costs remain settled costs.
+
+Selective surveys should retain the complete lightweight inventory, inspect changed heads or
+`updatedAt` values first, and reconcile unchanged PRs on a bounded rotation. Recheck expiring
+claims independently of GitHub's update clock, and always revalidate the selected candidate live.
+Keep scanning merge-ready PRs for new contests. Validate a selective picker against the existing
+picker in shadow mode before changing selection; track missed candidates, time to selection,
+oldest uninspected PR and requests per productive round. This bounds discovery delays without
+turning a missing/deleted comment or a stale cache into permission to spend.
 
 ## Codex accounts
 
@@ -327,8 +390,12 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |
-| `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
+| `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
+| `TAUCETI_OVERLAP_BATCH_COMMITS` | `160` | First-parent Mathlib commits examined per overlap-scan conversation; `--overlap-batch-commits` overrides it. Calibrated with Codex `gpt-6.1-sol` at high effort. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
+| `TAUCETI_GH_PROXY_WAIT` | `900` | Maximum host child `gh` quota wait, capped at 900 seconds to preserve the round deadline. |
+| `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
+| `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
@@ -353,5 +420,12 @@ and `--log` shows accounting history. Corrections use
 
 Grants never interrupt active sessions. Completed costs may create a deficit,
 and estimated pending costs reduce the amount available for new admissions.
+A missing receipt stays unresolved with its existing estimate reserved for later
+reconciliation; it does not independently block funded workers or replacement
+calibration sessions. Cold-model reservations use at least $1 or the largest
+of the last 20 recorded costs across all models. An unsettled resumed invocation
+pauses only explicit resumption of that same provider session. Recover its
+cumulative receipt before resuming; cost-only reconciliation does not restore
+its cumulative accounting baseline.
 See [the complete budget design](api-budget-plan.md) for state paths, recovery,
 and estimated-cost semantics.

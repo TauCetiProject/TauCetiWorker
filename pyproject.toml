@@ -43,3 +43,5 @@ ignore = ["E501", "UP031"]
 # Each test puts the repo root on sys.path before `import tauceti_worker as tc`, so the package
 # import deliberately follows statements (E402).
 "tests/*" = ["E402"]
+# Operator scripts also bootstrap the source checkout before package imports.
+"services/github-state/scripts/*.py" = ["E402"]

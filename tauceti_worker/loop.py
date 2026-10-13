@@ -11,7 +11,7 @@ import sys
 import time
 
 from .agents import resolve_authoring_profile
-from .budget import Budget, BudgetError, money
+from .budget import Budget, BudgetError, admission_pause
 from .claude_api import api_mode
 from .config import Config, NoProgress, log
 from .constants import (
@@ -116,14 +116,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
-                    blocked = (
-                        snapshot["unresolved"]
-                        or money(snapshot["available"]) <= 0
-                        or money(snapshot["available"]) < money(snapshot["admission_threshold"])
-                    )
+                    reason = admission_pause(snapshot)
+                    blocked = reason is not None
                     if blocked:
                         Budget().refresh_waiter(cfg.wid)
-                    reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
                 except (BudgetError, OSError) as error:
                     blocked, reason, snapshot = True, str(error), {}
                 if blocked:
@@ -209,7 +205,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # round spends (REST core and the progress-guard graphql); either being low blocks launch
             # until the later of their resets. The rate_limit probe is itself exempt, so this is free
             # when we are flush.
-            gb = github_budget()
+            # A configured mirror owns an independent read installation. Its callers must not
+            # be parked because the direct credential's unrelated read pool is running low.
+            # Publication is durable and actual rejections are handled by the transport/outbox.
+            gb = None if os.environ.get("TAUCETI_GITHUB_STATE_URL") else github_budget()
+            # Focused overlap scans publish through REST and do no PR authoring;
+            # unrelated GraphQL exhaustion must not park that queue.
             buckets = ("core",) if set(only) == {"overlap-scan"} else ("core", "graphql")
             low = {k: v for k, v in (gb or {}).items() if k in buckets and v[0] < GH_MIN_BUDGET}
             if low:

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import github_transport as transport
 from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
@@ -42,6 +43,7 @@ from .constants import (
     MAX_REVIEW_ERRORS,
     PROGRESS,
     PROGRESS_ATTEMPT_GAP,
+    PROGRESS_ERROR_KEY,
     PROGRESS_REF,
     PROGRESS_TTL,
     REVIEW_AFFINITY_GRACE_S,
@@ -73,11 +75,11 @@ class Counters:
             txt = (self.state / name).read_text().strip()
         except FileNotFoundError:
             return 0
-        except OSError:
+        except (OSError, UnicodeError):
             if name.startswith("rebase-pr-"):
                 raise RebaseBudgetUnavailable("rebase counter is unreadable") from None
             return 0
-        if not txt.isdigit() and name.startswith("rebase-pr-"):
+        if (not txt.isascii() or not txt.isdigit()) and name.startswith("rebase-pr-"):
             raise RebaseBudgetUnavailable("rebase counter is malformed")
         return int(txt) if txt.isdigit() else 0
 
@@ -219,6 +221,7 @@ class PRInfo:
     # Whether the head carries any `build` status at all. Without one a PR is pending, unless its
     # build finished without posting one (see lost_builds).
     build_reported: bool = False
+    bump_integration_failed: bool = False
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -255,6 +258,9 @@ class PRInfo:
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
             build_reported=bool(build_states),
+            bump_integration_failed=any(
+                c.get("context") == "bump-integration" and c.get("state") in BUILD_FAIL for c in rollup
+            ),
         )
 
 
@@ -270,6 +276,7 @@ class Candidate:
     ready_at: int | None = None  # when this exact review unit became actionable
     preferred_reviewer: str = ""  # latest scoreboard publisher; gets a short first refusal
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
+    bump_integration_failure: bool = False
 
 
 @dataclass
@@ -625,10 +632,10 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     if last_attempt and (time.time() - last_attempt) < PROGRESS_ATTEMPT_GAP:
         gap_h = (time.time() - last_attempt) / 3600.0
         return False, f"a progress round was attempted {gap_h:.1f}h ago; waiting out the attempt gap"
-    if counters.read("progress-err") >= MAX_PROGRESS_ERRORS:
+    if counters.read(PROGRESS_ERROR_KEY) >= MAX_PROGRESS_ERRORS:
         return False, (
-            f"progress rounds have failed {counters.read('progress-err')}x; "
-            f"backing off (clear state/progress-err to retry)"
+            f"progress rounds have failed {counters.read(PROGRESS_ERROR_KEY)}x; "
+            f"backing off (clear state/{PROGRESS_ERROR_KEY} to retry)"
         )
 
     try:
@@ -749,17 +756,18 @@ def confirm_lost_build(gh: GitHub, pr: int, head: str, now: float) -> bool:
     """A live, complete re-check of a head lost_builds reported, made before a fixer is spent on it:
     the PR is still open at that head with no `build` status, the head's own runs are still lost (a
     rerun of them may have started since a cached verdict), and no dispatched replacement may still
-    report (dispatch_pending). Any failed read answers no."""
-    live = gh.pr_view(pr, ["headRefOid", "isDraft", "state", "statusCheckRollup"])
-    if not live or live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != head:
-        return False
-    if any(c.get("context") == "build" for c in live.get("statusCheckRollup") or []):
-        return False
-    runs = gh.pr_build_runs(head)
-    if runs is None or not build_lost(runs, now):
-        return False
-    since = datetime.fromtimestamp(now - DISPATCH_LOOKBACK_S, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    dispatches = gh.pr_build_dispatches(since)
+    report (dispatch_pending). Every read bypasses the shared read cache. Any failed read answers no."""
+    with transport.read_context(fresh=True):
+        live = gh.pr_view(pr, ["headRefOid", "isDraft", "state", "statusCheckRollup"])
+        if not live or live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != head:
+            return False
+        if any(c.get("context") == "build" for c in live.get("statusCheckRollup") or []):
+            return False
+        runs = gh.pr_build_runs(head)
+        if runs is None or not build_lost(runs, now):
+            return False
+        since = datetime.fromtimestamp(now - DISPATCH_LOOKBACK_S, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        dispatches = gh.pr_build_dispatches(since)
     return dispatches is not None and not dispatch_pending(dispatches, pr, now)
 
 
@@ -1007,9 +1015,18 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
     #    fix still owns its review findings).
     for p in tended:
-        if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
+        integration = p.build_success and p.bump_integration_failed
+        branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
+        if not (branch and (p.build_failed or integration)):
             continue
-        c = Candidate(p.number, p.head_oid, "bump-mathlib, build red")
+        if {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close", "needs-rebase"}:
+            continue
+        c = Candidate(
+            p.number,
+            p.head_oid,
+            "bump-mathlib, singleton integration failed" if integration else "bump-mathlib, build red",
+            bump_integration_failure=integration,
+        )
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS

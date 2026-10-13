@@ -28,6 +28,7 @@ RUN_STDLIB=(
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py
+  bump_integration.py
   claude_config_dir.py
   claude_keychain.py
   claims_repo.py
@@ -41,6 +42,11 @@ RUN_STDLIB=(
   github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
+  github_shared_transport.py
+  github_state.py
+  github_state_rollout.py
+  github_state_reconciliation.py
+  github_outbox.py
   host_agent_preflight.py
   host_build_cache.py
   ignore_quota_hardblock.py
@@ -85,10 +91,12 @@ RUN_STDLIB=(
   roadmap_claims.py
   round_file_changes.py
   round_group_sweep.py
+  resources.py
   rubric_bundle.py
   safe_exists.py
   scoreboard_trust.py
   shared_build_caches.py
+  shared_repositories.py
   source_argument.py
   spread_candidates.py
   ssl_cert_file.py

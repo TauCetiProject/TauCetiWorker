@@ -97,6 +97,14 @@ def roadmap_areas(gh) -> list[str]:
     """The roadmap areas a user can steer toward: the subdirectories of the roadmap repo (each
     holds a README.md + Suggested.lean). Listed over the API so the TUI can offer a picker. Returns []
     if it can't be fetched (the picker then falls back to free-text entry)."""
+    from .shared_repositories import snapshot
+
+    try:
+        tree = snapshot(ROADMAP, ttl=3600)
+        if tree:
+            return sorted(path.name for path in (tree / "TauCetiRoadmap").iterdir() if path.is_dir())
+    except (OSError, TimeoutError):
+        pass
     out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')
     return sorted(out.splitlines()) if out else []
 

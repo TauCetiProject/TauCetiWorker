@@ -59,6 +59,7 @@ from .constants import (
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
     PR_TASKS,
+    PROGRESS_ERROR_KEY,
     PROGRESS_REF,
     PROGRESS_TOOL_LINE,
     PROGRESS_TOOL_TAIL,
@@ -438,7 +439,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # change what it means.
     focus_prs(sv, opts)
 
-    # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
+    # The cascade: first actionable stage wins, does one useful unit, returns its rc. A candidate that is
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
@@ -512,6 +513,28 @@ def _checkout_head(cfg: Config) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return p.stdout.strip() or None if p.returncode == 0 else None
+
+
+def _candidate_checkout_unchanged(cfg: Config, c: Candidate) -> bool:
+    """Only decline a no-change PR attempt when no local publication work would be discarded."""
+    if not c.pr or not c.head or _checkout_head(cfg) != c.head:
+        return False
+    from .github_outbox import directory
+    from .github_transport import root, scope
+
+    pending = (
+        directory(),
+        root() / "outbox" / (scope() or "unselected") / os.environ.get("TAUCETI_WORKER_ID", "unknown"),
+    )
+    if any(next(path.glob("*.json"), None) is not None for path in pending):
+        return False
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(cfg.checkout), "status", "--porcelain"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return status.returncode == 0 and not status.stdout.strip()
 
 
 def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
@@ -665,6 +688,8 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
             return True
         log(f"  fix-ci #{c.pr}: its build is not lost on a fresh read (moved, reported, rerun or replaced) — skipping")
         return False
+    if stage == "bump" and getattr(c, "bump_integration_failure", False):
+        return bool(w.gh.bump_repair_requested(c.pr, c.head))
     if stage not in ("review", "fix"):
         return True
     # The head the survey saw. A contributor pushing since then makes every verdict below describe a
@@ -735,9 +760,53 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     return True
 
 
+def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
+    """Quota failures in any stage are infrastructure pauses, including checkout and publishing.
+
+    Restore only this stage's attempt counters. Provider costs already settled remain costs, and
+    successful work is never rolled back just because a later cleanup request hit a limit.
+    """
+    from .github_transport import blocked_since
+
+    pr, head = c.pr, c.head[:12]
+    rebase_key = c.rebase_budget_key if stage == "rebase" else None
+    if stage == "rebase" and not rebase_key:
+        raise Die("rebase candidate has no selected retry budget; survey it again")
+    keys = {
+        "review": (f"review-err-{pr}",),
+        "fix": (f"fix-{pr}-{head}",),
+        "fix-ci": (f"ci-{pr}-{head}", f"ci-pr-{pr}"),
+        "rebase": (rebase_key,),
+        "bump": (f"bump-{pr}-{head}", f"bump-pr-{pr}"),
+        "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
+        "progress": ("progress-err",),
+    }.get(stage, ())
+    before = {key: w.counters.read(key) for key in keys}
+    started = time.time()
+
+    def pause():
+        for key, value in before.items():
+            # Another infrastructure handler may already have refunded this attempt.
+            w.counters.write(key, min(value, w.counters.read(key)))
+        raise NoProgress(f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR")
+
+    try:
+        rc = fn(w, sv, c, opts, bubble)
+    except Exception:
+        if blocked_since(started):
+            pause()
+        raise
+    if rc != 0 and blocked_since(started):
+        pause()
+    return rc
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
-    """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
-    (caller tries the next candidate). Dry-run logs the intent and returns 0."""
+    """Perform one stage. Return its rc, or None to decline this candidate and try another.
+
+    A paid PR attempt that changes neither GitHub nor its checkout is declined too;
+    its expenditure and attempt counter remain charged. Dry-run returns 0.
+    """
     bubble = _bubble(stage, opts)
     if opts.dry_run:
         target = f"#{c.pr}" if c.pr else (c.head[:12] if c.head else c.reason)
@@ -746,6 +815,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    from .github_transport import observed_budget
+
+    if stage not in ("overlap-scan", "overlap-fix") and any(
+        remaining == 0 for remaining, _ in observed_budget().values()
+    ):
+        raise NoProgress("GitHub API exhausted — waiting for reset before launching paid work")
+    os.environ["TAUCETI_GITHUB_PHASE"] = stage
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -842,6 +918,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
+    # Fresh candidate/claim reads can exhaust a bucket after the initial dispatch preflight.
+    if stage not in ("overlap-scan", "overlap-fix") and any(
+        remaining == 0 for remaining, _ in observed_budget().values()
+    ):
+        raise NoProgress("GitHub API exhausted during revalidation — waiting before launching paid work")
     from .budget import BudgetError
     from .claude_api import admission_failure, api_context, api_mode
 
@@ -859,7 +940,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             if not api_mode():
                 raise
             raise admission_failure(str(error)) from None
-        rc = fn(w, sv, c, opts, bubble)
+        rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
         if rc != 0 and api is not None and api.blocked_reason:
             raise admission_failure(api.blocked_reason)
     if stage in FILE_CHANGE_STAGES and not bubble:
@@ -869,11 +950,21 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
     if rc == 0 and stage in PROGRESS_GUARDED and not _progressed(w, c, pre):
         tgt = f" #{c.pr}" if c.pr else ""
-        raise NoProgress(
+        reason = (
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment). Most often another worker pushed the branch first (safe-push declines rather "
             f"than clobber) or the agent declined to act — not a failure. Transcript: {w.cfg.logdir}"
         )
+        if not bubble and _candidate_checkout_unchanged(w.cfg, c):
+            log(reason + "; checkout unchanged — selecting another candidate")
+            report_runtime(
+                "surveying",
+                phase=None,
+                target=None,
+                detail="previous PR attempt unchanged; selecting another candidate",
+            )
+            return None
+        raise NoProgress(reason)
     return rc
 
 
@@ -893,6 +984,9 @@ def do_overlap_fix(w, sv, c, opts, bubble):
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
+    from .github_transport import blocked_since
+
+    github_started = time.time()
     pr, head = c.pr, c.head
     reviewers = opts.work_model
     if reviewers in ("auto", ""):
@@ -981,6 +1075,8 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
+        elif blocked_since(github_started):
+            raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
             # The engine stopped because the reviewer's provider is unusable — a revoked credential or
             # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).
@@ -1161,7 +1257,24 @@ def _do_fixlike(
         return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
+    if label == "bump" and getattr(c, "bump_integration_failure", False):
+        batch = w.gh.bump_repair_requested(pr, head)
+        if not batch:
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            return None
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
+    if label == "bump" and getattr(c, "bump_integration_failure", False):
+        prompt += (
+            f"\nThe exact head {head} failed alone in Bors integration: "
+            f"https://bors.taucetiproject.org/batches/{batch}. Standalone CI is green. "
+            f"Verify the checked-out head is still {head}; otherwise stop without edits. "
+            "Fetch and merge current origin/main before diagnosing this failure; preserve the bot's "
+            "dependency target. Read the linked integration build's actual diagnostics. "
+            "Repair the combined source and verify it before pushing; recheck that the PR is open at the "
+            "expected head and that the Bors repair handoff still holds before pushing. "
+            "Do not request a manual Bors retry.\n"
+        )
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
@@ -1184,6 +1297,10 @@ def _do_fixlike(
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         checked = rev.stdout.strip() or head
+        if label == "bump" and getattr(c, "bump_integration_failure", False) and (rev.returncode or checked != head):
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            return None
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
         try:
@@ -1449,7 +1566,7 @@ def _do_progress_inner(w, opts) -> int | None:
         bust_progress_cache(w.cfg)
         return None
     if proc.returncode != 0:
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "plan", proc))
     plan = json.loads(plan_file.read_text())
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
@@ -1461,7 +1578,7 @@ def _do_progress_inner(w, opts) -> int | None:
         ).returncode
         != 0
     ):
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die("tauceti-progress facts failed")
 
     # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
@@ -1472,7 +1589,7 @@ def _do_progress_inner(w, opts) -> int | None:
     # one versioned thing. No new failure mode: `plan` and `facts` above already ran from that build.
     proc = run_tool("prompt", "progress", capture=True)
     if proc.returncode != 0 or not proc.stdout.strip():
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "prompt", proc))
     prompt_file.write_text(proc.stdout, encoding="utf-8")
     prompt = fill_prompt(
@@ -1493,11 +1610,11 @@ def _do_progress_inner(w, opts) -> int | None:
             from .claude_api import admission_failure
 
             raise admission_failure(reason)
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(f"the writing agent exited {rc}")
     for f in (status_body, section_body):
         if not f.is_file() or not f.read_text().strip():
-            w.counters.incr("progress-err")
+            w.counters.incr(PROGRESS_ERROR_KEY)
             raise Die(f"the agent did not write {f.name}")
 
     # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
@@ -1520,7 +1637,7 @@ def _do_progress_inner(w, opts) -> int | None:
     # A failure logs its own tail and saves the whole output, so it must be handled BEFORE the
     # excerpt below — otherwise the same text lands in the log twice, once uselessly clipped.
     if proc.returncode not in (0, EX_NOPROGRESS):
-        w.counters.incr("progress-err")
+        w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "apply", proc))
     log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
     if proc.returncode == EX_NOPROGRESS:
@@ -1530,7 +1647,7 @@ def _do_progress_inner(w, opts) -> int | None:
     # A report landed (as a PR). Clear the error streak, and drop the cached "due" verdict immediately:
     # otherwise this same worker would still read `due` from cache on its next round, minutes from now,
     # and open a second report before the first one merged.
-    w.counters.write("progress-err", 0)
+    w.counters.write(PROGRESS_ERROR_KEY, 0)
     bust_progress_cache(w.cfg)
     return 0
 

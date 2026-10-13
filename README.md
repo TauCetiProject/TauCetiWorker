@@ -119,6 +119,11 @@ status` in scripts.
 
 ## What a round does
 
+Mathlib adoption has two maintenance phases: `overlap-scan` examines batches
+between a shared cursor and Tau Ceti's pinned Mathlib commit; `overlap-fix`
+authors refactor PRs for labelled findings. They run after existing PR maintenance
+and review, before new roadmap authoring. See [Mathlib overlaps](docs/mathlib-overlaps.md).
+
 A round does exactly one unit of work: the first of these that applies.
 
 | Step | What it does |
@@ -130,6 +135,8 @@ A round does exactly one unit of work: the first of these that applies.
 | **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
+| **Overlap fix** | Refactor a labelled Mathlib overlap issue into a normal upstream PR, preserving additional Tau Ceti functionality. |
+| **Overlap scan** | Examine up to 160 consecutive Mathlib commits after the shared cursor, publish actionable overlaps as issues, then advance the cursor through the completed batch. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
 Review selection is cooperative across community workers. The worker named by
@@ -435,15 +442,22 @@ The append-only ledger lives at
 `~/.local/state/tauceti/budget/events.jsonl` on Linux), with a macOS equivalent
 and an explicit `TAUCETI_BUDGET_DIR` override. Grants, rate changes, balance
 adjustments, session admissions, and cost settlements remain auditable. Unknown
-costs block subsequent starts until reconciled; API throttling is handled
-separately from funding. Local accounting uses Claude's reported cost estimates
+costs remain visible for reconciliation and retain their pending estimates.
+Workers continue whenever available funds cover the next admission; API
+throttling is handled separately from funding. Local accounting uses Claude's reported cost estimates
 and does not represent the actual credit balance in Anthropic Console.
 
 Use `tauceti budget --json` for scripts. To recover a missing cost or correct a
 settlement, use `tauceti budget --reconcile INVOCATION --cost USD --note TEXT`;
 the correction is appended to history. A cold model runs one calibration
-session before parallel admissions use learned cost estimates. Unknown costs
-block new sessions until reconciled. No local budget amount is passed as
+session before parallel admissions use learned cost estimates. Its reservation
+is at least $1, or the largest of the last 20 recorded costs across all models if that is higher;
+zero-cost launch failures do not establish a spending estimate. If that session
+loses its receipt, another calibration session can run; missing costs never
+pause the fleet merely because reconciliation is outstanding. Resuming the same
+provider session waits while a previous resume is unsettled; unrelated sessions
+can run. Recover the cumulative receipt before resuming that provider session;
+a cost-only manual reconciliation does not restore its cumulative baseline. No local budget amount is passed as
 Claude's `--max-budget-usd`. After a crashed worker, first try
 `tauceti budget --recover --note "worker crash"` to recover its durable receipts
 and remove stale staged keys. Costs without a receipt still require reconciliation.

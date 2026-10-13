@@ -1,0 +1,14 @@
+{
+  "verified_at": "2026-10-13T01:17:08.825884+00:00",
+  "pr": 14684,
+  "original_head": "33d6634e68eec3a23857016087904277e11b30cc",
+  "bors_batch": 562,
+  "integration_sha": "aa1f50f094b85057c11f0bb07177ff27a32dbd7f",
+  "integration_ci": 38327460193,
+  "watch_exit": 0,
+  "main_commit": "a9180fced3f8b98587748f42d3b039e394ee6407",
+  "main_contains_commit": true,
+  "closed_at": "2026-10-13T01:14:53Z",
+  "bors_success_comment": "https://github.com/TauCetiProject/TauCeti/pull/14684#issuecomment-6135934915",
+  "note": "Bors squashes PR commits, so GitHub merged boolean is false; main ancestry and Bors success comment establish landing."
+}

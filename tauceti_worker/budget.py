@@ -18,6 +18,44 @@ class BudgetError(ValueError):
     pass
 
 
+def admission_pause(snapshot):
+    """Preflight funding and ledger integrity; missing receipts are audit work."""
+    if snapshot.get("ledger_repair_required"):
+        return "ledger repair requires reconciliation"
+    if money(snapshot["available"]) <= 0 or money(snapshot["available"]) < money(snapshot["admission_threshold"]):
+        return "waiting for funding"
+    return None
+
+
+def process_identity():
+    """Host bridge identity, including PID reuse and reboot protection on Linux."""
+    if sys.platform != "linux":
+        return None
+    try:
+        pid = os.getpid()
+        return dict(
+            pid=pid,
+            boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            start=Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
+        )
+    except (OSError, IndexError):
+        return None
+
+
+def bridge_owner_alive(owner):
+    if not owner or sys.platform != "linux":
+        return False
+    try:
+        fields = Path(f"/proc/{int(owner['pid'])}/stat").read_text().rsplit(")", 1)[1].split()
+        return (
+            owner["boot"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            and owner["start"] == fields[19]
+            and fields[0] not in {"Z", "X"}
+        )
+    except (OSError, KeyError, ValueError, IndexError, TypeError):
+        return False
+
+
 def money(value) -> Decimal:
     try:
         number = Decimal(str(value))
@@ -247,12 +285,17 @@ class Budget:
             self.save_waiting(queue)
 
     def estimate(self, state, model, phase=None):
-        costs = state["samples"].get(model + ":" + phase, []) if phase else []
+        costs = [c for c in state["samples"].get(model + ":" + phase, []) if c > 0] if phase else []
         costs = costs or [
-            money(s["cost"]) for s in state["sessions"].values() if s["model"] == model and s["status"] == "settled"
+            money(s["cost"])
+            for s in state["sessions"].values()
+            if s["model"] == model and s["status"] == "settled" and money(s["cost"]) > 0
         ]
         costs = sorted(costs[-20:])
-        return costs, costs[math.ceil(len(costs) * 0.75) - 1] if costs else Decimal(0)
+        if costs:
+            return costs, costs[math.ceil(len(costs) * 0.75) - 1]
+        recent = [money(s["cost"]) for s in state["sessions"].values() if s["status"] == "settled"][-20:]
+        return costs, max([Decimal(1), *recent])
 
     def snapshot(self, *, worker=None, model=None, phase=None):
         with self.locked():
@@ -289,6 +332,7 @@ class Budget:
             available=str(available),
             active_sessions=active,
             unresolved=[s["id"] for s in active if s["status"] == "unresolved"],
+            ledger_repair_required=any(s.get("archive") for s in active),
             waiting=waiting,
             balance_zero_at=zero_at,
             admission_threshold=str(threshold),
@@ -298,7 +342,7 @@ class Budget:
             cooldowns=state["cooldowns"],
         )
 
-    def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None):
+    def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None):
         with self.locked():
             state = self.replay()
             if invocation in state["sessions"]:
@@ -314,10 +358,11 @@ class Budget:
                         orphaned = self.clock() - heartbeat.stat().st_mtime > 30
                     except FileNotFoundError:
                         orphaned = True
-                    if orphaned:
+                    if orphaned and not bridge_owner_alive(session.get("owner")):
                         session["status"] = "unresolved"
                         events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
             costs, estimate = self.estimate(state, model, phase)
+            live = [s for s in active if s["status"] == "active"]
             available = state["balance"] - sum((money(s["estimate"]) for s in active), Decimal(0))
             now = self.clock()
             queue = self.waiting_state(state)
@@ -337,13 +382,17 @@ class Budget:
                 default=None,
             )
             reason = None
-            if any(s["status"] == "unresolved" for s in active):
-                reason = "unresolved session cost; use budget --reconcile"
+            if any(s.get("archive") for s in active):
+                reason = "ledger repair requires reconciliation"
             elif resume and any(s.get("resume") == resume for s in active):
-                reason = "provider session already being resumed"
+                reason = (
+                    "provider session already being resumed"
+                    if any(s.get("resume") == resume for s in live)
+                    else "provider session cost baseline unresolved"
+                )
             elif state["cooldowns"].get(model, 0) > now:
                 reason = "API throughput cooldown"
-            elif not costs and any(s["model"] == model for s in active):
+            elif not costs and any(s["model"] == model for s in live):
                 reason = "waiting for calibration session cost"
             elif available <= 0 or available < estimate:
                 reason = "waiting for funding"
@@ -378,6 +427,7 @@ class Budget:
                     started=now,
                     bridge=bridge,
                     resume=resume,
+                    owner=owner,
                 )
             )
             self.append(state, events)
@@ -423,7 +473,7 @@ class Budget:
                     live = self.clock() - (Path(session["bridge"]) / "outbox/heartbeat").stat().st_mtime <= 30
                 except FileNotFoundError:
                     live = False
-                if live:
+                if live or bridge_owner_alive(session.get("owner")):
                     raise BudgetError("cannot reconcile an active session with a live accounting bridge")
             if session["status"] != "settled":
                 events = [
@@ -497,6 +547,8 @@ class Budget:
             if session["status"] == "settled" or not session.get("bridge"):
                 continue
             bridge = Path(session["bridge"])
+            if session["status"] == "active" and bridge_owner_alive(session.get("owner")):
+                continue
             try:
                 if self.clock() - (bridge / "outbox/heartbeat").stat().st_mtime <= 30:
                     continue
@@ -521,7 +573,8 @@ class Budget:
             except Exception as error:
                 errors.append(f"{invocation}: {error}")
                 self.settle(invocation, None, "invalid recovered receipt", note=note)
-            (bridge / "key").unlink(missing_ok=True)
+            if not bridge_owner_alive(session.get("owner")):
+                (bridge / "key").unlink(missing_ok=True)
         return dict(self.snapshot(), recovery_errors=errors)
 
     def cooldown(self, model, seconds):
