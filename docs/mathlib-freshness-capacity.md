@@ -8,7 +8,8 @@ reads address duplicated API traffic; repository-wide CI and cache transfer
 still grow with repository size, and overloaded queues make update latency
 grow much faster than useful throughput.
 
-This assessment uses measurements from October 12, 2026. Recommendations below
+This assessment uses measurements from October 12, 2026, with production recovery
+results updated on October 13. Recommendations below
 are separate from the changes already deployed. The
 [measurement snapshot](evidence/freshness-capacity-2026-10-12.json) preserves
 the source definition, CI decomposition, API window, and scaling assumptions;
@@ -50,9 +51,15 @@ or review changes stopped re-admission; a repeated bootstrap changed no rows,
 and the original 133 active memberships remained represented. Later repaired
 heads can obtain fresh approvals through the normal gate. The canary,
 [PR 14684](https://github.com/TauCetiProject/TauCeti/pull/14684), survived failed
-integration attempts and remained in retry batch 562 at 20:55 UTC. A successful
-canary landing remains necessary to finish the production pilot. A failed
-batch is not evidence that every member has a bad branch: the latest failed
+integration attempts and landed through Bors on October 13 at 01:14 UTC, with
+its original branch head unchanged. Batch 562 passed
+[integration CI](https://github.com/TauCetiProject/TauCeti/actions/runs/38327460193),
+and its squash commit
+[`a9180fce`](https://github.com/TauCetiProject/TauCeti/commit/a9180fced3f8b98587748f42d3b039e394ee6407)
+is on main. The [Bors success comment](https://github.com/TauCetiProject/TauCeti/pull/14684#issuecomment-6135934915)
+and main ancestry establish landing; GitHub does not mark Bors squash closures
+as ordinary PR merges. This completes the recovery pilot. A failed
+batch is not evidence that every member has a bad branch: an earlier failed
 [integration run](https://github.com/TauCetiProject/TauCeti/actions/runs/38288099360)
 reported a ProjectiveLine identifier mismatch, not a failure of every PR in
 the batch.
@@ -71,6 +78,13 @@ or a repeated handoff cannot renew it. Candidates retain the selected budget
 key through execution and infrastructure refunds. This adds no GitHub request
 or AI session. The bound remains per worker, using the existing claim mechanism;
 it is not a new fleet-wide spending limit.
+[Worker PR 249](https://github.com/TauCetiProject/TauCetiWorker/pull/249) also
+fails closed on corrupt counter files. The shared-transport refund in
+[Worker PR 250](https://github.com/TauCetiProject/TauCetiWorker/pull/250) uses
+the selected budget key even if the current checkpoint changes during work.
+Live worker surveys created the new checkpoints, repeated observations and
+restart retained them, and the runtime refund check preserved the newer and
+legacy counters.
 
 ## API usage
 
@@ -104,6 +118,16 @@ histories, recovery bursts, fallback reads, storage/compute costs, and secondary
 write limits need separate measurements. The service capacity evidence and
 query builders are owned by the service implementation; do not treat the
 pre-service sample as its post-rollout performance.
+
+The October 13 production observation of the deployed service covered one hour
+and 63 healthy samples. Requested reconciliation gaps cleared afterward,
+independent comparisons had no outstanding differences, and 13,859 obsolete CI
+repair jobs were retired. This verifies operation at the observed workload.
+Issue-comment gap-fill p95 was **70.4 seconds across seven samples**; the
+60-second target is not consistently demonstrated. A test deployment also had
+one unexplained failed health probe; five-minute recovery and 350 subsequent
+invocations passed. Neither observation establishes capacity at ten times the
+arrival rate.
 
 Use one durable read service with pagination and recovery checkpoints. Keep
 normal worker requests from multiplying audits; coalesce repairs for the same
