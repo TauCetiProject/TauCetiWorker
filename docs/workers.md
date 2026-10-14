@@ -5,6 +5,14 @@ Persistent workers are declarative. You describe the workers you want in
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
 
+## Dependency bumps
+
+Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.
+Their build, rebase, review-error, review-fix and contest attempts are not permanently
+capped. Existing loop backoff, quota pacing, daily review limits, branch claims,
+and explicit holds still apply. Workers checkpoint coherent partial source repairs
+before their round deadline; full CI, audits, and current-head reviews authorize merging.
+
 ## Rebase retry budget
 
 For genuine Git conflicts, a tended PR gets three rebase attempts between verified progress checkpoints.
@@ -427,7 +435,7 @@ spending on an editor, it checks the live exact-head PR and Bors `bump_repairs`
 handoff. Pending or active queue work, withdrawals, draft/closed PRs and holds
 are excluded. A second check after taking the normal branch claim closes the
 selection gap. Failed observations decline the candidate and leave unrelated
-work available. Normal bump editing budgets apply. The repair session fetches
+work available. Automatic dependency bumps continue under the existing loop backoff and quota limits. The repair session fetches
 and merges current main, diagnoses the actual integration failure, preserves
 the dependency target and verifies its changes before pushing. Healthy surveys
 make no additional API calls.

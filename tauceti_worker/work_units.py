@@ -69,6 +69,7 @@ from .constants import (
     REVIEW_DAILY_CAP,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
+    ROUND_TIMEOUT,
     SANDBOX_DEFAULT,
     TAUCETI,
 )
@@ -642,7 +643,7 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool:
         st = w.gh.pr_progress_state(c.pr)
         if st is None:
             return True
-        return (st["head"] or "") != pre["head"] or st["ncomments"] > pre["ncomments"]
+        return (st["head"] or "") != pre["head"] or (not pre.get("require_push") and st["ncomments"] > pre["ncomments"])
     now = _open_pr_numbers(w)
     if now is None:
         return True
@@ -751,6 +752,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
             blocking,
             w.counters.read(f"fix-{c.pr}-{c.head[:12]}"),
             pending_contest=pending_contest,
+            unlimited=getattr(p, "automatic_bump", False),
         )
         if disp != "actionable":
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
@@ -964,6 +966,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     log(f"→ {stage.upper()}: {what}   [{detail}]")
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
+    if pre is not None:
+        pre["require_push"] = any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
     # Fresh candidate/claim reads can exhaust a bucket after the initial dispatch preflight.
     _check_stage_read_quota(stage)
@@ -1308,6 +1312,21 @@ def _do_fixlike(
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
+    if getattr(p, "automatic_bump", False):
+        deadline = getattr(getattr(w, "rc", None), "deadline", time.time() + ROUND_TIMEOUT)
+        prompt += (
+            "\nThis is an automatic Mathlib bump. Preserve its dependency target. "
+            "Prepare one coherent source repair checkpoint and push it once through git-safe-push, "
+            "then end this session. A pending Mathlib migration may leave full-library CI red; "
+            "build each repaired module group where possible and report the remaining "
+            "failures honestly. Never add sorry, admit, native_decide, axioms, or option overrides. "
+            "Full CI and review decide when the whole PR can merge. "
+            f"The round ends at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(deadline))}; "
+            "stop starting new groups ten minutes before then and push completed repairs before "
+            "the timeout. Run builds in the foreground. A correct conflict resolution may be pushed "
+            "while unrelated migration failures remain. These instructions override any earlier "
+            "requirement to never push red or to finish the entire library before pushing.\n"
+        )
     if label == "bump" and getattr(c, "bump_integration_failure", False):
         prompt += (
             f"\nThe exact head {head} failed alone in Bors integration: "

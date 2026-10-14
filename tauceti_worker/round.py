@@ -34,6 +34,7 @@ class RoundContext:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or (time.time() + ROUND_TIMEOUT))
         self._fd: int | None = None
         self._cleanups: list = []
         self._done = False
@@ -89,12 +90,14 @@ class RoundContext:
         return False
 
 
-def spawn_round(argv_tail: list[str]) -> subprocess.Popen:
+def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT) -> subprocess.Popen:
     """Spawn one round as a child in its OWN session (so the loop can kill the whole group). Invokes
     the current interpreter directly on this file (NOT via the uv shebang) to avoid a uv wrapper
     process between the loop and the round — sys.executable is already the uv-resolved interpreter."""
     cmd = self_argv("_round", *argv_tail)
-    return subprocess.Popen(cmd, start_new_session=True, env=self_env())
+    env = self_env()
+    env["TAUCETI_ROUND_DEADLINE"] = str(time.time() + timeout)
+    return subprocess.Popen(cmd, start_new_session=True, env=env)
 
 
 def signal_group(pgid: int, sig: int) -> str:
@@ -294,7 +297,7 @@ def cmd_heartbeat(args) -> int:
 def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:
     """Run one round as a child under a hard timeout; tear down the group on expiry. Used by the loop.
     Maps a timed-out round to rc 124, a SIGKILL-after-grace to 137 (matching the shell's `timeout`)."""
-    p = spawn_round(argv_tail)
+    p = spawn_round(argv_tail, timeout=timeout)
     pgid = p.pid  # spawn_round's start_new_session ⇒ the round leads its own group; pgid == leader pid
     try:
         return p.wait(timeout)

@@ -142,8 +142,8 @@ captured = {}
 orig_spawn = tc.round.spawn_round  # patch where run_round_subprocess looks it up
 
 
-def spy_spawn(argv_tail):
-    p = orig_spawn(argv_tail)
+def spy_spawn(argv_tail, **kwargs):
+    p = orig_spawn(argv_tail, **kwargs)
     captured["pgid"] = p.pid  # == pgid (spawn_round uses start_new_session)
     return p
 
