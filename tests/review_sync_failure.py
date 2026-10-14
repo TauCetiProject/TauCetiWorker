@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -158,6 +159,24 @@ try:
     check("no write access -> one explanatory log", len(logs), 1)
     check("no write access -> log says review counts", "counts for auto-merge" in logs[0].lower(), True)
     check("no write access -> log names retained archive", "analytics/provenance" in logs[0].lower(), True)
+
+    # The local engine override must drive host reviews as well as bubbles and archive sync.
+    calls = []
+    wu.run_to_logfile = lambda argv, logf, label: calls.append(argv) or 0
+    wu._sync_review_outbox = lambda w, pr: 0
+    with patch.dict(wu.os.environ, {"TAUCETI_REVIEW_ENGINE_DIR": "/tmp/local engine"}):
+        wu.do_review(FakeWorker(), None, CAND, opts("claude"), bubble=False)
+    check("host review uses local engine", calls[-1][:3], [sys.executable, "/tmp/local engine/runner/cli.py", "726"])
+    check("host local review still posts", "--post" in calls[-1], True)
+    check("host local review still checks expected head", calls[-1][calls[-1].index("--expect-head") + 1], "deadbeef")
+    with patch.dict(wu.os.environ):
+        wu.os.environ.pop("TAUCETI_REVIEW_ENGINE_DIR", None)
+        wu.do_review(FakeWorker(), None, CAND, opts("claude"), bubble=False)
+    check(
+        "host review defaults to upstream engine",
+        calls[-1][:4],
+        ["uvx", "--from", f"git+https://github.com/{wu.REVIEW}", "tauceti-review"],
+    )
 finally:
     for k, v in _saved.items():
         setattr(wu, k, v)
