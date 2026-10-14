@@ -30,7 +30,7 @@ def driver(started: Path, cleaned: Path) -> int:
 
     loop.choose_model = lambda *_args, **_kwargs: ("codex", {})
     loop.github_budget = lambda: {}
-    round_lifecycle.spawn_round = lambda _tail: subprocess.Popen(
+    round_lifecycle.spawn_round = lambda _tail, **_kwargs: subprocess.Popen(
         [sys.executable, __file__, "child", str(started), str(cleaned)],
         start_new_session=True,
     )

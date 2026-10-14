@@ -1,8 +1,8 @@
-You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib, to a Mathlib bump on pull request #__PR__. You are in a checkout of the repo, already on the PR's branch. A bot opened this PR to move the Lake pins (`lake-manifest.json` and/or `lean-toolchain`) forward to a newer Mathlib, and the `build` check is red because `TauCeti/` has not caught up to the Mathlib API at the new pin. Work autonomously to completion: make CI green by adapting `TauCeti/`, without reverting the bump and without weakening the library.
+You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib, to a Mathlib bump on pull request #__PR__. You are in a checkout of the repo, already on the PR's branch. A bot opened this PR to move the Lake pins (`lake-manifest.json` and/or `lean-toolchain`) forward to a newer Mathlib, and the `build` check is red because `TauCeti/` has not caught up to the Mathlib API at the new pin. Work toward making CI green by adapting `TauCeti/`, without reverting the bump and without weakening the library.
 
 ## The pins are the point — keep them
 - The bumped `lake-manifest.json` / `lean-toolchain` on this branch ARE the change under review. Do NOT revert them, do NOT re-pin to an older Mathlib, do NOT touch the lakefile. Your job is to make `TauCeti/` build against the Mathlib the bot pinned.
-- If the new pin is genuinely unworkable (e.g. a Mathlib change that can't be adapted without a redesign), stop and report that, rather than reverting the bump or gutting the library.
+- For a difficult API migration, preserve completed source repairs and describe the remaining root failure so the next session can continue. Never revert the target or gut the library.
 
 ## Reproduce and adapt
 ```
@@ -27,9 +27,28 @@ lake exe axioms
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, say so in your report and stop.
-- Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
+- The final PR must be green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
 
-## Verify before pushing (all three MUST pass)
+## Preserve progress between sessions
+
+Reproduce the first root failure, inspect the relevant upstream Mathlib change, and repair a coherent
+module group. Build that group and its dependencies where possible. Read previous repair commits
+and avoid repeating an approach that already failed.
+
+Push each useful source repair checkpoint through the safe wrapper, even when unrelated modules
+still fail. Keep the pins fixed and never introduce `sorry`, `admit`, `native_decide`, axioms, or
+option overrides. Describe what compiled and what remains broken in the commit body. The branch
+and CI logs are the next session's starting point; no separate progress file is needed.
+
+Work within the round deadline supplied below. Stop starting new groups ten minutes before it,
+and save completed repairs before the worker terminates the session. Full-library compilation and
+all audits remain required for merging; a partial checkpoint must never be described as green.
+
+When the migration is complete, run the full verification commands above if time permits. Otherwise
+push the completed repairs and let full CI verify them. Do not spend the session waiting for CI.
+
+## Final verification when time permits
+
 ```
 lake exe cache get
 git fetch -q origin main
@@ -41,9 +60,8 @@ rm -f "$base_shims"; rm -rf "$base_root"
 lake build
 lake exe axioms
 ```
-Iterate until green. Never push red.
 
-**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
+Full CI runs these checks even when a partial repair cannot run the full library yet.
 
 ## Submit
 - Commit the adaptation (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
@@ -55,4 +73,4 @@ Iterate until green. Never push red.
 - Do NOT open a new PR; do NOT touch files outside `TauCeti/` (and the already-bumped pins).
 
 ## Report
-End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry / `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry / `lake build` / `lake exe axioms` results observed, distinguishing partial checkpoints from full verification. Do not claim green unless you saw it.

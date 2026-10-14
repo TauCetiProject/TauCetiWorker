@@ -69,6 +69,7 @@ from .constants import (
     REVIEW_DAILY_CAP,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
+    ROUND_TIMEOUT,
     SANDBOX_DEFAULT,
     TAUCETI,
 )
@@ -751,6 +752,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
             blocking,
             w.counters.read(f"fix-{c.pr}-{c.head[:12]}"),
             pending_contest=pending_contest,
+            unlimited=getattr(p, "automatic_bump", False),
         )
         if disp != "actionable":
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
@@ -1308,6 +1310,19 @@ def _do_fixlike(
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
+    if getattr(p, "automatic_bump", False):
+        deadline = getattr(getattr(w, "ctx", None), "deadline", time.time() + ROUND_TIMEOUT)
+        prompt += (
+            "\nThis is an automatic Mathlib bump. Preserve its dependency target. "
+            "Checkpoint coherent source repairs through git-safe-push even while full-library CI "
+            "remains red; build each repaired module group where possible and report the remaining "
+            "failures honestly. Never add sorry, admit, native_decide, axioms, or option overrides. "
+            "Full CI and review decide when the whole PR can merge. "
+            f"The round ends at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(deadline))}; "
+            "stop starting new groups ten minutes before then and push completed repairs before "
+            "the timeout. This checkpoint instruction overrides any requirement above to finish "
+            "the entire library before pushing.\n"
+        )
     if label == "bump" and getattr(c, "bump_integration_failure", False):
         prompt += (
             f"\nThe exact head {head} failed alone in Bors integration: "

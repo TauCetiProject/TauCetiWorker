@@ -208,6 +208,14 @@ class PRInfo:
     updated_at: str = ""
     bump_integration_failed: bool = False
 
+    @property
+    def automatic_bump(self) -> bool:
+        return (
+            self.author_is_bot
+            and f"{self.head_owner}/{self.head_repo}" == TAUCETI
+            and self.head_ref.startswith(BUMP_HEAD_PREFIX)
+        )
+
     @staticmethod
     def from_json(d: dict) -> PRInfo:
         rollup = d.get("statusCheckRollup") or []
@@ -511,6 +519,7 @@ def fix_disposition(
     per_head: int,
     *,
     pending_contest: bool = False,
+    unlimited: bool = False,
 ) -> tuple[str, str]:
     """Classify a tended PR for the `fix` stage from its scoreboard meta. Returns (disposition, reason):
 
@@ -554,7 +563,7 @@ def fix_disposition(
         # review adjudicates that reply, the durable scoreboard remains blocking at the same head;
         # scheduling another fixer would only burn the per-head budget on the identical finding.
         return ("waiting", "author contest awaiting re-review")
-    if per_head >= MAX_FIX_ATTEMPTS:
+    if not unlimited and per_head >= MAX_FIX_ATTEMPTS:
         return (
             "exhausted",
             f"blocking review at head, but fix attempts are spent ({per_head}/{MAX_FIX_ATTEMPTS}) — needs a human",
@@ -728,7 +737,15 @@ def survey(
     # reads no review state at all and its callers need not supply one.
     if rs is not None:
         rs.observe(prs)
-    nondraft = [p for p in prs if not p.is_draft]
+    nondraft = [
+        p
+        for p in prs
+        if not p.is_draft
+        and not (
+            p.automatic_bump
+            and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close"}
+        )
+    ]
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
@@ -769,6 +786,19 @@ def survey(
         # Healthy tended PRs must be observed too: they replenish the budget
         # before a later main change makes them conflicting again. Test doubles
         # without persistent state retain the legacy counter interface.
+        if p.automatic_bump:
+            # A red dependency migration may require many conflict repairs before
+            # its first green head. Existing loop backoff and quotas bound retries.
+            if p.mergeable == "CONFLICTING" or handoff:
+                sv.rebaseable.actionable.append(
+                    Candidate(
+                        p.number,
+                        p.head_oid,
+                        "dependency bump reconciliation",
+                        rebase_budget_key=f"rebase-bump-{p.number}",
+                    )
+                )
+            continue
         budget_error = None
         try:
             if observe := getattr(counters, "observe_rebase_progress", None):
@@ -820,7 +850,7 @@ def survey(
                 ready_at=p.build_status_at,
                 preferred_reviewer=_scoreboard_reviewer(m),
             )
-            if c.attempts >= c.budget:
+            if not p.automatic_bump and c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
                 sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
                 continue
@@ -874,7 +904,7 @@ def survey(
             ready_at=_parse_iso8601(reply.get("created_at")),
             preferred_reviewer=_scoreboard_reviewer(m),
         )
-        if (
+        if not p.automatic_bump and (
             counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
             or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
             or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
@@ -907,6 +937,7 @@ def survey(
                 blocking,
                 per_head,
                 pending_contest=pending_contest,
+                unlimited=p.automatic_bump,
             )
             if disp == "skip":
                 continue
@@ -960,7 +991,7 @@ def survey(
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
-        if per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS:
+        if not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS):
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)
