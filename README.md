@@ -188,7 +188,7 @@ and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
 It uses its own isolated launcher regardless of the ordinary host/Bubble setting.
 The active GitHub credential must have repository-admin permission, checked before
 spending and again before updating the cursor. New toolchain tags must be at or
-behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docbuild/docs/security-audit.md).
+behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docs/security-audit.md).
 
 An admin initializes the protections and original audited snapshot once with:
 
