@@ -35,13 +35,15 @@ Reproduce the first root failure, inspect the relevant upstream Mathlib change, 
 module group. Build that group and its dependencies where possible. Read previous repair commits
 and avoid repeating an approach that already failed.
 
-Push each useful source repair checkpoint through the safe wrapper, even when unrelated modules
-still fail. Keep the pins fixed and never introduce `sorry`, `admit`, `native_decide`, axioms, or
+Prepare one coherent source repair checkpoint per session. Push it once through the safe wrapper,
+then end the session, even when unrelated modules still fail. Keep the pins fixed and never introduce `sorry`, `admit`, `native_decide`, axioms, or
 option overrides. Describe what compiled and what remains broken in the commit body. The branch
 and CI logs are the next session's starting point; no separate progress file is needed.
 
 Work within the round deadline supplied below. Stop starting new groups ten minutes before it,
-and save completed repairs before the worker terminates the session. Full-library compilation and
+and save completed repairs before the worker terminates the session. Run builds synchronously in
+the foreground; a background build will be abandoned when the session ends. Push the checkpoint
+before ending your turn; no later turn will recover unpushed edits. Full-library compilation and
 all audits remain required for merging; a partial checkpoint must never be described as green.
 
 When the migration is complete, run the full verification commands above if time permits. Otherwise

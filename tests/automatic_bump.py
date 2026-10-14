@@ -95,7 +95,7 @@ worker = SimpleNamespace(
 assert w._still_actionable("fix", worker, sv, sv.needs_fix.actionable[0])
 # Repair prompts carry the deadline through both host and bubble preparation.
 worker.claims = SimpleNamespace(begin_branch_work=lambda *args: True)
-worker.ctx = SimpleNamespace(deadline=1123)
+worker.rc = SimpleNamespace(deadline=1123)
 worker.rs.bust = lambda *args: None
 with patch.object(w, "run_in_bubble", return_value=0) as launch:
     assert (
@@ -112,8 +112,16 @@ with patch.object(w, "run_in_bubble", return_value=0) as launch:
     )
     prompt = launch.call_args.args[2]
     assert "1970-01-01 00:18:43 UTC" in prompt
-    assert "Checkpoint coherent source repairs" in prompt
-    assert "remains red" in prompt
+    assert "push it once" in prompt
+    assert "CI red" in prompt
+
+# Comment-only activity cannot classify an automatic repair as productive.
+worker.gh.pr_progress_state = lambda _: {"head": HEAD, "ncomments": 2}
+pre = {"head": HEAD, "ncomments": 1, "require_push": True}
+assert not w._progressed_direct(worker, sv.needs_fix.actionable[0], pre)
+assert w._progressed_direct(worker, sv.needs_fix.actionable[0], pre | {"require_push": False})
+worker.gh.pr_progress_state = lambda _: {"head": "b" * 40, "ncomments": 2}
+assert w._progressed_direct(worker, sv.needs_fix.actionable[0], pre)
 
 # Deadline begins before preparation, and uses the actual timeout selected by the loop.
 with patch.object(r.time, "time", return_value=1000), patch.object(r.subprocess, "Popen") as spawn:
