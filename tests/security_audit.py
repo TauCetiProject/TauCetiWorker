@@ -350,9 +350,25 @@ class CompactingInspection(unittest.TestCase):
                 reader.request("tools/call", {"name": name, "arguments": args})
         with self.assertRaises(ValueError):
             reader.request("tools/call", None)
+        fresh_receipt = self.work / "recovery.json"
+        reader = ar.Reader(self.batch, fresh_receipt, "initial")
         reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0, "token": "initial"}})
-        with self.assertRaisesRegex(ValueError, "previous successful read"):
+        with self.assertRaisesRegex(ValueError, "Stale reader token"):
             reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 1, "token": "initial"}})
+        replay = reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 1, "token": ""}})
+        body = json.loads(replay["content"][0]["text"])
+        self.assertEqual(body["page"], 0)
+        self.assertTrue(body["replayed"])
+        self.assertTrue(body["sections"])
+        self.assertEqual(reader.seen, {0})
+        restored = ar.Reader(self.batch, fresh_receipt, "new-server-token")
+        self.assertEqual(restored.seen, {0})
+        replay = restored.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 1, "token": ""}})
+        body = json.loads(replay["content"][0]["text"])
+        self.assertEqual(body["page"], 0)
+        self.assertEqual(restored.seen, {0})
+        restored.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 1, "token": body["next_token"]}})
+        self.assertEqual(restored.seen, {0, 1})
 
     def test_missing_pages_cannot_pass_but_findings_can_stop_early(self):
         receipt = self.work / "receipt.json"
@@ -384,10 +400,45 @@ class CompactingInspection(unittest.TestCase):
             self.assertTrue(text.endswith('"next_token":"' + reader.token + '"}'))
 
     def test_one_client_session_can_compact_and_read_all_pages(self):
+        self.run_reader_session()
+
+    def test_resume_retains_identity_receipt_and_all_isolation_flags(self):
+        self.run_reader_session(resume=True)
+
+    def run_reader_session(self, resume=False):
         auth = self.work / "auth.json"
         auth.write_text('{"tokens":{"access_token":"provider-only"}}')
 
+        original = None
+        thread = "11111111-2222-4333-8444-555555555555"
+        if resume:
+            original = self.work / "original"
+            original.mkdir()
+            (original / "model-rollout-0.jsonl").write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
+            )
+            reader = ar.Reader(self.batch, original / "read-receipt.json", "initial")
+            reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0, "token": "initial"}})
+
         def model(argv, **kwargs):
+            if resume:
+                self.assertEqual(argv[-3:], ["resume", thread, "-"])
+                for option in (
+                    "--sandbox",
+                    "--output-schema",
+                    "--ignore-user-config",
+                    "shell_tool",
+                    "unified_exec",
+                    "multi_agent",
+                ):
+                    self.assertIn(option, argv[: argv.index("resume")])
+                self.assertIn("read-only", argv)
+                self.assertIn('mcp_servers.audit.enabled_tools=["read_page"]', argv)
+                self.assertTrue(any(v.startswith("model_catalog_json=") for v in argv))
+                sessions = list((kwargs["cwd"] / ".codex/sessions").glob("*.jsonl"))
+                self.assertEqual(len(sessions), 1)
+                self.assertEqual(sessions[0].read_bytes(), (original / "model-rollout-0.jsonl").read_bytes())
+                self.assertEqual(json.loads((kwargs["cwd"] / "read-receipt.json").read_text())["read"], [0])
             self.assertNotIn("untrusted instruction", kwargs["input"])
             self.assertIn("ONE inspection session", kwargs["input"])
             self.assertIn("model_auto_compact_token_limit=180000", argv)
@@ -420,7 +471,7 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa, "codex_dir", return_value=self.work),
             patch.object(sa.subprocess, "run", side_effect=model) as run,
         ):
-            self.assertEqual(sa.inspect(self.batch, "codex", self.work), self.verdict)
+            self.assertEqual(sa.inspect(self.batch, "codex", self.work, resume_from=original), self.verdict)
             run.assert_called_once()
         self.assertTrue((self.work / "read-receipt.json").exists())
 
@@ -552,6 +603,164 @@ class Run(unittest.TestCase):
         with patch.object(sa, "advance") as advance, self.assertRaises(Die):
             sa.attest(self.state, self.target, "   ")
         advance.assert_not_called()
+
+    def retained_incomplete(self, *, finding=False):
+        import hashlib
+
+        work = self.state / sa.CURSOR
+        original = work / "attempt-1"
+        original.mkdir(parents=True)
+        batch = {
+            "from_sha": self.old,
+            "main_sha": self.target,
+            "commits": [{"sha": self.target, "parent": self.old, "files": [{}]}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        (original / "input.json").write_text(sa.serialize(batch))
+        (work / "blocked.json").write_text(
+            sa.serialize(
+                {
+                    "from_sha": self.old,
+                    "to_sha": self.target,
+                    "attempt": str(original),
+                    "reason": "security-audit: Unable to inspect pages 19–20: the available reader token could not be validated, so the final two pages and their source changes remain unreviewed.",
+                }
+            )
+        )
+        verdict = {
+            "input_digest": batch["input_digest"],
+            "commits": [self.target],
+            "verdict": "finding" if finding else "incomplete",
+            "findings": [
+                "IO"
+                if finding
+                else "Unable to inspect pages 19–20: the available reader token could not be validated, so the final two pages and their source changes remain unreviewed."
+            ],
+        }
+        sa.record(
+            work / "ledger.jsonl",
+            {
+                "batch": batch["input_digest"],
+                "provider": "codex",
+                "model": "gpt-6-luna",
+                "verdict": verdict,
+                "execution_record": str(original / "execution.json"),
+                "reader_digest": sa.LEGACY_READER_DIGEST,
+            },
+        )
+        return work, original, batch
+
+    def test_explicit_continuation_keeps_block_until_complete_pass_and_advance(self):
+        work, original, batch = self.retained_incomplete()
+        alias = self.state / "audit-alias"
+        alias.symlink_to(work, target_is_directory=True)
+        ledger = work / "ledger.jsonl"
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        rows[0]["execution_record"] = str(alias / original.name / "execution.json")
+        ledger.write_text("\n".join(map(sa.serialize, rows)) + "\n")
+
+        def inspect(value, provider, attempt, **kwargs):
+            self.assertEqual(value, batch)
+            self.assertEqual(provider, "codex")
+            self.assertEqual(kwargs["resume_from"], original.resolve())
+            self.assertTrue((work / "blocked.json").exists())
+            self.assertTrue((attempt / "previous-block.json").exists())
+            (attempt / "prompt.txt").write_text("retained inspection")
+            return {"input_digest": batch["input_digest"], "commits": [self.target], "verdict": "pass", "findings": []}
+
+        with (
+            patch.object(sa, "validate_history", return_value=[self.target]),
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch.object(sa, "inspect", side_effect=inspect) as model,
+            patch.object(sa, "advance", return_value=self.target),
+        ):
+            self.assertEqual(
+                sa.resume_incomplete(SimpleNamespace(state=self.state), "Repair reader transport", ignore_quota=True),
+                self.target,
+            )
+        model.assert_called_once()
+        self.assertFalse((work / "blocked.json").exists())
+        self.assertTrue((original / "input.json").exists())
+        rows = [json.loads(line) for line in (work / "ledger.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[0]["verdict"]["verdict"], "incomplete")
+        self.assertEqual(rows[-1]["advanced"], self.target)
+        self.assertNotIn("human_attestation", rows[-1])
+
+    def test_continuation_never_resumes_a_source_finding(self):
+        work, original, batch = self.retained_incomplete(finding=True)
+        with patch.object(sa, "inspect") as model, self.assertRaisesRegex(Die, "finding cannot"):
+            sa.resume_incomplete(SimpleNamespace(state=self.state), "Attempt to resume")
+        model.assert_not_called()
+        self.assertTrue((work / "blocked.json").exists())
+
+    def test_continuation_rejects_changed_input_before_model(self):
+        work, original, batch = self.retained_incomplete()
+        batch["commits"][0]["files"] = []
+        (original / "input.json").write_text(sa.serialize(batch))
+        with patch.object(sa, "inspect") as model, self.assertRaisesRegex(Die, "digest mismatch"):
+            sa.resume_incomplete(SimpleNamespace(state=self.state), "Repair reader transport")
+        model.assert_not_called()
+        self.assertTrue((work / "blocked.json").exists())
+
+    def test_continuation_cannot_skip_commits_or_auto_clear_another_incomplete(self):
+        work, original, batch = self.retained_incomplete()
+        cfg = SimpleNamespace(state=self.state)
+        with (
+            patch.object(sa, "validate_history", return_value=["c" * 40, self.target]),
+            patch.object(sa, "inspect") as model,
+            self.assertRaisesRegex(Die, "exact next main prefix"),
+        ):
+            sa.resume_incomplete(cfg, "Repair reader transport")
+        model.assert_not_called()
+        verdict = {
+            "input_digest": batch["input_digest"],
+            "commits": [self.target],
+            "verdict": "incomplete",
+            "findings": ["Still incomplete"],
+        }
+
+        def incomplete_model(batch, provider, attempt, **kwargs):
+            (attempt / "prompt.txt").write_text("retained inspection")
+            return verdict
+
+        with (
+            patch.object(sa, "validate_history", return_value=[self.target]),
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch.object(sa, "inspect", side_effect=incomplete_model) as model,
+            patch.object(sa, "advance") as advance,
+            self.assertRaises(Die),
+        ):
+            sa.resume_incomplete(cfg, "Repair reader transport")
+        model.assert_called_once()
+        advance.assert_not_called()
+        self.assertTrue((work / "blocked.json").exists())
+
+    def test_failed_continuation_cannot_be_retried_without_a_verdict(self):
+        work, original, batch = self.retained_incomplete()
+        cfg = SimpleNamespace(state=self.state)
+        with (
+            patch.object(sa, "validate_history", return_value=[self.target]),
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch.object(sa, "inspect", side_effect=Die("malformed output")) as model,
+            patch.object(sa, "advance") as advance,
+        ):
+            with self.assertRaisesRegex(Die, "malformed output"):
+                sa.resume_incomplete(cfg, "Repair reader transport")
+            with self.assertRaisesRegex(Die, "single administrative continuation"):
+                sa.resume_incomplete(cfg, "Retry malformed output")
+        model.assert_called_once()
+        advance.assert_not_called()
+        self.assertTrue((work / "blocked.json").exists())
+
+    def test_continuation_requires_exact_original_block(self):
+        work, original, batch = self.retained_incomplete()
+        blocked = work / "blocked.json"
+        value = json.loads(blocked.read_text())
+        value["reason"] = "some other failure"
+        blocked.write_text(sa.serialize(value))
+        with patch.object(sa, "inspect") as model, self.assertRaisesRegex(Die, "original recorded"):
+            sa.resume_incomplete(SimpleNamespace(state=self.state), "Repair reader transport")
+        model.assert_not_called()
 
 
 if __name__ == "__main__":
