@@ -189,6 +189,36 @@ def test_broken_retry_evidence_suppresses_rebase():
         assert "counter is malformed" in sv.rebaseable.suppressed[0].reason
 
 
+def test_launch_rechecks_head_hold_and_active_marker():
+    from tauceti_worker.work_units import _still_actionable
+
+    gh = GitHub()
+    live = {
+        "headRefOid": HEAD,
+        "state": "OPEN",
+        "isDraft": False,
+        "baseRefName": "main",
+        "mergeable": "MERGEABLE",
+        "labels": [{"name": "needs-rebase"}],
+    }
+    candidate = SimpleNamespace(pr=1, head=HEAD)
+    with (
+        patch.object(gh, "pr_view", return_value=live),
+        patch.object(gh, "rebase_requested", return_value=True) as marker,
+    ):
+        assert _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
+        live["labels"] = [{"name": "hold"}]
+        assert not _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
+        live["labels"] = [{"name": "needs-rebase"}]
+        live["headRefOid"] = "b" * 40
+        assert not _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
+        live["headRefOid"] = HEAD
+        marker.return_value = False
+        assert not _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
+        live["mergeable"] = "CONFLICTING"
+        assert _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
+
+
 def test_semantic_evidence_reaches_claimed_repair():
     from tauceti_worker import work_units
 
@@ -236,6 +266,7 @@ def test_semantic_evidence_reaches_claimed_repair():
 
 
 if __name__ == "__main__":
+    test_launch_rechecks_head_hold_and_active_marker()
     test_semantic_evidence_reaches_claimed_repair()
     test_trusted_paginated_comments()
     test_survey_ownership_head_pause_and_budget()

@@ -714,6 +714,25 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     reading normally looks equivalent and is not: the cache directory is shared with `status` and the
     dashboard, either of which can republish an entitled record in the gap, and the read would come
     back `assumed` from a fetch that happened before whatever prompted this re-check."""
+    if stage == "rebase":
+        from .github_transport import read_context
+
+        with read_context(fresh=True, direct=True):
+            live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels", "mergeable", "baseRefName"])
+            if (
+                not live
+                or live.get("headRefOid") != c.head
+                or live.get("state") != "OPEN"
+                or live.get("isDraft")
+                or live.get("baseRefName") != "main"
+            ):
+                return False
+            labels = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
+            if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
+                return False
+            return live.get("mergeable") == "CONFLICTING" or (
+                "needs-rebase" in labels and w.gh.rebase_requested(c.pr, c.head)
+            )
     if stage == "bump" and getattr(c, "bump_integration_failure", False):
         return bool(w.gh.bump_repair_requested(c.pr, c.head))
     if stage not in ("review", "fix"):
@@ -1370,7 +1389,9 @@ def _do_fixlike(
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         checked = rev.stdout.strip() or head
-        if label == "bump" and getattr(c, "bump_integration_failure", False) and (rev.returncode or checked != head):
+        if (label == "rebase" or label == "bump" and getattr(c, "bump_integration_failure", False)) and (
+            rev.returncode or checked != head
+        ):
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None
