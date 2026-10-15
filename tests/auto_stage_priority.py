@@ -97,10 +97,12 @@ checks.append(check("stale progress verdict falls through to fix-ci", seen, ["pr
 saved_prepare_checkout = tc.work_units.prepare_checkout
 saved_run = tc.work_units.subprocess.run
 writes = []
+plan_calls = []
 
 
 def fake_run(argv, *_a, **_k):
     if "plan" in argv:
+        plan_calls.append(argv)
         return SimpleNamespace(returncode=tc.EX_NOPROGRESS, stdout="", stderr="not due")
     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -118,6 +120,9 @@ with tempfile.TemporaryDirectory() as tmp:
         tc.work_units.prepare_checkout = saved_prepare_checkout
         tc.work_units.subprocess.run = saved_run
 checks.append(check("fresh not-due plan returns the fallthrough signal", progress_result, None))
+checks.append(
+    check("worker requires 25 PRs for a progress report", plan_calls[0][plan_calls[0].index("--min-prs") + 1], "25")
+)
 checks.append(check("fresh plan re-check records the attempt", writes[0][0], "progress-attempt-ts"))
 
 # Starting a progress attempt consumes the cached due verdict even when the fresh plan fails. Without
