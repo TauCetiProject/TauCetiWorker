@@ -85,7 +85,7 @@ class Reader:
             self.seen = set(seen)
             self.token = saved["last_token"]
             self.last_page = saved.get("last_page", max(seen) if seen else None)
-            if self.last_page is not None and self.last_page not in self.seen:
+            if self.last_page is not None and (type(self.last_page) is not int or self.last_page not in self.seen):
                 raise ValueError("Invalid retained reader page")
 
     def request(self, method, params):
@@ -124,7 +124,9 @@ class Reader:
         page = args["page"]
         if type(page) is not int or not 0 <= page < len(self.pages):
             raise ValueError("Invalid page number")
-        replayed = args["token"] != self.token
+        replayed = args["token"] == ""
+        if not replayed and args["token"] != self.token:
+            raise ValueError("Stale reader token; use an empty token to replay the last full page")
         if replayed:
             # Recover by delivering actual source, never by revealing a bare
             # token that could acknowledge unseen content. A stale request does

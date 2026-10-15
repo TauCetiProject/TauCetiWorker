@@ -179,9 +179,10 @@ up to 20 commits with a 2 MiB workload target. A single larger commit may use up
 from the model's live context window. Small inputs are supplied inline; larger
 inputs are available through one read-only `audit.read_page` tool. It accepts only
 a numbered page and a continuation token, with no filesystem paths, URLs, commands
-or writes. Each read returns the token for the next call so parallel reads cannot
-flood the context window. A stale or lost token replays the last full page with a
-fresh token; it does not count the requested new page as read. The same Luna/Haiku conversation can compact its history and
+or writes. Each read returns the token for the next call; a stale nonempty token
+is rejected. To recover a lost token, explicitly send an empty token: the reader
+replays the last full page with a fresh token. It does not count the requested new
+page as read. The same Luna/Haiku conversation can compact its history and
 re-read pages as needed, then returns one verdict covering the entire batch. There
 are no independent partial inspections or combined partial approvals. A pass is
 rejected unless the reader's receipt accounts for every page and the verdict echoes
@@ -212,7 +213,8 @@ python3 -m tauceti_worker.security_audit resume --state /path/to/worker/state/se
   --reason 'Reader-token transport repair; continue the retained inspection'
 ```
 
-This command is restricted to that recorded token-failure verdict. It checks the
+This command allows one administrative continuation, restricted to the exact
+original recorded token-failure block. A failed continuation cannot be retried. It checks the
 unchanged input digest, original commit order, current cursor and admin authority,
 then restores the native conversation and read receipt. It keeps the incomplete
 verdict and block on record; only a complete passing continuation and confirmed

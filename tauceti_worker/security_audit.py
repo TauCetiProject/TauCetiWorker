@@ -27,6 +27,8 @@ from .quota import CODEX_RT_PLACEHOLDER, _mirror_creds_file, claude_dir, codex_d
 
 CURSOR = "security-audit"
 BOOTSTRAP = "8eecb48e9b51da99ca119f190a64ca43c100795b"
+# Legacy token-failure recovery credits only this unchanged page-layout version.
+LEGACY_READER_DIGEST = "3b7c68055c792d0ea3243220cff9a73f282c1e1c1f71d9646f1739a2fd3757c4"
 MAX_COMMITS = 20
 MAX_BYTES = 2 * 1024 * 1024  # Session workload target, not a context-window limit.
 MAX_SINGLE_COMMIT_BYTES = 8 * 1024 * 1024
@@ -467,6 +469,8 @@ Manifest:\n"""
                     "Continue the SAME retained inspection conversation, preserving ALL previous findings, notes, and uncertainty. "
                     "The prior incomplete verdict remains recorded. A reader-token transport failure has been repaired; "
                     "this is not a new review or permission to discard earlier findings. Finish the unreviewed source, "
+                    "Start by calling read_page with an empty token to recover the retained reader state. "
+                    "Ignore the new manifest reader_token on this continuation. "
                     "re-read earlier pages as needed, and return one verdict for the exact original batch.\n" + prompt
                 )
             if provider == "codex":
@@ -775,6 +779,8 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False) -> str:
     reviews = [r for r in rows if r.get("batch") == batch["input_digest"] and "verdict" in r]
     if not reviews or any(r["verdict"]["verdict"] == "finding" for r in reviews):
         raise Die("security-audit: a finding cannot be continued or re-reviewed")
+    if any(r.get("batch") == batch["input_digest"] and "continuation_of" in r for r in rows):
+        raise Die("security-audit: this batch already used its single administrative continuation")
     last = reviews[-1]
     if (
         last.get("provider") != "codex"
@@ -790,6 +796,13 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False) -> str:
         failures[0],
     ):
         raise Die("security-audit: continuation is restricted to the recorded reader-token transport failure")
+    if (
+        set(previous) != {"from_sha", "to_sha", "reason", "attempt"}
+        or previous["reason"] != "security-audit: " + failures[0]
+        or last.get("execution_record") != str(original / "execution.json")
+        or last.get("reader_digest") != LEGACY_READER_DIGEST
+    ):
+        raise Die("security-audit: continuation does not match the original recorded transport block")
     target = batch["commits"][-1]["sha"]
     if batch["from_sha"] != cursor or previous.get("to_sha") != target:
         raise Die("security-audit: continuation range does not match the retained block")
@@ -832,6 +845,12 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False) -> str:
                 "to_sha": target,
                 "continuation_of": str(original),
                 "attempt": str(attempt),
+                "prompt_digest": hashlib.sha256((attempt / "prompt.txt").read_bytes()).hexdigest(),
+                "launcher_profile": reviewer_argv("codex"),
+                "execution_record": str(attempt / "execution.json"),
+                "catalog_digest": hashlib.sha256(serialize(CODEX_CATALOG).encode()).hexdigest(),
+                "reader_digest": hashlib.sha256(Path(__file__).with_name("audit_reader.py").read_bytes()).hexdigest(),
+                "input_policy": "compacting-session-v1",
                 "verdict": verdict,
             },
         )
@@ -843,7 +862,7 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False) -> str:
             {"actor": actor, "advanced": landed, "from_sha": cursor, "continuation_of": str(original)},
         )
         blocked.rename(work / f"resolved-continuation-block-{time.time_ns()}.json")
-    except (Die, ValueError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired) as exc:
+    except (Die, NoProgress, ValueError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired) as exc:
         failure = {
             "from_sha": cursor,
             "to_sha": target,
