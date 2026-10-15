@@ -43,6 +43,27 @@ jobs:
       - name: Run the test suite
         run: ./tests/run-all
 
+  prices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the review engine's price table
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: TauCetiProject/TauCetiReview
+          path: .review-engine
+          sparse-checkout: runner/prices.json
+          sparse-checkout-cone-mode: false
+      # tauceti_worker/prices.json is a vendored copy, not a second table: the review engine owns
+      # the rates, and two editable copies of a price table is how the cost model and the engine
+      # came to disagree. Report the command that re-vendors it rather than a diff to hand-apply.
+      - name: Compare the vendored price table with its source
+        run: |
+          if ! diff -u .review-engine/runner/prices.json tauceti_worker/prices.json; then
+            echo "::error file=tauceti_worker/prices.json::Vendored price table has drifted from TauCetiProject/TauCetiReview runner/prices.json. Change rates there, then re-vendor: cp .review-engine/runner/prices.json tauceti_worker/prices.json"
+            exit 1
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -88,7 +109,9 @@ jobs:
           base = pathlib.Path(m.__file__).parent
           assert (base / "prompts").is_dir(), "prompts/ missing from the installed wheel"
           assert (base / "scripts").is_dir(), "scripts/ missing from the installed wheel"
-          print("bundled prompts/ and scripts/ present")
+          from tauceti_worker.cost_model import AI_PRICES
+          assert AI_PRICES, "prices.json missing from the installed wheel"
+          print("bundled prompts/, scripts/ and prices.json present")
           PY
 
   docker:

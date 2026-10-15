@@ -69,6 +69,7 @@ RUN_STDLIB=(
   pace_curve.py
   pr_targeting.py
   preflight_review_lake.py
+  prices.py
   progress_tool_failure_log.py
   prompt_wrapper_paths.py
   provider_usage.py
