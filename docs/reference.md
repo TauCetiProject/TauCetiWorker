@@ -207,7 +207,11 @@ normally repeated once per content block), and delegated Claude sessions are
 charged to their parent. Codex is priced request-by-request so its long-context
 tier is applied to the requests that actually cross the threshold. Prompt-cache
 reads and Claude's 5-minute/1-hour cache writes use their distinct displayed
-rates. The default review source is the local canonical TauCetiData checkout at
+rates. Those rates come from `tauceti_worker/prices.json`, a byte-identical copy of
+the review engine's own dated table (TauCetiProject/TauCetiReview `runner/prices.json`):
+rates are edited there and re-vendored here, CI fails when the copy drifts, and the
+report stamps the copy's digest as `pricing.prices_sha` so a figure stays traceable to
+the rates behind it. The default review source is the local canonical TauCetiData checkout at
 `~/.cache/tauceti-review/data/TauCetiData`; use `--review-data-dir` to point at a
 different checkout. Production review records are de-duplicated by their durable
 key, with shadow experiments excluded.

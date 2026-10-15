@@ -23,6 +23,7 @@ RUN_STDLIB=(
   agent_cmds.py
   agent_transcript.py
   auto_stage_priority.py
+  automatic_bump.py
   authoring_profiles.py
   bubble_cache.py
   bubble_version.py
@@ -63,11 +64,13 @@ RUN_STDLIB=(
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  observability_failures.py
   open_pr_pages.py
   overlaps.py
   pace_curve.py
   pr_targeting.py
   preflight_review_lake.py
+  prices.py
   progress_tool_failure_log.py
   prompt_wrapper_paths.py
   provider_usage.py
@@ -97,6 +100,7 @@ RUN_STDLIB=(
   rubric_bundle.py
   safe_exists.py
   scoreboard_trust.py
+  security_audit.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py
@@ -111,8 +115,9 @@ RUN_STDLIB=(
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
 # bash tests
 RUN_SH=(docker_entrypoint.sh lifecycle.sh)
-# deliberately not run here (needs the bubble sandbox/proxy)
-SKIP=(egress.sh)
+# Deliberate manual checks: egress needs the bubble sandbox/proxy; the cross-repo
+# repair fixture needs Lean, Elixir and a bors checkout (see its module docstring).
+SKIP=(egress.sh integration_repair_fixture.py)
 
 pass=0; fail=0; failed=()
 
@@ -133,7 +138,7 @@ summary() {
   echo "================================================================"
   echo "run-all: $pass passed, $fail failed"
   ((${#failed[@]})) && printf '  failed: %s\n' "${failed[@]}"
-  ((${#SKIP[@]}))   && printf '  skipped (needs sandbox): %s\n' "${SKIP[@]}"
+  ((${#SKIP[@]}))   && printf '  skipped (requires external tooling): %s\n' "${SKIP[@]}"
 }
 
 # --- inventory guard: every tests/*.py and tests/*.sh must be classified --------------------------

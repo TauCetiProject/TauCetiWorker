@@ -310,7 +310,8 @@ ALLOWED_TASKS = [
     "overlap-fix",
 ]
 
-WORK_TASKS = list(ALLOWED_TASKS)
+EXPLICIT_TASKS = ("security-audit",)
+WORK_TASKS = [*ALLOWED_TASKS, *EXPLICIT_TASKS]
 
 # Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
 # honor the project's globally paced progress reporting. The worker's fix/CI maintenance remains

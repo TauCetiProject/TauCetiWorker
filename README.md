@@ -128,7 +128,7 @@ A round does exactly one unit of work: the first of these that applies.
 
 | Step | What it does |
 |------|--------------|
-| **Rebase** | Reconcile one of our conflicting PRs, or a fork update requested by the merge sweep for the current head. Genuine conflict retries renew after a distinct head builds and becomes mergeable; sweep handoffs keep their per-PR cap. Hold labels pause recovery. |
+| **Rebase** | Reconcile one of our conflicting PRs or an authenticated current-head integration repair request, including missing sources or renamed APIs after main moves. Integrate one main snapshot and validate source repair before safe push. Genuine conflict retries renew after verified progress; handoffs retain their per-PR cap. Hold labels pause recovery. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Lint repair** | Fix `TauCeti/` on a red `lint-repair/` PR. PR builds lint only the modules a change touches, so TauCeti's daily full lint opens one of these when main carries environment-lint violations elsewhere (for example, a new simp lemma that takes an older one out of simp normal form). The worker never opens one itself. |
 | **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
@@ -161,6 +161,76 @@ Four independent dials: which work, which pull requests, which agent, and where
 it runs. Combine them however you like.
 
 ### What work: `--only`
+
+`security-audit` is an explicit, admin-only phase outside the normal cascade:
+
+```bash
+tauceti work --only security-audit --agent codex --dry-run
+tauceti work --only security-audit --agent codex
+tauceti work --only security-audit --agent claude --loop
+```
+
+It advances TauCeti's protected `security-audit` branch through main's first-parent
+history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
+Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
+Each session inspects complete per-commit diffs and before/after file contents,
+up to 20 commits with a 2 MiB workload target. A single larger commit may use up to
+8 MiB (each source blob is limited to 4 MiB). These are workload limits, separate
+from the model's live context window. Small inputs are supplied inline; larger
+inputs are available through one read-only `audit.read_page` tool. It accepts only
+a numbered page and a continuation token, with no filesystem paths, URLs, commands
+or writes. Each read returns the token for the next call so parallel reads cannot
+flood the context window. The same Luna/Haiku conversation can compact its history and
+re-read pages as needed, then returns one verdict covering the entire batch. There
+are no independent partial inspections or combined partial approvals. A pass is
+rejected unless the reader's receipt accounts for every page and the verdict echoes
+the token that follows the last page's contents. Delivery coverage
+does not prove the model understood the source; compaction can lose details, so
+the prompt requires retaining findings and unresolved questions, re-reading when
+needed, and returning incomplete if the full inspection cannot be completed.
+
+Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
+Worker code alone verifies ancestry and moves the ref.
+No Lean builds or candidate scripts run. A finding, incomplete inspection, oversized
+commit or model error stops advancement. Read the retained `security-audit/blocked.json`
+in that worker's state directory. Resolve findings by explicit human attestation,
+not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
+The input, actual launcher/environment/prompt, transcript, native Codex
+compaction/usage records, read receipt (for larger inputs), and durable ledger are
+retained in the same directory. A pre-inspection commit-budget block from the old
+256 KiB planner can be archived and replanned when its exact next commit fits the
+new limits. This does not attest that commit or retry a model verdict: findings,
+incomplete inspections, client errors and other planning errors remain blocked.
+
+This phase must be selected alone, cannot use `--pr` or authoring-model overrides,
+and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
+`--agent claude` uses Haiku, with ordinary subscription pacing and no expensive fallback.
+It uses its own isolated launcher regardless of the ordinary host/Bubble setting.
+The active GitHub credential must have repository-admin permission, checked before
+spending and again before updating the cursor. New toolchain tags must be at or
+behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docs/security-audit.md).
+
+An admin initializes the protections and original audited snapshot once with:
+
+```bash
+python3 -m tauceti_worker.security_audit setup --state /path/to/private/audit-bootstrap
+```
+
+Setup is idempotent and refuses to overwrite a differing existing ruleset. Cursor
+updates are admin-only, with separate non-bypassable deletion/rewind restrictions.
+`v*` tag creation is admin-only, and existing tags cannot be updated or deleted.
+
+After manually inspecting every intermediate commit in a blocked or oversized range,
+an admin can record the evidence and advance with the same ancestry checks:
+
+```bash
+python3 -m tauceti_worker.security_audit attest --state /path/to/worker/state/security-audit \
+  --through FULL_MAIN_SHA --reason 'Human review evidence and explanation'
+```
+
+The local ledger and blocks are operational records, not a shared authorization
+service. This design trusts admins, including credentials used by other agents;
+admin credentials should be kept out of ordinary authoring/review workers.
 
 With no `--only`, a round walks the whole cascade and does the first job that
 applies. `--only <task>[,<task>...]` pins it to particular kinds, and `--skip`

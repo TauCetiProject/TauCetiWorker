@@ -32,7 +32,7 @@ export function issueFragment(c:any): any {
   const parsed=meta.length?parse(meta[meta.length-1][1]):null;
   const value=claim?parse(claim[1]):null;
   const marker=object(value) && Number.isSafeInteger(value.expires_at)?{head:value.head ?? null,expires_at:value.expires_at,providers:Array.isArray(value.providers)?value.providers.filter((p:any)=>typeof p==='string'):[]}:null;
-  const rebase=c.user?.login===spec.rebase_author && body.startsWith('Merge-queue recovery for head `')?body.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/).flatMap((line:string)=>line.match(/^<!--tauceti-rebase:v1 ([a-f0-9]{40})-->$/)?.slice(1) || []):[];
+  const rebase=spec.rebase_authors.includes(c.user?.login) && body.startsWith('Merge-queue recovery for head `')?body.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/).flatMap((line:string)=>line.match(/^<!--tauceti-rebase:v1 ([a-f0-9]{40})-->$/)?.slice(1) || []):[];
   return {id:String(c.id),updated:c.updated_at || '',meta:body.includes(spec.scoreboard)?compactMeta(parsed):null,marker,rebase_heads:rebase};
 }
 export function reviewFragment(c:any): any {

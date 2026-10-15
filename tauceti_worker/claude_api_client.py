@@ -17,11 +17,24 @@ from pathlib import Path
 def atomic(path, value):
     tmp = path.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as stream:
-        json.dump(value, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def warning(message):
+    try:
+        print(message, file=sys.stderr)
+    except (OSError, ValueError):
+        pass
 
 
 def request(directory, action, *, wait=True, **fields):
@@ -110,7 +123,7 @@ def main():
             invocation = admission["id"]
             break
         if admission["reason"] != previous_reason:
-            print("tauceti-local-admission: " + admission["reason"], file=sys.stderr)
+            warning("tauceti-local-admission: " + admission["reason"])
             previous_reason = admission["reason"]
         return 75  # Funding waits belong to the outer loop, outside the round timeout.
     output_format = "text"
@@ -143,7 +156,7 @@ def main():
         try:
             atomic(bridge / "inbox" / (invocation + ".receipt"), receipt)
         except OSError as error:
-            print(f"tauceti budget: receipt checkpoint pending: {error}", file=sys.stderr)
+            warning(f"tauceti budget: receipt checkpoint pending: {error}")
 
     process_exited = False
     try:
@@ -161,7 +174,7 @@ def main():
                         try:
                             sys.stdout.write(line)
                             sys.stdout.flush()
-                        except (OSError, UnicodeError):
+                        except (OSError, ValueError):
                             pass
                     continue
                 if final is not None and (
@@ -207,17 +220,20 @@ def main():
                     try:
                         sys.stdout.write(line)
                         sys.stdout.flush()
-                    except (OSError, UnicodeError):
+                    except (OSError, ValueError):
                         pass  # Keep draining Claude even if the transcript consumer disappeared.
         finally:
             proc.stdout.close()
         rc = proc.wait()
         process_exited = True
         outcome = f"exit:{rc}"
-        if output_format == "json" and final is not None:
-            print(json.dumps(final))
-        elif output_format == "text" and final is not None:
-            print(final.get("result", ""))
+        try:
+            if output_format == "json" and final is not None:
+                print(json.dumps(final))
+            elif output_format == "text" and final is not None:
+                print(final.get("result", ""))
+        except (OSError, ValueError):
+            pass
     except OSError:
         if outcome == "launch-failed":
             totals = {invocation: "0"}
@@ -234,11 +250,17 @@ def main():
             lower_bound_totals=dict(totals),
             outcome=outcome,
         )
-        atomic(bridge / "inbox" / (invocation + ".receipt"), receipt)
+        try:
+            atomic(bridge / "inbox" / (invocation + ".receipt"), receipt)
+        except OSError as exc:
+            # A completed native session keeps its result and exit status. The
+            # admission reservation/checkpoint remains until costs are recovered;
+            # the live bridge may still settle from the request below.
+            warning(f"tauceti budget: final receipt pending: {exc}")
         try:
             request(bridge, "settle", **receipt)
         except (OSError, RuntimeError) as exc:
-            print(f"tauceti budget: settlement pending: {exc}", file=sys.stderr)
+            warning(f"tauceti budget: settlement pending: {exc}")
     return rc
 
 
@@ -246,5 +268,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (OSError, ValueError, RuntimeError) as error:
-        print(f"tauceti-local-admission: {error}", file=sys.stderr)
+        warning(f"tauceti-local-admission: {error}")
         sys.exit(75)

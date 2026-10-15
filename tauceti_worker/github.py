@@ -968,6 +968,21 @@ class GitHub:
         comments = self.issue_comments(pr)
         return head in rebase_heads(comments)
 
+    def rebase_request_body(self, pr: int, head: str) -> str:
+        """Pass only authenticated exact-head evidence to the existing repair task."""
+        from .survey_facts import rebase_heads
+
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            return ""
+        comments = self.issue_comments(pr)
+        for comment in reversed(comments or []):
+            if head in rebase_heads([comment]):
+                body = comment["body"]
+                # Do not silently truncate a diagnosis. The prompt can fetch
+                # the original request if it exceeds this context budget.
+                return body if len(body) <= 32768 else ""
+        return ""
+
     def issue_comments(self, pr: int) -> list[dict] | None:
         """Complete GraphQL history in REST shape. Cache is triage-only; force reads bypass it."""
         from .github_state import read

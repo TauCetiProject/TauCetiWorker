@@ -5,6 +5,14 @@ Persistent workers are declarative. You describe the workers you want in
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
 
+## Dependency bumps
+
+Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.
+Their build, rebase, review-error, review-fix and contest attempts are not permanently
+capped. Existing loop backoff, quota pacing, daily review limits, branch claims,
+and explicit holds still apply. Workers checkpoint coherent partial source repairs
+before their round deadline; full CI, audits, and current-head reviews authorize merging.
+
 ## Rebase retry budget
 
 For genuine Git conflicts, a tended PR gets three rebase attempts between verified progress checkpoints.
@@ -377,6 +385,21 @@ which also catches short-lived children between samples. Neither is proportional
 set size (PSS). Container workloads in Bubble are outside these host measurements.
 Historical tree peaks before recording started cannot be reconstructed.
 
+Reporting does not control whether useful work may continue. Status lock waits
+are bounded and unsent fields retry on a later update; a failed status write leaves the supervisor's identity available
+over its control socket and retries the pending fields on a later heartbeat.
+Unavailable log files fall back to console output. Optional GitHub identity caches,
+CLI instrumentation and endpoint metrics may also fail without rejecting an
+authenticated request. A temporary CLI launcher preserves quota handling when
+the normal launcher directory is unavailable, without moving retained publications.
+Under these failures, retained metrics can be incomplete and worker status marks
+degraded instrumentation.
+
+A final cost-receipt write failure preserves the native agent's exit status and
+result. The accounting bridge still attempts settlement, while missing receipts
+retain their spending reservations until recovery. Actual funding admission and
+provider quota handling continue to apply independently of reporting.
+
 ## tmux is a viewer, not the supervisor
 
 `tauceti workers tmux` opens one dashboard window plus one log-following window
@@ -412,7 +435,7 @@ spending on an editor, it checks the live exact-head PR and Bors `bump_repairs`
 handoff. Pending or active queue work, withdrawals, draft/closed PRs and holds
 are excluded. A second check after taking the normal branch claim closes the
 selection gap. Failed observations decline the candidate and leave unrelated
-work available. Normal bump editing budgets apply. The repair session fetches
+work available. Automatic dependency bumps continue under the existing loop backoff and quota limits. The repair session fetches
 and merges current main, diagnoses the actual integration failure, preserves
 the dependency target and verifies its changes before pushing. Healthy surveys
 make no additional API calls.
