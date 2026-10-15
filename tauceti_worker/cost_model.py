@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import math
 import re
@@ -31,150 +32,27 @@ PR_URL_RE = re.compile(r"TauCetiProject/TauCeti/pull/(\d+)", re.I)
 CREATE_PR_CMD_RE = re.compile(r"(?:\bgh\s+pr\s+create|gh-safe-pr-create)\b")
 LONG_CONTEXT_THRESHOLD = 272_000
 
-# API-equivalent list prices in USD / 1M tokens. These are deliberately visible in JSON output
-# and dated: tokens are measured facts, dollars are a conversion at the rate in force when a
-# session ran. A price change adds a window; a model-name change adds a model.
-AI_PRICES = {
-    "gpt-5.5": [
-        {
-            "effective": "2026-01-01",
-            "input": 5.0,
-            "cached_input": 0.5,
-            "cache_write": 6.25,
-            "output": 30.0,
-            "long_context_threshold": 272_000,
-            "long_input": 10.0,
-            "long_cached_input": 1.0,
-            "long_cache_write": 12.5,
-            "long_output": 45.0,
-        }
-    ],
-    "gpt-5.6-sol": [
-        {
-            "effective": "2026-07-09",
-            "input": 5.0,
-            "cached_input": 0.5,
-            "cache_write": 6.25,
-            "output": 30.0,
-            "long_context_threshold": 272_000,
-            "long_input": 10.0,
-            "long_cached_input": 1.0,
-            "long_cache_write": 12.5,
-            "long_output": 45.0,
-        },
-        {
-            "effective": "2026-08-21",
-            "input": 4.0,
-            "cached_input": 0.4,
-            "cache_write": 5.0,
-            "output": 20.0,
-            "long_context_threshold": 272_000,
-            "long_input": 8.0,
-            "long_cached_input": 0.8,
-            "long_cache_write": 10.0,
-            "long_output": 30.0,
-        },
-    ],
-    "gpt-5.6-terra": [
-        {
-            "effective": "2026-07-09",
-            "input": 2.5,
-            "cached_input": 0.25,
-            "cache_write": 3.125,
-            "output": 15.0,
-            "long_context_threshold": 272_000,
-            "long_input": 5.0,
-            "long_cached_input": 0.5,
-            "long_cache_write": 6.25,
-            "long_output": 22.5,
-        },
-        {
-            "effective": "2026-07-30",
-            "input": 2.0,
-            "cached_input": 0.2,
-            "cache_write": 2.5,
-            "output": 12.0,
-            "long_context_threshold": 272_000,
-            "long_input": 4.0,
-            "long_cached_input": 0.4,
-            "long_cache_write": 5.0,
-            "long_output": 18.0,
-        },
-    ],
-    "gpt-6-sol": [
-        {
-            "effective": "2026-09-22",
-            "input": 2.0,
-            "cached_input": 0.2,
-            "cache_write": 2.5,
-            "output": 10.0,
-            "long_context_threshold": 272_000,
-            "long_input": 4.0,
-            "long_cached_input": 0.4,
-            "long_cache_write": 5.0,
-            "long_output": 15.0,
-        }
-    ],
-    "gpt-6.1-sol": [
-        {
-            "effective": "2026-09-29",
-            "input": 2.0,
-            "cached_input": 0.1,
-            "cache_write": 2.5,
-            "output": 10.0,
-            "long_context_threshold": 272_000,
-            "long_input": 4.0,
-            "long_cached_input": 0.2,
-            "long_cache_write": 5.0,
-            "long_output": 15.0,
-        }
-    ],
-    "gpt-6-luna": [
-        {
-            "effective": "2026-09-22",
-            "input": 0.1,
-            "cached_input": 0.01,
-            "cache_write": 0.125,
-            "output": 0.5,
-            "long_context_threshold": 272_000,
-            "long_input": 0.2,
-            "long_cached_input": 0.02,
-            "long_cache_write": 0.25,
-            "long_output": 0.75,
-        }
-    ],
-    "claude-opus-4-8": [
-        {
-            "effective": "2026-01-01",
-            "input": 5.0,
-            "cache_write_5m": 6.25,
-            "cache_write_1h": 10.0,
-            "cached_input": 0.5,
-            "output": 25.0,
-        }
-    ],
-    "claude-opus-5": [
-        {
-            "effective": "2026-07-24",
-            "input": 5.0,
-            "cache_write_5m": 6.25,
-            "cache_write_1h": 10.0,
-            "cached_input": 0.5,
-            "output": 25.0,
-        }
-    ],
-    "claude-opus-5-5": [
-        {
-            "effective": "2026-09-22",
-            "input": 4.0,
-            "cache_write_5m": 5.0,
-            "cache_write_1h": 8.0,
-            "cached_input": 0.2,
-            "output": 20.0,
-        }
-    ],
-}
+# API-equivalent list prices in USD / 1M tokens, vendored byte-identically from the review
+# engine's single source of truth, TauCetiReview's runner/prices.json. Rates are edited there and
+# re-vendored here; CI fails when this copy drifts. The table is deliberately visible in JSON
+# output and dated: tokens are measured facts, dollars are a conversion at the rate in force when
+# a session ran. Each model maps to windows a rate takes effect on; `long_context` repeats the
+# rate fields for requests over its threshold.
+PRICES_PATH = Path(__file__).resolve().parent / "prices.json"
+PRICES_UPSTREAM = "https://github.com/TauCetiProject/TauCetiReview/blob/main/runner/prices.json"
+
+
+def load_price_windows(path: Path | None = None) -> dict[str, list[dict]]:
+    """The dated price table {model: [window, ...]} straight from the vendored prices.json."""
+    return json.loads((path or PRICES_PATH).read_text()).get("models", {})
+
+
+AI_PRICES = load_price_windows()
+# The exact table a report was priced from, so a published figure stays traceable to its rates.
+# The review engine stamps the same digest, under the same rule, on every run it archives.
+AI_PRICES_SHA = hashlib.sha256(PRICES_PATH.read_bytes()).hexdigest()[:12]
 AI_PRICE_SOURCES = {
+    "table": PRICES_UPSTREAM,
     "openai": "https://developers.openai.com/api/docs/changelog",
     "anthropic": "https://www.anthropic.com/claude/opus",
     "cache_policy": "https://developers.openai.com/api/docs/pricing",
@@ -374,6 +252,12 @@ def _price_window(model: str | None, when: dt.datetime | str | None) -> dict | N
     return eligible[-1] if eligible else windows[0]
 
 
+def _cache_read(rates: dict) -> float:
+    """The prompt-cache read rate, falling back to the input rate for a route that does not
+    discount cache hits (the table omits `cache_read` there rather than restating `input`)."""
+    return rates.get("cache_read", rates["input"])
+
+
 def _api_cost(
     provider: str, model: str | None, tokens: dict[str, int], when: dt.datetime | str | None = None
 ) -> float | None:
@@ -402,15 +286,18 @@ def _api_cost(
             standard_write = tokens.get("cache_write_input_tokens", 0)
             standard_output = tokens.get("output_tokens", 0)
             long_input = long_cached = long_write = long_output = 0
+        # A model with no long-context tier in the table has no second set of rates to bill at;
+        # price its long-tier traffic at the standard rates rather than dropping it.
+        long = price.get("long_context") or price
         return (
             (standard_input - standard_cached - standard_write) * price["input"]
-            + standard_cached * price["cached_input"]
+            + standard_cached * _cache_read(price)
             + standard_write * price["cache_write"]
             + standard_output * price["output"]
-            + (long_input - long_cached - long_write) * price["long_input"]
-            + long_cached * price["long_cached_input"]
-            + long_write * price["long_cache_write"]
-            + long_output * price["long_output"]
+            + (long_input - long_cached - long_write) * long["input"]
+            + long_cached * _cache_read(long)
+            + long_write * long["cache_write"]
+            + long_output * long["output"]
         ) / 1e6
 
     created = tokens.get("cache_creation_input_tokens", 0)
@@ -423,7 +310,7 @@ def _api_cost(
         tokens.get("input_tokens", 0) * price["input"]
         + (created_5m + unsplit_created) * price["cache_write_5m"]
         + created_1h * price["cache_write_1h"]
-        + tokens.get("cache_read_input_tokens", 0) * price["cached_input"]
+        + tokens.get("cache_read_input_tokens", 0) * _cache_read(price)
         + tokens.get("output_tokens", 0) * price["output"]
     ) / 1e6
 
@@ -952,7 +839,11 @@ def analyze(logs_dir: Path, state_dir: Path, limit: int = 250) -> dict:
         },
         "groups": groups,
         "ai_sessions": {
-            "pricing": {"usd_per_million_tokens": AI_PRICES, "sources": AI_PRICE_SOURCES},
+            "pricing": {
+                "usd_per_million_tokens": AI_PRICES,
+                "sources": AI_PRICE_SOURCES,
+                "prices_sha": AI_PRICES_SHA,
+            },
             "groups": ai_groups,
             "model_groups": ai_model_groups,
             "preparation_prs_observed": len({s.pr_number for s in prep if s.pr_number is not None}),
