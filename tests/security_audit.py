@@ -405,7 +405,10 @@ class CompactingInspection(unittest.TestCase):
     def test_resume_retains_identity_receipt_and_all_isolation_flags(self):
         self.run_reader_session(resume=True)
 
-    def run_reader_session(self, resume=False):
+    def test_resume_before_first_page_starts_with_an_empty_receipt(self):
+        self.run_reader_session(resume=True, missing_receipt=True)
+
+    def run_reader_session(self, resume=False, missing_receipt=False):
         auth = self.work / "auth.json"
         auth.write_text('{"tokens":{"access_token":"provider-only"}}')
 
@@ -417,8 +420,9 @@ class CompactingInspection(unittest.TestCase):
             (original / "model-rollout-0.jsonl").write_text(
                 json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
             )
-            reader = ar.Reader(self.batch, original / "read-receipt.json", "initial")
-            reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0, "token": "initial"}})
+            if not missing_receipt:
+                reader = ar.Reader(self.batch, original / "read-receipt.json", "initial")
+                reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0, "token": "initial"}})
 
         def model(argv, **kwargs):
             if resume:
@@ -438,7 +442,10 @@ class CompactingInspection(unittest.TestCase):
                 sessions = list((kwargs["cwd"] / ".codex/sessions").glob("*.jsonl"))
                 self.assertEqual(len(sessions), 1)
                 self.assertEqual(sessions[0].read_bytes(), (original / "model-rollout-0.jsonl").read_bytes())
-                self.assertEqual(json.loads((kwargs["cwd"] / "read-receipt.json").read_text())["read"], [0])
+                if missing_receipt:
+                    self.assertFalse((kwargs["cwd"] / "read-receipt.json").exists())
+                else:
+                    self.assertEqual(json.loads((kwargs["cwd"] / "read-receipt.json").read_text())["read"], [0])
             self.assertNotIn("untrusted instruction", kwargs["input"])
             self.assertIn("ONE inspection session", kwargs["input"])
             self.assertIn("model_auto_compact_token_limit=180000", argv)
@@ -474,6 +481,126 @@ class CompactingInspection(unittest.TestCase):
             self.assertEqual(sa.inspect(self.batch, "codex", self.work, resume_from=original), self.verdict)
             run.assert_called_once()
         self.assertTrue((self.work / "read-receipt.json").exists())
+
+    def test_service_error_classifier_never_retries_an_answer_or_unknown_tool(self):
+        error = {"type": "turn.failed", "error": {"message": "service unavailable"}}
+        for verdict in ("finding", "incomplete", "pass", "not JSON"):
+            answer = {"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}
+            self.assertIsNone(sa.codex_service_error("\n".join(map(json.dumps, [error, answer])), True))
+        bad_tool = {"type": "item.started", "item": {"type": "command_execution"}}
+        self.assertIsNone(sa.codex_service_error("\n".join(map(json.dumps, [error, bad_tool])), True))
+        for invalid in ("broken JSON", "[]", '{"type":"turn.completed"}', ""):
+            self.assertIsNone(sa.codex_service_error(invalid, True))
+        self.assertIn("service unavailable", sa.codex_service_error(json.dumps(error), True))
+
+    def test_native_commentary_survives_service_failure_but_final_answers_do_not(self):
+        transcript = "\n".join(
+            map(
+                json.dumps,
+                [
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Pages 0–2 inspected; notes retained."},
+                    },
+                    {"type": "turn.failed", "error": {"message": "network failure"}},
+                ],
+            )
+        )
+        rollout = self.work / "model-rollout-0.jsonl"
+        message = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Pages 0–2 inspected; notes retained."}],
+            },
+        }
+        rollout.write_text(json.dumps(message) + "\n")
+        self.assertIn("network failure", sa.codex_service_error(transcript, True, self.work))
+        message["payload"]["phase"] = "final_answer"
+        rollout.write_text(json.dumps(message) + "\n")
+        self.assertIsNone(sa.codex_service_error(transcript, True, self.work))
+        message["payload"]["phase"] = "commentary"
+        message["payload"]["content"][0]["text"] = '{"verdict":"finding"}'
+        rollout.write_text(json.dumps(message) + "\n")
+        self.assertIsNone(sa.codex_service_error(transcript, True, self.work))
+
+    def test_malformed_native_identity_is_a_blocking_error(self):
+        rollout = self.work / "model-rollout-0.jsonl"
+        for value in ("", "{}", '{"type":"session_meta","payload":{}}'):
+            rollout.write_text(value)
+            with self.assertRaises(Die):
+                sa.retained_thread(self.work)
+
+    def test_service_retry_preserves_uuid_input_receipt_and_failed_evidence(self):
+        self.run_service_retry(succeed=True)
+
+    def test_service_retry_budget_is_bounded(self):
+        self.run_service_retry(succeed=False)
+
+    def run_service_retry(self, succeed):
+        home = self.work / "isolated"
+        sessions = home / ".codex/sessions"
+        sessions.mkdir(parents=True)
+        thread = "11111111-2222-4333-8444-555555555555"
+        rollout = sessions / "rollout.jsonl"
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n")
+        receipt = home / "receipt.json"
+        reader = ar.Reader(self.batch, receipt, "initial")
+        reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0, "token": "initial"}})
+        before = receipt.read_bytes()
+        prompt = "exact original inspection instructions and source manifest"
+        count = 0
+
+        def model(argv, **kwargs):
+            nonlocal count
+            count += 1
+            self.assertEqual(kwargs["input"], prompt if count == 1 else sa.CONTINUE_PROMPT + prompt)
+            self.assertEqual(receipt.read_bytes(), before)
+            if count > 1:
+                self.assertEqual(argv[-3:], ["resume", thread, "-"])
+                self.assertIn("--sandbox", argv)
+                self.assertIn("read-only", argv)
+            if succeed and count == 2:
+                return SimpleNamespace(returncode=0, stdout="completed", stderr="")
+            rollout.write_text(
+                rollout.read_text()
+                + json.dumps({"type": "event_msg", "payload": {"type": "error", "message": "network failure"}})
+                + "\n"
+            )
+            events = [
+                {"type": "thread.started", "thread_id": thread},
+                {"type": "turn.failed", "error": {"message": "network failure"}},
+            ]
+            return SimpleNamespace(returncode=1, stdout="\n".join(map(json.dumps, events)), stderr="service error")
+
+        with patch.object(sa.subprocess, "run", side_effect=model) as run, patch.object(sa.time, "sleep") as sleep:
+            result = sa.run_client(
+                ["codex", "exec", "--sandbox", "read-only", "-"],
+                prompt,
+                home=home,
+                env={},
+                work=self.work,
+                receipt=receipt,
+                provider="codex",
+                paged=True,
+            )
+        self.assertEqual(run.call_count, 2 if succeed else 3)
+        self.assertEqual(sleep.call_count, 1 if succeed else 2)
+        self.assertEqual(result.returncode, 0 if succeed else 1)
+        self.assertEqual(sa.retained_thread(self.work), thread)
+        self.assertIn("network failure", (self.work / "service-error-1/model-transcript.jsonl").read_text())
+        self.assertEqual((self.work / "service-error-1/read-receipt.json").read_bytes(), before)
+        execution = json.loads((self.work / "execution.json").read_text())
+        self.assertEqual(execution["argv"][-3:], ["resume", thread, "-"])
+        import hashlib
+
+        self.assertEqual(
+            execution["prompt_digest"], hashlib.sha256((self.work / "prompt.txt").read_bytes()).hexdigest()
+        )
+        for key, value in sa.inspection_profile().items():
+            self.assertEqual(execution[key], value)
 
     def test_claude_trace_rejects_other_tools_and_unreadable_inline_compaction(self):
         (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"provider-only"}}')
@@ -685,6 +812,65 @@ class Run(unittest.TestCase):
         self.assertEqual(rows[0]["verdict"]["verdict"], "incomplete")
         self.assertEqual(rows[-1]["advanced"], self.target)
         self.assertNotIn("human_attestation", rows[-1])
+
+    def service_evidence(self, work, original):
+        import hashlib
+
+        (original / "prompt.txt").write_text("retained inspection")
+        (original / "execution.json").write_text(
+            sa.serialize(
+                {**sa.inspection_profile(), "prompt_digest": hashlib.sha256(b"retained inspection").hexdigest()}
+            )
+        )
+        blocked = work / "blocked.json"
+        value = json.loads(blocked.read_text())
+        value["reason"] = f"security-audit: codex failed; see {original}/model-stderr.txt"
+        blocked.write_text(sa.serialize(value))
+
+    def test_service_recovery_requires_no_recorded_verdict(self):
+        work, original, batch = self.retained_incomplete()
+        self.service_evidence(work, original)
+        with patch.object(sa, "inspect") as model, self.assertRaisesRegex(Die, "recorded verdict cannot"):
+            sa.resume_incomplete(SimpleNamespace(state=self.state), "Retry service", service=True)
+        model.assert_not_called()
+
+    def test_service_recovery_resumes_same_attempt_without_clearing_block_early(self):
+        work, original, batch = self.retained_incomplete()
+        (work / "ledger.jsonl").write_text("")
+        self.service_evidence(work, original)
+        (original / "model-transcript.jsonl").write_text(
+            json.dumps({"type": "turn.failed", "error": {"message": "service unavailable"}})
+        )
+        (original / "model-rollout-0.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": "11111111-2222-4333-8444-555555555555"}}) + "\n"
+        )
+
+        def model(value, provider, attempt, **kwargs):
+            self.assertEqual(value, batch)
+            self.assertEqual(kwargs["resume_from"], original.resolve())
+            self.assertTrue((work / "blocked.json").exists())
+            (attempt / "prompt.txt").write_text("same inspection")
+            return {"input_digest": batch["input_digest"], "commits": [self.target], "verdict": "pass", "findings": []}
+
+        with (
+            patch.object(sa, "validate_history", return_value=[self.target]),
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch.object(sa, "inspect", side_effect=model) as inspect,
+            patch.object(sa, "advance", return_value=self.target),
+        ):
+            sa.resume_incomplete(SimpleNamespace(state=self.state), "Retry service", service=True)
+        inspect.assert_called_once()
+        self.assertFalse((work / "blocked.json").exists())
+
+    def test_service_recovery_rejects_changed_reader_policy_before_model(self):
+        work, original, batch = self.retained_incomplete()
+        self.service_evidence(work, original)
+        execution = json.loads((original / "execution.json").read_text())
+        execution["reader_digest"] = "changed"
+        (original / "execution.json").write_text(sa.serialize(execution))
+        with patch.object(sa, "inspect") as model, self.assertRaisesRegex(Die, "implementation changed"):
+            sa.resume_incomplete(SimpleNamespace(state=self.state), "Retry service", service=True)
+        model.assert_not_called()
 
     def test_continuation_never_resumes_a_source_finding(self):
         work, original, batch = self.retained_incomplete(finding=True)

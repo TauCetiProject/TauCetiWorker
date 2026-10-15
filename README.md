@@ -194,7 +194,7 @@ needed, and returning incomplete if the full inspection cannot be completed.
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
 Worker code alone verifies ancestry and moves the ref.
 No Lean builds or candidate scripts run. A finding, incomplete inspection, oversized
-commit or model error stops advancement. Read the retained `security-audit/blocked.json`
+commit or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
 not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
 The input, actual launcher/environment/prompt, transcript, native Codex
@@ -202,7 +202,29 @@ compaction/usage records, read receipt (for larger inputs), and durable ledger a
 retained in the same directory. A pre-inspection commit-budget block from the old
 256 KiB planner can be archived and replanned when its exact next commit fits the
 new limits. This does not attest that commit or retry a model verdict: findings,
-incomplete inspections, client errors and other planning errors remain blocked.
+incomplete inspections, malformed answers, unauthorized tools and other planning errors remain blocked.
+
+A Codex service error with no final model answer is retried at most twice, after 5 and
+10 seconds. Each retry resumes the same native Luna conversation with unchanged
+source, inspection instructions, model, tool restrictions and read receipt.
+Progress notes are preserved in the same conversation; native message phases
+distinguish them from final answers. Failed requests and their evidence are retained under `service-error-N/` with a
+`service-retries.jsonl` record. A final answer (including a finding, incomplete verdict
+or malformed answer), unauthorized tool call, unknown event or malformed stream
+is never retried as a service error. Exhausted retries leave the cursor blocked.
+To retry a retained service failure after service recovery, an admin can run:
+
+```bash
+python3 -m tauceti_worker.security_audit retry-service --state /path/to/worker/state/security-audit \
+  --reason 'Retry interrupted provider request in the retained conversation'
+```
+
+This command verifies the retained failure contains a service error and no model
+final answer or recorded verdict, checks the unchanged input and next main prefix,
+verifies the retained prompt, launcher code, reader and catalog digests,
+and restores the same native conversation and read receipt. It preserves the
+block until a complete pass and confirmed reference update. No human source
+attestation is needed for a provider failure. Hard quota limits still apply.
 
 For the recorded legacy Luna failure where the final two pages were inaccessible
 because the reader token was lost, an admin may explicitly continue the **same

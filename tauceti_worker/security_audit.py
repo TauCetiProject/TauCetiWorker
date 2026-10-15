@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 from .audit_reader import pages
@@ -353,19 +354,175 @@ def reviewer_argv(provider: str) -> list[str]:
     raise Die("security-audit supports only Codex Luna or Claude Haiku")
 
 
+def codex_service_error(transcript: str, paged: bool, work: Path | None = None) -> str | None:
+    """Recognize a client error with no answer, never reinterpret a verdict."""
+    try:
+        events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+    except ValueError:
+        return None
+    notes = Counter()
+    if work is not None:
+        rollouts = list(work.glob("model-rollout-*.jsonl"))
+        if len(rollouts) != 1:
+            return None
+        try:
+            native = [json.loads(line) for line in rollouts[0].read_text().splitlines()]
+            for row in native:
+                item = row.get("payload", {})
+                if (
+                    row.get("type") == "response_item"
+                    and item.get("type") == "message"
+                    and item.get("role") == "assistant"
+                ):
+                    if item.get("phase") != "commentary":
+                        return None
+                    text = "".join(part["text"] for part in item["content"] if part.get("type") == "output_text")
+                    if '"verdict"' in text:
+                        return None
+                    notes[text] += 1
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+    errors = []
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        kind = event.get("type")
+        if kind in ("error", "turn.failed"):
+            errors.append(str(event.get("message") or event.get("error") or kind))
+        elif kind in ("thread.started", "turn.started"):
+            continue
+        elif kind in ("item.started", "item.updated", "item.completed"):
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return None
+            if item.get("type") == "reasoning" or (paged and item.get("type") == "context_compaction"):
+                continue
+            if (
+                paged
+                and item.get("type") == "mcp_tool_call"
+                and item.get("server") == "audit"
+                and item.get("tool") == "read_page"
+            ):
+                continue
+            if item.get("type") == "agent_message" and notes[item.get("text")] > 0:
+                # Public exec events omit phase. Only native, matching commentary
+                # may be carried forward; every final or unclassified answer stops.
+                notes[item["text"]] -= 1
+                continue
+            return None
+        else:
+            return None
+    return "; ".join(errors) if errors else None
+
+
+def retained_thread(work: Path) -> str:
+    try:
+        rollouts = list(work.glob("model-rollout-*.jsonl"))
+        if len(rollouts) != 1:
+            raise ValueError("expected exactly one native conversation")
+        meta = json.loads(rollouts[0].read_text(encoding="utf-8").splitlines()[0])
+        if meta.get("type") != "session_meta":
+            raise ValueError("missing session metadata")
+        return str(uuid.UUID(meta["payload"]["id"]))
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+        raise Die(f"security-audit: invalid retained native conversation: {exc}") from exc
+
+
+def inspection_profile() -> dict:
+    return {
+        "launcher_code_digest": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "reader_digest": hashlib.sha256(Path(__file__).with_name("audit_reader.py").read_bytes()).hexdigest(),
+        "catalog_digest": hashlib.sha256(serialize(CODEX_CATALOG).encode()).hexdigest(),
+    }
+
+
+CONTINUE_PROMPT = (
+    "Continue the SAME retained inspection conversation, preserving ALL previous findings, notes, and uncertainty. "
+    "All prior evidence remains recorded. Continue after the interrupted request; "
+    "this is not a new review or permission to discard earlier findings. Finish the unreviewed source, "
+    "Start by calling read_page with an empty token to recover the retained reader state if this input is paged. "
+    "Ignore the new manifest reader_token on this continuation. "
+    "Previously inspected pages remain inspected; re-read earlier pages as needed. "
+    "Return one verdict for the exact original batch.\n"
+)
+
+
+def retain_client(work: Path, home: Path, receipt: Path) -> None:
+    if receipt.exists():
+        (work / "read-receipt.json").write_bytes(receipt.read_bytes())
+    for i, rollout in enumerate(sorted((home / ".codex/sessions").rglob("*.jsonl"))):
+        (work / f"model-rollout-{i}.jsonl").write_bytes(rollout.read_bytes())
+
+
+def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged):
+    """At most three requests, resuming one native conversation on service errors."""
+    for number in range(3):
+        (work / "prompt.txt").write_text(prompt)
+        (work / "execution.json").write_text(
+            serialize(
+                {
+                    "argv": cmd,
+                    "environment": env,
+                    "paged": paged,
+                    "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                    **inspection_profile(),
+                }
+            )
+        )
+        try:
+            result = subprocess.run(cmd, input=prompt, cwd=home, env=env, text=True, capture_output=True, timeout=1800)
+        except subprocess.TimeoutExpired as exc:
+            (work / "model-transcript.jsonl").write_bytes(
+                (exc.stdout or b"") if isinstance(exc.stdout, bytes) else (exc.stdout or "").encode()
+            )
+            (work / "model-stderr.txt").write_bytes(
+                (exc.stderr or b"") if isinstance(exc.stderr, bytes) else (exc.stderr or "").encode()
+            )
+            raise
+        else:
+            (work / "model-transcript.jsonl").write_text(result.stdout)
+            (work / "model-stderr.txt").write_text(result.stderr)
+        finally:
+            retain_client(work, home, receipt)
+        if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
+            raise Die("security-audit: resumed client changed the retained conversation identity")
+        error = codex_service_error(result.stdout, paged, work) if provider == "codex" else None
+        if error is None or number == 2:
+            return result
+        thread = retained_thread(work)
+        # Retain every failed launch before replacing the top-level evidence
+        # with the next launch. Source, policy, model and native UUID stay fixed.
+        archive = work / f"service-error-{number + 1}"
+        archive.mkdir()
+        for path in work.iterdir():
+            if path.is_file() and path.name != "service-retries.jsonl":
+                (archive / path.name).write_bytes(path.read_bytes())
+        notes = [
+            event["item"]["text"]
+            for event in map(json.loads, result.stdout.splitlines())
+            if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
+        ]
+        record(
+            work / "service-retries.jsonl",
+            {"service_error": error, "thread": thread, "retry": number + 1, "preserved_progress_notes": notes},
+        )
+        prefix = cmd[: cmd.index("resume")] if "resume" in cmd else cmd[:-1]
+        cmd = [*prefix, "resume", thread, "-"]
+        if not prompt.startswith(CONTINUE_PROMPT):
+            prompt = CONTINUE_PROMPT + prompt
+        log(f"security-audit: service error; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s")
+        time.sleep(5 * (number + 1))
+    raise AssertionError("unreachable")
+
+
 def inspect(batch: dict, provider: str, work: Path, *, resume_from: Path | None = None) -> dict:
     cmd = reviewer_argv(provider)
     thread = None
     if resume_from is not None:
         if provider != "codex":
             raise Die("security-audit: retained-session continuation supports Codex only")
+        thread = retained_thread(resume_from)
         rollouts = list(resume_from.glob("model-rollout-*.jsonl"))
-        if len(rollouts) != 1:
-            raise Die("security-audit: continuation requires exactly one retained native conversation")
-        meta = json.loads(rollouts[0].read_text(encoding="utf-8").splitlines()[0])
-        if meta.get("type") != "session_meta":
-            raise Die("security-audit: missing retained session identity")
-        thread = str(uuid.UUID(meta["payload"]["id"]))
     paged = len(serialize(batch).encode()) > INLINE_BYTES
     with tempfile.TemporaryDirectory(prefix="tauceti-security-review-") as tmp:
         home = Path(tmp)
@@ -418,7 +575,8 @@ def inspect(batch: dict, provider: str, work: Path, *, resume_from: Path | None 
             sessions.mkdir(parents=True)
             name = time.strftime("rollout-%Y-%m-%dT%H-%M-%S-", time.gmtime()) + thread + ".jsonl"
             (sessions / name).write_bytes(rollouts[0].read_bytes())
-            receipt.write_bytes((resume_from / "read-receipt.json").read_bytes())
+            if paged and (resume_from / "read-receipt.json").exists():
+                receipt.write_bytes((resume_from / "read-receipt.json").read_bytes())
             cmd[-1:] = ["resume", thread, "-"]
         if paged:
             schema_value = {
@@ -465,14 +623,7 @@ Manifest:\n"""
                 + serialize(manifest)
             )
             if resume_from is not None:
-                prompt = (
-                    "Continue the SAME retained inspection conversation, preserving ALL previous findings, notes, and uncertainty. "
-                    "The prior incomplete verdict remains recorded. A reader-token transport failure has been repaired; "
-                    "this is not a new review or permission to discard earlier findings. Finish the unreviewed source, "
-                    "Start by calling read_page with an empty token to recover the retained reader state. "
-                    "Ignore the new manifest reader_token on this continuation. "
-                    "re-read earlier pages as needed, and return one verdict for the exact original batch.\n" + prompt
-                )
+                prompt = CONTINUE_PROMPT + prompt
             if provider == "codex":
                 insert = cmd.index("resume") if resume_from is not None else len(cmd) - 1
                 cmd[insert:insert] = [
@@ -513,36 +664,7 @@ Manifest:\n"""
         else:
             cmd += ["--json-schema", serialize(schema_value)]
         (work / "prompt.txt").write_text(prompt)
-        (work / "execution.json").write_text(
-            serialize(
-                {
-                    "argv": cmd,
-                    "environment": env,
-                    "paged": paged,
-                    "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
-                }
-            )
-        )
-        try:
-            p = subprocess.run(cmd, input=prompt, cwd=home, env=env, text=True, capture_output=True, timeout=1800)
-        except subprocess.TimeoutExpired as exc:
-            (work / "model-transcript.jsonl").write_bytes(
-                (exc.stdout or b"") if isinstance(exc.stdout, bytes) else (exc.stdout or "").encode()
-            )
-            (work / "model-stderr.txt").write_bytes(
-                (exc.stderr or b"") if isinstance(exc.stderr, bytes) else (exc.stderr or "").encode()
-            )
-            raise
-        else:
-            (work / "model-transcript.jsonl").write_text(p.stdout)
-            (work / "model-stderr.txt").write_text(p.stderr)
-        finally:
-            if receipt.exists():
-                (work / "read-receipt.json").write_bytes(receipt.read_bytes())
-            # This isolated HOME is deleted below. Retain native compaction and
-            # per-request usage evidence as well as the public exec event stream.
-            for i, rollout in enumerate(sorted((home / ".codex/sessions").rglob("*.jsonl"))):
-                (work / f"model-rollout-{i}.jsonl").write_bytes(rollout.read_bytes())
+        p = run_client(cmd, prompt, home=home, env=env, work=work, receipt=receipt, provider=provider, paged=paged)
         if p.returncode:
             raise Die(f"security-audit: {provider} failed; see {work / 'model-stderr.txt'}")
         if provider == "claude":
@@ -662,7 +784,7 @@ def run(cfg, opts) -> int:
     )
     if not opts.dry_run and previous.get("from_sha") == cursor and not size_failure:
         raise NoProgress(
-            f"security-audit: unresolved inspection; read {blocked}; use explicit admin attestation after human review"
+            f"security-audit: unresolved inspection; read {blocked}; retry-service may continue a provider failure; source verdicts require human review"
         )
     try:
         batch = plan_batch(repo, cursor, main)
@@ -753,7 +875,7 @@ def run(cfg, opts) -> int:
         raise Die(f"security-audit: stopped without approval; see {blocked}: {exc}") from exc
 
 
-def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False) -> str:
+def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False, service: bool = False) -> str:
     """Explicit admin continuation of the same retained Luna conversation.
 
     Never create a fresh review, resume a finding, attest source, or remove the
@@ -777,33 +899,54 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False) -> str:
         raise Die("security-audit: retained input digest mismatch")
     rows = [json.loads(line) for line in (work / "ledger.jsonl").read_text(encoding="utf-8").splitlines()]
     reviews = [r for r in rows if r.get("batch") == batch["input_digest"] and "verdict" in r]
-    if not reviews or any(r["verdict"]["verdict"] == "finding" for r in reviews):
-        raise Die("security-audit: a finding cannot be continued or re-reviewed")
-    if any(r.get("batch") == batch["input_digest"] and "continuation_of" in r for r in rows):
-        raise Die("security-audit: this batch already used its single administrative continuation")
-    last = reviews[-1]
-    if (
-        last.get("provider") != "codex"
-        or last.get("model") != "gpt-6-luna"
-        or last["verdict"]["verdict"] != "incomplete"
-    ):
-        raise Die("security-audit: only an incomplete retained Luna conversation can be continued")
-    validate_verdict(last["verdict"], batch)
-    failures = last["verdict"]["findings"]
-    if len(failures) != 1 or not re.fullmatch(
-        r"Unable to inspect pages [0-9]+[–-][0-9]+: the available reader token could not be validated, "
-        r"so the final two pages and their source changes remain unreviewed\.",
-        failures[0],
-    ):
-        raise Die("security-audit: continuation is restricted to the recorded reader-token transport failure")
-    if (
-        set(previous) != {"from_sha", "to_sha", "reason", "attempt"}
-        or previous["reason"] != "security-audit: " + failures[0]
-        or not isinstance(last.get("execution_record"), str)
-        or Path(last["execution_record"]).resolve() != original / "execution.json"
-        or last.get("reader_digest") != LEGACY_READER_DIGEST
-    ):
-        raise Die("security-audit: continuation does not match the original recorded transport block")
+    if service:
+        if set(previous) not in (
+            {"from_sha", "to_sha", "reason", "attempt"},
+            {"from_sha", "to_sha", "reason", "attempt", "continuation_of"},
+        ) or previous.get("reason") not in (
+            f"security-audit: codex failed; see {previous['attempt']}/model-stderr.txt",
+            "security-audit: model failed",
+        ):
+            raise Die("security-audit: block does not record a provider request failure")
+        execution = json.loads((original / "execution.json").read_text())
+        if any(execution.get(key) != value for key, value in inspection_profile().items()):
+            raise Die("security-audit: inspection implementation changed since the failed request")
+        if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
+            raise Die("security-audit: retained inspection prompt digest mismatch")
+        if reviews:
+            raise Die("security-audit: a recorded verdict cannot be retried as a service error")
+        transcript = (original / "model-transcript.jsonl").read_text(encoding="utf-8")
+        if codex_service_error(transcript, len(serialize(batch).encode()) > INLINE_BYTES, original) is None:
+            raise Die("security-audit: retained failure is not a service error without an answer")
+        retained_thread(original)
+    else:
+        if not reviews or any(r["verdict"]["verdict"] == "finding" for r in reviews):
+            raise Die("security-audit: a finding cannot be continued or re-reviewed")
+        if any(r.get("batch") == batch["input_digest"] and "continuation_of" in r for r in rows):
+            raise Die("security-audit: this batch already used its single administrative continuation")
+        last = reviews[-1]
+        if (
+            last.get("provider") != "codex"
+            or last.get("model") != "gpt-6-luna"
+            or last["verdict"]["verdict"] != "incomplete"
+        ):
+            raise Die("security-audit: only an incomplete retained Luna conversation can be continued")
+        validate_verdict(last["verdict"], batch)
+        failures = last["verdict"]["findings"]
+        if len(failures) != 1 or not re.fullmatch(
+            r"Unable to inspect pages [0-9]+[–-][0-9]+: the available reader token could not be validated, "
+            r"so the final two pages and their source changes remain unreviewed\.",
+            failures[0],
+        ):
+            raise Die("security-audit: continuation is restricted to the recorded reader-token transport failure")
+        if (
+            set(previous) != {"from_sha", "to_sha", "reason", "attempt"}
+            or previous["reason"] != "security-audit: " + failures[0]
+            or not isinstance(last.get("execution_record"), str)
+            or Path(last["execution_record"]).resolve() != original / "execution.json"
+            or last.get("reader_digest") != LEGACY_READER_DIGEST
+        ):
+            raise Die("security-audit: continuation does not match the original recorded transport block")
     target = batch["commits"][-1]["sha"]
     if batch["from_sha"] != cursor or previous.get("to_sha") != target:
         raise Die("security-audit: continuation range does not match the retained block")
@@ -993,7 +1136,7 @@ def setup(state: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "attest", "resume"])
+    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service"])
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--through", help="full main commit SHA reviewed by the human administrator")
     parser.add_argument("--reason", help="human review evidence; never a model re-roll")
@@ -1001,7 +1144,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.command == "setup":
         setup(args.state)
-    elif args.command == "resume":
+    elif args.command in ("resume", "retry-service"):
         from .config import Config
         from .round import RoundContext
 
@@ -1011,7 +1154,7 @@ if __name__ == "__main__":
         if (cfg.state / CURSOR).resolve() != args.state.resolve():
             parser.error("resume --state must identify this checkout's existing worker audit state")
         with RoundContext(cfg):
-            resume_incomplete(cfg, args.reason, ignore_quota=args.ignore_quota)
+            resume_incomplete(cfg, args.reason, ignore_quota=args.ignore_quota, service=args.command == "retry-service")
     elif args.through is None or args.reason is None:
         parser.error("attest requires --through and --reason")
     else:
