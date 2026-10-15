@@ -226,7 +226,7 @@ and restores the same native conversation and read receipt. It preserves the
 block until a complete pass and confirmed reference update. No human source
 attestation is needed for a provider failure. Hard quota limits still apply.
 
-An unexplained `incomplete` answer with an empty findings list, or a `pass` whose
+An unexplained `incomplete` answer with an empty findings list, or a paged `pass` whose
 input digest omits only its final character, is eligible for bounded output repair only when its digest, commit list, schema, full page coverage
 and final receipt token otherwise validate (inline inputs need no receipt). The same retained conversation may
 produce a consistent answer; uncertainty must be explained and source findings

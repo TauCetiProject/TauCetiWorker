@@ -424,7 +424,7 @@ def repair_history(work: Path, batch: dict, paged: bool) -> bool:
 
 
 def repairable_output(transcript: str, batch: dict, receipt: Path, paged: bool, work: Path | None = None) -> bool:
-    """Only an unexplained incomplete with proven complete input delivery."""
+    """Only an empty incomplete or one-character digest omission with full delivery."""
     try:
         events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
         if any(
@@ -665,6 +665,66 @@ def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged, batch=
     raise AssertionError("unreachable")
 
 
+def codex_launch(home: Path, paged: bool, token: str = "", thread: str | None = None) -> list[str]:
+    cmd = reviewer_argv("codex")[:-1]
+    if paged:
+        reader = [
+            str(Path(__file__).with_name("audit_reader.py").resolve()),
+            str(home / "input.json"),
+            str(home / "read-receipt.json"),
+            token,
+        ]
+        cmd += [
+            "-c",
+            "mcp_servers.audit.command=" + json.dumps(sys.executable),
+            "-c",
+            "mcp_servers.audit.args=" + json.dumps(["-I", *reader]),
+            "-c",
+            'mcp_servers.audit.enabled_tools=["read_page"]',
+            "-c",
+            "mcp_servers.audit.required=true",
+            "-c",
+            'mcp_servers.audit.tools.read_page.approval_mode="approve"',
+            "-c",
+            "mcp_servers.audit.tools.read_page.output_token_limit=120000",
+        ]
+    cmd += [
+        "--output-schema",
+        str(home / "verdict-schema.json"),
+        "-c",
+        "model_catalog_json=" + json.dumps(str(home / "model-catalog.json")),
+    ]
+    return cmd + (["resume", thread, "-"] if thread else ["-"])
+
+
+def validate_output_profile(execution: dict, original: Path, batch: dict) -> None:
+    paged = len(serialize(batch).encode()) > INLINE_BYTES
+    if execution.get("paged") is not paged:
+        raise Die("security-audit: retained input delivery mode changed")
+    prompt = (original / "prompt.txt").read_text()
+    while prompt.startswith((OUTPUT_REPAIR_PROMPT, CONTINUE_PROMPT)):
+        prompt = prompt[
+            len(OUTPUT_REPAIR_PROMPT) if prompt.startswith(OUTPUT_REPAIR_PROMPT) else len(CONTINUE_PROMPT) :
+        ]
+    if not prompt.startswith(PROMPT):
+        raise Die("security-audit: retained prompt does not use the current inspection policy")
+    if batch["input_digest"] not in prompt:
+        raise Die("security-audit: retained prompt does not identify the original input")
+    home = Path(execution["environment"]["HOME"])
+    argv = execution["argv"]
+    token = ""
+    if paged:
+        candidates = [arg for arg in argv if arg.startswith("mcp_servers.audit.args=")]
+        if len(candidates) != 1:
+            raise Die("security-audit: retained launcher must have one fixed input reader")
+        token = json.loads(candidates[0].split("=", 1)[1])[-1]
+        if not isinstance(token, str) or not re.fullmatch("[0-9a-f]{32}", token):
+            raise Die("security-audit: invalid retained reader bootstrap token")
+    thread = retained_thread(original) if "resume" in argv else None
+    if argv != codex_launch(home, paged, token, thread):
+        raise Die("security-audit: retained launcher does not match the complete isolated Luna profile")
+
+
 def inspect(
     batch: dict, provider: str, work: Path, *, resume_from: Path | None = None, repair_output: bool = False
 ) -> dict:
@@ -779,23 +839,7 @@ Manifest:\n"""
             )
             if resume_from is not None:
                 prompt = CONTINUE_PROMPT + prompt
-            if provider == "codex":
-                insert = cmd.index("resume") if resume_from is not None else len(cmd) - 1
-                cmd[insert:insert] = [
-                    "-c",
-                    "mcp_servers.audit.command=" + json.dumps(sys.executable),
-                    "-c",
-                    "mcp_servers.audit.args=" + json.dumps(["-I", *reader]),
-                    "-c",
-                    'mcp_servers.audit.enabled_tools=["read_page"]',
-                    "-c",
-                    "mcp_servers.audit.required=true",
-                    "-c",
-                    'mcp_servers.audit.tools.read_page.approval_mode="approve"',
-                    "-c",
-                    "mcp_servers.audit.tools.read_page.output_token_limit=120000",
-                ]
-            else:
+            if provider == "claude":
                 # Safe mode suppresses even this explicitly configured MCP
                 # server. The empty HOME, --restricted, empty settings sources,
                 # empty built-in tools and strict MCP config provide isolation.
@@ -809,13 +853,7 @@ Manifest:\n"""
             schema.write_text(serialize(schema_value))
             catalog = home / "model-catalog.json"
             catalog.write_text(serialize(CODEX_CATALOG))
-            insert = cmd.index("resume") if resume_from is not None else len(cmd) - 1
-            cmd[insert:insert] = [
-                "--output-schema",
-                str(schema),
-                "-c",
-                "model_catalog_json=" + json.dumps(str(catalog)),
-            ]
+            cmd = codex_launch(home, paged, token if paged else "", thread)
         else:
             cmd += ["--json-schema", serialize(schema_value)]
         (work / "prompt.txt").write_text(prompt)
@@ -1128,9 +1166,7 @@ def resume_incomplete(
         if not legacy and not reader_compat:
             if any(execution.get(key) != profile[key] for key in ("reader_digest", "catalog_digest")):
                 raise Die("security-audit: inspection reader or policy changed since malformed output")
-            prefix = reviewer_argv("codex")[:-1]
-            if execution.get("argv", [])[: len(prefix)] != prefix:
-                raise Die("security-audit: retained launcher does not match the isolated Luna profile")
+            validate_output_profile(execution, original, batch)
         if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
             raise Die("security-audit: retained inspection prompt digest mismatch")
     elif service:
