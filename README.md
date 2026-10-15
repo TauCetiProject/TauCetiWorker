@@ -206,7 +206,7 @@ incomplete inspections, malformed answers, unauthorized tools and other planning
 
 A Codex service error with no final model answer is retried at most twice, after 5 and
 10 seconds. Each retry resumes the same native Luna conversation with unchanged
-source, inspection instructions, model, tool restrictions and read receipt. All
+source, inspection instructions, model, tool restrictions and read receipt.
 Progress notes are preserved in the same conversation; native message phases
 distinguish them from final answers. Failed requests and their evidence are retained under `service-error-N/` with a
 `service-retries.jsonl` record. A final answer (including a finding, incomplete verdict
@@ -221,6 +221,7 @@ python3 -m tauceti_worker.security_audit retry-service --state /path/to/worker/s
 
 This command verifies the retained failure contains a service error and no model
 final answer or recorded verdict, checks the unchanged input and next main prefix,
+verifies the retained prompt, launcher code, reader and catalog digests,
 and restores the same native conversation and read receipt. It preserves the
 block until a complete pass and confirmed reference update. No human source
 attestation is needed for a provider failure. Hard quota limits still apply.

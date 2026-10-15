@@ -416,13 +416,35 @@ def codex_service_error(transcript: str, paged: bool, work: Path | None = None) 
 
 
 def retained_thread(work: Path) -> str:
-    rollouts = list(work.glob("model-rollout-*.jsonl"))
-    if len(rollouts) != 1:
-        raise Die("security-audit: continuation requires exactly one retained native conversation")
-    meta = json.loads(rollouts[0].read_text(encoding="utf-8").splitlines()[0])
-    if meta.get("type") != "session_meta":
-        raise Die("security-audit: missing retained session identity")
-    return str(uuid.UUID(meta["payload"]["id"]))
+    try:
+        rollouts = list(work.glob("model-rollout-*.jsonl"))
+        if len(rollouts) != 1:
+            raise ValueError("expected exactly one native conversation")
+        meta = json.loads(rollouts[0].read_text(encoding="utf-8").splitlines()[0])
+        if meta.get("type") != "session_meta":
+            raise ValueError("missing session metadata")
+        return str(uuid.UUID(meta["payload"]["id"]))
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+        raise Die(f"security-audit: invalid retained native conversation: {exc}") from exc
+
+
+def inspection_profile() -> dict:
+    return {
+        "launcher_code_digest": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "reader_digest": hashlib.sha256(Path(__file__).with_name("audit_reader.py").read_bytes()).hexdigest(),
+        "catalog_digest": hashlib.sha256(serialize(CODEX_CATALOG).encode()).hexdigest(),
+    }
+
+
+CONTINUE_PROMPT = (
+    "Continue the SAME retained inspection conversation, preserving ALL previous findings, notes, and uncertainty. "
+    "All prior evidence remains recorded. Continue after the interrupted request; "
+    "this is not a new review or permission to discard earlier findings. Finish the unreviewed source, "
+    "Start by calling read_page with an empty token to recover the retained reader state if this input is paged. "
+    "Ignore the new manifest reader_token on this continuation. "
+    "Previously inspected pages remain inspected; re-read earlier pages as needed. "
+    "Return one verdict for the exact original batch.\n"
+)
 
 
 def retain_client(work: Path, home: Path, receipt: Path) -> None:
@@ -435,6 +457,7 @@ def retain_client(work: Path, home: Path, receipt: Path) -> None:
 def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged):
     """At most three requests, resuming one native conversation on service errors."""
     for number in range(3):
+        (work / "prompt.txt").write_text(prompt)
         (work / "execution.json").write_text(
             serialize(
                 {
@@ -442,6 +465,7 @@ def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged):
                     "environment": env,
                     "paged": paged,
                     "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                    **inspection_profile(),
                 }
             )
         )
@@ -473,9 +497,19 @@ def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged):
         for path in work.iterdir():
             if path.is_file() and path.name != "service-retries.jsonl":
                 (archive / path.name).write_bytes(path.read_bytes())
-        record(work / "service-retries.jsonl", {"service_error": error, "thread": thread, "retry": number + 1})
+        notes = [
+            event["item"]["text"]
+            for event in map(json.loads, result.stdout.splitlines())
+            if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
+        ]
+        record(
+            work / "service-retries.jsonl",
+            {"service_error": error, "thread": thread, "retry": number + 1, "preserved_progress_notes": notes},
+        )
         prefix = cmd[: cmd.index("resume")] if "resume" in cmd else cmd[:-1]
         cmd = [*prefix, "resume", thread, "-"]
+        if not prompt.startswith(CONTINUE_PROMPT):
+            prompt = CONTINUE_PROMPT + prompt
         log(f"security-audit: service error; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s")
         time.sleep(5 * (number + 1))
     raise AssertionError("unreachable")
@@ -541,7 +575,7 @@ def inspect(batch: dict, provider: str, work: Path, *, resume_from: Path | None 
             sessions.mkdir(parents=True)
             name = time.strftime("rollout-%Y-%m-%dT%H-%M-%S-", time.gmtime()) + thread + ".jsonl"
             (sessions / name).write_bytes(rollouts[0].read_bytes())
-            if paged:
+            if paged and (resume_from / "read-receipt.json").exists():
                 receipt.write_bytes((resume_from / "read-receipt.json").read_bytes())
             cmd[-1:] = ["resume", thread, "-"]
         if paged:
@@ -589,14 +623,7 @@ Manifest:\n"""
                 + serialize(manifest)
             )
             if resume_from is not None:
-                prompt = (
-                    "Continue the SAME retained inspection conversation, preserving ALL previous findings, notes, and uncertainty. "
-                    "All prior evidence remains recorded. Continue after the interrupted request; "
-                    "this is not a new review or permission to discard earlier findings. Finish the unreviewed source, "
-                    "Start by calling read_page with an empty token to recover the retained reader state. "
-                    "Ignore the new manifest reader_token on this continuation. "
-                    "re-read earlier pages as needed, and return one verdict for the exact original batch.\n" + prompt
-                )
+                prompt = CONTINUE_PROMPT + prompt
             if provider == "codex":
                 insert = cmd.index("resume") if resume_from is not None else len(cmd) - 1
                 cmd[insert:insert] = [
@@ -757,7 +784,7 @@ def run(cfg, opts) -> int:
     )
     if not opts.dry_run and previous.get("from_sha") == cursor and not size_failure:
         raise NoProgress(
-            f"security-audit: unresolved inspection; read {blocked}; use explicit admin attestation after human review"
+            f"security-audit: unresolved inspection; read {blocked}; retry-service may continue a provider failure; source verdicts require human review"
         )
     try:
         batch = plan_batch(repo, cursor, main)
@@ -873,6 +900,19 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False, service: 
     rows = [json.loads(line) for line in (work / "ledger.jsonl").read_text(encoding="utf-8").splitlines()]
     reviews = [r for r in rows if r.get("batch") == batch["input_digest"] and "verdict" in r]
     if service:
+        if set(previous) not in (
+            {"from_sha", "to_sha", "reason", "attempt"},
+            {"from_sha", "to_sha", "reason", "attempt", "continuation_of"},
+        ) or previous.get("reason") not in (
+            f"security-audit: codex failed; see {previous['attempt']}/model-stderr.txt",
+            "security-audit: model failed",
+        ):
+            raise Die("security-audit: block does not record a provider request failure")
+        execution = json.loads((original / "execution.json").read_text())
+        if any(execution.get(key) != value for key, value in inspection_profile().items()):
+            raise Die("security-audit: inspection implementation changed since the failed request")
+        if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
+            raise Die("security-audit: retained inspection prompt digest mismatch")
         if reviews:
             raise Die("security-audit: a recorded verdict cannot be retried as a service error")
         transcript = (original / "model-transcript.jsonl").read_text(encoding="utf-8")
