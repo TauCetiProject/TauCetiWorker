@@ -1,0 +1,28 @@
+{
+  "external_mutations": false,
+  "github_ci_review": "simulated",
+  "starting_head": "55612b30037b4e87e3110e1b159caab3af69f34b",
+  "tested_main": "2fc98d35436c0b009c7ffdb267fe89fceb363ac4",
+  "repaired_head": "13ffd0387bf703a4d55ca75e434bb601bde631da",
+  "finding": {
+    "pr": 1,
+    "head_sha": "55612b30037b4e87e3110e1b159caab3af69f34b",
+    "base_sha": "2fc98d35436c0b009c7ffdb267fe89fceb363ac4",
+    "policy": "local-source-v1",
+    "status": "missing_source",
+    "tree": "dfde380f1e3e0e653d015ac6f662174b82c8c936",
+    "missing_imports": [
+      {
+        "path": "TauCeti/Consumer.lean",
+        "module": "TauCeti.VariableChange",
+        "provider_path": "TauCeti/VariableChange.lean"
+      }
+    ],
+    "coverage": "all_project_local_headers"
+  },
+  "checks": {
+    "build": "\u2714 [4/5] Built TauCeti.Consumer (117ms)\nBuild completed successfully (5 jobs).",
+    "axioms": "'Fixture.branch_value' does not depend on any axioms"
+  },
+  "result": "source finding -> authenticated request -> owned worker -> semantic repair -> actual CAS push -> fresh-head eligibility"
+}
