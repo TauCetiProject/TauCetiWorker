@@ -65,14 +65,18 @@ def fake_worker(state):
     return types.SimpleNamespace(
         cfg=types.SimpleNamespace(state=state, logdir=state, wid="w", store_dir=state / "store"),
         counters=Counters(),
-        rs=types.SimpleNamespace(bust=lambda pr: None, review_rounds=lambda pr, c: 0),
+        rs=types.SimpleNamespace(
+            bust=lambda pr: None, gh_meta=lambda pr: types.SimpleNamespace(data={}), review_rounds=lambda pr, c: 0
+        ),
         gh=types.SimpleNamespace(add_reaction=lambda i: True, remove_reaction=lambda i: True),
     )
 
 
-def drive(rc, state):
+def drive(rc, state, posted=None, prior_errors=0):
     """Run do_review with the engine stubbed to return `rc`; return (worker, raised)."""
     w = fake_worker(state)
+    w.counters.write("review-err-42", prior_errors)
+    w.rs.gh_meta = lambda pr: types.SimpleNamespace(data=posted or {})
     c = types.SimpleNamespace(pr=42, head="a" * 40, contest=None, contest_reply_id=None)
     opts = types.SimpleNamespace(work_model="claude")
     sv = types.SimpleNamespace()
@@ -108,9 +112,20 @@ def main():
         check("an ordinary failure is charged", w2.counters.read("review-err-42") == 1)
 
         # 3) a posted review still clears the streak.
-        w3, raised3, out3 = drive(0, state)
+        w3, raised3, out3 = drive(0, state, prior_errors=2)
         check("success does not raise", raised3 is None and out3 == 0)
         check("success clears the streak", w3.counters.read("review-err-42") == 0)
+
+        # A zero exit carrying an error verdict is not a successful review.
+        posted = {"head_sha": "a" * 40, "runs": [{"verdict": "error"}]}
+        w4, raised4, out4 = drive(0, state, posted=posted, prior_errors=2)
+        check("posted error preserves and increments the streak", w4.counters.read("review-err-42") == 3)
+        check("posted error retains failure evidence", bool(read_review_failure(state, 42)))
+        check("posted scoreboard still completes normally", raised4 is None and out4 == 0)
+        # A stale scoreboard cannot charge errors to the new head.
+        old = {"head_sha": "b" * 40, "runs": [{"verdict": "error"}]}
+        w5, _, _ = drive(0, state, posted=old, prior_errors=2)
+        check("stale error is not charged", w5.counters.read("review-err-42") == 0)
 
         # 4) the status is distinct from the ordinary failure statuses it must be told apart from.
         check("the carve-out status is not 0 or 1", REVIEW_PROVIDER_DOWN_EXIT not in (0, 1))

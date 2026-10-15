@@ -52,6 +52,9 @@ class FakeRS:
     def review_rounds(self, pr, counters):
         return 0
 
+    def gh_meta(self, pr):
+        return types.SimpleNamespace(data={})
+
     def bust(self, pr):
         self.busted.append(pr)
 

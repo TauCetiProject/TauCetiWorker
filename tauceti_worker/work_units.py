@@ -1102,13 +1102,28 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
             raise admission_failure(reason)
         if rc == 0:
-            # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
-            # the "errored without posting a verdict" streak up front — BEFORE the publish step, which is
-            # a separate machine-wide concern. Otherwise a pre-post error streak (e.g. errkey=2) could
-            # combine with one later engine error to trip the escalation cap a round after a verdict was
-            # in fact posted, contradicting the "errored Nx without posting a verdict" message.
-            w.counters.write(errkey, 0)
-            clear_review_failure(w.cfg.state, pr)
+            w.rs.bust(pr)
+            posted = w.rs.gh_meta(pr).data
+            posted_error = posted.get("head_sha") == head and any(
+                run.get("verdict") == "error" for run in posted.get("runs") or []
+            )
+            if posted_error:
+                # A posted infrastructure error is still a failed review, even when the engine
+                # exits zero. Preserve the existing error streak instead of retrying it as success.
+                w.counters.incr(errkey)
+                record_review_failure(
+                    w.cfg.state,
+                    worker=w.cfg.wid,
+                    pr=pr,
+                    head=head,
+                    provider=reviewers,
+                    code=0,
+                    reason="review engine posted an error verdict at the current head",
+                    log_file=None if bubble else logf,
+                )
+            else:
+                w.counters.write(errkey, 0)
+                clear_review_failure(w.cfg.state, pr)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
             # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
@@ -1124,13 +1139,12 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     f"{w.cfg.store_dir / 'outbox'}. This archive failure is NOT charged to the PR; "
                     f"check the host's git/gh credentials. A later review retries the whole outbox."
                 )
-            if c.contest:
+            if c.contest and not posted_error:
                 # The engine advanced replies_through in the new scoreboard (the durable per-reply
                 # watermark); rs.bust below re-fetches it, so this contest won't re-fire once the 👀
                 # is dropped. Just bump the contest caps.
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
-            w.rs.bust(pr)
         elif blocked_since(github_started):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:

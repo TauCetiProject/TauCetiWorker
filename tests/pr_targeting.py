@@ -5,7 +5,7 @@ The flag exists so an operator can say "work on #412" and get that, or an honest
 not. The properties that make it safe to hand to an operator, and that this suite pins down:
 
   - it only ever REMOVES. A named PR the survey passed over does not become actionable by being
-    named, so the attempt budgets, the daily review cap, a peer's in-progress review and the branch
+    named, so the attempt budgets, a peer's in-progress review and the branch
     claims all still hold. `--pr` is a filter over what the round was already willing to do.
   - it composes with `--only` by intersection, and refuses up front when the two cannot both be
     honoured (`--only roadmap --pr 5` names a PR that does not exist yet).
