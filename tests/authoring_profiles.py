@@ -208,7 +208,7 @@ try:
     for only in (["security-audit"], ["bump", "progress", "security-audit"]):
         for provider in ("claude", "codex"):
             captured.clear()
-            tc.loop.choose_model = lambda *_a, **_k: (provider, {})
+            tc.loop.choose_model = lambda *_a, _provider=provider, **_k: (_provider, {})
             tc.loop.github_budget = lambda: {}
             tc.loop.run_round_subprocess = capture
             try:
@@ -222,7 +222,9 @@ try:
             check("audit child retains provider", captured[captured.index("--agent") + 1], provider)
             check("audit child has no authoring model override", "--author-model" in captured, False)
             check("audit child has no authoring effort override", "--author-effort" in captured, False)
-            check("audit child has no authoring fallback override", "--resolved-author-fallback-model" in captured, False)
+            check(
+                "audit child has no authoring fallback override", "--resolved-author-fallback-model" in captured, False
+            )
 
     # The default Codex profile remains fallback-eligible after the loop parent pins Sol into its child.
     captured.clear()
