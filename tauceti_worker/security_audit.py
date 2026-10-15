@@ -354,6 +354,60 @@ def reviewer_argv(provider: str) -> list[str]:
     raise Die("security-audit supports only Codex Luna or Claude Haiku")
 
 
+def codex_final(transcript: str, paged: bool) -> dict:
+    events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+    allowed = {"agent_message", "reasoning"} | ({"context_compaction"} if paged else set())
+    for event in events:
+        if event.get("type") in ("error", "turn.failed"):
+            raise Die("security-audit: model failed")
+        if event.get("type", "").startswith("item."):
+            item = event.get("item", {})
+            if (
+                paged
+                and item.get("type") == "mcp_tool_call"
+                and item.get("server") == "audit"
+                and item.get("tool") == "read_page"
+            ):
+                continue
+            if item.get("type") not in allowed:
+                raise Die("security-audit: reviewer attempted an unauthorized tool call")
+    messages = [
+        event["item"].get("text", "")
+        for event in events
+        if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
+    ]
+    if not messages or not any(event.get("type") == "turn.completed" for event in events):
+        raise Die("security-audit: incomplete model response")
+    return json.loads(messages[-1])
+
+
+def repairable_output(transcript: str, batch: dict, receipt: Path, paged: bool) -> bool:
+    """Only an unexplained incomplete with proven complete input delivery."""
+    try:
+        value = codex_final(transcript, paged)
+        if not isinstance(value, dict) or value.get("verdict") != "incomplete" or value.get("findings") != []:
+            return False
+        token = value.pop("read_token", None) if paged else None
+        # Validate every other schema field, identity and the complete receipt.
+        # This hypothetical pass is used only as a validator, never returned or
+        # recorded as a verdict; only a new model answer can approve the batch.
+        probe = {**value, "verdict": "pass"}
+        validate_verdict(probe, batch)
+        validate_reads(probe, batch, receipt, paged, token)
+        return True
+    except (Die, ValueError, TypeError, AttributeError, KeyError, OSError):
+        return False
+
+
+OUTPUT_REPAIR_PROMPT = (
+    "Your previous final JSON returned incomplete but findings was empty. That answer is malformed. "
+    "Repair the output in this SAME inspection, preserving ALL prior findings, notes and uncertainty. "
+    "If you cannot establish safety, return incomplete with a nonempty explanation; if you found a concern, "
+    "return finding and retain it. Return pass only if you have actually established safety for the ENTIRE "
+    "original batch. Do not infer pass from page delivery or from this repair request.\n"
+)
+
+
 def codex_service_error(transcript: str, paged: bool, work: Path | None = None) -> str | None:
     """Recognize a client error with no answer, never reinterpret a verdict."""
     try:
@@ -454,8 +508,8 @@ def retain_client(work: Path, home: Path, receipt: Path) -> None:
         (work / f"model-rollout-{i}.jsonl").write_bytes(rollout.read_bytes())
 
 
-def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged):
-    """At most three requests, resuming one native conversation on service errors."""
+def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged, batch=None):
+    """At most three requests, resuming one conversation for service/output recovery."""
     for number in range(3):
         (work / "prompt.txt").write_text(prompt)
         (work / "execution.json").write_text(
@@ -487,15 +541,21 @@ def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged):
         if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
             raise Die("security-audit: resumed client changed the retained conversation identity")
         error = codex_service_error(result.stdout, paged, work) if provider == "codex" else None
-        if error is None or number == 2:
+        repair = (
+            provider == "codex"
+            and not result.returncode
+            and batch is not None
+            and repairable_output(result.stdout, batch, receipt, paged)
+        )
+        if (error is None and not repair) or number == 2:
             return result
         thread = retained_thread(work)
         # Retain every failed launch before replacing the top-level evidence
         # with the next launch. Source, policy, model and native UUID stay fixed.
-        archive = work / f"service-error-{number + 1}"
+        archive = work / f"{'output-error' if repair else 'service-error'}-{number + 1}"
         archive.mkdir()
         for path in work.iterdir():
-            if path.is_file() and path.name != "service-retries.jsonl":
+            if path.is_file() and path.name not in ("service-retries.jsonl", "output-repairs.jsonl"):
                 (archive / path.name).write_bytes(path.read_bytes())
         notes = [
             event["item"]["text"]
@@ -503,19 +563,31 @@ def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged):
             if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
         ]
         record(
-            work / "service-retries.jsonl",
-            {"service_error": error, "thread": thread, "retry": number + 1, "preserved_progress_notes": notes},
+            work / ("output-repairs.jsonl" if repair else "service-retries.jsonl"),
+            {
+                "service_error": error,
+                "output_repair": repair,
+                "thread": thread,
+                "retry": number + 1,
+                "preserved_progress_notes": notes,
+            },
         )
         prefix = cmd[: cmd.index("resume")] if "resume" in cmd else cmd[:-1]
         cmd = [*prefix, "resume", thread, "-"]
         if not prompt.startswith(CONTINUE_PROMPT):
             prompt = CONTINUE_PROMPT + prompt
-        log(f"security-audit: service error; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s")
+        if repair:
+            prompt = OUTPUT_REPAIR_PROMPT + prompt
+        log(
+            f"security-audit: {'output repair' if repair else 'service error'}; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s"
+        )
         time.sleep(5 * (number + 1))
     raise AssertionError("unreachable")
 
 
-def inspect(batch: dict, provider: str, work: Path, *, resume_from: Path | None = None) -> dict:
+def inspect(
+    batch: dict, provider: str, work: Path, *, resume_from: Path | None = None, repair_output: bool = False
+) -> dict:
     cmd = reviewer_argv(provider)
     thread = None
     if resume_from is not None:
@@ -664,7 +736,11 @@ Manifest:\n"""
         else:
             cmd += ["--json-schema", serialize(schema_value)]
         (work / "prompt.txt").write_text(prompt)
-        p = run_client(cmd, prompt, home=home, env=env, work=work, receipt=receipt, provider=provider, paged=paged)
+        if repair_output:
+            prompt = OUTPUT_REPAIR_PROMPT + prompt
+        p = run_client(
+            cmd, prompt, home=home, env=env, work=work, receipt=receipt, provider=provider, paged=paged, batch=batch
+        )
         if p.returncode:
             raise Die(f"security-audit: {provider} failed; see {work / 'model-stderr.txt'}")
         if provider == "claude":
@@ -686,31 +762,7 @@ Manifest:\n"""
                 raise Die("security-audit: reviewer failed")
             value = result.get("structured_output")
         else:
-            events = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            allowed = {"agent_message", "reasoning"} | ({"context_compaction"} if paged else set())
-            for event in events:
-                if event.get("type") in ("error", "turn.failed"):
-                    raise Die("security-audit: model failed")
-                if event.get("type", "").startswith("item."):
-                    item = event.get("item", {})
-                    if (
-                        paged
-                        and item.get("type") == "mcp_tool_call"
-                        and item.get("server") == "audit"
-                        and item.get("tool") == "read_page"
-                    ):
-                        continue
-                    if item.get("type") not in allowed:
-                        raise Die("security-audit: reviewer attempted an unauthorized tool call")
-            messages = [
-                e["item"].get("text", "")
-                for e in events
-                if e.get("type") == "item.completed" and e.get("item", {}).get("type") == "agent_message"
-            ]
-            if not messages or not any(e.get("type") == "turn.completed" for e in events):
-                raise Die("security-audit: incomplete model response")
-            text = messages[-1]
-            value = json.loads(text)
+            value = codex_final(p.stdout, paged)
         read_token = value.pop("read_token", None) if paged and isinstance(value, dict) else None
         verdict = validate_verdict(value, batch)
         validate_reads(verdict, batch, receipt, paged, read_token)
@@ -875,7 +927,9 @@ def run(cfg, opts) -> int:
         raise Die(f"security-audit: stopped without approval; see {blocked}: {exc}") from exc
 
 
-def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False, service: bool = False) -> str:
+def resume_incomplete(
+    cfg, reason: str, *, ignore_quota: bool = False, service: bool = False, output: bool = False
+) -> str:
     """Explicit admin continuation of the same retained Luna conversation.
 
     Never create a fresh review, resume a finding, attest source, or remove the
@@ -899,7 +953,30 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False, service: 
         raise Die("security-audit: retained input digest mismatch")
     rows = [json.loads(line) for line in (work / "ledger.jsonl").read_text(encoding="utf-8").splitlines()]
     reviews = [r for r in rows if r.get("batch") == batch["input_digest"] and "verdict" in r]
-    if service:
+    if output:
+        if reviews:
+            raise Die("security-audit: a recorded source verdict cannot be repaired")
+        if previous.get("reason") != "security-audit: inconsistent findings and verdict":
+            raise Die("security-audit: block is not an unexplained incomplete output")
+        transcript = (original / "model-transcript.jsonl").read_text()
+        if not repairable_output(
+            transcript, batch, original / "read-receipt.json", len(serialize(batch).encode()) > INLINE_BYTES
+        ):
+            raise Die("security-audit: retained output is not eligible for bounded repair")
+        retained_thread(original)
+        execution = json.loads((original / "execution.json").read_text())
+        profile = inspection_profile()
+        # Explicit compatibility for the already-retained pre-profile incident;
+        # page layout and source identity are pinned, never generalized to others.
+        legacy = (
+            batch["input_digest"] == "4709c7a0a7894d94b9c8c7646560aab9897aa961b8e2026ed941cccbe29bb594"
+            and profile["reader_digest"] == "f852a254efc4336cce71f853b8c86e3ccc87084f2914efbf085463c3bb57bfc0"
+        )
+        if not legacy and any(execution.get(key) != value for key, value in profile.items()):
+            raise Die("security-audit: inspection implementation changed since malformed output")
+        if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
+            raise Die("security-audit: retained inspection prompt digest mismatch")
+    elif service:
         if set(previous) not in (
             {"from_sha", "to_sha", "reason", "attempt"},
             {"from_sha", "to_sha", "reason", "attempt", "continuation_of"},
@@ -977,7 +1054,7 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False, service: 
     )
     log(f"security-audit: continuing retained inspection {cursor[:12]}..{target[:12]}")
     try:
-        verdict = inspect(batch, "codex", attempt, resume_from=original)
+        verdict = inspect(batch, "codex", attempt, resume_from=original, **({"repair_output": True} if output else {}))
         record(
             work / "ledger.jsonl",
             {
@@ -1136,7 +1213,7 @@ def setup(state: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service"])
+    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output"])
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--through", help="full main commit SHA reviewed by the human administrator")
     parser.add_argument("--reason", help="human review evidence; never a model re-roll")
@@ -1144,7 +1221,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.command == "setup":
         setup(args.state)
-    elif args.command in ("resume", "retry-service"):
+    elif args.command in ("resume", "retry-service", "repair-output"):
         from .config import Config
         from .round import RoundContext
 
@@ -1154,7 +1231,13 @@ if __name__ == "__main__":
         if (cfg.state / CURSOR).resolve() != args.state.resolve():
             parser.error("resume --state must identify this checkout's existing worker audit state")
         with RoundContext(cfg):
-            resume_incomplete(cfg, args.reason, ignore_quota=args.ignore_quota, service=args.command == "retry-service")
+            resume_incomplete(
+                cfg,
+                args.reason,
+                ignore_quota=args.ignore_quota,
+                service=args.command == "retry-service",
+                output=args.command == "repair-output",
+            )
     elif args.through is None or args.reason is None:
         parser.error("attest requires --through and --reason")
     else:

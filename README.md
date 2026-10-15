@@ -210,7 +210,7 @@ source, inspection instructions, model, tool restrictions and read receipt.
 Progress notes are preserved in the same conversation; native message phases
 distinguish them from final answers. Failed requests and their evidence are retained under `service-error-N/` with a
 `service-retries.jsonl` record. A final answer (including a finding, incomplete verdict
-or malformed answer), unauthorized tool call, unknown event or malformed stream
+or other malformed answer), unauthorized tool call, unknown event or malformed stream
 is never retried as a service error. Exhausted retries leave the cursor blocked.
 To retry a retained service failure after service recovery, an admin can run:
 
@@ -225,6 +225,26 @@ verifies the retained prompt, launcher code, reader and catalog digests,
 and restores the same native conversation and read receipt. It preserves the
 block until a complete pass and confirmed reference update. No human source
 attestation is needed for a provider failure. Hard quota limits still apply.
+
+An unexplained `incomplete` answer with an empty findings list is eligible for
+bounded output repair only when its digest, commit list, schema, full page coverage
+and final receipt token otherwise validate. The same retained conversation may
+produce a consistent answer; uncertainty must be explained and source findings
+must be preserved. An explained incomplete verdict, any source finding, unknown
+or unauthorized tool, identity mismatch or coverage failure remains blocked.
+Service retries and output repairs share a maximum of three launches per invocation.
+Every malformed answer is archived under `output-error-N/` and recorded in
+`output-repairs.jsonl`. To repair a previously retained empty incomplete:
+
+```bash
+python3 -m tauceti_worker.security_audit repair-output --state /path/to/worker/state/security-audit \
+  --reason 'Repair unexplained incomplete output in the retained inspection'
+```
+
+The command checks eligibility and the retained inspection profile, preserves the
+original answer and block, and repeats the ordinary quota, authorization, input
+and ancestry checks. Only the model's complete passing answer and confirmed ref
+update can advance the cursor. It never converts the original answer into a pass.
 
 For the recorded legacy Luna failure where the final two pages were inaccessible
 because the reader token was lost, an admin may explicitly continue the **same
