@@ -186,6 +186,12 @@ class ClaudeAPIContext:
             self.blocked_reason = "Claude API authentication unavailable"
             return dict(ok=True)
         if action == "admit":
+            from .fleet_capacity import admission_reason as fleet_admission_reason
+
+            if reason := fleet_admission_reason(self.worker):
+                self.blocked_reason = reason
+                report_runtime("waiting-capacity", detail=reason)
+                return dict(allowed=False, reason=reason)
             ticket = request["id"]
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):
                 raise BudgetError("invalid admission request")

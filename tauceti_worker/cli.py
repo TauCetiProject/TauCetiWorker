@@ -783,6 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_workers_parser(sub)
     add_budget_parser(sub)
+    sub.add_parser("_fleet-protocol", help=argparse.SUPPRESS)
 
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
@@ -866,6 +867,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         raise Die(f"TAUCETI_MAX_OPEN_PRS {error}") from None
 
+    if cmd == "_fleet-protocol":
+        print(json.dumps({"version": 1, "admission": True, "events": True}))
+        return 0
     if cmd == "budget":
         try:
             return cmd_budget(args)

@@ -115,6 +115,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            from .fleet_capacity import admission_reason as fleet_admission_reason
+
+            if reason := fleet_admission_reason(cfg.wid):
+                report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
+                time.sleep(5)
+                continue
             if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
@@ -283,6 +289,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             rc = run_round_subprocess(tail)
 
             if rc == EX_ADMISSION_WAIT:
+                if reason := fleet_admission_reason(cfg.wid):
+                    report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
+                    time.sleep(5)
+                    continue
                 streak = 0
                 admission_streak += 1
                 nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))

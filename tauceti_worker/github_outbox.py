@@ -211,6 +211,9 @@ def finish(path, result, records=None, *, before_request=False):
 def _finish_locked(path, value, result, records=None, *, before_request=False):
     """Classify an initial attempt or replay while its intent lock is held."""
     if result.returncode == 0:
+        from .fleet_events import mutation
+
+        mutation(value, result)
         path.unlink(missing_ok=True)
         return
     records = records or []
