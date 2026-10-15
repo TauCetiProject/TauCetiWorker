@@ -147,7 +147,7 @@ def rebase_heads(comments):
         if not isinstance(c, dict) or not isinstance(c.get("body"), str):
             continue
         body = c.get("body") or ""
-        if (c.get("user") or {}).get("login") == SPEC["rebase_author"] and body.startswith(
+        if (c.get("user") or {}).get("login") in SPEC["rebase_authors"] and body.startswith(
             "Merge-queue recovery for head `"
         ):
             for line in body.splitlines():

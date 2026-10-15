@@ -25,6 +25,8 @@ def test_trusted_paginated_comments():
         for rows, expected in [
             ([request(author="peer"), request()], True),
             ([request(author="peer")], False),
+            ([request(author="tau-ceti-bors[bot]")], True),
+            ([request(author="tau-ceti-bors")], False),
             ([request("b" * 40)], False),
             ([{**request(), "body": request()["body"].replace("tauceti-rebase", "tauceti-merge-stalled")}], False),
             ([{**request(), "body": "Quoted text\n" + request()["body"]}], False),
@@ -36,6 +38,12 @@ def test_trusted_paginated_comments():
                 {**row, "user": {"login": row["author"]}} if isinstance(row, dict) else row for row in rows
             ]
             assert gh.rebase_requested(1, HEAD) is expected, rows
+            assert bool(gh.rebase_request_body(1, HEAD)) is expected, rows
+        call.return_value = [
+            {**request(), "user": {"login": request()["author"]}, "body": request()["body"] + "\n" + "x" * 32768}
+        ]
+        assert gh.rebase_requested(1, HEAD)
+        assert not gh.rebase_request_body(1, HEAD)
         call.return_value = None
         assert not gh.rebase_requested(1, HEAD)
         call.reset_mock()
@@ -181,7 +189,54 @@ def test_broken_retry_evidence_suppresses_rebase():
         assert "counter is malformed" in sv.rebaseable.suppressed[0].reason
 
 
+def test_semantic_evidence_reaches_claimed_repair():
+    from tauceti_worker import work_units
+
+    gh = GitHub()
+    body = request(author="tau-ceti-bors[bot]")["body"] + (
+        "\nTested main: `" + "b" * 40 + "`.\n`TauCeti/Consumer.lean` imports missing `TauCeti.Removed`."
+    )
+    raw = pr(20)
+    raw["statusCheckRollup"] = [{"context": "build", "state": "SUCCESS"}]
+    w = SimpleNamespace(
+        gh=gh,
+        claims=SimpleNamespace(begin_branch_work=lambda *args: True),
+        rs=SimpleNamespace(bust=lambda *args: None),
+    )
+    with (
+        patch.object(survey_mod, "me", return_value="me"),
+        patch.object(gh, "open_prs", return_value=[raw]),
+        patch.object(gh, "issue_comments", return_value=[{"user": {"login": "tau-ceti-bors[bot]"}, "body": body}]),
+    ):
+        sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, SimpleNamespace(read=lambda name: 0), deep=False)
+        candidate = sv.rebaseable.actionable[0]
+        assert candidate.pr == 20
+        with patch.object(work_units, "run_in_bubble", return_value=0) as agent:
+            assert (
+                work_units._do_fixlike(
+                    w, sv, candidate, SimpleNamespace(agent_name="Codex"), True, prompt_file="rebase.md", label="rebase"
+                )
+                == 0
+            )
+        prompt = agent.call_args.args[2]
+        assert body in prompt and HEAD in prompt
+        assert "semantic repair may still be needed" in prompt
+        assert '"__BIN__' not in prompt
+        assert agent.call_args.kwargs["allow_push"] == "me/TauCeti"
+    # A lost branch claim starts no authoring task.
+    w.claims.begin_branch_work = lambda *args: False
+    with patch.object(work_units, "run_in_bubble") as agent:
+        assert (
+            work_units._do_fixlike(
+                w, sv, candidate, SimpleNamespace(agent_name="Codex"), True, prompt_file="rebase.md", label="rebase"
+            )
+            is None
+        )
+        agent.assert_not_called()
+
+
 if __name__ == "__main__":
+    test_semantic_evidence_reaches_claimed_repair()
     test_trusted_paginated_comments()
     test_survey_ownership_head_pause_and_budget()
     test_verified_progress_restores_budget_without_unbounded_retries()

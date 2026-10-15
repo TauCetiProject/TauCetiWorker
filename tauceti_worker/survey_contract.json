@@ -7,5 +7,5 @@
   "target_pattern": "<!--tauceti-target:v1 (\\{[^}]*\\})-->",
   "meta_fields": ["head_sha", "states", "runs", "submitted_by", "round", "full_rounds", "replies_through"],
   "run_fields": ["provider", "verdict", "rubric"],
-  "rebase_author": "tauceti-review-bot[bot]"
+  "rebase_authors": ["tauceti-review-bot[bot]", "tau-ceti-bors[bot]"]
 }
