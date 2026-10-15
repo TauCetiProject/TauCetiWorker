@@ -362,6 +362,8 @@ def inspect(batch: dict, provider: str, work: Path) -> dict:
         env.update(
             ENABLE_CLAUDEAI_MCP_SERVERS="false",
             ENABLE_TOOL_SEARCH="false",
+            CLAUDE_CODE_DISABLE_CLAUDE_MDS="1",
+            MAX_MCP_OUTPUT_TOKENS="120000",
             MAX_STRUCTURED_OUTPUT_RETRIES="1",
         )
         source = (
@@ -426,7 +428,8 @@ Keep the latest token across compaction; re-reading an earlier page is allowed.
 Include read_token in the final JSON, echoing next_token from the LAST page result
 you received (or an empty string if no read succeeded). It follows all page content.
 Pages contain exact file-content/diff segments, identified by commit, path,
-field, start character and total characters. Combine segments in order. No
+field, start character and total characters. Combine text segments in order;
+prefix is preceding context only, not additional source to concatenate. No
 source is omitted. Use native conversation compaction as needed. Before compacting,
 retain the inspection policy, exact manifest, progress, ALL findings and unresolved
 questions in your working notes. Re-read pages if needed. Findings remain findings
@@ -697,7 +700,7 @@ def run(cfg, opts) -> int:
             record(work / "ledger.jsonl", {"advanced": landed, "report_dispatch_error": str(exc)})
             log("security-audit: advanced, but readiness-report dispatch failed; dispatch toolchain-tags manually")
         return 0
-    except (Die, ValueError, OSError, subprocess.TimeoutExpired) as exc:
+    except (Die, ValueError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired) as exc:
         failure = {"from_sha": cursor, "to_sha": target, "reason": str(exc), "attempt": str(attempt)}
         blocked.write_text(serialize(failure))
         record(work / "ledger.jsonl", failure)

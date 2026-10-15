@@ -122,28 +122,25 @@ class Reader:
             stream.flush()
             os.fsync(stream.fileno())
         temp.replace(self.receipt)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    # Keep the next token AFTER the entire page. A following
-                    # call/final verdict must echo it, detecting lost/truncated
-                    # results rather than merely counting server-side reads.
-                    "text": json.dumps(
-                        {
-                            "input_digest": self.digest,
-                            "page": page,
-                            "pages": len(self.pages),
-                            "commits": self.commits,
-                            "sections": self.pages[page],
-                            "next_token": self.token,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                }
-            ]
-        }
+        # Keep the next token AFTER the entire page. A following call/final
+        # verdict must echo it, detecting lost/truncated results.
+        text = json.dumps(
+            {
+                "input_digest": self.digest,
+                "page": page,
+                "pages": len(self.pages),
+                "commits": self.commits,
+                "sections": self.pages[page],
+                "next_token": self.token,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        # Even byte-level tokenization fits the clients' explicit 120k output
+        # limit; the Claude character limit is 200k. Do not rely on chars/4.
+        if len(text.encode("utf-8")) > 120000:
+            raise ValueError("Audit response exceeds the client output allowance")
+        return {"content": [{"type": "text", "text": text}]}
 
 
 def main():

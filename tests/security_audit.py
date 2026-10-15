@@ -364,12 +364,24 @@ class CompactingInspection(unittest.TestCase):
                             "input_digest": self.batch["input_digest"],
                             "pages": len(ar.pages(self.batch)),
                             "read": indices,
+                            "last_token": "valid-token",
                         }
                     )
                 )
             with self.subTest(indices=indices), self.assertRaises(Die):
-                sa.validate_reads(self.verdict, self.batch, receipt, True)
+                sa.validate_reads(self.verdict, self.batch, receipt, True, "valid-token")
         sa.validate_reads({**self.verdict, "verdict": "finding", "findings": ["IO"]}, self.batch, receipt, True)
+
+    def test_unicode_and_escaped_pages_fit_explicit_client_limits(self):
+        batch = json.loads(json.dumps(self.batch))
+        batch["commits"][0]["files"][0]["after"] = '🙂α"\\\x01' * 20000
+        reader = ar.Reader(batch, self.work / "receipt.json", "initial")
+        for i in range(len(reader.pages)):
+            response = reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
+            text = response["content"][0]["text"]
+            self.assertLessEqual(len(text.encode("utf-8")), 120000)
+            self.assertLess(len(text), 200000)
+            self.assertTrue(text.endswith('"next_token":"' + reader.token + '"}'))
 
     def test_one_client_session_can_compact_and_read_all_pages(self):
         auth = self.work / "auth.json"
@@ -379,6 +391,8 @@ class CompactingInspection(unittest.TestCase):
             self.assertNotIn("untrusted instruction", kwargs["input"])
             self.assertIn("ONE inspection session", kwargs["input"])
             self.assertIn("model_auto_compact_token_limit=180000", argv)
+            self.assertEqual(kwargs["env"]["MAX_MCP_OUTPUT_TOKENS"], "120000")
+            self.assertEqual(kwargs["env"]["CLAUDE_CODE_DISABLE_CLAUDE_MDS"], "1")
             home = kwargs["cwd"]
             batch = json.loads((home / "input.json").read_text())
             reader = ar.Reader(batch, home / "read-receipt.json", "initial")
@@ -471,6 +485,14 @@ class Run(unittest.TestCase):
             with self.assertRaises(NoProgress):
                 sa.run(SimpleNamespace(state=self.state), self.opts)
         inspect.assert_not_called()
+
+    def test_malformed_client_stream_blocks_a_second_model_call(self):
+        with patch.object(sa, "inspect", side_effect=AttributeError("malformed client event")) as inspect:
+            with self.assertRaises(Die):
+                sa.run(SimpleNamespace(state=self.state), self.opts)
+            with self.assertRaises(NoProgress):
+                sa.run(SimpleNamespace(state=self.state), self.opts)
+        inspect.assert_called_once()
 
     def test_concurrent_update_does_not_create_a_block(self):
         with (
