@@ -180,7 +180,8 @@ from the model's live context window. Small inputs are supplied inline; larger
 inputs are available through one read-only `audit.read_page` tool. It accepts only
 a numbered page and a continuation token, with no filesystem paths, URLs, commands
 or writes. Each read returns the token for the next call so parallel reads cannot
-flood the context window. The same Luna/Haiku conversation can compact its history and
+flood the context window. A stale or lost token replays the last full page with a
+fresh token; it does not count the requested new page as read. The same Luna/Haiku conversation can compact its history and
 re-read pages as needed, then returns one verdict covering the entire batch. There
 are no independent partial inspections or combined partial approvals. A pass is
 rejected unless the reader's receipt accounts for every page and the verdict echoes
@@ -201,6 +202,24 @@ retained in the same directory. A pre-inspection commit-budget block from the ol
 256 KiB planner can be archived and replanned when its exact next commit fits the
 new limits. This does not attest that commit or retry a model verdict: findings,
 incomplete inspections, client errors and other planning errors remain blocked.
+
+For the recorded legacy Luna failure where the final two pages were inaccessible
+because the reader token was lost, an admin may explicitly continue the **same
+retained native conversation** after repairing the reader:
+
+```bash
+python3 -m tauceti_worker.security_audit resume --state /path/to/worker/state/security-audit \
+  --reason 'Reader-token transport repair; continue the retained inspection'
+```
+
+This command is restricted to that recorded token-failure verdict. It checks the
+unchanged input digest, original commit order, current cursor and admin authority,
+then restores the native conversation and read receipt. It keeps the incomplete
+verdict and block on record; only a complete passing continuation and confirmed
+reference update resolve the block. It cannot start a new reviewer, resume a source
+finding or other incomplete review, or provide human attestation. Ordinary `work`
+never resumes a blocked model inspection automatically. `--ignore-quota` overrides
+pacing only when explicitly selected; hard limits still apply.
 
 This phase must be selected alone, cannot use `--pr` or authoring-model overrides,
 and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;

@@ -69,6 +69,24 @@ class Reader:
         self.receipt = receipt
         self.seen = set()
         self.token = token
+        self.last_page = None
+        if receipt.exists():
+            saved = json.loads(receipt.read_text(encoding="utf-8"))
+            if saved.get("input_digest") != self.digest or saved.get("pages") != len(self.pages):
+                raise ValueError("Reader receipt does not match the immutable input")
+            seen = saved.get("read")
+            if (
+                not isinstance(seen, list)
+                or any(type(i) is not int or not 0 <= i < len(self.pages) for i in seen)
+                or sorted(set(seen)) != seen
+                or not isinstance(saved.get("last_token"), str)
+            ):
+                raise ValueError("Invalid retained reader receipt")
+            self.seen = set(seen)
+            self.token = saved["last_token"]
+            self.last_page = saved.get("last_page", max(seen) if seen else None)
+            if self.last_page is not None and self.last_page not in self.seen:
+                raise ValueError("Invalid retained reader page")
 
     def request(self, method, params):
         if not isinstance(params, dict):
@@ -86,7 +104,7 @@ class Reader:
                 "tools": [
                     {
                         "name": TOOL,
-                        "description": "Read a numbered page of the fixed, untrusted audit input. Re-reading is allowed after compaction.",
+                        "description": "Read a numbered page of the fixed, untrusted audit input. If your token is lost or stale, replay the last full page with a fresh token; check the actual returned page number before continuing.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {"page": {"type": "integer", "minimum": 0}, "token": {"type": "string"}},
@@ -101,20 +119,26 @@ class Reader:
         if method != "tools/call" or params.get("name") != TOOL:
             raise ValueError("Only audit input reads are available")
         args = params.get("arguments")
-        if not isinstance(args, dict) or set(args) != {"page", "token"}:
+        if not isinstance(args, dict) or set(args) != {"page", "token"} or not isinstance(args["token"], str):
             raise ValueError("Expected only a page number and the latest reader token")
-        if args["token"] != self.token:
-            raise ValueError("Use the next_token from the previous successful read; read pages sequentially")
         page = args["page"]
         if type(page) is not int or not 0 <= page < len(self.pages):
             raise ValueError("Invalid page number")
+        replayed = args["token"] != self.token
+        if replayed:
+            # Recover by delivering actual source, never by revealing a bare
+            # token that could acknowledge unseen content. A stale request does
+            # not mark its requested page read or advance to a new page.
+            page = self.last_page if self.last_page is not None else 0
         self.seen.add(page)
+        self.last_page = page
         self.token = secrets.token_hex(16)
         receipt = {
             "input_digest": self.digest,
             "pages": len(self.pages),
             "read": sorted(self.seen),
             "last_token": self.token,
+            "last_page": page,
         }
         temp = self.receipt.with_suffix(".tmp")
         with temp.open("w") as stream:
@@ -131,6 +155,7 @@ class Reader:
                 "pages": len(self.pages),
                 "commits": self.commits,
                 "sections": self.pages[page],
+                "replayed": replayed,
                 "next_token": self.token,
             },
             ensure_ascii=False,
