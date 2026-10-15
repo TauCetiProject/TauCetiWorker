@@ -107,9 +107,7 @@ work_units._sync_review_outbox = lambda *_: 0
 work_units.clear_review_failure = lambda *_: None
 work_units.me = lambda: "tester"
 w.cfg.logdir = tmp
-w.rs = types.SimpleNamespace(
-    review_rounds=lambda *_: 0, bust=lambda *_: None, gh_meta=lambda *_: types.SimpleNamespace(data={})
-)
+w.rs = types.SimpleNamespace(review_rounds=lambda *_: 0, bust=lambda *_: None)
 w.counters = types.SimpleNamespace(write=lambda *_: None)
 c = types.SimpleNamespace(pr=470, head="abc123", contest=None, contest_reply_id=None)
 for configured, provider, expected in (

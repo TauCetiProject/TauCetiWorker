@@ -802,7 +802,7 @@ def survey(
     #    or an errored round → normal review; no round budget here, CI retires a non-converging PR),
     #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
-    #    review keeps erroring without posting a verdict is escalated, not silently dropped.
+    #    review keeps erroring without completing a review is escalated, not silently dropped.
     for p in nondraft if "review" in enabled else []:
         if not p.build_success:
             continue

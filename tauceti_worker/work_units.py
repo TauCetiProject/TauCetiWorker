@@ -257,7 +257,7 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
                 notes.append(f"{stage} suppressed: {c.reason}{spent}")
     notes += [f"review: a peer reviewer ({who}) holds this head" for n, who in sv.review_inflight if n == pr]
     if pr in sv.review_stuck:
-        notes.append("review keeps erroring without posting a verdict — needs infrastructure repair")
+        notes.append("review keeps erroring without completing a review — needs infrastructure repair")
     notes += [f"fix: {why}" for n, why in sv.fix_waiting if n == pr]
     # A throttle removes a candidate silently, so without this a PR the operator named would be
     # reported as having no work at all when in fact this worker was told to hold off on it.
@@ -398,7 +398,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             continue
         n_err = w.counters.read(f"review-err-{pr}")
         warn_red(
-            f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
+            f"PR #{pr}: review has ERRORED {n_err}x without completing a review — the worker cannot "
             f"review it. Needs infrastructure repair. https://github.com/{TAUCETI}/pull/{pr}"
         )
         if opts.dry_run:
@@ -409,7 +409,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if not retained:
             retained = recover_review_failures(w.cfg.state, w.cfg.logdir, worker=w.cfg.wid, pr=pr, head=head)
         diagnostic = public_review_failure(retained)
-        reason = f"its review has errored {n_err} times without posting a verdict"
+        reason = f"its review has errored {n_err} times without completing a review"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
     # Spread concurrent workers across different branch-writing work: shuffle each non-review stage so
@@ -1102,28 +1102,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
             raise admission_failure(reason)
         if rc == 0:
-            w.rs.bust(pr)
-            posted = w.rs.gh_meta(pr).data
-            posted_error = posted.get("head_sha") == head and any(
-                run.get("verdict") == "error" for run in posted.get("runs") or []
-            )
-            if posted_error:
-                # A posted infrastructure error is still a failed review, even when the engine
-                # exits zero. Preserve the existing error streak instead of retrying it as success.
-                w.counters.incr(errkey)
-                record_review_failure(
-                    w.cfg.state,
-                    worker=w.cfg.wid,
-                    pr=pr,
-                    head=head,
-                    provider=reviewers,
-                    code=0,
-                    reason="review engine posted an error verdict at the current head",
-                    log_file=None if bubble else logf,
-                )
-            else:
-                w.counters.write(errkey, 0)
-                clear_review_failure(w.cfg.state, pr)
+            # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
+            # the "errored without completing a review" streak up front — BEFORE the publish step, which is
+            # a separate machine-wide concern. Otherwise a pre-post error streak (e.g. errkey=2) could
+            # combine with one later engine error to trip the escalation cap a round after a verdict was
+            # in fact posted, contradicting the "errored Nx without completing a review" message.
+            w.counters.write(errkey, 0)
+            clear_review_failure(w.cfg.state, pr)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
             # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
@@ -1139,12 +1124,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     f"{w.cfg.store_dir / 'outbox'}. This archive failure is NOT charged to the PR; "
                     f"check the host's git/gh credentials. A later review retries the whole outbox."
                 )
-            if c.contest and not posted_error:
+            if c.contest:
                 # The engine advanced replies_through in the new scoreboard (the durable per-reply
                 # watermark); rs.bust below re-fetches it, so this contest won't re-fire once the 👀
                 # is dropped. Just bump the contest caps.
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
+            w.rs.bust(pr)
         elif blocked_since(github_started):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
