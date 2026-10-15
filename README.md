@@ -173,14 +173,32 @@ tauceti work --only security-audit --agent claude --loop
 It advances TauCeti's protected `security-audit` branch through main's first-parent
 history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
 Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
-Each session receives complete per-commit diffs and before/after file contents,
-up to 20 commits and 256 KiB of input. Luna/Haiku receives no GitHub credential or
-command/edit tools; trusted Worker code alone verifies ancestry and moves the ref.
+Each session inspects complete per-commit diffs and before/after file contents,
+up to 20 commits with a 2 MiB workload target. A single larger commit may use up to
+8 MiB (each source blob is limited to 4 MiB). These are workload limits, separate
+from the model's live context window. Small inputs are supplied inline; larger
+inputs are available through one read-only `audit.read_page` tool. It accepts only
+a numbered page and a continuation token, with no filesystem paths, URLs, commands
+or writes. Each read returns the token for the next call so parallel reads cannot
+flood the context window. The same Luna/Haiku conversation can compact its history and
+re-read pages as needed, then returns one verdict covering the entire batch. There
+are no independent partial inspections or combined partial approvals. A pass is
+rejected unless the reader's receipt accounts for every page. Delivery coverage
+does not prove the model understood the source; compaction can lose details, so
+the prompt requires retaining findings and unresolved questions, re-reading when
+needed, and returning incomplete if the full inspection cannot be completed.
+
+Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
+Worker code alone verifies ancestry and moves the ref.
 No Lean builds or candidate scripts run. A finding, incomplete inspection, oversized
 commit or model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
 not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
-The input, transcript and durable ledger are retained in the same directory.
+The input, transcript, native Codex compaction/usage records, read receipt (for larger inputs), and durable ledger are
+retained in the same directory. A pre-inspection size-only block from the old
+256 KiB planner can be archived and replanned when its exact next commit fits the
+new limits. This does not attest that commit or retry a model verdict: findings,
+incomplete inspections, client errors and other planning errors remain blocked.
 
 This phase must be selected alone, cannot use `--pr` or authoring-model overrides,
 and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
