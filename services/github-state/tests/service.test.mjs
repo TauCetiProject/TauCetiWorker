@@ -39,10 +39,13 @@ test('webhooks do not invent complete inventory; duplicate and old delivery are 
   assert.equal((await ingest('new','pull_request',body())).status,200);
   const r=await request('/v1/query?repository=org/repo&operation=open_prs',{headers}); assert.equal(r.status,200);
   const p=await r.json(); assert.equal(p.status,'unavailable'); assert.equal(p.complete,false);
-  assert.equal((await ingest('new','pull_request',body())).status,200);
   const doStub=namespace.get(namespace.idFromName('10')); const first=await (await doStub.fetch('https://internal/health')).json();
+  assert.equal((await ingest('new','pull_request',body())).status,200);
   await ingest('old','pull_request',body({title:'obsolete',state:'closed',updated_at:'2026-10-10T00:00:00Z'}),Date.now()-10000);
-  const second=await (await doStub.fetch('https://internal/health')).json(); assert.equal(second.revision,first.revision);
+  // Background survey hydration may advance the global revision independently of these deliveries.
+  const changes=await (await request('/v1/changes?repository=org/repo&after='+first.revision,{headers})).json();
+  assert.equal(changes.reset,false);
+  assert.deepEqual(changes.changes.filter(c=>c.kind==='pr' || c.kind==='collection'),[]);
 });
 test('resource tombstones advance journal without marking missing histories empty',async()=>{
   const c={id:999,body:'hello',created_at:'2026-10-11T00:00:00Z',updated_at:'2026-10-11T00:00:00Z',user:{login:'peer'}};
