@@ -233,7 +233,9 @@ produce a consistent answer; uncertainty must be explained and source findings
 must be preserved. An explained incomplete verdict, any source finding, unknown
 or unauthorized tool, identity mismatch or coverage failure remains blocked.
 Service retries and output repairs share a maximum of three launches per invocation.
-Each batch permits at most one explicit administrative output-repair invocation.
+Each batch permits at most two explicit administrative output-repair invocations.
+The response schema fixes `input_digest` to the exact full digest, preventing echo
+truncation in new replies.
 Every malformed answer is archived under `output-error-N/` and recorded in
 `output-repairs.jsonl`. To repair a previously retained empty incomplete:
 

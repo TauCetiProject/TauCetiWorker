@@ -463,6 +463,8 @@ class CompactingInspection(unittest.TestCase):
             self.assertEqual(kwargs["env"]["MAX_MCP_OUTPUT_TOKENS"], "120000")
             self.assertEqual(kwargs["env"]["CLAUDE_CODE_DISABLE_CLAUDE_MDS"], "1")
             home = kwargs["cwd"]
+            schema = json.loads((home / "verdict-schema.json").read_text())
+            self.assertEqual(schema["properties"]["input_digest"]["enum"], [self.batch["input_digest"]])
             batch = json.loads((home / "input.json").read_text())
             reader = ar.Reader(batch, home / "read-receipt.json", "initial")
             events = [{"type": "item.completed", "item": {"type": "context_compaction"}}]
@@ -1024,6 +1026,10 @@ class Run(unittest.TestCase):
         self.assertFalse(blocked.exists())
         self.assertTrue((original / "model-transcript.jsonl").exists())
         blocked.write_text(sa.serialize(block))
+        sa.record(
+            work / "ledger.jsonl",
+            {"batch": batch["input_digest"], "recovery_kind": "output-repair", "continuation_of": str(original)},
+        )
         with (
             patch.object(sa, "inspect") as second,
             self.assertRaisesRegex(Die, "already used its administrative output repair"),

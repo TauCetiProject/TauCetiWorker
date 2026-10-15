@@ -720,7 +720,10 @@ def inspect(
             raise Die("security-audit: no usable subscription access token available")
         dest.chmod(0o600)
         prompt = PROMPT + "\n" + serialize(batch)
-        schema_value = SCHEMA
+        schema_value = {
+            **SCHEMA,
+            "properties": {**SCHEMA["properties"], "input_digest": {"type": "string", "enum": [batch["input_digest"]]}},
+        }
         receipt = home / "read-receipt.json"
         if resume_from is not None:
             sessions = home / ".codex/sessions"
@@ -732,9 +735,9 @@ def inspect(
             cmd[-1:] = ["resume", thread, "-"]
         if paged:
             schema_value = {
-                **SCHEMA,
+                **schema_value,
                 "required": [*SCHEMA["required"], "read_token"],
-                "properties": {**SCHEMA["properties"], "read_token": {"type": "string"}},
+                "properties": {**schema_value["properties"], "read_token": {"type": "string"}},
             }
             source = home / "input.json"
             source.write_text(serialize(batch))
@@ -1037,10 +1040,16 @@ def resume_incomplete(
     rows = [json.loads(line) for line in (work / "ledger.jsonl").read_text(encoding="utf-8").splitlines()]
     reviews = [r for r in rows if r.get("batch") == batch["input_digest"] and "verdict" in r]
     if output:
-        if any(
-            row.get("batch") == batch["input_digest"] and row.get("recovery_kind") == "output-repair" for row in rows
+        if (
+            sum(
+                row.get("batch") == batch["input_digest"]
+                and row.get("recovery_kind") == "output-repair"
+                and "verdict" not in row
+                for row in rows
+            )
+            >= 2
         ):
-            raise Die("security-audit: this batch already used its administrative output repair")
+            raise Die("security-audit: this batch already used its administrative output repair limit")
         # One compatibility continuation for the retained incident whose repair
         # exposed an operational misunderstanding of rereads. Pin the exact
         # batch, explanation and reader; never generalize to source uncertainty.
