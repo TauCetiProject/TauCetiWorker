@@ -463,6 +463,8 @@ class CompactingInspection(unittest.TestCase):
             self.assertEqual(kwargs["env"]["MAX_MCP_OUTPUT_TOKENS"], "120000")
             self.assertEqual(kwargs["env"]["CLAUDE_CODE_DISABLE_CLAUDE_MDS"], "1")
             home = kwargs["cwd"]
+            schema = json.loads((home / "verdict-schema.json").read_text())
+            self.assertEqual(schema["properties"]["input_digest"]["enum"], [self.batch["input_digest"]])
             batch = json.loads((home / "input.json").read_text())
             reader = ar.Reader(batch, home / "read-receipt.json", "initial")
             events = [{"type": "item.completed", "item": {"type": "context_compaction"}}]
@@ -528,6 +530,16 @@ class CompactingInspection(unittest.TestCase):
             reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page, "token": reader.token}})
         value["read_token"] = reader.token
         self.assertTrue(sa.repairable_output(transcript(value), self.batch, receipt, True))
+        truncated = {**value, "verdict": "pass", "input_digest": self.batch["input_digest"][:-1]}
+        self.assertTrue(sa.repairable_output(transcript(truncated), self.batch, receipt, True))
+        self.assertFalse(
+            sa.repairable_output(
+                transcript({**truncated, "input_digest": self.batch["input_digest"][:-2]}), self.batch, receipt, True
+            )
+        )
+        self.assertFalse(
+            sa.repairable_output(transcript({**truncated, "findings": ["IO concern"]}), self.batch, receipt, True)
+        )
         for changed in (
             {"findings": ["Unresolved source question"]},
             {"verdict": "finding"},
@@ -907,16 +919,39 @@ class Run(unittest.TestCase):
     def service_evidence(self, work, original):
         import hashlib
 
-        (original / "prompt.txt").write_text("retained inspection")
+        batch = json.loads((original / "input.json").read_text())
+        prompt = sa.PROMPT + "\n" + sa.serialize(batch)
+        (original / "prompt.txt").write_text(prompt)
         (original / "execution.json").write_text(
             sa.serialize(
-                {**sa.inspection_profile(), "prompt_digest": hashlib.sha256(b"retained inspection").hexdigest()}
+                {
+                    **sa.inspection_profile(),
+                    "argv": sa.codex_launch(original / "home", False),
+                    "environment": {"HOME": str(original / "home")},
+                    "paged": False,
+                    "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                }
             )
         )
         blocked = work / "blocked.json"
         value = json.loads(blocked.read_text())
         value["reason"] = f"security-audit: codex failed; see {original}/model-stderr.txt"
         blocked.write_text(sa.serialize(value))
+
+    def test_output_recovery_checks_full_launcher_and_current_prompt_policy(self):
+        work, original, batch = self.retained_incomplete()
+        self.service_evidence(work, original)
+        execution = json.loads((original / "execution.json").read_text())
+        sa.validate_output_profile(execution, original, batch)
+        for change in (["-c", 'model="other"'], ["-c", 'mcp_servers.extra.command="bad"']):
+            altered = {**execution, "argv": [*execution["argv"][:-1], *change, "-"]}
+            with self.assertRaisesRegex(Die, "complete isolated Luna profile"):
+                sa.validate_output_profile(altered, original, batch)
+        with self.assertRaisesRegex(Die, "delivery mode changed"):
+            sa.validate_output_profile({**execution, "paged": True}, original, batch)
+        (original / "prompt.txt").write_text("weaker policy " + batch["input_digest"])
+        with self.assertRaisesRegex(Die, "current inspection policy"):
+            sa.validate_output_profile(execution, original, batch)
 
     def test_service_recovery_requires_no_recorded_verdict(self):
         work, original, batch = self.retained_incomplete()
@@ -1010,6 +1045,10 @@ class Run(unittest.TestCase):
         self.assertFalse(blocked.exists())
         self.assertTrue((original / "model-transcript.jsonl").exists())
         blocked.write_text(sa.serialize(block))
+        sa.record(
+            work / "ledger.jsonl",
+            {"batch": batch["input_digest"], "recovery_kind": "output-repair", "continuation_of": str(original)},
+        )
         with (
             patch.object(sa, "inspect") as second,
             self.assertRaisesRegex(Die, "already used its administrative output repair"),
