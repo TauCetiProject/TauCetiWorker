@@ -226,8 +226,8 @@ and restores the same native conversation and read receipt. It preserves the
 block until a complete pass and confirmed reference update. No human source
 attestation is needed for a provider failure. Hard quota limits still apply.
 
-An unexplained `incomplete` answer with an empty findings list is eligible for
-bounded output repair only when its digest, commit list, schema, full page coverage
+An unexplained `incomplete` answer with an empty findings list, or a `pass` whose
+input digest omits only its final character, is eligible for bounded output repair only when its digest, commit list, schema, full page coverage
 and final receipt token otherwise validate (inline inputs need no receipt). The same retained conversation may
 produce a consistent answer; uncertainty must be explained and source findings
 must be preserved. An explained incomplete verdict, any source finding, unknown
@@ -242,7 +242,8 @@ python3 -m tauceti_worker.security_audit repair-output --state /path/to/worker/s
   --reason 'Repair unexplained incomplete output in the retained inspection'
 ```
 
-The command checks eligibility and the retained inspection profile, preserves the
+The command checks eligibility, the fixed reader/catalog policy and isolated Luna
+launcher, preserves the
 original answer and block, and repeats the ordinary quota, authorization, input
 and ancestry checks. Only the model's complete passing answer and confirmed ref
 update can advance the cursor. It never converts the original answer into a pass. The pre-profile retained incident

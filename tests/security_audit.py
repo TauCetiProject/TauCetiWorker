@@ -528,6 +528,16 @@ class CompactingInspection(unittest.TestCase):
             reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page, "token": reader.token}})
         value["read_token"] = reader.token
         self.assertTrue(sa.repairable_output(transcript(value), self.batch, receipt, True))
+        truncated = {**value, "verdict": "pass", "input_digest": self.batch["input_digest"][:-1]}
+        self.assertTrue(sa.repairable_output(transcript(truncated), self.batch, receipt, True))
+        self.assertFalse(
+            sa.repairable_output(
+                transcript({**truncated, "input_digest": self.batch["input_digest"][:-2]}), self.batch, receipt, True
+            )
+        )
+        self.assertFalse(
+            sa.repairable_output(transcript({**truncated, "findings": ["IO concern"]}), self.batch, receipt, True)
+        )
         for changed in (
             {"findings": ["Unresolved source question"]},
             {"verdict": "finding"},
@@ -910,7 +920,11 @@ class Run(unittest.TestCase):
         (original / "prompt.txt").write_text("retained inspection")
         (original / "execution.json").write_text(
             sa.serialize(
-                {**sa.inspection_profile(), "prompt_digest": hashlib.sha256(b"retained inspection").hexdigest()}
+                {
+                    **sa.inspection_profile(),
+                    "argv": sa.reviewer_argv("codex"),
+                    "prompt_digest": hashlib.sha256(b"retained inspection").hexdigest(),
+                }
             )
         )
         blocked = work / "blocked.json"
