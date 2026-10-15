@@ -504,11 +504,10 @@ def drain(env=None):
             if destination != (None, None) and destination in blocked_targets:
                 remaining.append(path.stem)
                 continue
-            if local_operation(value["argv"]):
-                # Recover entries created by older proxies. Local checkout
-                # failure belongs to the normal round retry path; it cannot
-                # have an ambiguous remote publication to reconcile.
-                archive(path, value, "Local checkout operation is not a GitHub publication")
+            if local_operation(value["argv"]) or tr.proxy_readonly(value["argv"]):
+                # Recover entries created by older proxies. Read-only queries
+                # and local checkouts cannot have an ambiguous publication.
+                archive(path, value, "Read-only or local operation is not a GitHub publication")
                 continue
             allowed = value.get("status") in ("rejected", "prepared")
             optional_resolution = bool(resolution(value["argv"]))

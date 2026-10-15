@@ -14,6 +14,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import github_transport as tr
+
+for kind in ("code", "commits", "issues", "prs", "repos"):
+    assert tr.proxy_readonly(["search", kind, "query", "--json", "url"])
+assert not tr.proxy_readonly(["search", "unknown", "query"])
 from tauceti_worker.github import GitHub, github_budget
 from tauceti_worker.review_state import ReviewState
 

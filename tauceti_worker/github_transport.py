@@ -851,6 +851,8 @@ def migrated_identity(args):
 
 
 def proxy_readonly(args):
+    if len(args) > 1 and args[0] == "search" and args[1] in ("code", "commits", "issues", "prs", "repos"):
+        return True
     if args[:1] == ["api"]:
         if "graphql" in args:
             document = next((a[6:] for a in args if a.startswith("query=")), None)
