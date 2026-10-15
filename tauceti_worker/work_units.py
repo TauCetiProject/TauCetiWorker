@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .agents import (
@@ -313,9 +313,22 @@ def focus_prs(sv: Survey, opts) -> None:
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
     if "security-audit" in opts.only:
-        from .security_audit import run
+        from .security_audit import AuditNotDue, run
 
-        return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+        other_tasks = [task for task in opts.only if task != "security-audit"]
+        if not other_tasks:
+            return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+        try:
+            minimum = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS", "20"))
+        except ValueError:
+            raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
+        try:
+            return run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
+        except AuditNotDue as exc:
+            log(str(exc))
+        # Only an insufficient backlog permits fallback. Findings, incomplete inspections,
+        # permission failures and service errors retain their usual stopping behavior.
+        opts = replace(opts, only=other_tasks)
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
     # before any work runs. The quota pacer does this too, and every paced path now reaches it — but the
     # unpaced ones (kiro, the OpenRouter providers, --dry-run's early return) do not, and host-mode

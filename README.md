@@ -170,6 +170,15 @@ tauceti work --only security-audit --agent codex
 tauceti work --only security-audit --agent claude --loop
 ```
 
+An admin's maintenance worker can also use `--only security-audit,bump,progress`.
+It inspects a bounded batch before ordinary maintenance when at least 20 commits
+are pending. Below that threshold it continues with bump/progress work without
+launching an audit model. Set `TAUCETI_SECURITY_AUDIT_MIN_COMMITS` to a positive
+integer to change the threshold. Audit-only runs inspect any nonempty backlog.
+Findings, unresolved inspections and operational failures stop the round; they
+do not fall through to maintenance. Other work phases and `--pr` cannot be
+combined with the audit phase. Its isolated Luna/Haiku reviewer is unchanged.
+
 It advances TauCeti's protected `security-audit` branch through main's first-parent
 history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
 Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
