@@ -381,11 +381,68 @@ def codex_final(transcript: str, paged: bool) -> dict:
     return json.loads(messages[-1])
 
 
-def repairable_output(transcript: str, batch: dict, receipt: Path, paged: bool) -> bool:
+def empty_incomplete_shape(value: dict, batch: dict, paged: bool) -> bool:
+    if not isinstance(value, dict) or value.get("verdict") != "incomplete" or value.get("findings") != []:
+        return False
+    probe = dict(value)
+    if paged:
+        if not isinstance(probe.pop("read_token", None), str):
+            return False
+    validate_verdict({**probe, "verdict": "pass"}, batch)
+    return True
+
+
+def repair_history(work: Path, batch: dict, paged: bool) -> bool:
+    """Earlier final source verdicts remain binding across repairs and compaction."""
+    try:
+        files = list(work.glob("model-rollout-*.jsonl"))
+        if len(files) != 1:
+            return False
+        for row in map(json.loads, files[0].read_text().splitlines()):
+            item = row.get("payload", {})
+            if row.get("type") != "response_item" or item.get("type") != "message" or item.get("role") != "assistant":
+                continue
+            text = "".join(
+                part.get("text", "") for part in item.get("content", []) if part.get("type") == "output_text"
+            )
+            if item.get("phase") == "commentary":
+                if '"verdict"' in text:
+                    return False
+            elif not empty_incomplete_shape(json.loads(text), batch, paged):
+                return False
+        return True
+    except (Die, ValueError, TypeError, AttributeError, KeyError, OSError):
+        return False
+
+
+def repairable_output(transcript: str, batch: dict, receipt: Path, paged: bool, work: Path | None = None) -> bool:
     """Only an unexplained incomplete with proven complete input delivery."""
     try:
+        events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+        if any(
+            event.get("type")
+            not in {
+                "thread.started",
+                "turn.started",
+                "turn.completed",
+                "item.started",
+                "item.updated",
+                "item.completed",
+            }
+            for event in events
+        ):
+            return False
+        messages = [
+            event["item"].get("text", "")
+            for event in events
+            if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
+        ]
+        if any('"verdict"' in text for text in messages[:-1]):
+            return False
+        if work is not None and not repair_history(work, batch, paged):
+            return False
         value = codex_final(transcript, paged)
-        if not isinstance(value, dict) or value.get("verdict") != "incomplete" or value.get("findings") != []:
+        if not empty_incomplete_shape(value, batch, paged):
             return False
         token = value.pop("read_token", None) if paged else None
         # Validate every other schema field, identity and the complete receipt.
@@ -408,7 +465,9 @@ OUTPUT_REPAIR_PROMPT = (
 )
 
 
-def codex_service_error(transcript: str, paged: bool, work: Path | None = None) -> str | None:
+def codex_service_error(
+    transcript: str, paged: bool, work: Path | None = None, repair_batch: dict | None = None
+) -> str | None:
     """Recognize a client error with no answer, never reinterpret a verdict."""
     try:
         events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
@@ -429,6 +488,8 @@ def codex_service_error(transcript: str, paged: bool, work: Path | None = None) 
                     and item.get("role") == "assistant"
                 ):
                     if item.get("phase") != "commentary":
+                        if repair_batch is not None and repair_history(work, repair_batch, paged):
+                            continue
                         return None
                     text = "".join(part["text"] for part in item["content"] if part.get("type") == "output_text")
                     if '"verdict"' in text:
@@ -512,6 +573,12 @@ def retain_client(work: Path, home: Path, receipt: Path) -> None:
 
 def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged, batch=None):
     """At most three requests, resuming one conversation for service/output recovery."""
+    base_prompt = prompt
+    repairing = prompt.startswith(OUTPUT_REPAIR_PROMPT)
+    while base_prompt.startswith((OUTPUT_REPAIR_PROMPT, CONTINUE_PROMPT)):
+        base_prompt = base_prompt[
+            len(OUTPUT_REPAIR_PROMPT) if base_prompt.startswith(OUTPUT_REPAIR_PROMPT) else len(CONTINUE_PROMPT) :
+        ]
     for number in range(3):
         (work / "prompt.txt").write_text(prompt)
         (work / "execution.json").write_text(
@@ -542,12 +609,16 @@ def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged, batch=
             retain_client(work, home, receipt)
         if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
             raise Die("security-audit: resumed client changed the retained conversation identity")
-        error = codex_service_error(result.stdout, paged, work) if provider == "codex" else None
+        error = (
+            codex_service_error(result.stdout, paged, work, batch if repairing else None)
+            if provider == "codex"
+            else None
+        )
         repair = (
             provider == "codex"
             and not result.returncode
             and batch is not None
-            and repairable_output(result.stdout, batch, receipt, paged)
+            and repairable_output(result.stdout, batch, receipt, paged, work)
         )
         if (error is None and not repair) or number == 2:
             return result
@@ -576,10 +647,8 @@ def run_client(cmd, prompt, *, home, env, work, receipt, provider, paged, batch=
         )
         prefix = cmd[: cmd.index("resume")] if "resume" in cmd else cmd[:-1]
         cmd = [*prefix, "resume", thread, "-"]
-        if not prompt.startswith(CONTINUE_PROMPT):
-            prompt = CONTINUE_PROMPT + prompt
-        if repair:
-            prompt = OUTPUT_REPAIR_PROMPT + prompt
+        repairing = repairing or repair
+        prompt = (OUTPUT_REPAIR_PROMPT if repairing else "") + CONTINUE_PROMPT + base_prompt
         log(
             f"security-audit: {'output repair' if repair else 'service error'}; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s"
         )
@@ -838,7 +907,7 @@ def run(cfg, opts) -> int:
     )
     if not opts.dry_run and previous.get("from_sha") == cursor and not size_failure:
         raise NoProgress(
-            f"security-audit: unresolved inspection; read {blocked}; retry-service may continue a provider failure; source verdicts require human review"
+            f"security-audit: unresolved inspection; read {blocked}; retry-service handles provider errors, repair-output handles eligible malformed output; source verdicts require human review"
         )
     try:
         batch = plan_batch(repo, cursor, main)
@@ -901,6 +970,9 @@ def run(cfg, opts) -> int:
                 else None,
                 "reader_digest": hashlib.sha256(Path(__file__).with_name("audit_reader.py").read_bytes()).hexdigest(),
                 "input_policy": "compacting-session-v1",
+                "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
+                if (attempt / "output-repairs.jsonl").exists()
+                else 0,
                 "from_sha": cursor,
                 "to_sha": target,
                 "verdict": verdict,
@@ -956,6 +1028,10 @@ def resume_incomplete(
     rows = [json.loads(line) for line in (work / "ledger.jsonl").read_text(encoding="utf-8").splitlines()]
     reviews = [r for r in rows if r.get("batch") == batch["input_digest"] and "verdict" in r]
     if output:
+        if any(
+            row.get("batch") == batch["input_digest"] and row.get("recovery_kind") == "output-repair" for row in rows
+        ):
+            raise Die("security-audit: this batch already used its administrative output repair")
         # One compatibility continuation for the retained incident whose repair
         # exposed an operational misunderstanding of rereads. Pin the exact
         # batch, explanation and reader; never generalize to source uncertainty.
@@ -987,7 +1063,11 @@ def resume_incomplete(
         transcript = (original / "model-transcript.jsonl").read_text()
         if (
             not repairable_output(
-                transcript, batch, original / "read-receipt.json", len(serialize(batch).encode()) > INLINE_BYTES
+                transcript,
+                batch,
+                original / "read-receipt.json",
+                len(serialize(batch).encode()) > INLINE_BYTES,
+                original,
             )
             and not reader_repair
         ):
@@ -1009,7 +1089,18 @@ def resume_incomplete(
             batch["input_digest"] == "4709c7a0a7894d94b9c8c7646560aab9897aa961b8e2026ed941cccbe29bb594"
             and profile["reader_digest"] == "f852a254efc4336cce71f853b8c86e3ccc87084f2914efbf085463c3bb57bfc0"
         )
-        if not legacy and any(execution.get(key) != value for key, value in profile.items()):
+        legacy = (
+            legacy
+            and not (execution.keys() & profile.keys())
+            and execution.get("prompt_digest") == "974136fc966f3d3e6f969111f2d2a826dc3548731594839119f303dc184bdc17"
+        )
+        reader_compat = reader_repair and {key: execution.get(key) for key in (*profile, "prompt_digest")} == {
+            "launcher_code_digest": "092d877810c5548deb4461b673e49f682516ae63d96fd16ffc9ec9d0948a6ef2",
+            "reader_digest": "f852a254efc4336cce71f853b8c86e3ccc87084f2914efbf085463c3bb57bfc0",
+            "catalog_digest": "e16b921e0a354d549be4aeb439385f0fa82962eb948210f4c27ac9811a095ba3",
+            "prompt_digest": "611ced5fe6e16b1b0e24e246e585fd3d357f477086416769d5c3761a819a68d7",
+        }
+        if not legacy and not reader_compat and any(execution.get(key) != value for key, value in profile.items()):
             raise Die("security-audit: inspection implementation changed since malformed output")
         if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
             raise Die("security-audit: retained inspection prompt digest mismatch")
@@ -1082,6 +1173,7 @@ def resume_incomplete(
         {
             "actor": actor,
             "continuation_of": str(original),
+            "recovery_kind": "output-repair" if output else "service-retry" if service else "reader-resume",
             "attempt": str(attempt),
             "reason": reason,
             "batch": batch["input_digest"],
@@ -1108,7 +1200,11 @@ def resume_incomplete(
                 "from_sha": cursor,
                 "to_sha": target,
                 "continuation_of": str(original),
+                "recovery_kind": "output-repair" if output else "service-retry" if service else "reader-resume",
                 "attempt": str(attempt),
+                "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
+                if (attempt / "output-repairs.jsonl").exists()
+                else 0,
                 "prompt_digest": hashlib.sha256((attempt / "prompt.txt").read_bytes()).hexdigest(),
                 "launcher_profile": reviewer_argv("codex"),
                 "execution_record": str(attempt / "execution.json"),

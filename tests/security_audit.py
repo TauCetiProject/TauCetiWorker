@@ -408,7 +408,7 @@ class CompactingInspection(unittest.TestCase):
     def test_resume_before_first_page_starts_with_an_empty_receipt(self):
         self.run_reader_session(resume=True, missing_receipt=True)
 
-    def run_reader_session(self, resume=False, missing_receipt=False, repair_once=False):
+    def run_reader_session(self, resume=False, missing_receipt=False, repair_once=False, repair_always=False):
         auth = self.work / "auth.json"
         auth.write_text('{"tokens":{"access_token":"provider-only"}}')
 
@@ -433,7 +433,8 @@ class CompactingInspection(unittest.TestCase):
                 self.assertEqual(argv[-3:], ["resume", thread, "-"])
                 for option in ("--sandbox", "--output-schema", "shell_tool", "unified_exec", "multi_agent"):
                     self.assertIn(option, argv[: argv.index("resume")])
-                self.assertIn(sa.OUTPUT_REPAIR_PROMPT, kwargs["input"])
+                self.assertEqual(kwargs["input"].count(sa.OUTPUT_REPAIR_PROMPT), 1)
+                self.assertEqual(kwargs["input"].count(sa.CONTINUE_PROMPT), 1)
                 self.assertTrue((self.work / "output-error-1/model-transcript.jsonl").exists())
             if resume:
                 self.assertEqual(argv[-3:], ["resume", thread, "-"])
@@ -477,7 +478,7 @@ class CompactingInspection(unittest.TestCase):
                     json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
                 )
             answer = {**self.verdict, "read_token": reader.token}
-            if repair_once and calls == 1:
+            if repair_once and (calls == 1 or repair_always):
                 answer["verdict"] = "incomplete"
             events.extend(
                 [
@@ -498,8 +499,12 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa.subprocess, "run", side_effect=model) as run,
             patch.object(sa.time, "sleep"),
         ):
-            self.assertEqual(sa.inspect(self.batch, "codex", self.work, resume_from=original), self.verdict)
-            self.assertEqual(run.call_count, 2 if repair_once else 1)
+            if repair_always:
+                with self.assertRaisesRegex(Die, "inconsistent findings"):
+                    sa.inspect(self.batch, "codex", self.work, resume_from=original)
+            else:
+                self.assertEqual(sa.inspect(self.batch, "codex", self.work, resume_from=original), self.verdict)
+            self.assertEqual(run.call_count, 3 if repair_always else 2 if repair_once else 1)
         self.assertTrue((self.work / "read-receipt.json").exists())
 
     def test_empty_incomplete_repair_requires_complete_coverage_and_no_findings(self):
@@ -533,6 +538,9 @@ class CompactingInspection(unittest.TestCase):
         ):
             with self.subTest(changed=changed):
                 self.assertFalse(sa.repairable_output(transcript({**value, **changed}), self.batch, receipt, True))
+        self.assertFalse(
+            sa.repairable_output(json.dumps({"type": "unknown"}) + "\n" + transcript(value), self.batch, receipt, True)
+        )
         forbidden = {"type": "item.completed", "item": {"type": "command_execution"}}
         self.assertFalse(
             sa.repairable_output(json.dumps(forbidden) + "\n" + transcript(value), self.batch, receipt, True)
@@ -540,6 +548,30 @@ class CompactingInspection(unittest.TestCase):
 
     def test_same_session_output_repair_uses_full_isolated_launcher(self):
         self.run_reader_session(repair_once=True)
+
+    def test_repeated_empty_incomplete_exhausts_the_shared_three_launch_budget(self):
+        self.run_reader_session(repair_once=True, repair_always=True)
+        self.assertEqual(len((self.work / "output-repairs.jsonl").read_text().splitlines()), 2)
+
+    def test_native_history_keeps_source_findings_binding(self):
+        rollout = self.work / "model-rollout-0.jsonl"
+        for verdict, findings in [("finding", ["IO"]), ("incomplete", ["Unresolved source question"]), ("pass", [])]:
+            value = {**self.verdict, "verdict": verdict, "findings": findings, "read_token": "old"}
+            item = {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": json.dumps(value)}],
+                },
+            }
+            rollout.write_text(json.dumps(item) + "\n")
+            self.assertFalse(sa.repair_history(self.work, self.batch, True))
+        value = {**self.verdict, "verdict": "incomplete", "findings": [], "read_token": "old"}
+        item["payload"]["content"][0]["text"] = json.dumps(value)
+        rollout.write_text(json.dumps(item) + "\n")
+        self.assertTrue(sa.repair_history(self.work, self.batch, True))
 
     def test_service_error_classifier_never_retries_an_answer_or_unknown_tool(self):
         error = {"type": "turn.failed", "error": {"message": "service unavailable"}}
@@ -977,6 +1009,13 @@ class Run(unittest.TestCase):
         inspect.assert_called_once()
         self.assertFalse(blocked.exists())
         self.assertTrue((original / "model-transcript.jsonl").exists())
+        blocked.write_text(sa.serialize(block))
+        with (
+            patch.object(sa, "inspect") as second,
+            self.assertRaisesRegex(Die, "already used its administrative output repair"),
+        ):
+            sa.resume_incomplete(SimpleNamespace(state=self.state), "Repeat repair", output=True)
+        second.assert_not_called()
 
     def test_continuation_never_resumes_a_source_finding(self):
         work, original, batch = self.retained_incomplete(finding=True)
