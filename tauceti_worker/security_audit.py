@@ -1002,7 +1002,8 @@ if __name__ == "__main__":
     if args.command == "setup":
         setup(args.state)
     elif args.command == "resume":
-        from .config import Config, RoundContext
+        from .config import Config
+        from .round import RoundContext
 
         if args.reason is None:
             parser.error("resume requires --reason")

@@ -735,6 +735,17 @@ class Run(unittest.TestCase):
         advance.assert_not_called()
         self.assertTrue((work / "blocked.json").exists())
 
+    def test_resume_cli_loads_its_lock_before_argument_validation(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "tauceti_worker.security_audit", "resume", "--state", str(self.state)],
+            cwd=Path(sa.__file__).resolve().parents[1],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("resume requires --reason", result.stderr)
+        self.assertNotIn("ImportError", result.stderr)
+
     def test_failed_continuation_cannot_be_retried_without_a_verdict(self):
         work, original, batch = self.retained_incomplete()
         cfg = SimpleNamespace(state=self.state)
