@@ -221,7 +221,7 @@ for provenance in ("stale", "fetch_failed"):
         )
 
 # --- stages that do not read review state are not charged for a re-read ---------------------------
-for stage in ("rebase", "fix-ci", "bump", "roadmap", "progress"):
+for stage in ("fix-ci", "bump", "roadmap", "progress"):
     rs = FakeRS()
     check(f"{stage} needs no re-read", (still(stage, rs), rs.busted), (True, []))
 

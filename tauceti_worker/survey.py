@@ -809,7 +809,7 @@ def survey(
         if p.mergeable != "CONFLICTING":
             if not handoff:
                 continue
-            reason = "merge-sweep requested branch reconciliation"
+            reason = "authenticated request for integration repair"
         c = Candidate(p.number, p.head_oid, reason)
         try:
             if budget_error:

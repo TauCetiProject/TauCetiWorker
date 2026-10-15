@@ -114,8 +114,9 @@ RUN_STDLIB=(
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
 # bash tests
 RUN_SH=(docker_entrypoint.sh lifecycle.sh)
-# deliberately not run here (needs the bubble sandbox/proxy)
-SKIP=(egress.sh)
+# Deliberate manual checks: egress needs the bubble sandbox/proxy; the cross-repo
+# repair fixture needs Lean, Elixir and a bors checkout (see its module docstring).
+SKIP=(egress.sh integration_repair_fixture.py)
 
 pass=0; fail=0; failed=()
 
@@ -136,7 +137,7 @@ summary() {
   echo "================================================================"
   echo "run-all: $pass passed, $fail failed"
   ((${#failed[@]})) && printf '  failed: %s\n' "${failed[@]}"
-  ((${#SKIP[@]}))   && printf '  skipped (needs sandbox): %s\n' "${SKIP[@]}"
+  ((${#SKIP[@]}))   && printf '  skipped (requires external tooling): %s\n' "${SKIP[@]}"
 }
 
 # --- inventory guard: every tests/*.py and tests/*.sh must be classified --------------------------

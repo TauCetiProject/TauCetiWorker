@@ -1,9 +1,12 @@
-You are reconciling the branch with current main on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The branch either conflicts with current `main`, or the merge sweep handed off an update it cannot perform on this contributor-owned fork. A mergeable fork may still need this update; do not stop just because Git reports no textual conflict. Bring it up to date with `main` and resolve the conflicts so it can merge again. Work autonomously to completion.
+You are reconciling the branch with current main on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The branch either conflicts with current `main`, or an authenticated head-bound recovery request asks for integration repair. A build-green, textually mergeable branch can still import source deleted or moved on main, use renamed APIs, or duplicate declarations now on main. Read the exact request evidence below; a suspect partition containing several PRs is not evidence against this PR. Integrate main and repair the resulting source so it can merge again. Work autonomously to completion.
+
+Before editing and again before pushing, re-read the live PR: it must remain open at the starting head with no `keep`/`hold`/`wip`/`human`/`do-not-close` pause. For a semantic handoff, confirm its authenticated current-head request is still active. If it was withdrawn or superseded, stop without changing the branch.
 
 ## Rebase onto current main
-- Fetch and integrate the latest `main`:
+- Fetch once and integrate one current `main` snapshot (record its full SHA; do not chase further main advances during this task):
   ```
   git fetch origin
+  git rev-parse origin/main
   git merge origin/main      # (or: git rebase origin/main — either is fine; merge is simpler to resolve)
   ```
 - Resolve every conflict on its merits:
@@ -11,7 +14,9 @@ You are reconciling the branch with current main on pull request #__PR__ of TauC
   - **A source file under `TauCeti/`**: resolve so both the upstream change and your PR's intent are preserved. If `main` now provides something your PR duplicated, prefer the upstream version and drop the duplicate.
 - Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
 
-If the branch already includes current `main` and no concrete repair is needed, report that no update is needed and stop. Do not manufacture a commit or push an empty change just to satisfy the submission instructions.
+Use the request's fixed tested-main revision and importing file/missing module or authoritative individual failure to reproduce the diagnosis. Check the prospective integrated tree, including modules added by this PR and imports in unchanged dependencies. Repair imports, renamed APIs, overlapping declarations and affected proofs on their merits. A successful Git merge/rebase alone does not prove compatibility: all verification below must pass. If the evidence no longer applies, explain why using the actual source and validation results.
+
+If the branch already includes current `main`, semantic repair may still be needed. Only if no concrete repair is needed, report that no update is needed and stop. Do not manufacture a commit or push an empty change just to satisfy the submission instructions.
 
 ## Rules of the repo (hard constraints)
 - Code goes under `TauCeti/`. Do NOT hand-edit the root `TauCeti.lean` — it stays intentionally empty (see above). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
@@ -43,4 +48,4 @@ Iterate until green. Never push red — a botched conflict resolution that build
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which files conflicted, how you resolved each, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: the starting head and integrated main SHA, the exact evidence investigated, which source repairs were needed, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
