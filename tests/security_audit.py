@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_reader as ar
 from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
+from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
 from tauceti_worker.work_units import want
 
@@ -134,11 +135,67 @@ class History(unittest.TestCase):
         self.assertEqual(len(sa.plan_batch(self.repo, self.base, head)["commits"]), 20)
 
 
+class MaintenanceScheduling(unittest.TestCase):
+    def setUp(self):
+        self.opts = wu.RoundOpts(
+            only=["bump", "progress", "security-audit"],
+            agent="claude",
+            work_model="claude",
+            sandbox_host=True,
+            dry_run=False,
+        )
+        self.worker = SimpleNamespace(cfg=SimpleNamespace())
+
+    def test_below_threshold_reaches_maintenance_without_changing_options(self):
+        with (
+            patch.dict(os.environ, {"TAUCETI_SECURITY_AUDIT_MIN_COMMITS": "20"}),
+            patch.object(sa, "run", side_effect=sa.AuditNotDue("waiting")) as audit,
+            patch.object(wu, "mirror_creds", side_effect=RuntimeError("maintenance reached")),
+            self.assertRaisesRegex(RuntimeError, "maintenance reached"),
+        ):
+            wu.run_round(self.worker, self.opts)
+        self.assertEqual(audit.call_args.kwargs, {"min_commits": 20})
+        self.assertEqual(audit.call_args.args[1].only, ["security-audit"])
+        self.assertEqual(self.opts.only, ["bump", "progress", "security-audit"])
+
+    def test_audit_work_and_failures_never_fall_through(self):
+        for result in (0, sa.NoProgress("service unavailable"), sa.Die("finding")):
+            with (
+                patch.object(
+                    sa,
+                    "run",
+                    **({"side_effect": result} if isinstance(result, Exception) else {"return_value": result}),
+                ),
+                patch.object(wu, "mirror_creds") as maintenance,
+            ):
+                if isinstance(result, Exception):
+                    with self.assertRaises(type(result)):
+                        wu.run_round(self.worker, self.opts)
+                else:
+                    self.assertEqual(wu.run_round(self.worker, self.opts), 0)
+            maintenance.assert_not_called()
+
+    def test_mixed_round_still_preflights_maintenance_tools(self):
+        with patch.object(cli, "_have", side_effect=lambda name: name != "lake"):
+            with self.assertRaisesRegex(Die, "toolchain"):
+                cli.preflight(self.worker.cfg, self.opts)
+
+
 class Authority(unittest.TestCase):
     def test_phase_is_explicit_only(self):
         self.assertFalse(want([], "security-audit"))
         self.assertNotIn("security-audit", cli.resolve_tasks([], ["review"]))
         self.assertEqual(cli.resolve_tasks(["security-audit"], []), ["security-audit"])
+
+    def test_maintenance_combination_still_requires_admin(self):
+        for only in (["security-audit"], ["bump", "progress", "security-audit"]):
+            with patch.object(sa, "require_admin", side_effect=Die("not admin")) as admin:
+                with self.assertRaisesRegex(Die, "not admin"):
+                    cli.cmd_work(SimpleNamespace(), only=only, agent="claude", one_round=True)
+            admin.assert_called_once()
+        with patch.object(sa, "require_admin") as admin, self.assertRaisesRegex(Die, "bump/progress"):
+            cli.cmd_work(SimpleNamespace(), only=["review", "security-audit"], agent="claude", one_round=True)
+        admin.assert_not_called()
 
     def test_admin_must_be_literal_true(self):
         for value in (False, None, "true", 1):
@@ -740,12 +797,47 @@ class Run(unittest.TestCase):
             ("require_admin", {}),
             ("remote_sha", {"return_value": self.old}),
             ("refresh", {}),
+            ("validate_history", {"return_value": [self.target]}),
             ("plan_batch", {"return_value": self.batch}),
             ("api", {"return_value": {"login": "admin"}}),
         ):
             mock = patch.object(sa, name, **kwargs)
             mock.start()
             self.addCleanup(mock.stop)
+
+    def test_pending_threshold_skips_all_model_and_planning_work(self):
+        for count in (0, 1, 19):
+            with (
+                self.subTest(count=count),
+                patch.object(sa, "validate_history", return_value=[self.target] * count),
+                patch.object(sa, "plan_batch") as planner,
+                patch.object(sa, "inspect") as model,
+                self.assertRaises(sa.AuditNotDue),
+            ):
+                sa.run(SimpleNamespace(state=self.state), self.opts, min_commits=20)
+            planner.assert_not_called()
+            model.assert_not_called()
+        self.assertFalse((self.state / sa.CURSOR / "blocked.json").exists())
+
+    def test_threshold_boundary_and_audit_only_small_backlog(self):
+        for minimum, count in ((20, 20), (1, 1)):
+            with (
+                patch.object(sa, "validate_history", return_value=[self.target] * count),
+                patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
+                patch.object(sa, "advance", return_value=self.target),
+            ):
+                self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts, min_commits=minimum), 0)
+            model.assert_called_once()
+
+    def test_block_is_not_hidden_by_small_backlog(self):
+        work = self.state / sa.CURSOR
+        work.mkdir()
+        (work / "blocked.json").write_text(json.dumps({"from_sha": self.old, "reason": "finding"}))
+        with patch.object(sa, "inspect") as model:
+            with self.assertRaisesRegex(NoProgress, "unresolved inspection") as raised:
+                sa.run(SimpleNamespace(state=self.state), self.opts, min_commits=20)
+        self.assertNotIsInstance(raised.exception, sa.AuditNotDue)
+        model.assert_not_called()
 
     def test_finding_blocks_repeated_model_calls(self):
         verdict = {"verdict": "finding", "findings": ["unsafe IO"]}

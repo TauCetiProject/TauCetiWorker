@@ -935,7 +935,13 @@ def advance(repo: Path, batch: dict) -> str:
     return target
 
 
-def run(cfg, opts) -> int:
+class AuditNotDue(NoProgress):
+    """The cursor is current or the configured backlog threshold has not been met."""
+
+
+def run(cfg, opts, *, min_commits: int = 1) -> int:
+    if type(min_commits) is not int or min_commits < 1:
+        raise Die("security-audit: minimum pending commits must be a positive integer")
     require_admin()
     work = cfg.state / CURSOR
     repo = work / "objects.git"
@@ -959,6 +965,12 @@ def run(cfg, opts) -> int:
         raise NoProgress(
             f"security-audit: unresolved inspection; read {blocked}; retry-service handles provider errors, repair-output handles eligible malformed output; source verdicts require human review"
         )
+    pending = len(validate_history(repo, cursor, main))
+    if pending < min_commits:
+        reason = (
+            "cursor is caught up with main" if not pending else f"{pending} pending commits; waiting for {min_commits}"
+        )
+        raise AuditNotDue(f"security-audit: {reason}")
     try:
         batch = plan_batch(repo, cursor, main)
     except (Die, ValueError, OSError, subprocess.TimeoutExpired) as exc:
