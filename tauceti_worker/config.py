@@ -175,6 +175,9 @@ class Config:
         # owner per claim.sh invocation, so in host mode a worker can't renew or recognise its own
         # branch/<pr> lease and git-safe-push fails closed with "lease lost (another agent took over)".
         os.environ["TAUCETI_WORKER_ID"] = wid
+        if os.environ.get("TAUCETI_FLEET_EVENTS"):
+            os.environ["TAUCETI_FLEET_PYTHON"] = sys.executable
+            os.environ["TAUCETI_FLEET_EMITTER"] = str(Path(__file__).with_name("fleet_events.py").resolve())
         # Lake may otherwise leave a cache hit only in its local store, where TauCeti's later
         # `lake exe axioms` and `lake exe module-system` audits cannot resolve it. Enable the store
         # and restore its artifacts into the build directory as one default policy. A manager's

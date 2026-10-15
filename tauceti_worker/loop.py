@@ -26,6 +26,7 @@ from .constants import (
     OPENROUTER_MODELS,
     POLL,
 )
+from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
 from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
@@ -115,8 +116,6 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
-            from .fleet_capacity import admission_reason as fleet_admission_reason
-
             if reason := fleet_admission_reason(cfg.wid):
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)

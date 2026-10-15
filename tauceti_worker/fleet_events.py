@@ -32,7 +32,7 @@ def emit(kind, *, key=None, **fields):
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "a") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             stream.write(json.dumps(event, sort_keys=True) + "\n")
             stream.flush()
     except (OSError, ValueError, TypeError):
@@ -53,13 +53,15 @@ def mutation(value, result):
     if created and match:
         emit("pr_created", key=match[0], repository=match[1], pr=int(match[2]))
         return
-    context = value.get("context", {})
-    if context.get("repository") and str(context.get("pr", "")).isdigit():
+    from .github_outbox import target
+
+    repository, pr = target(value)
+    if repository and pr:
         emit(
             "pr_activity",
             key=value.get("created", "").__str__(),
-            repository=context["repository"],
-            pr=int(context["pr"]),
+            repository=repository,
+            pr=pr,
             activity="github_mutation",
         )
 

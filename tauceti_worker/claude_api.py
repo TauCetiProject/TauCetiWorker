@@ -131,6 +131,10 @@ class ClaudeAPIContext:
 
     def start(self):
         global CURRENT_CONTEXT
+        from .fleet_capacity import admission_reason as fleet_admission_reason
+
+        if reason := fleet_admission_reason(self.worker):
+            raise BudgetError(reason)
         if self.enabled:
             snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
             reason = admission_pause(snapshot)
@@ -188,9 +192,10 @@ class ClaudeAPIContext:
         if action == "admit":
             from .fleet_capacity import admission_reason as fleet_admission_reason
 
-            if reason := fleet_admission_reason(self.worker):
+            # A context can launch multiple calls or resume a paid session.
+            # Once admitted, finish this work unit even if CI takes capacity.
+            if not self.invocations and (reason := fleet_admission_reason(self.worker)):
                 self.blocked_reason = reason
-                report_runtime("waiting-capacity", detail=reason)
                 return dict(allowed=False, reason=reason)
             ticket = request["id"]
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):

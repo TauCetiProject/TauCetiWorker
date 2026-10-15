@@ -50,8 +50,8 @@ fi
 # 2) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
 echo "git-safe-push: $REMOTE HEAD:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2
 if git push --force-with-lease="$REF:$EXPECT" "$REMOTE" "HEAD:$REF"; then
-    if [[ -n "${TAUCETI_FLEET_EVENTS:-}" ]]; then
-        python3 -m tauceti_worker.fleet_events pushed || true
+    if [[ -n "${TAUCETI_FLEET_EVENTS:-}" && -n "${TAUCETI_FLEET_PYTHON:-}" && -n "${TAUCETI_FLEET_EMITTER:-}" ]]; then
+        "$TAUCETI_FLEET_PYTHON" -I "$TAUCETI_FLEET_EMITTER" pushed 2>/dev/null || true
     fi
     exit 0
 fi
