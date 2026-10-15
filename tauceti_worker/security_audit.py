@@ -799,7 +799,8 @@ def resume_incomplete(cfg, reason: str, *, ignore_quota: bool = False) -> str:
     if (
         set(previous) != {"from_sha", "to_sha", "reason", "attempt"}
         or previous["reason"] != "security-audit: " + failures[0]
-        or last.get("execution_record") != str(original / "execution.json")
+        or not isinstance(last.get("execution_record"), str)
+        or Path(last["execution_record"]).resolve() != original / "execution.json"
         or last.get("reader_digest") != LEGACY_READER_DIGEST
     ):
         raise Die("security-audit: continuation does not match the original recorded transport block")

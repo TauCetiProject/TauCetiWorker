@@ -652,6 +652,12 @@ class Run(unittest.TestCase):
 
     def test_explicit_continuation_keeps_block_until_complete_pass_and_advance(self):
         work, original, batch = self.retained_incomplete()
+        alias = self.state / "audit-alias"
+        alias.symlink_to(work, target_is_directory=True)
+        ledger = work / "ledger.jsonl"
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        rows[0]["execution_record"] = str(alias / original.name / "execution.json")
+        ledger.write_text("\n".join(map(sa.serialize, rows)) + "\n")
 
         def inspect(value, provider, attempt, **kwargs):
             self.assertEqual(value, batch)
