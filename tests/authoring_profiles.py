@@ -203,6 +203,27 @@ try:
         ["--author-model", "claude-custom", "--author-effort", "max"],
     )
 
+    # Audit workers reject authoring overrides before dispatch, including defaults
+    # injected by the loop. Exercise the real loop-to-child argument construction.
+    for only in (["security-audit"], ["bump", "progress", "security-audit"]):
+        for provider in ("claude", "codex"):
+            captured.clear()
+            tc.loop.choose_model = lambda *_a, **_k: (provider, {})
+            tc.loop.github_budget = lambda: {}
+            tc.loop.run_round_subprocess = capture
+            try:
+                args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None, source=None)
+                tc.loop.cmd_loop(args, SimpleNamespace(wid="test"), only=only, agent=provider)
+            finally:
+                tc.loop.choose_model = saved_choose
+                tc.loop.github_budget = saved_budget
+                tc.loop.run_round_subprocess = saved_round
+            check("audit child retains phase selection", captured[captured.index("--only") + 1], ",".join(only))
+            check("audit child retains provider", captured[captured.index("--agent") + 1], provider)
+            check("audit child has no authoring model override", "--author-model" in captured, False)
+            check("audit child has no authoring effort override", "--author-effort" in captured, False)
+            check("audit child has no authoring fallback override", "--resolved-author-fallback-model" in captured, False)
+
     # The default Codex profile remains fallback-eligible after the loop parent pins Sol into its child.
     captured.clear()
     tc.loop.choose_model = lambda *_a, **_k: ("codex", {})

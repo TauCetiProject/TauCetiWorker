@@ -256,7 +256,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 # after it has surveyed and picked a work unit, so a round that finds nothing to do never
                 # spends the request. The GitHub preflight above has already passed at this point.
                 tail.append("--claude-bootstrap")
-            if model:
+            # Audit-capable workers use a fixed Luna/Haiku inspection profile and reject
+            # authoring overrides. Their maintenance fallback resolves its normal defaults.
+            if model and "security-audit" not in only:
                 profile = resolve_authoring_profile(
                     model,
                     cli_model=getattr(args, "author_model", None),
