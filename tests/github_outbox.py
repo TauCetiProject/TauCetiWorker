@@ -72,6 +72,13 @@ with (
 ):
     env = dict(os.environ)
     # A failed local checkout/clone is not an ambiguous remote publication.
+    assert outbox.prepare(["gh", "search", "prs", "roadmap", "--repo", "org/repo"], env, tmp) is None
+    legacy_search = outbox.directory(env) / "legacy-search.json"
+    tr.atomic(legacy_search, {"argv": ["search", "prs", "roadmap"], "cwd": tmp, "status": "ambiguous"})
+    with patch.object(tr, "execute") as replay:
+        assert outbox.drain(env) == []
+        assert not legacy_search.exists() and legacy_search.with_suffix(".failed").exists()
+        replay.assert_not_called()
     for local in (["gh", "pr", "checkout", "15467", "--force"], ["gh", "repo", "clone", "org/repo"]):
         assert outbox.prepare(local, env, tmp) is None
     legacy_checkout = outbox.directory(env) / "legacy-checkout.json"
