@@ -1651,6 +1651,8 @@ def _do_progress_inner(w, opts) -> int | None:
         str(roadmap_dir),
         "--code-dir",
         str(w.cfg.checkout),
+        "--min-prs",
+        "25",
         "--out",
         str(plan_file),
         capture=True,
