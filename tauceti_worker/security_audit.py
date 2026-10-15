@@ -52,6 +52,15 @@ Return ONLY JSON with input_digest, commits (all SHA strings in order), verdict
 (pass, finding, incomplete), and findings (list of strings with commit/path/line
 and explanation). A pass must have no findings; other verdicts must explain why.
 """
+COMPACTION_POLICY = """Native compaction continues this SAME inspection session; it
+does not start an independent inspection. You do not need all source in the live
+context simultaneously. Preserve per-commit inspection notes, progress, ALL
+findings, unresolved questions and the latest reader token across compaction.
+Previously inspected pages remain inspected; no automatic full re-review is
+required after compaction. Re-read pages when the retained notes are insufficient.
+Compaction alone is not a reason to return incomplete. Return incomplete if lost
+context actually prevents establishing safety, and never discard a finding.
+"""
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -73,6 +82,7 @@ CODEX_CATALOG = {
             "description": "Source inspection with only the immutable audit input reader",
             "model_messages": {
                 "instructions_template": PROMPT
+                + COMPACTION_POLICY
                 + "\nThe only permitted tool is audit.read_page, which reads the prepared input."
             },
             "default_reasoning_level": "low",
@@ -279,7 +289,7 @@ def reviewer_argv(provider: str) -> list[str]:
             "--permission-mode",
             "dontAsk",
             "--append-system-prompt",
-            PROMPT,
+            PROMPT + COMPACTION_POLICY,
         ]
     if provider == "codex":
         cmd = [
