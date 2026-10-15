@@ -37,8 +37,8 @@ def _sample(cands: list[Candidate], n: int = 3) -> str:
 
 
 # The survey row policy — shared by the Rich snapshot (render_survey) and the Textual dashboard
-# (_render_table) so the two can't drift (e.g. the daily-capped note that once showed only in the
-# snapshot). Each renderer keeps its own styling/escaping; these decide only WHAT text a row carries.
+# (_render_table) so the two cannot drift. Each renderer keeps its own styling/escaping; these
+# decide only what text a row carries.
 
 
 def _kind_note(sv: Survey, name: str) -> tuple[str, str]:
@@ -47,9 +47,6 @@ def _kind_note(sv: Survey, name: str) -> tuple[str, str]:
     wk = sv.kind(name)
     ready = str(wk.count) if wk.count else "—"
     extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
-    if name == "review" and sv.review_capped:
-        capped = ",".join("#" + str(p) for p, _ in sv.review_capped[:5])
-        extra += f"  ({len(sv.review_capped)} daily-capped: {capped})"
     note = (_sample(wk.actionable) or "") + extra
     if name == "bump" and not wk.actionable and not wk.suppressed:
         note = "no broken bump-mathlib PR"

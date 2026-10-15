@@ -224,10 +224,6 @@ sv = survey_with(suppressed={"fix": [1]})
 check("out of attempts", reason(sv, Opts(prs=[1]), 1), "fix suppressed: fix at head (3/3 attempts spent)")
 
 sv = survey_with()
-sv.review_capped.append((1, "3/3"))
-check("behind the daily review cap", reason(sv, Opts(prs=[1]), 1), "review: daily cap 3/3 reached")
-
-sv = survey_with()
 sv.review_inflight.append((1, "codex"))
 check("a peer holds the head", reason(sv, Opts(prs=[1]), 1), "review: a peer reviewer (codex) holds this head")
 
@@ -242,9 +238,9 @@ check("nothing to fix yet", reason(sv, Opts(prs=[1]), 1), "fix: reviews at head 
 # Several reasons can be true at once, and reporting only the first would send the operator after the
 # wrong one.
 sv = survey_with(suppressed={"fix": [1]})
-sv.review_capped.append((1, "3/3"))
+sv.review_inflight.append((1, "codex"))
 got = reason(sv, Opts(prs=[1]), 1)
-check("every reason is reported, not just the first", ("attempts spent" in got, "daily cap" in got), (True, True))
+check("every reason is reported, not just the first", ("attempts spent" in got, "peer reviewer" in got), (True, True))
 
 
 def pr_info(number, *, draft=False, green_since=None):
@@ -427,18 +423,6 @@ check("...and that throttle is reported too", said("--review-min-age"), True)
 
 
 # --- the survey's own stops hold: a named PR is not reviewed just because it was named ---------------
-def capped_survey():
-    sv = survey_with()  # a capped PR is not in the review queue at all
-    sv.open_prs.append(pr_info(412))
-    sv.review_capped.append((412, "3/3"))
-    return sv
-
-
-units, why = round_over(capped_survey, opts_for(prs=[412]))
-check("a PR at its daily review cap is not reviewed", units, [])
-check("...and the cap is the reported reason", said("daily cap 3/3"), True)
-
-
 def inflight_survey():
     sv = survey_with()
     sv.open_prs.append(pr_info(412))

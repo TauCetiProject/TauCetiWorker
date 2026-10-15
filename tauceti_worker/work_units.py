@@ -66,7 +66,6 @@ from .constants import (
     PROGRESS_TOOL_TAIL,
     REVIEW,
     REVIEW_AFFINITY_GRACE_S,
-    REVIEW_DAILY_CAP,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
     ROUND_TIMEOUT,
@@ -239,11 +238,11 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
 
     An operator who names a PR is owed an answer about THAT PR, so this reads the survey back for
     everything it knows about it rather than reporting a bare "nothing to do". Several notes can be
-    true at once (a PR whose review is capped today may also have its fix budget spent), so they are
+    true at once (a PR held by a peer reviewer may also have its fix budget spent), so they are
     joined rather than raced: the first one printed is not necessarily the only reason, and hiding
     the rest would send the operator to fix the wrong thing.
 
-    A stage's `suppressed` list, `review_inflight` / `review_capped` / `review_stuck` and
+    A stage's `suppressed` list, `review_inflight` / `review_stuck` and
     `fix_waiting` are the survey's own vocabulary for "considered and passed over"; anything left
     over is either not an open PR at all, a draft, or open with genuinely nothing to do.
     """
@@ -257,7 +256,6 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
                 spent = f" ({c.attempts}/{c.budget} attempts spent)" if c.budget else ""
                 notes.append(f"{stage} suppressed: {c.reason}{spent}")
     notes += [f"review: a peer reviewer ({who}) holds this head" for n, who in sv.review_inflight if n == pr]
-    notes += [f"review: daily cap {count} reached" for n, count in sv.review_capped if n == pr]
     if pr in sv.review_stuck:
         notes.append("review keeps erroring without posting a verdict — needs infrastructure repair")
     notes += [f"fix: {why}" for n, why in sv.fix_waiting if n == pr]
@@ -373,13 +371,6 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if not in_scope(pr):
             continue
         log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
-    for pr, count in sv.review_capped:
-        if not in_scope(pr):
-            continue
-        if count.startswith("?"):
-            log(f"  review #{pr}: local ledger unreadable — skipping review (fail-closed); fix the ledger")
-        else:
-            log(f"  review #{pr}: daily cap {count} reached — skipping until 00:00 UTC (no launch/clone)")
 
     # Explain why a fix-focused worker has nothing to fix: for each of the contributor's own PRs that is
     # not an actionable fix candidate, say why (awaiting first review, head moved, all green, attempts
@@ -1069,7 +1060,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:
         nrnd = w.rs.review_rounds(pr, w.counters)
-        log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers} (CI retires at the cap)")
+        log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
     try:
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts)
@@ -1094,8 +1085,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
                     "--expect-head",
                     head,
-                    "--max-rounds-per-day",
-                    str(REVIEW_DAILY_CAP),
                     "--submitted-by",
                     me(),
                     *(["--claude-model", claude_model] if claude_model else []),

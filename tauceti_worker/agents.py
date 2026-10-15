@@ -33,7 +33,6 @@ from .constants import (
     OPENROUTER_MODELS,
     PI_RUN,
     REVIEW,
-    REVIEW_DAILY_CAP,
     ROADMAP,
     TAUCETI,
 )
@@ -1983,7 +1982,6 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
         "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
         f"--no-mathlib --no-sync --store /opt/review-store --post "
-        f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )

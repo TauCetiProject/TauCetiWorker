@@ -77,12 +77,6 @@ MAX_REVIEW_CONTESTS = 10  # per-PR lifetime cap on author-contest re-reviews (no
 # reply, so this bounds spend; separate from the review-round budget)
 MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't starve the PR's budget
 
-# The review ENGINE enforces a per-PR daily round cap (its --max-rounds-per-day, default 12); once hit it
-# refuses to review but still exits 0 after re-posting the scoreboard. The worker mirrors that number so it
-# can SKIP a capped PR during the survey — before launching the engine (and its expensive clones) — instead
-# of re-selecting it every round and tight-looping. MUST stay in sync with the engine default (review.py).
-REVIEW_DAILY_CAP = int(os.environ.get("TAUCETI_REVIEW_DAILY_CAP", "12"))
-
 # Soft reviewer affinity: the publisher of the latest scoreboard gets first refusal on a new
 # reviewable head (or an author contest) for twenty minutes. After that the unit returns to the shared
 # fleet queue. Fixed fleet policy rather than an operator knob: reviewers must agree on the same grace.
