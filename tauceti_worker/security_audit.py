@@ -496,7 +496,9 @@ CONTINUE_PROMPT = (
     "this is not a new review or permission to discard earlier findings. Finish the unreviewed source, "
     "Start by calling read_page with an empty token to recover the retained reader state if this input is paged. "
     "Ignore the new manifest reader_token on this continuation. "
-    "Previously inspected pages remain inspected; re-read earlier pages as needed. "
+    "Previously inspected pages remain inspected. You can reread ANY page: after empty-token recovery, "
+    "pass the fresh next_token with your desired page number. Empty token only replays the last page; "
+    "do not use it to request a different page. Re-read missing context rather than assuming it is inaccessible. "
     "Return one verdict for the exact original batch.\n"
 )
 
@@ -954,15 +956,50 @@ def resume_incomplete(
     rows = [json.loads(line) for line in (work / "ledger.jsonl").read_text(encoding="utf-8").splitlines()]
     reviews = [r for r in rows if r.get("batch") == batch["input_digest"] and "verdict" in r]
     if output:
-        if reviews:
+        # One compatibility continuation for the retained incident whose repair
+        # exposed an operational misunderstanding of rereads. Pin the exact
+        # batch, explanation and reader; never generalize to source uncertainty.
+        reader_repair = (
+            batch["input_digest"] == "4709c7a0a7894d94b9c8c7646560aab9897aa961b8e2026ed941cccbe29bb594"
+            and bool(reviews)
+            and reviews[-1]["verdict"]["verdict"] == "incomplete"
+            and hashlib.sha256(serialize(reviews[-1]["verdict"]["findings"]).encode()).hexdigest()
+            == "22d69cd1b528f2824ba954fc6d93b7ecc26627d9c315d2d8c7d2824bd418e874"
+            and len(
+                [
+                    row
+                    for row in rows
+                    if row.get("batch") == batch["input_digest"]
+                    and "continuation_of" in row
+                    and "reason" in row
+                    and "verdict" not in row
+                ]
+            )
+            == 1
+            and not any(row["verdict"]["verdict"] == "finding" for row in reviews)
+            and inspection_profile()["reader_digest"]
+            == "f852a254efc4336cce71f853b8c86e3ccc87084f2914efbf085463c3bb57bfc0"
+        )
+        if reviews and not reader_repair:
             raise Die("security-audit: a recorded source verdict cannot be repaired")
-        if previous.get("reason") != "security-audit: inconsistent findings and verdict":
+        if previous.get("reason") != "security-audit: inconsistent findings and verdict" and not reader_repair:
             raise Die("security-audit: block is not an unexplained incomplete output")
         transcript = (original / "model-transcript.jsonl").read_text()
-        if not repairable_output(
-            transcript, batch, original / "read-receipt.json", len(serialize(batch).encode()) > INLINE_BYTES
+        if (
+            not repairable_output(
+                transcript, batch, original / "read-receipt.json", len(serialize(batch).encode()) > INLINE_BYTES
+            )
+            and not reader_repair
         ):
             raise Die("security-audit: retained output is not eligible for bounded repair")
+        if reader_repair:
+            value = codex_final(transcript, True)
+            token = value.pop("read_token", None)
+            if value != reviews[-1]["verdict"]:
+                raise Die("security-audit: retained reader failure does not match its ledger verdict")
+            validate_reads(
+                {**value, "verdict": "pass", "findings": []}, batch, original / "read-receipt.json", True, token
+            )
         retained_thread(original)
         execution = json.loads((original / "execution.json").read_text())
         profile = inspection_profile()
@@ -1054,7 +1091,7 @@ def resume_incomplete(
     )
     log(f"security-audit: continuing retained inspection {cursor[:12]}..{target[:12]}")
     try:
-        verdict = inspect(batch, "codex", attempt, resume_from=original, **({"repair_output": True} if output else {}))
+        verdict = inspect(batch, "codex", attempt, resume_from=original, **({"repair_output": True} if output and not reader_repair else {}))
         record(
             work / "ledger.jsonl",
             {

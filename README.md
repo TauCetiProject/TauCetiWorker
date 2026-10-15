@@ -244,7 +244,10 @@ python3 -m tauceti_worker.security_audit repair-output --state /path/to/worker/s
 The command checks eligibility and the retained inspection profile, preserves the
 original answer and block, and repeats the ordinary quota, authorization, input
 and ancestry checks. Only the model's complete passing answer and confirmed ref
-update can advance the cursor. It never converts the original answer into a pass.
+update can advance the cursor. It never converts the original answer into a pass. The pre-profile retained incident
+also permits one pinned continuation of its exact recorded reader-context failure,
+with the input digest, reader digest, explanation, receipt and continuation count
+checked; this does not extend repair eligibility to other explained incomplete results.
 
 For the recorded legacy Luna failure where the final two pages were inaccessible
 because the reader token was lost, an admin may explicitly continue the **same
