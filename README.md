@@ -350,7 +350,7 @@ tauceti work --pr 412 --dry-run        # what it would do to #412, doing nothing
 
 `--pr` only ever *removes* work. It cannot make a PR actionable that the round
 had already passed over, so a spent attempt budget, a peer's in-progress review,
-the daily review cap and the branch claims all still hold: "work on these PRs"
+and the branch claims all still hold: "work on these PRs"
 means "of the work you were already willing to do, only this". Progress and
 roadmap rounds name no existing PR, so a targeted round drops them rather than
 quietly authoring something unrelated when the named PRs turn out to have
@@ -368,7 +368,7 @@ why, one line per PR you named, before it exits without progress:
 ```
 --pr: this round considers only #412, #415
   --pr #412: fix: reviews at head are all green
-  --pr #415: review: daily cap 3/3 reached
+  --pr #415: review: a peer reviewer (codex) holds this head
 ```
 
 `$TAUCETI_PR` is the environment equivalent, which is how a

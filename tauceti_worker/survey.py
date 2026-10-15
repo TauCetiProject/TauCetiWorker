@@ -13,10 +13,9 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import UTC
 from pathlib import Path
 
-from .config import Config, log, roadmap_only, roadmap_skip
+from .config import Config, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
@@ -44,7 +43,6 @@ from .constants import (
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_AGE_CAP_S,
     REVIEW_AGE_SCALE_S,
-    REVIEW_DAILY_CAP,
     STATUS_LABELS,
     TAUCETI,
     TAUCETI_OWNER,
@@ -326,10 +324,6 @@ class Survey:
     # exact head). Skipped this round so the worker neither pays the engine's launch cost just to have
     # it skip nor busy-loops on the one PR a peer holds. (pr, providers) for a one-line status note.
     review_inflight: list[tuple[int, str]] = field(default_factory=list)
-    # PRs at the engine's per-PR daily review cap (REVIEW_DAILY_CAP rounds today in this worker's local
-    # ledger). Skipped this round — reviewing them would only make the engine clone repos then refuse,
-    # which is the tight loop we hit. (pr, "n/cap") for a one-line status note; resets at 00:00 UTC.
-    review_capped: list[tuple[int, str]] = field(default_factory=list)
     # Tended PRs that are NOT actionable for `fix`, each with a one-line reason (awaiting first review,
     # head moved since review, reviews all green, fix attempts spent, or a transient fetch failure). A
     # fix-focused worker logs these so it explains its idleness instead of sitting on a bare "no eligible
@@ -385,27 +379,6 @@ class Survey:
         if self.n_status_unlabeled:
             parts.append(f"{self.n_status_unlabeled} unlabeled")
         return ", ".join(parts)
-
-
-def _review_rounds_today(store_dir: Path, pr: int) -> int | None:
-    """Count this PR's review rounds recorded TODAY (UTC) in the worker's LOCAL engine ledger — the exact
-    quantity the engine caps at REVIEW_DAILY_CAP (mirrors review.py's today()-prefixed count over
-    prs.<pr>.rounds). Returns 0 when the ledger or PR entry is simply absent (a never-reviewed PR is
-    reviewable). Returns None — a fail-CLOSED sentinel the caller treats as 'skip' — when the ledger
-    exists but can't be read/parsed, so a torn file can never silently re-enable the capped-PR tight loop."""
-    led = store_dir / "ledger.json"
-    if not led.exists():
-        return 0
-    try:
-        d = json.loads(led.read_text())
-    except (OSError, ValueError):
-        log(f"review cap: cannot read {led} — skipping review this round (fail-closed)")
-        return None
-    from datetime import datetime
-
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    rounds = (((d.get("prs") or {}).get(str(pr)) or {}).get("rounds")) or []
-    return sum(1 for r in rounds if isinstance(r, dict) and (r.get("ts") or "").startswith(today))
 
 
 def bucket_status_labels(nondraft: list[PRInfo], me_login: str) -> tuple[list[tuple[str, int, int]], int]:
@@ -829,7 +802,7 @@ def survey(
     #    or an errored round → normal review; no round budget here, CI retires a non-converging PR),
     #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
-    #    review keeps erroring without posting a verdict is escalated, not silently dropped.
+    #    review keeps erroring without completing a review is escalated, not silently dropped.
     for p in nondraft if "review" in enabled else []:
         if not p.build_success:
             continue
@@ -853,15 +826,6 @@ def survey(
             if not p.automatic_bump and c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
                 sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
-                continue
-            # Daily review cap: past REVIEW_DAILY_CAP rounds today the engine refuses but would still clone
-            # repos first, then exit 0 re-posting the scoreboard — the tight loop we hit. Mirror the
-            # engine's count from our LOCAL ledger and skip the PR here, before any launch/clone. Resets at
-            # 00:00 UTC. Fail-CLOSED (None) on a corrupt ledger so a torn file can't re-enable the loop.
-            today_rounds = _review_rounds_today(cfg.store_dir, p.number)
-            if today_rounds is None or today_rounds >= REVIEW_DAILY_CAP:
-                shown = "?" if today_rounds is None else str(today_rounds)
-                sv.review_capped.append((p.number, f"{shown}/{REVIEW_DAILY_CAP}"))
                 continue
             # A peer reviewer holds this exact head (de-contention is on the head alone): skip it now,
             # the same call the engine's coordinate() would make after a full build+launch. Doing it

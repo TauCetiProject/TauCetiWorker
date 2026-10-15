@@ -32,7 +32,7 @@ backing off repeated failures. They do not belong to a terminal session.
 
 Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.
 Their build, rebase, review-error, review-fix and contest attempts are not permanently
-capped. Existing loop backoff, quota pacing, daily review limits, branch claims,
+capped. Existing loop backoff, quota pacing, branch claims,
 and explicit holds still apply. Workers checkpoint coherent partial source repairs
 before their round deadline; full CI, audits, and current-head reviews authorize merging.
 

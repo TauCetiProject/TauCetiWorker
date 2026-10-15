@@ -86,7 +86,6 @@ RUN_STDLIB=(
   quota_codex_windows.py
   quota_reason.py
   review_codex_model.py
-  review_daily_cap.py
   review_diagnostics.py
   review_provider_down.py
   review_scheduling.py
