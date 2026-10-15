@@ -1091,7 +1091,13 @@ def resume_incomplete(
     )
     log(f"security-audit: continuing retained inspection {cursor[:12]}..{target[:12]}")
     try:
-        verdict = inspect(batch, "codex", attempt, resume_from=original, **({"repair_output": True} if output and not reader_repair else {}))
+        verdict = inspect(
+            batch,
+            "codex",
+            attempt,
+            resume_from=original,
+            **({"repair_output": True} if output and not reader_repair else {}),
+        )
         record(
             work / "ledger.jsonl",
             {
