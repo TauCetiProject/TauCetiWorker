@@ -183,7 +183,8 @@ or writes. Each read returns the token for the next call so parallel reads canno
 flood the context window. The same Luna/Haiku conversation can compact its history and
 re-read pages as needed, then returns one verdict covering the entire batch. There
 are no independent partial inspections or combined partial approvals. A pass is
-rejected unless the reader's receipt accounts for every page. Delivery coverage
+rejected unless the reader's receipt accounts for every page and the verdict echoes
+the token that follows the last page's contents. Delivery coverage
 does not prove the model understood the source; compaction can lose details, so
 the prompt requires retaining findings and unresolved questions, re-reading when
 needed, and returning incomplete if the full inspection cannot be completed.
@@ -194,8 +195,9 @@ No Lean builds or candidate scripts run. A finding, incomplete inspection, overs
 commit or model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
 not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
-The input, transcript, native Codex compaction/usage records, read receipt (for larger inputs), and durable ledger are
-retained in the same directory. A pre-inspection size-only block from the old
+The input, actual launcher/environment/prompt, transcript, native Codex
+compaction/usage records, read receipt (for larger inputs), and durable ledger are
+retained in the same directory. A pre-inspection commit-budget block from the old
 256 KiB planner can be archived and replanned when its exact next commit fits the
 new limits. This does not attest that commit or retry a model verdict: findings,
 incomplete inspections, client errors and other planning errors remain blocked.

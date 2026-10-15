@@ -336,7 +336,9 @@ class CompactingInspection(unittest.TestCase):
         for field in ("after", "diff"):
             sections = parts[field]
             self.assertEqual("".join(s["text"] for s in sections), self.batch["commits"][0]["files"][0][field])
-        sa.validate_reads(self.verdict, self.batch, receipt, True)
+        sa.validate_reads(self.verdict, self.batch, receipt, True, token)
+        with self.assertRaisesRegex(Die, "complete input"):
+            sa.validate_reads(self.verdict, self.batch, receipt, True, "truncated-result")
         reader = ar.Reader(self.batch, receipt, "initial")
         for name, args in (
             ("shell", {}),
@@ -346,6 +348,8 @@ class CompactingInspection(unittest.TestCase):
         ):
             with self.subTest(name=name, args=args), self.assertRaises(ValueError):
                 reader.request("tools/call", {"name": name, "arguments": args})
+        with self.assertRaises(ValueError):
+            reader.request("tools/call", None)
         reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0, "token": "initial"}})
         with self.assertRaisesRegex(ValueError, "previous successful read"):
             reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 1, "token": "initial"}})
@@ -386,7 +390,13 @@ class CompactingInspection(unittest.TestCase):
                 )
             events.extend(
                 [
-                    {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(self.verdict)}},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": json.dumps({**self.verdict, "read_token": reader.token}),
+                        },
+                    },
                     {"type": "turn.completed"},
                 ]
             )
@@ -399,6 +409,28 @@ class CompactingInspection(unittest.TestCase):
             self.assertEqual(sa.inspect(self.batch, "codex", self.work), self.verdict)
             run.assert_called_once()
         self.assertTrue((self.work / "read-receipt.json").exists())
+
+    def test_claude_trace_rejects_other_tools_and_unreadable_inline_compaction(self):
+        (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"provider-only"}}')
+        cases = [
+            (self.batch, {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}}),
+            (
+                {"input_digest": "digest", "commits": [{"sha": "b" * 40, "files": []}]},
+                {"type": "system", "subtype": "compact_boundary"},
+            ),
+        ]
+        for batch, event in cases:
+            with (
+                self.subTest(event=event),
+                patch.object(sa, "claude_dir", return_value=self.work),
+                patch.object(
+                    sa.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0, stdout=json.dumps(event), stderr=""),
+                ),
+                self.assertRaises(Die),
+            ):
+                sa.inspect(batch, "claude", self.work)
 
 
 class Run(unittest.TestCase):
@@ -430,6 +462,15 @@ class Run(unittest.TestCase):
                 sa.run(SimpleNamespace(state=self.state), self.opts)
             inspect.assert_called_once()
             advance.assert_not_called()
+
+    def test_identity_failure_cannot_lose_a_model_finding(self):
+        with (
+            patch.object(sa, "api", side_effect=NoProgress("GitHub unavailable")),
+            patch.object(sa, "inspect") as inspect,
+        ):
+            with self.assertRaises(NoProgress):
+                sa.run(SimpleNamespace(state=self.state), self.opts)
+        inspect.assert_not_called()
 
     def test_concurrent_update_does_not_create_a_block(self):
         with (
@@ -470,6 +511,9 @@ class Run(unittest.TestCase):
         blocked = json.loads((self.state / sa.CURSOR / "blocked.json").read_text())
         self.assertEqual(blocked["from_sha"], self.old)
         self.assertTrue(blocked["manual_inspection_required"])
+        self.assertEqual(blocked["input_policy"], "compacting-session-v1")
+        with self.assertRaises(NoProgress):
+            sa.run(SimpleNamespace(state=self.state), self.opts)
 
     def test_attestation_records_exact_range_before_advance(self):
         with (

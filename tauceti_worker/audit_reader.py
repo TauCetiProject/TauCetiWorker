@@ -29,21 +29,33 @@ def pages(batch):
                 text = file[field]
                 # Bound UTF-8 plus JSON escaping, including pathological source.
                 width = PAGE_BYTES // 8
-                for start in range(0, max(1, len(text or "")), width):
+                start = 0
+                while True:
+                    end = min(start + width, len(text or ""))
+                    if text and end < len(text):
+                        newline = text.rfind("\n", start, end)
+                        if newline >= start:
+                            end = newline + 1
                     section = {
                         "commit": commit["sha"],
                         "path": file["path"],
                         "field": field,
                         "start": start,
                         "total_chars": len(text or ""),
-                        "text": None if text is None else text[start : start + width],
+                        "text": None if text is None else text[start:end],
+                        "prefix": (text or "")[max(0, start - 256) : start],
                     }
                     length = len(encode(section).encode()) + 1
+                    if length > PAGE_BYTES:
+                        raise ValueError("Audit path/section metadata exceeds the reader page limit")
                     if current and size + length > PAGE_BYTES:
                         result.append(current)
                         current, size = [], 0
                     current.append(section)
                     size += length
+                    if end == len(text or ""):
+                        break
+                    start = end
     if current:
         result.append(current)
     return result
@@ -53,11 +65,14 @@ class Reader:
     def __init__(self, batch, receipt, token):
         self.pages = pages(batch)
         self.digest = batch["input_digest"]
+        self.commits = [c["sha"] for c in batch["commits"]]
         self.receipt = receipt
         self.seen = set()
         self.token = token
 
     def request(self, method, params):
+        if not isinstance(params, dict):
+            raise ValueError("Expected object parameters")
         if method == "initialize":
             return {
                 "protocolVersion": params["protocolVersion"],
@@ -95,7 +110,12 @@ class Reader:
             raise ValueError("Invalid page number")
         self.seen.add(page)
         self.token = secrets.token_hex(16)
-        receipt = {"input_digest": self.digest, "pages": len(self.pages), "read": sorted(self.seen)}
+        receipt = {
+            "input_digest": self.digest,
+            "pages": len(self.pages),
+            "read": sorted(self.seen),
+            "last_token": self.token,
+        }
         temp = self.receipt.with_suffix(".tmp")
         with temp.open("w") as stream:
             stream.write(encode(receipt))
@@ -106,14 +126,20 @@ class Reader:
             "content": [
                 {
                     "type": "text",
-                    "text": encode(
+                    # Keep the next token AFTER the entire page. A following
+                    # call/final verdict must echo it, detecting lost/truncated
+                    # results rather than merely counting server-side reads.
+                    "text": json.dumps(
                         {
                             "input_digest": self.digest,
                             "page": page,
                             "pages": len(self.pages),
-                            "next_token": self.token,
+                            "commits": self.commits,
                             "sections": self.pages[page],
-                        }
+                            "next_token": self.token,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 }
             ]
