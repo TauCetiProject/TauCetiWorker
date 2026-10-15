@@ -721,6 +721,15 @@ def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[i
     verdict can miss a rerun started since, and dispatched replacements are not consulted, so
     confirm_lost_build re-checks a head before anything is spent on it. Never raises: a failed read
     counts as not lost, and is retried next round."""
+    due = [
+        p
+        for p in prs
+        if not p.build_reported
+        and (updated := _parse_iso8601(p.updated_at)) is not None
+        and now - updated >= LOST_BUILD_GRACE_S
+    ]
+    if not due:
+        return set()
     cache = cfg.state / "cache" / "lost-builds.json"
     try:
         seen = json.loads(cache.read_text())
@@ -728,10 +737,7 @@ def lost_builds(cfg: Config, gh: GitHub, prs: list[PRInfo], now: float) -> set[i
         seen = {}
     kept: dict[str, dict] = {}
     lost: set[int] = set()
-    for p in prs:
-        updated = _parse_iso8601(p.updated_at)
-        if p.build_reported or updated is None or now - updated < LOST_BUILD_GRACE_S:
-            continue
+    for p in due:
         entry = seen.get(p.head_oid) if isinstance(seen, dict) else None
         if not (isinstance(entry, dict) and now - float(entry.get("at", 0)) < LOST_BUILD_TTL):
             runs = gh.pr_build_runs(p.head_oid)
