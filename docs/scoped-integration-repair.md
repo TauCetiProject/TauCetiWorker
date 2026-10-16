@@ -69,8 +69,11 @@ Candidate: PR13940, head `dbba78bdb3a5f4d234373a4248a3022004331fa5`, tested main
 It has an actual textual conflict in
 `TauCeti/Analysis/InnerProductSpace/SymmetricFunctionalCalculus.lean`. This is not
 claimed as a missing-module diagnosis or as proof the original head CI is green.
-Fresh evidence must still match at activation time; a moved main makes this
-specific proposal a no-op rather than permission to update the tuple silently.
+This historical proposal is **currently a no-op**: a fresh read at 02:29 UTC
+confirmed actual main `b160c8a8f870997b9652251aefd5e64b8c9a72ef`. The old
+authenticated request tested main03de. Fresh authenticated evidence and a
+separately reviewed exact tuple are required before activation; a moved main is
+not permission to update this tuple silently.
 
 Only after reviewed code is installed for the existing idle worker2 and explicit
 authorization is recorded in the #16813 window, the **proposed** addition to that
