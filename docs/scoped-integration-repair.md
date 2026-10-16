@@ -12,12 +12,24 @@ science workers remain disabled. Existing PR targeting does not override
 ownership; changing GitHub identity or enabling a disabled worker would change
 those operating constraints.
 
-The proposed alternative admits **one exact PR/head/main tuple**, only for the
+The proposed alternative admits **one exact PR/head/evidence-main/integration-main tuple**, only for the
 existing rebase task on that one named science author/fork:
 
 ```
-TAUCETI_REBASE_REPAIR_TARGET=<PR>:<40-character-head>:<40-character-tested-main>
+TAUCETI_REBASE_REPAIR_TARGET=<PR>:<full-head>:<full-evidence-main>:<full-integration-main>
 ```
+
+The evidence main is the tested revision in the original Bors request. Bors
+intentionally deduplicates requests by PR head and does not post a new request
+on every promotion. Requiring that original main to equal live main would
+strand a valid request after promotion. The integration main is instead one
+separately and explicitly authorized snapshot, with no automatic update.
+GitHub must confirm it contains the evidence main (`ahead` or `identical`);
+unknown, diverged or rewound ancestry fails closed. This establishes ancestry,
+not source compatibility: the worker must investigate the original evidence
+and validate the integrated source, without calling the old result fresh.
+The three-field option from the initial proposal is rejected; no live
+configuration ever activated that format.
 
 Unsetting the option, an invalid tuple, a new head, or a different live main
 prevents selection/launch. It does not authorize later heads or another PR.
@@ -35,7 +47,8 @@ Each selection and launch performs fresh, direct reads requiring:
 - `needs-rebase` present and no `keep`, `hold`, `wip`, `human` or `do-not-close`;
 - an authenticated `tau-ceti-bors[bot]` exact-head request with the exact tested
   main and `local-source-v3`; a conflict, review-bot comment or label alone fails;
-- actual current main equal to the explicitly authorized main.
+- actual current main equal to the explicitly authorized integration main,
+  with verified ancestry from the separately pinned evidence main.
 
 The exception uses the existing `rebase-pr-<PR>` counter with a **one-attempt
 canary cap**, without resetting it. Normal owned repairs retain their existing
@@ -69,18 +82,22 @@ Candidate: PR13940, head `dbba78bdb3a5f4d234373a4248a3022004331fa5`, tested main
 It has an actual textual conflict in
 `TauCeti/Analysis/InnerProductSpace/SymmetricFunctionalCalculus.lean`. This is not
 claimed as a missing-module diagnosis or as proof the original head CI is green.
-This historical proposal is **currently a no-op**: a fresh read at 02:29 UTC
-confirmed actual main `b160c8a8f870997b9652251aefd5e64b8c9a72ef`. The old
-authenticated request tested main03de. Fresh authenticated evidence and a
-separately reviewed exact tuple are required before activation; a moved main is
-not permission to update this tuple silently.
+The historical three-field proposal pinned integration to that old main and
+correctly refused after promotion. A **new inactive four-field proposal** keeps
+evidence main03de but separately names integration main
+`239c9bd88c1c32f474ca193ba3d199cd565c911d`, captured as live main at 02:38 UTC.
+It does not rewrite/reissue the request or pretend source checks ran at239c.
+The request must still be active, the exact head unchanged, all existing guards
+satisfied and actual live main equal this integration snapshot at authorization
+and launch. If it moves again, this proposal refuses; any new integration target
+needs a separately reviewed explicit tuple, never automatic retargeting.
 
 Only after reviewed code is installed for the existing idle worker2 and explicit
 authorization is recorded in the #16813 window, the **proposed** addition to that
 worker's existing `env` table is (preserve every existing entry):
 
 ```toml
-"TAUCETI_REBASE_REPAIR_TARGET" = "13940:dbba78bdb3a5f4d234373a4248a3022004331fa5:03de080239e2f6ccee2f6e054e65c5445c50cf1e"
+"TAUCETI_REBASE_REPAIR_TARGET" = "13940:dbba78bdb3a5f4d234373a4248a3022004331fa5:03de080239e2f6ccee2f6e054e65c5445c50cf1e:239c9bd88c1c32f474ca193ba3d199cd565c911d"
 "PYTHONPATH" = "/home/kim/.local/share/tauceti/releases/<reviewed-code-commit>"
 ```
 
@@ -88,12 +105,12 @@ The manager's supported configuration reconciliation can restart only that
 existing idle worker with this environment; no new worker/slot, GitHub account,
 agent/model, concurrency, quota policy or research stage is added. Preserve all
 other configuration verbatim, including all nine disabled science workers. Do
-not interrupt an active task to apply this option. The activation must name the exact reviewed code revision. Prepare that immutable
+not interrupt an active task to apply this option. The activation must name the
+exact reviewed code revision. Prepare that immutable
 trusted Worker source release with its existing `state`, `checkouts` and `logs`
 directories symlinked to the same locations as the current installation; verify
 `Config.resolve("worker2")` resolves state/checkout/log paths to the same real
-directories. This
-preserves the instance lock, counters, claims and checkout across the supported
+directories. This preserves the instance lock, counters, claims and checkout across the supported
 restart. The exact private before/after configuration diff and baseline hash are
 prepared for review after the final code commit, with only these two environment
 entries added. This document does not perform an installation, change
@@ -107,7 +124,7 @@ It can consume existing Codex subscription capacity; the observed quota was
 unchanged. No dollar forecast, new paid worker or recurring service is proposed.
 A stalled/failed attempt is a reported blocker, not repair acceptance.
 
-Rollback: remove only the added target environment entry after the worker is
+Rollback: remove only the two added environment entries after the worker is
 idle and reconcile normally. Leave request comments, labels, counters, claims
 and source branches to their existing protocols. Do not reset a consumed
 attempt to manufacture proof.

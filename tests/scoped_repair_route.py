@@ -17,7 +17,7 @@ from tauceti_worker.github import GitHub, GitHubError
 
 survey_mod = importlib.import_module("tauceti_worker.survey")
 HEAD, BASE = "a" * 40, "b" * 40
-SCOPE = f"13940:{HEAD}:{BASE}"
+SCOPE = f"13940:{HEAD}:{BASE}:{BASE}"
 
 
 def fixture():
@@ -71,7 +71,14 @@ def raw_pr():
 
 def test_default_off_and_exact_operator_scope():
     _, _, gh = fixture()
-    for value in ["", "13940", SCOPE + "," + SCOPE, SCOPE.upper(), SCOPE.replace("13940:", "0:")]:
+    for value in [
+        "",
+        "13940",
+        f"13940:{HEAD}:{BASE}",
+        SCOPE + "," + SCOPE,
+        SCOPE.upper(),
+        SCOPE.replace("13940:", "0:"),
+    ]:
         with patch.dict(os.environ, {route.ENV: value}):
             assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
     gh.api_jq.assert_not_called()
@@ -148,10 +155,46 @@ def test_frozen_genuine_request_fixture_without_live_execution():
     gh.issue_comments.return_value = [observed["request"]]
     read = gh.api_jq.side_effect
     gh.api_jq.side_effect = lambda p, q: observed["base"] if p.endswith("/git/ref/heads/main") else read(p, q)
-    value = f"{observed['pr']}:{observed['head']}:{observed['base']}"
+    value = f"{observed['pr']}:{observed['head']}:{observed['base']}:{observed['base']}"
     with patch.dict(os.environ, {route.ENV: value}):
         assert route.authorize(gh, observed["pr"], observed["head"], "feature", route.FORK) == observed["base"]
     assert not observed["production_worker_repair_verified"]
+
+
+def test_original_request_survives_main_advance_without_reissuing_or_retargeting():
+    integration = "c" * 40
+    _, comment, gh = fixture()
+    original_read = gh.api_jq.side_effect
+    relation = "ahead"
+    live_main = integration
+
+    def read(path, jq):
+        if path.endswith("/git/ref/heads/main"):
+            return live_main
+        if path == f"repos/{TAUCETI}/compare/{BASE}...{integration}":
+            return relation
+        return original_read(path, jq)
+
+    gh.api_jq.side_effect = read
+    original_comment = copy.deepcopy(comment)
+    scope = f"13940:{HEAD}:{BASE}:{integration}"
+    with patch.dict(os.environ, {route.ENV: scope}):
+        # The exact same original Bors request authorizes source investigation
+        # only against the separately named integration main; no comment write.
+        assert route.authorize(gh, 13940, HEAD, "feature", route.FORK) == integration
+        assert comment == original_comment
+        for status in [None, "behind", "diverged", "unknown"]:
+            relation = status
+            assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
+        relation = "ahead"
+        live_main = "d" * 40
+        assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
+        live_main = integration
+        assert route.authorize(gh, 13940, HEAD, "feature", route.FORK) == integration
+        comment["body"] = comment["body"].replace(BASE, integration)
+        assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
+        comment["body"] = original_comment["body"].replace("Merge-queue recovery", "Resolved recovery")
+        assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
 
 
 def test_selection_is_rebase_only_and_one_attempt_without_budget_reset():
@@ -246,6 +289,7 @@ if __name__ == "__main__":
     test_live_permission_pause_identity_and_movement_guards()
     test_only_authenticated_current_v3_source_request()
     test_frozen_genuine_request_fixture_without_live_execution()
+    test_original_request_survives_main_advance_without_reissuing_or_retargeting()
     test_selection_is_rebase_only_and_one_attempt_without_budget_reset()
     test_paid_launch_rechecks_scope_and_requires_a_real_claim()
     print("PASS: default-off exact fork repair scope, live guards, one attempt, real claim and paid-launch fences")
