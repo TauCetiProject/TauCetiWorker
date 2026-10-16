@@ -25,12 +25,13 @@ PAUSE = {"keep", "hold", "wip", "human", "do-not-close"}
 class Target:
     pr: int
     head: str
+    evidence_base: str  # immutable tested main in the original, head-deduplicated request
     base: str
 
 
 def target() -> Target | None:
-    match = re.fullmatch(r"([1-9][0-9]{0,9}):([a-f0-9]{40}):([a-f0-9]{40})", os.environ.get(ENV, ""))
-    return Target(int(match[1]), match[2], match[3]) if match else None
+    match = re.fullmatch(r"([1-9][0-9]{0,9}):([a-f0-9]{40}):([a-f0-9]{40}):([a-f0-9]{40})", os.environ.get(ENV, ""))
+    return Target(int(match[1]), match[2], match[3], match[4]) if match else None
 
 
 def authorize(gh, pr: int, head: str, refname: str, head_repository: str) -> str:
@@ -65,7 +66,14 @@ def authorize(gh, pr: int, head: str, refname: str, head_repository: str) -> str
                 return ""
             if gh.api_jq(f"repos/{TAUCETI}/git/ref/heads/main", ".object.sha") != scope.base:
                 return ""
-            evidence_line = f"Tested main: `{scope.base}`. Checker policy: `local-source-v3`."
+            if scope.evidence_base != scope.base and gh.api_jq(
+                f"repos/{TAUCETI}/compare/{scope.evidence_base}...{scope.base}", ".status"
+            ) not in {"ahead", "identical"}:
+                return ""
+            # Bors intentionally publishes once per PR head, not once per main
+            # promotion. Preserve that original evidence identity while the
+            # operator separately names the one main snapshot to integrate.
+            evidence_line = f"Tested main: `{scope.evidence_base}`. Checker policy: `local-source-v3`."
             for comment in gh.issue_comments(pr) or []:
                 if (
                     isinstance(comment, dict)

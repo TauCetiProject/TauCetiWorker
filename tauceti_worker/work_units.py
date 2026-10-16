@@ -1374,6 +1374,10 @@ def _do_fixlike(
             prompt += (
                 f"\nThe operator scoped this repair to PR #{pr}, starting head {head}, "
                 f"and main snapshot {foreign}, on tauceti-ai-for-science/TauCeti only. "
+                "The authenticated request's tested main is the original evidence snapshot; "
+                "it may precede the explicitly authorized integration snapshot. Reproduce or "
+                "explain that original diagnosis using actual source; do not claim the old "
+                "evidence is a fresh check against the integration snapshot. "
                 "After the single fetch, stop without editing if origin/main differs from that "
                 "snapshot. Do not switch GitHub identity or work on another PR. Before pushing, "
                 "re-read the live head, pause labels and authenticated Bors v3 request; stop if the "
