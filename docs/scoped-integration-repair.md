@@ -18,7 +18,7 @@ The evidence main stays bound to the original authenticated Bors v3 request, whi
 
 Fresh direct reads require the exact PR/head/ref, open/nondraft status, named User author/fork, canonical main target, maintainer modification permission, actual canonical push permission, needs-rebase, no pause labels, and the original active authenticated Bors exact-head v3 request. Unknown API/ancestry, changed head, withdrawn request, unwritable source or divergent/rewound main refuses launch. Labels alone grant nothing.
 
-A real existing branch claim is mandatory. Authentication and pause guards run again after the claim. A refused claim or failed prelaunch guard starts no task, writes no launch receipt and refunds the unstarted counter charge.
+A real existing branch claim is mandatory. Authentication and pause guards run again after the claim. A refused claim or failed authorization starts no task, writes no launch receipt and refunds the unstarted counter charge. If authorization is refused after acquisition, stop its heartbeat and release that matching claim before dispatch tries another candidate; leave any unrelated replacement claim alone.
 
 The existing lifetime rebase-pr counter has a one-attempt cap. The same counter store writes `rebase-foreign-launch-<PR>.json`, containing PR, head, evidence main and integration main, with fsync/atomic replace before delegation. Its presence blocks another delegation after restart or stale selection, even if an unstarted preparation path refunded the numeric counter. Malformed/unreadable receipts do not grant retries. A crash after charging/recording can conservatively consume the scope without a paid task; report that instead of deleting state. Neither key depends on advancing main.
 

@@ -1,7 +1,8 @@
 """An operator can authorize one existing foreign-fork repair, never general authorship.
 
-Unset by default. The exact PR/head/main scope expires on source movement; all
-reads below are fresh and fail closed. It is not a request queue or permission
+Unset by default. The exact PR/head and evidence main stay pinned; integration
+main is fixed explicitly or captured once at launch. Fresh reads fail closed.
+It is not a request queue or permission
 inferred from a label, a Git conflict, or maintainerCanModify alone.
 """
 
