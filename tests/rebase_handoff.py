@@ -219,13 +219,19 @@ def test_launch_rechecks_head_hold_and_active_marker():
         assert _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
 
 
-def test_semantic_evidence_reaches_claimed_repair():
+def test_semantic_evidence_reaches_claimed_repair(provisional=False):
     from tauceti_worker import work_units
 
     gh = GitHub()
     body = request(author="tau-ceti-bors[bot]")["body"] + (
         "\nTested main: `" + "b" * 40 + "`.\n`TauCeti/Consumer.lean` imports missing `TauCeti.Removed`."
     )
+    if provisional:
+        body = request(author="tau-ceti-bors[bot]")["body"] + (
+            "\nChecker policy: `provisional-diagnostic-v1`. PROVISIONAL SUSPECT, not a proven individual failure."
+            "\nCandidate 42, failed commit " + "c" * 40 + ", run attempt 2. Evidence main `" + "b" * 40 + "`."
+            "\nDiagnostic path: TauCeti/Consumer.lean. An interaction may be responsible."
+        )
     raw = pr(20)
     raw["statusCheckRollup"] = [{"context": "build", "state": "SUCCESS"}]
     w = SimpleNamespace(
@@ -250,6 +256,10 @@ def test_semantic_evidence_reaches_claimed_repair():
             )
         prompt = agent.call_args.args[2]
         assert body in prompt and HEAD in prompt
+        if provisional:
+            assert "attribution **unconfirmed**" in prompt
+            assert "still complete all verification below" in prompt
+            assert "Never integrate another PR's branch" in prompt
         assert "semantic repair may still be needed" in prompt
         assert '"__BIN__' not in prompt
         assert agent.call_args.kwargs["allow_push"] == "me/TauCeti"
@@ -268,6 +278,7 @@ def test_semantic_evidence_reaches_claimed_repair():
 if __name__ == "__main__":
     test_launch_rechecks_head_hold_and_active_marker()
     test_semantic_evidence_reaches_claimed_repair()
+    test_semantic_evidence_reaches_claimed_repair(provisional=True)
     test_trusted_paginated_comments()
     test_survey_ownership_head_pause_and_budget()
     test_verified_progress_restores_budget_without_unbounded_retries()
