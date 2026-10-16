@@ -262,7 +262,7 @@ class PrivateAlerts(unittest.TestCase):
             alerts.notify_block(self.work, self.block)
         self.assertEqual(self.http.call_count, 2)
         self.assertEqual(self.http.call_args.args[1], "GET")
-        self.assertEqual(json.loads(self.http.call_args.args[2]["narrow"]), [{"operator": "dm", "operand": 123}])
+        self.assertEqual(json.loads(self.http.call_args.args[2]["narrow"]), [{"operator": "dm", "operand": [123]}])
         self.assertEqual(
             next(iter(json.loads((self.work / "zulip-alerts.json").read_text()).values()))["message_id"], 789
         )
