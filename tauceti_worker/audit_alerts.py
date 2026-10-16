@@ -149,5 +149,5 @@ def notify_block(work: Path, block: dict) -> None:
         state[key] = {"message_id": result["id"]}
         save(path, state)
         log(f"security-audit: sent private Zulip alert {result['id']}")
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         log("security-audit: private Zulip alert delivery pending; retained block remains in force")

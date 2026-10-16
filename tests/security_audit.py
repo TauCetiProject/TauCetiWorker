@@ -280,6 +280,18 @@ class PrivateAlerts(unittest.TestCase):
             alerts.notify_block(self.work, self.block)
         self.http.assert_not_called()
 
+    def test_malformed_notification_state_preserves_audit_block(self):
+        blocked = self.work / "blocked.json"
+        blocked.write_text(json.dumps(self.block))
+        for malformed in ([], "invalid-state"):
+            (self.work / "zulip-alerts.json").write_text(json.dumps(malformed))
+            alerts.notify_block(self.work, self.block)
+            self.assertEqual(json.loads(blocked.read_text()), self.block)
+        self.config.write_text("[]")
+        alerts.notify_block(self.work, self.block)
+        self.assertEqual(json.loads(blocked.read_text()), self.block)
+        self.http.assert_not_called()
+
     def test_invalid_destination_is_rejected_before_network_access(self):
         config = json.loads(self.config.read_text())
         for changes in (
