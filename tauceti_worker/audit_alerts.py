@@ -125,7 +125,7 @@ def notify_block(work: Path, block: dict) -> None:
                 config,
                 "GET",
                 {
-                    "narrow": json.dumps([{"operator": "dm", "operand": str(config["recipient_id"])}]),
+                    "narrow": json.dumps([{"operator": "dm", "operand": config["recipient_id"]}]),
                     "anchor": "newest",
                     "num_before": 100,
                     "num_after": 0,
