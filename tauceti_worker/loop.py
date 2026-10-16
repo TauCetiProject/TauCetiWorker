@@ -26,6 +26,7 @@ from .constants import (
     OPENROUTER_MODELS,
     POLL,
 )
+from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
 from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
@@ -115,6 +116,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            if reason := fleet_admission_reason(cfg.wid):
+                report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
+                time.sleep(5)
+                continue
             if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
@@ -251,7 +256,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 # after it has surveyed and picked a work unit, so a round that finds nothing to do never
                 # spends the request. The GitHub preflight above has already passed at this point.
                 tail.append("--claude-bootstrap")
-            if model:
+            # Audit-capable workers use a fixed Luna/Haiku inspection profile and reject
+            # authoring overrides. Their maintenance fallback resolves its normal defaults.
+            if model and "security-audit" not in only:
                 profile = resolve_authoring_profile(
                     model,
                     cli_model=getattr(args, "author_model", None),
@@ -283,6 +290,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             rc = run_round_subprocess(tail)
 
             if rc == EX_ADMISSION_WAIT:
+                if reason := fleet_admission_reason(cfg.wid):
+                    report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
+                    time.sleep(5)
+                    continue
                 streak = 0
                 admission_streak += 1
                 nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))

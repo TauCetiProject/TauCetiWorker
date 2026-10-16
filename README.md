@@ -131,7 +131,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Rebase** | Reconcile one of our conflicting PRs or an authenticated current-head integration repair request, including missing sources or renamed APIs after main moves. Integrate one main snapshot and validate source repair before safe push. Genuine conflict retries renew after verified progress; handoffs retain their per-PR cap. Hold labels pause recovery. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Lint repair** | Fix `TauCeti/` on a red `lint-repair/` PR. PR builds lint only the modules a change touches, so TauCeti's daily full lint opens one of these when main carries environment-lint violations elsewhere (for example, a new simp lemma that takes an older one out of simp normal form). The worker never opens one itself. |
-| **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
+| **Progress** | When the global eight-hour cadence is due and a roadmap has at least 25 new PRs, update its generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
 | **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
@@ -170,6 +170,15 @@ tauceti work --only security-audit --agent codex
 tauceti work --only security-audit --agent claude --loop
 ```
 
+An admin's maintenance worker can also use `--only security-audit,bump,progress`.
+It inspects a bounded batch before ordinary maintenance when at least 20 commits
+are pending. Below that threshold it continues with bump/progress work without
+launching an audit model. Set `TAUCETI_SECURITY_AUDIT_MIN_COMMITS` to a positive
+integer to change the threshold. Audit-only runs inspect any nonempty backlog.
+Findings, unresolved inspections and operational failures stop the round; they
+do not fall through to maintenance. Other work phases and `--pr` cannot be
+combined with the audit phase. Its isolated Luna/Haiku reviewer is unchanged.
+
 It advances TauCeti's protected `security-audit` branch through main's first-parent
 history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
 Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
@@ -179,8 +188,10 @@ up to 20 commits with a 2 MiB workload target. A single larger commit may use up
 from the model's live context window. Small inputs are supplied inline; larger
 inputs are available through one read-only `audit.read_page` tool. It accepts only
 a numbered page and a continuation token, with no filesystem paths, URLs, commands
-or writes. Each read returns the token for the next call so parallel reads cannot
-flood the context window. The same Luna/Haiku conversation can compact its history and
+or writes. Each read returns the token for the next call; a stale nonempty token
+is rejected. To recover a lost token, explicitly send an empty token: the reader
+replays the last full page with a fresh token. It does not count the requested new
+page as read. The same Luna/Haiku conversation can compact its history and
 re-read pages as needed, then returns one verdict covering the entire batch. There
 are no independent partial inspections or combined partial approvals. A pass is
 rejected unless the reader's receipt accounts for every page and the verdict echoes
@@ -192,7 +203,7 @@ needed, and returning incomplete if the full inspection cannot be completed.
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
 Worker code alone verifies ancestry and moves the ref.
 No Lean builds or candidate scripts run. A finding, incomplete inspection, oversized
-commit or model error stops advancement. Read the retained `security-audit/blocked.json`
+commit or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
 not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
 The input, actual launcher/environment/prompt, transcript, native Codex
@@ -200,7 +211,75 @@ compaction/usage records, read receipt (for larger inputs), and durable ledger a
 retained in the same directory. A pre-inspection commit-budget block from the old
 256 KiB planner can be archived and replanned when its exact next commit fits the
 new limits. This does not attest that commit or retry a model verdict: findings,
-incomplete inspections, client errors and other planning errors remain blocked.
+incomplete inspections, malformed answers, unauthorized tools and other planning errors remain blocked.
+
+A Codex service error with no final model answer is retried at most twice, after 5 and
+10 seconds. Each retry resumes the same native Luna conversation with unchanged
+source, inspection instructions, model, tool restrictions and read receipt.
+Progress notes are preserved in the same conversation; native message phases
+distinguish them from final answers. Failed requests and their evidence are retained under `service-error-N/` with a
+`service-retries.jsonl` record. A final answer (including a finding, incomplete verdict
+or other malformed answer), unauthorized tool call, unknown event or malformed stream
+is never retried as a service error. Exhausted retries leave the cursor blocked.
+To retry a retained service failure after service recovery, an admin can run:
+
+```bash
+python3 -m tauceti_worker.security_audit retry-service --state /path/to/worker/state/security-audit \
+  --reason 'Retry interrupted provider request in the retained conversation'
+```
+
+This command verifies the retained failure contains a service error and no model
+final answer or recorded verdict, checks the unchanged input and next main prefix,
+verifies the retained prompt, launcher code, reader and catalog digests,
+and restores the same native conversation and read receipt. It preserves the
+block until a complete pass and confirmed reference update. No human source
+attestation is needed for a provider failure. Hard quota limits still apply.
+
+An unexplained `incomplete` answer with an empty findings list, or a paged `pass` whose
+input digest omits only its final character, is eligible for bounded output repair only when its digest, commit list, schema, full page coverage
+and final receipt token otherwise validate (inline inputs need no receipt). The same retained conversation may
+produce a consistent answer; uncertainty must be explained and source findings
+must be preserved. An explained incomplete verdict, any source finding, unknown
+or unauthorized tool, identity mismatch or coverage failure remains blocked.
+Service retries and output repairs share a maximum of three launches per invocation.
+Each batch permits at most two explicit administrative output-repair invocations.
+The response schema fixes `input_digest` to the exact full digest, preventing echo
+truncation in new replies.
+Every malformed answer is archived under `output-error-N/` and recorded in
+`output-repairs.jsonl`. To repair a previously retained empty incomplete:
+
+```bash
+python3 -m tauceti_worker.security_audit repair-output --state /path/to/worker/state/security-audit \
+  --reason 'Repair unexplained incomplete output in the retained inspection'
+```
+
+The command checks eligibility, the fixed reader/catalog policy and isolated Luna
+launcher, preserves the
+original answer and block, and repeats the ordinary quota, authorization, input
+and ancestry checks. Only the model's complete passing answer and confirmed ref
+update can advance the cursor. It never converts the original answer into a pass. The pre-profile retained incident
+also permits one pinned continuation of its exact recorded reader-context failure,
+with the input digest, reader digest, explanation, receipt and continuation count
+checked; this does not extend repair eligibility to other explained incomplete results.
+
+For the recorded legacy Luna failure where the final two pages were inaccessible
+because the reader token was lost, an admin may explicitly continue the **same
+retained native conversation** after repairing the reader:
+
+```bash
+python3 -m tauceti_worker.security_audit resume --state /path/to/worker/state/security-audit \
+  --reason 'Reader-token transport repair; continue the retained inspection'
+```
+
+This command allows one administrative continuation, restricted to the exact
+original recorded token-failure block. A failed continuation cannot be retried. It checks the
+unchanged input digest, original commit order, current cursor and admin authority,
+then restores the native conversation and read receipt. It keeps the incomplete
+verdict and block on record; only a complete passing continuation and confirmed
+reference update resolve the block. It cannot start a new reviewer, resume a source
+finding or other incomplete review, or provide human attestation. Ordinary `work`
+never resumes a blocked model inspection automatically. `--ignore-quota` overrides
+pacing only when explicitly selected; hard limits still apply.
 
 This phase must be selected alone, cannot use `--pr` or authoring-model overrides,
 and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
@@ -280,7 +359,7 @@ tauceti work --pr 412 --dry-run        # what it would do to #412, doing nothing
 
 `--pr` only ever *removes* work. It cannot make a PR actionable that the round
 had already passed over, so a spent attempt budget, a peer's in-progress review,
-the daily review cap and the branch claims all still hold: "work on these PRs"
+and the branch claims all still hold: "work on these PRs"
 means "of the work you were already willing to do, only this". Progress and
 roadmap rounds name no existing PR, so a targeted round drops them rather than
 quietly authoring something unrelated when the named PRs turn out to have
@@ -298,7 +377,7 @@ why, one line per PR you named, before it exits without progress:
 ```
 --pr: this round considers only #412, #415
   --pr #412: fix: reviews at head are all green
-  --pr #415: review: daily cap 3/3 reached
+  --pr #415: review: a peer reviewer (codex) holds this head
 ```
 
 `$TAUCETI_PR` is the environment equivalent, which is how a

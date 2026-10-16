@@ -2,9 +2,11 @@
 """Dependency repair remains actionable past legacy caps, with ordinary gates intact."""
 
 import importlib
+import json
 import os
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -56,18 +58,20 @@ class Reviews:
         return self.contest
 
 
-def classify(record, stages, reviews=None, daily=0):
+def classify(record, stages, reviews=None, rounds=0, attempts=100):
     with (
         tempfile.TemporaryDirectory() as directory,
         patch.object(s, "me", return_value="me"),
         patch.object(s, "can_push", return_value=True),
-        patch.object(s, "_review_rounds_today", return_value=daily),
     ):
+        (Path(directory) / "ledger.json").write_text(
+            json.dumps({"prs": {"1": {"rounds": [{"ts": datetime.now(UTC).isoformat()} for _ in range(rounds)]}}})
+        )
         return s.survey(
             SimpleNamespace(wid="test", store_dir=Path(directory)),
             SimpleNamespace(open_prs=lambda: [record], fresh_claim_age=lambda _: None),
             reviews or Reviews(),
-            SimpleNamespace(read=lambda _: 100),
+            SimpleNamespace(read=lambda _: attempts),
             stages=stages,
         )
 
@@ -81,7 +85,13 @@ for label in ["keep", "hold", "wip", "human", "do-not-close"]:
     assert not classify(raw(labels=[{"name": label}]), ["bump", "rebase", "review", "fix"]).bump.count
 green = raw(statusCheckRollup=[{"context": "build", "state": "SUCCESS"}])
 assert classify(green, ["review"]).reviewable.count == 1
-assert not classify(green, ["review"], daily=s.REVIEW_DAILY_CAP).reviewable.count
+assert classify(green, ["review"], rounds=100).reviewable.count == 1
+assert (
+    classify(
+        green | {"headRefName": "feature", "author": {"login": "me"}}, ["review"], rounds=100, attempts=0
+    ).reviewable.count
+    == 1
+)
 assert classify(green, ["fix"]).needs_fix.count == 1
 contest = {"id": 42, "rubric": "reuse", "created_at": "2026-10-14T00:00:00Z"}
 assert classify(green, ["review"], Reviews(clean=True, contest=contest)).reviewable.count == 1

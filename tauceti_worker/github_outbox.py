@@ -212,6 +212,7 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
     """Classify an initial attempt or replay while its intent lock is held."""
     if result.returncode == 0:
         path.unlink(missing_ok=True)
+        _report_mutation(value, result)
         return
     records = records or []
     text = (result.stderr or "") + (result.stdout or "")
@@ -312,6 +313,15 @@ def same_body(left, right):
     )
 
 
+def _report_mutation(value, result):
+    try:
+        from .fleet_events import mutation
+
+        mutation(value, result)
+    except Exception:
+        pass  # Reporting must not change a successful GitHub mutation.
+
+
 def reconcile(value, env):
     args = value["argv"]
     replay = {**env, "TAUCETI_OUTBOX_REPLAY": "1"}
@@ -380,6 +390,7 @@ def reconcile(value, env):
                 )
             ]
             if matches:
+                _report_mutation(value, subprocess.CompletedProcess(args, 0, matches[0]["url"], ""))
                 return True
             if connection["pageInfo"]["hasNextPage"]:
                 return None

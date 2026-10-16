@@ -1,5 +1,28 @@
 # Persistent workers
 
+## Fleet admission and reporting
+
+TauCetiFleet can supervise a separate worker configuration without adopting this
+account's existing manager. Its `TAUCETI_FLEET_ADMISSION_FILE` names a private,
+controller-owned version-1 JSON policy with `expires_at` and an allowed `workers`
+list. The controller refreshes it while running. Missing, malformed, expired, or
+clock-inconsistent policies prevent new rounds and paid Claude API admissions;
+an already-started agent session runs to completion. Workers report
+`waiting-capacity` while draining instead of being terminated. Workers without
+the environment variable behave as before.
+
+`TAUCETI_FLEET_MACHINE_ID` and `TAUCETI_FLEET_EVENTS` opt into a private JSONL
+provenance journal. Successful PR creation and GitHub mutations record machine,
+worker, repository and PR identity. Branch pushes record assistance when the PR
+identity is known. These observations are statistics only: they never authorize
+CI, reviews, merges, cache publication, or another GitHub mutation. No request
+body, command line, credential or agent prompt is retained. Event reporting is
+best effort and cannot fail a successful publication.
+
+Fleet installers can query `_fleet-protocol` to verify this integration before
+starting workers. The response is local, contains no credentials, and launches
+no agents.
+
 Persistent workers are declarative. You describe the workers you want in
 `workers.toml`, and a manager process reconciles reality against that file:
 starting missing workers, stopping removed ones, restarting changed ones, and
@@ -9,7 +32,7 @@ backing off repeated failures. They do not belong to a terminal session.
 
 Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.
 Their build, rebase, review-error, review-fix and contest attempts are not permanently
-capped. Existing loop backoff, quota pacing, daily review limits, branch claims,
+capped. Existing loop backoff, quota pacing, branch claims,
 and explicit holds still apply. Workers checkpoint coherent partial source repairs
 before their round deadline; full CI, audits, and current-head reviews authorize merging.
 

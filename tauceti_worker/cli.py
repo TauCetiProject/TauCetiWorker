@@ -783,6 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_workers_parser(sub)
     add_budget_parser(sub)
+    sub.add_parser("_fleet-protocol", help=argparse.SUPPRESS)
 
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
@@ -866,6 +867,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         raise Die(f"TAUCETI_MAX_OPEN_PRS {error}") from None
 
+    if cmd == "_fleet-protocol":
+        print(json.dumps({"version": 1, "admission": True, "events": True}))
+        return 0
     if cmd == "budget":
         try:
             return cmd_budget(args)
@@ -1126,8 +1130,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     if "security-audit" in only:
         from .security_audit import require_admin
 
-        if only != ["security-audit"] or prs:
-            raise Die("security-audit must run alone, without --pr")
+        if set(only) - {"security-audit", "bump", "progress"} or prs:
+            raise Die("security-audit may run alone or with bump/progress, without --pr")
         if agent not in ("auto", "codex", "claude"):
             raise Die("security-audit supports Codex Luna or Claude Haiku only")
         if getattr(args, "author_model", None) or getattr(args, "author_effort", None):
@@ -1435,7 +1439,8 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
         for t in ("gh", "git", opts.work_model):
             if not _have(t):
                 raise Die(f"security-audit: missing '{t}' on PATH")
-        return  # No Lake, fork, general agent launcher, or GitHub proxy.
+        if set(opts.only) == {"security-audit"}:
+            return  # Audit-only rounds need no Lake, fork, general agent launcher, or GitHub proxy.
     for t in ("gh", "git", "uvx"):
         if not _have(t):
             raise Die(f"preflight: missing '{t}' on PATH")

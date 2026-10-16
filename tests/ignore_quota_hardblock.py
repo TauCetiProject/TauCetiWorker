@@ -7,7 +7,7 @@ a HARD block — a window at 100% (exhausted), usage it cannot read (fail-closed
 refusing to answer (its own 429 / a network error, which leaves the Provider with no windows) — as a
 reason to wait. Only a SOFT over-pace block (real quota left, merely ahead of pace) is run through.
 
-Regression for the loop that re-reviewed the same green PRs up to the daily cap during a subscription
+Regression for the loop that repeatedly re-reviewed the same green PRs during a subscription
 rate-limit, burning a clone + engine launch each round to post an all-error scoreboard. Dependency-free.
 """
 

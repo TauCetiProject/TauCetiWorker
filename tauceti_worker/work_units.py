@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .agents import (
@@ -66,7 +66,6 @@ from .constants import (
     PROGRESS_TOOL_TAIL,
     REVIEW,
     REVIEW_AFFINITY_GRACE_S,
-    REVIEW_DAILY_CAP,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
     ROUND_TIMEOUT,
@@ -241,11 +240,11 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
 
     An operator who names a PR is owed an answer about THAT PR, so this reads the survey back for
     everything it knows about it rather than reporting a bare "nothing to do". Several notes can be
-    true at once (a PR whose review is capped today may also have its fix budget spent), so they are
+    true at once (a PR held by a peer reviewer may also have its fix budget spent), so they are
     joined rather than raced: the first one printed is not necessarily the only reason, and hiding
     the rest would send the operator to fix the wrong thing.
 
-    A stage's `suppressed` list, `review_inflight` / `review_capped` / `review_stuck` and
+    A stage's `suppressed` list, `review_inflight` / `review_stuck` and
     `fix_waiting` are the survey's own vocabulary for "considered and passed over"; anything left
     over is either not an open PR at all, a draft, or open with genuinely nothing to do.
     """
@@ -259,9 +258,8 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
                 spent = f" ({c.attempts}/{c.budget} attempts spent)" if c.budget else ""
                 notes.append(f"{stage} suppressed: {c.reason}{spent}")
     notes += [f"review: a peer reviewer ({who}) holds this head" for n, who in sv.review_inflight if n == pr]
-    notes += [f"review: daily cap {count} reached" for n, count in sv.review_capped if n == pr]
     if pr in sv.review_stuck:
-        notes.append("review keeps erroring without posting a verdict — needs infrastructure repair")
+        notes.append("review keeps erroring without completing a review — needs infrastructure repair")
     notes += [f"fix: {why}" for n, why in sv.fix_waiting if n == pr]
     # A throttle removes a candidate silently, so without this a PR the operator named would be
     # reported as having no work at all when in fact this worker was told to hold off on it.
@@ -317,9 +315,22 @@ def focus_prs(sv: Survey, opts) -> None:
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
     if "security-audit" in opts.only:
-        from .security_audit import run
+        from .security_audit import AuditNotDue, run
 
-        return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+        other_tasks = [task for task in opts.only if task != "security-audit"]
+        if not other_tasks:
+            return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+        try:
+            minimum = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS", "20"))
+        except ValueError:
+            raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
+        try:
+            return run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
+        except AuditNotDue as exc:
+            log(str(exc))
+        # Only an insufficient backlog permits fallback. Findings, incomplete inspections,
+        # permission failures and service errors retain their usual stopping behavior.
+        opts = replace(opts, only=other_tasks)
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
     # before any work runs. The quota pacer does this too, and every paced path now reaches it — but the
     # unpaced ones (kiro, the OpenRouter providers, --dry-run's early return) do not, and host-mode
@@ -375,13 +386,6 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if not in_scope(pr):
             continue
         log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
-    for pr, count in sv.review_capped:
-        if not in_scope(pr):
-            continue
-        if count.startswith("?"):
-            log(f"  review #{pr}: local ledger unreadable — skipping review (fail-closed); fix the ledger")
-        else:
-            log(f"  review #{pr}: daily cap {count} reached — skipping until 00:00 UTC (no launch/clone)")
 
     # Explain why a fix-focused worker has nothing to fix: for each of the contributor's own PRs that is
     # not an actionable fix candidate, say why (awaiting first review, head moved, all green, attempts
@@ -409,7 +413,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             continue
         n_err = w.counters.read(f"review-err-{pr}")
         warn_red(
-            f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
+            f"PR #{pr}: review has ERRORED {n_err}x without completing a review — the worker cannot "
             f"review it. Needs infrastructure repair. https://github.com/{TAUCETI}/pull/{pr}"
         )
         if opts.dry_run:
@@ -420,7 +424,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if not retained:
             retained = recover_review_failures(w.cfg.state, w.cfg.logdir, worker=w.cfg.wid, pr=pr, head=head)
         diagnostic = public_review_failure(retained)
-        reason = f"its review has errored {n_err} times without posting a verdict"
+        reason = f"its review has errored {n_err} times without completing a review"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
     # Spread concurrent workers across different branch-writing work: shuffle each non-review stage so
@@ -1078,7 +1082,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:
         nrnd = w.rs.review_rounds(pr, w.counters)
-        log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers} (CI retires at the cap)")
+        log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
     try:
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts)
@@ -1103,8 +1107,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
                     "--expect-head",
                     head,
-                    "--max-rounds-per-day",
-                    str(REVIEW_DAILY_CAP),
                     "--submitted-by",
                     me(),
                     *(["--claude-model", claude_model] if claude_model else []),
@@ -1123,10 +1125,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             raise admission_failure(reason)
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
-            # the "errored without posting a verdict" streak up front — BEFORE the publish step, which is
+            # the "errored without completing a review" streak up front — BEFORE the publish step, which is
             # a separate machine-wide concern. Otherwise a pre-post error streak (e.g. errkey=2) could
             # combine with one later engine error to trip the escalation cap a round after a verdict was
-            # in fact posted, contradicting the "errored Nx without posting a verdict" message.
+            # in fact posted, contradicting the "errored Nx without completing a review" message.
             w.counters.write(errkey, 0)
             clear_review_failure(w.cfg.state, pr)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
@@ -1660,6 +1662,8 @@ def _do_progress_inner(w, opts) -> int | None:
         str(roadmap_dir),
         "--code-dir",
         str(w.cfg.checkout),
+        "--min-prs",
+        "25",
         "--out",
         str(plan_file),
         capture=True,
