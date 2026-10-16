@@ -1,9 +1,19 @@
-You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red. Work autonomously to completion: make CI green without weakening the PR.
+You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red, or the build job finished without posting it. Work autonomously to completion: make CI green without weakening the PR.
 
 ## Find out what's actually failing
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
+- If the head has no `build` check at all, the `sandboxed-build` job ended before its report step, or
+  its only runs were cancelled and nothing rebuilt it. A log ending in `The runner has received a
+  shutdown signal` (exit code 143) during `lake build` means the runner was stopped, which happens when
+  the build runs the 16 GB runner out of memory; re-triggering CI then repeats it. Measure before you
+  decide. Once a changed file's imports are built,
+  `python3 -c 'import resource, subprocess, sys; subprocess.run(sys.argv[1:]); print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)' lake lean <path/to/File.lean>`
+  recompiles the file and prints its peak memory (kilobytes on Linux); a `lake build` of an already-built
+  module would measure only Lake. If a changed file comes anywhere near 16 GB, bring it well under,
+  typically by restructuring a large `decide` over a finite type so that the kernel checks less at
+  once. If every changed file is well under and the checks below pass, treat the stop as transient.
 - Reproduce locally — this is the source of truth, not the log alone. The single `build` check bundles
   the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
   ```
@@ -43,7 +53,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
 - If the shim-expiry command fails, its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
-- If the failure is genuinely transient/infra (e.g. cache fetch timeout), the code and shim-expiry command are green locally, and the failed logs contain no actionable migration, do NOT hack the code — push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so in your report.
+- If the failure is genuinely transient/infra (e.g. a cache fetch timeout, a cancelled build nothing replaced, or a runner shutdown whose memory you measured as above), the code and shim-expiry command are green locally, and the failed logs contain no actionable migration, do NOT hack the code — push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so in your report.
 - Prefer the smallest correct fix. If a declaration is unsalvageable, it is better to remove it than to leave the PR red — but never gut the PR into vacuity; if almost nothing survives, stop and report that rather than pushing an empty shell.
 
 ## Rules of the repo (hard constraints)
