@@ -313,7 +313,7 @@ def focus_prs(sv: Survey, opts) -> None:
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
     if "security-audit" in opts.only:
-        from .security_audit import AuditNotDue, run
+        from .security_audit import run
 
         other_tasks = [task for task in opts.only if task != "security-audit"]
         if not other_tasks:
@@ -324,10 +324,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
         try:
             return run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
-        except AuditNotDue as exc:
-            log(str(exc))
-        # Only an insufficient backlog permits fallback. Findings, incomplete inspections,
-        # permission failures and service errors retain their usual stopping behavior.
+        except (Die, NoProgress) as exc:
+            log(f"{exc}; continuing bump/progress work without advancing the audit cursor")
+        # The audit runner retains its evidence and blocks. Maintenance cannot
+        # clear them or move the cursor; the separate release gate stays enforced.
         opts = replace(opts, only=other_tasks)
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
     # before any work runs. The quota pacer does this too, and every paced path now reaches it — but the
