@@ -175,17 +175,20 @@ It inspects a bounded batch before ordinary maintenance when at least 20 commits
 are pending. Below that threshold it continues with bump/progress work without
 launching an audit model. Set `TAUCETI_SECURITY_AUDIT_MIN_COMMITS` to a positive
 integer to change the threshold. Audit-only runs inspect any nonempty backlog.
-Findings, unresolved inspections and operational failures stop the round; they
-do not fall through to maintenance. Other work phases and `--pr` cannot be
+Findings, unresolved inspections and operational failures stop audit advancement
+and preserve their blocks and evidence. The combined worker continues with
+bump/progress work; this never clears a block or bypasses release gating.
+Other work phases and `--pr` cannot be
 combined with the audit phase. Its isolated Luna/Haiku reviewer is unchanged.
 
 It advances TauCeti's protected `security-audit` branch through main's first-parent
 history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
 Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
 Each session inspects complete per-commit diffs and before/after file contents,
-up to 20 commits with a 2 MiB workload target. A single larger commit may use up to
-8 MiB (each source blob is limited to 4 MiB). These are workload limits, separate
-from the model's live context window. Small inputs are supplied inline; larger
+up to 20 commits with a 2 MiB workload target. A single larger commit is inspected
+alone without an aggregate byte cap, through the same compacting session. Each
+source blob remains limited to 4 MiB, and each model launch to 30 minutes.
+The batching target is separate from the model's live context window. Small inputs are supplied inline; larger
 inputs are available through one read-only `audit.read_page` tool. It accepts only
 a numbered page and a continuation token, with no filesystem paths, URLs, commands
 or writes. Each read returns the token for the next call; a stale nonempty token
@@ -202,16 +205,34 @@ needed, and returning incomplete if the full inspection cannot be completed.
 
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
 Worker code alone verifies ancestry and moves the ref.
-No Lean builds or candidate scripts run. A finding, incomplete inspection, oversized
-commit or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
+No Lean builds or candidate scripts run. A finding, incomplete inspection, unsupported
+source blob or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
 not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
 The input, actual launcher/environment/prompt, transcript, native Codex
 compaction/usage records, read receipt (for larger inputs), and durable ledger are
-retained in the same directory. A pre-inspection commit-budget block from the old
-256 KiB planner can be archived and replanned when its exact next commit fits the
-new limits. This does not attest that commit or retry a model verdict: findings,
+retained in the same directory. A pre-inspection commit-budget block from an older
+planner can be archived automatically and its exact next commit replanned under
+the current limits. This does not attest that commit or retry a model verdict: findings,
 incomplete inspections, malformed answers, unauthorized tools and other planning errors remain blocked.
+
+For private Zulip alerts, set `TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG` in the trusted
+worker's environment to an absolute path to a mode-0600 JSON file:
+
+```json
+{"site":"https://leanprover.zulipchat.com","email":"BOT_EMAIL","api_key":"BOT_API_KEY","recipient_id":123}
+```
+
+Use a bot credential and the recipient's numeric Zulip user ID. The credential
+and its configuration path are excluded from the isolated reviewer's environment.
+Alerts include the commit range, recorded findings and local evidence paths.
+Source findings, incomplete inspections and operational pauses are labelled separately.
+They are sent only as direct messages; no GitHub issue is created. A durable local
+receipt suppresses repeated alerts for the same blocked range and kind. Failed
+delivery is retried on a subsequent audit round after at least 15 minutes, checking
+the latest 100 messages in that private conversation for an earlier ambiguous delivery.
+Notification failure preserves the audit block and allows bump/progress work to continue.
+Without this setting, reporting remains local to the worker's evidence and logs.
 
 A Codex service error with no final model answer is retried at most twice, after 5 and
 10 seconds. Each retry resumes the same native Luna conversation with unchanged

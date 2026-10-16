@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tauceti_worker import audit_alerts as alerts
 from tauceti_worker import audit_reader as ar
 from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
@@ -75,10 +76,24 @@ class History(unittest.TestCase):
         batch = sa.plan_batch(self.repo, self.base, head)
         self.assertIn("TauCeti/Side.lean", [f["path"] for f in batch["commits"][-1]["files"]])
 
-    def test_oversized_commit_is_not_truncated(self):
-        head = self.commit("big", "TauCeti/A.lean", "x" * sa.MAX_BLOB_BYTES)
-        with self.assertRaisesRegex(Die, "budget"):
-            sa.plan_batch(self.repo, self.base, head)
+    def test_large_commit_is_complete_and_isolated_from_neighbors(self):
+        content = "-- mathematical source\n" * 50000
+        for i in range(5):
+            self.commit(str(i), f"TauCeti/Large{i}.lean", content)
+        baseline = self.command("rev-parse", "HEAD")
+        for i in range(5):
+            (self.root / f"TauCeti/Large{i}.lean").write_text(content + "def x := 1\n")
+        self.command("add", ".")
+        self.command("commit", "-qm", "wide ordinary change")
+        wide = self.command("rev-parse", "HEAD")
+        head = self.commit("next", "TauCeti/A.lean", "def a := 1\n")
+        batch = sa.plan_batch(self.repo, baseline, head)
+        self.assertGreater(len(sa.serialize(batch).encode()), 8 * 1024 * 1024)
+        self.assertEqual([c["sha"] for c in batch["commits"]], [wide])
+        self.assertEqual(len(batch["commits"][0]["files"]), 5)
+        for f in batch["commits"][0]["files"]:
+            self.assertEqual(f["before"], content)
+            self.assertEqual(f["after"], content + "def x := 1\n")
 
     def test_batch_ends_before_oversized_commit(self):
         small = self.commit("small", "TauCeti/A.lean", "def x := 1\n")
@@ -158,27 +173,141 @@ class MaintenanceScheduling(unittest.TestCase):
         self.assertEqual(audit.call_args.args[1].only, ["security-audit"])
         self.assertEqual(self.opts.only, ["bump", "progress", "security-audit"])
 
-    def test_audit_work_and_failures_never_fall_through(self):
-        for result in (0, sa.NoProgress("service unavailable"), sa.Die("finding")):
+    def test_successful_audit_does_not_run_maintenance_in_same_round(self):
+        with patch.object(sa, "run", return_value=0), patch.object(wu, "mirror_creds") as maintenance:
+            self.assertEqual(wu.run_round(self.worker, self.opts), 0)
+        maintenance.assert_not_called()
+
+    def test_audit_blocks_and_service_failures_allow_maintenance(self):
+        for result in (sa.NoProgress("service unavailable"), sa.Die("finding")):
             with (
-                patch.object(
-                    sa,
-                    "run",
-                    **({"side_effect": result} if isinstance(result, Exception) else {"return_value": result}),
-                ),
-                patch.object(wu, "mirror_creds") as maintenance,
+                self.subTest(error=str(result)),
+                patch.object(sa, "run", side_effect=result),
+                patch.object(wu, "mirror_creds", side_effect=RuntimeError("maintenance reached")),
+                self.assertRaisesRegex(RuntimeError, "maintenance reached"),
             ):
-                if isinstance(result, Exception):
-                    with self.assertRaises(type(result)):
-                        wu.run_round(self.worker, self.opts)
-                else:
-                    self.assertEqual(wu.run_round(self.worker, self.opts), 0)
-            maintenance.assert_not_called()
+                wu.run_round(self.worker, self.opts)
+
+    def test_audit_only_failures_still_stop(self):
+        self.opts.only = ["security-audit"]
+        with patch.object(sa, "run", side_effect=Die("finding")), patch.object(wu, "mirror_creds") as maintenance:
+            with self.assertRaisesRegex(Die, "finding"):
+                wu.run_round(self.worker, self.opts)
+        maintenance.assert_not_called()
 
     def test_mixed_round_still_preflights_maintenance_tools(self):
         with patch.object(cli, "_have", side_effect=lambda name: name != "lake"):
             with self.assertRaisesRegex(Die, "toolchain"):
                 cli.preflight(self.worker.cfg, self.opts)
+
+
+class PrivateAlerts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+        self.config = self.work / "bot.json"
+        self.config.write_text(
+            json.dumps({"site": "https://chat.example", "recipient_id": 123, "email": "bot", "api_key": "secret"})
+        )
+        env = patch.dict(os.environ, {"TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG": str(self.config)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.block = {"from_sha": "a" * 40, "to_sha": "b" * 40, "reason": "network unavailable"}
+        self.real_request = alerts.request
+        self.request = patch.object(alerts, "request", return_value={"result": "success", "id": 456})
+        self.http = self.request.start()
+        self.addCleanup(self.request.stop)
+
+    def test_private_recipient_and_durable_deduplication(self):
+        alerts.notify_block(self.work, self.block)
+        alerts.notify_block(self.work, self.block)
+        alerts.notify_block(self.work, {**self.block, "reason": "another request failed"})
+        self.http.assert_called_once()
+        _, method, params = self.http.call_args.args
+        self.assertEqual(method, "POST")
+        self.assertEqual(params["type"], "direct")
+        self.assertEqual(json.loads(params["to"]), [123])
+        self.assertIn("Operational pause", params["content"])
+        self.assertNotIn("secret", params["content"])
+
+    def test_source_finding_is_reported_as_data_with_evidence(self):
+        (self.work / "ledger.jsonl").write_text(
+            json.dumps(
+                {
+                    "from_sha": self.block["from_sha"],
+                    "to_sha": self.block["to_sha"],
+                    "verdict": {"verdict": "finding", "findings": ["TauCeti/A.lean:12 IO access ``` @**everyone**"]},
+                }
+            )
+            + "\n"
+        )
+        alerts.notify_block(self.work, self.block)
+        message = self.http.call_args.args[2]["content"]
+        self.assertIn("Source-safety finding", message)
+        self.assertIn("TauCeti/A.lean:12", message)
+        self.assertIn("blocked.json", message)
+        self.assertNotIn("@**everyone**", message)
+        self.assertEqual(message.count("```"), 2)
+
+    def test_failed_delivery_backs_off_and_reconciles_ambiguous_post(self):
+        self.http.side_effect = OSError("response lost")
+        alerts.notify_block(self.work, self.block)
+        marker = "tauceti-audit-" + next(iter(json.loads((self.work / "zulip-alerts.json").read_text())))
+        alerts.notify_block(self.work, self.block)
+        self.assertEqual(self.http.call_count, 1)
+        self.http.side_effect = None
+        self.http.return_value = {"result": "success", "messages": [{"id": 789, "content": marker}]}
+        with patch.object(alerts.time, "time", return_value=10**12):
+            alerts.notify_block(self.work, self.block)
+        self.assertEqual(self.http.call_count, 2)
+        self.assertEqual(self.http.call_args.args[1], "GET")
+        self.assertEqual(json.loads(self.http.call_args.args[2]["narrow"]), [{"operator": "dm", "operand": [123]}])
+        self.assertEqual(
+            next(iter(json.loads((self.work / "zulip-alerts.json").read_text()).values()))["message_id"], 789
+        )
+
+    def test_failed_reconciliation_does_not_resend_and_backs_off(self):
+        self.http.side_effect = OSError("unavailable")
+        alerts.notify_block(self.work, self.block)
+        with patch.object(alerts.time, "time", return_value=10**12):
+            alerts.notify_block(self.work, self.block)
+            alerts.notify_block(self.work, self.block)
+        self.assertEqual(self.http.call_count, 2)
+        self.assertEqual(self.http.call_args.args[1], "GET")
+
+    def test_unconfigured_worker_sends_nothing(self):
+        with patch.dict(os.environ, {"TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG": ""}):
+            alerts.notify_block(self.work, self.block)
+        self.http.assert_not_called()
+
+    def test_malformed_notification_state_preserves_audit_block(self):
+        blocked = self.work / "blocked.json"
+        blocked.write_text(json.dumps(self.block))
+        for malformed in ([], "invalid-state"):
+            (self.work / "zulip-alerts.json").write_text(json.dumps(malformed))
+            alerts.notify_block(self.work, self.block)
+            self.assertEqual(json.loads(blocked.read_text()), self.block)
+        self.config.write_text("[]")
+        alerts.notify_block(self.work, self.block)
+        self.assertEqual(json.loads(blocked.read_text()), self.block)
+        self.http.assert_not_called()
+
+    def test_invalid_destination_is_rejected_before_network_access(self):
+        config = json.loads(self.config.read_text())
+        for changes in (
+            {"site": "http://chat.example"},
+            {"site": "https://name:password@chat.example"},
+            {"site": "https://chat.example/other"},
+            {"site": "https://chat.example?token=secret"},
+            {"recipient_id": True},
+            {"recipient_id": "123"},
+            {"recipient_id": 0},
+        ):
+            with self.subTest(changes=changes), patch.object(alerts.urllib.request, "build_opener") as network:
+                with self.assertRaises(ValueError):
+                    self.real_request({**config, **changes}, "POST", {})
+                network.assert_not_called()
 
 
 class Authority(unittest.TestCase):
@@ -277,6 +406,7 @@ class Authority(unittest.TestCase):
                 self.assertNotIn("GH_TOKEN", kwargs["env"])
                 self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
                 self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
+                self.assertNotIn("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG", kwargs["env"])
                 self.assertNotEqual(kwargs["cwd"], work)
                 credentials = json.loads((kwargs["cwd"] / ".codex/auth.json").read_text())
                 self.assertEqual(credentials["tokens"]["refresh_token"], sa.CODEX_RT_PLACEHOLDER)
@@ -294,7 +424,14 @@ class Authority(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout="\n".join(map(json.dumps, events)), stderr="")
 
             with (
-                patch.dict(os.environ, {"GH_TOKEN": "admin-secret", "GITHUB_TOKEN": "secret"}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "GH_TOKEN": "admin-secret",
+                        "GITHUB_TOKEN": "secret",
+                        "TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG": "/private/bot.json",
+                    },
+                ),
                 patch.object(sa, "codex_dir", return_value=work),
                 patch.object(sa.subprocess, "run", side_effect=model),
             ):
@@ -885,7 +1022,12 @@ class Run(unittest.TestCase):
             "manual_inspection_required": True,
             "reason": f"security-audit: commit {self.target} exceeds the input budget; manual inspection required",
         }
-        for extra in ({"attempt": "failed-model"}, {"reason": "unexpected library file"}):
+        for extra in (
+            {"attempt": "failed-model"},
+            {"reason": "unexpected library file"},
+            {"input_policy": "unknown-policy"},
+            {"manual_inspection_required": False},
+        ):
             blocked.write_text(json.dumps({**previous, **extra}))
             with patch.object(sa, "inspect") as inspect, self.assertRaises(NoProgress):
                 sa.run(SimpleNamespace(state=self.state), self.opts)
@@ -899,6 +1041,27 @@ class Run(unittest.TestCase):
         inspect.assert_called_once()
         self.assertFalse(blocked.exists())
         self.assertEqual(len(list(work.glob("superseded-size-block-*.json"))), 1)
+
+    def test_current_size_block_is_archived_before_single_session_inspection(self):
+        work = self.state / sa.CURSOR
+        work.mkdir()
+        block = {
+            "from_sha": self.old,
+            "reason": f"security-audit: commit {self.target} exceeds the input budget; manual inspection required",
+            "manual_inspection_required": True,
+            "input_policy": "compacting-session-v1",
+        }
+        (work / "blocked.json").write_text(sa.serialize(block))
+
+        def inspection(*args):
+            archived = list(work.glob("superseded-size-block-*.json"))
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(json.loads(archived[0].read_text()), block)
+            self.assertFalse((work / "blocked.json").exists())
+            return {"verdict": "pass", "findings": []}
+
+        with patch.object(sa, "inspect", side_effect=inspection), patch.object(sa, "advance", return_value=self.target):
+            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
 
     def test_planning_failure_retains_manual_review_record(self):
         with patch.object(sa, "plan_batch", side_effect=Die("oversized")), self.assertRaises(Die):

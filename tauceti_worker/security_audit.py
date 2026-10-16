@@ -20,6 +20,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
+from .audit_alerts import notify_block
 from .audit_reader import pages
 from .config import Die, NoProgress, log
 from .constants import TAUCETI
@@ -32,7 +33,6 @@ BOOTSTRAP = "8eecb48e9b51da99ca119f190a64ca43c100795b"
 LEGACY_READER_DIGEST = "3b7c68055c792d0ea3243220cff9a73f282c1e1c1f71d9646f1739a2fd3757c4"
 MAX_COMMITS = 20
 MAX_BYTES = 2 * 1024 * 1024  # Session workload target, not a context-window limit.
-MAX_SINGLE_COMMIT_BYTES = 8 * 1024 * 1024
 MAX_BLOB_BYTES = 4 * 1024 * 1024
 INLINE_BYTES = 32 * 1024
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -243,9 +243,9 @@ def plan_batch(repo: Path, cursor: str, main: str) -> dict:
         size = len(PROMPT.encode()) + len(serialize(candidate).encode()) + 1024
         if size > MAX_BYTES and commits:
             break
-        if size > MAX_SINGLE_COMMIT_BYTES:
-            if not commits:
-                raise Die(f"security-audit: commit {sha} exceeds the input budget; manual inspection required")
+        # One commit is indivisible. Stream its complete input through the reader
+        # in one compacting session even when it exceeds the batching target.
+        # Source-blob and model-launch resource bounds remain enforced.
         commits.append(item)
     if not commits:
         raise NoProgress("security-audit: cursor is caught up with main")
@@ -958,10 +958,18 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
             r"security-audit: commit ([0-9a-f]{40}) exceeds the input budget; manual inspection required",
             previous.get("reason", ""),
         )
-        if set(previous) == {"from_sha", "reason", "manual_inspection_required"}
+        if previous.get("manual_inspection_required") is True
+        and (
+            set(previous) == {"from_sha", "reason", "manual_inspection_required"}
+            or (
+                set(previous) == {"from_sha", "reason", "manual_inspection_required", "input_policy"}
+                and previous["input_policy"] == "compacting-session-v1"
+            )
+        )
         else None
     )
     if not opts.dry_run and previous.get("from_sha") == cursor and not size_failure:
+        notify_block(work, previous)
         raise NoProgress(
             f"security-audit: unresolved inspection; read {blocked}; retry-service handles provider errors, repair-output handles eligible malformed output; source verdicts require human review"
         )
@@ -983,6 +991,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
             }
             blocked.write_text(serialize(failure))
             record(work / "ledger.jsonl", failure)
+            notify_block(work, failure)
         raise Die(f"security-audit: cannot form a complete batch: {exc}") from exc
     target = batch["commits"][-1]["sha"]
     if not opts.dry_run and size_failure and previous.get("from_sha") == cursor:
@@ -1060,6 +1069,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         failure = {"from_sha": cursor, "to_sha": target, "reason": str(exc), "attempt": str(attempt)}
         blocked.write_text(serialize(failure))
         record(work / "ledger.jsonl", failure)
+        notify_block(work, failure)
         raise Die(f"security-audit: stopped without approval; see {blocked}: {exc}") from exc
 
 
