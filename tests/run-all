@@ -78,6 +78,7 @@ RUN_STDLIB=(
   quota_cache_fp.py
   quota_loop_refresh.py
   rebase_handoff.py
+  scoped_repair_route.py
   rebase_budget.py
   review_sync_failure.py
   quota_claude_bootstrap.py
