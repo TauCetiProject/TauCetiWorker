@@ -268,6 +268,7 @@ class Candidate:
     ready_at: int | None = None  # when this exact review unit became actionable
     preferred_reviewer: str = ""  # latest scoreboard publisher; gets a short first refusal
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
+    foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
 
 
@@ -743,11 +744,21 @@ def survey(
     #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
     #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
     #    is rebased until it merges or CI retires it.
-    for p in tended if "rebase" in enabled else []:
+    foreign_repairs = []
+    if "rebase" in enabled:
+        from .repair_route import authorize, target
+
+        scope = target()
+        for p in nondraft if scope else []:
+            if p not in tended and (p.number, p.head_oid) == (scope.pr, scope.head):
+                if authorize(gh, p.number, p.head_oid, p.head_ref, f"{p.head_owner}/{p.head_repo}") == scope.base:
+                    foreign_repairs.append(p)
+    for p in tended + foreign_repairs if "rebase" in enabled else []:
+        foreign = p in foreign_repairs
         labels = {label.lower() for label in p.labels}
         if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
             continue
-        handoff = (
+        handoff = foreign or (
             p.mergeable != "CONFLICTING"
             and "needs-rebase" in labels
             and (
@@ -784,6 +795,9 @@ def survey(
                 continue
             reason = "authenticated request for integration repair"
         c = Candidate(p.number, p.head_oid, reason)
+        if foreign:
+            c.foreign_repair_base = scope.base
+            c.reason = "explicitly scoped foreign-fork integration repair"
         try:
             if budget_error:
                 raise RebaseBudgetUnavailable(budget_error)
@@ -795,7 +809,7 @@ def survey(
         except RebaseBudgetUnavailable as error:
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS
-        c.budget = MAX_REBASE_ATTEMPTS
+        c.budget = 1 if foreign else MAX_REBASE_ATTEMPTS
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit

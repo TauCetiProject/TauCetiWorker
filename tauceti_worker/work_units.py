@@ -719,6 +719,14 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     dashboard, either of which can republish an entitled record in the gap, and the read would come
     back `assumed` from a fetch that happened before whatever prompted this re-check."""
     if stage == "rebase":
+        if getattr(c, "foreign_repair_base", ""):
+            from .repair_route import authorize
+
+            p = next((p for p in sv.open_prs if p.number == c.pr), None)
+            return bool(
+                p
+                and authorize(w.gh, c.pr, c.head, p.head_ref, f"{p.head_owner}/{p.head_repo}") == c.foreign_repair_base
+            )
         from .github_transport import read_context
 
         with read_context(fresh=True, direct=True):
@@ -1324,8 +1332,27 @@ def _do_fixlike(
     if not (p.head_owner and p.head_repo and p.head_ref):
         log(f"  {label} #{pr}: head repo deleted/unavailable — skipping")
         return None
+    foreign = getattr(c, "foreign_repair_base", "")
+    if foreign:
+        from .repair_route import authorize
+
+        if label != "rebase" or authorize(w.gh, pr, head, p.head_ref, f"{p.head_owner}/{p.head_repo}") != foreign:
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            log(f"  {label} #{pr}: explicit fork repair scope is no longer valid — skipping")
+            return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
+        if foreign:
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None  # claimed elsewhere → caller tries the next candidate
+    held = getattr(w.claims, "held", None)
+    if foreign and (not held or held[0] != f"branch/{pr}"):
+        # The optional foreign canary requires a real claim; an API outage must
+        # not launch duplicate paid tasks. Normal owned-PR claim behavior is unchanged.
+        for key in charged:
+            w.counters.write(key, max(0, w.counters.read(key) - 1))
+        return None
     if label == "bump" and getattr(c, "bump_integration_failure", False):
         batch = w.gh.bump_repair_requested(pr, head)
         if not batch:
@@ -1343,6 +1370,17 @@ def _do_fixlike(
         )
         if evidence:
             prompt += f"\nAuthenticated recovery request for this head:\n{evidence}\n"
+        if foreign:
+            prompt += (
+                f"\nThe operator scoped this repair to PR #{pr}, starting head {head}, "
+                f"and main snapshot {foreign}, on tauceti-ai-for-science/TauCeti only. "
+                "After the single fetch, stop without editing if origin/main differs from that "
+                "snapshot. Do not switch GitHub identity or work on another PR. Before pushing, "
+                "re-read the live head, pause labels and authenticated Bors v3 request; stop if the "
+                "request was withdrawn or superseded. Integrate only the scoped main snapshot, "
+                "finish the required full build and axiom checks, and use git-safe-push with the "
+                "existing branch lease and starting-head CAS. A new head ends this authorization.\n"
+            )
     if getattr(p, "automatic_bump", False):
         deadline = getattr(getattr(w, "rc", None), "deadline", time.time() + ROUND_TIMEOUT)
         prompt += (
@@ -1409,7 +1447,9 @@ def _do_fixlike(
             raise
     if rc == 0:
         w.rs.bust(pr)
-    else:
+    elif not foreign:
+        # The optional foreign canary gets one authoring launch even if the
+        # provider later fails. Do not turn its scope into repeated paid tasks.
         _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
 

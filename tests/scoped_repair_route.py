@@ -1,0 +1,251 @@
+"""One explicitly scoped foreign repair; no live reads, pushes, or paid agents."""
+
+import copy
+import importlib
+import json
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tauceti_worker import repair_route as route
+from tauceti_worker import work_units
+from tauceti_worker.constants import TAUCETI
+from tauceti_worker.github import GitHub, GitHubError
+
+survey_mod = importlib.import_module("tauceti_worker.survey")
+HEAD, BASE = "a" * 40, "b" * 40
+SCOPE = f"13940:{HEAD}:{BASE}"
+
+
+def fixture():
+    live = {
+        "state": "open",
+        "draft": False,
+        "maintainer_can_modify": True,
+        "user": {"login": route.AUTHOR, "type": "User"},
+        "head": {"sha": HEAD, "ref": "feature", "repo": {"full_name": route.FORK, "fork": True}},
+        "base": {"ref": "main", "repo": {"full_name": TAUCETI}},
+        "labels": [{"name": "needs-rebase"}],
+    }
+    comment = {
+        "user": {"login": "tau-ceti-bors[bot]"},
+        "body": (
+            f"Merge-queue recovery for head `{HEAD[:7]}`: exact individual source compatibility failed.\n\n"
+            f"Tested main: `{BASE}`. Checker policy: `local-source-v3`.\n"
+            "Missing source: TauCeti/Consumer.lean imports TauCeti.Removed.\n\n"
+            f"<!--tauceti-rebase:v1 {HEAD}-->"
+        ),
+    }
+    gh = GitHub()
+    gh.issue_comments = Mock(return_value=[comment])
+
+    def api(path, jq):
+        if path.endswith("/pulls/13940"):
+            return json.dumps(live)
+        if path.endswith("/git/ref/heads/main"):
+            return BASE
+        if path == "repos/" + TAUCETI:
+            return "true"
+        raise AssertionError((path, jq))
+
+    gh.api_jq = Mock(side_effect=api)
+    return live, comment, gh
+
+
+def raw_pr():
+    return {
+        "number": 13940,
+        "headRefOid": HEAD,
+        "headRefName": "feature",
+        "headRepositoryOwner": {"login": route.AUTHOR},
+        "headRepository": {"name": "TauCeti"},
+        "author": {"login": route.AUTHOR},
+        "mergeable": "MERGEABLE",
+        "statusCheckRollup": [{"context": "build", "state": "SUCCESS"}],
+        "labels": [{"name": "needs-rebase"}],
+    }
+
+
+def test_default_off_and_exact_operator_scope():
+    _, _, gh = fixture()
+    for value in ["", "13940", SCOPE + "," + SCOPE, SCOPE.upper(), SCOPE.replace("13940:", "0:")]:
+        with patch.dict(os.environ, {route.ENV: value}):
+            assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
+    gh.api_jq.assert_not_called()
+    with patch.dict(os.environ, {route.ENV: SCOPE}):
+        assert not route.authorize(gh, 13940, HEAD, "feature", "other/TauCeti")
+        assert not route.authorize(gh, 13941, HEAD, "feature", route.FORK)
+        assert not route.authorize(gh, 13940, "c" * 40, "feature", route.FORK)
+        assert route.authorize(gh, 13940, HEAD, "feature", route.FORK) == BASE
+
+
+def test_live_permission_pause_identity_and_movement_guards():
+    original, _, _ = fixture()
+    changes = [
+        {"state": "closed"},
+        {"draft": True},
+        {"maintainer_can_modify": False},
+        {"maintainer_can_modify": "true"},
+        {"user": {"login": "another-author", "type": "User"}},
+        {"user": {"login": route.AUTHOR, "type": "Bot"}},
+        {"head": {**original["head"], "sha": "c" * 40}},
+        {"head": {**original["head"], "ref": "renamed"}},
+        {"head": {**original["head"], "repo": {"full_name": "other/TauCeti", "fork": True}}},
+        {"head": {**original["head"], "repo": None}},
+        {"head": {**original["head"], "repo": {"full_name": route.FORK, "fork": False}}},
+        {"base": {"ref": "other", "repo": {"full_name": TAUCETI}}},
+        {"base": {"ref": "main", "repo": {"full_name": "other/TauCeti"}}},
+        {"labels": []},
+        *({"labels": [{"name": "needs-rebase"}, {"name": name.upper()}]} for name in route.PAUSE),
+    ]
+    with patch.dict(os.environ, {route.ENV: SCOPE}):
+        for change in changes:
+            live, _, gh = fixture()
+            live.update(copy.deepcopy(change))
+            assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK), change
+        for path, result in [
+            (f"repos/{TAUCETI}", "false"),
+            (f"repos/{TAUCETI}", None),
+            (f"repos/{TAUCETI}/git/ref/heads/main", "c" * 40),
+            (f"repos/{TAUCETI}/pulls/13940", "not-json"),
+        ]:
+            _, _, gh = fixture()
+            read = gh.api_jq.side_effect
+            gh.api_jq.side_effect = lambda p, q, path=path, result=result, read=read: (
+                result if p == path else read(p, q)
+            )
+            assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
+        _, _, gh = fixture()
+        gh.api_jq.side_effect = GitHubError("API unavailable")
+        assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK)
+
+
+def test_only_authenticated_current_v3_source_request():
+    with patch.dict(os.environ, {route.ENV: SCOPE}):
+        for change in ["actor", "policy", "base", "head", "quoted", "missing", "oversized"]:
+            _, comment, gh = fixture()
+            if change == "actor":
+                comment["user"]["login"] = "tauceti-review-bot[bot]"
+            elif change == "quoted":
+                comment["body"] = "Quoted text\n" + comment["body"]
+            elif change == "missing":
+                gh.issue_comments.return_value = None
+            elif change == "oversized":
+                comment["body"] += "x" * 32768
+            else:
+                old = {"policy": "local-source-v3", "base": BASE, "head": HEAD}[change]
+                comment["body"] = comment["body"].replace(old, "old")
+            assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK), change
+
+
+def test_frozen_genuine_request_fixture_without_live_execution():
+    observed = json.loads((Path(__file__).parent / "fixtures" / "scoped-repair-route.json").read_text())
+    live, _, gh = fixture()
+    live["head"]["sha"] = observed["head"]
+    gh.issue_comments.return_value = [observed["request"]]
+    read = gh.api_jq.side_effect
+    gh.api_jq.side_effect = lambda p, q: observed["base"] if p.endswith("/git/ref/heads/main") else read(p, q)
+    value = f"{observed['pr']}:{observed['head']}:{observed['base']}"
+    with patch.dict(os.environ, {route.ENV: value}):
+        assert route.authorize(gh, observed["pr"], observed["head"], "feature", route.FORK) == observed["base"]
+    assert not observed["production_worker_repair_verified"]
+
+
+def test_selection_is_rebase_only_and_one_attempt_without_budget_reset():
+    _, _, gh = fixture()
+    gh.open_prs = Mock(return_value=[raw_pr()])
+    counters = SimpleNamespace(read=Mock(return_value=0))
+    with patch.object(survey_mod, "me", return_value="maintainer"):
+        with patch.dict(os.environ, {route.ENV: ""}):
+            assert not survey_mod.survey(
+                SimpleNamespace(wid="test"), gh, None, counters, deep=False
+            ).rebaseable.actionable
+        with patch.dict(os.environ, {route.ENV: SCOPE}):
+            sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False, stages=["rebase"])
+            c = sv.rebaseable.actionable[0]
+            assert (c.pr, c.head, c.foreign_repair_base, c.budget, c.rebase_budget_key) == (
+                13940,
+                HEAD,
+                BASE,
+                1,
+                "rebase-pr-13940",
+            )
+            counters.read.return_value = 1
+            capped = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False, stages=["rebase"])
+            assert not capped.rebaseable.actionable and capped.rebaseable.suppressed[0].attempts == 1
+            gh.api_jq.reset_mock()
+            sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False, stages=["fix-ci"])
+            assert not sv.rebaseable.actionable
+            gh.api_jq.assert_not_called()
+
+
+def test_paid_launch_rechecks_scope_and_requires_a_real_claim():
+    _, comment, gh = fixture()
+    p = survey_mod.PRInfo.from_json(raw_pr())
+    sv = SimpleNamespace(open_prs=[p])
+    c = survey_mod.Candidate(13940, HEAD, foreign_repair_base=BASE, rebase_budget_key="rebase-pr-13940")
+    count = {c.rebase_budget_key: 0}
+    counters = SimpleNamespace(
+        read=lambda k: count[k],
+        write=lambda k, v: count.update({k: v}),
+        incr=lambda k: count.update({k: count[k] + 1}),
+    )
+    w = SimpleNamespace(
+        gh=gh,
+        counters=counters,
+        rs=SimpleNamespace(bust=Mock()),
+        claims=SimpleNamespace(begin_branch_work=Mock(return_value=True), held=("branch/13940", "claims")),
+    )
+    with patch.dict(os.environ, {route.ENV: SCOPE}), patch.object(work_units, "run_in_bubble", return_value=0) as agent:
+        assert work_units._still_actionable("rebase", w, sv, c)
+        # A pause added after selection prevents both claim and paid launch, even
+        # though a textual conflict would normally select an owned PR.
+        live = json.loads(gh.api_jq(f"repos/{TAUCETI}/pulls/13940", "."))
+        original_read = gh.api_jq.side_effect
+        live["labels"].append({"name": "human"})
+        gh.api_jq.side_effect = lambda p, q: json.dumps(live) if "/pulls/" in p else original_read(p, q)
+        assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) is None
+        assert count[c.rebase_budget_key] == 0
+        w.claims.begin_branch_work.assert_not_called()
+        agent.assert_not_called()
+        gh.api_jq.side_effect = original_read
+        for acquired, held in [(False, None), (True, None), (True, ("branch/other", "claims"))]:
+            w.claims.begin_branch_work.return_value = acquired
+            w.claims.held = held
+            assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) is None
+            assert count[c.rebase_budget_key] == 0
+            agent.assert_not_called()
+        w.claims.begin_branch_work.return_value = True
+        w.claims.held = ("branch/13940", "claims")
+        assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) == 0
+        assert count[c.rebase_budget_key] == 1
+        assert agent.call_args.kwargs["allow_push"] == route.FORK
+        prompt = agent.call_args.args[2]
+        assert comment["body"] in prompt and HEAD in prompt and BASE in prompt
+        assert "stop without editing if origin/main differs" in prompt
+        agent.reset_mock()
+        # A provider failure after launch also consumes the one canary attempt.
+        count[c.rebase_budget_key] = 0
+        agent.return_value = 1
+        with patch.object(work_units, "_refund_infra_failure") as refund:
+            assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) == 1
+            assert count[c.rebase_budget_key] == 1
+            refund.assert_not_called()
+        agent.reset_mock()
+        with patch.dict(os.environ, {route.ENV: ""}):
+            assert not work_units._still_actionable("rebase", w, sv, c)
+            assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) is None
+        agent.assert_not_called()
+
+
+if __name__ == "__main__":
+    test_default_off_and_exact_operator_scope()
+    test_live_permission_pause_identity_and_movement_guards()
+    test_only_authenticated_current_v3_source_request()
+    test_frozen_genuine_request_fixture_without_live_execution()
+    test_selection_is_rebase_only_and_one_attempt_without_budget_reset()
+    test_paid_launch_rechecks_scope_and_requires_a_real_claim()
+    print("PASS: default-off exact fork repair scope, live guards, one attempt, real claim and paid-launch fences")

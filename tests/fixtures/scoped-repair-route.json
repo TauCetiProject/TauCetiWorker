@@ -1,0 +1,16 @@
+{
+  "observed_at": "2026-10-16T02:09:00Z",
+  "pr": 13940,
+  "head": "dbba78bdb3a5f4d234373a4248a3022004331fa5",
+  "base": "03de080239e2f6ccee2f6e054e65c5445c50cf1e",
+  "author": "tauceti-ai-for-science",
+  "fork": "tauceti-ai-for-science/TauCeti",
+  "request_url": "https://github.com/TauCetiProject/TauCeti/pull/13940#issuecomment-6206164978",
+  "request": {
+    "user": {
+      "login": "tau-ceti-bors[bot]"
+    },
+    "body": "Merge-queue recovery for head `dbba78b`: exact individual source compatibility failed.\n\nTested main: `03de080239e2f6ccee2f6e054e65c5445c50cf1e`. Checker policy: `local-source-v3`.\nTextual merge conflicts: TauCeti/Analysis/InnerProductSpace/SymmetricFunctionalCalculus.lean\n\nThe prospective tree includes this PR's added modules. This does not change its existing head-CI build status. Its author or tending worker should integrate one current main snapshot, repair imports/APIs/proofs as necessary, and pass build and axiom checks before a compare-and-swap safe push. Git rebase alone is not proof of repair. Normal fresh-head CI and review then apply. Existing ownership/fork/human-path restrictions, claims and per-PR retry caps apply; untended or unwritable heads require their author/maintainer. Add keep to pause.\n\n<!--tauceti-rebase:v1 dbba78bdb3a5f4d234373a4248a3022004331fa5-->"
+  },
+  "production_worker_repair_verified": false
+}
