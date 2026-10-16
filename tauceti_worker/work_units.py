@@ -720,12 +720,13 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     back `assumed` from a fetch that happened before whatever prompted this re-check."""
     if stage == "rebase":
         if getattr(c, "foreign_repair_base", ""):
-            from .repair_route import authorize
+            from .repair_route import authorize, reselect_before_launch
 
             p = next((p for p in sv.open_prs if p.number == c.pr), None)
             return bool(
                 p
-                and authorize(w.gh, c.pr, c.head, p.head_ref, f"{p.head_owner}/{p.head_repo}") == c.foreign_repair_base
+                and (base := authorize(w.gh, c.pr, c.head, p.head_ref, f"{p.head_owner}/{p.head_repo}"))
+                and (base == c.foreign_repair_base or reselect_before_launch())
             )
         from .github_transport import read_context
 
@@ -1334,9 +1335,10 @@ def _do_fixlike(
         return None
     foreign = getattr(c, "foreign_repair_base", "")
     if foreign:
-        from .repair_route import authorize
+        from .repair_route import authorize, reselect_before_launch
 
-        if label != "rebase" or authorize(w.gh, pr, head, p.head_ref, f"{p.head_owner}/{p.head_repo}") != foreign:
+        base = authorize(w.gh, pr, head, p.head_ref, f"{p.head_owner}/{p.head_repo}")
+        if label != "rebase" or not base or (base != foreign and not reselect_before_launch()):
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             log(f"  {label} #{pr}: explicit fork repair scope is no longer valid — skipping")
@@ -1353,6 +1355,15 @@ def _do_fixlike(
         for key in charged:
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
+    if foreign:
+        # The last fresh authorization follows the real claim. Nothing paid has
+        # started; the current-at-launch option may cheaply select main once here.
+        base = authorize(w.gh, pr, head, p.head_ref, f"{p.head_owner}/{p.head_repo}")
+        if not base or (base != foreign and not reselect_before_launch()):
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            return None
+        foreign = c.foreign_repair_base = base
     if label == "bump" and getattr(c, "bump_integration_failure", False):
         batch = w.gh.bump_repair_requested(pr, head)
         if not batch:
@@ -1378,8 +1389,15 @@ def _do_fixlike(
                 "it may precede the explicitly authorized integration snapshot. Reproduce or "
                 "explain that original diagnosis using actual source; do not claim the old "
                 "evidence is a fresh check against the integration snapshot. "
-                "After the single fetch, stop without editing if origin/main differs from that "
-                "snapshot. Do not switch GitHub identity or work on another PR. Before pushing, "
+                + (
+                    f"This is the current-at-launch snapshot, now frozen. Fetch exactly `{foreign}` "
+                    f"from https://github.com/{TAUCETI}.git, verify FETCH_HEAD equals it and integrate "
+                    "that exact commit. These instructions replace the earlier fetch/merge origin/main steps. "
+                    "Later main advances do not retarget this attempt. "
+                    if reselect_before_launch()
+                    else "After the single fetch, stop without editing if origin/main differs from that snapshot. "
+                )
+                + "Do not switch GitHub identity or work on another PR. Before pushing, "
                 "re-read the live head, pause labels and authenticated Bors v3 request; stop if the "
                 "request was withdrawn or superseded. Integrate only the scoped main snapshot, "
                 "finish the required full build and axiom checks, and use git-safe-push with the "
@@ -1411,6 +1429,17 @@ def _do_fixlike(
             "expected head and that the Bors repair handoff still holds before pushing. "
             "Do not request a manual Bors retry.\n"
         )
+    if foreign:
+        from .repair_route import target
+
+        scope = target()
+        if not scope or (scope.pr, scope.head) != (pr, head):
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            return None
+        # Existing counter storage supplies fsync + atomic replace. The receipt
+        # also blocks a restart if preparation fails/refunds before a paid agent.
+        w.counters.record_foreign_repair_launch(pr, head, scope.evidence_base, foreign)
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
@@ -1477,6 +1506,10 @@ def do_rebase(w, sv, c, opts, bubble) -> int | None:
     key = c.rebase_budget_key
     if not key:
         raise Die("rebase candidate has no selected retry budget; survey it again")
+    if getattr(c, "foreign_repair_base", "") and (
+        w.counters.read(key) >= 1 or w.counters.foreign_repair_launched(c.pr)
+    ):
+        return None
     w.counters.incr(key)
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
 

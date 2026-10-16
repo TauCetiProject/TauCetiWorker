@@ -107,6 +107,16 @@ class Counters:
         self.write(name, v)
         return v
 
+    def foreign_repair_launched(self, pr: int) -> bool:
+        # An unreadable/malformed receipt still consumes the optional canary.
+        return (self.state / f"rebase-foreign-launch-{pr}.json").exists()
+
+    def record_foreign_repair_launch(self, pr: int, head: str, evidence: str, main: str) -> None:
+        self._atomic_write(
+            f"rebase-foreign-launch-{pr}.json",
+            json.dumps({"pr": pr, "head": head, "evidence_main": evidence, "integration_main": main}),
+        )
+
     def _rebase_progress(self, pr: int) -> dict | None:
         try:
             value = json.loads((self.state / f"rebase-progress-{pr}.json").read_text())
@@ -751,7 +761,7 @@ def survey(
         scope = target()
         for p in nondraft if scope else []:
             if p not in tended and (p.number, p.head_oid) == (scope.pr, scope.head):
-                if authorize(gh, p.number, p.head_oid, p.head_ref, f"{p.head_owner}/{p.head_repo}") == scope.base:
+                if integration := authorize(gh, p.number, p.head_oid, p.head_ref, f"{p.head_owner}/{p.head_repo}"):
                     foreign_repairs.append(p)
     for p in tended + foreign_repairs if "rebase" in enabled else []:
         foreign = p in foreign_repairs
@@ -796,7 +806,7 @@ def survey(
             reason = "authenticated request for integration repair"
         c = Candidate(p.number, p.head_oid, reason)
         if foreign:
-            c.foreign_repair_base = scope.base
+            c.foreign_repair_base = integration
             c.reason = "explicitly scoped foreign-fork integration repair"
         try:
             if budget_error:
@@ -806,6 +816,8 @@ def survey(
             # green push cannot prove it succeeded; retain its per-PR cap.
             c.rebase_budget_key = key_for(p.number) if key_for and not handoff else f"rebase-pr-{p.number}"
             c.attempts = counters.read(c.rebase_budget_key)
+            if foreign and getattr(counters, "foreign_repair_launched", lambda _: False)(p.number):
+                c.attempts = max(1, c.attempts)
         except RebaseBudgetUnavailable as error:
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS

@@ -16,6 +16,7 @@ from .github_transport import read_context
 from .survey_facts import rebase_heads
 
 ENV = "TAUCETI_REBASE_REPAIR_TARGET"
+CURRENT = "current-at-launch"
 AUTHOR = "tauceti-ai-for-science"
 FORK = AUTHOR + "/TauCeti"
 PAUSE = {"keep", "hold", "wip", "human", "do-not-close"}
@@ -30,8 +31,16 @@ class Target:
 
 
 def target() -> Target | None:
-    match = re.fullmatch(r"([1-9][0-9]{0,9}):([a-f0-9]{40}):([a-f0-9]{40}):([a-f0-9]{40})", os.environ.get(ENV, ""))
+    match = re.fullmatch(
+        rf"([1-9][0-9]{{0,9}}):([a-f0-9]{{40}}):([a-f0-9]{{40}}):([a-f0-9]{{40}}|{CURRENT})",
+        os.environ.get(ENV, ""),
+    )
     return Target(int(match[1]), match[2], match[3], match[4]) if match else None
+
+
+def reselect_before_launch() -> bool:
+    scope = target()
+    return bool(scope and scope.base == CURRENT)
 
 
 def authorize(gh, pr: int, head: str, refname: str, head_repository: str) -> str:
@@ -64,10 +73,13 @@ def authorize(gh, pr: int, head: str, refname: str, head_repository: str) -> str
                 return ""
             if gh.api_jq(f"repos/{TAUCETI}", ".permissions.push") != "true":
                 return ""
-            if gh.api_jq(f"repos/{TAUCETI}/git/ref/heads/main", ".object.sha") != scope.base:
+            integration = gh.api_jq(f"repos/{TAUCETI}/git/ref/heads/main", ".object.sha")
+            if not isinstance(integration, str) or not re.fullmatch(r"[a-f0-9]{40}", integration):
                 return ""
-            if scope.evidence_base != scope.base and gh.api_jq(
-                f"repos/{TAUCETI}/compare/{scope.evidence_base}...{scope.base}", ".status"
+            if scope.base != CURRENT and integration != scope.base:
+                return ""
+            if scope.evidence_base != integration and gh.api_jq(
+                f"repos/{TAUCETI}/compare/{scope.evidence_base}...{integration}", ".status"
             ) not in {"ahead", "identical"}:
                 return ""
             # Bors intentionally publishes once per PR head, not once per main
@@ -82,7 +94,7 @@ def authorize(gh, pr: int, head: str, refname: str, head_repository: str) -> str
                     and len(comment["body"]) <= 32768
                     and evidence_line in comment["body"].splitlines()
                 ):
-                    return scope.base
+                    return integration
     except (GitHubError, ValueError, TypeError, AttributeError):
         pass
     return ""
