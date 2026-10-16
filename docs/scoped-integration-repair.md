@@ -1,130 +1,42 @@
-# Proposed one-PR integration repair authorization
+# One named integration repair: inactive proposal
 
-This option is **off by default and not activated in production**. It is an
-operator authorization boundary, not a label that grants ownership. Review and
-explicit authorization in the #16813 implementation window must precede any
-actual activation. A peer coordination message is not human approval.
+This option is **off by default**. Code preparation or merge does not authorize a foreign-fork task. Explicit human authorization belongs in the original #16813 window. Peer coordination is not approval. All nine science workers stay disabled.
 
-Nine genuine Bors v3 requests at 02:09 UTC on 2026-10-16 all belonged to
-`tauceti-ai-for-science/TauCeti`. The active `kim-em` worker correctly excluded
-them. Its normal 02:03:34–02:07:17 survey launched no task. The nine configured
-science workers remain disabled. Existing PR targeting does not override
-ownership; changing GitHub identity or enabling a disabled worker would change
-those operating constraints.
+The exception admits only one named PR/exact head in `tauceti-ai-for-science/TauCeti` to the existing rebase task. It grants no additional account, worker, model, stage, concurrency or budget.
 
-The proposed alternative admits **one exact PR/head/evidence-main/integration-main tuple**, only for the
-existing rebase task on that one named science author/fork:
+## Choose main once
 
 ```
-TAUCETI_REBASE_REPAIR_TARGET=<PR>:<full-head>:<full-evidence-main>:<full-integration-main>
+TAUCETI_REBASE_REPAIR_TARGET=<PR>:<full-head>:<full-evidence-main>:current-at-launch
 ```
 
-The evidence main is the tested revision in the original Bors request. Bors
-intentionally deduplicates requests by PR head and does not post a new request
-on every promotion. Requiring that original main to equal live main would
-strand a valid request after promotion. The integration main is instead one
-separately and explicitly authorized snapshot, with no automatic update.
-GitHub must confirm it contains the evidence main (`ahead` or `identical`);
-unknown, diverged or rewound ancestry fails closed. This establishes ancestry,
-not source compatibility: the worker must investigate the original evidence
-and validate the integrated source, without calling the old result fresh.
-The three-field option from the initial proposal is rejected; no live
-configuration ever activated that format.
+The evidence main stays bound to the original authenticated Bors v3 request, which Bors intentionally deduplicates by head. The fourth field may still be an explicit integration SHA, retaining the strict fixed-main behavior. The old three-field option remains rejected.
 
-Unsetting the option, an invalid tuple, a new head, or a different live main
-prevents selection/launch. It does not authorize later heads or another PR.
-No other foreign author/fork can use this exception. It does not expand fix,
-fix-ci, bump, lint-repair, roadmap or general research ownership. Review retains
-its existing independent eligibility rules.
+`current-at-launch` authorizes this precise rule: after acquiring the real branch claim, perform fresh authorization, read actual canonical main, verify it contains the original evidence main, and freeze that concrete SHA for the sole attempt. Earlier survey/dispatch checks may cheaply reselect main. Immediately before delegation, write the frozen SHA into both the prompt and an atomic launch receipt. Later main advances never retarget the task or replenish its budget.
 
-Each selection and launch performs fresh, direct reads requiring:
+## Existing guards and durable limit
 
-- the PR still open and nondraft, on the exact branch/head in the named fork;
-- author `tauceti-ai-for-science` as a GitHub User and fork
-  `tauceti-ai-for-science/TauCeti`, targeting canonical TauCeti `main`;
-- `maintainer_can_modify=true`, plus the current identity's actual canonical
-  repository push permission; unknown/unwritable API results fail closed;
-- `needs-rebase` present and no `keep`, `hold`, `wip`, `human` or `do-not-close`;
-- an authenticated `tau-ceti-bors[bot]` exact-head request with the exact tested
-  main and `local-source-v3`; a conflict, review-bot comment or label alone fails;
-- actual current main equal to the explicitly authorized integration main,
-  with verified ancestry from the separately pinned evidence main.
+Fresh direct reads require the exact PR/head/ref, open/nondraft status, named User author/fork, canonical main target, maintainer modification permission, actual canonical push permission, needs-rebase, no pause labels, and the original active authenticated Bors exact-head v3 request. Unknown API/ancestry, changed head, withdrawn request, unwritable source or divergent/rewound main refuses launch. Labels alone grant nothing.
 
-The exception uses the existing `rebase-pr-<PR>` counter with a **one-attempt
-canary cap**, without resetting it. Normal owned repairs retain their existing
-three-attempt cap and verified-progress behavior. A lost claim or unavailable
-claim service starts no paid task and refunds the unstarted canary attempt.
-A real existing branch claim is mandatory for this optional foreign task; it
-does not use the normal owned-task fallback that can proceed unclaimed on an
-API outage. After an authoring launch, even a provider error consumes this canary attempt.
-Normal owned tasks keep their existing bounded provider-outage refunds and
-backoff; only this explicitly scoped foreign canary has the stricter limit.
+A real existing branch claim is mandatory. Authentication and pause guards run again after the claim. A refused claim or failed authorization starts no task, writes no launch receipt and refunds the unstarted counter charge. If authorization is refused after acquisition, stop its heartbeat and release that matching claim before dispatch tries another candidate; leave any unrelated replacement claim alone.
 
-The same repair prompt, fixed main snapshot, full `lake build` / axiom checks,
-human-owned path restrictions and `git-safe-push` starting-head CAS apply. Before
-editing, a fetched main differing from the scoped main stops the task. During
-the task, it does not chase later main advances. The prompt requires the live
-head, pause labels and Bors request to be checked again before push. The push
-wrapper mechanically enforces the branch lease and head CAS; request/label and
-source-validation checks inside the agent remain prompt requirements, as in the
-normal path. No claim of a new mechanical build/label guard is made.
+The existing lifetime rebase-pr counter has a one-attempt cap. The same counter store writes `rebase-foreign-launch-<PR>.json`, containing PR, head, evidence main and integration main, with fsync/atomic replace before delegation. Its presence blocks another delegation after restart or stale selection, even if an unstarted preparation path refunded the numeric counter. Malformed/unreadable receipts do not grant retries. A crash after charging/recording can conservatively consume the scope without a paid task; report that instead of deleting state. Neither key depends on advancing main.
 
-A successful push changes the head and expires this scope. Normal fresh-head
-CI, math review and current-base admission checks decide readmission. An
-unchanged head after the attempt cannot start another paid repair under this
-canary. No request, approval, label or retry counter is manufactured/reset.
+The agent fetches exactly the frozen SHA from canonical TauCeti, verifies FETCH_HEAD and integrates that commit, replacing ordinary origin/main fetch/merge instructions. It never integrates another PR branch or chases main. Original evidence is not called a fresh check against the integration snapshot.
 
-## Exact inactive activation proposal
+Full build and axiom validation, human-owned path restrictions and the existing safe-push lease/head CAS remain mandatory. Live request/head/pause checks before push remain prompt requirements, as do source validation checks; no new mechanical build/label gate is claimed. Changed-head CI, math review and admission decide readmission. No-change or failure is not repair acceptance.
 
-Candidate: PR13940, head `dbba78bdb3a5f4d234373a4248a3022004331fa5`, tested main
-`03de080239e2f6ccee2f6e054e65c5445c50cf1e`, existing
-[authenticated Bors request](https://github.com/TauCetiProject/TauCeti/pull/13940#issuecomment-6206164978).
-It has an actual textual conflict in
-`TauCeti/Analysis/InnerProductSpace/SymmetricFunctionalCalculus.lean`. This is not
-claimed as a missing-module diagnosis or as proof the original head CI is green.
-The historical three-field proposal pinned integration to that old main and
-correctly refused after promotion. A **new inactive four-field proposal** keeps
-evidence main03de but separately names integration main
-`239c9bd88c1c32f474ca193ba3d199cd565c911d`, captured as live main at 02:38 UTC.
-It does not rewrite/reissue the request or pretend source checks ran at239c.
-The request must still be active, the exact head unchanged, all existing guards
-satisfied and actual live main equal this integration snapshot at authorization
-and launch. If it moves again, this proposal refuses; any new integration target
-needs a separately reviewed explicit tuple, never automatic retargeting.
+## Concrete proposal, still inactive
 
-Only after reviewed code is installed for the existing idle worker2 and explicit
-authorization is recorded in the #16813 window, the **proposed** addition to that
-worker's existing `env` table is (preserve every existing entry):
+Existing worker2, one attempt on PR13940 head `dbba78bdb3a5f4d234373a4248a3022004331fa5`, original evidence main `03de080239e2f6ccee2f6e054e65c5445c50cf1e`, [authenticated Bors request](https://github.com/TauCetiProject/TauCeti/pull/13940#issuecomment-6206164978). The actual finding is a textual conflict in SymmetricFunctionalCalculus.lean, not missing-module evidence or proof of green head CI.
 
 ```toml
-"TAUCETI_REBASE_REPAIR_TARGET" = "13940:dbba78bdb3a5f4d234373a4248a3022004331fa5:03de080239e2f6ccee2f6e054e65c5445c50cf1e:239c9bd88c1c32f474ca193ba3d199cd565c911d"
+"TAUCETI_REBASE_REPAIR_TARGET" = "13940:dbba78bdb3a5f4d234373a4248a3022004331fa5:03de080239e2f6ccee2f6e054e65c5445c50cf1e:current-at-launch"
 "PYTHONPATH" = "/home/kim/.local/share/tauceti/releases/<reviewed-code-commit>"
 ```
 
-The manager's supported configuration reconciliation can restart only that
-existing idle worker with this environment; no new worker/slot, GitHub account,
-agent/model, concurrency, quota policy or research stage is added. Preserve all
-other configuration verbatim, including all nine disabled science workers. Do
-not interrupt an active task to apply this option. The activation must name the
-exact reviewed code revision. Prepare that immutable
-trusted Worker source release with its existing `state`, `checkouts` and `logs`
-directories symlinked to the same locations as the current installation; verify
-`Config.resolve("worker2")` resolves state/checkout/log paths to the same real
-directories. This preserves the instance lock, counters, claims and checkout across the supported
-restart. The exact private before/after configuration diff and baseline hash are
-prepared for review after the final code commit, with only these two environment
-entries added. This document does not perform an installation, change
-`workers.toml`, or authorize a task.
+Prepare the exact inactive diff and baseline hash first. Preserve worker1's external changes and all other fields, including disabled science workers. Use an immutable reviewed release with state/checkouts/logs linked to existing locations; verify resolved state, checkout, logs, store and caches remain identical. Validate configuration and reconcile only the existing idle worker through its supported manager after explicit human authorization. Never overwrite newer settings with an old whole-file proposal or interrupt paid work.
 
-Cost scope: at most one existing rebase attempt for this PR under worker2's
-normal model/quota/resource rules, with its existing default 90-minute round
-cap, required full source validation, and ordinary changed-head CI/math review.
-It can consume existing Codex subscription capacity; the observed quota was
-32% weekly usage and ahead of pace, with the existing `ignore_quota` policy
-unchanged. No dollar forecast, new paid worker or recurring service is proposed.
-A stalled/failed attempt is a reported blocker, not repair acceptance.
+Cost: at most one existing worker2 authoring attempt, using unchanged Codex/model/quota policy and default 90-minute cap, plus full source validation and ordinary fresh-head CI/review. No new paid worker, recurring service, dollar forecast or guaranteed repair. Cheap prelaunch reselection is not another paid task.
 
-Rollback: remove only the two added environment entries after the worker is
-idle and reconcile normally. Leave request comments, labels, counters, claims
-and source branches to their existing protocols. Do not reset a consumed
-attempt to manufacture proof.
+Rollback while idle removes only the repair target and restores the previously reviewed code path if needed, preserving later unrelated changes. Leave comments, labels, branches, claims, counters and the launch receipt intact. The old fixed-main239c question is obsolete and never enabled; it is replaced only by a reviewed concrete proposal with this explicit selection rule.

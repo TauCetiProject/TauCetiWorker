@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,6 +17,7 @@ from tauceti_worker.constants import TAUCETI
 from tauceti_worker.github import GitHub, GitHubError
 
 survey_mod = importlib.import_module("tauceti_worker.survey")
+round_mod = importlib.import_module("tauceti_worker.round")
 HEAD, BASE = "a" * 40, "b" * 40
 SCOPE = f"13940:{HEAD}:{BASE}:{BASE}"
 
@@ -235,12 +237,19 @@ def test_paid_launch_rechecks_scope_and_requires_a_real_claim():
         read=lambda k: count[k],
         write=lambda k, v: count.update({k: v}),
         incr=lambda k: count.update({k: count[k] + 1}),
+        foreign_repair_launched=lambda pr: False,
+        record_foreign_repair_launch=Mock(),
     )
     w = SimpleNamespace(
         gh=gh,
         counters=counters,
         rs=SimpleNamespace(bust=Mock()),
-        claims=SimpleNamespace(begin_branch_work=Mock(return_value=True), held=("branch/13940", "claims")),
+        claims=SimpleNamespace(
+            begin_branch_work=Mock(return_value=True),
+            held=("branch/13940", "claims"),
+            stop_heartbeat=Mock(),
+            release=Mock(),
+        ),
     )
     with patch.dict(os.environ, {route.ENV: SCOPE}), patch.object(work_units, "run_in_bubble", return_value=0) as agent:
         assert work_units._still_actionable("rebase", w, sv, c)
@@ -261,6 +270,8 @@ def test_paid_launch_rechecks_scope_and_requires_a_real_claim():
             assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) is None
             assert count[c.rebase_budget_key] == 0
             agent.assert_not_called()
+            w.claims.stop_heartbeat.assert_not_called()
+            w.claims.release.assert_not_called()
         w.claims.begin_branch_work.return_value = True
         w.claims.held = ("branch/13940", "claims")
         assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) == 0
@@ -284,7 +295,196 @@ def test_paid_launch_rechecks_scope_and_requires_a_real_claim():
         agent.assert_not_called()
 
 
+def test_current_at_launch_freezes_after_claim_and_survives_restart():
+    with tempfile.TemporaryDirectory() as directory:
+        live, comment, gh = fixture()
+        gh.open_prs = Mock(return_value=[raw_pr()])
+        original = gh.api_jq.side_effect
+        current = BASE
+
+        def read(path, jq):
+            if path.endswith("/git/ref/heads/main"):
+                return current
+            if "/compare/" in path:
+                return "ahead"
+            return original(path, jq)
+
+        gh.api_jq.side_effect = read
+        counters = survey_mod.Counters(SimpleNamespace(state=Path(directory)))
+        scope = f"13940:{HEAD}:{BASE}:{route.CURRENT}"
+        with patch.dict(os.environ, {route.ENV: scope}), patch.object(survey_mod, "me", return_value="maintainer"):
+            sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False, stages=["rebase"])
+            c = sv.rebaseable.actionable[0]
+            assert c.foreign_repair_base == BASE
+            current = "c" * 40
+            w = SimpleNamespace(gh=gh, counters=counters, rs=SimpleNamespace(bust=Mock()))
+            assert work_units._still_actionable("rebase", w, sv, c)
+
+            def claim(*args):
+                nonlocal current
+                current = "d" * 40
+                return True
+
+            w.claims = SimpleNamespace(begin_branch_work=claim, held=("branch/13940", "lease"))
+
+            def agent(*args, **kwargs):
+                nonlocal current
+                receipt = json.loads((Path(directory) / "rebase-foreign-launch-13940.json").read_text())
+                assert receipt == {"pr": 13940, "head": HEAD, "evidence_main": BASE, "integration_main": "d" * 40}
+                assert counters.read("rebase-pr-13940") == 1
+                assert "current-at-launch snapshot, now frozen" in args[2]
+                assert "Fetch exactly `" + "d" * 40 + "`" in args[2]
+                assert comment["body"] in args[2]
+                current = "e" * 40  # later promotion never retargets this prompt
+                return 1
+
+            with patch.object(work_units, "run_in_bubble", side_effect=agent) as launch:
+                assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) == 1
+                assert launch.call_count == 1
+                # Even an unstarted-preparation refund cannot erase the durable launch fence.
+                counters.write("rebase-pr-13940", 0)
+                w.counters = survey_mod.Counters(SimpleNamespace(state=Path(directory)))
+                assert work_units.do_rebase(w, sv, c, SimpleNamespace(agent_name="Codex"), True) is None
+                assert launch.call_count == 1
+                sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, w.counters, deep=False, stages=["rebase"])
+                assert not sv.rebaseable.actionable and sv.rebaseable.suppressed[0].attempts == 1
+
+
+def test_current_at_launch_keeps_all_authentication_and_post_claim_pause_guards():
+    scope = f"13940:{HEAD}:{BASE}:{route.CURRENT}"
+    with patch.dict(os.environ, {route.ENV: scope}):
+        for failure in ["ancestry", "permission", "request", "head", "unknown_main"]:
+            live, comment, gh = fixture()
+            original = gh.api_jq.side_effect
+            main = "c" * 40
+            if failure == "head":
+                live["head"]["sha"] = "f" * 40
+            if failure == "request":
+                gh.issue_comments.return_value = []
+
+            def read(path, jq, failure=failure, main=main, original=original):
+                if path.endswith("/git/ref/heads/main"):
+                    return "unknown" if failure == "unknown_main" else main
+                if "/compare/" in path:
+                    return "diverged" if failure == "ancestry" else "ahead"
+                if path == "repos/" + TAUCETI and failure == "permission":
+                    return "false"
+                return original(path, jq)
+
+            gh.api_jq.side_effect = read
+            assert not route.authorize(gh, 13940, HEAD, "feature", route.FORK), failure
+        with tempfile.TemporaryDirectory() as directory:
+            live, _, gh = fixture()
+            p = survey_mod.PRInfo.from_json(raw_pr())
+            c = survey_mod.Candidate(13940, HEAD, foreign_repair_base=BASE, rebase_budget_key="rebase-pr-13940")
+            counters = survey_mod.Counters(SimpleNamespace(state=Path(directory)))
+
+            def claim(*args):
+                live["labels"].append({"name": "keep"})
+                return True
+
+            w = SimpleNamespace(
+                gh=gh,
+                counters=counters,
+                claims=SimpleNamespace(
+                    begin_branch_work=claim, held=("branch/13940", "lease"), stop_heartbeat=Mock(), release=Mock()
+                ),
+            )
+            with patch.object(work_units, "run_in_bubble") as launch:
+                assert (
+                    work_units.do_rebase(w, SimpleNamespace(open_prs=[p]), c, SimpleNamespace(agent_name="Codex"), True)
+                    is None
+                )
+                launch.assert_not_called()
+                assert counters.read(c.rebase_budget_key) == 0
+                assert not counters.foreign_repair_launched(13940)
+                w.claims.stop_heartbeat.assert_called_once()
+                w.claims.release.assert_called_once()
+
+
+def test_declined_foreign_claim_lifecycle_before_next_candidate():
+    # Real claim/heartbeat lifecycle, stubbing only external claim commands and
+    # child creation. Both post-claim refusals must clean up before dispatch can
+    # acquire the next candidate's lease, and stale cleanup cannot release it.
+    for refusal in ["pause_after_claim", "scope_withdrawn_during_prompt", "claim_replaced_during_prompt"]:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {route.ENV: SCOPE}):
+            live, _, gh = fixture()
+            counters = survey_mod.Counters(SimpleNamespace(state=Path(directory)))
+            cleanups, events, children = [], [], []
+            claims = round_mod.Claims(SimpleNamespace(), SimpleNamespace(add_cleanup=cleanups.append))
+
+            def command(cmd, *, claims=claims, refusal=refusal, live=live, events=events, **kwargs):
+                operation, key = cmd[1:3]
+                assert kwargs["env"]["CLAIM_REPO"] == "test/claims"
+                if operation == "acquire":
+                    # A previous candidate must no longer own a lease/heartbeat.
+                    assert claims.held is None and claims._hb is None and claims._hb_wfd is None
+                    if key == "branch/13940" and refusal == "pause_after_claim":
+                        live["labels"].append({"name": "keep"})
+                else:
+                    assert operation == "release" and claims._hb is None and claims._hb_wfd is None
+                events.append((operation, key))
+                return SimpleNamespace(returncode=0)
+
+            def child(*args, events=events, children=children, **kwargs):
+                process = Mock()
+                process.terminate.side_effect = lambda: events.append(("stop", kwargs["env"]["TAUCETI_CLAIM_KEY"]))
+                children.append(process)
+                return process
+
+            def evidence(*args, refusal=refusal, claims=claims):
+                if refusal == "claim_replaced_during_prompt":
+                    claims.stop_heartbeat()
+                    claims.release()
+                    assert claims.begin_branch_work(13941, HEAD, "other", "other", "TauCeti")
+                if refusal != "pause_after_claim":
+                    os.environ.pop(route.ENV)
+                return ""
+
+            gh.rebase_request_body = Mock(side_effect=evidence)
+            w = SimpleNamespace(gh=gh, counters=counters, claims=claims)
+            p = survey_mod.PRInfo.from_json(raw_pr())
+            c = survey_mod.Candidate(13940, HEAD, foreign_repair_base=BASE, rebase_budget_key="rebase-pr-13940")
+            with (
+                patch.object(round_mod, "claims_repo", return_value="test/claims"),
+                patch.object(round_mod.subprocess, "run", side_effect=command),
+                patch.object(round_mod.subprocess, "Popen", side_effect=child),
+                patch.object(work_units, "run_in_bubble") as launch,
+            ):
+                assert (
+                    work_units.do_rebase(w, SimpleNamespace(open_prs=[p]), c, SimpleNamespace(agent_name="Codex"), True)
+                    is None
+                )
+                expected = [("acquire", "branch/13940"), ("stop", "branch/13940"), ("release", "branch/13940")]
+                if refusal == "claim_replaced_during_prompt":
+                    expected.append(("acquire", "branch/13941"))
+                else:
+                    assert claims.held is None and claims._hb is None and claims._hb_wfd is None
+                    assert "TAUCETI_CLAIM_KEY" not in os.environ and "TAUCETI_CLAIM_REPO" not in os.environ
+                assert events == expected
+                children[0].wait.assert_called_once_with(5)
+                launch.assert_not_called()
+                assert counters.read(c.rebase_budget_key) == 0 and not counters.foreign_repair_launched(13940)
+                if refusal != "claim_replaced_during_prompt":
+                    assert claims.begin_branch_work(13941, HEAD, "other", "other", "TauCeti")
+                assert claims.held == ("branch/13941", "test/claims")
+                assert claims._hb is children[1] and os.environ["TAUCETI_CLAIM_KEY"] == "branch/13941"
+                assert events[-1] == ("acquire", "branch/13941")
+                claims.stop_heartbeat()
+                claims.release()
+                # Round-end cleanup remains harmless after explicit cleanup.
+                for cleanup in reversed(cleanups):
+                    cleanup()
+                assert [event for event in events if event[0] == "release"] == [
+                    ("release", "branch/13940"),
+                    ("release", "branch/13941"),
+                ]
+
+
 if __name__ == "__main__":
+    test_current_at_launch_freezes_after_claim_and_survives_restart()
+    test_current_at_launch_keeps_all_authentication_and_post_claim_pause_guards()
+    test_declined_foreign_claim_lifecycle_before_next_candidate()
     test_default_off_and_exact_operator_scope()
     test_live_permission_pause_identity_and_movement_guards()
     test_only_authenticated_current_v3_source_request()
