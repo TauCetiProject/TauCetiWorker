@@ -1070,35 +1070,46 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
-    """Terminate downloader children on timeout or interruption (including round SIGTERM).
+    """Bind detached downloaders to the worker, including after parent SIGKILL.
 
-    SIGKILL cannot run Python cleanup; normal manager/round shutdown sends SIGTERM first.
+    The pipe guardian retains the snapshot lease and kills its process group if
+    the worker disappears. Ordinary timeout/interruption also tears down the group.
     """
     from .shared_mathlib import lease_fds
 
-    proc = subprocess.Popen(
-        command,
-        pass_fds=lease_fds(env),
-        cwd=cwd,
-        env=env,
-        stdout=output,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    reader, writer = os.pipe()
     try:
-        return proc.wait(timeout=timeout)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command],
+            pass_fds=(reader, *lease_fds(env)),
+            cwd=cwd,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        finally:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+        os.close(writer)
         raise
+    finally:
+        os.close(reader)
+    try:
+        try:
+            return proc.wait(timeout=timeout)
+        except BaseException:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            raise
+    finally:
+        os.close(writer)
 
 
 def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:

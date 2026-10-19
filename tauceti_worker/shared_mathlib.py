@@ -426,6 +426,7 @@ def view(cwd, env, logdir, fetch):
             key, spec = signature(cwd, env)
             report(pool, env, mode="preparing", key=key)
             lease = stack.enter_context(key_lock(pool, key, exclusive=False))
+            env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = str(lease.fileno())
             entry = pool / "entries" / key
             hit = read_json(entry / "ready.json").get("key") == key and (entry / "build").is_dir()
             if hit:
@@ -481,6 +482,9 @@ def view(cwd, env, logdir, fetch):
             else:
                 detach_upper(upper, marker)
             report(pool, env, mode="private", reason=str(error), preparation_seconds=time.monotonic() - started)
+            stack.close()
+            env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
+            env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []

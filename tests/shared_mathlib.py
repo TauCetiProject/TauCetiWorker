@@ -1,6 +1,7 @@
 """Fresh-source publication, leases, fallback and real rootless copy-on-write tests."""
 
 import concurrent.futures
+import contextlib
 import json
 import os
 import shutil
@@ -311,6 +312,52 @@ class SharedTests(unittest.TestCase):
             self.assertEqual(prefix, [])
             self.assertEqual(list(upper.iterdir()), [])
             self.assertTrue((upper.with_name("build-shared-delta") / "lib/lean/Mathlib.olean").exists())
+
+    def test_auto_fallback_releases_snapshot_lock_before_private_round(self):
+        self.require_overlay()
+        key, _ = s.signature(self.cwd, self.env)
+        with patch.object(s, "publish", side_effect=s.Unavailable("download interrupted")):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                with s.key_lock(self.pool, key, nonblocking=True):
+                    pass
+                self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", self.env)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
+    def test_killed_cache_parent_terminates_detached_downloader_group(self):
+        pidfile = self.root / "downloader.pid"
+        childcode = 'import os,time,sys; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(100)'
+        parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1]],Path.cwd(),dict(os.environ),f,100)'
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parentcode, str(pidfile), str(self.root / "cache.log"), childcode]
+        )
+        pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(pidfile.exists())
+            pid = int(pidfile.read_text())
+            parent.kill()
+            parent.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                except FileNotFoundError:
+                    break
+                if state == "Z":
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("detached cache downloader survived its killed parent")
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait()
+            if pid:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, 9)
 
     def test_gc_reclaims_killed_builder_staging_and_skips_live_builder(self):
         key = "a" * 64
