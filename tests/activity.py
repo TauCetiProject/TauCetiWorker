@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -40,6 +41,28 @@ class ActivityTests(unittest.TestCase):
         rid = rid or str(age)
         with patch.object(a.time, "time", return_value=self.now - age):
             a.emit("round_finished", key=rid, round_id=rid, round_type=kind, outcome=outcome)
+
+    def test_table_aligns_all_rows_and_lists_zero_count_work_types(self):
+        self.finish(10, kind="fix")
+        self.finish(20, kind="unknown", outcome="unknown")
+        a.prepare(now=self.now)
+        value = a.cached()
+        self.assertEqual(value["summary"]["round_types"], list(a.ROUND_TYPES))
+        value["summary"]["rounds"]["total"]["fix"]["finished"] = 12345678
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(value)
+        lines = output.getvalue().splitlines()
+        header = next(line for line in lines if line.startswith("Finished rounds"))
+        expected_ends = [header.index(h) + len(h) for h in ("3h", "24h", "7d", "Recorded total")]
+        data_rows = [line for line in lines if re.search(r"\d+\s+\d+\s+\d+\s+\d+$", line)]
+        for line in data_rows:
+            self.assertEqual([m.end() for m in re.finditer(r"\d+", line)], expected_ends, line)
+        for kind in ("roadmap", "review", "fix-ci", "progress", "security-audit", "no-work"):
+            line = next(line for line in data_rows if line.strip().startswith(kind + " "))
+            self.assertEqual(re.findall(r"\d+", line), ["0"] * 4)
+        self.assertTrue(any("type unrecorded" in line for line in data_rows))
+        self.assertIn("Older resource logs did not record round types or outcomes", output.getvalue())
+        self.assertIn("Outcome rows are subsets", output.getvalue())
 
     def test_windows_total_failures_and_idempotent_replays(self):
         for age in (10, 10800, 10801, 86400, 86401, 604800, 604801):
