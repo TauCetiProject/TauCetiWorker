@@ -1,5 +1,14 @@
 # Shared GitHub state
 
+Reporting clients can use authenticated `POST /v1/activity` with
+`{"repository":"TauCetiProject/TauCeti","numbers":[1,2]}` (maximum 500 numbers).
+It returns stored PR headers, original observation timestamps and missing IDs.
+This route is observation-only: no repository configuration, demand renewal,
+repair jobs, upstream validation or installation-scheduler access. Closed PRs
+without cached merge evidence have no landing timestamp. See
+[activity reporting](../../docs/activity.md); reporting clients must retain stale
+data or unknowns when unavailable, without direct GitHub fallback.
+
 The Cloudflare service receives GitHub webhooks and serves repository state to
 TauCeti clients. Production and test each use a separate private, read-only
 GitHub App installation on `TauCetiProject/TauCeti`. The service owns those read

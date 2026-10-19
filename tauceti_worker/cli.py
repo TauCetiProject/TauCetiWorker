@@ -565,6 +565,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_github_account_flag(p)
     sub = p.add_subparsers(dest="cmd")
+    activity = sub.add_parser("activity", help="read prepared local activity; never query GitHub")
+    activity.add_argument("action", nargs="?", choices=("show", "refresh", "install-timer"), default="show")
+    scope = activity.add_mutually_exclusive_group()
+    scope.add_argument("--worker")
+    scope.add_argument("--group", help="fleet machine ID, or local")
+    activity.add_argument("--config", type=Path, help="worker configuration for observation-server credentials")
+    activity.add_argument("--backfill", action="store_true", help="refresh: import existing structured history")
+    activity.add_argument(
+        "--history-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="refresh --backfill: also import logs from this earlier installation",
+    )
+    activity.add_argument("--json", action="store_true")
+    activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")
 
     w = sub.add_parser(
         "work",
@@ -834,6 +850,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cmd = args.cmd
+    if cmd == "activity":
+        from .activity import command
+
+        return command(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size
@@ -868,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
         raise Die(f"TAUCETI_MAX_OPEN_PRS {error}") from None
 
     if cmd == "_fleet-protocol":
-        print(json.dumps({"version": 1, "admission": True, "events": True}))
+        print(json.dumps({"version": 1, "admission": True, "events": True, "activity": 1}))
         return 0
     if cmd == "budget":
         try:
@@ -1253,6 +1273,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # means moving $HOME; on macOS $HOME deliberately stays put and $CLAUDE_CONFIG_DIR/$CODEX_HOME carry
     # the isolation instead (see isolate_home). Either way it is a no-op once already isolated, so loop
     # children that inherit the environment don't re-isolate.
+    from .activity import pin_root
+
+    pin_root()
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
     cfg = Config.resolve(wid)
@@ -1270,7 +1293,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     ignore_quota = getattr(args, "ignore_quota", False)
     quota_cmd = getattr(args, "quota_cmd", None)
 
-    with RoundContext(cfg) as ctx:  # one round per worker; cleanup + SIGTERM/SIGINT handling
+    with RoundContext(cfg, record_activity=not dry) as ctx:  # one round per worker; cleanup + signals
         # Lifecycle test hooks (no GitHub, no model, no mutation) — exercise lock / fd-leak / timeout.
         hb = os.environ.get("TAUCETI_TEST_HEARTBEAT")
         if hb:
@@ -1331,7 +1354,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         raise_on_account_mismatch(cfg, opts.account, opts.work_model, "account")
         if not dry:
             preflight(cfg, opts)
-        return run_round(w, opts)  # NoProgress/Die propagate to main()'s handler
+        result = run_round(w, opts)  # NoProgress/Die propagate to main()'s handler
+        if ctx.activity:
+            ctx.activity.rc = result
+        return result
 
 
 def cmd_egress_probe(args) -> int:

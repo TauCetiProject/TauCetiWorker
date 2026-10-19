@@ -11,6 +11,14 @@ from pathlib import Path
 
 
 def emit(kind, *, key=None, **fields):
+    if __package__:
+        from .activity import emit as activity_emit
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tauceti_worker.activity import emit as activity_emit
+
+    safe = {k: v for k, v in fields.items() if k in {"repository", "pr", "head_sha", "activity"}}
+    activity_emit(kind, key=("pr:" + key if key and kind == "pr_created" else None), **safe)
     path = os.environ.get("TAUCETI_FLEET_EVENTS")
     machine = os.environ.get("TAUCETI_FLEET_MACHINE_ID")
     if not path or not machine:

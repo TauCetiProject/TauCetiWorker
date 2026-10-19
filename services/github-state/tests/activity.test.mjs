@@ -1,0 +1,48 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {build} from 'esbuild';
+const bundle=await build({entryPoints:['src/repository.ts'],bundle:true,platform:'node',format:'esm',write:false,plugins:[{
+ name:'fixture',setup(b){b.onResolve({filter:/^cloudflare:workers$/},()=>({path:'context',namespace:'fixture'}));b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export class DurableObject {constructor(ctx,env){this.ctx=ctx;this.env=env}}',loader:'js'}));}
+}]});
+const {RepositoryState}=await import('data:text/javascript;base64,'+Buffer.from(bundle.outputFiles[0].text).toString('base64'));
+function fixture(){
+ const db=new DatabaseSync(':memory:');
+ const forbidden=()=>{throw new Error('Reporting attempted upstream/scheduler access');};
+ const ctx={storage:{sql:{exec(sql,...bindings){let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};}},getAlarm:forbidden,setAlarm:forbidden}};
+ const state=new RepositoryState(ctx,{INSTALLATIONS:new Proxy({},{get:forbidden}),ARCHIVE:{get:forbidden}});
+ for(const name of ['configure','noteDemand','enqueue','query','runAttempt'])state[name]=forbidden;
+ return {db,state};
+}
+const query=(state,numbers)=>state.fetch(new Request('https://internal/activity',{method:'POST',body:JSON.stringify({repository:'org/repo',numbers})}));
+test('reporting missing/never-configured resources creates no demand, jobs, alarms or upstream calls',async()=>{
+ const {db,state}=fixture();try{
+  for(let i=0;i<3;i++){
+   const result=await (await query(state,[7,8])).json();
+   assert.deepEqual(result.missing,[7,8]);assert.deepEqual(result.prs,[]);assert.equal(result.coverage,'observed');
+  }
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM demand').get().n,0);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jobs').get().n,0);
+  assert.equal(state.meta('repository'),undefined);
+ }finally{db.close();}
+});
+test('stale cached closed/merged PRs remain readable without reactivating polling',async()=>{
+ const {db,state}=fixture();try{
+  const at=Date.now()-7*86400000;
+  for(const p of [{number:7,state:'CLOSED',headRefOid:'head'},{number:8,state:'MERGED',mergedAt:'2026-10-18T00:00:00Z'}])
+   db.prepare('INSERT INTO resources VALUES (?,?,?,?,?,?,?,0)').run('pr',String(p.number),'',JSON.stringify(p),'',at,1);
+  const result=await (await query(state,[7,8,9])).json();
+  assert.deepEqual(result.missing,[9]);assert.equal(result.prs[0].observed_at,at);
+  assert.equal(result.prs[0].landed_at,null,'closed does not mean landed');
+  assert.equal(result.prs[1].landed_at,'2026-10-18T00:00:00Z');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM demand').get().n,0);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jobs').get().n,0);
+ }finally{db.close();}
+});
+test('unavailable stored resource fails without falling back to upstream repair',async()=>{
+ const {db,state}=fixture();try{
+  db.prepare('INSERT INTO resources VALUES (?,?,?,?,?,?,?,0)').run('pr','7','',JSON.stringify({$r2:'missing'}),'',Date.now(),1);
+  assert.equal((await query(state,[7])).status,500);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jobs').get().n,0);
+ }finally{db.close();}
+});

@@ -51,6 +51,18 @@ export default {
         }
         return json({accepted:true},202);
       }
+      // Reporting never enters query(), noteDemand(), configure(), or the scheduler.
+      if (url.pathname==='/v1/activity' && req.method==='POST') {
+        if (!await authorize(req,env)) return json({error:'unauthorized'},401);
+        if (Number(req.headers.get('content-length') || 0)>16384) return json({error:'payload_too_large'},413);
+        const text=await req.text();if(text.length>16384)return json({error:'payload_too_large'},413);
+        let input:any;try {input=JSON.parse(text);}catch{return json({error:'invalid_json'},400);}
+        if(!input || typeof input!=='object' || Array.isArray(input))return json({error:'invalid_request'},400);
+        const repo=repository(env,input.repository);
+        if (!repo || !await authorize(req,env,repo.name)) return json({error:'repository_unavailable'},403);
+        if (!Array.isArray(input.numbers) || input.numbers.length>500 || input.numbers.some((n:any)=>!Number.isSafeInteger(n) || n<=0)) return json({error:'invalid_numbers'},400);
+        return stub(env.REPOSITORIES,repo.id).fetch('https://internal/activity',{method:'POST',body:JSON.stringify({repository:repo.name,numbers:[...new Set(input.numbers)]})});
+      }
       if (url.pathname==='/v1/query' && req.method==='GET') {
         let args; try { args=JSON.parse(url.searchParams.get('args') || '{}'); } catch { return json({error:'invalid_args'},400); }
         if (url.searchParams.has('allow_observed') && !['true','false'].includes(url.searchParams.get('allow_observed')!)) return json({error:'invalid_query'},400);

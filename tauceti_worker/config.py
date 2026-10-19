@@ -186,6 +186,8 @@ class Config:
         os.environ.setdefault("LAKE_ARTIFACT_CACHE", "1")
         os.environ.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         h = home or Path(os.environ.get("HOME", os.path.expanduser("~")))
+        # Export before worker HOME isolation so every local worker shares receipts.
+        os.environ.setdefault("TAUCETI_ACTIVITY_DIR", str(h / ".local/state/tauceti/activity"))
         # Two different homes, and conflating them is what made the macOS isolation change risky.
         # `home` answers "whose credentials?" and must follow the login user, because the macOS
         # Keychain, gh and git are per-login-user stores. `data_home` answers "whose working data?"

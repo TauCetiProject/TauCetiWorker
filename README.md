@@ -1,5 +1,9 @@
 # Tau Ceti Worker
 
+Cached round counts and authored/open/landed PR reporting are available with
+`tauceti activity`; see [prepared activity reports](docs/activity.md). Status reads
+prepared files only, and background reporting adds no GitHub API requests.
+
 `tauceti` keeps the [TauCeti](https://github.com/TauCetiProject/TauCeti) Lean
 library moving, using a "bring your own agent" approach. Run it with no command
 and you get a dashboard of the work the queue needs right now: PRs to review,

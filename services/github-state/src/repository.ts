@@ -886,6 +886,20 @@ export class RepositoryState extends DurableObject<Env> {
         // still be referenced by yesterday's seven-day archive.
         return json({retained:Date.now()-retired<8*86400000});
       }
+      if (path==='/activity') {
+        const input:any=await req.json();
+        const prs=[],missing=[];
+        // Deliberately no configure, demand, collection verification, or repair.
+        for (const number of input.numbers) {
+          const row=this.ctx.storage.sql.exec<any>("SELECT data,observed FROM resources WHERE kind='pr' AND id=? AND tombstone=0",String(number)).toArray()[0];
+          if(!row){missing.push(number);continue;}
+          const p=await this.decode(row.data);
+          prs.push({number,state:p.state,created_at:p.createdAt || null,landed_at:p.mergedAt || null,
+            head_sha:p.headRefOid || null,observed_at:row.observed,
+            landing_source:p.mergedAt?'github-merged':null});
+        }
+        return json({version:1,repository:input.repository,revision:this.revision(),as_of:Date.now(),coverage:'observed',prs,missing});
+      }
       if (path==='/query') {
         const q=await req.json() as Query;
         validateQuery(q);
