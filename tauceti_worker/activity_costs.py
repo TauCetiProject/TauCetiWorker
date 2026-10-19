@@ -125,6 +125,7 @@ def summarize(db, now, cutoff, column=None, identity=None):
             covered_seconds=covered,
             worker_seconds=worker_seconds,
             usd_per_hour=hourly_rate(spent, covered),
+            usd_per_worker_hour=hourly_rate(spent, worker_seconds),
         )
     return dict(
         windows=windows, spending=spending, funding=funding, prepared_at=funding.get("prepared_at") if funding else None

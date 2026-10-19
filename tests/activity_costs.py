@@ -143,6 +143,8 @@ class CostTests(unittest.TestCase):
     def test_hourly_spending_uses_settlements_in_each_window_and_excludes_reservations(self):
         self.session("recent", 3600, "author", "12", settled=True)
         self.write_ledger()
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE rounds SET started=finished-1800 WHERE id='reviewer'")
         s = self.summary()
         rows = s["costs"]["spending"]
         self.assertEqual(set(rows), {"3h", "24h", "7d", "total"})
@@ -155,6 +157,10 @@ class CostTests(unittest.TestCase):
             self.assertEqual(Decimal(rows[window]["spent_usd"]), spent)
             self.assertEqual(rows[window]["covered_seconds"], seconds)
             self.assertEqual(Decimal(rows[window]["usd_per_hour"]), Decimal(spent) * 3600 / seconds)
+            self.assertEqual(
+                Decimal(rows[window]["usd_per_worker_hour"]),
+                Decimal(spent) * 3600 / Decimal(str(rows[window]["worker_seconds"])),
+            )
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
         self.assertIn("Spending (completed sessions)", output.getvalue())
@@ -196,6 +202,11 @@ class CostTests(unittest.TestCase):
         self.assertEqual(rows["3h"]["worker_seconds"], 6000)
         self.assertEqual(rows["24h"]["worker_seconds"], 9600)
         self.assertEqual(rows["total"]["worker_seconds"], 9600)
+        self.assertEqual(Decimal(rows["total"]["usd_per_worker_hour"]), Decimal(60) * 3600 / 9600)
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM rounds")
+            rows = activity_costs.summarize(db, self.now, self.now - 10 * DAY, "scope", "machine")["spending"]
+            self.assertTrue(all(row["usd_per_worker_hour"] is None for row in rows.values()))
 
     def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
         s = self.summary()
@@ -206,6 +217,10 @@ class CostTests(unittest.TestCase):
         combined = activity_summary.combine(values)["summary"]["costs"]["spending"]
         self.assertEqual(Decimal(combined["3h"]["usd_per_hour"]), 10)
         self.assertEqual(combined["3h"]["worker_seconds"], s["costs"]["spending"]["3h"]["worker_seconds"] + 7200)
+        self.assertEqual(
+            Decimal(combined["3h"]["usd_per_worker_hour"]),
+            Decimal(30) * 3600 / Decimal(str(combined["3h"]["worker_seconds"])),
+        )
         self.assertEqual(Decimal(combined["total"]["usd_per_hour"]), Decimal(90) * 3600 / (10 * DAY + 1))
         # Missing/older hosts cannot silently turn unavailable spending into zero.
         other["costs"].pop("spending")

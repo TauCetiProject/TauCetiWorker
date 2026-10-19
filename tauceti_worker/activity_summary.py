@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 WINDOWS = ("3h", "24h", "7d", "total")
-COST_WINDOWS = ("total", "7d")
+COST_WINDOWS = ("7d", "total")
 
 
 def amount(value, *, rate=False):
@@ -120,7 +120,6 @@ def display(value, default_kinds=()):
         spending = costs["spending"]
         hours = [spending[w].get("worker_seconds") for w in WINDOWS]
         spending_rows = [
-            ("API spend ($/elapsed hour)", [amount(spending[w].get("usd_per_hour")) for w in WINDOWS]),
             (
                 "Worker-hours recorded",
                 [
@@ -128,6 +127,14 @@ def display(value, default_kinds=()):
                     for seconds in hours
                 ],
             ),
+            (
+                "API spend ($/worker-hour)",
+                [
+                    amount(spending[w].get("usd_per_worker_hour", hourly_rate(spending[w].get("spent_usd"), hours[i])))
+                    for i, w in enumerate(WINDOWS)
+                ],
+            ),
+            ("API spend ($/elapsed hour)", [amount(spending[w].get("usd_per_hour")) for w in WINDOWS]),
         ]
     cost_rows = []
     if costs.get("windows"):
@@ -178,7 +185,7 @@ def display(value, default_kinds=()):
         len("Spending (completed sessions)"),
         *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *spending_rows]),
     )
-    headers = ("3h", "24h", "7d", "Recorded total")
+    headers = ("3h", "24h", "7d", "All time")
     widths = [
         max(len(h), *(len(str(values[i])) for _, values in [*rounds, *prs, *ci_rows, *spending_rows]))
         for i, h in enumerate(headers)
@@ -200,7 +207,7 @@ def display(value, default_kinds=()):
     if spending_rows:
         table("Spending (completed sessions)", ("3h", "24h", "7d", "All time"), spending_rows, widths)
     if cost_rows:
-        table("Costs / initiated PR output", ("All time", "7 days"), cost_rows)
+        table("Costs / initiated PR output", ("7 days", "All time"), cost_rows)
         if any(windows[w].get("loc_estimated") for w in COST_WINDOWS):
             print("~ Missing LOC estimated from measured PRs; zero if none measured. Unknown PR states count as zero.")
     funding = costs.get("funding")
@@ -212,7 +219,8 @@ def display(value, default_kinds=()):
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
     print()
-    current = f"Currently: {s['running'] if s['running'] is not None else 'unknown'} rounds running; {s['open_prs']} open authored PRs"
+    count = s["running"] if s["running"] is not None else "unknown"
+    current = f"Currently: {count} {'worker' if count == 1 else 'workers'} working; {s['open_prs']} open authored PRs"
     if s["unknown_prs"]:
         current += f"; {s['unknown_prs']} PR states pending"
     if s.get("unknown_landings"):
@@ -304,6 +312,7 @@ def combine(values):
                 covered_seconds=covered,
                 worker_seconds=worker_seconds,
                 usd_per_hour=hourly_rate(spent, covered),
+                usd_per_worker_hour=hourly_rate(spent, worker_seconds),
             )
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):

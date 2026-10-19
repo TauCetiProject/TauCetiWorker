@@ -11,14 +11,17 @@ tauceti activity --group FLEET_MACHINE_ID
 ```
 
 Finished rounds use their finish receipt in trailing 3-hour, 24-hour, and 7-day
-windows and a recorded-total column. The type is the final selected work unit,
+windows and an All time column. The type is the final selected work unit,
 such as `roadmap`, `review`, `fix`, or `security-audit`; fallback candidates are
 not additional rounds. All supported round types appear even when their counts
 are zero; the prepared summary publishes the worker taxonomy for other consumers.
 No-work surveys have their own row. Admission/GitHub
 waiting attempts and dry runs are excluded. Failed/interrupted rounds are
 included, with a failure subset (including timeouts). Running rounds and
-processes interrupted without a finish receipt are separate. Discovery of an
+processes interrupted without a finish receipt are separate. The current
+"workers working" count is distinct workers with an active work round, excluding
+workers waiting for capacity or budget; it can lag until the next preparation.
+Discovery of an
 interruption never supplies a fabricated finish time.
 
 PR authorship comes from successful tracked creation, not the entire GitHub
@@ -41,14 +44,17 @@ new installation is not diluted by hours before recording began. `Worker-hours
 recorded` adds time across completed and currently running native rounds, clipped
 to each window. Capacity/budget/quota waiting and interruptions without a known
 end do not inflate it. Failed rounds with recorded durations still count. The
-spending rate remains dollars per elapsed hour, not dollars per worker-hour.
+report shows worker-hours first, then API dollars per worker-hour (completed
+spending divided by worker-hours) and API dollars per elapsed hour. Active-session
+cost reservations do not enter either spending rate. Zero recorded worker-hours
+leave the worker-hour rate unavailable.
 Fleet averages pool spending over the longest recorded
 duration covered by their host summaries; parallel machines do not add elapsed
 wall-clock hours. Missing spending data leaves the fleet rate unavailable.
 Preparation reuses the existing local budget cache and collector, with no extra
 tasks or GitHub requests.
 
-Cost estimates have **All time** and **7 days** columns. They pool every
+Cost estimates have **7 days** and **All time** columns. They pool every
 conversation in the reported worker/machine scope, including reviews and fixes
 on PRs initiated elsewhere. Completed sessions use their reconciled budget
 receipts at the original settlement time; ongoing sessions use the budget's

@@ -54,7 +54,7 @@ class ActivityTests(unittest.TestCase):
             a.display(value)
         lines = output.getvalue().splitlines()
         header = next(line for line in lines if line.startswith("Finished rounds"))
-        expected_ends = [header.index(h) + len(h) for h in ("3h", "24h", "7d", "Recorded total")]
+        expected_ends = [header.index(h) + len(h) for h in ("3h", "24h", "7d", "All time")]
         data_rows = [line for line in lines if re.search(r"\d+\s+\d+\s+\d+\s+\d+$", line)]
         for line in data_rows:
             self.assertEqual([m.end() for m in re.finditer(r"\d+", line)], expected_ends, line)
@@ -67,6 +67,20 @@ class ActivityTests(unittest.TestCase):
         self.assertNotIn("Outcome rows are subsets", output.getvalue())
         pr_start = next(i for i, line in enumerate(lines) if line.startswith("PRs authored"))
         self.assertEqual(lines[pr_start - 1], "")
+
+    def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            for key, worker in (("one", "w1"), ("duplicate", "w1"), ("two", "w2")):
+                db.execute(
+                    "INSERT INTO rounds(id,worker,scope,kind,started) VALUES (?,?,?,'fix',?)",
+                    (key, worker, "machine", self.now - 5),
+                )
+            summary = a._summary(db, self.now, "scope", "machine")
+        self.assertEqual(summary["running"], 2)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(dict(available=True, summary=summary))
+        self.assertIn("Currently: 2 workers working;", output.getvalue())
 
     def test_windows_total_failures_and_idempotent_replays(self):
         for age in (10, 10800, 10801, 86400, 86401, 604800, 604801):
@@ -149,7 +163,7 @@ class ActivityTests(unittest.TestCase):
         ):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 a.display(a.cached())
-            self.assertIn("Recorded", output.getvalue())
+        self.assertIn("All time", output.getvalue())
 
     def test_bors_requires_exact_head_and_verified_main_landing(self):
         a.emit("pr_created", repository="org/repo", pr=7)
