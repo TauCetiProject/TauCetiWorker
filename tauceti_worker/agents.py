@@ -1059,7 +1059,14 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
                 try:
-                    warm_host_build_caches(cwd, env, logdir)
+                    try:
+                        warm_host_build_caches(cwd, env, logdir)
+                    except Exception as error:
+                        if prefix:
+                            shared_mathlib.preparation_status(env, error=error)
+                        raise
+                    if prefix:
+                        shared_mathlib.preparation_status(env)
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)

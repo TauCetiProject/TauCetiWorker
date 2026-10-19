@@ -39,6 +39,11 @@ class SharedTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.gitconfig = self.root / "gitconfig"
+        self.gitconfig.write_text("")
+        git_env = patch.dict(os.environ, GIT_CONFIG_GLOBAL=str(self.gitconfig), GIT_CONFIG_NOSYSTEM="1")
+        git_env.start()
+        self.addCleanup(git_env.stop)
         self.cwd = self.root / "checkout"
         self.mathlib = self.cwd / ".lake/packages/mathlib"
         repository(
@@ -122,9 +127,47 @@ class SharedTests(unittest.TestCase):
         git(self.mathlib, "remote", "add", "origin", url)
         target = self.root / "fresh-mathlib"
         s.clone(self.mathlib, target, self.rev)
-        self.assertEqual(git(target, "remote", "get-url", "origin"), url)
+        self.assertEqual(git(target, "remote", "get-url", "origin"), git(self.mathlib, "remote", "get-url", "origin"))
         self.assertEqual(git(target, "remote", "get-url", "--push", "origin"), "no_push")
         self.assertEqual(git(target, "rev-parse", "HEAD"), self.rev)
+
+    def test_clone_preserves_tracking_remote_and_named_branch(self):
+        git(self.mathlib, "remote", "add", "origin", "https://github.com/user/mathlib4.git")
+        git(self.mathlib, "remote", "add", "upstream", "https://github.com/TauCetiProject/mathlib4.git")
+        branch = git(self.mathlib, "rev-parse", "--abbrev-ref", "HEAD")
+        git(self.mathlib, "config", f"branch.{branch}.remote", "upstream")
+        target = self.root / "fresh"
+        s.clone(self.mathlib, target, self.rev)
+        self.assertEqual(s.cache_identity(s.cache_context(target)), s.cache_identity(s.cache_context(self.mathlib)))
+        self.assertEqual(git(target, "remote", "get-url", "--push", "upstream"), "no_push")
+
+    def test_clone_does_not_apply_global_url_rewrites_twice(self):
+        self.gitconfig.write_text(
+            '[url "https://mirror.invalid/"]\n insteadOf = https://github.com/\n[url "https://second.invalid/"]\n insteadOf = https://mirror.invalid/\n'
+        )
+        url = "https://github.com/TauCetiProject/mathlib4.git"
+        git(self.mathlib, "remote", "add", "origin", url)
+        target = self.root / "fresh"
+        s.clone(self.mathlib, target, self.rev)
+        self.assertEqual(git(target, "config", "--get", "remote.origin.url"), url)
+        self.assertEqual(git(target, "remote", "get-url", "origin"), git(self.mathlib, "remote", "get-url", "origin"))
+
+    def test_cache_identity_changes_key_without_persisting_git_credentials(self):
+        key, _ = s.signature(self.cwd, self.env)
+        git(self.mathlib, "remote", "add", "origin", "https://secret-fixture@github.com/owner/mathlib4.git")
+        changed, spec = s.signature(self.cwd, self.env)
+        self.assertNotEqual(key, changed)
+        self.assertNotIn("secret-fixture", json.dumps(spec))
+        git(self.mathlib, "remote", "set-url", "origin", "https://github.com/other/mathlib4.git")
+        self.assertNotEqual(changed, s.signature(self.cwd, self.env)[0])
+
+    def test_clone_preserves_detached_nightly_tag_context(self):
+        git(self.mathlib, "checkout", "--detach", "--quiet", self.rev)
+        git(self.mathlib, "tag", "nightly-testing-fixture")
+        target = self.root / "fresh"
+        s.clone(self.mathlib, target, self.rev)
+        self.assertEqual(s.cache_identity(s.cache_context(target)), s.cache_identity(s.cache_context(self.mathlib)))
+        self.assertEqual(git(target, "remote"), "")
 
     def test_publish_from_fresh_sources_and_reuse_without_agent_outputs(self):
         poison = self.mathlib / ".lake/build/poison"
@@ -399,6 +442,31 @@ class SharedTests(unittest.TestCase):
                 cancel_event=threading.Event(),
             )
             self.assertEqual(rc, 0)
+
+    def test_pid_namespace_proc_matches_process_and_toolchain_lookup(self):
+        self.require_overlay()
+        lower, upper, work = (self.root / name for name in ("lower", "upper", "work"))
+        for path in (lower, upper, work):
+            path.mkdir()
+        code = 'import os,pathlib; assert int(pathlib.Path("/proc/self/stat").read_text().split()[0])==os.getpid(); assert pathlib.Path("/proc",str(os.getpid()),"exe").exists()'
+        result = subprocess.run(
+            s.overlay_command(lower, upper, work, upper, lower) + [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_preparation_telemetry_does_not_claim_readiness_before_warmers_pass(self):
+        self.require_overlay()
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+            self.assertEqual(s.summary(self.env)["shared"], 0)
+            self.assertEqual(s.summary(self.env)["preparing"], 1)
+            s.preparation_status(self.env, error="Lake installation unavailable")
+            self.assertEqual(s.summary(self.env)["blocked"], 1)
+            self.assertIn("Lake installation unavailable", s.summary(self.env)["reasons"])
+            s.preparation_status(self.env)
+            self.assertEqual(s.summary(self.env)["shared"], 1)
 
     def test_two_real_readers_share_physical_mmap_pages(self):
         self.require_overlay()

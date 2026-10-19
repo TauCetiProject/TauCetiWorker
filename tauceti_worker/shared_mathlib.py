@@ -57,14 +57,14 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
         "bwrap",
         "--die-with-parent",
         "--unshare-pid",
-        "--proc",
-        "/proc",
         "--bind",
         "/",
         "/",
         "--dev-bind",
         "/dev",
         "/dev",
+        "--proc",
+        "/proc",
         "--ro-bind",
         str(pool),
         str(pool),
@@ -121,6 +121,43 @@ def git(path, *args):
     return p.stdout.strip()
 
 
+def optional_git(path, *args):
+    result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def cache_context(path):
+    """Git metadata used by Mathlib's cache selector; URLs stay private in memory."""
+    branch = git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    tracking = optional_git(path, "config", "--get", f"branch.{branch}.remote")
+    selected = tracking or "origin"
+    names = sorted({"origin", selected})
+    raw = {name: optional_git(path, "config", "--get", f"remote.{name}.url") for name in names}
+    resolved = {name: optional_git(path, "remote", "get-url", name) for name in names}
+    return dict(
+        branch=branch,
+        tracking=tracking,
+        selected=selected,
+        raw_urls={name: url for name, url in raw.items() if url},
+        resolved_urls=resolved,
+        tag=git(path, "name-rev", "--tags", "HEAD") if branch == "HEAD" else None,
+    )
+
+
+def cache_identity(context):
+    # Bind the key to the repository scope without persisting credentials that
+    # an operator may have embedded in a Git URL.
+    return dict(
+        branch=context["branch"],
+        selected=context["selected"],
+        tag=context["tag"],
+        remotes={
+            name: hashlib.sha256(url.encode()).hexdigest() if url else None
+            for name, url in context["resolved_urls"].items()
+        },
+    )
+
+
 def signature(cwd, env):
     # Loading Lake synchronizes pinned dependency checkouts without compiling
     # Mathlib. Do this before deciding the key, so a manifest bump can hit a
@@ -135,7 +172,7 @@ def signature(cwd, env):
     mathlib = cwd / ".lake/packages/mathlib"
     if not mathlib.is_dir():
         raise Unavailable("Mathlib dependency is not checked out yet")
-    dependencies = {}
+    dependencies, cache_contexts = {}, {}
     for package in packages:
         name = package.get("name")
         if not isinstance(name, str) or not name or Path(name).name != name or package.get("type") != "git":
@@ -145,6 +182,7 @@ def signature(cwd, env):
         if revision != package.get("rev") or git(source, "status", "--porcelain", "--untracked-files=normal"):
             raise Unavailable(f"dependency {name} differs from its pinned revision; using private builds")
         dependencies[name] = revision
+        cache_contexts[name] = cache_identity(cache_context(source))
     if "mathlib" not in dependencies:
         raise Unavailable("manifest has no pinned Mathlib dependency")
     toolchain = (cwd / "lean-toolchain").read_text().strip()
@@ -172,6 +210,7 @@ def signature(cwd, env):
         artifacts=artifacts,
         mathlib=dependencies["mathlib"],
         dependencies=dependencies,
+        cache_contexts=cache_contexts,
         config=config,
         mathlib_manifest=(mathlib / "lake-manifest.json").read_text(),
         toolchain=toolchain,
@@ -280,23 +319,28 @@ def collect(pool, *, protect=(), now=None):
 
 
 def clone(source, target, revision):
+    context = cache_context(source)
     for command in (
         ["git", "clone", "--shared", "--quiet", "--no-checkout", str(source), str(target)],
         ["git", "-C", str(target), "checkout", "--quiet", "--detach", revision],
     ):
-        p = subprocess.run(command, capture_output=True, text=True, timeout=120)
-        if p.returncode:
-            raise Unavailable("fresh snapshot checkout failed: " + p.stderr.strip()[-300:])
-
-    # A local clone otherwise records the source directory as origin. Mathlib's
-    # cache tool uses that URL to select a fork's artifact scope; losing it can
-    # silently fall back to the upstream cache and miss all fork-only artifacts.
-    remote = subprocess.run(
-        ["git", "-C", str(source), "remote", "get-url", "origin"], capture_output=True, text=True, timeout=30
-    )
-    if remote.returncode == 0 and remote.stdout.strip():
-        git(target, "remote", "set-url", "origin", remote.stdout.strip())
-    git(target, "remote", "set-url", "--push", "origin", "no_push")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        if result.returncode:
+            raise Unavailable("fresh snapshot checkout failed: " + result.stderr.strip()[-300:])
+    # The local clone's origin points into the mutable workspace. Reconstruct
+    # the source's cache-selection context, never a writable push path to it.
+    git(target, "remote", "remove", "origin")
+    for name, url in context["raw_urls"].items():
+        git(target, "remote", "add", name, url)
+        git(target, "remote", "set-url", "--push", name, "no_push")
+    if context["branch"] != "HEAD":
+        git(target, "checkout", "--quiet", "-B", context["branch"], revision)
+    if context["tracking"]:
+        git(target, "config", f"branch.{context['branch']}.remote", context["tracking"])
+    if cache_identity(cache_context(target)) != cache_identity(context):
+        raise Unavailable(
+            "Git cache selection context differs in the fresh clone; normalize repository-specific URL rules or use private builds"
+        )
 
 
 def verify(build, mathlib, artifacts=(".olean", ".ilean")):
@@ -401,7 +445,8 @@ def summary(env=None, *, scope=None, worker=None):
         shared=sum(r.get("mode") == "shared" for r in rows),
         private=sum(r.get("mode") == "private" for r in rows),
         cache_hits=sum(r.get("cache_hit", False) for r in rows),
-        preparing=sum(r.get("mode") == "preparing" for r in rows),
+        preparing=sum(r.get("mode") in {"preparing", "overlay-ready"} for r in rows),
+        blocked=sum(r.get("mode") == "blocked" for r in rows),
         preparation_seconds=sum(r.get("preparation_seconds", 0) for r in rows),
         reasons=sorted({r["reason"] for r in rows if r.get("reason")}),
     )
@@ -480,7 +525,10 @@ def view(cwd, env, logdir, fetch):
             prefix = candidate
             env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = str(lease.fileno())
             env["TAUCETI_SHARED_MATHLIB_KEY"] = key
-            report(pool, env, mode="shared", key=key, cache_hit=hit, preparation_seconds=time.monotonic() - started)
+            env["TAUCETI_SHARED_MATHLIB_PREP_STARTED"] = str(started)
+            report(
+                pool, env, mode="overlay-ready", key=key, cache_hit=hit, preparation_seconds=time.monotonic() - started
+            )
         except (Unavailable, OSError, ValueError, subprocess.TimeoutExpired) as error:
             if backup_created and backup and backup.exists():
                 remove_tree(upper)
@@ -491,10 +539,17 @@ def view(cwd, env, logdir, fetch):
                 marker.unlink(missing_ok=True)
             else:
                 detach_upper(upper, marker)
-            report(pool, env, mode="private", reason=str(error), preparation_seconds=time.monotonic() - started)
+            report(
+                pool,
+                env,
+                mode="blocked" if selected == "required" else "private",
+                reason=str(error),
+                preparation_seconds=time.monotonic() - started,
+            )
             stack.close()
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
+            env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []
@@ -504,8 +559,26 @@ def view(cwd, env, logdir, fetch):
         finally:
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
+            env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
         if prefix and backup and backup.exists():
             remove_tree(backup)
+
+
+def preparation_status(env, *, error=None):
+    """Mark ready only after both cache warmers pass, before any inference starts."""
+    worker = env.get("TAUCETI_WORKER_ID", "default")
+    pool = root(env)
+    previous = read_json(pool / "status" / (hashlib.sha256(worker.encode()).hexdigest() + ".json"))
+    elapsed = time.monotonic() - float(env.get("TAUCETI_SHARED_MATHLIB_PREP_STARTED", time.monotonic()))
+    report(
+        pool,
+        env,
+        mode="blocked" if error else "shared",
+        reason=str(error) if error else None,
+        key=env.get("TAUCETI_SHARED_MATHLIB_KEY"),
+        cache_hit=previous.get("cache_hit", False),
+        preparation_seconds=elapsed,
+    )
 
 
 def lease_fds(env):
