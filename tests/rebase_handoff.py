@@ -262,7 +262,7 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         assert "Nobody reads your final transcript" in prompt
         assert "You may close this PR" in prompt
         assert "gh pr close 20 --repo TauCetiProject/TauCeti" in prompt
-        assert "--add-label on-hold" in prompt
+        assert "<!--tauceti-blocked:v1 " + HEAD + "-->" in prompt
         if provisional:
             assert "attribution **unconfirmed**" in prompt
             assert "still complete all verification below" in prompt
@@ -272,7 +272,7 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         assert agent.call_args.kwargs["allow_push"] == "me/TauCeti"
         with (
             patch.object(work_units, "run_in_bubble", return_value=0) as other,
-            patch.object(work_units, "me", return_value="different-account"),
+            patch.object(sv, "me_login", "different-account"),
         ):
             work_units._do_fixlike(
                 w,

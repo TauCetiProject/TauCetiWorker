@@ -1,6 +1,6 @@
 You are reconciling the branch with current main on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The branch either conflicts with current `main`, or an authenticated head-bound recovery request asks for integration repair. A build-green, textually mergeable branch can still import source deleted or moved on main, use renamed APIs, or duplicate declarations now on main. Read the exact request evidence below; a suspect partition containing several PRs is not evidence against this PR. Integrate main and repair the resulting source so it can merge again. Work autonomously to completion.
 
-Before editing and again before pushing, re-read the live PR: it must remain open at the starting head with no `keep`/`hold`/`wip`/`human`/`do-not-close` pause. For a semantic handoff, confirm its authenticated current-head request is still active. If it was withdrawn or superseded, stop without changing the branch.
+Before editing and again before pushing, re-read the live PR: it must remain open at the starting head with no `keep`/`hold`/`wip`/`human`/`on-hold`/`do-not-close` pause. For a semantic handoff, confirm its authenticated current-head request is still active. If it was withdrawn or superseded, stop without changing the branch.
 
 ## Rebase onto current main
 - Fetch once and integrate one current `main` snapshot (record its full SHA; do not chase further main advances during this task):

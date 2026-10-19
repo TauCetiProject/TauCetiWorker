@@ -833,14 +833,10 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
         log(f"  {stage} #{c.pr}: moved on since the survey (head, draft or closed) — skipping")
         return False
-    if {str(label.get("name", "")).lower() for label in live.get("labels", [])} & {
-        "keep",
-        "hold",
-        "wip",
-        "human",
-        "on-hold",
-        "do-not-close",
-    }:
+    paused = {"hold", "wip", "human", "on-hold"}
+    if stage != "review":
+        paused |= {"keep", "do-not-close"}
+    if {str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused:
         return False
     meta = w.rs.gh_meta(c.pr, force=True)
     if meta.provenance in ("stale", "fetch_failed"):
@@ -1024,6 +1020,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # Last free check before anything that spends — the entitlement probe and the Claude bootstrap
     # below both cost a provider request. Everything above this line is local (a binary on PATH, the
     # configured account), so it stays ahead of a network read that only matters if we get this far.
+    if c.pr and hasattr(getattr(w, "rs", None), "maintenance_blocked"):
+        patch = next((p for p in sv.open_prs if p.number == c.pr), None)
+        if patch and w.rs.maintenance_blocked(c.pr, c.head, patch.author, selected=True):
+            return None
     if not _still_actionable(stage, w, sv, c):
         return None
     if needs_codex_probe:
@@ -1507,12 +1507,20 @@ def _do_fixlike(
     # superseded work instead of leaving an actionable decision in stdout.
     author = getattr(p, "author", "")
     may_close = (
-        bool(author) and not foreign and not getattr(p, "automatic_bump", False) and author.lower() == me().lower()
+        bool(author)
+        and not foreign
+        and not getattr(p, "automatic_bump", False)
+        and author.lower() == getattr(sv, "me_login", "").lower()
     )
     prompt += "\n" + fill_prompt(
         HERE / "prompts" / "pr-outcome.md",
         PR=pr,
         HEAD=head,
+        BLOCK_AUTHORITY=(
+            "If you own this PR, publish the head-bound blocker marker below."
+            if not foreign and not getattr(p, "automatic_bump", False)
+            else "For this scoped foreign or automatic bump repair, publish only an evidence comment; do NOT add a blocker marker or change labels. Preserve the existing retry/checkpoint policy."
+        ),
         CLOSE_AUTHORITY=(
             "You may close this PR only while its live author is the authenticated GitHub account."
             if may_close

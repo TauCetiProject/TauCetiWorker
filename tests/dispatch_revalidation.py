@@ -116,7 +116,7 @@ check("a review candidate that still stands is taken", still("review", rs), True
 check("...having read every answer live", [f for _, f in rs.forced], [True] * len(rs.forced))
 check("...and without busting a cache other processes share", rs.busted, [])
 
-for pause in ("hold", "on-hold", "human", "do-not-close"):
+for pause in ("hold", "on-hold", "human"):
     gh = FakeGH()
     gh.view["labels"] = [{"name": pause}]
     check("live pause declines review: " + pause, still("review", FakeRS(), gh=gh), False)

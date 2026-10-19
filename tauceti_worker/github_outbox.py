@@ -85,6 +85,9 @@ def prepare(argv, env, cwd=None, input=None):
     context = {}
     context["repository"] = _flag(args, "--repo", "-R")
     context["pr"] = env.get("TAUCETI_GITHUB_PR") or None
+    if args[:2] == ["pr", "close"]:
+        context["expected_head"] = env.get("TAUCETI_PUSH_EXPECT")
+        context["actor"] = env.get("TAUCETI_GITHUB_ACCOUNT") or actor(env)
     input_file = _flag(args, "--input")
     payload_input = (
         input
@@ -193,9 +196,16 @@ def pending_for(repo, number, env=None, *, conservative=False):
     for path in intent_paths(env):
         try:
             value = json.loads(path.read_text())
-            if target(value) == (repo, number):
+            destination = target(value)
+            if destination == (repo, number):
                 return True
-        except (OSError, ValueError, KeyError, TypeError):
+            if conservative and destination == (None, None):
+                context = value.get("context", {})
+                # Branch-relative/opaque writes can belong to this checkout even
+                # when their repository cannot be resolved. Preserve them.
+                if str(context.get("pr")) == str(number):
+                    return True
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             if conservative:
                 return True
     return False
@@ -327,6 +337,35 @@ def reconcile(value, env):
     args = value["argv"]
     replay = {**env, "TAUCETI_OUTBOX_REPLAY": "1"}
     repo, number = target(value)
+    if args[:2] == ["pr", "close"]:
+        context = value.get("context", {})
+        expected, who = context.get("expected_head"), context.get("actor")
+        if (
+            not repo
+            or not number
+            or not isinstance(expected, str)
+            or not re.fullmatch(r"[a-f0-9]{40}", expected)
+            or not who
+        ):
+            return None
+        with tr.read_context(fresh=True, direct=True):
+            result = tr.execute(["gh", "api", f"repos/{repo}/pulls/{number}"], env=replay)
+        if result.returncode:
+            return None
+        try:
+            live = json.loads(result.stdout)
+            if live.get("state") == "closed":
+                return True
+            holds = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
+            if (
+                live.get("head", {}).get("sha") != expected
+                or live.get("user", {}).get("login", "").lower() != who.lower()
+                or holds & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
+            ):
+                return "obsolete"
+            return False if live.get("state") == "open" else None
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
     endpoint = None
     if repo and number and args[:2] in (["pr", "comment"], ["pr", "review"]):
         endpoint = f"repos/{repo}/" + (
@@ -527,6 +566,9 @@ def drain(env=None):
                 applied = reconcile(value, env)
                 if applied is True:
                     path.unlink()
+                    continue
+                if applied == "obsolete":
+                    archive(path, value, "Recorded PR head, ownership or pause changed; closure not replayed")
                     continue
                 if applied == "permanent_failure":
                     archive(path, value, "Review-thread resolution unavailable for this account or target")

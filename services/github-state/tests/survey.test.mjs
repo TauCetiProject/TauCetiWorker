@@ -29,3 +29,11 @@ test('compact survey is authenticated, roadmap scoped and does not issue GitHub 
   assert.equal((await mf.dispatchFetch('https://test/v1/query?repository=org/repo&operation=survey',{headers:{Authorization:'Bearer invalid'}})).status,401);
  }finally{await mf.dispose();}
 });
+
+test('head-bound blockers retain their authenticated actor and do not trust quoted markers',()=>{
+ const head='a'.repeat(40), marker='<!--tauceti-blocked:v1 '+head+'-->';
+ const rows=[{body:marker+'\nEvidence',user:{login:'Author'}},{body:'> '+marker,user:{login:'Author'}},{body:'Quoted\n'+marker,user:{login:'Author'}}];
+ assert.deepEqual(facts.summarize(rows,[]).blocked,[{head,author:'author'}]);
+ assert.deepEqual(facts.summarize([],[]).blocked,[]);
+ assert.deepEqual(facts.summarizeFragments([{meta:null,rebase_heads:[],marker:null}],[]).blocked,[],'old stored fragments require no refetch');
+});

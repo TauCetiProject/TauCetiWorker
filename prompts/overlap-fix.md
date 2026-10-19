@@ -35,7 +35,7 @@ exact tauceti-mathlib-overlap marker from the issue, and a standalone `Roadmap:`
 attribution (use the motivating canonical roadmap, or none for general work).
 Describe what remains additional. Do not merge the PR or close the issue while
 its repair is unmerged; existing review/fix/CI phases own that lifecycle.
-If another account already opened a repair PR, post its URL on this issue before stopping. Leave the issue open until its repair merges; a final transcript is not a notification. If the issue
+If another account already opened a repair PR, post its URL on this issue before stopping, unless a comment already links that repair. Leave the issue open until its repair merges; a final transcript is not a notification. If the issue
 is a false positive or no useful repair is possible, leave an evidence-backed
 comment and close it as not planned. Do not launch other agents.
 

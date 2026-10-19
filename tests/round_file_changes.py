@@ -175,6 +175,11 @@ def main():
                 "another PR publication does not stall this checkout",
                 tc.work_units._candidate_checkout_unchanged(cfg, candidate),
             )
+            pending.write_text(json.dumps({"argv": ["pr", "comment", "--body", "pending"], "context": {"pr": "1"}}))
+            check(
+                "same-PR branch-relative publication is retained",
+                not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
             pending.unlink()
 
         # Closing a superseded PR is progress even without a push/comment;

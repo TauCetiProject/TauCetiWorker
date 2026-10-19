@@ -64,6 +64,15 @@ def cases():
                 "updated_at": "4",
             }
         )
+        for k, prefix in enumerate(("", "> ", "Quoted\n")):
+            issues.append(
+                {
+                    "id": str(200 + k),
+                    "body": prefix + "<!--tauceti-blocked:v1 " + "a" * 40 + "-->\nEvidence",
+                    "user": {"login": "Author"},
+                    "updated_at": "5",
+                }
+            )
         reviews = [{"id": "18446744073709551600", "body": "<!--tauceti-rubric:reuse -->"}]
         reviews.append({"id": None, "in_reply_to_id": "18446744073709551600", "body": "contest"})
         for j in range(rng.randrange(6)):
