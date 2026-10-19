@@ -28,10 +28,10 @@ The key includes pinned dependency revisions, the Mathlib manifest, the root Lak
 configuration and manifest, Lean toolchain and ABI, architecture and platform.
 Dirty or unpinned dependencies use private builds. A miss makes fresh local git
 clones at those revisions, downloads using `lake exe cache get`, and verifies
-Mathlib `.olean` and `.ilean` outputs before atomic publication. It never publishes
+Mathlib `.olean` and `.ilean` outputs before syncing the immutable tree and publishing it atomically. It never publishes
 an agent's mutable build directory. A per-key lock serializes builders.
 
-Each agent runs inside a rootless bubblewrap mount namespace. The published pool
+Each agent runs inside rootless bubblewrap mount and PID namespaces. The published pool
 is read-only there. OverlayFS combines the shared Mathlib lower with that worker's
 persistent private upper; in-place writes copy up. The entire coding process and
 its tools see this view. Networking, credentials and the existing cancellation
@@ -43,12 +43,16 @@ private Mathlib build aside and starts with an empty upper. Duplicate old artifa
 therefore cannot shadow the shared lower. The backup survives failed activation;
 it is removed after a successful invocation. Toolchain/dependency changes made by
 an agent affect private files; the following round selects a new key. Disabling
-sharing reconstructs missing private outputs through normal cache preparation.
+sharing moves the sparse private delta aside, starts an empty private build, and
+reconstructs outputs through normal cache preparation. Sparse deltas and whiteouts
+are never reused outside their overlay. Cache warming still runs inside the view
+to prepare other dependencies, skipping already verified Mathlib outputs.
 
 Running readers hold shared leases; the sandbox also retains the lease descriptor
 so collection cannot race a surviving process. Cleanup removes unused snapshots
 after seven days, or oldest unused snapshots under disk pressure, until at least
-10% disk space is free. Leased entries are skipped. Publication refuses to leave
+10% disk space is free. Leased entries are skipped. Unlocked staging trees left by killed builders are
+reclaimed after four hours, before useful snapshots are evicted for disk pressure. Publication refuses to leave
 less than 10% free if no unused entries can be reclaimed.
 
 The existing activity preparer collects small local preparation receipts. Status

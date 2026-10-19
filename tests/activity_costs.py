@@ -151,6 +151,24 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(row["weighted_loc"]), Decimal("350.5"))
         self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal("350.5"))
 
+    def test_unchanged_usage_is_cached_and_new_checkpoint_invalidates_it(self):
+        self.summary()
+        with patch.object(activity_costs, "session_usage", side_effect=AssertionError("unchanged journal reread")):
+            self.assertEqual(Decimal(self.summary()["costs"]["windows"]["total"]["estimated_usd"]), 100)
+        journal = UsageJournal(
+            self.root / "budget/usage", "b" * 32, model="claude-opus-5-5", clock=lambda: self.now - 1
+        )
+        journal.observe(
+            dict(
+                type="assistant",
+                session_id="new",
+                message=dict(id="new", model="claude-opus-5-5", usage=dict(input_tokens=0, output_tokens=100000)),
+            )
+        )
+        self.session("b" * 32, 60, "author", "500", settled=False)
+        self.write_ledger()
+        self.assertEqual(Decimal(self.summary()["costs"]["windows"]["total"]["estimated_usd"]), 102)
+
     def test_timestamped_running_usage_and_final_correction_do_not_spike(self):
         key = "b" * 32
         self.session(key, 5 * 3600, "author", "500", settled=False)

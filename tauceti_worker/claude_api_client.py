@@ -134,12 +134,7 @@ def main():
     else:
         args += ["--output-format", "stream-json"]
     journal = None
-    if config.get("usage_dir"):
-        from usage_accounting import UsageJournal
-
-        journal = UsageJournal(config["usage_dir"], invocation, model=model)
-        if "--include-partial-messages" not in args:
-            args.append("--include-partial-messages")
+    requested_partials = "--include-partial-messages" in args
     if "--verbose" not in args:
         args.append("--verbose")
     totals = {}
@@ -167,6 +162,12 @@ def main():
 
     process_exited = False
     try:
+        if config.get("usage_dir"):
+            from usage_accounting import UsageJournal
+
+            journal = UsageJournal(config["usage_dir"], invocation, model=model)
+            if not requested_partials:
+                args.append("--include-partial-messages")
         proc = subprocess.Popen(real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
         outcome = "started"
         assert proc.stdout is not None
@@ -228,7 +229,7 @@ def main():
                             request(bridge, "cooldown", id=invocation, model=model, seconds=delay, wait=False)
                         except (OSError, RuntimeError, ValueError, TypeError, OverflowError):
                             pass  # Accounting failure must not interrupt the already admitted session.
-                if output_format == "stream-json":
+                if output_format == "stream-json" and (requested_partials or event.get("type") != "stream_event"):
                     try:
                         sys.stdout.write(line)
                         sys.stdout.flush()
@@ -246,8 +247,11 @@ def main():
                 print(final.get("result", ""))
         except (OSError, ValueError):
             pass
-    except OSError:
+    except Exception as error:
         if outcome == "launch-failed":
+            warning(
+                f"tauceti: pre-launch accounting/native executable unavailable; no inference started ({type(error).__name__}: {error})"
+            )
             totals = {invocation: "0"}
             unknown_segments.clear()
             rc = 75

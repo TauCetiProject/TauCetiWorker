@@ -289,6 +289,99 @@ time.sleep(100)
             self.assertNotIn("timestamp", saved["messages"][provider + ":new"])
             self.assertNotIn("content", self.journal.path.read_text())
 
+    def test_native_evidence_survives_repeated_prefix_recovery(self):
+        self.journal.observe(response(output_tokens=100000))
+        self.budget.settle_receipt(
+            dict(
+                id=self.identity,
+                totals=None,
+                provisional=True,
+                lower_bound_totals={"s": "5"},
+                outcome="result observed; process has not exited",
+            )
+        )
+        self.budget.recover_usage(self.identity)
+        before = self.budget.ledger.read_bytes()
+        self.budget.recover_usage(self.identity)
+        self.assertEqual(self.budget.ledger.read_bytes(), before)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 5)
+        with self.budget.locked():
+            saved = self.budget.replay()["sessions"][self.identity]
+        self.assertEqual(saved["lower_bound_totals"], {"s": "5"})
+        self.assertEqual(Decimal(saved["lower_bound_cost"]), 5)
+        self.budget.settle_receipt(
+            dict(
+                id=self.identity,
+                totals=None,
+                provisional=True,
+                lower_bound_totals={"s": "5"},
+                outcome="result observed; process has not exited",
+            )
+        )
+        self.budget.recover_usage(self.identity)
+        self.assertEqual(self.budget.ledger.read_bytes(), before)
+
+    def test_provisional_receipt_cannot_reopen_settled_token_estimate(self):
+        self.journal.observe(response(output_tokens=100000))
+        self.journal.flush(closed=True)
+        self.budget.recover_usage(self.identity)
+        before = self.budget.ledger.read_bytes()
+        self.budget.settle_receipt(
+            dict(id=self.identity, totals=None, provisional=True, lower_bound_totals={"s": "1"}, outcome="interrupted")
+        )
+        self.assertEqual(self.budget.ledger.read_bytes(), before)
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_late_native_baseline_rebases_estimated_successor_without_charging_it(self):
+        self.journal.observe(response(output_tokens=100000))
+        self.journal.flush(closed=True)
+        self.budget.recover_usage(self.identity)
+        identity = "b" * 32
+        self.budget.admit(identity, "worker", MODEL, "fix", bridge=str(self.bridge), resume="s")
+        second = UsageJournal(self.root / "usage", identity, model=MODEL, clock=lambda: AT + 1)
+        second.observe(response(mid="new", output_tokens=100000))
+        second.flush(closed=True)
+        self.budget.recover_usage(identity)
+        self.budget.settle_receipt(dict(id=self.identity, totals={"s": "1"}, outcome="exit:0"))
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 3)
+        with self.budget.locked():
+            saved = self.budget.replay()["sessions"][identity]
+        self.assertEqual(Decimal(saved["cost"]), 2)
+        self.assertEqual(saved["totals"], {"s": "3.0"})
+
+    def test_journal_newer_than_valid_checkpoint_wins(self):
+        self.journal.observe(response(output_tokens=100))
+        old = self.journal.path.read_bytes()
+        self.journal.observe(response(output_tokens=200))
+        self.journal.path.write_bytes(old)
+        self.assertEqual(read_usage(self.journal.path)["messages"]["s:m"]["usage"]["output_tokens"], 200)
+
+    def test_partial_assistant_does_not_complete_before_message_stop(self):
+        self.journal.observe(
+            dict(
+                type="stream_event",
+                session_id="s",
+                event=dict(
+                    type="message_start",
+                    message=dict(id="m", model=MODEL, usage=dict(input_tokens=10, output_tokens=0)),
+                ),
+            )
+        )
+        self.journal.observe(response(input_tokens=10, output_tokens=1))
+        self.assertFalse(read_usage(self.journal.path)["messages"]["s:m"]["complete"])
+        self.journal.observe(
+            dict(type="stream_event", session_id="s", event=dict(type="message_delta", usage=dict(output_tokens=2)))
+        )
+        self.journal.observe(dict(type="stream_event", session_id="s", event=dict(type="message_stop")))
+        self.assertTrue(read_usage(self.journal.path)["messages"]["s:m"]["complete"])
+
+    def test_unpriced_server_fees_retain_uncertainty(self):
+        self.journal.observe(response(input_tokens=100, output_tokens=200, server_tool_use=dict(web_search_requests=1)))
+        self.journal.flush(closed=True)
+        self.budget.recover_usage(self.identity)
+        self.assertIn(self.identity, self.budget.snapshot()["provisional"])
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+
     def test_live_owner_is_not_recovered(self):
         self.journal.observe(response(output_tokens=100000))
         with patch("tauceti_worker.budget.bridge_owner_alive", return_value=True):

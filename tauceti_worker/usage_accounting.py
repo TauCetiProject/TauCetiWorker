@@ -25,13 +25,16 @@ TOKENS = (
     "cache_creation_1h_input_tokens",
 )
 MAX_CHECKPOINT = 16 * 1024**2
+UTC = UTC
 
 
 def price_usage(model, usage, at, prices=None):
     """Decimal list-price estimate using the vendored, dated price table."""
     table = prices or json.loads(Path(__file__).with_name("prices.json").read_text())["models"]
     if model not in table:
-        candidates = [key for key in table if model and (key in model or model == key.removeprefix("claude-"))]
+        candidates = [
+            key for key in table if model and (key in model or model == (key[7:] if key.startswith("claude-") else key))
+        ]
         if not candidates:
             return None
         model = max(candidates, key=len)
@@ -104,11 +107,55 @@ def _validate(value, identity):
     return value
 
 
+def usage_path(directory, identity, bridge=None):
+    namespace = Path(bridge).name if bridge else ""
+    if len(namespace) == 32 and all(c in "0123456789abcdef" for c in namespace):
+        return Path(directory) / "usage" / namespace / (identity + ".json")
+    return Path(directory) / "usage" / (identity + ".json")
+
+
+def session_usage(directory, session):
+    path = usage_path(directory, session["id"], session.get("bridge"))
+    return read_usage(path) or (
+        read_usage(Path(directory) / "usage" / (session["id"] + ".json")) if path.parent.name != "usage" else None
+    )
+
+
+def _latest_sequence(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return 0
+            offset = max(0, info.st_size - 65536)
+            stream.seek(offset)
+            lines = stream.read(65536).splitlines(keepends=True)
+            if offset:
+                lines = lines[1:]
+            for raw in reversed(lines):
+                if not raw.endswith(b"\n"):
+                    continue
+                try:
+                    record = json.loads(raw)
+                    sequence = record.get("sequence", 0)
+                    if type(sequence) is int and sequence >= 0:
+                        return sequence
+                except (ValueError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    return 0
+
+
 def read_usage(path):
     """Reject links, foreign files and malformed data. Absence is never zero spend."""
     path = Path(path)
+    checkpoint = None
     try:
-        return _validate(json.loads(_read(path, MAX_CHECKPOINT)), path.stem)
+        checkpoint = _validate(json.loads(_read(path, MAX_CHECKPOINT)), path.stem)
+        if checkpoint.get("sequence", 0) >= _latest_sequence(path.with_suffix(".jsonl")):
+            return checkpoint
     except (OSError, ValueError, TypeError, AttributeError, ArithmeticError):
         pass
     try:
@@ -124,9 +171,10 @@ def read_usage(path):
                 state = candidate
             except (ValueError, TypeError, AttributeError, ArithmeticError):
                 break  # A torn suffix cannot invalidate the preceding durable records.
-        return _validate(state, path.stem)
+        recovered = _validate(state, path.stem)
+        return checkpoint if checkpoint and checkpoint.get("sequence", 0) > recovered.get("sequence", 0) else recovered
     except (OSError, ValueError, TypeError, AttributeError, ArithmeticError):
-        return None
+        return checkpoint
 
 
 class UsageJournal:
@@ -187,13 +235,21 @@ class UsageJournal:
                     complete=False,
                 ),
             )
+            if ek == "message_start":
+                item["streamed"] = True
             self._usage(item, message.get("usage") or {})
             if kind == "assistant":
-                # Several content blocks may repeat the same response. Token
-                # counters are merged by ID, never summed across those blocks.
-                item["complete"] = "input_tokens" in item["usage"] and "output_tokens" in item["usage"]
-                self.waiting.discard(lane)
-                self.waiting.discard("unknown")
+                if not item.get("streamed"):
+                    item["complete"] = (
+                        "input_tokens" in item["usage"]
+                        and "output_tokens" in item["usage"]
+                        and not item.get("unpriced_extra")
+                    )
+                if item["complete"]:
+                    self.waiting.discard(lane)
+                    self.waiting.discard("unknown")
+                else:
+                    self.waiting.add(lane)
             else:
                 self.waiting.add(lane)
             self.dirty.add(key)
@@ -203,7 +259,11 @@ class UsageJournal:
             item = self.value["messages"][key]
             self._usage(item, e.get("usage") or {})
             if ek == "message_stop":
-                item["complete"] = "input_tokens" in item["usage"] and "output_tokens" in item["usage"]
+                item["complete"] = (
+                    "input_tokens" in item["usage"]
+                    and "output_tokens" in item["usage"]
+                    and not item.get("unpriced_extra")
+                )
                 self.waiting.discard(lane)
                 self.waiting.discard("unknown")
             self.dirty.add(key)
@@ -219,6 +279,13 @@ class UsageJournal:
         if not isinstance(usage, dict):
             return
         values = dict(usage)
+        fees = usage.get("server_tool_use")
+        if (
+            isinstance(fees, dict)
+            and any(fees.values())
+            or usage.get("service_tier") not in (None, "standard", "default")
+        ):
+            item["unpriced_extra"] = True
         cache = usage.get("cache_creation")
         if isinstance(cache, dict):
             values.update(

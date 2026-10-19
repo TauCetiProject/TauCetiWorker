@@ -169,8 +169,8 @@ class ClaudeAPIContext:
         shutil.copy(Path(__file__).with_name("claude_api_client.py"), shim)
         for name in ("usage_accounting.py", "prices.json"):
             shutil.copy(Path(__file__).with_name(name), self.bin / name)
-        usage = self.budget.directory / "usage"
-        usage.mkdir(mode=0o700, exist_ok=True)
+        usage = self.budget.directory / "usage" / self.directory.name
+        usage.mkdir(mode=0o700, exist_ok=True, parents=True)
         # Use the actual host interpreter even on systems whose python3 is older than 3.11.
         text = shim.read_text().replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1)
         shim.write_text(text)

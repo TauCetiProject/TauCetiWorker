@@ -168,6 +168,9 @@ class Budget:
                                 lower_bound_totals=event["lower_bound_totals"],
                                 outcome=event["outcome"],
                             )
+                            for field in ("usage_checkpoint", "usage_tail"):
+                                if field in event:
+                                    session[field] = event[field]
                     elif kind == "cooldown":
                         state["cooldowns"][event["model"]] = event["until"]
                     else:
@@ -592,6 +595,8 @@ class Budget:
                     break
                 for provider_id, value in prior.get("totals", {}).items():
                     baseline[provider_id] = max(baseline.get(provider_id, Decimal(0)), money(value))
+            if session["status"] == "settled" and totals is None:
+                return
             if totals is None and lower:
                 differences = [money(v) - baseline.get(k, Decimal(0)) for k, v in lower.items()]
                 if all(v >= 0 for v in differences):
@@ -604,7 +609,10 @@ class Budget:
                         self.estimate(state, session["model"], session["phase"], include_pending=False)[1],
                         known,
                     )
-                    reserve = max(money(session.get("reserve", "0")), known + tail)
+                    charged = money(session.get("cost", "0"))
+                    if session.get("cost_provenance") == "token-priced-prefix" and "usage_tail" in session:
+                        tail = money(session["usage_tail"])
+                    reserve = max(money(session.get("reserve", "0")), max(Decimal(0), known - charged) + tail)
                     if (
                         session["status"] == ("provisional" if provisional else "unresolved")
                         and session.get("lower_bound_totals") == lower
@@ -630,10 +638,7 @@ class Budget:
                 for provider, native in totals.items():
                     if money(native) >= baseline.get(provider, Decimal(0)):
                         continue
-                    priors = sorted(
-                        (p for p in ordered[:position] if provider in p.get("totals", {})),
-                        key=lambda p: (p["started"], p["id"]),
-                    )
+                    priors = [p for p in ordered[:position] if provider in p.get("totals", {})]
                     exact = max(
                         (
                             money(p["totals"][provider])
@@ -651,8 +656,14 @@ class Budget:
                         break
                     weight = sum((money(p["cost"]) for p in estimates), Decimal(0))
                     cursor = exact
-                    for prior in estimates:
-                        value = (money(native) - exact) * money(prior["cost"]) / weight if weight else Decimal(0)
+                    for index, prior in enumerate(estimates):
+                        value = (
+                            (money(native) - cursor)
+                            if index == len(estimates) - 1
+                            else (money(native) - exact) * money(prior["cost"]) / weight
+                            if weight
+                            else Decimal(0)
+                        )
                         cursor += value
                         events.append(
                             dict(
@@ -684,18 +695,30 @@ class Budget:
                         )
                         # Correcting an earlier estimated resume baseline must
                         # preserve the next native cumulative total as well.
-                        later = sorted(
-                            (
-                                p
-                                for p in ordered[position + 1 :]
-                                if p["status"] == "settled" and set(p.get("totals", {})) & set(totals)
-                            ),
-                            key=lambda p: (p["started"], p["id"]),
-                        )
-                        if later:
-                            successor = later[0]
-                            adjusted = money(successor["cost"]) + previous - cost
-                            if adjusted < 0 or set(totals) != set(successor.get("totals", {})):
+                        later = [
+                            p
+                            for p in ordered[position + 1 :]
+                            if p["status"] == "settled" and set(p.get("totals", {})) & set(totals)
+                        ]
+                        for successor in later:
+                            if set(totals) != set(successor.get("totals", {})):
+                                raise BudgetError("late receipt has mixed cumulative baselines; reconcile explicitly")
+                            delta = cost - previous
+                            if successor.get("cost_provenance") == "token-priced":
+                                rebased = {key: str(money(value) + delta) for key, value in successor["totals"].items()}
+                                events.append(
+                                    dict(
+                                        type="correction",
+                                        id=successor["id"],
+                                        delta="0",
+                                        cost=successor["cost"],
+                                        totals=rebased,
+                                        note="rebase estimated cumulative totals after native correction",
+                                    )
+                                )
+                                continue
+                            adjusted = money(successor["cost"]) - delta
+                            if adjusted < 0:
                                 raise BudgetError(
                                     "late receipt conflicts with later cumulative baseline; reconcile explicitly"
                                 )
@@ -703,11 +726,12 @@ class Budget:
                                 dict(
                                     type="correction",
                                     id=successor["id"],
-                                    delta=str(cost - previous),
+                                    delta=str(delta),
                                     cost=str(adjusted),
-                                    note="preserve cumulative resume total after baseline correction",
+                                    note="preserve native cumulative total after baseline correction",
                                 )
                             )
+                            break
                     else:
                         if previous:
                             events.append(
@@ -744,18 +768,38 @@ class Budget:
         from .budget_usage import evidence
 
         with self.locked():
+            sessions = self.replay()["sessions"]
+        session = sessions.get(invocation)
+        if (
+            not session
+            or session["status"] == "settled"
+            or (not allow_live_owner and bridge_owner_alive(session.get("owner")))
+        ):
+            return None
+        saved = evidence(self.directory, session, sessions)
+        if not saved or not saved["items"]:
+            return None
+        with self.locked():
             state = self.replay()
             session = state["sessions"].get(invocation)
-            if not session or session["status"] == "settled":
-                return None
-            if not allow_live_owner and bridge_owner_alive(session.get("owner")):
-                return None
-            saved = evidence(self.directory, session, state["sessions"])
-            if not saved or not saved["items"]:
+            if (
+                not session
+                or session["status"] == "settled"
+                or (not allow_live_owner and bridge_owner_alive(session.get("owner")))
+            ):
                 return None
             cost = max(saved["cost"], money(session.get("lower_bound_cost", "0")))
+            stamp = (
+                str(saved["checkpoint"].get("sequence", 0))
+                + ":"
+                + str(saved["checkpoint"].get("observed_at"))
+                + ":"
+                + str(cost)
+            )
             tail = (
-                Decimal(0)
+                money(session["usage_tail"])
+                if session.get("usage_checkpoint") == stamp and "usage_tail" in session
+                else Decimal(0)
                 if saved["complete"]
                 else max(
                     money(session["estimate"]),
@@ -776,8 +820,9 @@ class Budget:
                 return result
             if saved["checkpoint"].get("recovered_from"):
                 from .runtime_status import atomic_json
+                from .usage_accounting import usage_path
 
-                atomic_json(self.directory / "usage" / (invocation + ".json"), saved["checkpoint"])
+                atomic_json(usage_path(self.directory, invocation, session.get("bridge")), saved["checkpoint"])
             previous = money(session.get("cost", "0"))
             if saved["complete"]:
                 events = (
@@ -824,8 +869,10 @@ class Budget:
                         id=invocation,
                         provisional=True,
                         reserve=str(tail),
-                        lower_bound_cost="0",
-                        lower_bound_totals={},
+                        lower_bound_cost=session.get("lower_bound_cost", "0"),
+                        lower_bound_totals=session.get("lower_bound_totals", {}),
+                        usage_checkpoint=stamp,
+                        usage_tail=str(tail),
                         outcome="incomplete request; token-priced prefix charged",
                         note=note,
                     ),

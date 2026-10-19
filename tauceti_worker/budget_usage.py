@@ -2,11 +2,11 @@
 
 from decimal import Decimal
 
-from .usage_accounting import read_usage
+from .usage_accounting import session_usage
 
 
 def evidence(directory, session, sessions):
-    value = read_usage(directory / "usage" / (session["id"] + ".json"))
+    value = session_usage(directory, session)
     if value is None:
         value = linked_transcript(directory, session)
     if value is None:
@@ -22,7 +22,7 @@ def evidence(directory, session, sessions):
             prior.get("resume") != session["resume"] and session["resume"] not in prior.get("totals", {})
         ):
             continue
-        saved = read_usage(directory / "usage" / (prior["id"] + ".json"))
+        saved = session_usage(directory, prior)
         if saved:
             seen.update((m["session"], m["message_id"]) for m in saved["messages"].values())
     items = [m for m in value["messages"].values() if (m["session"], m["message_id"]) not in seen]

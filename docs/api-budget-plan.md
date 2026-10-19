@@ -314,19 +314,19 @@ from funding waits. Retain existing subscription behavior and its checks.
 
 ## Durable response usage and recovery
 
-The native Claude shim records content-free usage in `budget/usage/<invocation>.json`
+The native Claude shim records content-free usage in `budget/usage/<bridge>/<invocation>.json`
 and an append-only delta journal. Evidence includes provider response/session IDs,
 model, timestamps, token counters and a hash of the vendored dated price table.
 It contains no prompts, response text or keys. Each usage change is synced before
 forwarding the corresponding event; completed responses do not depend on a later
 stdout event or final Claude result. Atomic checkpoints and the preceding valid
-journal prefix survive process termination and torn writes. Bubble mounts this
+journal prefix survive process termination and torn writes. Bubble mounts only its own round
 usage directory separately from the bridge and never receives the ledger.
 
 Response counters merge by ID, including partial/repeated events. Replayed
 responses on resumed invocations are not charged twice. Decimal token pricing
-honours cache-write TTLs. Unknown models, missing counters and requests still in
-flight remain incomplete rather than becoming zero-cost completed work.
+honours cache-write TTLs. Unknown models, missing counters, unpriced server-tool/priority-tier usage and
+requests still in flight remain incomplete rather than becoming zero-cost completed work.
 
 `tauceti budget --recover --dry-run --json` previews stopped-owner recovery without
 changing the ledger or deleting bridge keys. Apply with `--recover --note '…'`.

@@ -658,8 +658,9 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 ).fetchall()
                 for row in ids:
                     value[key][row[0]] = _summary(db, now, column, row[0])
-                    if key == "groups":
-                        value[key][row[0]]["shared_mathlib"] = sharing
+                    value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
+                        **{"scope" if key == "groups" else "worker": row[0]}
+                    )
                     atomic_json(
                         scope_path(key, row[0]), dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors)
                     )

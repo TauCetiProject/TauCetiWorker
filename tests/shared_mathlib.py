@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -274,6 +275,70 @@ class SharedTests(unittest.TestCase):
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"], expires_at=time.time() - 1))
         self.assertEqual(s.mode(self.env), "off")
 
+    def test_real_overlay_remounts_after_key_change(self):
+        self.require_overlay()
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+            first = self.env["TAUCETI_SHARED_MATHLIB_KEY"]
+        (self.cwd / "lean-toolchain").write_text("changed toolchain key")
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+            self.assertNotEqual(first, self.env["TAUCETI_SHARED_MATHLIB_KEY"])
+            result = subprocess.run(
+                prefix + ["cat", str(self.mathlib / ".lake/build/lib/lean/Mathlib.olean")],
+                capture_output=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+            self.assertEqual(result.stdout, b"verified artifact")
+        self.assertEqual(self.downloads, 2)
+
+    def test_off_moves_sparse_delta_aside_before_private_warming(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(
+                prefix + ["sh", "-c", 'echo private > "$1/lib/lean/Mathlib.olean"', "sh", str(upper)],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertEqual(prefix, [])
+            self.assertEqual(list(upper.iterdir()), [])
+            self.assertTrue((upper.with_name("build-shared-delta") / "lib/lean/Mathlib.olean").exists())
+
+    def test_gc_reclaims_killed_builder_staging_and_skips_live_builder(self):
+        key = "a" * 64
+        old = self.pool / "staging" / (key + "-orphan")
+        old.mkdir(parents=True)
+        (old / "partial").write_text("incomplete")
+        at = time.time() - 5 * 3600
+        os.utime(old, (at, at))
+        with s.key_lock(self.pool, key):
+            s.collect(self.pool)
+            self.assertTrue(old.exists())
+        s.collect(self.pool)
+        self.assertFalse(old.exists())
+
+    def test_parent_bound_cancellation_wrapper_preserves_sandbox_lease(self):
+        self.require_overlay()
+        from tauceti_worker import agents
+
+        logs = self.root / "agent-logs"
+        logs.mkdir()
+        with s.view(self.cwd, self.env, logs, self.extract) as prefix:
+            code = 'import json; print(json.dumps(dict(type="system",subtype="init"))); print(json.dumps(dict(type="result",subtype="success",total_cost_usd=0)))'
+            rc = agents.run_agent_proc(
+                prefix + [sys.executable, "-c", code],
+                env=self.env,
+                logdir=logs,
+                label="offline",
+                provider="claude",
+                cwd=self.cwd,
+                cancel_event=threading.Event(),
+            )
+            self.assertEqual(rc, 0)
+
     def test_two_real_readers_share_physical_mmap_pages(self):
         self.require_overlay()
         lower = self.root / "lower"
@@ -293,7 +358,24 @@ class SharedTests(unittest.TestCase):
                     stdin=subprocess.PIPE,
                     text=True,
                 )
-                pid = int(p.stdout.readline())
+                self.assertTrue(p.stdout.readline().strip())
+                pending, pid = [p.pid], None
+                while pending:
+                    candidate = pending.pop()
+                    try:
+                        if "mapped-artifact" in Path(f"/proc/{candidate}/smaps").read_text():
+                            pid = candidate
+                            break
+                        pending.extend(
+                            int(v) for v in Path(f"/proc/{candidate}/task/{candidate}/children").read_text().split()
+                        )
+                    except FileNotFoundError:
+                        pass
+                if pid is None:
+                    p.stdin.close()
+                    p.wait(timeout=5)
+                    p.stdout.close()
+                    self.fail("cannot find mapped reader in the host PID namespace")
                 readers.append((p, pid))
             for _p, pid in readers:
                 blocks = Path(f"/proc/{pid}/smaps").read_text().splitlines()

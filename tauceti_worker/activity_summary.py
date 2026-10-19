@@ -145,7 +145,7 @@ def display(value, default_kinds=()):
         windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
         for key, label in (
             ("spent_usd", "API cost: completed sessions"),
-            ("active_accrued_usd", "API cost: running usage"),
+            ("active_accrued_usd", "API cost: running/interrupted"),
             ("estimated_usd", "API cost: estimated total"),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))

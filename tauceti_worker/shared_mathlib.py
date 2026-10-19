@@ -56,6 +56,9 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
     return [
         "bwrap",
         "--die-with-parent",
+        "--unshare-pid",
+        "--proc",
+        "/proc",
         "--bind",
         "/",
         "/",
@@ -119,6 +122,14 @@ def git(path, *args):
 
 
 def signature(cwd, env):
+    # Loading Lake synchronizes pinned dependency checkouts without compiling
+    # Mathlib. Do this before deciding the key, so a manifest bump can hit a
+    # shared snapshot on its first round instead of downloading privately first.
+    lean = subprocess.run(
+        ["lake", "env", "lean", "--version"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30
+    )
+    if lean.returncode:
+        raise Unavailable("Lean toolchain is unavailable; run lake env lean --version")
     manifest = json.loads((cwd / "lake-manifest.json").read_text())
     packages = manifest.get("packages", [])
     mathlib = cwd / ".lake/packages/mathlib"
@@ -137,11 +148,6 @@ def signature(cwd, env):
     if "mathlib" not in dependencies:
         raise Unavailable("manifest has no pinned Mathlib dependency")
     toolchain = (cwd / "lean-toolchain").read_text().strip()
-    lean = subprocess.run(
-        ["lake", "env", "lean", "--version"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30
-    )
-    if lean.returncode:
-        raise Unavailable("Lean toolchain is unavailable; run lake env lean --version")
     prefix = subprocess.run(
         ["lake", "env", "lean", "--print-prefix"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30
     )
@@ -187,11 +193,75 @@ def key_lock(pool, key, exclusive=True, nonblocking=False):
         yield stream
 
 
+def remove_tree(path):
+    """OverlayFS can leave work/work mode 000; make directories removable first."""
+    path = Path(path)
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.exists():
+        return
+    os.chmod(path, 0o700)
+    for here, directories, _ in os.walk(path, followlinks=False):
+        for name in directories:
+            child = Path(here) / name
+            if not child.is_symlink():
+                os.chmod(child, 0o700)
+    shutil.rmtree(path)
+
+
+def detach_upper(upper, marker):
+    """A sparse overlay delta, including whiteouts, is never a standalone build."""
+    if not marker.exists():
+        return
+    delta = upper.with_name("build-shared-delta")
+    remove_tree(delta)
+    if upper.exists():
+        os.replace(upper, delta)
+    upper.mkdir(parents=True, exist_ok=True)
+    remove_tree(upper.with_name("tauceti-overlay-work"))
+    marker.unlink(missing_ok=True)
+
+
+def durable_tree(path):
+    """Sync immutable data and directories before publishing its ready marker."""
+    for here, _, files in os.walk(path, topdown=False):
+        for name in files:
+            file = Path(here) / name
+            if file.is_symlink():
+                if not file.resolve().is_relative_to(path.resolve()):
+                    raise Unavailable("snapshot has a symlink outside its immutable build tree")
+                continue
+            fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        fd = os.open(here, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def collect(pool, *, protect=(), now=None):
     """Bounded by snapshot count. Locked readers/builders are never reclaimed."""
     now = time.time() if now is None else now
     entries = pool / "entries"
     entries.mkdir(parents=True, exist_ok=True)
+    # A killed builder cannot run TemporaryDirectory cleanup. Reclaim its
+    # staging tree before evicting useful published snapshots for disk pressure.
+    for stage in (pool / "staging").glob("*"):
+        key = stage.name.split("-", 1)[0]
+        if key in protect or len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+            continue
+        if not stage.is_dir() or now - stage.stat().st_mtime < 4 * 3600:
+            continue
+        try:
+            with key_lock(pool, key, nonblocking=True):
+                remove_tree(stage)
+        except (BlockingIOError, FileNotFoundError):
+            pass
     candidates = sorted((p for p in entries.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime)
     removed = []
     for entry in candidates:
@@ -274,6 +344,7 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         ready = stage / "ready"
         ready.mkdir()
         shutil.move(str(build), ready / "build")
+        durable_tree(ready / "build")
         atomic_json(ready / "ready.json", dict(key=key, spec=spec, files_verified=count, published_at=time.time()))
         collect(pool, protect=(key,))
         usage = shutil.disk_usage(pool)
@@ -295,18 +366,27 @@ def report(pool, env, **fields):
     worker = env.get("TAUCETI_WORKER_ID", "default")
     identity = hashlib.sha256(worker.encode()).hexdigest()
     try:
-        atomic_json(pool / "status" / (identity + ".json"), dict(worker=worker, observed_at=time.time(), **fields))
+        atomic_json(
+            pool / "status" / (identity + ".json"),
+            dict(worker=worker, scope=env.get("TAUCETI_FLEET_MACHINE_ID", "local"), observed_at=time.time(), **fields),
+        )
     except OSError:
         from .config import log
 
         log("shared Mathlib reporting unavailable; " + fields.get("reason", fields.get("mode", "unknown")))
 
 
-def summary(env=None):
+def summary(env=None, *, scope=None, worker=None):
     """Background preparation only; status itself reads the resulting summary JSON."""
     pool = root(env)
     rows = [read_json(p) for p in (pool / "status").glob("*.json")]
-    rows = [r for r in rows if time.time() - r.get("observed_at", 0) < 86400]
+    rows = [
+        r
+        for r in rows
+        if time.time() - r.get("observed_at", 0) < 86400
+        and (scope is None or r.get("scope", "local") == scope)
+        and (worker is None or r.get("worker") == worker)
+    ]
     return dict(
         shared=sum(r.get("mode") == "shared" for r in rows),
         private=sum(r.get("mode") == "private" for r in rows),
@@ -329,14 +409,14 @@ def view(cwd, env, logdir, fetch):
         # Normal private cache warming reconstructs any files previously visible
         # only in the lower. Clearing the marker forces a fresh empty upper when
         # sharing is enabled again at a later idle boundary.
-        marker.unlink(missing_ok=True)
+        detach_upper(upper, marker)
         if selected != "off" and selected == "required":
             raise Unavailable("Mathlib dependency is not available for sharing")
         if selected == "off":
             report(pool, env, mode="private", reason="sharing disabled")
         yield []
         return
-    prefix, backup = [], None
+    prefix, backup, backup_created, backup_sparse = [], None, False, False
     with contextlib.ExitStack() as stack:
         try:
             pool.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -366,17 +446,22 @@ def view(cwd, env, logdir, fetch):
             work = upper.with_name("tauceti-overlay-work")
             if old.get("key") != key:
                 if backup.exists():
-                    shutil.rmtree(backup)
+                    remove_tree(backup)
+                backup_sparse = marker.exists()
                 if upper.exists():
                     os.replace(upper, backup)
+                    backup_created = True
                 upper.mkdir(parents=True)
                 if work.exists():
-                    shutil.rmtree(work)
+                    remove_tree(work)
                 atomic_json(marker, dict(key=key, activated_at=time.time()))
             work.mkdir(exist_ok=True)
             candidate = overlay_command(entry / "build", upper, work, upper, pool, lease_fd=lease.fileno())
             probe = subprocess.run(
-                candidate + ["test", "-f", str(upper / "lib/lean/Mathlib.olean")], capture_output=True, timeout=15
+                candidate + ["test", "-f", str(upper / "lib/lean/Mathlib.olean")],
+                capture_output=True,
+                timeout=15,
+                pass_fds=(lease.fileno(),),
             )
             if probe.returncode:
                 raise Unavailable("shared Mathlib view failed: " + probe.stderr.decode(errors="replace")[-300:])
@@ -386,13 +471,15 @@ def view(cwd, env, logdir, fetch):
             env["TAUCETI_SHARED_MATHLIB_KEY"] = key
             report(pool, env, mode="shared", key=key, cache_hit=hit, preparation_seconds=time.monotonic() - started)
         except (Unavailable, OSError, ValueError, subprocess.TimeoutExpired) as error:
-            marker.unlink(missing_ok=True)
-            # Restore a complete private build if activation failed after moving
-            # it aside. Existing private upper writes are otherwise preserved.
-            if backup and backup.exists():
-                if upper.exists():
-                    shutil.rmtree(upper)
-                os.replace(backup, upper)
+            if backup_created and backup and backup.exists():
+                remove_tree(upper)
+                if backup_sparse:
+                    upper.mkdir(parents=True)
+                else:
+                    os.replace(backup, upper)
+                marker.unlink(missing_ok=True)
+            else:
+                detach_upper(upper, marker)
             report(pool, env, mode="private", reason=str(error), preparation_seconds=time.monotonic() - started)
             if selected == "required":
                 raise Unavailable(str(error)) from error
@@ -404,7 +491,7 @@ def view(cwd, env, logdir, fetch):
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
         if prefix and backup and backup.exists():
-            shutil.rmtree(backup)
+            remove_tree(backup)
 
 
 def lease_fds(env):
@@ -426,8 +513,13 @@ def record_result(env, code):
         exit_code=code,
     )
     pool = root(env)
-    with (pool / "results.jsonl").open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        stream.write(json.dumps(record) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    try:
+        with (pool / "results.jsonl").open("a") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            stream.write(json.dumps(record) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        from .config import log
+
+        log("shared Mathlib result receipt unavailable; paid invocation exit status preserved")

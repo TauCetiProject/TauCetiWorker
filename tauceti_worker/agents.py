@@ -781,7 +781,8 @@ def parent_gone():
         pass
     os.killpg(os.getpgrp(), signal.SIGKILL)
 threading.Thread(target=parent_gone, daemon=True).start()
-child = subprocess.Popen(sys.argv[2:], close_fds=True)
+lease = os.environ.get("TAUCETI_SHARED_MATHLIB_LEASE_FD")
+child = subprocess.Popen(sys.argv[2:], close_fds=True, pass_fds=(int(lease),) if lease else ())
 rc = child.wait()
 os._exit(rc if rc >= 0 else 128 - rc)
 """
@@ -1181,7 +1182,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
             unavailable(f"{label} build cache download failed")
         raise AssertionError("unreachable")
 
-    if not prefix and fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
+    if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
         return
     if env.get("LAKE_ARTIFACT_CACHE", "1").lower() in _LAKE_FALSE:
         log("host build caches: TauCeti artifact caching explicitly disabled by LAKE_ARTIFACT_CACHE")
