@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import Counter
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
@@ -119,20 +120,7 @@ def mechanical_output(
     from . import security_audit as sa
 
     try:
-        events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
-        if any(
-            e.get("type")
-            not in {
-                "thread.started",
-                "turn.started",
-                "turn.completed",
-                "item.started",
-                "item.updated",
-                "item.completed",
-            }
-            for e in events
-        ):
-            return False
+        events = sa.codex_events(transcript, paged)
         thread = sa.retained_thread(work)
         if any(e.get("type") == "thread.started" and e.get("thread_id") != thread for e in events):
             return False
@@ -282,6 +270,83 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
     return original, batch, execution, legacy
 
 
+def completed_pass(original: Path, batch: dict, execution: dict) -> dict | None:
+    """Revalidate an already finished current-protocol answer without asking again.
+
+    The caller must first validate ownership, launcher, lineage, native history
+    and the ledger with retained(). Coverage or retry progress alone never passes.
+    """
+    from . import security_audit as sa
+
+    if execution.get("protocol_version") != sa.PROTOCOL_VERSION:
+        return None
+    try:
+        transcript = (original / "model-transcript.jsonl").read_text()
+        events = sa.codex_events(transcript, execution["paged"])
+        if [e.get("thread_id") for e in events if e.get("type") == "thread.started"] != [sa.retained_thread(original)]:
+            return None
+        value = sa.codex_final(transcript, execution["paged"])
+        finals = native_finals(original)
+        if not finals or finals[-1] != value:
+            return None
+        # Earlier public messages must be native commentary, never an extra
+        # source judgment omitted from the retained native conversation.
+        notes = Counter()
+        for line in sa.native_rollouts(original)[0].read_text().splitlines():
+            row = json.loads(line)
+            item = row.get("payload", {})
+            if (
+                row.get("type") == "response_item"
+                and item.get("type") == "message"
+                and item.get("role") == "assistant"
+                and item.get("phase") == "commentary"
+            ):
+                notes[
+                    "".join(p.get("text", "") for p in item.get("content", []) if p.get("type") == "output_text")
+                ] += 1
+        messages = [
+            e["item"].get("text", "")
+            for e in events
+            if e.get("type") == "item.completed" and e.get("item", {}).get("type") == "agent_message"
+        ]
+        if Counter(messages[:-1]) - notes:
+            return None
+        answer = dict(value)
+        token = answer.pop("read_token", None) if execution["paged"] else None
+        verdict = sa.bind_verdict(answer, batch)
+        if verdict["verdict"] != "pass":
+            return None
+        sa.validate_reads(verdict, batch, original / "read-receipt.json", execution["paged"], token)
+        return verdict
+    except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def check_current_batch(work: Path, batch: dict) -> None:
+    from . import security_audit as sa
+
+    sa.require_admin()
+    if sa.remote_sha(sa.CURSOR) != batch["from_sha"]:
+        raise NoProgress("security-audit: cursor moved before recovery launch")
+    main = sa.remote_sha("main")
+    sa.refresh(work / "objects.git", main)
+    target = batch["commits"][-1]["sha"]
+    remaining = sa.validate_history(work / "objects.git", batch["from_sha"], main, target)
+    if remaining[: len(batch["commits"])] != [c["sha"] for c in batch["commits"]]:
+        raise Die("security-audit: retained batch is not the next main prefix")
+
+
+def finish_pass(work: Path, batch: dict, evidence: dict, verdict: dict) -> None:
+    from . import security_audit as sa
+
+    sa.record(work / "ledger.jsonl", {**evidence, "verdict": verdict, "protocol_version": sa.PROTOCOL_VERSION})
+    landed = sa.advance(work / "objects.git", batch)
+    sa.record(work / "ledger.jsonl", {**evidence, "advanced": landed})
+    (work / "blocked.json").rename(work / f"resolved-operational-block-{time.time_ns()}.json")
+    log(f"security-audit: recovered inspection passed; advanced to {landed}")
+    sa.dispatch_advanced(work, landed)
+
+
 def recover(cfg, opts, previous: dict) -> bool:
     """At most one recovery invocation per cooldown; retain the same native UUID."""
     from . import security_audit as sa
@@ -291,6 +356,7 @@ def recover(cfg, opts, previous: dict) -> bool:
         original, batch, execution, legacy = retained(work, previous)
         paged = execution["paged"]
         allowed = execution.get("_allowed_history", ())
+        completed = completed_pass(original, batch, execution)
         transcript_path = original / "model-transcript.jsonl"
         transcript = transcript_path.read_text() if transcript_path.exists() else ""
         mechanical = mechanical_output(
@@ -316,10 +382,23 @@ def recover(cfg, opts, previous: dict) -> bool:
             progress = progress or sa.serialize(sa.codex_final(transcript, True)) in allowed
         interrupted = previous.get("reason") == "security-audit: operational recovery interrupted"
         timed_out = previous.get("failure_kind") == "provider-timeout"
-        if not mechanical and not service and not interrupted and not timed_out and not progress:
+        if not completed and not mechanical and not service and not interrupted and not timed_out and not progress:
             return False
     except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
+    if completed is not None:
+        check_current_batch(work, batch)
+        evidence = {
+            "actor": sa.api("user")["login"],
+            "batch": batch["input_digest"],
+            "from_sha": batch["from_sha"],
+            "to_sha": batch["commits"][-1]["sha"],
+            "attempt": str(original),
+            "recovery_kind": "retained-pass-v3",
+        }
+        log("security-audit: revalidated retained completed pass; no model request needed")
+        finish_pass(work, batch, evidence, completed)
+        return True
     state_path = work / "operational-recovery.json"
     try:
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -342,15 +421,8 @@ def recover(cfg, opts, previous: dict) -> bool:
     attempts = entry.get("attempts", 0) + 1
     state[key] = {"attempts": attempts, "retry_at": time.time() + min(3600, 300 * 2 ** min(attempts - 1, 4))}
     save(state_path, state)  # Reserve the budget before launch; a restart cannot reset it.
-    sa.require_admin()
-    if sa.remote_sha(sa.CURSOR) != batch["from_sha"]:
-        raise NoProgress("security-audit: cursor moved before recovery launch")
-    main = sa.remote_sha("main")
-    sa.refresh(work / "objects.git", main)
+    check_current_batch(work, batch)
     target = batch["commits"][-1]["sha"]
-    remaining = sa.validate_history(work / "objects.git", batch["from_sha"], main, target)
-    if remaining[: len(batch["commits"])] != [c["sha"] for c in batch["commits"]]:
-        raise Die("security-audit: retained batch is not the next main prefix")
     actor = sa.api("user")["login"]
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
@@ -390,14 +462,10 @@ def recover(cfg, opts, previous: dict) -> bool:
             allowed_history=allowed,
             continue_reading=progress,
         )
-        sa.record(work / "ledger.jsonl", {**recovery, "verdict": verdict, "protocol_version": sa.PROTOCOL_VERSION})
         if verdict["verdict"] != "pass":
+            sa.record(work / "ledger.jsonl", {**recovery, "verdict": verdict, "protocol_version": sa.PROTOCOL_VERSION})
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
-        landed = sa.advance(work / "objects.git", batch)
-        sa.record(work / "ledger.jsonl", {**recovery, "advanced": landed})
-        (work / "blocked.json").rename(work / f"resolved-operational-block-{time.time_ns()}.json")
-        log(f"security-audit: recovered inspection passed; advanced to {landed}")
-        sa.dispatch_advanced(work, landed)
+        finish_pass(work, batch, recovery, verdict)
     except (Die, NoProgress, OSError, ValueError, TypeError, AttributeError, sa.subprocess.TimeoutExpired) as exc:
         failure = {
             "from_sha": batch["from_sha"],

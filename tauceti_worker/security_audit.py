@@ -409,9 +409,26 @@ def reviewer_argv(provider: str, *, goals: bool = True) -> list[str]:
     raise Die("security-audit supports only Codex Luna or Claude Haiku")
 
 
+def codex_retry_notice(event: dict) -> bool:
+    """Recognize the client's nonterminal server-retry progress, not arbitrary errors."""
+    return (
+        set(event) == {"type", "message"}
+        and event["type"] == "error"
+        and isinstance(event["message"], str)
+        and re.fullmatch(
+            r"Retrying model request in [0-9]+ seconds\.\.\. \("
+            r"(?:Selected model is at capacity\. Please try a different model\."
+            r"|An error occurred while processing your request\.[^\r\n]*)\)",
+            event["message"],
+        )
+        is not None
+    )
+
+
 def codex_events(transcript: str, paged: bool) -> list[dict]:
     events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
     allowed = {"agent_message", "reasoning"} | ({"context_compaction"} if paged else set())
+    retry_pending = False
     for event in events:
         if event.get("type") not in {
             "thread.started",
@@ -424,8 +441,13 @@ def codex_events(transcript: str, paged: bool) -> list[dict]:
             "item.completed",
         }:
             raise Die("security-audit: unknown reviewer event")
+        if codex_retry_notice(event):
+            retry_pending = True
+            continue
         if event.get("type") in ("error", "turn.failed"):
             raise Die("security-audit: model failed")
+        if event.get("type") == "turn.completed":
+            retry_pending = False
         if event.get("type", "").startswith("item."):
             item = event.get("item", {})
             if (
@@ -437,19 +459,30 @@ def codex_events(transcript: str, paged: bool) -> list[dict]:
                 continue
             if item.get("type") not in allowed:
                 raise Die("security-audit: reviewer attempted an unauthorized tool call")
+    if retry_pending:
+        raise Die("security-audit: model failed")
     return events
 
 
 def codex_final(transcript: str, paged: bool) -> dict:
     events = codex_events(transcript, paged)
     messages = [
-        event["item"].get("text", "")
-        for event in events
+        (i, event["item"].get("text", ""))
+        for i, event in enumerate(events)
         if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
     ]
-    if not messages or not any(event.get("type") == "turn.completed" for event in events):
+    completed = [i for i, event in enumerate(events) if event.get("type") == "turn.completed"]
+    retries = [i for i, event in enumerate(events) if codex_retry_notice(event)]
+    started = [i for i, event in enumerate(events) if event.get("type") == "turn.started"]
+    if (
+        not messages
+        or not completed
+        or completed[-1] < messages[-1][0]
+        or (retries and messages[-1][0] < retries[-1])
+        or (started and messages[-1][0] < started[-1])
+    ):
         raise Die("security-audit: incomplete model response")
-    return json.loads(messages[-1])
+    return json.loads(messages[-1][1])
 
 
 def repair_shape(value: dict, batch: dict, paged: bool) -> bool:

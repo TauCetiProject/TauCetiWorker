@@ -288,6 +288,16 @@ immutable input, original UUID, launch policy, reader, catalog, exact prompt and
 all prior judgments. Complete coverage, the final delivery token, a complete
 passing judgment and confirmed ref update remain mandatory for advancement.
 
+Known Codex capacity and request-processing retry notices are nonterminal progress
+when followed by a completed turn and its answer. Unknown errors and failed turns
+remain failures. If a current-protocol inspection already finished successfully
+but was blocked during result handling, the Worker can revalidate its retained
+answer without another model request or model quota check. The public answer must
+match the native final, all prior judgments must remain clear, and complete reader
+coverage and the final token must validate. Fresh admin, cursor and exact main-prefix
+checks still precede advancement; the ledger records reuse of the original attempt,
+and its evidence and block remain preserved until the ref update is confirmed.
+
 Reviewed version-1 and version-2 launcher profiles can migrate in their original
 native session. Version-2 coverage-only incompletes are recognized only by a closed
 diagnostic grammar whose claimed unread range and final token match the retained

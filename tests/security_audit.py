@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cursor invariants, complete history coverage, authorization, and reviewer isolation."""
 
+import copy
 import hashlib
 import json
 import os
@@ -49,6 +50,59 @@ def append_native(home, answer, thread="11111111-2222-4333-8444-555555555555"):
             )
             + "\n"
         )
+
+
+CAPACITY_RETRY = {
+    "type": "error",
+    "message": "Retrying model request in 300 seconds... (Selected model is at capacity. Please try a different model.)",
+}
+
+
+class RetryEvents(unittest.TestCase):
+    def final(self, events):
+        return sa.codex_final("\n".join(map(sa.serialize, events)), True)
+
+    def test_server_retry_notices_followed_by_a_completed_answer_are_progress(self):
+        answer = {"verdict": "pass", "findings": [], "read_token": "token"}
+        for message in (
+            CAPACITY_RETRY["message"],
+            "Retrying model request in 600 seconds... (An error occurred while processing your request. Request ID abc)",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(
+                    self.final(
+                        [
+                            {"type": "turn.started"},
+                            {"type": "error", "message": message},
+                            CAPACITY_RETRY,
+                            {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(answer)}},
+                            {"type": "turn.completed"},
+                        ]
+                    ),
+                    answer,
+                )
+
+    def test_terminal_unknown_unfinished_and_out_of_order_errors_never_pass(self):
+        answer = {"type": "item.completed", "item": {"type": "agent_message", "text": '{"verdict":"pass"}'}}
+        completed = {"type": "turn.completed"}
+        for events in (
+            [CAPACITY_RETRY, answer],
+            [answer, completed, CAPACITY_RETRY],
+            [answer, CAPACITY_RETRY, completed],
+            [CAPACITY_RETRY, completed, answer],
+            [answer, completed, {"type": "turn.started"}, completed],
+            [{"type": "error", "message": "unknown error"}, answer, completed],
+            [{"type": "turn.failed", "error": {"message": CAPACITY_RETRY["message"]}}, answer, completed],
+            [{**CAPACITY_RETRY, "unknown": True}, answer, completed],
+            [
+                {"type": "error", "message": "Retrying model request in 300 seconds... (unknown failure)"},
+                answer,
+                completed,
+            ],
+            [CAPACITY_RETRY, {"type": "item.completed", "item": {"type": "command_execution"}}, answer, completed],
+        ):
+            with self.subTest(events=events), self.assertRaises(Die):
+                self.final(events)
 
 
 class WorkerBoundJudgments(unittest.TestCase):
@@ -197,6 +251,147 @@ class WorkerBoundJudgments(unittest.TestCase):
         for key, v in (("commits", ["other"]), ("input_digest", "other"), ("batch_id", "other")):
             with self.subTest(key=key), self.assertRaises(Die):
                 sa.bind_verdict({**value, key: v}, self.batch)
+
+    def completed_evidence(self):
+        self.evidence()
+        proof = json.loads((self.original / "read-receipt.json").read_text())
+        self.replace_answer({"verdict": "pass", "findings": [], "read_token": proof["last_token"]})
+        transcript = self.original / "model-transcript.jsonl"
+        events = [json.loads(line) for line in transcript.read_text().splitlines()]
+        events[1:1] = [CAPACITY_RETRY, CAPACITY_RETRY]
+        transcript.write_text("\n".join(map(sa.serialize, events)))
+
+    def test_retained_completed_pass_advances_without_another_model_or_quota_request(self):
+        self.completed_evidence()
+        native = self.original / "model-rollout-0.jsonl"
+        rows = [json.loads(line) for line in native.read_text().splitlines()]
+        earlier = copy.deepcopy(rows[-1])
+        earlier["payload"]["content"][0]["text"] = sa.serialize(
+            {"verdict": "unfinished", "findings": [], "read_token": "earlier-token"}
+        )
+        note = copy.deepcopy(rows[-1])
+        note["payload"]["phase"] = "commentary"
+        note["payload"]["content"][0]["text"] = "All pages inspected; preparing the final judgment."
+        rows[-1:-1] = [earlier, note]
+        native.write_text("\n".join(map(sa.serialize, rows)) + "\n")
+        transcript = self.original / "model-transcript.jsonl"
+        events = [json.loads(line) for line in transcript.read_text().splitlines()]
+        events[-2:-2] = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": note["payload"]["content"][0]["text"]}}
+        ]
+        transcript.write_text("\n".join(map(sa.serialize, events)))
+        before = {p.name: p.read_bytes() for p in self.original.iterdir() if p.is_file()}
+        with (
+            patch.object(sa, "inspect") as model,
+            patch("tauceti_worker.loop.resolve_work_model") as quota,
+            patch.object(sa, "advance", return_value=self.block["to_sha"]) as advance,
+        ):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+        quota.assert_not_called()
+        advance.assert_called_once_with(self.work / "objects.git", self.batch)
+        self.assertFalse((self.work / "blocked.json").exists())
+        self.assertEqual({p.name: p.read_bytes() for p in self.original.iterdir() if p.is_file()}, before)
+        self.assertEqual(len(list(self.work.glob("attempt-*"))), 1)
+        rows = [json.loads(line) for line in (self.work / "ledger.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[0]["verdict"], sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch))
+        self.assertEqual(rows[0]["attempt"], str(self.original))
+        self.assertEqual(rows[0]["recovery_kind"], "retained-pass-v3")
+        self.assertEqual(rows[1]["advanced"], self.block["to_sha"])
+
+    def test_completed_pass_rechecks_admin_cursor_and_exact_main_prefix(self):
+        self.completed_evidence()
+        for name, kwargs in (
+            ("require_admin", {"side_effect": Die("not admin")}),
+            ("remote_sha", {"return_value": "d" * 40}),
+            ("validate_history", {"return_value": ["d" * 40]}),
+        ):
+            with (
+                self.subTest(check=name),
+                patch.object(sa, name, **kwargs),
+                patch.object(sa, "inspect") as model,
+                patch.object(sa, "advance") as advance,
+                self.assertRaises((Die, NoProgress)),
+            ):
+                recovery.recover(self.cfg, self.opts, self.block)
+            model.assert_not_called()
+            advance.assert_not_called()
+            self.assertTrue((self.work / "blocked.json").exists())
+
+    def test_failed_ref_update_preserves_completed_evidence_and_can_retry_without_model(self):
+        self.completed_evidence()
+        before = (self.original / "model-transcript.jsonl").read_bytes()
+        with patch.object(sa, "advance", side_effect=NoProgress("network down")), self.assertRaises(NoProgress):
+            recovery.recover(self.cfg, self.opts, self.block)
+        self.assertTrue((self.work / "blocked.json").exists())
+        self.assertEqual((self.original / "model-transcript.jsonl").read_bytes(), before)
+        with patch.object(sa, "inspect") as model, patch.object(sa, "advance", return_value=self.block["to_sha"]):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+
+    def test_retained_pass_requires_matching_native_final_complete_receipt_and_final_token(self):
+        for damaged in ("native", "receipt", "token", "thread", "tool", "terminal", "unknown", "public-finding"):
+            self.completed_evidence()
+            (self.work / "blocked.json").write_text(sa.serialize(self.block))
+            (self.work / "operational-recovery.json").unlink(missing_ok=True)
+            a = self.original
+            transcript = a / "model-transcript.jsonl"
+            if damaged == "native":
+                native = a / "model-rollout-0.jsonl"
+                native.write_text(native.read_text().splitlines()[0] + "\n")
+            elif damaged == "receipt":
+                receipt = a / "read-receipt.json"
+                receipt.write_text(sa.serialize({**json.loads(receipt.read_text()), "read": []}))
+            elif damaged == "token":
+                self.replace_answer({"verdict": "pass", "findings": [], "read_token": "wrong"})
+            elif damaged == "thread":
+                transcript.write_text(
+                    transcript.read_text().replace(self.thread, "22222222-2222-4333-8444-555555555555")
+                )
+            else:
+                extra = {
+                    "tool": {"type": "item.completed", "item": {"type": "command_execution"}},
+                    "terminal": {"type": "turn.failed", "error": {"message": "network down"}},
+                    "unknown": {"type": "error", "message": "unknown failure"},
+                    "public-finding": {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": '{"verdict":"finding","findings":["IO"]}'},
+                    },
+                }[damaged]
+                transcript.write_text(sa.serialize(extra) + "\n" + transcript.read_text())
+            with self.subTest(damaged=damaged), patch.object(sa, "advance") as advance:
+                try:
+                    with patch.object(sa, "inspect", side_effect=OSError("no model in this test")):
+                        recovery.recover(self.cfg, self.opts, self.block)
+                except NoProgress:
+                    pass  # Missing coverage may continue reading, but cannot approve.
+            advance.assert_not_called()
+            self.assertTrue((self.work / "blocked.json").exists())
+
+    def test_earlier_native_or_ledger_source_judgment_blocks_a_retained_pass(self):
+        for source in ("native", "ledger"):
+            for verdict in ("finding", "incomplete"):
+                self.completed_evidence()
+                (self.work / "ledger.jsonl").write_text("")
+                value = {"verdict": verdict, "findings": ["Possible IO"], "read_token": "old-token"}
+                if source == "native":
+                    p = self.original / "model-rollout-0.jsonl"
+                    rows = [json.loads(line) for line in p.read_text().splitlines()]
+                    earlier = copy.deepcopy(rows[-1])
+                    earlier["payload"]["content"][0]["text"] = sa.serialize(value)
+                    rows.insert(-1, earlier)
+                    p.write_text("\n".join(map(sa.serialize, rows)) + "\n")
+                else:
+                    bound = sa.bind_verdict({k: v for k, v in value.items() if k != "read_token"}, self.batch)
+                    sa.record(self.work / "ledger.jsonl", {"batch": self.batch["input_digest"], "verdict": bound})
+                with (
+                    self.subTest(source=source, verdict=verdict),
+                    patch.object(sa, "inspect") as model,
+                    patch.object(sa, "advance") as advance,
+                ):
+                    self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+                model.assert_not_called()
+                advance.assert_not_called()
 
     def test_missing_coverage_and_foreign_receipt_still_cannot_pass(self):
         p = self.original / "read-receipt.json"
@@ -1427,13 +1622,21 @@ class CompactingInspection(unittest.TestCase):
     def test_one_client_session_can_compact_and_read_all_pages(self):
         self.run_reader_session()
 
+    def test_capacity_retries_can_finish_in_one_inspection_without_a_new_request(self):
+        self.run_reader_session(capacity_retry=True)
+
+    def test_output_repair_after_capacity_retry_preserves_the_same_session(self):
+        self.run_reader_session(capacity_retry=True, repair_once=True)
+
     def test_resume_retains_identity_receipt_and_all_isolation_flags(self):
         self.run_reader_session(resume=True)
 
     def test_resume_before_first_page_starts_with_an_empty_receipt(self):
         self.run_reader_session(resume=True, missing_receipt=True)
 
-    def run_reader_session(self, resume=False, missing_receipt=False, repair_once=False, repair_always=False):
+    def run_reader_session(
+        self, resume=False, missing_receipt=False, repair_once=False, repair_always=False, capacity_retry=False
+    ):
         auth = self.work / "auth.json"
         auth.write_text('{"tokens":{"access_token":"provider-only"}}')
 
@@ -1494,6 +1697,8 @@ class CompactingInspection(unittest.TestCase):
             batch = json.loads((home / "input.json").read_text())
             reader = ar.Reader(batch, self.work / "read-receipt.json", "initial")
             events = [{"type": "item.completed", "item": {"type": "context_compaction"}}]
+            if capacity_retry:
+                events.extend([CAPACITY_RETRY, CAPACITY_RETRY])
             for i in range(len(reader.pages)):
                 reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
                 events.append(
