@@ -1,5 +1,14 @@
 # Shared GitHub state
 
+Reporting clients can use authenticated `POST /v1/activity` with
+`{"repository":"TauCetiProject/TauCeti","numbers":[1,2]}` (maximum 500 numbers).
+It returns stored PR headers, original observation timestamps and missing IDs.
+This route is observation-only: no repository configuration, demand renewal,
+repair jobs, upstream validation or installation-scheduler access. Closed PRs
+without cached merge evidence have no landing timestamp. See
+[activity reporting](../../docs/activity.md); reporting clients must retain stale
+data or unknowns when unavailable, without direct GitHub fallback.
+
 The Cloudflare service receives GitHub webhooks and serves repository state to
 TauCeti clients. Production and test each use a separate private, read-only
 GitHub App installation on `TauCetiProject/TauCeti`. The service owns those read
@@ -162,6 +171,12 @@ npm run deploy -- --env test
 npm run deploy -- --env ''
 ```
 
+`POST /v1/activity` also derives Lean LOC from complete cached PR file lists,
+checking immutable file URLs against the PR's head/base and header totals.
+Derived counts are cached by PR head/base and file-collection revision, with at
+most 32 uncached computations per request. It reads stored resources only: no
+client demand, upstream request, repair job, or closed-PR polling is created.
+
 `/healthz` is public and exposes only service identity/version. `/v1/health`,
 `/v1/query`, `/v1/query_batch`, and `/v1/changes` require a repository-scoped
 client token. Valid credentials querying an unavailable repository scope get
@@ -306,6 +321,17 @@ Missing staging pages restart their collection; persistent parser and transport
 errors retain pagination and retry with exponential delays from one minute to
 one hour. Webhook redelivery auth and transport failures remain retryable while
 other gaps proceed; deleted deliveries trigger one broad repair and are skipped.
+
+The existing cron separately caches Bors promotion receipts from its public,
+read-only candidate journal through the `BORS_ACTIVITY` HTTP service binding,
+at most once per five minutes for TauCeti. The production and test environments
+both read the existing production Bors journal; the request is fixed to GET on
+the candidate observation endpoint, with no public-network fallback. This
+never calls GitHub, registers demand or changes merge authority. Receipts bind
+the original approved PR head to the constructed commit and recorded promotion
+to main. `/v1/activity` reads this cache only, allowing squash-merged PRs to count
+as landed even when GitHub describes them as closed. Failed journal reads retain
+last-known receipts and expose the current preparation error.
 
 Daily R2 archives use version-2 manifests and bounded, resumable table pages.
 They record the starting and ending revisions and are observational archives;

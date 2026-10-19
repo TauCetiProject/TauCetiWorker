@@ -11,11 +11,15 @@ from pathlib import Path
 
 
 def emit(kind, *, key=None, **fields):
+    if __package__:
+        from .activity import emit as activity_emit
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tauceti_worker.activity import emit as activity_emit
+
     path = os.environ.get("TAUCETI_FLEET_EVENTS")
     machine = os.environ.get("TAUCETI_FLEET_MACHINE_ID")
-    if not path or not machine:
-        return
-    # No command lines, prompts, request payloads or credentials enter this log.
+    # Use the same identity in native receipts and the compatibility journal.
     fields = {k: v for k, v in fields.items() if k in {"repository", "pr", "head_sha", "activity"}}
     event = dict(
         version=1,
@@ -26,7 +30,10 @@ def emit(kind, *, key=None, **fields):
         **fields,
     )
     identity = key or json.dumps(event, sort_keys=True)
-    event["id"] = hashlib.sha256((machine + ":" + kind + ":" + identity).encode()).hexdigest()
+    event["id"] = hashlib.sha256(((machine or "local") + ":" + kind + ":" + identity).encode()).hexdigest()
+    activity_emit(kind, key=event["id"], at=event["at"], **fields)
+    if not path or not machine:
+        return
     try:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

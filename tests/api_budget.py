@@ -432,6 +432,47 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             **kwargs,
         )
 
+    def test_usage_storage_failure_before_launch_releases_reservation(self):
+        with ClaudeAPIContext("worker1", "fix") as context:
+            settings = json.loads((context.bin / "config.json").read_text())
+            blocked = self.root / "not-a-directory"
+            blocked.write_text("fixture")
+            settings["usage_dir"] = str(blocked / "usage")
+            (context.bin / "config.json").write_text(json.dumps(settings))
+            result = self.run_claude()
+            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertNotIn('"type": "system"', result.stdout)
+            self.assertIn("no inference started", result.stderr)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_internal_partial_events_are_not_forwarded_to_ordinary_callers(self):
+        os.environ["FAKE_EVENTS"] = json.dumps(
+            [
+                dict(
+                    type="stream_event",
+                    session_id="s",
+                    event=dict(
+                        type="message_start",
+                        message=dict(id="m", model="claude-opus-5-5", usage=dict(input_tokens=1, output_tokens=0)),
+                    ),
+                ),
+                dict(
+                    type="assistant",
+                    session_id="s",
+                    message=dict(id="m", model="claude-opus-5-5", usage=dict(input_tokens=1, output_tokens=2)),
+                ),
+                dict(type="result", session_id="s", total_cost_usd=1),
+            ]
+        )
+        with ClaudeAPIContext("worker1", "fix") as context:
+            result = self.run_claude()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('"type": "stream_event"', result.stdout)
+            namespace = Path(context.config["usage_dir"])
+            self.assertEqual(namespace.name, context.directory.name)
+            self.assertTrue(list(namespace.glob("*.json")))
+
     def test_finished_sessions_never_cut_off_on_balance_change(self):
         os.environ["FAKE_DELAY"] = "0.6"
         os.environ["FAKE_COST"] = "150"
@@ -863,6 +904,7 @@ shutil.copytree(mounts['/opt/api-bin'], private / 'bin')
 settings = private / 'bin/config.json'
 config = json.loads(settings.read_text())
 config['key'] = config['key'].replace('/opt/round', mounts['/opt/round'])
+config['usage_dir'] = mounts['/opt/api-usage']
 (private / 'inbox').symlink_to(mounts['/opt/api-bridge/inbox'])
 (private / 'outbox').symlink_to(mounts['/opt/api-bridge/outbox'])
 config['bridge'] = str(private)

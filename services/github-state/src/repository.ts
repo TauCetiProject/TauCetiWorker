@@ -4,6 +4,7 @@ import { comment, issue, pr, status } from './normalize';
 import { batchLimit } from './catalog';
 import { Lane, LANES, laneAt, settings } from './reconciliation';
 import { SURVEY_CONTRACT, compactPR, issueFragment, reviewFragment, summarizeFragments, inScope, roadmapFocuses } from './survey';
+import { readPromotionReceipts } from './activity_landings';
 
 export class RepositoryState extends DurableObject<Env> {
   private inflightQueries=new Map<string,Promise<Result>>();
@@ -13,6 +14,8 @@ export class RepositoryState extends DurableObject<Env> {
     super(ctx,env);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
       CREATE TABLE IF NOT EXISTS resources(kind TEXT,id TEXT,parent TEXT,data TEXT,updated TEXT,observed INTEGER,revision INTEGER,tombstone INTEGER DEFAULT 0,PRIMARY KEY(kind,id));
+      CREATE TABLE IF NOT EXISTS activity_loc_cache(number INTEGER PRIMARY KEY,fingerprint TEXT,data TEXT);
+      CREATE TABLE IF NOT EXISTS activity_landings(number INTEGER,head TEXT,at INTEGER,source TEXT,PRIMARY KEY(number,head));
       CREATE INDEX IF NOT EXISTS resource_parent ON resources(kind,parent,tombstone);
       CREATE TABLE IF NOT EXISTS collections(key TEXT PRIMARY KEY,operation TEXT,args TEXT,complete INTEGER,verified INTEGER,revision INTEGER,etag TEXT);
       CREATE TABLE IF NOT EXISTS members(collection TEXT,id TEXT,PRIMARY KEY(collection,id));
@@ -123,7 +126,7 @@ export class RepositoryState extends DurableObject<Env> {
   projectSurvey(kind:string,id:string,parent:string,data:any,deleted=false): void {
     if(!parent || !this.ctx.storage.sql.exec("SELECT id FROM resources WHERE kind='pr' AND id=?",parent).toArray().length) return;
     const fragment=kind==='issue_comments'?issueFragment(data):reviewFragment(data);
-    const useful=kind==='issue_comments'?fragment.meta!==null || fragment.marker || fragment.rebase_heads.length:fragment.root || fragment.parent && fragment.reply;
+    const useful=kind==='issue_comments'?fragment.meta!==null || fragment.marker || fragment.rebase_heads.length || fragment.blocked.length:fragment.root || fragment.parent && fragment.reply;
     if(deleted || !useful) this.ctx.storage.sql.exec('DELETE FROM survey_fragments WHERE kind=? AND id=?',kind,id);
     else this.ctx.storage.sql.exec('INSERT INTO survey_fragments VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET parent=excluded.parent,data=excluded.data',kind,id,parent,JSON.stringify(fragment));
   }
@@ -459,7 +462,7 @@ export class RepositoryState extends DurableObject<Env> {
       await this.noteDemand(detail);if(!this.complete(detail)) await this.enqueue(detail,5);
       const cs=await this.rows({...q,operation:'issue_comments'}), rcs=await this.rows({...q,operation:'review_comments'});
       for (const operation of ['issue_comments','review_comments']) { const child={...q,operation};await this.noteDemand(child);if (!this.complete(child)) await this.enqueue(child,5); }
-      rows=p && cs && rcs ? {head:p.headRefOid,ncomments:cs.length+rcs.length,revision:this.revision()}:null;
+      rows=p && cs && rcs ? {head:p.headRefOid,state:p.state,ncomments:cs.length+rcs.length,revision:this.revision()}:null;
     } else {
       if (!q.allow_observed && !this.complete(q)) await this.enqueue(q,5);
       rows=await this.rows(q);
@@ -770,7 +773,7 @@ export class RepositoryState extends DurableObject<Env> {
     let state=this.meta('snapshot_pending');
     if(!state) {
       if(now-(this.meta('last_snapshot') || 0)<=86400000) return;
-      state={version:2,observational:true,started:now,revision:this.revision(),key:`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}-${crypto.randomUUID()}`,index:0,tables:['meta','resources','collections','members'].map(table=>({table,after:0,pages:0,upper:this.ctx.storage.sql.exec<any>('SELECT COALESCE(MAX(rowid),0) last FROM '+table).one().last}))};
+      state={version:2,observational:true,started:now,revision:this.revision(),key:`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}-${crypto.randomUUID()}`,index:0,tables:['meta','resources','collections','members','activity_landings'].map(table=>({table,after:0,pages:0,upper:this.ctx.storage.sql.exec<any>('SELECT COALESCE(MAX(rowid),0) last FROM '+table).one().last}))};
       this.setMeta('snapshot_pending',state);
     }
     // Archive bounded pages and checkpoint each one. Repository mutations can
@@ -871,6 +874,58 @@ export class RepositoryState extends DurableObject<Env> {
       if (row.due) await this.ctx.storage.setAlarm(Math.max(Date.now()+100,row.due));
     }
   }
+  async refreshActivityLandings(): Promise<void> {
+    if(this.meta('repository')?.name!=='TauCetiProject/TauCeti') return;
+    const now=Date.now();
+    if(this.meta('activity_landings_transport')==='service-binding-v2' && now-(this.meta('activity_landings_checked') || 0)<300000) return;
+    // Reserve the interval before yielding so overlapping cron requests cannot
+    // multiply reads. This path never calls configure, demand or the scheduler.
+    this.setMeta('activity_landings_checked',now);
+    this.setMeta('activity_landings_transport','service-binding-v2');
+    try {
+      const receipts=await readPromotionReceipts((url,options)=>this.env.BORS_ACTIVITY.fetch(url,options));
+      for(const r of receipts) this.ctx.storage.sql.exec('INSERT INTO activity_landings VALUES(?,?,?,?) ON CONFLICT(number,head) DO UPDATE SET at=excluded.at,source=excluded.source WHERE excluded.at<activity_landings.at',r.number,r.head,r.at,r.source);
+      this.setMeta('activity_landings_success',now);
+      this.setMeta('activity_landings_error',null);
+    } catch(error) {this.setMeta('activity_landings_error','Stored Bors promotion receipts unavailable: '+(error instanceof Error?error.name+': '+error.message.slice(0,160):'unknown error'));}
+  }
+  async activityLOC(number:number,p:any,budget?:{remaining:number}): Promise<any> {
+    const key=queryKey({operation:'files',args:{number}});
+    const complete=this.ctx.storage.sql.exec<any>('SELECT complete,revision FROM collections WHERE key=?',key).toArray()[0];
+    if(!complete?.complete || !p.headRefOid || !Number.isSafeInteger(p.changedFiles)) return null;
+    const fingerprint=JSON.stringify([p.headRefOid,p.baseRefOid,p.changedFiles,p.additions,p.deletions,complete.revision]);
+    const cached=this.ctx.storage.sql.exec<any>('SELECT data FROM activity_loc_cache WHERE number=? AND fingerprint=?',number,fingerprint).toArray()[0];
+    if(cached) return JSON.parse(cached.data);
+    if(budget && budget.remaining--<=0) return null;
+    const remember=(result:any)=>{
+      this.ctx.storage.sql.exec('INSERT OR REPLACE INTO activity_loc_cache VALUES (?,?,?)',number,fingerprint,JSON.stringify(result));
+      return result;
+    };
+    const stored=this.ctx.storage.sql.exec<any>("SELECT r.data FROM members m JOIN resources r ON r.kind='files' AND r.id=m.id WHERE m.collection=? AND r.tombstone=0",key).toArray();
+    if(stored.length!==p.changedFiles) return remember(null);
+    let added=0,deleted=0,totalAdded=0,totalDeleted=0;
+    for(const row of stored) {
+      const file=await this.decode(row.data);
+      if(typeof file.filename!=='string') return remember(null);
+      if(!Number.isSafeInteger(file.additions) || file.additions<0 || !Number.isSafeInteger(file.deletions) || file.deletions<0) return remember(null);
+      // Cached file URLs carry their immutable commit. A mixed/old-head file
+      // collection cannot be credited to the PR's current output.
+      const expected=file.status==='removed'?p.baseRefOid:p.headRefOid;
+      const matches=(raw:any)=>{
+        try {
+          const url=new URL(raw),parts=url.pathname.split('/').filter(Boolean);
+          if(url.hostname==='github.com') return ['blob','raw'].includes(parts[2]) && parts[3]===expected;
+          if(url.hostname==='raw.githubusercontent.com') return parts[2]===expected;
+          return url.hostname==='api.github.com' && url.searchParams.get('ref')===expected;
+        } catch {return false;}
+      };
+      if(!expected || ![file.blob_url,file.raw_url,file.contents_url].some(matches)) return remember(null);
+      totalAdded+=file.additions;totalDeleted+=file.deletions;
+      if(typeof file.filename==='string' && file.filename.endsWith('.lean')) {added+=file.additions;deleted+=file.deletions;}
+    }
+    if(Number.isSafeInteger(p.additions) && p.additions!==totalAdded || Number.isSafeInteger(p.deletions) && p.deletions!==totalDeleted) return remember(null);
+    return remember({added,deleted,head_sha:p.headRefOid});
+  }
   async fetch(req:Request): Promise<Response> {
     try {
       const path=new URL(req.url).pathname;
@@ -885,6 +940,22 @@ export class RepositoryState extends DurableObject<Env> {
         // Object upload age is not retirement age: a months-old object may
         // still be referenced by yesterday's seven-day archive.
         return json({retained:Date.now()-retired<8*86400000});
+      }
+      if (path==='/activity') {
+        const input:any=await req.json();
+        const prs=[],missing=[],locBudget={remaining:32};
+        // Deliberately no configure, demand, collection verification, or repair.
+        for (const number of input.numbers) {
+          const row=this.ctx.storage.sql.exec<any>("SELECT data,observed FROM resources WHERE kind='pr' AND id=? AND tombstone=0",String(number)).toArray()[0];
+          if(!row){missing.push(number);continue;}
+          const p=await this.decode(row.data);
+          const landing=this.ctx.storage.sql.exec<any>('SELECT at,source FROM activity_landings WHERE number=? AND head=?',number,p.headRefOid || '').toArray()[0];
+          prs.push({number,state:p.state,created_at:p.createdAt || null,landed_at:p.mergedAt || (landing?new Date(landing.at/1000).toISOString():null),
+            head_sha:p.headRefOid || null,observed_at:row.observed,
+            landing_source:p.mergedAt?'github-merged':landing?.source || null,lean_loc:await this.activityLOC(number,p,locBudget)});
+        }
+        return json({version:1,repository:input.repository,revision:this.revision(),as_of:Date.now(),coverage:'observed',prs,missing,
+          landing_observations:{checked_at:this.meta('activity_landings_checked'),last_success_at:this.meta('activity_landings_success'),error:this.meta('activity_landings_error')}});
       }
       if (path==='/query') {
         const q=await req.json() as Query;
@@ -918,6 +989,7 @@ export class RepositoryState extends DurableObject<Env> {
       }
       if (path==='/health') return json({storage_bytes:this.ctx.storage.sql.databaseSize,snapshot_pending:this.meta('snapshot_pending'),survey:this.surveyHealth(),reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),repository:this.meta('repository'),revision:this.revision(),bootstrap_inventory:this.meta('bootstrap_inventory'),last_webhook:this.meta('last_webhook'),webhook_apply_ms:this.meta('webhook_apply_ms'),last_repair:this.meta('last_repair'),last_upstream_failure:this.meta('last_upstream_failure'),coverage:this.ctx.storage.sql.exec('SELECT operation,COUNT(*) resources,SUM(complete) complete,MIN(verified) oldest_verified FROM collections GROUP BY operation').toArray(),jobs:this.ctx.storage.sql.exec('SELECT COUNT(*) total,SUM(due<=?) due,MIN(started) oldest_started FROM jobs',Date.now()).one(),lanes:this.ctx.storage.sql.exec('SELECT lane,COUNT(*) jobs,SUM(due<=? AND lease_until<=?) eligible,SUM(lease_until>?) inflight,MIN(CASE WHEN due<=? AND lease_until<=? THEN due END) oldest_eligible,MIN(requested_at) oldest_requested FROM jobs GROUP BY lane',...Array(5).fill(Date.now())).toArray(),waits:this.ctx.storage.sql.exec('SELECT lane,wait_reason,COUNT(*) jobs FROM jobs WHERE wait_reason IS NOT NULL GROUP BY lane,wait_reason').toArray(),repair_hour:this.ctx.storage.sql.exec('SELECT lane,operation,event,COUNT(*) n,SUM(value) value,MAX(value) maximum FROM repair_metrics WHERE at>? GROUP BY lane,operation,event',Date.now()-3600000).toArray(),requested_latency:this.ctx.storage.sql.exec("SELECT operation,MIN(value) p95_ms,MAX(samples) samples FROM (SELECT operation,value,ROW_NUMBER() OVER(PARTITION BY operation ORDER BY value) rank,COUNT(*) OVER(PARTITION BY operation) samples FROM repair_metrics WHERE event='requested_single_latency_ms' AND at>?) WHERE rank>=MAX(1,CAST((samples*95+99)/100 AS INTEGER)) GROUP BY operation",Date.now()-3600000).toArray(),queries:this.ctx.storage.sql.exec('SELECT * FROM query_metrics').toArray(),repair_operations:this.ctx.storage.sql.exec("SELECT json_extract(query,'$.operation') operation,COUNT(*) jobs,SUM(due<=?) due,MIN(due) next_due,MAX(attempt) attempts FROM jobs GROUP BY operation",Date.now()).toArray()});
       if (path==='/changes') { const after=Number(new URL(req.url).searchParams.get('after') || 0); const first=this.ctx.storage.sql.exec<any>('SELECT MIN(revision) AS revision FROM changes').one(); return json({revision:this.revision(),reset:after>0 && first.revision && after<first.revision-1,changes:this.ctx.storage.sql.exec('SELECT * FROM changes WHERE revision>? ORDER BY revision LIMIT 1000',after).toArray()}); }
+      if (path==='/activity-refresh' && req.method==='POST') {await this.refreshActivityLandings();return json({ok:true});}
       if (path==='/tick') { if (!this.meta('repository')) await this.configure((await req.json() as any).repository); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }
       if (path==='/repair') { this.ctx.storage.sql.exec('UPDATE jobs SET due=CASE WHEN wait_reason IS NULL AND attempt=0 THEN ? ELSE due END,dirty=1,generation=generation+1',Date.now()); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }
       return json({error:'not_found'},404);

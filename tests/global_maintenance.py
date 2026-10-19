@@ -1,0 +1,282 @@
+"""Global maintenance precedes roadmap choice without expanding GitHub reads."""
+
+import importlib
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tauceti_worker.config import NoProgress
+from tauceti_worker.github_state import SurveyRows
+from tauceti_worker.review_state import ReviewState
+from tauceti_worker.survey import PRInfo
+from tauceti_worker.work_units import RoundOpts, run_round
+
+work = importlib.import_module("tauceti_worker.work_units")
+HEAD = "a" * 40
+branch_claimed_elsewhere = work._branch_claimed_elsewhere
+
+
+def row(number, area, *, author="science", blocking=True, complete=True, contest=None, mergeable="MERGEABLE"):
+    return {
+        "pr": {
+            "number": number,
+            "author": {"login": author},
+            "headRefOid": HEAD,
+            "headRefName": "roadmap/work",
+            "headRepositoryOwner": {"login": author},
+            "headRepository": {"name": "TauCeti"},
+            "labels": [{"name": "roadmap/" + area}],
+            "mergeable": mergeable,
+            "statusCheckRollup": [{"context": "build", "state": "SUCCESS"}],
+        },
+        "review": {
+            "meta": {
+                "head_sha": HEAD,
+                "runs": [{"verdict": "request_changes"}],
+                "states": {"reuse": "blocking_request"},
+            }
+            if blocking
+            else None,
+            "markers": [],
+            "rebase_heads": [],
+            "contest": contest,
+            "issue_complete": complete,
+            "review_complete": complete,
+        },
+    }
+
+
+class GlobalMaintenance(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        cfg = SimpleNamespace(wid="test", sbcache=root / "sb", store_dir=root / "review", state=root)
+
+        def forbidden(*args, **kwargs):
+            self.fail("global discovery performed an upstream or per-PR history read")
+
+        gh = SimpleNamespace(
+            repo="org/repo",
+            open_prs=forbidden,
+            issue_comments=forbidden,
+            review_comments=forbidden,
+            fresh_claim_age=forbidden,
+            rebase_requested=forbidden,
+        )
+        self.counter_values = {}
+        self.w = SimpleNamespace(
+            cfg=cfg,
+            gh=gh,
+            claims=SimpleNamespace(),
+            rs=ReviewState(cfg, gh),
+            counters=SimpleNamespace(read=lambda key: self.counter_values.get(key, 0)),
+        )
+        self.opts = RoundOpts(
+            only=["rebase", "fix-ci", "fix", "review", "roadmap"],
+            agent="claude",
+            work_model="claude-opus-5-5",
+            sandbox_host=True,
+            dry_run=False,
+        )
+        for item in (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://state.test", "TAUCETI_ROADMAP_SKIP": ""}),
+            patch.object(work, "roadmap_only", return_value=None),
+            patch("tauceti_worker.survey.me", return_value="science"),
+            patch.object(work, "mirror_creds"),
+            patch.object(work, "_branch_claimed_elsewhere", return_value=False),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def run_round(self, rows, dispatch=None):
+        self.calls = []
+
+        def perform(stage, _w, sv, candidate, _opts):
+            self.calls.append((stage, candidate.pr, candidate.reason, sv.roadmap_only))
+            return dispatch(stage, candidate) if dispatch else 0
+
+        with (
+            patch(
+                "tauceti_worker.github_state.read_survey", return_value=(True, SurveyRows(rows, {"science": 3}))
+            ) as query,
+            patch.object(work, "dispatch", side_effect=perform),
+            patch.object(work, "roadmap_areas", return_value=["NewArea"]) as areas,
+        ):
+            result = run_round(self.w, self.opts)
+        return result, query, areas
+
+    def test_held_prs_do_not_consume_automatic_maintenance_or_reviews(self):
+        for label in ("on-hold", "human", "hold", "keep", "do-not-close"):
+            held = row(10, "Other", mergeable="CONFLICTING")
+            held["pr"]["labels"].append({"name": label})
+            self.run_round([held, row(20, "Other")])
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+            if label in {"keep", "do-not-close"}:
+                continue  # These prohibit closure/recovery, not ordinary reviews.
+            held = row(10, "Other", author="peer", blocking=False)
+            held["pr"]["labels"].append({"name": label})
+            self.run_round([held, row(20, "Other")])
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+
+    def test_authenticated_current_head_blocker_is_shared_without_label_permissions(self):
+        for marker, expected in (
+            ({"head": HEAD, "author": "science"}, [("fix", 20)]),
+            ({"head": "b" * 40, "author": "science"}, [("fix", 10)]),
+            ({"head": HEAD, "author": "peer"}, [("fix", 10)]),
+        ):
+            blocked = row(10, "Other")
+            blocked["review"]["blocked"] = [marker]
+            self.run_round([blocked, row(20, "Other")])
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], expected)
+
+    def test_other_roadmap_maintenance_and_claim_fallthrough(self):
+        # Newest arrives first; a peer holds the oldest. Exhausted and contested
+        # heads must not hide the remaining maintenance in a different area.
+        rows = [
+            row(30, "Algebra"),
+            row(20, "PDE"),
+            row(10, "Topology"),
+            row(15, "Geometry", contest={"id": 1, "rubric": "reuse"}),
+        ]
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+        _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr == 20 else 0)
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20), ("fix", 30)])
+        self.assertEqual(query.call_args.kwargs["stages"], [])
+        self.assertEqual(query.call_args.args[1], "auto")
+        areas.assert_not_called()
+
+    def test_git_claim_precheck_handles_owner_expiry_and_failures(self):
+        leases = [
+            ({"owner": "peer", "expires_at": 200}, True),
+            ({"owner": "test", "expires_at": 200}, False),
+            ({"owner": "peer", "expires_at": 99}, False),
+            ({"owner": "peer", "expires_at": "200"}, False),
+            (None, False),
+        ]
+        import json
+        import subprocess
+
+        with (
+            patch.object(work, "claims_repo", return_value="org/claims"),
+            patch.object(work.time, "time", return_value=100),
+        ):
+            for lease, expected in leases:
+                with patch.object(
+                    work.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(lease))
+                ) as git:
+                    self.assertEqual(branch_claimed_elsewhere(self.w, 10), expected)
+                    self.assertEqual(git.call_args.args[0][1:], ["read", "branch/10"])
+                    self.assertEqual(git.call_args.kwargs["env"]["CLAIM_REPO"], "org/claims")
+            for error in (OSError("offline"), subprocess.TimeoutExpired("git", 15)):
+                with patch.object(work.subprocess, "run", side_effect=error):
+                    self.assertFalse(branch_claimed_elsewhere(self.w, 10))
+
+    def test_known_branch_claim_skips_dispatch_and_fresh_reads(self):
+        with patch.object(work, "_branch_claimed_elsewhere", side_effect=lambda _w, pr: pr == 10):
+            self.run_round([row(10, "Other"), row(20, "Topology")])
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+
+    def test_lost_claim_race_refunds_every_retry_counter(self):
+        self.w.claims = SimpleNamespace(begin_branch_work=lambda *args: False)
+        self.w.counters.write = lambda key, value: self.counter_values.update({key: value})
+        self.counter_values.update({"per-head": 1, "per-pr": 2})
+        sv = work.Survey(worker_id="test")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        result = work._do_fixlike(
+            self.w,
+            sv,
+            work.Candidate(10, HEAD),
+            self.opts,
+            False,
+            prompt_file="fix.md",
+            label="fix-ci",
+            charged=("per-head", "per-pr"),
+        )
+        self.assertIsNone(result)
+        self.assertEqual(self.counter_values, {"per-head": 0, "per-pr": 1})
+
+    def test_global_review_before_area_choice(self):
+        _, _, areas = self.run_round([row(40, "Other", author="peer", blocking=False)])
+        self.assertEqual(self.calls[0][:2], ("review", 40))
+        areas.assert_not_called()
+
+    def test_contest_reaction_is_checked_only_at_dispatch(self):
+        _, _, areas = self.run_round([row(40, "Other", author="peer", contest={"id": 123, "rubric": "reuse"})])
+        self.assertEqual(self.calls[0][:2], ("review", 40))
+        areas.assert_not_called()
+
+    def test_conflicting_pr_needs_no_comment_fetch(self):
+        _, _, areas = self.run_round([row(5, "Other", complete=False, mergeable="CONFLICTING")])
+        self.assertEqual(self.calls[0][:2], ("rebase", 5))
+        areas.assert_not_called()
+
+    def test_new_authoring_selects_area_last(self):
+        _, query, areas = self.run_round([])
+        self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
+        self.assertEqual(query.call_args.kwargs["stages"], [])
+        areas.assert_called_once_with(self.w.gh)
+
+    def test_incomplete_cache_does_not_author_or_fetch_histories(self):
+        with self.assertRaisesRegex(NoProgress, "need cached history"):
+            self.run_round([row(10, "Other", complete=False)])
+        self.assertEqual(self.calls, [])
+
+    def test_unavailable_service_never_falls_back_to_global_github_scan(self):
+        with (
+            patch("tauceti_worker.github_state.read_survey", return_value=(False, None)),
+            patch.object(work, "roadmap_areas") as areas,
+            self.assertRaisesRegex(NoProgress, "global maintenance cache unavailable"),
+        ):
+            run_round(self.w, self.opts)
+        areas.assert_not_called()
+
+    def test_explicit_roadmap_is_preserved(self):
+        with patch.object(work, "roadmap_only", return_value="Topology"):
+            _, query, areas = self.run_round([row(10, "Other"), row(20, "Topology")])
+        self.assertEqual(self.calls[0][:2], ("fix", 20))
+        self.assertEqual(query.call_args.args[1], "Topology")
+        self.assertIn("fix", query.call_args.kwargs["stages"])
+        areas.assert_not_called()
+
+    def test_explicit_pr_overrides_roadmap_without_authoring(self):
+        self.opts.prs = (10,)
+        with patch.object(work, "roadmap_only", return_value="Topology"):
+            _, query, areas = self.run_round([row(10, "Other"), row(20, "Topology")])
+        self.assertEqual(self.calls[0][:2], ("fix", 10))
+        self.assertEqual(query.call_args.kwargs["numbers"], (10,))
+        areas.assert_not_called()
+
+    def test_skipped_roadmap_remains_excluded(self):
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_SKIP": "Topology"}):
+            self.run_round([row(10, "Topology"), row(20, "Other")])
+        self.assertEqual(self.calls[0][:2], ("fix", 20))
+
+    def test_missing_cache_predictor_does_not_offer_authoring(self):
+        survey = importlib.import_module("tauceti_worker.survey")
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, [row(10, "Other", complete=False)])):
+            result = survey.survey(
+                self.w.cfg,
+                self.w.gh,
+                self.w.rs,
+                self.w.counters,
+                stages=["fix", "review"],
+                selected_roadmap="auto",
+                cached_only=True,
+            )
+        self.assertEqual(result.discovery_gaps, 1)
+        self.assertIsNone(result.next_auto_stage)
+
+    def test_disabled_maintenance_remains_disabled(self):
+        self.opts.only = ["roadmap"]
+        self.run_round([row(10, "Other", complete=False)])
+        self.assertEqual(self.calls[0][:2], ("roadmap", 0))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -23,7 +23,7 @@ FIRST_PIN = "66748b489336a59ed4b4a4a612615c38de823e9a"
 LABEL = "mathlib-overlap"
 DEFAULT_BATCH = 160  # calibrated with nine inspected Codex scans; see docs/mathlib-overlap-calibration.md
 MARKER = re.compile(r"<!--tauceti-mathlib-overlap:v1 ([0-9a-f]{64})-->")
-HOLDS = {"keep", "hold", "wip", "human", "do-not-close"}
+HOLDS = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
 
 
 class HistoryRangeError(Die):

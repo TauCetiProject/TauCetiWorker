@@ -844,7 +844,7 @@ class GitHub:
                 or live.get("head", {}).get("repo", {}).get("full_name") != self.repo
                 or live.get("user", {}).get("login") != "tauceti-review-bot[bot]"
                 or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
-                & {"keep", "hold", "wip", "human", "do-not-close", "needs-rebase"}
+                & {"keep", "hold", "wip", "human", "on-hold", "do-not-close", "needs-rebase"}
             ):
                 return None
             context = ssl.create_default_context()
@@ -1129,7 +1129,7 @@ class GitHub:
             return None
 
     def pr_progress_state(self, pr: int) -> dict | None:
-        """{'head': <headRefOid>, 'ncomments': <issue + review-thread comments>} in ONE GraphQL request,
+        """Head, lifecycle state and issue + review-thread comment count in ONE GraphQL request,
         replacing a `pr view` plus two paginated REST comment fetches. The progress guard runs this twice
         per guarded round per PR, so collapsing ~5 REST calls into 1 GraphQL call is the bulk of the
         round's GitHub spend. None on any failure (caller treats that as 'can't tell'). Review threads are
@@ -1143,7 +1143,7 @@ class GitHub:
         owner, _, name = self.repo.partition("/")
         q = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
-            "pullRequest(number:$pr){headRefOid comments{totalCount}"
+            "pullRequest(number:$pr){headRefOid state comments{totalCount}"
             "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
         )
         p = self._gh(
@@ -1158,13 +1158,13 @@ class GitHub:
             d = payload["data"]["repository"]["pullRequest"]
             threads = d["reviewThreads"]
             if threads["totalCount"] > 100:  # beyond one page — get the exact count via REST
-                return self._pr_progress_state_rest(pr, d["headRefOid"])
+                return self._pr_progress_state_rest(pr, d["headRefOid"], d.get("state"))
             nc = d["comments"]["totalCount"] + sum(t["comments"]["totalCount"] for t in threads["nodes"])
-            return {"head": d["headRefOid"], "ncomments": nc}
+            return {"head": d["headRefOid"], "ncomments": nc, "state": d.get("state")}
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
 
-    def _pr_progress_state_rest(self, pr: int, head: str) -> dict | None:
+    def _pr_progress_state_rest(self, pr: int, head: str, state: str | None = None) -> dict | None:
         """Exact issue + review comment count via the paginated REST endpoints (the pre-GraphQL path),
         for the rare PR with >100 review threads. None if either fetch fails."""
         with transport.read_context(fresh=True):
@@ -1172,7 +1172,7 @@ class GitHub:
             rcs = self.review_comments(pr)
         if cs is None or rcs is None:
             return None
-        return {"head": head, "ncomments": len(cs) + len(rcs)}
+        return {"head": head, "ncomments": len(cs) + len(rcs), "state": state}
 
     def api_jq(self, path: str, jq: str) -> str | None:
         def fetch():

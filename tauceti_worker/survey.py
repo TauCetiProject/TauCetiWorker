@@ -113,6 +113,16 @@ class Counters:
         self.write(name, v)
         return v
 
+    def foreign_repair_launched(self, pr: int) -> bool:
+        # An unreadable/malformed receipt still consumes the optional canary.
+        return (self.state / f"rebase-foreign-launch-{pr}.json").exists()
+
+    def record_foreign_repair_launch(self, pr: int, head: str, evidence: str, main: str) -> None:
+        self._atomic_write(
+            f"rebase-foreign-launch-{pr}.json",
+            json.dumps({"pr": pr, "head": head, "evidence_main": evidence, "integration_main": main}),
+        )
+
     def _rebase_progress(self, pr: int) -> dict | None:
         try:
             value = json.loads((self.state / f"rebase-progress-{pr}.json").read_text())
@@ -149,7 +159,7 @@ class Counters:
             or not patch.build_success
             or not patch.head_oid
             or {name.lower() for name in patch.labels}
-            & {"needs-rebase", "keep", "hold", "wip", "human", "do-not-close"}
+            & {"needs-rebase", "keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         ):
             return
         at = patch.build_status_at
@@ -278,6 +288,7 @@ class Candidate:
     ready_at: int | None = None  # when this exact review unit became actionable
     preferred_reviewer: str = ""  # latest scoreboard publisher; gets a short first refusal
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
+    foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
 
 
@@ -315,6 +326,8 @@ class Survey:
     progress: WorkKind = field(default_factory=lambda: WorkKind("progress"))  # a roadmap report is due
     overlap_scan: WorkKind = field(default_factory=lambda: WorkKind("overlap-scan"))
     overlap_fix: WorkKind = field(default_factory=lambda: WorkKind("overlap-fix"))
+    me_login: str = ""
+    blocked_prs: list[int] = field(default_factory=list)
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -325,6 +338,7 @@ class Survey:
     max_open_prs: int = field(default_factory=configured_max_open_prs)
     next_auto_stage: str | None = None
     github_failed: bool = False
+    discovery_gaps: int = 0  # cached histories needed before ruling out global maintenance
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
@@ -760,6 +774,7 @@ def survey(
     selected_roadmap=None,
     numbers=(),
     count_all_roadmaps=False,
+    cached_only=False,
 ) -> Survey:
     """Classify relevant open PRs per enabled work-kind, without writes or model work.
 
@@ -771,8 +786,8 @@ def survey(
     began = time.monotonic()
     _f = selected_roadmap if selected_roadmap is not None else roadmap_only()
     enabled = set(AUTO_STAGES if stages is None else stages)
-    # Authoring rounds pass their selected area before any history reads; status
-    # and dashboard calls keep "auto" stable rather than randomly changing scope.
+    # Automatic rounds discover existing work across all areas. Explicit scopes
+    # still filter before history reads; authoring chooses its area after maintenance.
     sv = Survey(
         worker_id=cfg.wid,
         roadmap_only=("auto" if _f is None else (_f or "any")),
@@ -785,10 +800,20 @@ def survey(
         from .github_state import read_survey
 
         available, compact = (
-            read_survey(gh.repo, sv.roadmap_only, sv.roadmap_skip, numbers=numbers, stages=sorted(enabled))
+            read_survey(
+                gh.repo,
+                sv.roadmap_only,
+                sv.roadmap_skip,
+                numbers=numbers,
+                stages=[] if cached_only else sorted(enabled),
+            )
             if deep and hasattr(gh, "repo")
             else (False, [])
         )
+        if cached_only and not available:
+            sv.github_failed = True
+            sv.errors.append("global maintenance cache unavailable; waiting for the shared GitHub state service")
+            return sv
         raw = [row["pr"] for row in compact] if available else gh.open_prs()
         if available and seed:
             seed(compact)
@@ -829,10 +854,11 @@ def survey(
         if not p.is_draft
         and not (
             p.automatic_bump
-            and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close"}
+            and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         )
     ]
     me_login = me()
+    sv.me_login = me_login
     mine = [p for p in nondraft if p.author == me_login]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
@@ -841,8 +867,29 @@ def survey(
     )
     tend_bot = bot_on_canonical and can_push(TAUCETI) is True
     tended = [
-        p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
+        p
+        for p in nondraft
+        if (p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
+        and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]
+    facts = {row["pr"]["number"]: row["review"] for row in compact or []}
+    if deep and rs is not None and hasattr(rs, "maintenance_blocked"):
+        blocked_prs = {p.number for p in nondraft if rs.maintenance_blocked(p.number, p.head_oid, p.author)}
+        sv.blocked_prs = sorted(blocked_prs)
+        tended = [p for p in tended if p.number not in blocked_prs]
+    else:
+        blocked_prs = set()
+    gaps: set[int] = set()
+
+    def history_ready(p):
+        if not cached_only:
+            return True
+        covered = facts.get(p.number, {})
+        ready = covered.get("issue_complete") and covered.get("review_complete")
+        if not ready:
+            gaps.add(p.number)
+        return ready
+
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv._mine_open_prs = mine
@@ -856,11 +903,29 @@ def survey(
     #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
     #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
     #    is rebased until it merges or CI retires it.
-    for p in tended if "rebase" in enabled else []:
+    foreign_repairs = []
+    if "rebase" in enabled:
+        from .repair_route import authorize, target
+
+        scope = target()
+        for p in nondraft if scope else []:
+            if p not in tended and (p.number, p.head_oid) == (scope.pr, scope.head):
+                if integration := authorize(gh, p.number, p.head_oid, p.head_ref, f"{p.head_owner}/{p.head_repo}"):
+                    foreign_repairs.append(p)
+    for p in tended + foreign_repairs if "rebase" in enabled else []:
+        foreign = p in foreign_repairs
         labels = {label.lower() for label in p.labels}
-        if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
+        if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
             continue
-        handoff = (
+        if (
+            cached_only
+            and p.mergeable != "CONFLICTING"
+            and "needs-rebase" in labels
+            and not facts.get(p.number, {}).get("issue_complete")
+        ):
+            gaps.add(p.number)
+            continue
+        handoff = foreign or (
             p.mergeable != "CONFLICTING"
             and "needs-rebase" in labels
             and (
@@ -897,6 +962,9 @@ def survey(
                 continue
             reason = "authenticated request for integration repair"
         c = Candidate(p.number, p.head_oid, reason)
+        if foreign:
+            c.foreign_repair_base = integration
+            c.reason = "explicitly scoped foreign-fork integration repair"
         try:
             if budget_error:
                 raise RebaseBudgetUnavailable(budget_error)
@@ -905,10 +973,12 @@ def survey(
             # green push cannot prove it succeeded; retain its per-PR cap.
             c.rebase_budget_key = key_for(p.number) if key_for and not handoff else f"rebase-pr-{p.number}"
             c.attempts = counters.read(c.rebase_budget_key)
+            if foreign and getattr(counters, "foreign_repair_launched", lambda _: False)(p.number):
+                c.attempts = max(1, c.attempts)
         except RebaseBudgetUnavailable as error:
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS
-        c.budget = MAX_REBASE_ATTEMPTS
+        c.budget = 1 if foreign else MAX_REBASE_ATTEMPTS
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
@@ -917,12 +987,16 @@ def survey(
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
     for p in nondraft if "review" in enabled else []:
+        if p.number in blocked_prs or {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
+            continue
         if not p.build_success:
             continue
         if not deep:
             sv.reviewable.actionable.append(
                 Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
             )
+            continue
+        if not history_ready(p):
             continue
         m = rs.gh_meta(p.number)
         if rs.ledger_clean_head(p.number) != p.head_oid:
@@ -966,7 +1040,9 @@ def survey(
         # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
         # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
         # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
-        age = gh.fresh_claim_age(reply["id"])
+        # Global discovery never reads reactions for every contest. Dispatch
+        # rechecks the selected reply's claim immediately before launching.
+        age = None if cached_only else gh.fresh_claim_age(reply["id"])
         if age is not None and age < CONTEST_CLAIM_TTL:
             continue
         rubric = reply["rubric"]
@@ -998,6 +1074,8 @@ def survey(
         #    green, attempts spent) so a fix-focused worker explains its idleness instead of a bare
         #    "no eligible work" — reviews are async, so a one-shot fix run can precede the scoreboard.
         for p in tended:
+            if cached_only and (not p.build_success or not history_ready(p)):
+                continue
             meta = rs.gh_meta(p.number)
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
@@ -1065,7 +1143,15 @@ def survey(
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
         if not (branch and (p.build_failed or integration)):
             continue
-        if {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close", "needs-rebase"}:
+        if {label.lower() for label in p.labels} & {
+            "keep",
+            "hold",
+            "wip",
+            "human",
+            "on-hold",
+            "do-not-close",
+            "needs-rebase",
+        }:
             continue
         c = Candidate(
             p.number,
@@ -1114,6 +1200,7 @@ def survey(
         from .overlaps import survey_overlaps
 
         survey_overlaps(cfg, gh, sv)
+    sv.discovery_gaps = len(gaps)
     sv.next_auto_stage = _next_auto_stage(sv)
     if deep:
         from .github_transport import event
@@ -1137,6 +1224,6 @@ def _next_auto_stage(sv: Survey) -> str | None:
     for stage in AUTO_STAGES:
         if sv.kind(stage).actionable:
             return stage
-    if not sv.roadmap_backpressure:
+    if not sv.roadmap_backpressure and not sv.discovery_gaps:
         return "roadmap"
     return None

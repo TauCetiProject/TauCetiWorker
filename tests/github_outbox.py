@@ -303,3 +303,25 @@ with (
         assert outbox.reconcile(value, unpinned) is True and read.call_count == 1
     assert "paid-result" not in (Path(tmp) / "requests.jsonl").read_text()
 print("PASS: quota deferral, durable publication and ambiguous-write reconciliation")
+
+
+# An uncertain close is reconciled against its exact original head and actor.
+head = "a" * 40
+value = {
+    "argv": ["pr", "close", "7", "--repo", "org/repo"],
+    "context": {"pr": "7", "expected_head": head, "actor": "author"},
+}
+for live, expected in (
+    ({"state": "closed"}, True),
+    ({"state": "open", "head": {"sha": head}, "user": {"login": "author"}, "labels": []}, False),
+    ({"state": "open", "head": {"sha": "b" * 40}, "user": {"login": "author"}}, "obsolete"),
+    ({"state": "open", "head": {"sha": head}, "user": {"login": "peer"}}, "obsolete"),
+    ({"state": "open", "head": {"sha": head}, "user": {"login": "author"}, "labels": [{"name": "keep"}]}, "obsolete"),
+):
+    with patch.object(tr, "execute", return_value=subprocess.CompletedProcess([], 0, json.dumps(live), "")):
+        assert outbox.reconcile(value, {}) == expected, (live, expected)
+with patch.object(tr, "execute", return_value=subprocess.CompletedProcess([], 1, "", "timeout")):
+    assert outbox.reconcile(value, {}) is None
+with patch.object(tr, "execute") as request:
+    assert outbox.reconcile({**value, "context": {}}, {}) is None
+    request.assert_not_called()

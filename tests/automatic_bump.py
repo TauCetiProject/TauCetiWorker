@@ -124,6 +124,7 @@ with patch.object(w, "run_in_bubble", return_value=0) as launch:
     assert "1970-01-01 00:18:43 UTC" in prompt
     assert "push it once" in prompt
     assert "CI red" in prompt
+    assert "You may NOT close this PR" in prompt
 
 # Comment-only activity cannot classify an automatic repair as productive.
 worker.gh.pr_progress_state = lambda _: {"head": HEAD, "ncomments": 2}

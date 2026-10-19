@@ -18,11 +18,14 @@ def add_budget_parser(sub):
     parser.add_argument("--cost", metavar="USD", help="reconciled cost")
     parser.add_argument("--note", default="", help="explanation required for reconciliation or ledger repair")
     parser.add_argument("--repair-ledger", action="store_true", help="archive a torn write and audit recovery")
+    parser.add_argument("--dry-run", action="store_true", help="preview --recover without changing the ledger")
     parser.add_argument("--recover", action="store_true", help="recover receipts from stopped accounting bridges")
 
 
 def cmd_budget(args):
     budget = Budget()
+    if args.dry_run and not args.recover:
+        raise BudgetError("--dry-run requires --recover")
     changes = any(v is not None for v in (args.grant, args.set_grant, args.grant_rate))
     if sum((changes, bool(args.reconcile), args.repair_ledger, args.recover, args.log)) > 1:
         raise BudgetError("choose one of grant changes, reconciliation, repair, or history")
@@ -38,7 +41,7 @@ def cmd_budget(args):
     elif args.repair_ledger:
         snapshot = budget.repair(args.note)
     elif args.recover:
-        snapshot = budget.recover(args.note)
+        snapshot = budget.recover(args.note, dry_run=args.dry_run)
     elif args.log:
         with budget.locked():
             records = budget.records()
@@ -74,6 +77,8 @@ def cmd_budget(args):
         print("  Balance reaches zero       " + datetime.fromtimestamp(snapshot["balance_zero_at"], UTC).isoformat())
     if snapshot["clock_backwards"]:
         print("  Clock moved backward; accrual waits for the persisted watermark")
+    for action in snapshot.get("recovery_actions", []):
+        print("  Recovery: " + json.dumps(action))
     for error in snapshot.get("recovery_errors", []):
         print("  Unresolved recovery: " + error)
     print(f"  Ledger                     {snapshot['ledger']}")

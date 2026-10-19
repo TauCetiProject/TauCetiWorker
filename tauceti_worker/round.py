@@ -32,12 +32,14 @@ class RoundContext:
     """Holds the per-worker round lock for the life of a round, runs cleanup on any exit, and routes
     SIGTERM→143 / SIGINT→130 through that cleanup (so a loop-sent SIGTERM still releases the lease)."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, *, record_activity=True):
         self.cfg = cfg
         self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or (time.time() + ROUND_TIMEOUT))
         self._fd: int | None = None
         self._cleanups: list = []
         self._done = False
+        self.activity = None
+        self.record_activity = record_activity
 
     def __enter__(self) -> RoundContext:
         self.cfg.state.mkdir(parents=True, exist_ok=True)
@@ -52,6 +54,10 @@ class RoundContext:
                 f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
             ) from None
         self._fd = fd
+        if self.record_activity:
+            from .activity import Round
+
+            self.activity = Round(self.cfg.wid)
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
@@ -72,6 +78,8 @@ class RoundContext:
         if self._done:
             return
         self._done = True
+        if self.activity:
+            self.activity.finish()
         for fn in reversed(self._cleanups):  # LIFO: stop heartbeat, pop bubble, release claim
             try:
                 fn()
@@ -86,6 +94,8 @@ class RoundContext:
             self._fd = None
 
     def __exit__(self, *exc) -> bool:
+        if self.activity:
+            self.activity.finish(exc[1])
         self._cleanup()
         return False
 

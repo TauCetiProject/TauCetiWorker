@@ -19,7 +19,11 @@ FAIL_FAST=0
 
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
+  activity.py
+  activity_costs.py
   api_budget.py
+  usage_accounting.py
+  shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
   auto_stage_priority.py
@@ -50,6 +54,7 @@ RUN_STDLIB=(
   github_state_rollout.py
   github_state_reconciliation.py
   github_outbox.py
+  global_maintenance.py
   github_pause.py
   host_agent_preflight.py
   host_build_cache.py
@@ -79,6 +84,7 @@ RUN_STDLIB=(
   quota_cache_fp.py
   quota_loop_refresh.py
   rebase_handoff.py
+  scoped_repair_route.py
   rebase_budget.py
   review_sync_failure.py
   quota_claude_bootstrap.py

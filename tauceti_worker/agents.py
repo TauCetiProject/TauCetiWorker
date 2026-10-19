@@ -666,9 +666,9 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
-    with host_build_cache_context(cwd, env, logdir):
+    with host_build_cache_context(cwd, env, logdir) as prefix:
         rc = run_agent_proc(
-            argv,
+            [*(prefix or []), *argv],
             env=env,
             cwd=cwd,
             logdir=logdir,
@@ -676,6 +676,10 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
             provider=profile.provider,
             cancel_event=cancel_event,
         )
+        if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
+            from .shared_mathlib import record_result
+
+            record_result(env, rc)
     if rc == 75:
         from .claude_api import blocked_reason
 
@@ -777,7 +781,8 @@ def parent_gone():
         pass
     os.killpg(os.getpgrp(), signal.SIGKILL)
 threading.Thread(target=parent_gone, daemon=True).start()
-child = subprocess.Popen(sys.argv[2:], close_fds=True)
+lease = os.environ.get("TAUCETI_SHARED_MATHLIB_LEASE_FD")
+child = subprocess.Popen(sys.argv[2:], close_fds=True, pass_fds=(int(lease),) if lease else ())
 rc = child.wait()
 os._exit(rc if rc >= 0 else 128 - rc)
 """
@@ -830,6 +835,8 @@ def run_agent_proc(
         if cancel_event is not None:
             reader, writer = os.pipe()
             command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *argv]
+        from .shared_mathlib import lease_fds
+
         try:
             proc = subprocess.Popen(
                 command,
@@ -842,7 +849,7 @@ def run_agent_proc(
                 errors="replace",
                 bufsize=1,
                 start_new_session=cancel_event is not None,
-                pass_fds=() if reader is None else (reader,),
+                pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env)),
             )
         except BaseException:
             if writer is not None:
@@ -1045,37 +1052,71 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.pop("TAUCETI_PR_CACHE_MISS", None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
-        warm_host_build_caches(cwd, env, logdir)
-        yield
+        from . import shared_mathlib
+
+        try:
+            with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+                if prefix:
+                    env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+                try:
+                    try:
+                        warm_host_build_caches(cwd, env, logdir)
+                    except Exception as error:
+                        if prefix:
+                            shared_mathlib.preparation_status(env, error=error)
+                        raise
+                    if prefix:
+                        shared_mathlib.preparation_status(env)
+                    yield prefix
+                finally:
+                    env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        except shared_mathlib.Unavailable as error:
+            raise BuildCacheUnavailable(
+                f"shared Mathlib required: {error}", log_file=logdir / "shared-mathlib-prepare.log"
+            ) from error
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
-    """Terminate downloader children on timeout or interruption (including round SIGTERM).
+    """Bind detached downloaders to the worker, including after parent SIGKILL.
 
-    SIGKILL cannot run Python cleanup; normal manager/round shutdown sends SIGTERM first.
+    The pipe guardian retains the snapshot lease and kills its process group if
+    the worker disappears. Ordinary timeout/interruption also tears down the group.
     """
-    proc = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        stdout=output,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    from .shared_mathlib import lease_fds
+
+    reader, writer = os.pipe()
     try:
-        return proc.wait(timeout=timeout)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command],
+            pass_fds=(reader, *lease_fds(env)),
+            cwd=cwd,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        finally:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+        os.close(writer)
         raise
+    finally:
+        os.close(reader)
+    try:
+        try:
+            return proc.wait(timeout=timeout)
+        except BaseException:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            raise
+    finally:
+        os.close(writer)
 
 
 def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
@@ -1085,6 +1126,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
     failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
     retain successful downloads. All fetches together have one twenty-minute deadline.
     """
+    prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
     max_revs = lake_cache_max_revs(env)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
@@ -1107,7 +1149,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
                 output.flush()
                 try:
-                    rc = _cache_fetch(command, cwd, env, output, remaining)
+                    rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1765,13 +1807,19 @@ def run_in_bubble(
         api_bin = rounddir / "api-bin"
         api_bin.mkdir(mode=0o700)
         shutil.copy(Path(__file__).with_name("claude_api_client.py"), api_bin / "claude")
+        for name in ("usage_accounting.py", "prices.json"):
+            shutil.copy(Path(__file__).with_name(name), api_bin / name)
         (api_bin / "claude").chmod(0o700)
         keyfile = rounddir / "anthropic.key"
         keyfile.write_text((bridge / "key").read_text())
         keyfile.chmod(0o600)
         w.rc.add_cleanup(lambda: keyfile.unlink(missing_ok=True))
         settings = json.loads((bridge / "bin/config.json").read_text())
+        usage_dir = settings.get("usage_dir")
         settings.update(command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge")
+        if usage_dir:
+            settings["usage_dir"] = "/opt/api-usage"
+            mount_flags += ["--mount", f"{usage_dir}:/opt/api-usage:rw"]
         atomic(api_bin / "config.json", settings)
         mount_flags += [
             "--mount",
@@ -2071,6 +2119,9 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
     and resolved through `_host_home()` (pwd, not $HOME) so it computes the same answer either way. An
     operator-supplied value always wins. Returns the resolved mapping, for logging."""
     host = _host_home()
+    from .shared_mathlib import pin_root
+
+    pin_root(os.environ)
     os.environ.setdefault("ELAN_HOME", str(build_caches.elan_pool(host)))
     os.environ.setdefault("MATHLIB_CACHE_DIR", str(data_home / ".cache" / "mathlib"))
     os.environ.setdefault("LAKE_CACHE_DIR", str(data_home / ".cache" / "lake"))

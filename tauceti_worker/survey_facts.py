@@ -156,10 +156,27 @@ def rebase_heads(comments):
     return sorted(set(heads))
 
 
+def blocked(comments):
+    """Only an unquoted, head-bound marker signed by the real comment actor."""
+    result = []
+    for comment in comments or []:
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        actor = (comment.get("user") or {}).get("login")
+        if not isinstance(body, str) or len(body) > 32768 or not isinstance(actor, str):
+            continue
+        match = re.match(r"\A<!--tauceti-blocked:v1 ([a-f0-9]{40})-->(?:\r?\n|\Z)", body)
+        if match:
+            result.append({"head": match[1], "author": actor.lower()})
+    return result
+
+
 def summarize(issue_comments, review_comments):
     return {
         "meta": compact_meta(scoreboard(issue_comments)),
         "markers": markers(issue_comments),
         "contest": newest_contest(review_comments),
         "rebase_heads": rebase_heads(issue_comments),
+        "blocked": blocked(issue_comments),
     }
