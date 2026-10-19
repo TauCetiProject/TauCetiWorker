@@ -13,6 +13,7 @@ export class RepositoryState extends DurableObject<Env> {
     super(ctx,env);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
       CREATE TABLE IF NOT EXISTS resources(kind TEXT,id TEXT,parent TEXT,data TEXT,updated TEXT,observed INTEGER,revision INTEGER,tombstone INTEGER DEFAULT 0,PRIMARY KEY(kind,id));
+      CREATE TABLE IF NOT EXISTS activity_loc_cache(number INTEGER PRIMARY KEY,fingerprint TEXT,data TEXT);
       CREATE INDEX IF NOT EXISTS resource_parent ON resources(kind,parent,tombstone);
       CREATE TABLE IF NOT EXISTS collections(key TEXT PRIMARY KEY,operation TEXT,args TEXT,complete INTEGER,verified INTEGER,revision INTEGER,etag TEXT);
       CREATE TABLE IF NOT EXISTS members(collection TEXT,id TEXT,PRIMARY KEY(collection,id));
@@ -871,6 +872,43 @@ export class RepositoryState extends DurableObject<Env> {
       if (row.due) await this.ctx.storage.setAlarm(Math.max(Date.now()+100,row.due));
     }
   }
+  async activityLOC(number:number,p:any,budget?:{remaining:number}): Promise<any> {
+    const key=queryKey({operation:'files',args:{number}});
+    const complete=this.ctx.storage.sql.exec<any>('SELECT complete,revision FROM collections WHERE key=?',key).toArray()[0];
+    if(!complete?.complete || !p.headRefOid || !Number.isSafeInteger(p.changedFiles)) return null;
+    const fingerprint=JSON.stringify([p.headRefOid,p.baseRefOid,p.changedFiles,p.additions,p.deletions,complete.revision]);
+    const cached=this.ctx.storage.sql.exec<any>('SELECT data FROM activity_loc_cache WHERE number=? AND fingerprint=?',number,fingerprint).toArray()[0];
+    if(cached) return JSON.parse(cached.data);
+    if(budget && budget.remaining--<=0) return null;
+    const remember=(result:any)=>{
+      this.ctx.storage.sql.exec('INSERT OR REPLACE INTO activity_loc_cache VALUES (?,?,?)',number,fingerprint,JSON.stringify(result));
+      return result;
+    };
+    const stored=this.ctx.storage.sql.exec<any>("SELECT r.data FROM members m JOIN resources r ON r.kind='files' AND r.id=m.id WHERE m.collection=? AND r.tombstone=0",key).toArray();
+    if(stored.length!==p.changedFiles) return remember(null);
+    let added=0,deleted=0,totalAdded=0,totalDeleted=0;
+    for(const row of stored) {
+      const file=await this.decode(row.data);
+      if(typeof file.filename!=='string') return remember(null);
+      if(!Number.isSafeInteger(file.additions) || file.additions<0 || !Number.isSafeInteger(file.deletions) || file.deletions<0) return remember(null);
+      // Cached file URLs carry their immutable commit. A mixed/old-head file
+      // collection cannot be credited to the PR's current output.
+      const expected=file.status==='removed'?p.baseRefOid:p.headRefOid;
+      const matches=(raw:any)=>{
+        try {
+          const url=new URL(raw),parts=url.pathname.split('/').filter(Boolean);
+          if(url.hostname==='github.com') return ['blob','raw'].includes(parts[2]) && parts[3]===expected;
+          if(url.hostname==='raw.githubusercontent.com') return parts[2]===expected;
+          return url.hostname==='api.github.com' && url.searchParams.get('ref')===expected;
+        } catch {return false;}
+      };
+      if(!expected || ![file.blob_url,file.raw_url,file.contents_url].some(matches)) return remember(null);
+      totalAdded+=file.additions;totalDeleted+=file.deletions;
+      if(typeof file.filename==='string' && file.filename.endsWith('.lean')) {added+=file.additions;deleted+=file.deletions;}
+    }
+    if(Number.isSafeInteger(p.additions) && p.additions!==totalAdded || Number.isSafeInteger(p.deletions) && p.deletions!==totalDeleted) return remember(null);
+    return remember({added,deleted,head_sha:p.headRefOid});
+  }
   async fetch(req:Request): Promise<Response> {
     try {
       const path=new URL(req.url).pathname;
@@ -888,7 +926,7 @@ export class RepositoryState extends DurableObject<Env> {
       }
       if (path==='/activity') {
         const input:any=await req.json();
-        const prs=[],missing=[];
+        const prs=[],missing=[],locBudget={remaining:32};
         // Deliberately no configure, demand, collection verification, or repair.
         for (const number of input.numbers) {
           const row=this.ctx.storage.sql.exec<any>("SELECT data,observed FROM resources WHERE kind='pr' AND id=? AND tombstone=0",String(number)).toArray()[0];
@@ -896,7 +934,7 @@ export class RepositoryState extends DurableObject<Env> {
           const p=await this.decode(row.data);
           prs.push({number,state:p.state,created_at:p.createdAt || null,landed_at:p.mergedAt || null,
             head_sha:p.headRefOid || null,observed_at:row.observed,
-            landing_source:p.mergedAt?'github-merged':null});
+            landing_source:p.mergedAt?'github-merged':null,lean_loc:await this.activityLOC(number,p,locBudget)});
         }
         return json({version:1,repository:input.repository,revision:this.revision(),as_of:Date.now(),coverage:'observed',prs,missing});
       }

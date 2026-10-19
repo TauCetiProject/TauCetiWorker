@@ -1,0 +1,103 @@
+"""Prepare pooled conversation costs from the authoritative local budget ledger."""
+
+import json
+from decimal import Decimal
+
+from .budget import Budget, money
+
+COST_WINDOWS = {"total": None, "7d": 7 * 86400}
+
+
+def install(db):
+    db.executescript("""
+      CREATE TABLE IF NOT EXISTS conversation_costs(
+        id TEXT PRIMARY KEY,worker TEXT,scope TEXT,started REAL,settled REAL,cost TEXT);
+      CREATE INDEX IF NOT EXISTS cost_scope ON conversation_costs(scope,settled);
+      CREATE INDEX IF NOT EXISTS cost_worker ON conversation_costs(worker,settled);
+    """)
+
+
+def prepare(db, now, scope_for_worker):
+    """Background only. Reuse Budget's validation/reconciliation, never mutate it."""
+    budget = Budget(clock=lambda: now)
+    if not budget.ledger.exists():
+        if db.execute("SELECT 1 FROM meta WHERE key='activity_funding'").fetchone():
+            raise ValueError("Budget ledger unavailable")
+        return
+    with budget.locked():
+        raw = budget.ledger.read_bytes()
+    records = budget.records(raw)
+    state = budget.replay(records)
+    budget.accrue(state)
+    settled_at = {}
+    for record in records:
+        for event in record["events"]:
+            if event["type"] == "settle":
+                settled_at.setdefault(event["id"], record["timestamp"])
+    rows = []
+    for identity, session in state["sessions"].items():
+        settled = session["status"] == "settled"
+        value = session["cost"] if settled else session.get("reserve", session["estimate"])
+        if money(value) < 0:
+            raise ValueError("Negative conversation cost")
+        rows.append(
+            (
+                identity,
+                session["worker"],
+                scope_for_worker(session["worker"]),
+                session["started"],
+                settled_at[identity] if settled else None,
+                value,
+            )
+        )
+    # This is a derived cache. A ledger repair/replacement cannot leave old sessions behind.
+    db.execute("DELETE FROM conversation_costs")
+    db.executemany("INSERT INTO conversation_costs VALUES (?,?,?,?,?,?)", rows)
+    pending = sum(
+        (money(s.get("reserve", s["estimate"])) for s in state["sessions"].values() if s["status"] != "settled"),
+        Decimal(0),
+    )
+    funding = dict(
+        balance=str(state["balance"]),
+        pending=str(pending),
+        available=str(state["balance"] - pending),
+        grant_rate=str(state["rate"]),
+        prepared_at=now,
+    )
+    db.execute("INSERT OR REPLACE INTO meta VALUES ('activity_funding',?)", (json.dumps(funding),))
+    db.execute("DELETE FROM meta WHERE key='activity_cost_error'")
+
+
+def summarize(db, now, cutoff, column=None, identity=None):
+    where, args = (f"AND {column}=?", [identity]) if column else ("", [])
+    funding_row = db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()
+    funding = json.loads(funding_row[0]) if funding_row else None
+    failure = db.execute("SELECT value FROM meta WHERE key='activity_cost_error'").fetchone()
+    windows = {}
+    for key, seconds in COST_WINDOWS.items():
+        since = max(cutoff or 0, now - seconds) if seconds is not None else cutoff or 0
+        costs = db.execute(
+            f"SELECT cost FROM conversation_costs WHERE settled>=? AND settled<=? {where}", [since, now, *args]
+        )
+        spent = sum((money(row[0]) for row in costs), Decimal(0))
+        active = db.execute(
+            f"SELECT cost FROM conversation_costs WHERE settled IS NULL AND started>=? AND started<=? {where}",
+            [since, now, *args],
+        )
+        pending = sum((money(row[0]) for row in active), Decimal(0))
+        available = funding and not failure
+        windows[key] = dict(
+            spent_usd=str(spent) if available else None,
+            pending_usd=str(pending) if available else None,
+            estimated_usd=str(spent + pending) if available else None,
+        )
+    return dict(windows=windows, funding=funding, prepared_at=funding.get("prepared_at") if funding else None)
+
+
+def estimate(spent, landed_added, open_added, missing=0):
+    """All conversation spending amortized over initiated PR output, not per-PR costs."""
+    weighted = Decimal(landed_added) + Decimal(open_added) / 2
+    return dict(
+        weighted_loc=str(weighted),
+        usd_per_loc=str(money(spent) / weighted) if spent is not None and weighted > 0 and not missing else None,
+    )

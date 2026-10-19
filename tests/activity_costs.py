@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Pooled costs, initiated-PR cohorts, half-credit open output and cached readers."""
+
+import contextlib
+import io
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import unittest
+from decimal import Decimal
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_worker import activity as a
+from tauceti_worker import activity_summary, fleet_events
+
+DAY = 86400
+
+
+class CostTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.now = time.time()
+        env = patch.dict(
+            os.environ,
+            {
+                "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
+                "TAUCETI_BUDGET_DIR": str(self.root / "budget"),
+                "TAUCETI_ACTIVITY_CI_DB": str(self.root / "ci.sqlite"),
+                "TAUCETI_FLEET_MACHINE_ID": "machine",
+                "TAUCETI_WORKER_ID": "author",
+                "TAUCETI_FLEET_EVENTS": str(self.root / "worker-events.jsonl"),
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        with patch.object(a.time, "time", return_value=self.now - 10 * DAY):
+            a.emit("round_started", round_id="initial")
+            a.emit("round_finished", round_id="initial", round_type="fix", outcome="completed")
+        a.emit("round_started", round_id="reviewer", worker="reviewer")
+        a.emit("round_finished", round_id="reviewer", worker="reviewer", round_type="review", outcome="completed")
+        self.records = []
+        self.record(self.now - 10 * DAY, dict(type="grant", delta="1000"))
+        self.session("old", 8 * DAY, "author", "10", settled=True)
+        self.session("review", DAY, "reviewer", "20", settled=True, phase="review")
+        self.session("fix", DAY, "author", "30", settled=True)
+        self.session("active", 60, "reviewer", "40", settled=False, phase="review")
+        self.session("external", DAY, "not-in-fleet", "99", settled=True)
+        self.write_ledger()
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            for n, age, state, loc, landed in (
+                (1, 8 * DAY, "MERGED", 100, True),
+                (2, 2 * DAY, "MERGED", 200, True),
+                (3, DAY, "OPEN", 300, False),
+                (4, 8 * DAY, "OPEN", 400, False),
+                (5, DAY, "CLOSED", 10000, False),
+            ):
+                db.execute(
+                    "INSERT INTO prs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "org/repo",
+                        n,
+                        "author",
+                        "machine",
+                        self.now - age,
+                        state,
+                        self.now - 10 if landed else None,
+                        self.now,
+                        self.now,
+                        "head",
+                        None,
+                    ),
+                )
+                db.execute("INSERT INTO pr_loc VALUES (?,?,?,?,?,?)", ("org/repo", n, "head", loc, 0, self.now))
+        a.emit("pr_activity", repository="org/repo", pr=99, activity="review", worker="reviewer")
+
+    def record(self, at, event):
+        self.records.append(dict(version=1, seq=len(self.records) + 1, timestamp=at, events=[event]))
+
+    def session(self, key, age, worker, cost, *, settled, phase="fix"):
+        start = self.now - age
+        self.record(
+            start,
+            dict(
+                type="admit",
+                id=key,
+                worker=worker,
+                model="m",
+                phase=phase,
+                estimate=cost,
+                status="active",
+                started=start,
+            ),
+        )
+        if settled:
+            self.record(start + 1, dict(type="settle", id=key, cost=cost, outcome="completed"))
+
+    def write_ledger(self):
+        p = self.root / "budget/events.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(json.dumps(r) + "\n" for r in self.records))
+
+    def summary(self):
+        a.prepare(now=self.now + 1)
+        return a.cached(group="machine")["summary"]
+
+    def test_all_fleet_costs_include_reviews_but_only_initiated_output_counts(self):
+        s = self.summary()
+        rows = s["costs"]["windows"]
+        self.assertEqual(set(rows), {"total", "7d"})
+        self.assertEqual(Decimal(rows["total"]["spent_usd"]), Decimal(60))
+        self.assertEqual(Decimal(rows["total"]["pending_usd"]), Decimal(40))
+        self.assertEqual(Decimal(rows["total"]["weighted_loc"]), Decimal(650))
+        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 650)
+        # An old PR landing yesterday does not enter the seven-day initiation cohort.
+        self.assertEqual(Decimal(rows["7d"]["estimated_usd"]), Decimal(90))
+        self.assertEqual(Decimal(rows["7d"]["weighted_loc"]), Decimal(350))
+        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal(90) / 350)
+        self.assertEqual(s["pr_windows"]["total"]["reviews"], 1)
+        self.assertEqual(s["pr_windows"]["total"]["assisted"], 1)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(dict(available=True, summary=s))
+        self.assertIn("All time", output.getvalue())
+        self.assertIn("7 days", output.getvalue())
+        self.assertIn("$0.1538", output.getvalue())
+        self.assertIn("$0.2571", output.getvalue())
+
+    def test_odd_open_LOC_gets_exactly_half_credit(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE pr_loc SET added=301 WHERE number=3")
+        row = self.summary()["costs"]["windows"]["7d"]
+        self.assertEqual(Decimal(row["weighted_loc"]), Decimal("350.5"))
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal("350.5"))
+
+    def test_reconciliations_restate_the_original_cost_window(self):
+        self.record(self.now, dict(type="correction", id="old", cost="15", delta="-5"))
+        self.write_ledger()
+        rows = self.summary()["costs"]["windows"]
+        self.assertEqual(Decimal(rows["total"]["estimated_usd"]), 105)
+        self.assertEqual(Decimal(rows["7d"]["estimated_usd"]), 90)
+
+    def test_missing_or_changed_head_LOC_never_produces_a_partial_ratio(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET head='new-head' WHERE number=3")
+        rows = self.summary()["costs"]["windows"]
+        self.assertIsNone(rows["total"]["usd_per_loc"])
+        self.assertEqual(rows["7d"]["missing_loc_prs"], 1)
+
+    def test_zero_output_and_failed_ledger_are_not_zero_dollars_per_LOC(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET state='CLOSED',landed=NULL")
+        self.assertIsNone(self.summary()["costs"]["windows"]["total"]["usd_per_loc"])
+        p = self.root / "budget/events.jsonl"
+        p.write_text(p.read_text() + '{"torn":')
+        s = self.summary()
+        self.assertIsNone(s["costs"]["windows"]["total"]["spent_usd"])
+        self.assertIsNotNone(s["costs"]["funding"])
+
+    def test_native_and_compatibility_review_receipts_are_not_double_counted(self):
+        # Clear the direct fixture receipt so just the dual-written review remains.
+        self.summary()
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM pr_contributions")
+        fleet_events.emit("pr_activity", repository="org/repo", pr=100, activity="review")
+        s = self.summary()
+        self.assertEqual(s["pr_windows"]["total"]["reviews"], 1)
+        self.assertEqual(s["pr_windows"]["total"]["assisted"], 1)
+        with contextlib.closing(a._connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM pr_contributions").fetchone()[0], 1)
+
+    def test_fleet_ratio_divides_pooled_costs_by_pooled_LOC(self):
+        s = self.summary()
+        other = json.loads(json.dumps(s))
+        for row in other["costs"]["windows"].values():
+            row.update(spent_usd="0", pending_usd="0", estimated_usd="0", landed_loc_added=1000, open_loc_added=0)
+        v = activity_summary.combine([dict(available=True, summary=s), dict(available=True, summary=other)])
+        row = v["summary"]["costs"]["windows"]["total"]
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(100) / 1650)
+
+    def test_CI_history_is_local_incremental_and_accepts_late_receipts(self):
+        p = self.root / "ci.sqlite"
+        with contextlib.closing(sqlite3.connect(p)) as source, source:
+            source.execute("CREATE TABLE events(id TEXT PRIMARY KEY,at REAL,kind TEXT,data TEXT)")
+            source.execute(
+                "INSERT INTO events VALUES ('one',?,'ci_result',?)",
+                (self.now - 5, json.dumps(dict(conclusion="success", wait_seconds=10, run_seconds=100))),
+            )
+        self.assertEqual(self.summary()["ci_windows"]["total"]["attempts"], 1)
+        with contextlib.closing(sqlite3.connect(p)) as source, source:
+            source.execute(
+                "INSERT INTO events VALUES ('late',?,'ci_result',?)",
+                (self.now - 100, json.dumps(dict(conclusion="failure", wait_seconds=20, run_seconds=50))),
+            )
+        s = self.summary()
+        self.summary()
+        self.assertEqual(
+            s["ci_windows"]["total"], dict(attempts=2, successes=1, failures=1, wait_seconds=30, run_seconds=150)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

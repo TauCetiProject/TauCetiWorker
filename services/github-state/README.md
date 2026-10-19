@@ -171,6 +171,12 @@ npm run deploy -- --env test
 npm run deploy -- --env ''
 ```
 
+`POST /v1/activity` also derives Lean LOC from complete cached PR file lists,
+checking immutable file URLs against the PR's head/base and header totals.
+Derived counts are cached by PR head/base and file-collection revision, with at
+most 32 uncached computations per request. It reads stored resources only: no
+client demand, upstream request, repair job, or closed-PR polling is created.
+
 `/healthz` is public and exposes only service identity/version. `/v1/health`,
 `/v1/query`, `/v1/query_batch`, and `/v1/changes` require a repository-scoped
 client token. Valid credentials querying an unavailable repository scope get

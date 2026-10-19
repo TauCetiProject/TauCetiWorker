@@ -1053,6 +1053,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             )
             return None
         raise NoProgress(reason)
+    if rc == 0 and stage in PR_TASKS and c.pr:
+        with contextlib.suppress(Exception):
+            from .fleet_events import emit
+
+            emit("pr_activity", repository=TAUCETI, pr=c.pr, activity=stage, head_sha=c.head)
     return rc
 
 
