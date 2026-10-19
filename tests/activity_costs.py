@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import activity as a
-from tauceti_worker import activity_summary, fleet_events
+from tauceti_worker import activity_costs, activity_summary, fleet_events
 
 DAY = 86400
 
@@ -139,12 +139,63 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(row["weighted_loc"]), Decimal("350.5"))
         self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal("350.5"))
 
+    def test_hourly_spending_uses_settlements_in_each_window_and_excludes_reservations(self):
+        self.session("recent", 3600, "author", "12", settled=True)
+        self.write_ledger()
+        s = self.summary()
+        rows = s["costs"]["spending"]
+        self.assertEqual(set(rows), {"3h", "24h", "7d", "total"})
+        for window, spent, seconds in (
+            ("3h", 12, 10800),
+            ("24h", 62, DAY),
+            ("7d", 62, 7 * DAY),
+            ("total", 72, 10 * DAY + 1),
+        ):
+            self.assertEqual(Decimal(rows[window]["spent_usd"]), spent)
+            self.assertEqual(rows[window]["covered_seconds"], seconds)
+            self.assertEqual(Decimal(rows[window]["usd_per_hour"]), Decimal(spent) * 3600 / seconds)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(dict(available=True, summary=s))
+        self.assertIn("Spending (completed sessions)", output.getvalue())
+        self.assertIn("API spend ($/hour)", output.getvalue())
+        self.assertIn("Hours recorded", output.getvalue())
+        self.assertIn("$4.00", output.getvalue())
+
+    def test_new_recording_uses_elapsed_time_not_the_entire_trailing_window(self):
+        self.session("recent", 900, "author", "12", settled=True)
+        self.write_ledger()
+        self.summary()
+        with contextlib.closing(a._connect()) as db:
+            value = activity_costs.summarize(db, self.now, self.now - 1800, "scope", "machine")
+            for row in value["spending"].values():
+                self.assertEqual(row["covered_seconds"], 1800)
+                self.assertEqual(Decimal(row["usd_per_hour"]), 24)
+            zero = activity_costs.summarize(db, self.now, self.now, "scope", "machine")
+            self.assertTrue(all(r["usd_per_hour"] is None for r in zero["spending"].values()))
+
+    def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
+        s = self.summary()
+        other = json.loads(json.dumps(s))
+        for row in other["costs"]["spending"].values():
+            row.update(spent_usd="30", covered_seconds=3600, usd_per_hour="30")
+        values = [dict(available=True, summary=s), dict(available=True, summary=other)]
+        combined = activity_summary.combine(values)["summary"]["costs"]["spending"]
+        self.assertEqual(Decimal(combined["3h"]["usd_per_hour"]), 10)
+        self.assertEqual(Decimal(combined["total"]["usd_per_hour"]), Decimal(90) * 3600 / (10 * DAY + 1))
+        # Missing/older hosts cannot silently turn unavailable spending into zero.
+        other["costs"].pop("spending")
+        missing = activity_summary.combine(values)["summary"]["costs"]["spending"]
+        self.assertTrue(all(r["usd_per_hour"] is None for r in missing.values()))
+
     def test_reconciliations_restate_the_original_cost_window(self):
         self.record(self.now, dict(type="correction", id="old", cost="15", delta="-5"))
         self.write_ledger()
         rows = self.summary()["costs"]["windows"]
         self.assertEqual(Decimal(rows["total"]["estimated_usd"]), 105)
         self.assertEqual(Decimal(rows["7d"]["estimated_usd"]), 90)
+        spending = self.summary()["costs"]["spending"]
+        self.assertEqual(Decimal(spending["7d"]["spent_usd"]), 50)
+        self.assertEqual(Decimal(spending["total"]["spent_usd"]), 65)
 
     def test_missing_or_changed_head_LOC_never_produces_a_partial_ratio(self):
         with contextlib.closing(a._connect()) as db, db:
@@ -161,6 +212,7 @@ class CostTests(unittest.TestCase):
         p.write_text(p.read_text() + '{"torn":')
         s = self.summary()
         self.assertIsNone(s["costs"]["windows"]["total"]["spent_usd"])
+        self.assertTrue(all(r["usd_per_hour"] is None for r in s["costs"]["spending"].values()))
         self.assertIsNotNone(s["costs"]["funding"])
 
     def test_native_and_compatibility_review_receipts_are_not_double_counted(self):

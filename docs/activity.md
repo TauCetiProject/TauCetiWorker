@@ -30,6 +30,17 @@ verified batch-to-main evidence, not titles, reviews or staging success.
 
 ## Costs and initiated PR output
 
+Average API spending has **3h**, **24h**, **7d** and **All time** columns in
+$/hour. It uses completed/reconciled session costs, including reviews, recognized
+at settlement; active reservations are separate estimates and do not enter this
+rate. Each average divides by elapsed recorded time within that window, so a
+new installation is not diluted by hours before recording began. `Hours recorded`
+shows the denominator. Fleet averages pool spending over the longest recorded
+duration covered by their host summaries; parallel machines do not add elapsed
+wall-clock hours. Missing spending data leaves the fleet rate unavailable.
+Preparation reuses the existing local budget cache and collector, with no extra
+tasks or GitHub requests.
+
 Cost estimates have **All time** and **7 days** columns. They pool every
 conversation in the reported worker/machine scope, including reviews and fixes
 on PRs initiated elsewhere. Completed sessions use their reconciled budget
