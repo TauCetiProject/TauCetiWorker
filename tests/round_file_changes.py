@@ -22,6 +22,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -157,6 +158,41 @@ def main():
                 not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
             )
             pending.unlink()
+            # A roadmap-fork intent has no unpublished work for this PR. It
+            # must not strand a clean maintenance checkout in global backoff.
+            pending.write_text(json.dumps({"argv": ["repo", "fork", "TauCetiProject/TauCetiRoadmap"]}))
+            check(
+                "unrelated publication permits other PR work",
+                tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.write_text(json.dumps({"argv": ["pr", "comment", "1", "--repo", "TauCetiProject/TauCeti"]}))
+            check(
+                "same-PR publication retains its recovery path",
+                not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.write_text(json.dumps({"argv": ["pr", "comment", "2", "--repo", "TauCetiProject/TauCeti"]}))
+            check(
+                "another PR publication does not stall this checkout",
+                tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.unlink()
+
+        # Closing a superseded PR is progress even without a push/comment;
+        # a stale merged/closed snapshot is not a new state transition.
+        for before, after, expected in (
+            ("OPEN", "CLOSED", True),
+            ("OPEN", "MERGED", True),
+            ("OPEN", "OPEN", False),
+            ("CLOSED", "CLOSED", False),
+        ):
+            gh = types.SimpleNamespace(
+                pr_progress_state=lambda _, after=after: {"head": head, "ncomments": 0, "state": after}
+            )
+            pre = {"head": head, "ncomments": 0, "state": before}
+            check(
+                "PR transition " + before + " -> " + after,
+                tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+            )
 
         # 4) a round that changed nothing is silent.
         check("a clean round logs nothing", run(repo, head) == "")

@@ -189,14 +189,15 @@ def target(value):
     return (repository, int(number)) if repository and str(number).isdigit() else (None, None)
 
 
-def pending_for(repo, number, env=None):
+def pending_for(repo, number, env=None, *, conservative=False):
     for path in intent_paths(env):
         try:
             value = json.loads(path.read_text())
             if target(value) == (repo, number):
                 return True
         except (OSError, ValueError, KeyError, TypeError):
-            continue
+            if conservative:
+                return True
     return False
 
 

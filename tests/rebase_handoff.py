@@ -247,7 +247,10 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, SimpleNamespace(read=lambda name: 0), deep=False)
         candidate = sv.rebaseable.actionable[0]
         assert candidate.pr == 20
-        with patch.object(work_units, "run_in_bubble", return_value=0) as agent:
+        with (
+            patch.object(work_units, "run_in_bubble", return_value=0) as agent,
+            patch.object(work_units, "me", return_value="me"),
+        ):
             assert (
                 work_units._do_fixlike(
                     w, sv, candidate, SimpleNamespace(agent_name="Codex"), True, prompt_file="rebase.md", label="rebase"
@@ -256,6 +259,10 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
             )
         prompt = agent.call_args.args[2]
         assert body in prompt and HEAD in prompt
+        assert "Nobody reads your final transcript" in prompt
+        assert "You may close this PR" in prompt
+        assert "gh pr close 20 --repo TauCetiProject/TauCeti" in prompt
+        assert "--add-label on-hold" in prompt
         if provisional:
             assert "attribution **unconfirmed**" in prompt
             assert "still complete all verification below" in prompt
@@ -263,6 +270,20 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         assert "semantic repair may still be needed" in prompt
         assert '"__BIN__' not in prompt
         assert agent.call_args.kwargs["allow_push"] == "me/TauCeti"
+        with (
+            patch.object(work_units, "run_in_bubble", return_value=0) as other,
+            patch.object(work_units, "me", return_value="different-account"),
+        ):
+            work_units._do_fixlike(
+                w,
+                sv,
+                candidate,
+                SimpleNamespace(agent_name="Codex"),
+                True,
+                prompt_file="rebase.md",
+                label="rebase",
+            )
+        assert "You may NOT close this PR" in other.call_args.args[2]
     # A lost branch claim starts no authoring task.
     w.claims.begin_branch_work = lambda *args: False
     with patch.object(work_units, "run_in_bubble") as agent:

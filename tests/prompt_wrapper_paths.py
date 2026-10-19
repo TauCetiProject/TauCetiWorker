@@ -41,6 +41,7 @@ WRAPPERS = ("git-safe-push", "gh-safe-pr-create", "claim.sh")
 # The keys each call site passes, so a prompt that grows a placeholder without a substitution fails
 # here rather than reaching an agent. Mirrors work_units._do_fixlike / do_roadmap.
 CALL_SITES = {
+    "pr-outcome.md": dict(PR=123, HEAD="a" * 40, CLOSE_AUTHORITY="Closure authority is pinned by the worker."),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
     "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin"),
     "fix.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
@@ -101,7 +102,10 @@ def main():
         left = sorted(set(re.findall(r"__[A-Z][A-Z0-9_]*__", out)))
         check(f"{name}: renders with no placeholder left", not left)
         invocations = [ln.strip() for ln in out.splitlines() if any(f"/{w}" in ln for w in WRAPPERS)]
-        check(f"{name}: expected write-wrapper usage", bool(invocations) == (name != "overlap-scan.md"))
+        check(
+            f"{name}: expected write-wrapper usage",
+            bool(invocations) == (name not in {"overlap-scan.md", "pr-outcome.md"}),
+        )
         # Quoted, so an install directory containing a space stays one word.
         check(
             f"{name}: every wrapper invocation is absolute and quoted",

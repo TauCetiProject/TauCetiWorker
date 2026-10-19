@@ -153,7 +153,7 @@ class Counters:
             or not patch.build_success
             or not patch.head_oid
             or {name.lower() for name in patch.labels}
-            & {"needs-rebase", "keep", "hold", "wip", "human", "do-not-close"}
+            & {"needs-rebase", "keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         ):
             return
         at = patch.build_status_at
@@ -739,7 +739,7 @@ def survey(
         if not p.is_draft
         and not (
             p.automatic_bump
-            and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close"}
+            and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         )
     ]
     me_login = me()
@@ -751,7 +751,10 @@ def survey(
     )
     tend_bot = bot_on_canonical and can_push(TAUCETI) is True
     tended = [
-        p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
+        p
+        for p in nondraft
+        if (p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
+        and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
     gaps: set[int] = set()
@@ -790,7 +793,7 @@ def survey(
     for p in tended + foreign_repairs if "rebase" in enabled else []:
         foreign = p in foreign_repairs
         labels = {label.lower() for label in p.labels}
-        if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
+        if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
             continue
         if (
             cached_only
@@ -862,6 +865,8 @@ def survey(
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
     for p in nondraft if "review" in enabled else []:
+        if {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
+            continue
         if not p.build_success:
             continue
         if not deep:
@@ -1008,7 +1013,15 @@ def survey(
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
         if not (branch and (p.build_failed or integration)):
             continue
-        if {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close", "needs-rebase"}:
+        if {label.lower() for label in p.labels} & {
+            "keep",
+            "hold",
+            "wip",
+            "human",
+            "on-hold",
+            "do-not-close",
+            "needs-rebase",
+        }:
             continue
         c = Candidate(
             p.number,

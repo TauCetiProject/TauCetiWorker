@@ -621,14 +621,9 @@ def _candidate_checkout_unchanged(cfg: Config, c: Candidate) -> bool:
     """Only decline a no-change PR attempt when no local publication work would be discarded."""
     if not c.pr or not c.head or _checkout_head(cfg) != c.head:
         return False
-    from .github_outbox import directory
-    from .github_transport import root, scope
+    from .github_outbox import pending_for
 
-    pending = (
-        directory(),
-        root() / "outbox" / (scope() or "unselected") / os.environ.get("TAUCETI_WORKER_ID", "unknown"),
-    )
-    if any(next(path.glob("*.json"), None) is not None for path in pending):
+    if pending_for(TAUCETI, c.pr, conservative=True):
         return False
     try:
         status = subprocess.run(
@@ -698,7 +693,7 @@ def _progress_snapshot(w: Worker, c: Candidate) -> dict | None:
         st = w.gh.pr_progress_state(c.pr)  # head + comment count in one GraphQL call
         if st is None:
             return None
-        return {"head": st["head"] or c.head, "ncomments": st["ncomments"]}
+        return {"head": st["head"] or c.head, "ncomments": st["ncomments"], "state": st.get("state")}
     nums = _open_pr_numbers(w)  # roadmap / bump: a new marker-bearing PR = progress
     return {"prs": nums} if nums is not None else None
 
@@ -721,7 +716,12 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool:
         st = w.gh.pr_progress_state(c.pr)
         if st is None:
             return True
-        return (st["head"] or "") != pre["head"] or (not pre.get("require_push") and st["ncomments"] > pre["ncomments"])
+        closed = st.get("state") in {"CLOSED", "MERGED"} and pre.get("state") not in {"CLOSED", "MERGED"}
+        return (
+            closed
+            or (st["head"] or "") != pre["head"]
+            or (not pre.get("require_push") and st["ncomments"] > pre["ncomments"])
+        )
     now = _open_pr_numbers(w)
     if now is None:
         return True
@@ -815,7 +815,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
             ):
                 return False
             labels = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
-            if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
+            if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
                 return False
             return live.get("mergeable") == "CONFLICTING" or (
                 "needs-rebase" in labels and w.gh.rebase_requested(c.pr, c.head)
@@ -826,12 +826,21 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
         return True
     # The head the survey saw. A contributor pushing since then makes every verdict below describe a
     # commit that is no longer there, and _do_fixlike would check the NEW head out and work on it.
-    live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state"])
+    live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels"])
     if live is None:
         log(f"  {stage} #{c.pr}: could not re-read the PR before launching — leaving it for a later round")
         return False
     if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
         log(f"  {stage} #{c.pr}: moved on since the survey (head, draft or closed) — skipping")
+        return False
+    if {str(label.get("name", "")).lower() for label in live.get("labels", [])} & {
+        "keep",
+        "hold",
+        "wip",
+        "human",
+        "on-hold",
+        "do-not-close",
+    }:
         return False
     meta = w.rs.gh_meta(c.pr, force=True)
     if meta.provenance in ("stale", "fetch_failed"):
@@ -1109,8 +1118,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         tgt = f" #{c.pr}" if c.pr else ""
         reason = (
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
-            f"comment). Most often another worker pushed the branch first (safe-push declines rather "
-            f"than clobber) or the agent declined to act — not a failure. Transcript: {w.cfg.logdir}"
+            f"comment or closure). No durable PR outcome was confirmed. Transcript: {w.cfg.logdir}"
         )
         if not bubble and _candidate_checkout_unchanged(w.cfg, c):
             log(reason + "; checkout unchanged — selecting another candidate")
@@ -1495,6 +1503,22 @@ def _do_fixlike(
                 "finish the required full build and axiom checks, and use git-safe-push with the "
                 "existing branch lease and starting-head CAS. A new head ends this authorization.\n"
             )
+    # Every PR repair runs unattended. Persist blockers and retire verified
+    # superseded work instead of leaving an actionable decision in stdout.
+    author = getattr(p, "author", "")
+    may_close = (
+        bool(author) and not foreign and not getattr(p, "automatic_bump", False) and author.lower() == me().lower()
+    )
+    prompt += "\n" + fill_prompt(
+        HERE / "prompts" / "pr-outcome.md",
+        PR=pr,
+        HEAD=head,
+        CLOSE_AUTHORITY=(
+            "You may close this PR only while its live author is the authenticated GitHub account."
+            if may_close
+            else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
+        ),
+    )
     if getattr(p, "automatic_bump", False):
         deadline = getattr(getattr(w, "rc", None), "deadline", time.time() + ROUND_TIMEOUT)
         prompt += (

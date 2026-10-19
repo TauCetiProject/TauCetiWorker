@@ -111,6 +111,17 @@ class GlobalMaintenance(unittest.TestCase):
             result = run_round(self.w, self.opts)
         return result, query, areas
 
+    def test_held_prs_do_not_consume_automatic_maintenance_or_reviews(self):
+        for label in ("on-hold", "human", "hold", "keep", "do-not-close"):
+            held = row(10, "Other", mergeable="CONFLICTING")
+            held["pr"]["labels"].append({"name": label})
+            self.run_round([held, row(20, "Other")])
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+            held = row(10, "Other", author="peer", blocking=False)
+            held["pr"]["labels"].append({"name": label})
+            self.run_round([held, row(20, "Other")])
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+
     def test_other_roadmap_maintenance_and_claim_fallthrough(self):
         # Newest arrives first; a peer holds the oldest. Exhausted and contested
         # heads must not hide the remaining maintenance in a different area.

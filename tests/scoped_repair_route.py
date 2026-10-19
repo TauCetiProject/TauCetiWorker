@@ -279,6 +279,7 @@ def test_paid_launch_rechecks_scope_and_requires_a_real_claim():
         assert agent.call_args.kwargs["allow_push"] == route.FORK
         prompt = agent.call_args.args[2]
         assert comment["body"] in prompt and HEAD in prompt and BASE in prompt
+        assert "You may NOT close this PR" in prompt
         assert "stop without editing if origin/main differs" in prompt
         agent.reset_mock()
         # A provider failure after launch also consumes the one canary attempt.

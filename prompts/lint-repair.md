@@ -6,14 +6,14 @@ The daily lint comments on an open repair PR rather than replacing it, so `main`
 git fetch -q origin main
 git merge --no-edit origin/main
 ```
-If the merge conflicts, resolve it (conflicts can only be in `TauCeti/`), or stop and say so.
+If the merge conflicts, resolve it (conflicts can only be in `TauCeti/`), or follow the durable blocked-PR procedure below.
 
 ## What the violations usually are
 - **simpNF**: a `@[simp]` lemma whose left-hand side simp now rewrites, usually because a newer simp lemma elsewhere took it out of simp normal form, or because a newer `attribute [simp]` made an old lemma a simp lemma. The linter's message says which lemmas simp used. Fix it by restating the lemma so its left-hand side is in simp normal form, or by removing `@[simp]` from whichever of the two lemmas is redundant or points the wrong way. Check what uses a lemma (`grep -rn` for its name) before removing `@[simp]`.
 - **simpComm**: a commutativity lemma marked `@[simp]`. Remove the attribute.
 - **Other linters** (checkType, synTaut, unusedArguments, docBlame, ...): the message explains the problem; fix the declaration.
 
-Repair existing declarations only: restate, re-annotate, or (if redundant) remove them. Do NOT add new lemmas or definitions: new mathematics needs a roadmap target, which a repair PR does not have. If a violation can only be fixed by adding one, stop and say so in your report.
+Repair existing declarations only: restate, re-annotate, or (if redundant) remove them. Do NOT add new lemmas or definitions: new mathematics needs a roadmap target, which a repair PR does not have. If a violation can only be fixed by adding one, follow the durable blocked-PR procedure below.
 
 The PR body and its comments list the violations the daily lint found, and this PR's CI build lints the whole library, so its failing log is the current list: each violation with the linter's explanation. Work from that list, and from the latest daily-lint comment if it is newer than the last build. Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it. To check your repairs locally, lint only the modules that define the flagged declarations. The log names each one as `<linter> <declaration>`; collect the modules whose source mentions each declaration's last name component (a few extra modules only cost a little time):
 ```
@@ -30,7 +30,7 @@ If `test -s` fails, or a name is auto-generated (for example an `inst...` instan
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and everything below passes locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
 
 ## Rules of the repo (hard constraints)
-- Fix code under `TauCeti/` only. Do NOT edit `scripts/` (including `scripts/lint-baseline.txt` and `scripts/lint-nolints-allowlist.txt`), `.github/`, the lakefile, or the Lake pins. Do NOT add `@[nolint ...]`: every nolint must be allowlisted in a human-owned file, so CI rejects it. If a violation genuinely should be an exception, stop and say so in your report instead of silencing it.
+- Fix code under `TauCeti/` only. Do NOT edit `scripts/` (including `scripts/lint-baseline.txt` and `scripts/lint-nolints-allowlist.txt`), `.github/`, the lakefile, or the Lake pins. Do NOT add `@[nolint ...]`: every nolint must be allowlisted in a human-owned file, so CI rejects it. If a violation genuinely should be an exception, follow the durable blocked-PR procedure below instead of silencing it.
 - Do NOT edit the root `TauCeti.lean`: it is intentionally empty.
 - Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
