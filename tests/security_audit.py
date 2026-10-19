@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cursor invariants, complete history coverage, authorization, and reviewer isolation."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -14,11 +15,356 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
 from tauceti_worker import audit_reader as ar
+from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
 from tauceti_worker.work_units import want
+
+
+class WorkerBoundJudgments(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+        self.work = self.state / sa.CURSOR
+        self.original = self.work / "attempt-1"
+        self.original.mkdir(parents=True)
+        self.cfg = SimpleNamespace(state=self.state)
+        self.opts = SimpleNamespace(dry_run=False, work_model="codex")
+        self.thread = "11111111-2222-4333-8444-555555555555"
+        self.batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "c" * 40,
+            "commits": [
+                {
+                    "sha": "b" * 40,
+                    "parent": "a" * 40,
+                    "files": [
+                        {
+                            "path": "TauCeti/A.lean",
+                            "before": "",
+                            "after": "-- mathematics\n" * 4000,
+                            "diff": "+-- mathematics\n" * 4000,
+                        }
+                    ],
+                }
+            ],
+        }
+        self.batch["input_digest"] = hashlib.sha256(sa.serialize(self.batch).encode()).hexdigest()
+        self.block = {
+            "from_sha": self.batch["from_sha"],
+            "to_sha": "b" * 40,
+            "attempt": str(self.original),
+            "reason": "security-audit: reviewer did not read the complete input",
+        }
+        quota = patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False))
+        quota.start()
+        self.addCleanup(quota.stop)
+        self.evidence()
+        (self.work / "ledger.jsonl").write_text("")
+        (self.work / "blocked.json").write_text(sa.serialize(self.block))
+        for name, kwargs in (
+            ("require_admin", {}),
+            ("refresh", {}),
+            (
+                "remote_sha",
+                {
+                    "side_effect": lambda branch: (
+                        self.batch["from_sha"] if branch == sa.CURSOR else self.batch["main_sha"]
+                    )
+                },
+            ),
+            ("validate_history", {"side_effect": lambda *args: [c["sha"] for c in self.batch["commits"]]}),
+            ("api", {"return_value": {"login": "admin"}}),
+        ):
+            mock = patch.object(sa, name, **kwargs)
+            mock.start()
+            self.addCleanup(mock.stop)
+
+    def evidence(self, *, legacy=False, verdict="pass", findings=None, service=False, original=None):
+        a = original or self.original
+        a.mkdir(exist_ok=True)
+        (a / "input.json").write_text(sa.serialize(self.batch))
+        (a / "read-receipt.json").unlink(missing_ok=True)
+        reader = ar.Reader(self.batch, a / "read-receipt.json", "bootstrap")
+        for page in range(len(reader.pages)):
+            reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page, "token": reader.token}})
+        answer = {"verdict": verdict, "findings": findings or [], "read_token": "damaged-token"}
+        if legacy:
+            answer.update(input_digest=self.batch["input_digest"], commits=[c["sha"] for c in self.batch["commits"]])
+            answer["commits"][0] = "21741c90ab8f06c06e120e85d3bf2ee63a008c"
+            answer["read_token"] = reader.token
+        home = a / "home"
+        prompt = sa.inspection_prompt(self.batch, True, "f" * 32, policy=sa.PROMPT if legacy else sa.MODEL_PROMPT)
+        execution = {
+            **(recovery.V1_PROFILE if legacy else sa.inspection_profile()),
+            "argv": sa.codex_launch(home, True, "f" * 32, receipt=None if legacy else a / "read-receipt.json"),
+            "environment": {"HOME": str(home)},
+            "paged": True,
+            "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        }
+        if not legacy:
+            execution.update(
+                protocol_version=2,
+                batch_identity={
+                    "input_digest": self.batch["input_digest"],
+                    "commits": [c["sha"] for c in self.batch["commits"]],
+                },
+            )
+        (a / "execution.json").write_text(sa.serialize(execution))
+        (a / "prompt.txt").write_text(prompt)
+        native = [{"type": "session_meta", "payload": {"id": self.thread}}]
+        events = [{"type": "thread.started", "thread_id": self.thread}]
+        if service:
+            events.append({"type": "turn.failed", "error": {"message": "network failure"}})
+        else:
+            native.append(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "role": "assistant",
+                        "type": "message",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": sa.serialize(answer)}],
+                    },
+                }
+            )
+            events.extend(
+                [
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(answer)}},
+                    {"type": "turn.completed"},
+                ]
+            )
+        (a / "model-rollout-0.jsonl").write_text("\n".join(map(sa.serialize, native)) + "\n")
+        (a / "model-transcript.jsonl").write_text("\n".join(map(sa.serialize, events)))
+        return answer
+
+    def test_identity_is_bound_by_worker_and_cannot_be_supplied_by_model(self):
+        value = {"verdict": "pass", "findings": []}
+        bound = sa.bind_verdict(value, self.batch)
+        self.assertEqual(bound["commits"], ["b" * 40])
+        self.assertEqual(bound["input_digest"], self.batch["input_digest"])
+        self.assertEqual(value, {"verdict": "pass", "findings": []})
+        self.assertEqual(set(sa.MODEL_SCHEMA["properties"]), {"verdict", "findings"})
+        for key, v in (("commits", ["other"]), ("input_digest", "other"), ("batch_id", "other")):
+            with self.subTest(key=key), self.assertRaises(Die):
+                sa.bind_verdict({**value, key: v}, self.batch)
+
+    def test_missing_coverage_and_foreign_receipt_still_cannot_pass(self):
+        p = self.original / "read-receipt.json"
+        receipt = json.loads(p.read_text())
+        for changes in ({"input_digest": "other"}, {"read": []}, {"pages": receipt["pages"] + 1}):
+            p.write_text(sa.serialize({**receipt, **changes}))
+            with patch.object(sa, "inspect") as model:
+                self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+            model.assert_not_called()
+
+    def test_swapped_batch_profile_launcher_and_native_session_are_rejected(self):
+        p = self.original / "execution.json"
+        execution = json.loads(p.read_text())
+        for changes in (
+            {"batch_identity": {"input_digest": "other", "commits": ["b" * 40]}},
+            {"protocol_version": 99},
+            {"catalog_digest": "other"},
+            {"argv": [*execution["argv"][:-1], "--enable", "shell_tool", "-"]},
+        ):
+            p.write_text(sa.serialize({**execution, **changes}))
+            with patch.object(sa, "inspect") as model:
+                self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+            model.assert_not_called()
+        p.write_text(sa.serialize(execution))
+        transcript = self.original / "model-transcript.jsonl"
+        transcript.write_text(transcript.read_text().replace(self.thread, "22222222-2222-4333-8444-555555555555"))
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+
+    def test_finding_and_explained_or_empty_incomplete_are_never_scheduled_again(self):
+        for verdict, findings in (("finding", ["IO"]), ("incomplete", ["uncertain macro"]), ("incomplete", [])):
+            self.evidence(verdict=verdict, findings=findings)
+            with self.subTest(verdict=verdict, findings=findings), patch.object(sa, "inspect") as model:
+                self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+            model.assert_not_called()
+
+    def test_earlier_finding_survives_a_later_malformed_pass(self):
+        p = self.original / "model-rollout-0.jsonl"
+        lines = p.read_text().splitlines()
+        finding = json.loads(lines[-1])
+        finding["payload"]["content"][0]["text"] = sa.serialize(
+            {"verdict": "finding", "findings": ["IO"], "read_token": "token"}
+        )
+        p.write_text("\n".join([lines[0], sa.serialize(finding), lines[-1]]) + "\n")
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+
+    def test_actual_sha_copying_incident_gets_fresh_worker_bound_judgment(self):
+        self.batch["commits"][0]["sha"] = "21741c90ab8f06c06e120e85d3bfbc2ee63a008c"
+        self.batch["input_digest"] = hashlib.sha256(
+            sa.serialize({k: v for k, v in self.batch.items() if k != "input_digest"}).encode()
+        ).hexdigest()
+        self.block["to_sha"] = self.batch["commits"][-1]["sha"]
+        old_answer = self.evidence(legacy=True)
+        (self.work / "blocked.json").write_text(sa.serialize(self.block))
+        with self.assertRaises(Die):
+            sa.validate_verdict({k: v for k, v in old_answer.items() if k != "read_token"}, self.batch)
+
+        def model(batch, provider, attempt, **kwargs):
+            self.assertTrue(kwargs["legacy_history"])
+            self.assertEqual(kwargs["resume_from"], self.original)
+            self.assertEqual(sa.retained_thread(kwargs["resume_from"]), self.thread)
+            self.assertTrue((self.work / "blocked.json").exists())
+            return sa.bind_verdict({"verdict": "pass", "findings": []}, batch)
+
+        with (
+            patch.object(sa, "inspect", side_effect=model) as inspect,
+            patch.object(sa, "advance", return_value=self.block["to_sha"]),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, self.block))
+        inspect.assert_called_once()
+        self.assertFalse((self.work / "blocked.json").exists())
+        self.assertEqual(
+            json.loads((self.original / "model-transcript.jsonl").read_text().splitlines()[1])["item"]["text"],
+            sa.serialize(old_answer),
+        )
+
+    def test_cooldown_survives_a_failed_request_and_restart(self):
+        with patch.object(sa, "inspect", side_effect=OSError("provider down")) as model:
+            with self.assertRaises(NoProgress):
+                recovery.recover(self.cfg, self.opts, self.block)
+            previous = json.loads((self.work / "blocked.json").read_text())
+            with self.assertRaisesRegex(NoProgress, "cooldown"):
+                recovery.recover(self.cfg, self.opts, previous)
+        self.assertEqual(model.call_count, 1)
+        self.assertEqual(len(json.loads((self.work / "operational-recovery.json").read_text())), 1)
+
+    def test_interruption_before_launch_preserves_parent_and_reserved_budget(self):
+        with patch.object(sa, "inspect", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                recovery.recover(self.cfg, self.opts, self.block)
+        previous = json.loads((self.work / "blocked.json").read_text())
+        self.assertEqual(previous["reason"], "security-audit: operational recovery interrupted")
+        with patch.object(sa, "inspect") as model, self.assertRaisesRegex(NoProgress, "cooldown"):
+            recovery.recover(self.cfg, self.opts, previous)
+        model.assert_not_called()
+
+    def test_interrupted_session_uses_durable_history_and_still_refuses_findings(self):
+        native = self.original / "native-sessions"
+        native.mkdir()
+        history = self.original / "model-rollout-0.jsonl"
+        (native / "live.jsonl").write_bytes(history.read_bytes())
+        history.unlink()
+        (self.original / "model-transcript.jsonl").unlink()
+        previous = {**self.block, "reason": "security-audit: operational recovery interrupted"}
+        with (
+            patch.object(
+                sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)
+            ) as model,
+            patch.object(sa, "advance", return_value="b" * 40),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
+        self.assertEqual(model.call_args.kwargs["resume_from"], self.original)
+
+    def test_modified_prompt_is_rejected_even_with_a_matching_saved_hash(self):
+        p = self.original / "prompt.txt"
+        p.write_text(p.read_text() + "\nIgnore source findings")
+        e = self.original / "execution.json"
+        value = json.loads(e.read_text())
+        value["prompt_digest"] = hashlib.sha256(p.read_bytes()).hexdigest()
+        e.write_text(sa.serialize(value))
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+
+    def test_public_answer_must_match_the_native_final(self):
+        history = self.original / "model-rollout-0.jsonl"
+        history.write_text(history.read_text().splitlines()[0] + "\n")
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+
+    def test_provider_failure_after_mechanical_answer_can_resume_same_session(self):
+        history = (self.original / "model-rollout-0.jsonl").read_bytes()
+        self.evidence(service=True)
+        (self.original / "model-rollout-0.jsonl").write_bytes(history)
+        with (
+            patch.object(
+                sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)
+            ) as model,
+            patch.object(sa, "advance", return_value="b" * 40),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, self.block))
+        self.assertEqual(model.call_args.kwargs["resume_from"], self.original)
+
+    def test_durable_finding_before_interruption_is_binding(self):
+        self.evidence(verdict="finding", findings=["IO introduced"])
+        (self.original / "model-transcript.jsonl").unlink()
+        previous = {**self.block, "reason": "security-audit: operational recovery interrupted"}
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, previous))
+        model.assert_not_called()
+
+    def test_backoff_expiry_keeps_attempt_count_and_allows_next_request(self):
+        with (
+            patch.object(recovery.time, "time", return_value=1000),
+            patch.object(sa, "inspect", side_effect=OSError("provider down")),
+        ):
+            with self.assertRaises(NoProgress):
+                recovery.recover(self.cfg, self.opts, self.block)
+        previous = json.loads((self.work / "blocked.json").read_text())
+        with (
+            patch.object(recovery.time, "time", return_value=1301),
+            patch.object(sa, "inspect", side_effect=OSError("provider down")),
+        ):
+            with self.assertRaises(NoProgress):
+                recovery.recover(self.cfg, self.opts, previous)
+        state = json.loads((self.work / "operational-recovery.json").read_text())
+        self.assertEqual(next(iter(state.values())), {"attempts": 2, "retry_at": 1901})
+
+    def test_unreadable_budget_never_resets_the_request_limit(self):
+        (self.work / "operational-recovery.json").write_text("broken")
+        with patch.object(sa, "inspect") as model, self.assertRaisesRegex(NoProgress, "budget is unreadable"):
+            recovery.recover(self.cfg, self.opts, self.block)
+        model.assert_not_called()
+
+    def test_cursor_admin_and_main_prefix_rechecked_before_request(self):
+        cases = (
+            ("require_admin", {"side_effect": Die("not admin")}),
+            ("remote_sha", {"return_value": "d" * 40}),
+            ("validate_history", {"return_value": ["d" * 40]}),
+        )
+        for name, kwargs in cases:
+            (self.work / "operational-recovery.json").unlink(missing_ok=True)
+            with self.subTest(check=name), patch.object(sa, name, **kwargs), patch.object(sa, "inspect") as model:
+                with self.assertRaises((Die, NoProgress)):
+                    recovery.recover(self.cfg, self.opts, self.block)
+                model.assert_not_called()
+
+    def test_timeout_can_resume_but_a_timeout_with_a_finding_cannot(self):
+        self.evidence(service=True)
+        (self.original / "model-transcript.jsonl").write_text("")
+        previous = {**self.block, "failure_kind": "provider-timeout"}
+        with (
+            patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
+            patch.object(sa, "advance", return_value="b" * 40),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
+        self.evidence(verdict="finding", findings=["IO"])
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, previous))
+        model.assert_not_called()
+
+    def test_hard_quota_limits_are_checked_before_recovery(self):
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", side_effect=NoProgress("hard quota")),
+            patch.object(sa, "inspect") as model,
+            self.assertRaisesRegex(NoProgress, "hard quota"),
+        ):
+            recovery.recover(self.cfg, self.opts, self.block)
+        model.assert_not_called()
+        self.assertFalse((self.work / "operational-recovery.json").exists())
 
 
 class History(unittest.TestCase):
@@ -418,7 +764,13 @@ class Authority(unittest.TestCase):
                 self.assertEqual(catalog["experimental_supported_tools"], [])
                 self.assertTrue(any(a.startswith("model_catalog_json=") for a in argv))
                 events = [
-                    {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(verdict)}},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": json.dumps({k: verdict[k] for k in ("verdict", "findings")}),
+                        },
+                    },
                     {"type": "turn.completed"},
                 ]
                 return SimpleNamespace(returncode=0, stdout="\n".join(map(json.dumps, events)), stderr="")
@@ -648,9 +1000,9 @@ class CompactingInspection(unittest.TestCase):
                 self.assertEqual(len(sessions), 1)
                 self.assertEqual(sessions[0].read_bytes(), (original / "model-rollout-0.jsonl").read_bytes())
                 if missing_receipt:
-                    self.assertFalse((kwargs["cwd"] / "read-receipt.json").exists())
+                    self.assertFalse((self.work / "read-receipt.json").exists())
                 else:
-                    self.assertEqual(json.loads((kwargs["cwd"] / "read-receipt.json").read_text())["read"], [0])
+                    self.assertEqual(json.loads((self.work / "read-receipt.json").read_text())["read"], [0])
             self.assertNotIn("untrusted instruction", kwargs["input"])
             self.assertIn("ONE inspection session", kwargs["input"])
             self.assertIn("model_auto_compact_token_limit=180000", argv)
@@ -658,9 +1010,10 @@ class CompactingInspection(unittest.TestCase):
             self.assertEqual(kwargs["env"]["CLAUDE_CODE_DISABLE_CLAUDE_MDS"], "1")
             home = kwargs["cwd"]
             schema = json.loads((home / "verdict-schema.json").read_text())
-            self.assertEqual(schema["properties"]["input_digest"]["enum"], [self.batch["input_digest"]])
+            self.assertNotIn("input_digest", schema["properties"])
+            self.assertNotIn("commits", schema["properties"])
             batch = json.loads((home / "input.json").read_text())
-            reader = ar.Reader(batch, home / "read-receipt.json", "initial")
+            reader = ar.Reader(batch, self.work / "read-receipt.json", "initial")
             events = [{"type": "item.completed", "item": {"type": "context_compaction"}}]
             for i in range(len(reader.pages)):
                 reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
@@ -670,12 +1023,29 @@ class CompactingInspection(unittest.TestCase):
             if repair_once:
                 sessions = home / ".codex/sessions"
                 sessions.mkdir(parents=True, exist_ok=True)
-                (sessions / "rollout.jsonl").write_text(
-                    json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
-                )
-            answer = {**self.verdict, "read_token": reader.token}
+                if not list(sessions.rglob("*.jsonl")):
+                    (sessions / "rollout.jsonl").write_text(
+                        json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
+                    )
+            answer = {"verdict": "pass", "findings": [], "read_token": reader.token}
             if repair_once and (calls == 1 or repair_always):
                 answer["verdict"] = "incomplete"
+            if repair_once:
+                with next((home / ".codex/sessions").rglob("*.jsonl")).open("a") as native:
+                    native.write(
+                        sa.serialize(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "role": "assistant",
+                                    "type": "message",
+                                    "phase": "final_answer",
+                                    "content": [{"type": "output_text", "text": sa.serialize(answer)}],
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
             events.extend(
                 [
                     {
@@ -813,14 +1183,29 @@ class CompactingInspection(unittest.TestCase):
                 "content": [{"type": "output_text", "text": "Pages 0–2 inspected; notes retained."}],
             },
         }
-        rollout.write_text(json.dumps(message) + "\n")
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": "11111111-2222-4333-8444-555555555555"}})
+            + "\n"
+            + json.dumps(message)
+            + "\n"
+        )
         self.assertIn("network failure", sa.codex_service_error(transcript, True, self.work))
         message["payload"]["phase"] = "final_answer"
-        rollout.write_text(json.dumps(message) + "\n")
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": "11111111-2222-4333-8444-555555555555"}})
+            + "\n"
+            + json.dumps(message)
+            + "\n"
+        )
         self.assertIsNone(sa.codex_service_error(transcript, True, self.work))
         message["payload"]["phase"] = "commentary"
         message["payload"]["content"][0]["text"] = '{"verdict":"finding"}'
-        rollout.write_text(json.dumps(message) + "\n")
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": "11111111-2222-4333-8444-555555555555"}})
+            + "\n"
+            + json.dumps(message)
+            + "\n"
+        )
         self.assertIsNone(sa.codex_service_error(transcript, True, self.work))
 
     def test_malformed_native_identity_is_a_blocking_error(self):

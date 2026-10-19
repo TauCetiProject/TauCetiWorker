@@ -204,7 +204,12 @@ the prompt requires retaining findings and unresolved questions, re-reading when
 needed, and returning incomplete if the full inspection cannot be completed.
 
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
-Worker code alone verifies ancestry and moves the ref.
+Worker code alone verifies ancestry and moves the ref. In judgment protocol v2,
+the model returns only `verdict` and `findings`, plus the final `read_token` for
+paged inputs. The Worker attaches the immutable input digest and ordered commit
+list from the launch record. Neither commit SHAs nor a digest are copied from
+model output. Unknown response fields are rejected. Coverage and final-token
+checks remain mandatory; host-owned identity does not establish source safety.
 No Lean builds or candidate scripts run. A finding, incomplete inspection, unsupported
 source blob or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
@@ -214,7 +219,8 @@ compaction/usage records, read receipt (for larger inputs), and durable ledger a
 retained in the same directory. A pre-inspection commit-budget block from an older
 planner can be archived automatically and its exact next commit replanned under
 the current limits. This does not attest that commit or retry a model verdict: findings,
-incomplete inspections, malformed answers, unauthorized tools and other planning errors remain blocked.
+incomplete inspections, unauthorized tools and other planning errors remain blocked.
+Only the operational failures described below can resume automatically.
 
 For private Zulip alerts, set `TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG` in the trusted
 worker's environment to an absolute path to a mode-0600 JSON file:
@@ -234,54 +240,36 @@ the latest 100 messages in that private conversation for an earlier ambiguous de
 Notification failure preserves the audit block and allows bump/progress work to continue.
 Without this setting, reporting remains local to the worker's evidence and logs.
 
-A Codex service error with no final model answer is retried at most twice, after 5 and
-10 seconds. Each retry resumes the same native Luna conversation with unchanged
-source, inspection instructions, model, tool restrictions and read receipt.
-Progress notes are preserved in the same conversation; native message phases
-distinguish them from final answers. Failed requests and their evidence are retained under `service-error-N/` with a
-`service-retries.jsonl` record. A final answer (including a finding, incomplete verdict
-or other malformed answer), unauthorized tool call, unknown event or malformed stream
-is never retried as a service error. Exhausted retries leave the cursor blocked.
-To retry a retained service failure after service recovery, an admin can run:
+Codex provider errors and eligible mechanical output failures share at most three
+launches per invocation, with 5- and 10-second delays. They resume the same native
+conversation, retaining all findings and notes. Every failed launch is archived
+under `service-error-N/` or `output-error-N/`, with a retry record. The inspection's
+native history and reader receipt are durable while the subprocess is running, so
+a Worker restart can retain evidence written before stdout capture finishes.
 
-```bash
-python3 -m tauceti_worker.security_audit retry-service --state /path/to/worker/state/security-audit \
-  --reason 'Retry interrupted provider request in the retained conversation'
-```
+After those immediate retries, ordinary `work` can recover an operational block
+without human intervention. A durable budget waits 5, 10, 20, 40, then 60 minutes
+between recovery invocations, capped at one invocation per hour thereafter. Budget
+reservation precedes launch and survives restarts. Every invocation rechecks admin
+authority, the current cursor, exact next main prefix, immutable input, original
+native UUID, launch policy, reader, catalog, prompt and all prior judgments.
+A valid fresh passing judgment and confirmed ref update are still required.
 
-This command verifies the retained failure contains a service error and no model
-final answer or recorded verdict, checks the unchanged input and next main prefix,
-verifies the retained prompt, launcher code, reader and catalog digests,
-and restores the same native conversation and read receipt. It preserves the
-block until a complete pass and confirmed reference update. No human source
-attestation is needed for a provider failure. Hard quota limits still apply.
+Automatic mechanical repair requires complete input delivery and an empty-finding
+pass whose final token or legacy copied identity failed validation. It does not
+approve the old answer. A reviewed version-1 launcher profile may migrate in the
+same native session to the new worker-bound response format; its old evidence is
+retained. No per-commit SHA exception is used. An unexplained empty `incomplete`
+may receive bounded immediate repair, but is not scheduled again afterward.
+Explained uncertainty, any source finding, missing coverage, unauthorized tools,
+unknown profiles and mismatched evidence remain blocked. A finding anywhere in
+the retained native history or ledger remains binding, including after a restart.
+Provider recovery likewise preserves prior mechanical answers and never rerolls a
+source finding or explained uncertainty. Private alerts retain their usual deduplication.
 
-An unexplained `incomplete` answer with an empty findings list, or a paged `pass` whose
-input digest omits only its final character, is eligible for bounded output repair only when its digest, commit list, schema, full page coverage
-and final receipt token otherwise validate (inline inputs need no receipt). The same retained conversation may
-produce a consistent answer; uncertainty must be explained and source findings
-must be preserved. An explained incomplete verdict, any source finding, unknown
-or unauthorized tool, identity mismatch or coverage failure remains blocked.
-Service retries and output repairs share a maximum of three launches per invocation.
-Each batch permits at most two explicit administrative output-repair invocations.
-The response schema fixes `input_digest` to the exact full digest, preventing echo
-truncation in new replies.
-Every malformed answer is archived under `output-error-N/` and recorded in
-`output-repairs.jsonl`. To repair a previously retained empty incomplete:
-
-```bash
-python3 -m tauceti_worker.security_audit repair-output --state /path/to/worker/state/security-audit \
-  --reason 'Repair unexplained incomplete output in the retained inspection'
-```
-
-The command checks eligibility, the fixed reader/catalog policy and isolated Luna
-launcher, preserves the
-original answer and block, and repeats the ordinary quota, authorization, input
-and ancestry checks. Only the model's complete passing answer and confirmed ref
-update can advance the cursor. It never converts the original answer into a pass. The pre-profile retained incident
-also permits one pinned continuation of its exact recorded reader-context failure,
-with the input digest, reader digest, explanation, receipt and continuation count
-checked; this does not extend repair eligibility to other explained incomplete results.
+The `retry-service` and `repair-output` administrative commands remain for their
+restricted historical recovery profiles; automatic protocol-v2 recovery uses the
+ordinary worker loop and does not need those commands or a human attestation.
 
 For the recorded legacy Luna failure where the final two pages were inaccessible
 because the reader token was lost, an admin may explicitly continue the **same
@@ -298,11 +286,11 @@ unchanged input digest, original commit order, current cursor and admin authorit
 then restores the native conversation and read receipt. It keeps the incomplete
 verdict and block on record; only a complete passing continuation and confirmed
 reference update resolve the block. It cannot start a new reviewer, resume a source
-finding or other incomplete review, or provide human attestation. Ordinary `work`
-never resumes a blocked model inspection automatically. `--ignore-quota` overrides
+finding or other incomplete review, or provide human attestation. This historical
+exception does not widen ordinary automatic operational recovery eligibility. `--ignore-quota` overrides
 pacing only when explicitly selected; hard limits still apply.
 
-This phase must be selected alone, cannot use `--pr` or authoring-model overrides,
+This phase can run alone or alongside bump/progress maintenance. It cannot use `--pr` or authoring-model overrides,
 and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
 `--agent claude` uses Haiku, with ordinary subscription pacing and no expensive fallback.
 It uses its own isolated launcher regardless of the ordinary host/Bubble setting.
