@@ -412,6 +412,8 @@ def _refresh_prs(db, config, now, errors):
             batch = numbers[offset : offset + 100]
             try:
                 value = observe(url, token, repo, batch)
+                if value.get("landing_observations", {}).get("error"):
+                    observation_errors[repo] = "Stored Bors landing observations unavailable; retaining last-known data"
                 seen = [p["number"] for p in value["prs"]] + value["missing"]
                 if len(seen) != len(set(seen)) or set(seen) != set(batch):
                     raise ValueError("incomplete observation response")
@@ -600,7 +602,7 @@ def _summary(db, now, column=None, identity=None):
         ).fetchone()[0],
         open_prs=sum(p["state"] == "OPEN" and p["landed"] is None for p in prs),
         unknown_prs=sum(p["state"] is None for p in prs),
-        unknown_landings=sum(p["state"] in ("CLOSED", "MERGED") and p["landed"] is None for p in prs),
+        unknown_landings=sum(p["state"] == "MERGED" and p["landed"] is None for p in prs),
         pr_observed_at=min((p["observed"] for p in prs if p["observed"]), default=None),
         pr_checked_at=min((p["checked"] for p in prs if p["checked"]), default=None),
     )

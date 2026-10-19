@@ -109,7 +109,23 @@ def summarize(db, now, cutoff, column=None, identity=None):
             [since if since is not None else now, now, *args],
         )
         spent = str(sum((money(row[0]) for row in costs), Decimal(0))) if funding and not failure else None
-        spending[key] = dict(spent_usd=spent, covered_seconds=covered, usd_per_hour=hourly_rate(spent, covered))
+        # Existing native round intervals record work, rather than the lifetime
+        # of wrappers that may be waiting for capacity, budget or GitHub.
+        begin = since if since is not None else now
+        rounds = db.execute(
+            f"SELECT started,finished FROM rounds WHERE started<=? AND (finished>=? OR finished IS NULL) AND COALESCE(outcome,'') NOT IN ('waiting','interrupted-unfinished') {where}",
+            [now, begin, *args],
+        )
+        worker_seconds = sum(
+            max(0, min(finished if finished is not None else now, now) - max(started, begin))
+            for started, finished in rounds
+        )
+        spending[key] = dict(
+            spent_usd=spent,
+            covered_seconds=covered,
+            worker_seconds=worker_seconds,
+            usd_per_hour=hourly_rate(spent, covered),
+        )
     return dict(
         windows=windows, spending=spending, funding=funding, prepared_at=funding.get("prepared_at") if funding else None
     )

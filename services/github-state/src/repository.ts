@@ -4,6 +4,7 @@ import { comment, issue, pr, status } from './normalize';
 import { batchLimit } from './catalog';
 import { Lane, LANES, laneAt, settings } from './reconciliation';
 import { SURVEY_CONTRACT, compactPR, issueFragment, reviewFragment, summarizeFragments, inScope, roadmapFocuses } from './survey';
+import { readPromotionReceipts } from './activity_landings';
 
 export class RepositoryState extends DurableObject<Env> {
   private inflightQueries=new Map<string,Promise<Result>>();
@@ -14,6 +15,7 @@ export class RepositoryState extends DurableObject<Env> {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
       CREATE TABLE IF NOT EXISTS resources(kind TEXT,id TEXT,parent TEXT,data TEXT,updated TEXT,observed INTEGER,revision INTEGER,tombstone INTEGER DEFAULT 0,PRIMARY KEY(kind,id));
       CREATE TABLE IF NOT EXISTS activity_loc_cache(number INTEGER PRIMARY KEY,fingerprint TEXT,data TEXT);
+      CREATE TABLE IF NOT EXISTS activity_landings(number INTEGER,head TEXT,at INTEGER,source TEXT,PRIMARY KEY(number,head));
       CREATE INDEX IF NOT EXISTS resource_parent ON resources(kind,parent,tombstone);
       CREATE TABLE IF NOT EXISTS collections(key TEXT PRIMARY KEY,operation TEXT,args TEXT,complete INTEGER,verified INTEGER,revision INTEGER,etag TEXT);
       CREATE TABLE IF NOT EXISTS members(collection TEXT,id TEXT,PRIMARY KEY(collection,id));
@@ -771,7 +773,7 @@ export class RepositoryState extends DurableObject<Env> {
     let state=this.meta('snapshot_pending');
     if(!state) {
       if(now-(this.meta('last_snapshot') || 0)<=86400000) return;
-      state={version:2,observational:true,started:now,revision:this.revision(),key:`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}-${crypto.randomUUID()}`,index:0,tables:['meta','resources','collections','members'].map(table=>({table,after:0,pages:0,upper:this.ctx.storage.sql.exec<any>('SELECT COALESCE(MAX(rowid),0) last FROM '+table).one().last}))};
+      state={version:2,observational:true,started:now,revision:this.revision(),key:`snapshots/${this.meta('repository').id}/${new Date(now).toISOString().slice(0,10)}-${crypto.randomUUID()}`,index:0,tables:['meta','resources','collections','members','activity_landings'].map(table=>({table,after:0,pages:0,upper:this.ctx.storage.sql.exec<any>('SELECT COALESCE(MAX(rowid),0) last FROM '+table).one().last}))};
       this.setMeta('snapshot_pending',state);
     }
     // Archive bounded pages and checkpoint each one. Repository mutations can
@@ -872,6 +874,20 @@ export class RepositoryState extends DurableObject<Env> {
       if (row.due) await this.ctx.storage.setAlarm(Math.max(Date.now()+100,row.due));
     }
   }
+  async refreshActivityLandings(): Promise<void> {
+    if(this.meta('repository')?.name!=='TauCetiProject/TauCeti') return;
+    const now=Date.now();
+    if(now-(this.meta('activity_landings_checked') || 0)<300000) return;
+    // Reserve the interval before yielding so overlapping cron requests cannot
+    // multiply reads. This path never calls configure, demand or the scheduler.
+    this.setMeta('activity_landings_checked',now);
+    try {
+      const receipts=await readPromotionReceipts();
+      for(const r of receipts) this.ctx.storage.sql.exec('INSERT INTO activity_landings VALUES(?,?,?,?) ON CONFLICT(number,head) DO UPDATE SET at=excluded.at,source=excluded.source WHERE excluded.at<activity_landings.at',r.number,r.head,r.at,r.source);
+      this.setMeta('activity_landings_success',now);
+      this.setMeta('activity_landings_error',null);
+    } catch {this.setMeta('activity_landings_error','Stored Bors promotion receipts unavailable');}
+  }
   async activityLOC(number:number,p:any,budget?:{remaining:number}): Promise<any> {
     const key=queryKey({operation:'files',args:{number}});
     const complete=this.ctx.storage.sql.exec<any>('SELECT complete,revision FROM collections WHERE key=?',key).toArray()[0];
@@ -932,11 +948,13 @@ export class RepositoryState extends DurableObject<Env> {
           const row=this.ctx.storage.sql.exec<any>("SELECT data,observed FROM resources WHERE kind='pr' AND id=? AND tombstone=0",String(number)).toArray()[0];
           if(!row){missing.push(number);continue;}
           const p=await this.decode(row.data);
-          prs.push({number,state:p.state,created_at:p.createdAt || null,landed_at:p.mergedAt || null,
+          const landing=this.ctx.storage.sql.exec<any>('SELECT at,source FROM activity_landings WHERE number=? AND head=?',number,p.headRefOid || '').toArray()[0];
+          prs.push({number,state:p.state,created_at:p.createdAt || null,landed_at:p.mergedAt || (landing?new Date(landing.at/1000).toISOString():null),
             head_sha:p.headRefOid || null,observed_at:row.observed,
-            landing_source:p.mergedAt?'github-merged':null,lean_loc:await this.activityLOC(number,p,locBudget)});
+            landing_source:p.mergedAt?'github-merged':landing?.source || null,lean_loc:await this.activityLOC(number,p,locBudget)});
         }
-        return json({version:1,repository:input.repository,revision:this.revision(),as_of:Date.now(),coverage:'observed',prs,missing});
+        return json({version:1,repository:input.repository,revision:this.revision(),as_of:Date.now(),coverage:'observed',prs,missing,
+          landing_observations:{checked_at:this.meta('activity_landings_checked'),last_success_at:this.meta('activity_landings_success'),error:this.meta('activity_landings_error')}});
       }
       if (path==='/query') {
         const q=await req.json() as Query;
@@ -970,6 +988,7 @@ export class RepositoryState extends DurableObject<Env> {
       }
       if (path==='/health') return json({storage_bytes:this.ctx.storage.sql.databaseSize,snapshot_pending:this.meta('snapshot_pending'),survey:this.surveyHealth(),reconciliation_version:2,deployment_id:this.env.CF_VERSION?.id,settings:settings(this.env),repository:this.meta('repository'),revision:this.revision(),bootstrap_inventory:this.meta('bootstrap_inventory'),last_webhook:this.meta('last_webhook'),webhook_apply_ms:this.meta('webhook_apply_ms'),last_repair:this.meta('last_repair'),last_upstream_failure:this.meta('last_upstream_failure'),coverage:this.ctx.storage.sql.exec('SELECT operation,COUNT(*) resources,SUM(complete) complete,MIN(verified) oldest_verified FROM collections GROUP BY operation').toArray(),jobs:this.ctx.storage.sql.exec('SELECT COUNT(*) total,SUM(due<=?) due,MIN(started) oldest_started FROM jobs',Date.now()).one(),lanes:this.ctx.storage.sql.exec('SELECT lane,COUNT(*) jobs,SUM(due<=? AND lease_until<=?) eligible,SUM(lease_until>?) inflight,MIN(CASE WHEN due<=? AND lease_until<=? THEN due END) oldest_eligible,MIN(requested_at) oldest_requested FROM jobs GROUP BY lane',...Array(5).fill(Date.now())).toArray(),waits:this.ctx.storage.sql.exec('SELECT lane,wait_reason,COUNT(*) jobs FROM jobs WHERE wait_reason IS NOT NULL GROUP BY lane,wait_reason').toArray(),repair_hour:this.ctx.storage.sql.exec('SELECT lane,operation,event,COUNT(*) n,SUM(value) value,MAX(value) maximum FROM repair_metrics WHERE at>? GROUP BY lane,operation,event',Date.now()-3600000).toArray(),requested_latency:this.ctx.storage.sql.exec("SELECT operation,MIN(value) p95_ms,MAX(samples) samples FROM (SELECT operation,value,ROW_NUMBER() OVER(PARTITION BY operation ORDER BY value) rank,COUNT(*) OVER(PARTITION BY operation) samples FROM repair_metrics WHERE event='requested_single_latency_ms' AND at>?) WHERE rank>=MAX(1,CAST((samples*95+99)/100 AS INTEGER)) GROUP BY operation",Date.now()-3600000).toArray(),queries:this.ctx.storage.sql.exec('SELECT * FROM query_metrics').toArray(),repair_operations:this.ctx.storage.sql.exec("SELECT json_extract(query,'$.operation') operation,COUNT(*) jobs,SUM(due<=?) due,MIN(due) next_due,MAX(attempt) attempts FROM jobs GROUP BY operation",Date.now()).toArray()});
       if (path==='/changes') { const after=Number(new URL(req.url).searchParams.get('after') || 0); const first=this.ctx.storage.sql.exec<any>('SELECT MIN(revision) AS revision FROM changes').one(); return json({revision:this.revision(),reset:after>0 && first.revision && after<first.revision-1,changes:this.ctx.storage.sql.exec('SELECT * FROM changes WHERE revision>? ORDER BY revision LIMIT 1000',after).toArray()}); }
+      if (path==='/activity-refresh' && req.method==='POST') {await this.refreshActivityLandings();return json({ok:true});}
       if (path==='/tick') { if (!this.meta('repository')) await this.configure((await req.json() as any).repository); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }
       if (path==='/repair') { this.ctx.storage.sql.exec('UPDATE jobs SET due=CASE WHEN wait_reason IS NULL AND attempt=0 THEN ? ELSE due END,dirty=1,generation=generation+1',Date.now()); await this.ctx.storage.setAlarm(Date.now()+100); return json({ok:true}); }
       return json({error:'not_found'},404);

@@ -121,6 +121,7 @@ export default {
   async scheduled(_event:ScheduledController,env:Env,ctx:ExecutionContext):Promise<void> {
     for (const repo of repositories(env)) {
       ctx.waitUntil(stub(env.REPOSITORIES,repo.id).fetch('https://internal/tick',{method:'POST',body:JSON.stringify({repository:repo.name})}));
+      if(repo.name==='TauCetiProject/TauCeti') ctx.waitUntil(stub(env.REPOSITORIES,repo.id).fetch('https://internal/activity-refresh',{method:'POST'}));
       ctx.waitUntil(stub(env.INSTALLATIONS,repo.installation).fetch('https://internal/audit',{method:'POST',body:JSON.stringify(repo)}));
     }
     // Retention is explicit so raw webhook bodies and abandoned staging pages do not accumulate.

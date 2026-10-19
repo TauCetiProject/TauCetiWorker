@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -157,8 +158,8 @@ class CostTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
         self.assertIn("Spending (completed sessions)", output.getvalue())
-        self.assertIn("API spend ($/hour)", output.getvalue())
-        self.assertIn("Hours recorded", output.getvalue())
+        self.assertIn("API spend ($/elapsed hour)", output.getvalue())
+        self.assertIn("Worker-hours recorded", output.getvalue())
         self.assertIn("$4.00", output.getvalue())
 
     def test_new_recording_uses_elapsed_time_not_the_entire_trailing_window(self):
@@ -173,14 +174,38 @@ class CostTests(unittest.TestCase):
             zero = activity_costs.summarize(db, self.now, self.now, "scope", "machine")
             self.assertTrue(all(r["usd_per_hour"] is None for r in zero["spending"].values()))
 
+    def test_worker_hours_sum_clipped_rounds_and_exclude_waiting_or_unknown_ends(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM rounds")
+            for key, start, end, outcome, scope in (
+                ("overlap", -14400, -7200, "completed", "machine"),
+                ("done", -1800, -600, "completed", "machine"),
+                ("live", -900, None, None, "machine"),
+                ("waiting", -3600, None, "waiting", "machine"),
+                ("unknown-end", -7200, None, "interrupted-unfinished", "machine"),
+                ("interrupted", -1200, -1000, "interrupted", "machine"),
+                ("survey", -300, -200, "completed", "machine"),
+                ("other-scope", -10000, -1, "completed", "local"),
+                ("future", 10, None, None, "machine"),
+            ):
+                db.execute(
+                    "INSERT INTO rounds(id,worker,scope,kind,started,finished,outcome) VALUES (?,?,?,'fix',?,?,?)",
+                    (key, key, scope, self.now + start, self.now + end if end is not None else None, outcome),
+                )
+            rows = activity_costs.summarize(db, self.now, self.now - 10 * DAY, "scope", "machine")["spending"]
+        self.assertEqual(rows["3h"]["worker_seconds"], 6000)
+        self.assertEqual(rows["24h"]["worker_seconds"], 9600)
+        self.assertEqual(rows["total"]["worker_seconds"], 9600)
+
     def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
         s = self.summary()
         other = json.loads(json.dumps(s))
         for row in other["costs"]["spending"].values():
-            row.update(spent_usd="30", covered_seconds=3600, usd_per_hour="30")
+            row.update(spent_usd="30", covered_seconds=3600, worker_seconds=7200, usd_per_hour="30")
         values = [dict(available=True, summary=s), dict(available=True, summary=other)]
         combined = activity_summary.combine(values)["summary"]["costs"]["spending"]
         self.assertEqual(Decimal(combined["3h"]["usd_per_hour"]), 10)
+        self.assertEqual(combined["3h"]["worker_seconds"], s["costs"]["spending"]["3h"]["worker_seconds"] + 7200)
         self.assertEqual(Decimal(combined["total"]["usd_per_hour"]), Decimal(90) * 3600 / (10 * DAY + 1))
         # Missing/older hosts cannot silently turn unavailable spending into zero.
         other["costs"].pop("spending")
@@ -214,6 +239,43 @@ class CostTests(unittest.TestCase):
         self.assertIsNone(s["costs"]["windows"]["total"]["spent_usd"])
         self.assertTrue(all(r["usd_per_hour"] is None for r in s["costs"]["spending"].values()))
         self.assertIsNotNone(s["costs"]["funding"])
+
+    def test_shared_bors_promotion_turns_closed_pr_into_landed_output(self):
+        self.summary()
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET checked=0 WHERE number=5")
+            db.execute("UPDATE pr_observations SET checked=0 WHERE number=5")
+
+        def observe(url, token, repo, numbers):
+            return dict(
+                prs=[
+                    dict(
+                        number=5,
+                        state="CLOSED",
+                        head_sha="head",
+                        landed_at=datetime.fromtimestamp(self.now - 5, UTC).isoformat(),
+                        landing_source="bors-main-push-receipt",
+                        observed_at=self.now * 1000,
+                        lean_loc=dict(head_sha="head", added=10000, deleted=0),
+                    )
+                ]
+                if 5 in numbers
+                else [],
+                missing=[n for n in numbers if n != 5],
+            )
+
+        with (
+            patch.dict(
+                os.environ,
+                TAUCETI_GITHUB_STATE_URL="https://observations.invalid",
+                TAUCETI_GITHUB_STATE_TOKEN_FILE="unused",
+            ),
+            patch.object(a, "observe", side_effect=observe),
+        ):
+            s = self.summary()
+        self.assertEqual(s["unknown_landings"], 0)
+        self.assertEqual(s["costs"]["windows"]["7d"]["landed_loc_added"], 10200)
+        self.assertEqual(Decimal(s["costs"]["windows"]["7d"]["weighted_loc"]), 10350)
 
     def test_native_and_compatibility_review_receipts_are_not_double_counted(self):
         # Clear the direct fixture receipt so just the dual-written review remains.

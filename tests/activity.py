@@ -168,7 +168,8 @@ class ActivityTests(unittest.TestCase):
             db.execute("INSERT INTO main_landings VALUES ('org/repo','batch','2026-10-19T00:00:00Z')")
         with patch.dict(os.environ, TAUCETI_ACTIVITY_BORS_DB=str(path)):
             a.prepare(now=self.now)
-            self.assertEqual(a.cached()["summary"]["unknown_landings"], 1)
+            self.assertEqual(a.cached()["summary"]["unknown_landings"], 0)
+            self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["landed"], 0)
             with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute("UPDATE merge_builds SET members_json=?", (json.dumps([dict(pr=7, head_sha="right")]),))
             a.prepare(now=self.now)

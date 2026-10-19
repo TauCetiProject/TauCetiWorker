@@ -25,8 +25,11 @@ PR authorship comes from successful tracked creation, not the entire GitHub
 account's history. Authored counts use creation time; landed counts use landing
 time, including PRs created before the window. Open PRs are the current last-known
 stock. Unknown states, landing evidence, and historical outcomes are explicit.
-Closed never means landed. Bors landings require an exact PR-head match in
-verified batch-to-main evidence, not titles, reviews or staging success.
+Closed never means landed. Bors squash-merges can leave GitHub's state as closed;
+the shared server supplies the recorded promotion to main, bound to the exact
+approved PR head and constructed batch commit. Titles, reviews, CI success and
+staging pushes are not landing evidence. Ordinary closed PRs do not produce a
+missing-landing warning.
 
 ## Costs and initiated PR output
 
@@ -34,8 +37,12 @@ Average API spending has **3h**, **24h**, **7d** and **All time** columns in
 $/hour. It uses completed/reconciled session costs, including reviews, recognized
 at settlement; active reservations are separate estimates and do not enter this
 rate. Each average divides by elapsed recorded time within that window, so a
-new installation is not diluted by hours before recording began. `Hours recorded`
-shows the denominator. Fleet averages pool spending over the longest recorded
+new installation is not diluted by hours before recording began. `Worker-hours
+recorded` adds time across completed and currently running native rounds, clipped
+to each window. Capacity/budget/quota waiting and interruptions without a known
+end do not inflate it. Failed rounds with recorded durations still count. The
+spending rate remains dollars per elapsed hour, not dollars per worker-hour.
+Fleet averages pool spending over the longest recorded
 duration covered by their host summaries; parallel machines do not add elapsed
 wall-clock hours. Missing spending data leaves the fleet rate unavailable.
 Preparation reuses the existing local budget cache and collector, with no extra
@@ -127,8 +134,14 @@ are not retried before the next interval. The endpoint returns stored states,
 original observation timestamps and explicit missing numbers. Existing webhook
 and reconciliation behavior is unchanged.
 
-Existing webhook `merged_at` data supplies ordinary GitHub merge evidence.
-Already-present TauCetiCI SQLite data supplies Bors landing times; set
+Existing webhook `merged_at` data supplies ordinary GitHub merge evidence. The
+shared server's existing cron also imports Bors's stored candidate/promotion
+journal at most once per five minutes for the whole fleet. This reads Bors's
+database, not GitHub, and neither triggers merges nor changes queue state. The
+activity endpoint only reads the resulting cache. Promotion receipts require
+matching construction and main-push (or recovery-read) evidence, preserving the
+original recorded timestamp and exact approved PR head across squash merges.
+
+Already-present TauCetiCI SQLite data remains an optional Bors landing source; set
 `TAUCETI_ACTIVITY_BORS_DB` to its path (the default checks the existing fleet
-cache). Reporting never downloads or refreshes that database. Without evidence,
-landing counts remain incomplete and the unknown count is displayed.
+cache). Reporting never downloads or refreshes that database.
