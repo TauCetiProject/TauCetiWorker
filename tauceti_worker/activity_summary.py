@@ -25,6 +25,15 @@ def number(value):
     return format(Decimal(str(value)), "f").rstrip("0").rstrip(".") if "." in str(value) else str(value)
 
 
+def hourly_rate(spent, covered_seconds):
+    """A wall-clock average of settled costs; reservations are not spending."""
+    return (
+        str(Decimal(spent) * 3600 / Decimal(str(covered_seconds)))
+        if spent is not None and covered_seconds and covered_seconds > 0
+        else None
+    )
+
+
 def display(value, default_kinds=()):
     if not value.get("available"):
         print("Activity: " + value.get("reason", "unavailable"))
@@ -69,6 +78,17 @@ def display(value, default_kinds=()):
                 (label, [f"{ci[w][key] / ci[w]['attempts']:.1f}" if ci[w]["attempts"] else "—" for w in WINDOWS])
             )
     costs = s.get("costs", {})
+    spending_rows = []
+    if costs.get("spending"):
+        spending = costs["spending"]
+        hours = [spending[w].get("covered_seconds") for w in WINDOWS]
+        spending_rows = [
+            ("API spend ($/hour)", [amount(spending[w].get("usd_per_hour")) for w in WINDOWS]),
+            (
+                "Hours recorded",
+                ["—" if not seconds else "<0.01" if seconds < 36 else f"{seconds / 3600:.2f}" for seconds in hours],
+            ),
+        ]
     cost_rows = []
     if costs.get("windows"):
         windows = costs["windows"]
@@ -105,10 +125,14 @@ def display(value, default_kinds=()):
                     ],
                 )
             )
-    label_width = max(len("Finished rounds"), *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows]))
+    label_width = max(
+        len("Spending (completed sessions)"),
+        *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *spending_rows]),
+    )
     headers = ("3h", "24h", "7d", "Recorded total")
     widths = [
-        max(len(h), *(len(str(values[i])) for _, values in [*rounds, *prs, *ci_rows])) for i, h in enumerate(headers)
+        max(len(h), *(len(str(values[i])) for _, values in [*rounds, *prs, *ci_rows, *spending_rows]))
+        for i, h in enumerate(headers)
     ]
 
     def table(title, cols, rows, col_widths=None):
@@ -124,6 +148,8 @@ def display(value, default_kinds=()):
 
     table("Finished rounds", headers, rounds, widths)
     table(None, headers, prs, widths)
+    if spending_rows:
+        table("Spending (completed sessions)", ("3h", "24h", "7d", "All time"), spending_rows, widths)
     if cost_rows:
         table("Costs / initiated PR output", ("All time", "7 days"), cost_rows)
     funding = costs.get("funding")
@@ -210,6 +236,18 @@ def combine(values):
             else None
         )
         s["costs"]["windows"][w] = row
+    if any(v.get("costs", {}).get("spending") for v in known):
+        s["costs"]["spending"] = {}
+        for w in WINDOWS:
+            rows = [v.get("costs", {}).get("spending", {}).get(w, {}) for v in known]
+            complete = len(known) == len(values) and all(r.get("spent_usd") is not None for r in rows)
+            spent = str(sum((Decimal(r["spent_usd"]) for r in rows), Decimal(0))) if complete else None
+            # Parallel machines share wall-clock time; neither sum durations nor
+            # average their rates. A newly joined host contributes only its costs.
+            covered = max((r.get("covered_seconds", 0) for r in rows), default=0)
+            s["costs"]["spending"][w] = dict(
+                spent_usd=spent, covered_seconds=covered, usd_per_hour=hourly_rate(spent, covered)
+            )
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):
         s["costs"]["funding"] = {

@@ -3,9 +3,11 @@
 import json
 from decimal import Decimal
 
+from .activity_summary import hourly_rate
 from .budget import Budget, money
 
 COST_WINDOWS = {"total": None, "7d": 7 * 86400}
+SPENDING_WINDOWS = {"3h": 10800, "24h": 86400, "7d": 7 * 86400, "total": None}
 
 
 def install(db):
@@ -91,7 +93,26 @@ def summarize(db, now, cutoff, column=None, identity=None):
             pending_usd=str(pending) if available else None,
             estimated_usd=str(spent + pending) if available else None,
         )
-    return dict(windows=windows, funding=funding, prepared_at=funding.get("prepared_at") if funding else None)
+    recorded_since = cutoff
+    if recorded_since is None:
+        recorded_since = db.execute(f"SELECT MIN(started) FROM conversation_costs WHERE 1=1 {where}", args).fetchone()[
+            0
+        ]
+    spending = {}
+    for key, seconds in SPENDING_WINDOWS.items():
+        since = (
+            max(recorded_since, now - seconds) if seconds is not None and recorded_since is not None else recorded_since
+        )
+        covered = max(0, now - since) if since is not None else 0
+        costs = db.execute(
+            f"SELECT cost FROM conversation_costs WHERE settled>=? AND settled<=? {where}",
+            [since if since is not None else now, now, *args],
+        )
+        spent = str(sum((money(row[0]) for row in costs), Decimal(0))) if funding and not failure else None
+        spending[key] = dict(spent_usd=spent, covered_seconds=covered, usd_per_hour=hourly_rate(spent, covered))
+    return dict(
+        windows=windows, spending=spending, funding=funding, prepared_at=funding.get("prepared_at") if funding else None
+    )
 
 
 def estimate(spent, landed_added, open_added, missing=0):
