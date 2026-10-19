@@ -129,12 +129,3 @@ def summarize(db, now, cutoff, column=None, identity=None):
     return dict(
         windows=windows, spending=spending, funding=funding, prepared_at=funding.get("prepared_at") if funding else None
     )
-
-
-def estimate(spent, landed_added, open_added, missing=0):
-    """All conversation spending amortized over initiated PR output, not per-PR costs."""
-    weighted = Decimal(landed_added) + Decimal(open_added) / 2
-    return dict(
-        weighted_loc=str(weighted),
-        usd_per_loc=str(money(spent) / weighted) if spent is not None and weighted > 0 and not missing else None,
-    )

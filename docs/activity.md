@@ -66,8 +66,14 @@ LOC comes from complete file lists already cached by the shared GitHub state
 server. Immutable file URLs must match the PR head (or base for deleted files),
 and cached file totals must agree with available PR headers. The observation
 route never schedules file collection or falls back to GitHub. Missing or stale
-LOC and a zero denominator produce an unavailable rate, with measured-PR coverage
-shown alongside it. Cost preparation runs in the existing background collector;
+LOC is extrapolated from measured PRs in the same window: measured weighted LOC
+per measured PR weight, multiplied by total eligible PR weight (landed = 1,
+open = ½). Unknown PR states contribute zero. These estimates carry `~` and show
+measured-PR coverage. With no measured LOC, missing LOC contributes zero; positive
+spending divided by zero LOC displays `$∞` (zero spending displays `$0.0000`).
+Missing financial data remains explicitly unavailable. Fleet totals pool the
+measurement counts and costs before estimating and dividing.
+Cost preparation runs in the existing background collector;
 `activity` and `workers status` still only read small JSON summaries.
 
 Completed review counts include reviews of other authors' PRs. `PRs assisted`
