@@ -910,10 +910,98 @@ class PrivateAlerts(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.block = {"from_sha": "a" * 40, "to_sha": "b" * 40, "reason": "network unavailable"}
+        timer = patch.object(alerts.time, "time", return_value=10000)
+        self.clock = timer.start()
+        self.addCleanup(timer.stop)
+        # Most delivery tests exercise a persistent stall already past its delay.
+        (self.work / "operational-alert.json").write_text(
+            json.dumps({"from_sha": self.block["from_sha"], "first_seen": 6400})
+        )
         self.real_request = alerts.request
         self.request = patch.object(alerts, "request", return_value={"result": "success", "id": 456})
         self.http = self.request.start()
         self.addCleanup(self.request.stop)
+
+    def test_transient_pause_never_contacts_zulip_or_loads_credentials(self):
+        (self.work / "operational-alert.json").unlink()
+        self.config.unlink()
+        alerts.notify_block(self.work, self.block)
+        self.clock.return_value = 13599
+        alerts.notify_block(self.work, self.block)
+        self.http.assert_not_called()
+        self.assertFalse((self.work / "zulip-alerts.json").exists())
+        state = self.work / "operational-alert.json"
+        self.assertEqual(json.loads(state.read_text())["first_seen"], 10000)
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+
+    def test_persistent_stall_timer_survives_restart_retry_and_target_changes(self):
+        (self.work / "operational-alert.json").unlink()
+        alerts.notify_block(self.work, self.block)
+        self.clock.return_value = 13599
+        retry = {**self.block, "reason": "inspection unfinished", "attempt": "new-attempt", "to_sha": "c" * 40}
+        alerts.notify_block(self.work, retry)
+        self.http.assert_not_called()
+        self.clock.return_value = 13600
+        alerts.notify_block(self.work, retry)
+        alerts.notify_block(self.work, retry)
+        self.http.assert_called_once()
+        self.assertEqual(json.loads((self.work / "operational-alert.json").read_text())["first_seen"], 10000)
+
+    def test_advancing_cursor_starts_a_new_operational_delay(self):
+        alerts.notify_block(self.work, self.block)
+        self.http.assert_called_once()
+        self.http.reset_mock()
+        next_block = {**self.block, "from_sha": "b" * 40, "to_sha": "c" * 40}
+        alerts.notify_block(self.work, next_block)
+        self.clock.return_value = 13599
+        alerts.notify_block(self.work, next_block)
+        self.http.assert_not_called()
+        self.clock.return_value = 13600
+        alerts.notify_block(self.work, next_block)
+        self.http.assert_called_once()
+
+    def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
+        (self.work / "operational-alert.json").unlink()
+        alerts.notify_block(self.work, self.block)
+        self.http.assert_not_called()
+        sa.record(
+            self.work / "ledger.jsonl",
+            {
+                "from_sha": self.block["from_sha"],
+                "to_sha": self.block["to_sha"],
+                "verdict": {"verdict": "incomplete", "findings": ["Cannot establish whether macro performs IO"]},
+            },
+        )
+        alerts.notify_block(self.work, self.block)
+        self.http.assert_called_once()
+        message = self.http.call_args.args[2]["content"]
+        self.assertIn("Inspection incomplete", message)
+        self.assertIn("Human review required", message)
+        self.assertNotIn("operational stall", message)
+
+    def test_bad_operational_timer_does_not_mutate_audit_evidence_or_send_misleading_dm(self):
+        blocked = self.work / "blocked.json"
+        blocked.write_text(json.dumps(self.block))
+        for state in (
+            [],
+            {"from_sha": self.block["from_sha"], "first_seen": True},
+            {"from_sha": self.block["from_sha"], "first_seen": float("nan")},
+        ):
+            (self.work / "operational-alert.json").write_text(json.dumps(state))
+            alerts.notify_block(self.work, self.block)
+            self.assertEqual(json.loads(blocked.read_text()), self.block)
+        self.http.assert_not_called()
+
+    def test_alert_filter_never_clears_a_block_or_modifies_recovery_budget(self):
+        blocked = self.work / "blocked.json"
+        blocked.write_text(json.dumps(self.block))
+        recovery = self.work / "operational-recovery.json"
+        recovery.write_text('{"budget": "unchanged"}')
+        before = blocked.read_bytes(), recovery.read_bytes()
+        (self.work / "operational-alert.json").unlink()
+        alerts.notify_block(self.work, self.block)
+        self.assertEqual((blocked.read_bytes(), recovery.read_bytes()), before)
+        self.http.assert_not_called()
 
     def test_private_recipient_and_durable_deduplication(self):
         alerts.notify_block(self.work, self.block)
@@ -924,10 +1012,14 @@ class PrivateAlerts(unittest.TestCase):
         self.assertEqual(method, "POST")
         self.assertEqual(params["type"], "direct")
         self.assertEqual(json.loads(params["to"]), [123])
-        self.assertIn("Operational pause", params["content"])
+        self.assertIn("Operational stall", params["content"])
+        self.assertIn("at least one hour", params["content"])
+        self.assertIn("Automatic recovery continues", params["content"])
         self.assertNotIn("secret", params["content"])
 
     def test_source_finding_is_reported_as_data_with_evidence(self):
+        # A finding bypasses both a fresh delay and damaged operational bookkeeping.
+        (self.work / "operational-alert.json").write_text("invalid operational timer")
         (self.work / "ledger.jsonl").write_text(
             json.dumps(
                 {
@@ -941,6 +1033,7 @@ class PrivateAlerts(unittest.TestCase):
         alerts.notify_block(self.work, self.block)
         message = self.http.call_args.args[2]["content"]
         self.assertIn("Source-safety finding", message)
+        self.assertIn("Human review required", message)
         self.assertIn("TauCeti/A.lean:12", message)
         self.assertIn("blocked.json", message)
         self.assertNotIn("@**everyone**", message)

@@ -236,8 +236,15 @@ worker's environment to an absolute path to a mode-0600 JSON file:
 Use a bot credential and the recipient's numeric Zulip user ID. The credential
 and its configuration path are excluded from the isolated reviewer's environment.
 Alerts include the commit range, recorded findings and local evidence paths.
-Source findings, incomplete inspections and operational pauses are labelled separately.
-They are sent only as direct messages; no GitHub issue is created. A durable local
+Source findings and explained code-safety uncertainty send an immediate DM marked
+**Human review required**. Routine unfinished turns and provider errors stay in the
+logs while automatic recovery handles them. An operational pause sends a DM only
+when the same cursor has remained held for at least one hour after the first
+observed pause. Its separate **Operational stall** label explains that no source
+finding is recorded and eligible automatic recovery continues. This durable timer
+survives retries and Worker restarts; advancement starts a fresh delay. The timer
+changes notifications only, preserving all blocks, evidence and recovery checks.
+Alerts are sent only as direct messages; no GitHub issue is created. A durable local
 receipt suppresses repeated alerts for the same blocked range and kind. Failed
 delivery is retried on a subsequent audit round after at least 15 minutes, checking
 the latest 100 messages in that private conversation for an earlier ambiguous delivery.

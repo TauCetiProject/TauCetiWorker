@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import time
 import urllib.parse
@@ -13,6 +14,8 @@ from pathlib import Path
 
 from .config import log
 from .constants import TAUCETI
+
+OPERATIONAL_STALL_SECONDS = 3600
 
 
 def request(config: dict, method: str, params: dict) -> dict:
@@ -68,7 +71,7 @@ def report(work: Path, block: dict) -> dict:
             if (row.get("from_sha"), row.get("to_sha")) == (block.get("from_sha"), block.get("to_sha")):
                 if "verdict" in row:
                     verdict = row["verdict"]
-    kind = "Operational pause"
+    kind = "Operational stall"
     if verdict and verdict["verdict"] != "pass":
         kind = "Source-safety finding" if verdict["verdict"] == "finding" else "Inspection incomplete"
     return {
@@ -77,6 +80,29 @@ def report(work: Path, block: dict) -> dict:
         "to_sha": block.get("to_sha"),
         "details": verdict["findings"] if verdict else [block.get("reason", "Unknown audit failure")],
     }
+
+
+def actionable(work: Path, value: dict) -> bool:
+    """Source concerns notify now; operational pauses notify after an hour held.
+
+    The cursor, rather than an attempt ID or failure text, identifies the stall.
+    Retries and Worker restarts cannot reset the delay. A new cursor resets it.
+    This timer controls notifications only; audit blocks/recovery are untouched.
+    """
+    if value["kind"] != "Operational stall":
+        return True
+    path = work / "operational-alert.json"
+    now = time.time()
+    state = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(state, dict):
+        raise ValueError("invalid operational alert state")
+    if state.get("from_sha") != value["from_sha"]:
+        state = {"from_sha": value["from_sha"], "first_seen": now}
+        save(path, state)
+    started = state.get("first_seen")
+    if type(started) not in (int, float) or not math.isfinite(started):
+        raise ValueError("invalid operational alert timestamp")
+    return now - started >= OPERATIONAL_STALL_SECONDS
 
 
 def content(value: dict, work: Path, marker: str) -> str:
@@ -88,9 +114,17 @@ def content(value: dict, work: Path, marker: str) -> str:
         if old and target
         else f"https://github.com/{TAUCETI}/commits/main"
     )
+    attention = (
+        "**Attention: the audit cursor has remained held for at least one hour.** "
+        "This is an operational stall, with no recorded source-safety finding for this range. "
+        "Automatic recovery continues where eligible; investigate if the stall persists."
+        if value["kind"] == "Operational stall"
+        else "**Human review required:** the inspection recorded a source concern or unresolved "
+        "code-safety uncertainty. Automatic recovery will not discard this judgment."
+    )
     return (
         f"**Tau Ceti security audit — {value['kind']}**\n\n"
-        f"Inspection: {location}\n\n```text\n{detail}\n```\n\n"
+        f"{attention}\n\nInspection: {location}\n\n```text\n{detail}\n```\n\n"
         "The `security-audit` cursor has not advanced past this inspection. "
         "Toolchain releases remain gated by that cursor. Bump/progress work may continue.\n\n"
         f"Evidence on the worker host: `{work / 'blocked.json'}` and `{work / 'ledger.jsonl'}`.\n\n"
@@ -104,8 +138,11 @@ def notify_block(work: Path, block: dict) -> None:
     if not configured:
         return
     try:
-        config = json.loads(Path(configured).read_text())
         value = report(work, block)
+        if not actionable(work, value):
+            log("security-audit: transient operational pause retained in logs; no private alert before one hour")
+            return
+        config = json.loads(Path(configured).read_text())
         identity = {key: value[key] for key in ("kind", "from_sha", "to_sha")}
         key = hashlib.sha256(
             json.dumps([config["site"], config["recipient_id"], identity], sort_keys=True).encode()
