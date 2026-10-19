@@ -117,6 +117,15 @@ class SharedTests(unittest.TestCase):
         with self.assertRaises(s.Unavailable):
             s.signature(self.cwd, self.env)
 
+    def test_local_clone_preserves_fork_cache_identity_and_disables_push(self):
+        url = "https://github.com/TauCetiProject/mathlib4.git"
+        git(self.mathlib, "remote", "add", "origin", url)
+        target = self.root / "fresh-mathlib"
+        s.clone(self.mathlib, target, self.rev)
+        self.assertEqual(git(target, "remote", "get-url", "origin"), url)
+        self.assertEqual(git(target, "remote", "get-url", "--push", "origin"), "no_push")
+        self.assertEqual(git(target, "rev-parse", "HEAD"), self.rev)
+
     def test_publish_from_fresh_sources_and_reuse_without_agent_outputs(self):
         poison = self.mathlib / ".lake/build/poison"
         poison.parent.mkdir(parents=True)

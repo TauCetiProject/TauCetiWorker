@@ -288,6 +288,16 @@ def clone(source, target, revision):
         if p.returncode:
             raise Unavailable("fresh snapshot checkout failed: " + p.stderr.strip()[-300:])
 
+    # A local clone otherwise records the source directory as origin. Mathlib's
+    # cache tool uses that URL to select a fork's artifact scope; losing it can
+    # silently fall back to the upstream cache and miss all fork-only artifacts.
+    remote = subprocess.run(
+        ["git", "-C", str(source), "remote", "get-url", "origin"], capture_output=True, text=True, timeout=30
+    )
+    if remote.returncode == 0 and remote.stdout.strip():
+        git(target, "remote", "set-url", "origin", remote.stdout.strip())
+    git(target, "remote", "set-url", "--push", "origin", "no_push")
+
 
 def verify(build, mathlib, artifacts=(".olean", ".ilean")):
     modules = [mathlib / "Mathlib.lean", *sorted((mathlib / "Mathlib").rglob("*.lean"))]
