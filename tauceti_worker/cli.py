@@ -571,13 +571,15 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument("--worker")
     scope.add_argument("--group", help="fleet machine ID, or local")
     activity.add_argument("--config", type=Path, help="worker configuration for observation-server credentials")
-    activity.add_argument("--backfill", action="store_true", help="refresh: import existing structured history")
+    activity.add_argument(
+        "--backfill", action="store_true", help="refresh: import PR creation receipts since activity recording began"
+    )
     activity.add_argument(
         "--history-root",
         type=Path,
         action="append",
         default=[],
-        help="refresh --backfill: also import logs from this earlier installation",
+        help=argparse.SUPPRESS,
     )
     activity.add_argument("--json", action="store_true")
     activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")

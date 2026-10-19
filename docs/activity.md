@@ -46,18 +46,14 @@ scoped by worker or group).
 ```sh
 # Explicit preparation, using configured shared-server credentials; never GitHub.
 tauceti activity refresh --config ~/.config/tauceti/workers.toml
-# Import structured history once; registered files are then followed by offset.
+# Import PR creation receipts since activity recording began; follow by offset.
 tauceti activity refresh --backfill
-# Include an earlier installation during a gradual runtime upgrade.
-tauceti activity refresh --backfill --history-root /path/to/old/installation
 ```
 
-Historical `resources.jsonl` receipts lack type/outcome information; those counts
-appear as `type unrecorded` and the `outcome unrecorded` subset. The report explains
-this gap; it does not infer missing types from transcripts. New resource receipts carry a lifecycle marker and cannot
-be counted again through backfill. Existing fleet creation journals retain their
-original machine attribution. No transcripts are parsed. Totals mean recorded
-history, not a claim of complete lifetime coverage.
+Activity starts with native round lifecycle recording. Preparation discards
+previously imported resource-log rounds and PR activity before that starting
+point. Resource logs are never imported, and the cutoff is retained across
+journal replays and upgrades. Native rounds already recorded are preserved.
 
 Without a running manager, Linux installations can optionally enable preparation:
 

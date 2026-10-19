@@ -44,7 +44,6 @@ class ActivityTests(unittest.TestCase):
 
     def test_table_aligns_all_rows_and_lists_zero_count_work_types(self):
         self.finish(10, kind="fix")
-        self.finish(20, kind="unknown", outcome="unknown")
         a.prepare(now=self.now)
         value = a.cached()
         self.assertEqual(value["summary"]["round_types"], list(a.ROUND_TYPES))
@@ -60,8 +59,9 @@ class ActivityTests(unittest.TestCase):
         for kind in ("roadmap", "review", "fix-ci", "progress", "security-audit", "no-work"):
             line = next(line for line in data_rows if line.strip().startswith(kind + " "))
             self.assertEqual(re.findall(r"\d+", line), ["0"] * 4)
-        self.assertTrue(any("type unrecorded" in line for line in data_rows))
-        self.assertIn("Older resource logs did not record round types or outcomes", output.getvalue())
+        self.assertNotIn("unrecorded", output.getvalue())
+        self.assertNotIn("Older resource logs", output.getvalue())
+        self.assertNotIn("totals cover", output.getvalue())
         self.assertIn("Outcome rows are subsets", output.getvalue())
 
     def test_windows_total_failures_and_idempotent_replays(self):
@@ -170,7 +170,7 @@ class ActivityTests(unittest.TestCase):
             a.prepare(now=self.now)
         self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["landed"], 1)
 
-    def test_backfill_never_recounts_new_resource_receipts(self):
+    def test_backfill_ignores_resource_receipts(self):
         logs = Path(self.tmp.name) / "logs" / "worker"
         logs.mkdir(parents=True)
         path = logs / "resources.jsonl"
@@ -184,7 +184,46 @@ class ActivityTests(unittest.TestCase):
             a.prepare(now=self.now, import_history=True)
             a.prepare(now=self.now, import_history=True)
         s = a.cached()["summary"]
-        self.assertEqual(sum(r["finished"] for r in s["rounds"]["total"].values()), 2)
+        self.assertEqual(sum(r["finished"] for r in s["rounds"]["total"].values()), 1)
+
+    def test_migration_keeps_native_activity_and_cannot_restore_old_data(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT INTO rounds(id,worker,scope,kind,finished,outcome) VALUES ('resource:old','worker','machine','unknown',?,'unknown')",
+                (self.now - 80,),
+            )
+            db.execute("INSERT INTO cursors VALUES ('/old/logs/worker/resources.jsonl',1,100)")
+        with patch.object(a.time, "time", return_value=self.now - 60):
+            a.emit("round_started", key="native:start", round_id="native")
+        self.finish(30, rid="native")
+        with patch.object(a.time, "time", return_value=self.now - 100):
+            a.emit("pr_created", repository="org/repo", pr=7)
+        with patch.object(a.time, "time", return_value=self.now - 10):
+            a.emit("pr_created", repository="org/repo", pr=8)
+        a.prepare(now=self.now)
+        s = a.cached()["summary"]
+        self.assertEqual(s["history_since"], self.now - 60)
+        self.assertEqual(s["rounds"]["total"], {"review": dict(finished=1, failed=0, unknown=0)})
+        self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
+        # Even a still-running older collector cannot reinsert imported rounds/PRs.
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("INSERT INTO rounds(id,kind) VALUES ('resource:replayed','unknown')")
+            db.execute("INSERT INTO prs(repo,number,created) VALUES ('org/repo',9,?)", (self.now - 100,))
+            db.execute("INSERT INTO prs(repo,number,created) VALUES ('org/repo',11,?)", (self.now - 1,))
+            db.execute("UPDATE prs SET created=? WHERE number=11", (self.now - 100,))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 0)
+            cutoff = db.execute("SELECT value FROM meta WHERE key='history_cutoff'").fetchone()[0]
+        a.emit("round_finished", round_id="resource:pending", round_type="unknown", outcome="unknown")
+        with patch.object(a.time, "time", return_value=self.now - 100):
+            a.emit("pr_created", repository="org/repo", pr=10)
+        a.prepare(now=self.now + 1, import_history=True)
+        s = a.cached()["summary"]
+        self.assertEqual(s["history_since"], self.now - 60)
+        self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
+        with contextlib.closing(a._connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM rounds").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT value FROM meta WHERE key='history_cutoff'").fetchone()[0], cutoff)
 
     def test_observation_client_has_no_redirect_or_direct_api_fallback(self):
         import threading
