@@ -1,6 +1,6 @@
 You are reconciling the branch with current main on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The branch either conflicts with current `main`, or an authenticated head-bound recovery request asks for integration repair. A build-green, textually mergeable branch can still import source deleted or moved on main, use renamed APIs, or duplicate declarations now on main. Read the exact request evidence below; a suspect partition containing several PRs is not evidence against this PR. Integrate main and repair the resulting source so it can merge again. Work autonomously to completion.
 
-Before editing and again before pushing, re-read the live PR: it must remain open at the starting head with no `keep`/`hold`/`wip`/`human`/`do-not-close` pause. For a semantic handoff, confirm its authenticated current-head request is still active. If it was withdrawn or superseded, stop without changing the branch.
+Before editing and again before pushing, re-read the live PR: it must remain open at the starting head with no `keep`/`hold`/`wip`/`human`/`on-hold`/`do-not-close` pause. For a semantic handoff, confirm its authenticated current-head request is still active. If it was withdrawn or superseded, stop without changing the branch.
 
 ## Rebase onto current main
 - Fetch once and integrate one current `main` snapshot (record its full SHA; do not chase further main advances during this task):
@@ -12,7 +12,7 @@ Before editing and again before pushing, re-read the live PR: it must remain ope
 - Resolve every conflict on its merits:
   - **`TauCeti.lean` (the intentionally empty root module)**: preserve `main`'s version; do not add imports or reconstruct it.
   - **A source file under `TauCeti/`**: resolve so both the upstream change and your PR's intent are preserved. If `main` now provides something your PR duplicated, prefer the upstream version and drop the duplicate.
-- Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
+- Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If `main` has fully subsumed this PR, follow the durable PR outcome rules below: verify the replacement and close your superseded PR with evidence. If useful content remains, preserve it; a conflict alone is not evidence of supersession.
 
 Use the request's fixed tested-main revision and importing file/missing module or authoritative individual failure to reproduce the diagnosis. Check the prospective integrated tree, including modules added by this PR and imports in unchanged dependencies. Repair imports, renamed APIs, overlapping declarations and affected proofs on their merits. A successful Git merge/rebase alone does not prove compatibility: all verification below must pass. If the evidence no longer applies, explain why using the actual source and validation results.
 
@@ -25,7 +25,7 @@ If the branch already includes current `main`, semantic repair may still be need
 - Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, say so in your report and stop.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, follow the durable blocked-PR procedure below rather than leaving the decision in your final report.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
 
 Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.

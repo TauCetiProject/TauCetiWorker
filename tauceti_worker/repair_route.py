@@ -20,7 +20,7 @@ ENV = "TAUCETI_REBASE_REPAIR_TARGET"
 CURRENT = "current-at-launch"
 AUTHOR = "tauceti-ai-for-science"
 FORK = AUTHOR + "/TauCeti"
-PAUSE = {"keep", "hold", "wip", "human", "do-not-close"}
+PAUSE = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
 
 
 @dataclass(frozen=True)

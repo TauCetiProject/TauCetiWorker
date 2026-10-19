@@ -116,6 +116,11 @@ check("a review candidate that still stands is taken", still("review", rs), True
 check("...having read every answer live", [f for _, f in rs.forced], [True] * len(rs.forced))
 check("...and without busting a cache other processes share", rs.busted, [])
 
+for pause in ("hold", "on-hold", "human"):
+    gh = FakeGH()
+    gh.view["labels"] = [{"name": pause}]
+    check("live pause declines review: " + pause, still("review", FakeRS(), gh=gh), False)
+
 check("a head a peer now holds is declined", still("review", FakeRS(held=("codex",))), False)
 check("a head reviewed since the survey is declined", still("review", FakeRS(clean_head=HEAD)), False)
 

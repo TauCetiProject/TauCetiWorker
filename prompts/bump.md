@@ -26,7 +26,7 @@ lake exe axioms
 - Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, say so in your report and stop.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, follow the durable blocked-PR procedure below.
 - The final PR must be green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
 
 ## Preserve progress between sessions

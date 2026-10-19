@@ -198,6 +198,7 @@ def main() -> int:
                 "repository": {
                     "pullRequest": {
                         "headRefOid": head,
+                        "state": "OPEN",
                         "comments": {"totalCount": issue_n},
                         "reviewThreads": {
                             "totalCount": thread_total if thread_total is not None else len(thread_counts),
@@ -212,7 +213,7 @@ def main() -> int:
     check(
         "pr_progress_state counts head+issue+thread comments",
         gh.pr_progress_state(7),
-        {"head": "abc123", "ncomments": 6},
+        {"head": "abc123", "ncomments": 6, "state": "OPEN"},
     )  # 3 + 2 + 1
 
     # >100 threads: fall back to the exact paginated REST count (here 12 issue + 9 review = 21).
@@ -220,7 +221,7 @@ def main() -> int:
     check(
         "pr_progress_state falls back to REST past 100 threads",
         gh.pr_progress_state(8),
-        {"head": "def456", "ncomments": 21},
+        {"head": "def456", "ncomments": 21, "state": "OPEN"},
     )
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0

@@ -126,7 +126,7 @@ export class RepositoryState extends DurableObject<Env> {
   projectSurvey(kind:string,id:string,parent:string,data:any,deleted=false): void {
     if(!parent || !this.ctx.storage.sql.exec("SELECT id FROM resources WHERE kind='pr' AND id=?",parent).toArray().length) return;
     const fragment=kind==='issue_comments'?issueFragment(data):reviewFragment(data);
-    const useful=kind==='issue_comments'?fragment.meta!==null || fragment.marker || fragment.rebase_heads.length:fragment.root || fragment.parent && fragment.reply;
+    const useful=kind==='issue_comments'?fragment.meta!==null || fragment.marker || fragment.rebase_heads.length || fragment.blocked.length:fragment.root || fragment.parent && fragment.reply;
     if(deleted || !useful) this.ctx.storage.sql.exec('DELETE FROM survey_fragments WHERE kind=? AND id=?',kind,id);
     else this.ctx.storage.sql.exec('INSERT INTO survey_fragments VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET parent=excluded.parent,data=excluded.data',kind,id,parent,JSON.stringify(fragment));
   }
@@ -462,7 +462,7 @@ export class RepositoryState extends DurableObject<Env> {
       await this.noteDemand(detail);if(!this.complete(detail)) await this.enqueue(detail,5);
       const cs=await this.rows({...q,operation:'issue_comments'}), rcs=await this.rows({...q,operation:'review_comments'});
       for (const operation of ['issue_comments','review_comments']) { const child={...q,operation};await this.noteDemand(child);if (!this.complete(child)) await this.enqueue(child,5); }
-      rows=p && cs && rcs ? {head:p.headRefOid,ncomments:cs.length+rcs.length,revision:this.revision()}:null;
+      rows=p && cs && rcs ? {head:p.headRefOid,state:p.state,ncomments:cs.length+rcs.length,revision:this.revision()}:null;
     } else {
       if (!q.allow_observed && !this.complete(q)) await this.enqueue(q,5);
       rows=await this.rows(q);

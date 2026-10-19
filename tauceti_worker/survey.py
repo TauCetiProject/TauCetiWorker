@@ -153,7 +153,7 @@ class Counters:
             or not patch.build_success
             or not patch.head_oid
             or {name.lower() for name in patch.labels}
-            & {"needs-rebase", "keep", "hold", "wip", "human", "do-not-close"}
+            & {"needs-rebase", "keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         ):
             return
         at = patch.build_status_at
@@ -316,6 +316,8 @@ class Survey:
     progress: WorkKind = field(default_factory=lambda: WorkKind("progress"))  # a roadmap report is due
     overlap_scan: WorkKind = field(default_factory=lambda: WorkKind("overlap-scan"))
     overlap_fix: WorkKind = field(default_factory=lambda: WorkKind("overlap-fix"))
+    me_login: str = ""
+    blocked_prs: list[int] = field(default_factory=list)
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -739,10 +741,11 @@ def survey(
         if not p.is_draft
         and not (
             p.automatic_bump
-            and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close"}
+            and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         )
     ]
     me_login = me()
+    sv.me_login = me_login
     mine = [p for p in nondraft if p.author == me_login]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
@@ -751,9 +754,18 @@ def survey(
     )
     tend_bot = bot_on_canonical and can_push(TAUCETI) is True
     tended = [
-        p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
+        p
+        for p in nondraft
+        if (p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
+        and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
+    if deep and rs is not None and hasattr(rs, "maintenance_blocked"):
+        blocked_prs = {p.number for p in nondraft if rs.maintenance_blocked(p.number, p.head_oid, p.author)}
+        sv.blocked_prs = sorted(blocked_prs)
+        tended = [p for p in tended if p.number not in blocked_prs]
+    else:
+        blocked_prs = set()
     gaps: set[int] = set()
 
     def history_ready(p):
@@ -790,7 +802,7 @@ def survey(
     for p in tended + foreign_repairs if "rebase" in enabled else []:
         foreign = p in foreign_repairs
         labels = {label.lower() for label in p.labels}
-        if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
+        if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
             continue
         if (
             cached_only
@@ -862,6 +874,8 @@ def survey(
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
     for p in nondraft if "review" in enabled else []:
+        if p.number in blocked_prs or {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
+            continue
         if not p.build_success:
             continue
         if not deep:
@@ -1008,7 +1022,15 @@ def survey(
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
         if not (branch and (p.build_failed or integration)):
             continue
-        if {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "do-not-close", "needs-rebase"}:
+        if {label.lower() for label in p.labels} & {
+            "keep",
+            "hold",
+            "wip",
+            "human",
+            "on-hold",
+            "do-not-close",
+            "needs-rebase",
+        }:
             continue
         c = Candidate(
             p.number,
