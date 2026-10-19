@@ -28,3 +28,12 @@ test('receipt fetch is restricted to the existing stored Bors journal and refuse
   await assert.rejects(readPromotionReceipts(),/size limit/);
  }finally{globalThis.fetch=original;}
 });
+test('production receipt reads use the explicit service fetcher without public-network fallback',async()=>{
+ const original=globalThis.fetch;
+ try{
+  globalThis.fetch=()=>{throw Error('public-network fetch forbidden');};
+  const service=async(url,options)=>{assert.equal(url,BORS_RECEIPTS);assert.equal(options.method,'GET');return Response.json(fixture());};
+  assert.equal((await readPromotionReceipts(service)).length,1);
+  await assert.rejects(readPromotionReceipts(async()=>new Response('',{status:503})),/HTTP 503/);
+ }finally{globalThis.fetch=original;}
+});

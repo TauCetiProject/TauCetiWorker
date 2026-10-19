@@ -10,7 +10,7 @@ function fixture(){
  const db=new DatabaseSync(':memory:');
  const forbidden=()=>{throw new Error('Reporting attempted upstream/scheduler access');};
  const ctx={storage:{sql:{exec(sql,...bindings){let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};}},getAlarm:forbidden,setAlarm:forbidden}};
- const state=new RepositoryState(ctx,{INSTALLATIONS:new Proxy({},{get:forbidden}),ARCHIVE:{get:forbidden}});
+ const state=new RepositoryState(ctx,{INSTALLATIONS:new Proxy({},{get:forbidden}),ARCHIVE:{get:forbidden},BORS_ACTIVITY:{fetch:(...args)=>globalThis.fetch(...args)}});
  for(const name of ['configure','noteDemand','enqueue','query','runAttempt'])state[name]=forbidden;
  return {db,state};
 }
@@ -79,6 +79,7 @@ test('background Bors receipt import is shared and rate limited; activity reads 
  try{
   const head='c'.repeat(40),base='a'.repeat(40),commit='b'.repeat(40);
   state.setMeta('repository',{name:'TauCetiProject/TauCeti'});
+  state.setMeta('activity_landings_checked',Date.now()); // Earlier public-fetch failure must not delay the transport upgrade.
   const v={schema:'tauceti-bors.candidates/v1',repo:'TauCetiProject/TauCeti',base:'main',timestamp_unit:'unix_microseconds',candidates:[{
    snapshot:{contract:'tauceti-bors.candidate/v1',base:'main',base_sha:base,members:[{pr:7,head_sha:head}]},
    events:[{kind:'constructed',details:{commit,base_sha:base}},{kind:'promoted',source:'github.base_push_response',observed_at:1792380591874607,details:{base:'main',base_sha:base,commit}}]

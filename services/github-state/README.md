@@ -323,7 +323,10 @@ one hour. Webhook redelivery auth and transport failures remain retryable while
 other gaps proceed; deleted deliveries trigger one broad repair and are skipped.
 
 The existing cron separately caches Bors promotion receipts from its public,
-read-only candidate journal, at most once per five minutes for TauCeti. This
+read-only candidate journal through the `BORS_ACTIVITY` HTTP service binding,
+at most once per five minutes for TauCeti. The production and test environments
+both read the existing production Bors journal; the request is fixed to GET on
+the candidate observation endpoint, with no public-network fallback. This
 never calls GitHub, registers demand or changes merge authority. Receipts bind
 the original approved PR head to the constructed commit and recorded promotion
 to main. `/v1/activity` reads this cache only, allowing squash-merged PRs to count

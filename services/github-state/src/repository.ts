@@ -877,16 +877,17 @@ export class RepositoryState extends DurableObject<Env> {
   async refreshActivityLandings(): Promise<void> {
     if(this.meta('repository')?.name!=='TauCetiProject/TauCeti') return;
     const now=Date.now();
-    if(now-(this.meta('activity_landings_checked') || 0)<300000) return;
+    if(this.meta('activity_landings_transport')==='service-binding-v1' && now-(this.meta('activity_landings_checked') || 0)<300000) return;
     // Reserve the interval before yielding so overlapping cron requests cannot
     // multiply reads. This path never calls configure, demand or the scheduler.
     this.setMeta('activity_landings_checked',now);
+    this.setMeta('activity_landings_transport','service-binding-v1');
     try {
-      const receipts=await readPromotionReceipts();
+      const receipts=await readPromotionReceipts((url,options)=>this.env.BORS_ACTIVITY.fetch(url,options));
       for(const r of receipts) this.ctx.storage.sql.exec('INSERT INTO activity_landings VALUES(?,?,?,?) ON CONFLICT(number,head) DO UPDATE SET at=excluded.at,source=excluded.source WHERE excluded.at<activity_landings.at',r.number,r.head,r.at,r.source);
       this.setMeta('activity_landings_success',now);
       this.setMeta('activity_landings_error',null);
-    } catch {this.setMeta('activity_landings_error','Stored Bors promotion receipts unavailable');}
+    } catch(error) {this.setMeta('activity_landings_error','Stored Bors promotion receipts unavailable: '+(error instanceof Error?error.name+': '+error.message.slice(0,160):'unknown error'));}
   }
   async activityLOC(number:number,p:any,budget?:{remaining:number}): Promise<any> {
     const key=queryKey({operation:'files',args:{number}});

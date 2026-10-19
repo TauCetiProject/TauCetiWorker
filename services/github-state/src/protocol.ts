@@ -7,6 +7,7 @@ export interface Env {
   CLIENT_TOKENS: string; ADMIN_TOKEN_HASH: string;
   RECONCILIATION_SETTINGS?: string; REFERENCE_READS?: string;
   CF_VERSION?: {id:string};
+  BORS_ACTIVITY: Fetcher;
 }
 export interface EventPointer { key: string; delivery: string; event: string; repository: string; received: number }
 export interface Query { repository: string; operation: string; args?: Record<string, string | number>; cursor?: string; allow_observed?: boolean }
