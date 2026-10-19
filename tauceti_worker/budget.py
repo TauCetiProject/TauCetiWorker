@@ -134,6 +134,9 @@ class Budget:
                         if kind == "correction":
                             state["spent"] -= money(event["delta"])
                             state["sessions"][event["id"]]["cost"] = event["cost"]
+                            for field in ("cost_provenance", "totals"):
+                                if field in event:
+                                    state["sessions"][event["id"]][field] = event[field]
                     elif kind == "rate":
                         state["rate"] = money(event["amount"])
                     elif kind == "wait":
@@ -148,6 +151,7 @@ class Budget:
                             cost=event["cost"],
                             outcome=event["outcome"],
                             totals=event.get("totals", {}),
+                            cost_provenance=event.get("cost_provenance", "native-reported"),
                         )
                         cost = money(event["cost"])
                         state["balance"] -= cost
@@ -453,7 +457,7 @@ class Budget:
             self.save_waiting(queue)
             return dict(allowed=True, estimate=str(estimate))
 
-    def settle(self, invocation, cost, outcome="completed", *, note=None, totals=None):
+    def settle(self, invocation, cost, outcome="completed", *, note=None, totals=None, provenance="native-reported"):
         value = money(cost) if cost is not None else None
         if value is not None and value < 0:
             raise BudgetError("session cost cannot be negative")
@@ -470,8 +474,28 @@ class Budget:
             if value is None:
                 events.append(dict(type="unresolved", id=invocation, outcome=outcome))
             else:
+                if "cost" in session:
+                    # Prefixes use ordinary correction events, so older ledger
+                    # readers also see the right balance and total spend.
+                    events.append(
+                        dict(
+                            type="correction",
+                            id=invocation,
+                            delta=session["cost"],
+                            cost="0",
+                            note="replace estimated prefix",
+                        )
+                    )
                 events.append(
-                    dict(type="settle", id=invocation, cost=str(value), outcome=outcome, note=note, totals=totals or {})
+                    dict(
+                        type="settle",
+                        id=invocation,
+                        cost=str(value),
+                        outcome=outcome,
+                        note=note,
+                        totals=totals or {},
+                        cost_provenance=provenance,
+                    )
                 )
             self.append(state, events)
 
@@ -494,10 +518,18 @@ class Budget:
                 if live or bridge_owner_alive(session.get("owner")):
                     raise BudgetError("cannot reconcile an active session with a live accounting bridge")
             if session["status"] != "settled":
-                events = [
-                    self.accrue(state),
-                    dict(type="settle", id=invocation, cost=str(value), outcome="reconciled", note=note),
-                ]
+                events = [self.accrue(state)]
+                if "cost" in session:
+                    events.append(
+                        dict(
+                            type="correction",
+                            id=invocation,
+                            delta=session["cost"],
+                            cost="0",
+                            note="replace estimated prefix through reconciliation",
+                        )
+                    )
+                events.append(dict(type="settle", id=invocation, cost=str(value), outcome="reconciled", note=note))
             else:
                 previous = money(session["cost"])
                 # Corrections also update the session through replay, without erasing the first receipt.
@@ -550,12 +582,14 @@ class Budget:
             session = state["sessions"].get(receipt["id"])
             if not session:
                 raise BudgetError("receipt has no recorded admission")
-            if session["status"] == "settled":
+            if session["status"] == "settled" and session.get("cost_provenance") != "token-priced":
                 return
+            ordered = list(state["sessions"].values())
+            position = next(i for i, entry in enumerate(ordered) if entry["id"] == receipt["id"])
             baseline = {}
             for prior in state["sessions"].values():
                 if prior["id"] == receipt["id"]:
-                    continue
+                    break
                 for provider_id, value in prior.get("totals", {}).items():
                     baseline[provider_id] = max(baseline.get(provider_id, Decimal(0)), money(value))
             if totals is None and lower:
@@ -590,21 +624,227 @@ class Budget:
                     self.append(state, [self.accrue(state), event])
                     return
             if totals is not None:
+                events = [self.accrue(state)]
+                # An estimate may exceed a later native cumulative total. Clamp
+                # only the estimated segment, never an authoritative receipt.
+                for provider, native in totals.items():
+                    if money(native) >= baseline.get(provider, Decimal(0)):
+                        continue
+                    priors = sorted(
+                        (p for p in ordered[:position] if provider in p.get("totals", {})),
+                        key=lambda p: (p["started"], p["id"]),
+                    )
+                    exact = max(
+                        (
+                            money(p["totals"][provider])
+                            for p in priors
+                            if p.get("cost_provenance", "native-reported") != "token-priced"
+                        ),
+                        default=Decimal(0),
+                    )
+                    estimates = [
+                        p
+                        for p in priors
+                        if p.get("cost_provenance") == "token-priced" and money(p["totals"][provider]) > exact
+                    ]
+                    if money(native) < exact or not estimates or any(set(p["totals"]) != {provider} for p in estimates):
+                        break
+                    weight = sum((money(p["cost"]) for p in estimates), Decimal(0))
+                    cursor = exact
+                    for prior in estimates:
+                        value = (money(native) - exact) * money(prior["cost"]) / weight if weight else Decimal(0)
+                        cursor += value
+                        events.append(
+                            dict(
+                                type="correction",
+                                id=prior["id"],
+                                delta=str(money(prior["cost"]) - value),
+                                cost=str(value),
+                                totals={provider: str(cursor)},
+                                cost_provenance="token-priced",
+                                note="estimate constrained by native cumulative total",
+                            )
+                        )
+                    baseline[provider] = cursor
                 differences = [money(v) - baseline.get(k, Decimal(0)) for k, v in totals.items()]
                 if all(v >= 0 for v in differences):
                     cost = sum(differences, Decimal(0))
-        self.settle(receipt["id"], cost, receipt["outcome"], totals=totals, note=note)
+                    previous = money(session.get("cost", "0"))
+                    if session["status"] == "settled":
+                        events.append(
+                            dict(
+                                type="correction",
+                                id=receipt["id"],
+                                delta=str(previous - cost),
+                                cost=str(cost),
+                                totals=totals,
+                                cost_provenance="native-reported",
+                                note=note or "native receipt replaces estimate",
+                            )
+                        )
+                        # Correcting an earlier estimated resume baseline must
+                        # preserve the next native cumulative total as well.
+                        later = sorted(
+                            (
+                                p
+                                for p in ordered[position + 1 :]
+                                if p["status"] == "settled" and set(p.get("totals", {})) & set(totals)
+                            ),
+                            key=lambda p: (p["started"], p["id"]),
+                        )
+                        if later:
+                            successor = later[0]
+                            adjusted = money(successor["cost"]) + previous - cost
+                            if adjusted < 0 or set(totals) != set(successor.get("totals", {})):
+                                raise BudgetError(
+                                    "late receipt conflicts with later cumulative baseline; reconcile explicitly"
+                                )
+                            events.append(
+                                dict(
+                                    type="correction",
+                                    id=successor["id"],
+                                    delta=str(cost - previous),
+                                    cost=str(adjusted),
+                                    note="preserve cumulative resume total after baseline correction",
+                                )
+                            )
+                    else:
+                        if previous:
+                            events.append(
+                                dict(
+                                    type="correction",
+                                    id=receipt["id"],
+                                    delta=str(previous),
+                                    cost="0",
+                                    note="replace token-priced prefix",
+                                )
+                            )
+                        events.append(
+                            dict(
+                                type="settle",
+                                id=receipt["id"],
+                                cost=str(cost),
+                                totals=totals,
+                                outcome=receipt["outcome"],
+                                cost_provenance="native-reported",
+                                note=note,
+                            )
+                        )
+                    self.append(state, events)
+                    return
+        if session["status"] != "settled":
+            self.settle(receipt["id"], None, receipt["outcome"], note=note)
 
-    def recover(self, note):
-        if not note.strip():
+    def recover_usage(self, invocation, *, note="saved usage checkpoint", allow_live_owner=False, dry_run=False):
+        """Settle a stopped complete journal, or charge its prefix and reserve uncertainty.
+
+        No reservations are treated as costs. Repeated recovery is idempotent.
+        A late native receipt reverses the estimated prefix before settlement.
+        """
+        from .budget_usage import evidence
+
+        with self.locked():
+            state = self.replay()
+            session = state["sessions"].get(invocation)
+            if not session or session["status"] == "settled":
+                return None
+            if not allow_live_owner and bridge_owner_alive(session.get("owner")):
+                return None
+            saved = evidence(self.directory, session, state["sessions"])
+            if not saved or not saved["items"]:
+                return None
+            cost = max(saved["cost"], money(session.get("lower_bound_cost", "0")))
+            tail = (
+                Decimal(0)
+                if saved["complete"]
+                else max(
+                    money(session["estimate"]),
+                    self.estimate(state, session["model"], session["phase"], include_pending=False)[1],
+                    cost,
+                )
+            )
+            result = dict(
+                id=invocation,
+                action="settle token-priced estimate"
+                if saved["complete"]
+                else "charge token-priced prefix; reserve incomplete request",
+                estimated_usd=str(cost),
+                reserve_usd=str(tail),
+            )
+            result["source"] = saved["checkpoint"].get("recovered_from", "usage-journal")
+            if dry_run:
+                return result
+            if saved["checkpoint"].get("recovered_from"):
+                from .runtime_status import atomic_json
+
+                atomic_json(self.directory / "usage" / (invocation + ".json"), saved["checkpoint"])
+            previous = money(session.get("cost", "0"))
+            if saved["complete"]:
+                events = (
+                    [dict(type="correction", id=invocation, delta=str(previous), cost="0", note=note)]
+                    if previous
+                    else []
+                )
+                # Estimated totals establish a resume baseline. They are labelled
+                # so a subsequent native cumulative receipt can correct them.
+                primary = session.get("resume") or saved["checkpoint"].get("provider_session")
+                totals = {}
+                if primary and primary != "unknown":
+                    baseline = Decimal(0)
+                    for prior in state["sessions"].values():
+                        if prior["id"] == invocation:
+                            break
+                        baseline = max(baseline, money(prior.get("totals", {}).get(primary, "0")))
+                    totals = {primary: str(baseline + cost)}
+                events.append(
+                    dict(
+                        type="settle",
+                        id=invocation,
+                        cost=str(cost),
+                        outcome="recovered usage estimate",
+                        cost_provenance="token-priced",
+                        totals=totals,
+                        note=note,
+                    )
+                )
+            else:
+                if previous == cost and session.get("reserve") == str(tail) and session["status"] == "provisional":
+                    return result
+                events = [
+                    dict(
+                        type="correction",
+                        id=invocation,
+                        delta=str(previous - cost),
+                        cost=str(cost),
+                        cost_provenance="token-priced-prefix",
+                        note=note,
+                    ),
+                    dict(
+                        type="unresolved",
+                        id=invocation,
+                        provisional=True,
+                        reserve=str(tail),
+                        lower_bound_cost="0",
+                        lower_bound_totals={},
+                        outcome="incomplete request; token-priced prefix charged",
+                        note=note,
+                    ),
+                ]
+            self.append(state, [self.accrue(state), *events])
+            return result
+
+    def recover(self, note, *, dry_run=False):
+        if not dry_run and not note.strip():
             raise BudgetError("receipt recovery requires --note")
         from .claude_api import safe_message
 
         with self.locked():
             sessions = self.replay()["sessions"]
-        errors = []
+        errors, actions = [], []
         for session in sessions.values():
-            if session["status"] == "settled" or not session.get("bridge"):
+            if (session["status"] == "settled" and session.get("cost_provenance") != "token-priced") or not session.get(
+                "bridge"
+            ):
                 continue
             bridge = Path(session["bridge"])
             if session["status"] == "active" and bridge_owner_alive(session.get("owner")):
@@ -627,15 +867,28 @@ class Budget:
                     value = safe_message(receipt)
                     if not isinstance(value, dict) or value.get("id") != invocation:
                         raise BudgetError("receipt invocation mismatch")
-                    self.settle_receipt(value, note=note)
+                    actions.append(
+                        dict(id=invocation, action="recover native receipt", complete=bool(value.get("totals")))
+                    )
+                    if not dry_run:
+                        self.settle_receipt(value, note=note)
+                    if not value.get("totals"):
+                        action = self.recover_usage(invocation, note=note, dry_run=dry_run)
+                        if action:
+                            actions.append(action)
                 else:
-                    self.settle(invocation, None, "orphaned without receipt", note=note)
+                    action = self.recover_usage(invocation, note=note, dry_run=dry_run)
+                    if action:
+                        actions.append(action)
+                    elif not dry_run:
+                        self.settle(invocation, None, "orphaned without receipt", note=note)
             except Exception as error:
                 errors.append(f"{invocation}: {error}")
-                self.settle(invocation, None, "invalid recovered receipt", note=note)
-            if not bridge_owner_alive(session.get("owner")):
+                if not dry_run:
+                    self.settle(invocation, None, "invalid recovered receipt", note=note)
+            if not dry_run and not bridge_owner_alive(session.get("owner")):
                 (bridge / "key").unlink(missing_ok=True)
-        return dict(self.snapshot(), recovery_errors=errors)
+        return dict(self.snapshot(), recovery_errors=errors, recovery_actions=actions, dry_run=dry_run)
 
     def cooldown(self, model, seconds):
         with self.locked():

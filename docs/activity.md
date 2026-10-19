@@ -37,14 +37,13 @@ missing-landing warning.
 ## Costs and initiated PR output
 
 Average API spending has **3h**, **24h**, **7d** and **All time** columns in
-$/hour. It uses completed/reconciled session costs, including reviews, recognized
-at settlement; active reservations are separate estimates and do not enter this
-rate. Each average divides by elapsed recorded time within that window, so a
+$/hour. It uses accrued conversation costs, including running and interrupted work
+and reviews. Admission reservations do not enter this rate. Each average divides by elapsed recorded time within that window, so a
 new installation is not diluted by hours before recording began. `Worker-hours
 recorded` adds time across completed and currently running native rounds, clipped
 to each window. Capacity/budget/quota waiting and interruptions without a known
 end do not inflate it. Failed rounds with recorded durations still count. The
-report shows worker-hours first, then API dollars per worker-hour (completed
+report shows worker-hours first, then API dollars per worker-hour (accrued
 spending divided by worker-hours) and API dollars per elapsed hour. Active-session
 cost reservations do not enter either spending rate. Zero recorded worker-hours
 leave the worker-hour rate unavailable.
@@ -56,9 +55,9 @@ tasks or GitHub requests.
 
 Cost estimates have **7 days** and **All time** columns. They pool every
 conversation in the reported worker/machine scope, including reviews and fixes
-on PRs initiated elsewhere. Completed sessions use their reconciled budget
-receipts at the original settlement time; ongoing sessions use the budget's
-current reservations, shown separately as active estimates. These are API costs,
+on PRs initiated elsewhere. Native final costs correct response-level estimates at their usage timestamps;
+ongoing sessions use recorded usage, shown separately as running usage.
+Legacy costs without response timing are spread over their conversation duration. These are API costs,
 not machine charges or subscription fees. Reading the ledger never changes it.
 
 The seven-day denominator contains only PRs initiated within those seven days;
@@ -157,3 +156,28 @@ original recorded timestamp and exact approved PR head across squash merges.
 Already-present TauCetiCI SQLite data remains an optional Bors landing source; set
 `TAUCETI_ACTIVITY_BORS_DB` to its path (the default checks the existing fleet
 cache). Reporting never downloads or refreshes that database.
+
+## Accrued spending
+
+Spending rows use recorded usage from running, completed and interrupted
+conversations. Admission reservations are excluded. The existing rows show one
+estimated rate in each 3h/24h/7d/All-time window, followed by a compact quality note.
+Worker-hours sum recorded work intervals; elapsed hours measure the covered
+wall-clock interval. Fleet rates pool dollars and worker-hours before dividing;
+elapsed time is shared across machines, not summed.
+
+Native final costs take precedence. Timestamped, token-priced usage estimates
+provide running and interrupted costs; a native final correction is distributed
+across the recorded responses. Legacy costs without response timing are spread
+uniformly over their conversation duration and remain estimates. This prevents a
+long session from appearing entirely in the window in which it happens to finish.
+Unknown usage remains incomplete and reserved; it is not invented as spending.
+
+The cost/LOC numerator is the same accrued spending, including reviews and other
+fleet conversations. The denominator still uses only initiated PRs: landed LOC
+plus half of open LOC. Seven-day output includes only PRs opened in those seven
+days. Missing LOC uses the existing extrapolation/zero fallback and never hides
+the rate. Costs remain seven days and all time; hourly rates retain four windows.
+
+Preparation is local and runs in the existing background collector. Reading
+`status` performs no transcript scans, SQL queries or additional GitHub requests.

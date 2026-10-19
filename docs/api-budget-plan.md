@@ -311,3 +311,36 @@ workers. Verify orphaned calibration sessions can be replaced, unresolved
 estimates remain reserved, and ledger-repair markers still require audit.
 Exercise provider cooldowns separately
 from funding waits. Retain existing subscription behavior and its checks.
+
+## Durable response usage and recovery
+
+The native Claude shim records content-free usage in `budget/usage/<invocation>.json`
+and an append-only delta journal. Evidence includes provider response/session IDs,
+model, timestamps, token counters and a hash of the vendored dated price table.
+It contains no prompts, response text or keys. Each usage change is synced before
+forwarding the corresponding event; completed responses do not depend on a later
+stdout event or final Claude result. Atomic checkpoints and the preceding valid
+journal prefix survive process termination and torn writes. Bubble mounts this
+usage directory separately from the bridge and never receives the ledger.
+
+Response counters merge by ID, including partial/repeated events. Replayed
+responses on resumed invocations are not charged twice. Decimal token pricing
+honours cache-write TTLs. Unknown models, missing counters and requests still in
+flight remain incomplete rather than becoming zero-cost completed work.
+
+`tauceti budget --recover --dry-run --json` previews stopped-owner recovery without
+changing the ledger or deleting bridge keys. Apply with `--recover --note '…'`.
+Recovery tries native receipts first, then directly linked usage journals. Legacy
+transcripts are considered only when a saved receipt names the exact provider
+session and exactly one file belongs to that worker; time-overlap guesses are
+never used. A recovered transcript keeps an incomplete-request reservation. Complete
+saved usage can settle as a marked, correctable token-price estimate. Incomplete
+usage charges the known estimate once and retains a separate conservative
+reservation for uncertainty. Reservations never enter spend reports. Late native
+receipts correct estimates; resumed cumulative totals preserve previously recorded
+baselines and cannot debit the same response twice. Live owners remain protected.
+
+The authoritative ledger stays append-only. Estimated prefix charges use the
+existing correction/unresolved event vocabulary so previous ledger readers retain
+the right financial totals. Native final settlement reverses a prefix before
+recording the full native cost. All cost corrections preserve their audit trail.

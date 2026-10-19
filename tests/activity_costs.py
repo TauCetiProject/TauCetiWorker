@@ -18,6 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import activity as a
 from tauceti_worker import activity_costs, activity_summary, fleet_events
+from tauceti_worker.usage_accounting import UsageJournal
 
 DAY = 86400
 
@@ -49,9 +50,19 @@ class CostTests(unittest.TestCase):
         self.records = []
         self.record(self.now - 10 * DAY, dict(type="grant", delta="1000"))
         self.session("old", 8 * DAY, "author", "10", settled=True)
-        self.session("review", DAY, "reviewer", "20", settled=True, phase="review")
-        self.session("fix", DAY, "author", "30", settled=True)
-        self.session("active", 60, "reviewer", "40", settled=False, phase="review")
+        self.session("review", DAY - 60, "reviewer", "20", settled=True, phase="review")
+        self.session("fix", DAY - 60, "author", "30", settled=True)
+        self.session("a" * 32, 60, "reviewer", "40", settled=False, phase="review")
+        journal = UsageJournal(
+            self.root / "budget/usage", "a" * 32, model="claude-opus-5-5", clock=lambda: self.now - 60
+        )
+        journal.observe(
+            dict(
+                type="assistant",
+                session_id="active",
+                message=dict(id="r1", model="claude-opus-5-5", usage=dict(input_tokens=0, output_tokens=2_000_000)),
+            )
+        )
         self.session("external", DAY, "not-in-fleet", "99", settled=True)
         self.write_ledger()
         a.prepare(now=self.now)
@@ -117,7 +128,7 @@ class CostTests(unittest.TestCase):
         rows = s["costs"]["windows"]
         self.assertEqual(set(rows), {"total", "7d"})
         self.assertEqual(Decimal(rows["total"]["spent_usd"]), Decimal(60))
-        self.assertEqual(Decimal(rows["total"]["pending_usd"]), Decimal(40))
+        self.assertEqual(Decimal(rows["total"]["active_accrued_usd"]), Decimal(40))
         self.assertEqual(Decimal(rows["total"]["weighted_loc"]), Decimal(650))
         self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 650)
         # An old PR landing yesterday does not enter the seven-day initiation cohort.
@@ -140,7 +151,46 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(row["weighted_loc"]), Decimal("350.5"))
         self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal("350.5"))
 
-    def test_hourly_spending_uses_settlements_in_each_window_and_excludes_reservations(self):
+    def test_timestamped_running_usage_and_final_correction_do_not_spike(self):
+        key = "b" * 32
+        self.session(key, 5 * 3600, "author", "500", settled=False)
+        self.write_ledger()
+        journal = UsageJournal(
+            self.root / "budget/usage", key, model="claude-opus-5-5", clock=lambda: self.now - 4 * 3600
+        )
+        journal.observe(
+            dict(
+                type="assistant",
+                session_id="session",
+                message=dict(id="early", model="claude-opus-5-5", usage=dict(input_tokens=0, output_tokens=200000)),
+            )
+        )
+        journal.clock = lambda: self.now - 3600
+        journal.observe(
+            dict(
+                type="assistant",
+                session_id="session",
+                message=dict(id="late", model="claude-opus-5-5", usage=dict(input_tokens=0, output_tokens=300000)),
+            )
+        )
+        before = self.summary()["costs"]
+        self.assertEqual(Decimal(before["spending"]["3h"]["spent_usd"]), 46)  # existing active 40 plus recent 6
+        self.assertEqual(Decimal(before["spending"]["total"]["spent_usd"]), 110)
+        self.assertEqual(
+            Decimal(before["windows"]["7d"]["estimated_usd"]), Decimal(before["spending"]["7d"]["spent_usd"])
+        )
+        self.assertGreater(Decimal(before["funding"]["pending"]), 500)
+        self.record(self.now, dict(type="settle", id=key, cost="20", outcome="completed"))
+        self.write_ledger()
+        final = self.summary()["costs"]
+        self.assertEqual(Decimal(final["spending"]["3h"]["spent_usd"]), 52)  # recent share is 12, not the full 20
+        self.assertEqual(Decimal(final["spending"]["total"]["spent_usd"]), 120)
+        with contextlib.closing(a._connect()) as db:
+            db.execute("DELETE FROM cost_accruals WHERE id!=?", (key,))
+            window = activity_costs.summarize(db, self.now, self.now - 1800, "scope", "machine")
+            self.assertEqual(Decimal(window["spending"]["3h"]["spent_usd"]), 0)
+
+    def test_hourly_spending_includes_running_usage_and_excludes_reservations(self):
         self.session("recent", 3600, "author", "12", settled=True)
         self.write_ledger()
         with contextlib.closing(a._connect()) as db, db:
@@ -149,10 +199,10 @@ class CostTests(unittest.TestCase):
         rows = s["costs"]["spending"]
         self.assertEqual(set(rows), {"3h", "24h", "7d", "total"})
         for window, spent, seconds in (
-            ("3h", 12, 10800),
-            ("24h", 62, DAY),
-            ("7d", 62, 7 * DAY),
-            ("total", 72, 10 * DAY + 1),
+            ("3h", 52, 10800),
+            ("24h", 102, DAY),
+            ("7d", 102, 7 * DAY),
+            ("total", 112, 10 * DAY + 1),
         ):
             self.assertEqual(Decimal(rows[window]["spent_usd"]), spent)
             self.assertEqual(rows[window]["covered_seconds"], seconds)
@@ -163,10 +213,10 @@ class CostTests(unittest.TestCase):
             )
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
-        self.assertIn("Spending (completed sessions)", output.getvalue())
+        self.assertIn("Spending (recorded usage)", output.getvalue())
         self.assertIn("API spend ($/elapsed hour)", output.getvalue())
         self.assertIn("Worker-hours recorded", output.getvalue())
-        self.assertIn("$4.00", output.getvalue())
+        self.assertIn("$17.33", output.getvalue())
 
     def test_new_recording_uses_elapsed_time_not_the_entire_trailing_window(self):
         self.session("recent", 900, "author", "12", settled=True)
@@ -176,7 +226,7 @@ class CostTests(unittest.TestCase):
             value = activity_costs.summarize(db, self.now, self.now - 1800, "scope", "machine")
             for row in value["spending"].values():
                 self.assertEqual(row["covered_seconds"], 1800)
-                self.assertEqual(Decimal(row["usd_per_hour"]), 24)
+                self.assertEqual(Decimal(row["usd_per_hour"]), 104)
             zero = activity_costs.summarize(db, self.now, self.now, "scope", "machine")
             self.assertTrue(all(r["usd_per_hour"] is None for r in zero["spending"].values()))
 
@@ -202,7 +252,7 @@ class CostTests(unittest.TestCase):
         self.assertEqual(rows["3h"]["worker_seconds"], 6000)
         self.assertEqual(rows["24h"]["worker_seconds"], 9600)
         self.assertEqual(rows["total"]["worker_seconds"], 9600)
-        self.assertEqual(Decimal(rows["total"]["usd_per_worker_hour"]), Decimal(60) * 3600 / 9600)
+        self.assertEqual(Decimal(rows["total"]["usd_per_worker_hour"]), Decimal(100) * 3600 / 9600)
         with contextlib.closing(a._connect()) as db, db:
             db.execute("DELETE FROM rounds")
             rows = activity_costs.summarize(db, self.now, self.now - 10 * DAY, "scope", "machine")["spending"]
@@ -215,13 +265,13 @@ class CostTests(unittest.TestCase):
             row.update(spent_usd="30", covered_seconds=3600, worker_seconds=7200, usd_per_hour="30")
         values = [dict(available=True, summary=s), dict(available=True, summary=other)]
         combined = activity_summary.combine(values)["summary"]["costs"]["spending"]
-        self.assertEqual(Decimal(combined["3h"]["usd_per_hour"]), 10)
+        self.assertEqual(Decimal(combined["3h"]["usd_per_hour"]), Decimal(70) / 3)
         self.assertEqual(combined["3h"]["worker_seconds"], s["costs"]["spending"]["3h"]["worker_seconds"] + 7200)
         self.assertEqual(
             Decimal(combined["3h"]["usd_per_worker_hour"]),
-            Decimal(30) * 3600 / Decimal(str(combined["3h"]["worker_seconds"])),
+            Decimal(70) * 3600 / Decimal(str(combined["3h"]["worker_seconds"])),
         )
-        self.assertEqual(Decimal(combined["total"]["usd_per_hour"]), Decimal(90) * 3600 / (10 * DAY + 1))
+        self.assertEqual(Decimal(combined["total"]["usd_per_hour"]), Decimal(130) * 3600 / (10 * DAY + 1))
         # Missing/older hosts cannot silently turn unavailable spending into zero.
         other["costs"].pop("spending")
         missing = activity_summary.combine(values)["summary"]["costs"]["spending"]
@@ -234,8 +284,8 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(rows["total"]["estimated_usd"]), 105)
         self.assertEqual(Decimal(rows["7d"]["estimated_usd"]), 90)
         spending = self.summary()["costs"]["spending"]
-        self.assertEqual(Decimal(spending["7d"]["spent_usd"]), 50)
-        self.assertEqual(Decimal(spending["total"]["spent_usd"]), 65)
+        self.assertEqual(Decimal(spending["7d"]["spent_usd"]), 90)
+        self.assertEqual(Decimal(spending["total"]["spent_usd"]), 105)
 
     def test_missing_or_changed_head_LOC_is_extrapolated_with_half_weight_open_prs(self):
         with contextlib.closing(a._connect()) as db, db:

@@ -863,6 +863,7 @@ shutil.copytree(mounts['/opt/api-bin'], private / 'bin')
 settings = private / 'bin/config.json'
 config = json.loads(settings.read_text())
 config['key'] = config['key'].replace('/opt/round', mounts['/opt/round'])
+config['usage_dir'] = mounts['/opt/api-usage']
 (private / 'inbox').symlink_to(mounts['/opt/api-bridge/inbox'])
 (private / 'outbox').symlink_to(mounts['/opt/api-bridge/outbox'])
 config['bridge'] = str(private)

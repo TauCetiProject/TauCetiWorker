@@ -28,7 +28,7 @@ def number(value):
 
 
 def hourly_rate(spent, covered_seconds):
-    """A wall-clock average of settled costs; reservations are not spending."""
+    """A wall-clock average of accrued costs; reservations are not spending."""
     return (
         str(Decimal(spent) * 3600 / Decimal(str(covered_seconds)))
         if spent is not None and covered_seconds and covered_seconds > 0
@@ -115,6 +115,9 @@ def display(value, default_kinds=()):
                 (label, [f"{ci[w][key] / ci[w]['attempts']:.1f}" if ci[w]["attempts"] else "—" for w in WINDOWS])
             )
     costs = s.get("costs", {})
+    spending_title = (
+        "Spending (recorded usage)" if costs.get("accounting_version", 1) >= 2 else "Spending (completed sessions)"
+    )
     spending_rows = []
     if costs.get("spending"):
         spending = costs["spending"]
@@ -142,7 +145,7 @@ def display(value, default_kinds=()):
         windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
         for key, label in (
             ("spent_usd", "API cost: completed sessions"),
-            ("pending_usd", "API cost: active estimates"),
+            ("active_accrued_usd", "API cost: running usage"),
             ("estimated_usd", "API cost: estimated total"),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
@@ -182,7 +185,7 @@ def display(value, default_kinds=()):
                 )
             )
     label_width = max(
-        len("Spending (completed sessions)"),
+        len("Spending (recorded usage)"),
         *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *spending_rows]),
     )
     headers = ("3h", "24h", "7d", "All time")
@@ -205,7 +208,12 @@ def display(value, default_kinds=()):
     table("Finished rounds", headers, rounds, widths)
     table(None, headers, prs, widths)
     if spending_rows:
-        table("Spending (completed sessions)", ("3h", "24h", "7d", "All time"), spending_rows, widths)
+        table(spending_title, ("3h", "24h", "7d", "All time"), spending_rows, widths)
+    if spending_rows and costs.get("quality"):
+        q = costs["quality"]
+        print(
+            f"Costs: native totals where available; token/interval estimates otherwise; {q.get('incomplete', 0)} conversations have incomplete usage. Reservations excluded."
+        )
     if cost_rows:
         table("Costs / initiated PR output", ("7 days", "All time"), cost_rows)
         if any(windows[w].get("loc_estimated") for w in COST_WINDOWS):
@@ -216,6 +224,14 @@ def display(value, default_kinds=()):
         print(
             f"Budget: {amount(funding['available'])} available; {amount(funding['pending'])} pending; {amount(funding['grant_rate'])}/hour replenishment"
         )
+    sharing = s.get("shared_mathlib")
+    if sharing and (sharing.get("shared") or sharing.get("private") or sharing.get("preparing")):
+        print()
+        print(
+            f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
+        )
+        for reason in sharing.get("reasons", []):
+            print("  " + reason)
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
     print()
@@ -251,7 +267,7 @@ def combine(values):
         round_types=list(dict.fromkeys(k for v in known for k in v.get("round_types", []))),
         rounds={w: {} for w in WINDOWS},
         pr_windows={w: {} for w in WINDOWS},
-        costs=dict(windows={}),
+        costs=dict(windows={}, accounting_version=min(v.get("costs", {}).get("accounting_version", 1) for v in known)),
         ci_windows=None,
         running=sum(v["running"] for v in known) if all(v["running"] is not None for v in known) else None,
         interrupted_unfinished=sum(v.get("interrupted_unfinished", 0) for v in known),
@@ -284,7 +300,7 @@ def combine(values):
                 "open_prs",
             )
         }
-        for key in ("spent_usd", "pending_usd", "estimated_usd"):
+        for key in ("spent_usd", "active_accrued_usd", "estimated_usd"):
             row[key] = (
                 str(sum((Decimal(r[key]) for r in rows), Decimal(0)))
                 if all(r.get(key) is not None for r in rows) and len(known) == len(values)
@@ -314,6 +330,17 @@ def combine(values):
                 usd_per_hour=hourly_rate(spent, covered),
                 usd_per_worker_hour=hourly_rate(spent, worker_seconds),
             )
+    s["costs"]["quality"] = {
+        k: sum(v.get("costs", {}).get("quality", {}).get(k, 0) for v in known)
+        for k in ("native", "estimated", "incomplete")
+    }
+    sharing = [v.get("shared_mathlib", {}) for v in known]
+    if any(sharing):
+        s["shared_mathlib"] = {
+            key: sum(row.get(key, 0) for row in sharing)
+            for key in ("shared", "private", "preparing", "cache_hits", "preparation_seconds")
+        }
+        s["shared_mathlib"]["reasons"] = sorted({reason for row in sharing for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):
         s["costs"]["funding"] = {

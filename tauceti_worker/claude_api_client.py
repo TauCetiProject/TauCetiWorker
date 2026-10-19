@@ -133,6 +133,13 @@ def main():
         args[index + 1] = "stream-json"
     else:
         args += ["--output-format", "stream-json"]
+    journal = None
+    if config.get("usage_dir"):
+        from usage_accounting import UsageJournal
+
+        journal = UsageJournal(config["usage_dir"], invocation, model=model)
+        if "--include-partial-messages" not in args:
+            args.append("--include-partial-messages")
     if "--verbose" not in args:
         args.append("--verbose")
     totals = {}
@@ -177,6 +184,11 @@ def main():
                         except (OSError, ValueError):
                             pass
                     continue
+                if journal is not None:
+                    try:
+                        journal.observe(event)
+                    except (OSError, ValueError, TypeError, KeyError, ArithmeticError) as error:
+                        warning(f"tauceti usage checkpoint pending: {type(error).__name__}")
                 if final is not None and (
                     event.get("type") == "assistant"
                     or event.get("type") == "system"
@@ -242,6 +254,11 @@ def main():
         else:
             raise
     finally:
+        if journal is not None:
+            try:
+                journal.flush(closed=process_exited)
+            except OSError as error:
+                warning(f"tauceti usage checkpoint pending: {type(error).__name__}")
         authoritative = outcome == "launch-failed" or process_exited and 0 <= rc < 128
         receipt = dict(
             id=invocation,

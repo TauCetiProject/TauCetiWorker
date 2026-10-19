@@ -167,11 +167,15 @@ class ClaudeAPIContext:
                 raise BudgetError(str(error)) from None
         shim = self.bin / "claude"
         shutil.copy(Path(__file__).with_name("claude_api_client.py"), shim)
+        for name in ("usage_accounting.py", "prices.json"):
+            shutil.copy(Path(__file__).with_name(name), self.bin / name)
+        usage = self.budget.directory / "usage"
+        usage.mkdir(mode=0o700, exist_ok=True)
         # Use the actual host interpreter even on systems whose python3 is older than 3.11.
         text = shim.read_text().replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1)
         shim.write_text(text)
         shim.chmod(0o700)
-        self.config = dict(command=real, key=str(keyfile), bridge=str(self.directory), wait=False)
+        self.config = dict(command=real, key=str(keyfile), bridge=str(self.directory), wait=False, usage_dir=str(usage))
         atomic(self.bin / "config.json", self.config)
         os.environ["PATH"] = f"{self.bin}:{self.previous_path}"
         os.environ["TAUCETI_API_CONTEXT"] = str(self.directory)
@@ -314,8 +318,10 @@ class ClaudeAPIContext:
                 with self.budget.locked():
                     sessions = self.budget.replay()["sessions"]
                 for invocation in self.invocations:
-                    if sessions[invocation]["status"] == "active":
-                        self.budget.settle(invocation, None, "missing cost receipt")
+                    if sessions[invocation]["status"] != "settled":
+                        recovered = self.budget.recover_usage(invocation, allow_live_owner=True)
+                        if not recovered and sessions[invocation]["status"] == "active":
+                            self.budget.settle(invocation, None, "missing cost receipt")
                 report_runtime(budget=self.budget.snapshot())
             except (BudgetError, OSError) as error:
                 self.errors.append(str(error))

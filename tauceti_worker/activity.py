@@ -646,7 +646,11 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
                 _refresh_prs(db, config, now, errors)
                 _bors(db, errors)
+            from . import shared_mathlib
+
+            sharing = shared_mathlib.summary()
             value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
+            value["all"]["shared_mathlib"] = sharing
             for column, key in (("worker", "workers"), ("scope", "groups")):
                 ids = db.execute(
                     f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
@@ -654,6 +658,8 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 ).fetchall()
                 for row in ids:
                     value[key][row[0]] = _summary(db, now, column, row[0])
+                    if key == "groups":
+                        value[key][row[0]]["shared_mathlib"] = sharing
                     atomic_json(
                         scope_path(key, row[0]), dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors)
                     )
