@@ -318,7 +318,11 @@ def observe(url, token_file, repository, numbers):
     req = urllib.request.Request(
         url.rstrip("/") + "/v1/activity",
         data=json.dumps(dict(repository=repository, numbers=numbers)).encode(),
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "User-Agent": "TauCetiWorker/1.0 (+https://github.com/TauCetiProject/TauCetiWorker)",
+        },
     )
     try:
         response = urllib.request.build_opener(NoRedirect).open(req, timeout=5)
