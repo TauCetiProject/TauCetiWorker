@@ -593,7 +593,7 @@ def _summary(db, now, column=None, identity=None):
         ci_windows=activity_ci.summarize(db, now, WINDOWS, column, identity),
         running=(
             db.execute(
-                f"SELECT COUNT(*) FROM rounds {where} {'AND' if where else 'WHERE'} finished IS NULL AND outcome IS NULL",
+                f"SELECT COUNT(DISTINCT worker) FROM rounds {where} {'AND' if where else 'WHERE'} finished IS NULL AND outcome IS NULL",
                 args,
             ).fetchone()[0]
             if native_since is not None
