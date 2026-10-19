@@ -28,6 +28,40 @@ stock. Unknown states, landing evidence, and historical outcomes are explicit.
 Closed never means landed. Bors landings require an exact PR-head match in
 verified batch-to-main evidence, not titles, reviews or staging success.
 
+## Costs and initiated PR output
+
+Cost estimates have **All time** and **7 days** columns. They pool every
+conversation in the reported worker/machine scope, including reviews and fixes
+on PRs initiated elsewhere. Completed sessions use their reconciled budget
+receipts at the original settlement time; ongoing sessions use the budget's
+current reservations, shown separately as active estimates. These are API costs,
+not machine charges or subscription fees. Reading the ledger never changes it.
+
+The seven-day denominator contains only PRs initiated within those seven days;
+all-time contains all retained initiated PRs. Each verified landed PR contributes
+its Lean lines added, each currently open PR contributes half its Lean lines
+added, and a closed unmerged PR contributes nothing. Reviews and other assists
+never add another author's LOC to this denominator. Fleet totals pool costs and
+weighted LOC before dividing; they do not average machine ratios.
+
+LOC comes from complete file lists already cached by the shared GitHub state
+server. Immutable file URLs must match the PR head (or base for deleted files),
+and cached file totals must agree with available PR headers. The observation
+route never schedules file collection or falls back to GitHub. Missing or stale
+LOC and a zero denominator produce an unavailable rate, with measured-PR coverage
+shown alongside it. Cost preparation runs in the existing background collector;
+`activity` and `workers status` still only read small JSON summaries.
+
+Completed review counts include reviews of other authors' PRs. `PRs assisted`
+counts distinct PRs in the reported scope with completed review/fix/rebase work
+or a branch push, excluding that scope's initiated PRs. Multi-host summaries add
+review events, while unique assisted-PR counts remain per-host.
+
+Existing local CI receipts are imported read-only and incrementally when a fleet
+controller is present; this adds no GitHub requests. Non-fleet consumers can set
+`TAUCETI_ACTIVITY_CI_DB` to a compatible receipt database or omit this optional
+source.
+
 ## Preparation and freshness
 
 Workers write small private receipts into `~/.local/state/tauceti/activity/pending`.
@@ -70,7 +104,7 @@ activity directory and is exported before worker HOME isolation.
 
 ## No additional GitHub API requests
 
-The preparer requests up to 500 tracked PR headers per call to the shared server's
+The preparer requests up to 100 tracked PR headers and cached LOC counts per call to the shared server's
 authenticated `POST /v1/activity`, at most once per five minutes per unlanded PR.
 It uses worker configuration's `github_state_url` and `github_state_token_file`,
 or the corresponding `TAUCETI_GITHUB_STATE_*` environment variables.

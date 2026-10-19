@@ -28,6 +28,8 @@ class ActivityTests(unittest.TestCase):
             os.environ,
             {
                 "TAUCETI_ACTIVITY_DIR": self.tmp.name,
+                "TAUCETI_BUDGET_DIR": self.tmp.name + "/budget",
+                "TAUCETI_ACTIVITY_CI_DB": self.tmp.name + "/ci-events.sqlite",
                 "TAUCETI_FLEET_MACHINE_ID": "machine",
                 "TAUCETI_WORKER_ID": "worker",
             },

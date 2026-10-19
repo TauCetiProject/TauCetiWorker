@@ -46,3 +46,31 @@ test('unavailable stored resource fails without falling back to upstream repair'
   assert.equal(db.prepare('SELECT COUNT(*) n FROM jobs').get().n,0);
  }finally{db.close();}
 });
+test('LOC uses complete cached files at the exact PR head without scheduling work',async()=>{
+ const {db,state}=fixture();try{
+  const head='a'.repeat(40),base='b'.repeat(40),key='files:{"number":7}';
+  const p={number:7,state:'OPEN',headRefOid:head,baseRefOid:base,changedFiles:2,additions:32,deletions:5};
+  const put=()=>db.prepare('INSERT OR REPLACE INTO resources VALUES (?,?,?,?,?,?,?,0)').run('pr','7','',JSON.stringify(p),'',Date.now(),1);
+  put();
+  const file=(name,added,deleted,sha=head)=>({filename:name,status:'modified',additions:added,deletions:deleted,blob_url:`https://github.com/org/repo/blob/${sha}/${name}`});
+  for(const f of [file('TauCeti/A.lean',30,4),file('README.md',2,1)]){
+   const id='7:'+f.filename;
+   db.prepare('INSERT INTO resources VALUES (?,?,?,?,?,?,?,0)').run('files',id,'7',JSON.stringify(f),'',Date.now(),1);
+   db.prepare('INSERT INTO members VALUES (?,?)').run(key,id);
+  }
+  db.prepare('INSERT INTO collections VALUES (?,?,?,?,?,?,?)').run(key,'files','{"number":7}',0,Date.now(),1,null);
+  assert.equal((await (await query(state,[7])).json()).prs[0].lean_loc,null);
+  db.prepare('UPDATE collections SET complete=1 WHERE key=?').run(key);
+  assert.deepEqual((await (await query(state,[7])).json()).prs[0].lean_loc,{added:30,deleted:4,head_sha:head});
+  p.headRefOid='c'.repeat(40);put();
+  assert.equal((await (await query(state,[7])).json()).prs[0].lean_loc,null,'an old-head diff must not count');
+  const newer={filename:'TauCeti/A.lean',status:'modified',additions:30,deletions:4,blob_url:`https://github.com/org/repo/blob/${p.headRefOid}/TauCeti/A.lean`};
+  db.prepare("UPDATE resources SET data=? WHERE kind='files' AND id='7:TauCeti/A.lean'").run(JSON.stringify(newer));
+  newer.filename='README.md';newer.additions=2;newer.deletions=1;newer.blob_url=`https://github.com/org/repo/blob/${p.headRefOid}/README.md`;
+  db.prepare("UPDATE resources SET data=? WHERE kind='files' AND id='7:README.md'").run(JSON.stringify(newer));
+  db.prepare('UPDATE collections SET revision=revision+1 WHERE key=?').run(key);
+  assert.equal((await (await query(state,[7])).json()).prs[0].lean_loc.added,30,'a completed new collection invalidates a negative cache');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM demand').get().n,0);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jobs').get().n,0);
+ }finally{db.close();}
+});
