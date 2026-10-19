@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from .activity_summary import hourly_rate
 from .budget import Budget, money
+from .usage_accounting import session_usage, usage_path
 
 COST_WINDOWS = {"total": None, "7d": 7 * 86400}
 SPENDING_WINDOWS = {"3h": 10800, "24h": 86400, "7d": 7 * 86400, "total": None}
@@ -14,9 +15,45 @@ def install(db):
     db.executescript("""
       CREATE TABLE IF NOT EXISTS conversation_costs(
         id TEXT PRIMARY KEY,worker TEXT,scope TEXT,started REAL,settled REAL,cost TEXT);
+      CREATE TABLE IF NOT EXISTS prepared_usage(
+        id TEXT PRIMARY KEY,signature TEXT,payload TEXT);
+      CREATE TABLE IF NOT EXISTS conversation_quality(
+        id TEXT PRIMARY KEY,worker TEXT,scope TEXT,native INTEGER,estimated INTEGER,incomplete INTEGER);
+      CREATE TABLE IF NOT EXISTS cost_accruals(
+        id TEXT,worker TEXT,scope TEXT,started REAL,finished REAL,cost TEXT,quality TEXT,active INTEGER);
+      CREATE INDEX IF NOT EXISTS accrual_scope ON cost_accruals(scope,started);
       CREATE INDEX IF NOT EXISTS cost_scope ON conversation_costs(scope,settled);
       CREATE INDEX IF NOT EXISTS cost_worker ON conversation_costs(worker,settled);
     """)
+
+
+def cached_usage(db, budget, session):
+    """Stat small checkpoints; immutable old usage is reduced and cached in SQLite."""
+    path = usage_path(budget.directory, session["id"], session.get("bridge"))
+    paths = {path, budget.directory / "usage" / (session["id"] + ".json")}
+    fingerprints = []
+    for candidate in sorted(paths):
+        for file in (candidate, candidate.with_suffix(".jsonl")):
+            try:
+                stat = file.lstat()
+                fingerprints.append((str(file), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_uid, stat.st_mode))
+            except FileNotFoundError:
+                fingerprints.append((str(file), None))
+    signature = json.dumps(fingerprints)
+    saved = db.execute("SELECT signature,payload FROM prepared_usage WHERE id=?", (session["id"],)).fetchone()
+    if saved and saved[0] == signature:
+        return json.loads(saved[1])
+    value = session_usage(budget.directory, session)
+    if value:
+        value = {
+            **value,
+            "messages": {
+                key: {name: item[name] for name in ("session", "message_id", "at", "cost", "complete")}
+                for key, item in value["messages"].items()
+            },
+        }
+    db.execute("INSERT OR REPLACE INTO prepared_usage VALUES (?,?,?)", (session["id"], signature, json.dumps(value)))
+    return value
 
 
 def prepare(db, now, scope_for_worker):
@@ -36,10 +73,71 @@ def prepare(db, now, scope_for_worker):
         for event in record["events"]:
             if event["type"] == "settle":
                 settled_at.setdefault(event["id"], record["timestamp"])
-    rows = []
-    for identity, session in state["sessions"].items():
+    rows, accruals, quality_rows, seen = [], [], [], set()
+    for identity, session in sorted(state["sessions"].items(), key=lambda pair: pair[1]["started"]):
         settled = session["status"] == "settled"
-        value = session["cost"] if settled else session.get("reserve", session["estimate"])
+        value = session.get("cost", "0")
+        saved = (
+            cached_usage(db, budget, session)
+            if len(identity) == 32 and all(c in "0123456789abcdef" for c in identity)
+            else None
+        )
+        items = []
+        if saved:
+            for item in saved["messages"].values():
+                key = (item["session"], item["message_id"])
+                if key not in seen:
+                    items.append(item)
+                    seen.add(key)
+        priced = [item for item in items if item["cost"] is not None]
+        total = sum((money(item["cost"]) for item in priced), Decimal(0))
+        source = session.get("cost_provenance", "native-reported")
+        native = settled and source == "native-reported"
+        if not settled:
+            value = str(max(money(value), total, money(session.get("lower_bound_cost", "0"))))
+        scope = scope_for_worker(session["worker"])
+        incomplete = not settled and (
+            not saved
+            or not saved["closed"]
+            or saved["inflight"]
+            or any(not item["complete"] or item["cost"] is None for item in items)
+        )
+        quality_rows.append((identity, session["worker"], scope, native, not native, incomplete))
+        if total > 0:
+            # A native final total corrects all response costs proportionally,
+            # retaining their timestamps rather than creating a settlement spike.
+            allocated = Decimal(0)
+            for index, item in enumerate(priced):
+                part = (
+                    money(value) - allocated if index == len(priced) - 1 else money(value) * money(item["cost"]) / total
+                )
+                allocated += part
+                accruals.append(
+                    (
+                        identity,
+                        session["worker"],
+                        scope,
+                        item["at"],
+                        item["at"],
+                        str(part),
+                        "native-allocated" if native else "token-priced",
+                        not settled,
+                    )
+                )
+        elif money(value) > 0:
+            finish = settled_at.get(identity, saved["observed_at"] if saved else now)
+            accruals.append(
+                (
+                    identity,
+                    session["worker"],
+                    scope,
+                    session["started"],
+                    max(session["started"], finish),
+                    value,
+                    "interval-estimate",
+                    not settled,
+                )
+            )
         if money(value) < 0:
             raise ValueError("Negative conversation cost")
         rows.append(
@@ -55,6 +153,10 @@ def prepare(db, now, scope_for_worker):
     # This is a derived cache. A ledger repair/replacement cannot leave old sessions behind.
     db.execute("DELETE FROM conversation_costs")
     db.executemany("INSERT INTO conversation_costs VALUES (?,?,?,?,?,?)", rows)
+    db.execute("DELETE FROM cost_accruals")
+    db.executemany("INSERT INTO cost_accruals VALUES (?,?,?,?,?,?,?,?)", accruals)
+    db.execute("DELETE FROM conversation_quality")
+    db.executemany("INSERT INTO conversation_quality VALUES (?,?,?,?,?,?)", quality_rows)
     pending = sum(
         (money(s.get("reserve", s["estimate"])) for s in state["sessions"].values() if s["status"] != "settled"),
         Decimal(0),
@@ -75,23 +177,32 @@ def summarize(db, now, cutoff, column=None, identity=None):
     funding_row = db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()
     funding = json.loads(funding_row[0]) if funding_row else None
     failure = db.execute("SELECT value FROM meta WHERE key='activity_cost_error'").fetchone()
+
+    def accrued(since, active=None):
+        query = f"SELECT started,finished,cost FROM cost_accruals WHERE finished>=? AND started<=? {where}"
+        values = [since, now, *args]
+        if active is not None:
+            query += " AND active=?"
+            values.append(active)
+        total = Decimal(0)
+        for start, finish, cost in db.execute(query, values):
+            if start == finish:
+                if since <= start <= now:
+                    total += money(cost)
+            else:
+                overlap = max(0, min(finish, now) - max(start, since))
+                total += money(cost) * money(overlap) / money(finish - start)
+        return total
+
     windows = {}
     for key, seconds in COST_WINDOWS.items():
         since = max(cutoff or 0, now - seconds) if seconds is not None else cutoff or 0
-        costs = db.execute(
-            f"SELECT cost FROM conversation_costs WHERE settled>=? AND settled<=? {where}", [since, now, *args]
-        )
-        spent = sum((money(row[0]) for row in costs), Decimal(0))
-        active = db.execute(
-            f"SELECT cost FROM conversation_costs WHERE settled IS NULL AND started>=? AND started<=? {where}",
-            [since, now, *args],
-        )
-        pending = sum((money(row[0]) for row in active), Decimal(0))
         available = funding and not failure
+        completed, active = accrued(since, 0), accrued(since, 1)
         windows[key] = dict(
-            spent_usd=str(spent) if available else None,
-            pending_usd=str(pending) if available else None,
-            estimated_usd=str(spent + pending) if available else None,
+            spent_usd=str(completed) if available else None,
+            active_accrued_usd=str(active) if available else None,
+            estimated_usd=str(completed + active) if available else None,
         )
     recorded_since = cutoff
     if recorded_since is None:
@@ -104,11 +215,7 @@ def summarize(db, now, cutoff, column=None, identity=None):
             max(recorded_since, now - seconds) if seconds is not None and recorded_since is not None else recorded_since
         )
         covered = max(0, now - since) if since is not None else 0
-        costs = db.execute(
-            f"SELECT cost FROM conversation_costs WHERE settled>=? AND settled<=? {where}",
-            [since if since is not None else now, now, *args],
-        )
-        spent = str(sum((money(row[0]) for row in costs), Decimal(0))) if funding and not failure else None
+        spent = str(accrued(since if since is not None else now)) if funding and not failure else None
         # Existing native round intervals record work, rather than the lifetime
         # of wrappers that may be waiting for capacity, budget or GitHub.
         begin = since if since is not None else now
@@ -128,5 +235,19 @@ def summarize(db, now, cutoff, column=None, identity=None):
             usd_per_worker_hour=hourly_rate(spent, worker_seconds),
         )
     return dict(
-        windows=windows, spending=spending, funding=funding, prepared_at=funding.get("prepared_at") if funding else None
+        accounting_version=2,
+        windows=windows,
+        spending=spending,
+        funding=funding,
+        quality=dict(
+            zip(
+                ("native", "estimated", "incomplete"),
+                db.execute(
+                    f"SELECT COALESCE(SUM(native),0),COALESCE(SUM(estimated),0),COALESCE(SUM(incomplete),0) FROM conversation_quality WHERE 1=1 {where}",
+                    args,
+                ).fetchone(),
+                strict=True,
+            )
+        ),
+        prepared_at=funding.get("prepared_at") if funding else None,
     )

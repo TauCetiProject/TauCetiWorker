@@ -1418,6 +1418,10 @@ def cmd_doctor(args) -> int:
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
+    from . import shared_mathlib
+
+    shared_ok, shared_note = shared_mathlib.capability()
+    rows.append(("shared Mathlib", shared_ok, shared_note + "; TAUCETI_SHARED_MATHLIB_BUILDS=auto|off|required"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("kiro-cli", _have("kiro-cli"), "for --agent kiro"))
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
