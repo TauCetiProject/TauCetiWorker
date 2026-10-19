@@ -1323,6 +1323,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             review_min_queue=review_min_queue,
             review_min_age=review_min_age,
             prs=prs,
+            ignore_quota=ignore_quota,
         )
         # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,
         # so it is the one run that most needs to answer "am I on the right account?". The check is a

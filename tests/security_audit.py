@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
@@ -366,6 +366,23 @@ class WorkerBoundJudgments(unittest.TestCase):
         model.assert_not_called()
         self.assertFalse((self.work / "operational-recovery.json").exists())
 
+    def test_recovery_preserves_round_pacing_override(self):
+        opts = wu.RoundOpts(
+            only=["security-audit"],
+            agent="codex",
+            work_model="codex",
+            sandbox_host=True,
+            dry_run=False,
+            ignore_quota=True,
+        )
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)) as quota,
+            patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
+            patch.object(sa, "advance", return_value="b" * 40),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, opts, self.block))
+        quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=True, fresh=True)
+
 
 class History(unittest.TestCase):
     def setUp(self):
@@ -657,6 +674,41 @@ class PrivateAlerts(unittest.TestCase):
 
 
 class Authority(unittest.TestCase):
+    def test_cli_carries_pacing_override_into_audit_round(self):
+        for ignored in (False, True):
+            with (
+                self.subTest(ignore_quota=ignored),
+                patch.object(sa, "require_admin"),
+                patch.dict(
+                    os.environ, {"TAUCETI_TEST_SLEEP": "", "TAUCETI_TEST_HOLD": "", "TAUCETI_TEST_HEARTBEAT": ""}
+                ),
+                patch.multiple(
+                    cli,
+                    Config=DEFAULT,
+                    RoundContext=DEFAULT,
+                    Worker=DEFAULT,
+                    GitHub=DEFAULT,
+                    ReviewState=DEFAULT,
+                    Counters=DEFAULT,
+                    Claims=DEFAULT,
+                    set_log_file=DEFAULT,
+                    configure_api=DEFAULT,
+                    resolve_work_model=DEFAULT,
+                    run_round=DEFAULT,
+                ) as mocks,
+            ):
+                mocks["resolve_work_model"].return_value = ("codex", False)
+                mocks["run_round"].return_value = 0
+                cli.cmd_work(
+                    SimpleNamespace(worker_id="default", dry_run=True, ignore_quota=ignored),
+                    only=["security-audit", "bump", "progress"],
+                    agent="codex",
+                    one_round=True,
+                )
+                opts = mocks["run_round"].call_args.args[1]
+                self.assertIs(opts.ignore_quota, ignored)
+                self.assertIs(mocks["resolve_work_model"].call_args.kwargs["ignore_quota"], ignored)
+
     def test_phase_is_explicit_only(self):
         self.assertFalse(want([], "security-audit"))
         self.assertNotIn("security-audit", cli.resolve_tasks([], ["review"]))
