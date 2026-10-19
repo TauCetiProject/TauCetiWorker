@@ -85,11 +85,14 @@ class RoundResources:
     """
 
     def __init__(self, cfg, *, interval: float = 2.0, publish_interval: float = 60.0):
+        from .activity import current_round_id
+
         self.cfg = cfg
         self.interval = interval
         self.publish_interval = publish_interval
         self.root = os.getpid()
         self.id = uuid.uuid4().hex
+        self.activity_id = current_round_id()
         self.started_at = time.time()
         self.started = time.monotonic()
         self.baseline_cpu = usage()[0]
@@ -118,6 +121,8 @@ class RoundResources:
         self.sample_count += 1
         return dict(
             id=self.id,
+            activity_id=self.activity_id,
+            activity_schema=1,
             started_at=self.started_at,
             elapsed_seconds=round(elapsed, 3),
             cpu_seconds=round(self.cpu, 3),

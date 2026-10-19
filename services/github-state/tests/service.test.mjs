@@ -78,3 +78,14 @@ test('reference reads require an explicitly enabled environment and admin authen
  const body=JSON.stringify({query:{repository:'org/repo',operation:'files',args:{number:7}}});
  assert.equal((await request('/admin/reference',{method:'POST',headers:{Authorization:'Bearer '+admin},body})).status,401,'production default disables reference reads');
 });
+
+
+test('activity observations are authenticated, repository-scoped, bounded, and tolerate missing coverage',async()=>{
+ const body=JSON.stringify({repository:'org/repo',numbers:[999999]});
+ assert.equal((await request('/v1/activity',{method:'POST',body})).status,401);
+ assert.equal((await request('/v1/activity',{method:'POST',headers,body:JSON.stringify({repository:'org/private',numbers:[7]})})).status,403);
+ for(const input of [null,{repository:'org/repo',numbers:[-1]},{repository:'org/repo',numbers:Array(501).fill(1)}])
+  assert.equal((await request('/v1/activity',{method:'POST',headers,body:JSON.stringify(input)})).status,400);
+ const r=await request('/v1/activity',{method:'POST',headers,body});
+ assert.equal(r.status,200);const data=await r.json();assert.equal(data.coverage,'observed');assert.deepEqual(data.missing,[999999]);
+});

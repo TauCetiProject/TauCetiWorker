@@ -19,6 +19,7 @@ export function pr(n: any): any {
   }
   return { number: n.number, title: n.title, body: n.body || '', state: n.merged || n.merged_at ? 'MERGED' : String(n.state).toUpperCase(),
     isDraft: Boolean(n.draft), ...(n.mergeable===undefined?{}:{mergeable:n.mergeable === false ? 'CONFLICTING' : n.mergeable === true ? 'MERGEABLE' : 'UNKNOWN'}),
+    mergedAt: n.merged_at, closedAt: n.closed_at,
     updatedAt: n.updated_at, createdAt: n.created_at, headRefOid: n.head?.sha, headRefName: n.head?.ref,
     headRepositoryOwner: {login: n.head?.repo?.owner?.login || n.head?.user?.login || ''}, headRepository: {name: n.head?.repo?.name || ''},
     author: {login: n.user?.type === 'Bot' ? 'app/' + (n.user.login || '').replace(/\[bot\]$/, '') : n.user?.login || '', is_bot: n.user?.type === 'Bot'},

@@ -972,6 +972,9 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             return {"ok": False, "error": f"unknown action: {action}"}
 
         print(f"tauceti workers: managing {config} every {interval:g}s", flush=True)
+        from .activity import start_collector
+
+        activity_stopping = start_collector(config)
         try:
             while not exiting:
                 try:
@@ -1108,6 +1111,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     time.sleep(0.1)
             return 0
         finally:
+            activity_stopping.set()
             signal.signal(signal.SIGTERM, old_term)
             signal.signal(signal.SIGINT, old_int)
             server.close()
@@ -1429,14 +1433,19 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
 
 
 def print_worker_status(config: Path, *, as_json: bool = False) -> bool:
+    from .activity import cached, display
+
     specs = load_worker_specs(config)
     snapshots = worker_snapshots(specs)
     online = manager_request("ping")
     if as_json:
-        print(json.dumps({"manager": online, "config": str(config), "workers": snapshots}, indent=2))
+        print(
+            json.dumps({"manager": online, "config": str(config), "workers": snapshots, "activity": cached()}, indent=2)
+        )
     else:
         width = shutil.get_terminal_size(fallback=(100, 24)).columns
         print("\n".join(_worker_status_lines(config, snapshots, bool(online), width=width)))
+        display(cached())
     healthy = bool(online) and all(item["desired"] == "stopped" or item.get("alive") for item in snapshots)
     return healthy
 

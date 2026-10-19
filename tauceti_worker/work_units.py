@@ -316,8 +316,10 @@ def focus_prs(sv: Survey, opts) -> None:
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
     if "security-audit" in opts.only:
+        from .activity import select
         from .security_audit import run
 
+        select("security-audit")
         other_tasks = [task for task in opts.only if task != "security-audit"]
         if not other_tasks:
             return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
@@ -999,6 +1001,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         effort = profile.effort or "none"
         detail = f"provider={profile.provider}, model={profile.model}, effort={effort}, sandbox={where}"
     log(f"→ {stage.upper()}: {what}   [{detail}]")
+    from .activity import select
+
+    select(stage)
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     if pre is not None:
