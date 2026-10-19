@@ -137,6 +137,9 @@ class RoundOpts:
     review_min_age: int = 0  # minutes a PR must have been awaiting review before this worker takes it
     # --pr: the pull requests this round is restricted to. Empty (the normal case) = no targeting.
     prs: tuple[int, ...] = ()
+    # Preserve the operator's pacing override for fresh launch-stage quota checks.
+    # This never waives hard exhaustion or unreadable provider usage.
+    ignore_quota: bool = False
 
     @property
     def agent_name(self) -> str:
