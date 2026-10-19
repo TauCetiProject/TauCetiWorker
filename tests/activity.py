@@ -82,6 +82,15 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
         self.assertEqual(s["unknown_prs"], 1)
 
+    def test_transport_wait_is_not_counted_as_a_failed_round(self):
+        from tauceti_worker.config import Die
+
+        r = a.Round("worker")
+        with patch("tauceti_worker.github_transport.blocking_event_since", return_value={"reset": self.now + 60}):
+            r.finish(Die("GitHub quota wait"))
+        a.prepare(now=time.time())
+        self.assertEqual(a.cached()["summary"]["rounds"]["total"], {})
+
     def test_missing_stale_and_failed_server_do_not_fallback_or_retry_early(self):
         a.emit("pr_created", repository="org/repo", pr=7)
         a.emit("pr_created", repository="org/repo", pr=8)

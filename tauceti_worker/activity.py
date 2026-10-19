@@ -80,6 +80,7 @@ class Round:
         self.done = False
         self.kind = "no-work"
         self.rc = 0
+        self.started_at = time.time()
         self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE", "inf"))
         _round = self
         emit(
@@ -117,6 +118,14 @@ class Round:
                 if code
                 else "completed"
             )
+        if type(exc).__name__ in ("Die", "NoProgress"):
+            # Match cli_main's conversion of transport/quota failures to a wait.
+            # This reads local instrumentation only, never GitHub.
+            from .github_transport import blocking_event_since
+
+            with contextlib.suppress(Exception):
+                if blocking_event_since(self.started_at):
+                    code = 77
         if code in (76, 77) or type(exc).__name__ in ("AdmissionUnavailable", "GitHubUnavailable"):
             # Waiting for permission to work is not a finished work round.
             emit("round_waited", key=self.id + ":wait", round_id=self.id, worker=self.worker)
