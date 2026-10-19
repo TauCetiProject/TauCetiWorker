@@ -25,7 +25,9 @@ back to ordinary private cache warming; required mode pauses before inference.
 ## Publication and private writes
 
 The key includes pinned dependency revisions, the Mathlib manifest, the root Lake
-configuration and manifest, Lean toolchain and ABI, architecture and platform.
+configuration and manifest, Lean toolchain and ABI, architecture and platform,
+and the Git remote/branch/tag context that selects Mathlib artifact caches.
+Remote URLs are hashed in published metadata; credentials are not copied there.
 Dirty or unpinned dependencies use private builds. A miss makes fresh local git
 clones at those revisions, downloads using `lake exe cache get`, and verifies
 Mathlib `.olean` and `.ilean` outputs before syncing the immutable tree and publishing it atomically. It never publishes
@@ -57,7 +59,9 @@ less than 10% free if no unused entries can be reclaimed.
 
 The existing activity preparer collects small local preparation receipts. Status
 reads only that prepared summary, including sharing/private modes, cache hits,
-preparation time and fallback reasons. `results.jsonl` in the pool contains
+preparation time and fallback reasons. A mounted overlay remains "preparing"
+until cache warming succeeds; a failed warmer is reported as blocked and never
+starts inference. `results.jsonl` in the pool contains
 content-free coding invocation results and native round IDs for rollout checks.
 
 ## Rollout

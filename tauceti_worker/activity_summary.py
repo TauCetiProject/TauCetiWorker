@@ -230,10 +230,12 @@ def display(value, default_kinds=()):
             f"Budget: {amount(funding['available'])} available; {amount(funding['pending'])} pending; {amount(funding['grant_rate'])}/hour replenishment"
         )
     sharing = s.get("shared_mathlib")
-    if sharing and (sharing.get("shared") or sharing.get("private") or sharing.get("preparing")):
+    if sharing and (
+        sharing.get("shared") or sharing.get("private") or sharing.get("preparing") or sharing.get("blocked")
+    ):
         print()
         print(
-            f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
+            f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing, {sharing.get('blocked', 0)} blocked; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
         )
         for reason in sharing.get("reasons", []):
             print("  " + reason)
@@ -349,7 +351,7 @@ def combine(values):
     if any(sharing):
         s["shared_mathlib"] = {
             key: sum(row.get(key, 0) for row in sharing)
-            for key in ("shared", "private", "preparing", "cache_hits", "preparation_seconds")
+            for key in ("shared", "private", "preparing", "blocked", "cache_hits", "preparation_seconds")
         }
         s["shared_mathlib"]["reasons"] = sorted({reason for row in sharing for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
