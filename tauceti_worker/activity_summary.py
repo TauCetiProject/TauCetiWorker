@@ -145,7 +145,12 @@ def display(value, default_kinds=()):
         windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
         for key, label in (
             ("spent_usd", "API cost: completed sessions"),
-            ("active_accrued_usd", "API cost: running/interrupted"),
+            (
+                "active_accrued_usd" if costs.get("accounting_version", 1) >= 2 else "pending_usd",
+                "API cost: running/interrupted"
+                if costs.get("accounting_version", 1) >= 2
+                else "API cost: active estimates",
+            ),
             ("estimated_usd", "API cost: estimated total"),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
@@ -209,7 +214,7 @@ def display(value, default_kinds=()):
     table(None, headers, prs, widths)
     if spending_rows:
         table(spending_title, ("3h", "24h", "7d", "All time"), spending_rows, widths)
-    if spending_rows and costs.get("quality"):
+    if spending_rows and costs.get("quality") and costs.get("accounting_version", 1) >= 2:
         q = costs["quality"]
         print(
             f"Costs: native totals where available; token/interval estimates otherwise; {q.get('incomplete', 0)} conversations have incomplete usage. Reservations excluded."
@@ -261,6 +266,10 @@ def combine(values):
     errors = [e for v in values for e in v.get("errors", [])]
     if len(known) != len(values):
         errors.append("Some hosts have no prepared activity")
+    accounting_versions = {v.get("costs", {}).get("accounting_version", 1) for v in known}
+    compatible_costs = len(accounting_versions) == 1
+    if not compatible_costs:
+        errors.append("Hosts use different cost accounting versions; refresh their native activity collectors")
     s = dict(
         prepared_at=min(v["prepared_at"] for v in known),
         history_since=min((v["history_since"] for v in known if v.get("history_since")), default=None),
@@ -300,10 +309,10 @@ def combine(values):
                 "open_prs",
             )
         }
-        for key in ("spent_usd", "active_accrued_usd", "estimated_usd"):
+        for key in ("spent_usd", "active_accrued_usd", "pending_usd", "estimated_usd"):
             row[key] = (
                 str(sum((Decimal(r[key]) for r in rows), Decimal(0)))
-                if all(r.get(key) is not None for r in rows) and len(known) == len(values)
+                if compatible_costs and all(r.get(key) is not None for r in rows) and len(known) == len(values)
                 else None
             )
         row["measured_pr_weight"] = float(sum((measured_pr_weight(r) for r in rows), Decimal(0)))
@@ -313,7 +322,9 @@ def combine(values):
         s["costs"]["spending"] = {}
         for w in WINDOWS:
             rows = [v.get("costs", {}).get("spending", {}).get(w, {}) for v in known]
-            complete = len(known) == len(values) and all(r.get("spent_usd") is not None for r in rows)
+            complete = (
+                compatible_costs and len(known) == len(values) and all(r.get("spent_usd") is not None for r in rows)
+            )
             spent = str(sum((Decimal(r["spent_usd"]) for r in rows), Decimal(0))) if complete else None
             # Parallel machines share wall-clock time; neither sum durations nor
             # average their rates. A newly joined host contributes only its costs.

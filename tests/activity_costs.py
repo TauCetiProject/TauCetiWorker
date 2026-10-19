@@ -295,6 +295,22 @@ class CostTests(unittest.TestCase):
         missing = activity_summary.combine(values)["summary"]["costs"]["spending"]
         self.assertTrue(all(r["usd_per_hour"] is None for r in missing.values()))
 
+    def test_different_accounting_versions_are_not_silently_pooled(self):
+        modern = self.summary()
+        legacy = json.loads(json.dumps(modern))
+        legacy["costs"]["accounting_version"] = 1
+        for row in legacy["costs"]["windows"].values():
+            row["pending_usd"] = row.pop("active_accrued_usd")
+        combined = activity_summary.combine(
+            [dict(available=True, summary=modern), dict(available=True, summary=legacy)]
+        )
+        self.assertTrue(any("accounting versions" in error for error in combined["errors"]))
+        self.assertIsNone(combined["summary"]["costs"]["spending"]["3h"]["usd_per_hour"])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            activity_summary.display(dict(available=True, summary=legacy), [])
+        self.assertIn("API cost: active estimates", output.getvalue())
+        self.assertNotIn("Reservations excluded", output.getvalue())
+
     def test_reconciliations_restate_the_original_cost_window(self):
         self.record(self.now, dict(type="correction", id="old", cost="15", delta="-5"))
         self.write_ledger()
