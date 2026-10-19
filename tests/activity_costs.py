@@ -222,17 +222,86 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(spending["7d"]["spent_usd"]), 50)
         self.assertEqual(Decimal(spending["total"]["spent_usd"]), 65)
 
-    def test_missing_or_changed_head_LOC_never_produces_a_partial_ratio(self):
+    def test_missing_or_changed_head_LOC_is_extrapolated_with_half_weight_open_prs(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE prs SET head='new-head' WHERE number=3")
         rows = self.summary()["costs"]["windows"]
-        self.assertIsNone(rows["total"]["usd_per_loc"])
+        self.assertEqual(Decimal(rows["total"]["measured_weighted_loc"]), 500)
+        self.assertEqual(Decimal(rows["total"]["weighted_loc"]), 600)
+        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 600)
+        self.assertEqual(Decimal(rows["7d"]["weighted_loc"]), 300)
+        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal("0.3"))
         self.assertEqual(rows["7d"]["missing_loc_prs"], 1)
+        self.assertTrue(rows["7d"]["loc_estimated"])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(dict(available=True, summary=self.summary()))
+        self.assertIn("~$0.1667", output.getvalue())
+        self.assertIn("~$0.3000", output.getvalue())
+        self.assertIn("~ Missing LOC estimated", output.getvalue())
+
+    def test_missing_all_LOC_keeps_rate_visible_without_inventing_output(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM pr_loc")
+        s = self.summary()
+        for row in s["costs"]["windows"].values():
+            self.assertEqual(Decimal(row["weighted_loc"]), 0)
+            self.assertEqual(row["usd_per_loc"], "Infinity")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(dict(available=True, summary=s))
+        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / weighted LOC"))
+        self.assertEqual(rate.count("~$∞"), 2)
+
+    def test_unknown_pr_state_contributes_zero_without_hiding_rate(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET state=NULL WHERE number=3")
+        row = self.summary()["costs"]["windows"]["7d"]
+        self.assertTrue(row["loc_estimated"])
+        self.assertEqual(Decimal(row["weighted_loc"]), 200)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.45"))
+
+    def test_partial_fleet_estimate_pools_measurements_before_dividing(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET head='new-head' WHERE number=3")
+        s = self.summary()
+        other = json.loads(json.dumps(s))
+        for row in other["costs"]["windows"].values():
+            row.update(
+                estimated_usd="20",
+                landed_loc_added=200,
+                open_loc_added=0,
+                landed_prs=1,
+                open_prs=0,
+                missing_loc_prs=0,
+                known_loc_prs=1,
+                measured_pr_weight=1,
+            )
+        combined = activity_summary.combine([dict(available=True, summary=s), dict(available=True, summary=other)])
+        row = combined["summary"]["costs"]["windows"]["total"]
+        self.assertEqual(Decimal(row["weighted_loc"]), 800)  # 700 measured LOC * 4 / 3.5
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.15"))
+        self.assertTrue(row["loc_estimated"])
+
+    def test_old_prepared_summary_gets_numeric_fallback_without_refresh(self):
+        s = self.summary()
+        for row in s["costs"]["windows"].values():
+            for key in ("loc_estimated", "measured_pr_weight"):
+                row.pop(key)
+            row.update(usd_per_loc=None, missing_loc_prs=1, known_loc_prs=3)
+        with (
+            patch.object(a, "_connect", side_effect=AssertionError("SQL in status")),
+            patch.object(a, "observe", side_effect=AssertionError("network in status")),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            a.display(dict(available=True, summary=s))
+        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / weighted LOC"))
+        self.assertEqual(rate.count("~$"), 2)
+        self.assertNotIn("—", rate)
 
     def test_zero_output_and_failed_ledger_are_not_zero_dollars_per_LOC(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE prs SET state='CLOSED',landed=NULL")
-        self.assertIsNone(self.summary()["costs"]["windows"]["total"]["usd_per_loc"])
+        self.assertEqual(self.summary()["costs"]["windows"]["total"]["usd_per_loc"], "Infinity")
+        self.assertEqual(activity_summary.loc_estimate(dict(estimated_usd="0"))["usd_per_loc"], "0")
         p = self.root / "budget/events.jsonl"
         p.write_text(p.read_text() + '{"torn":')
         s = self.summary()

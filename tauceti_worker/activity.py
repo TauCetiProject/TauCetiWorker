@@ -560,8 +560,10 @@ def _summary(db, now, column=None, identity=None):
             open_prs=len(opened),
             missing_loc_prs=missing,
             known_loc_prs=len(landed) + len(opened) - sum(measured(p) is None for p in [*landed, *opened]),
+            measured_pr_weight=sum(measured(p) is not None for p in landed)
+            + sum(measured(p) is not None for p in opened) / 2,
         )
-        row.update(activity_costs.estimate(row["estimated_usd"], landed_loc, open_loc, missing))
+        row.update(activity_summary.loc_estimate(row))
     contributions = [dict(r) for r in db.execute(f"SELECT * FROM pr_contributions {where}", args)]
     owned_keys = {(p["repo"], p["number"]) for p in prs}
     for window, seconds in WINDOWS.items():

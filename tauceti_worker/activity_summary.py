@@ -16,6 +16,8 @@ def amount(value, *, rate=False):
     if value is None:
         return "—"
     n = Decimal(value)
+    if n.is_infinite():
+        return "$∞"
     if rate and 0 < n < Decimal("0.0001"):
         return "<$0.0001"
     return f"${n:.4f}" if rate else f"${n:.2f}"
@@ -31,6 +33,41 @@ def hourly_rate(spent, covered_seconds):
         str(Decimal(spent) * 3600 / Decimal(str(covered_seconds)))
         if spent is not None and covered_seconds and covered_seconds > 0
         else None
+    )
+
+
+def measured_pr_weight(row):
+    """Full weight for measured landed PRs, half for measured open PRs."""
+    if row.get("measured_pr_weight") is not None:
+        return Decimal(str(row["measured_pr_weight"]))
+    # Older prepared summaries have only unweighted coverage counts.
+    weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
+    known = row.get("known_loc_prs", 0)
+    count = known + row.get("missing_loc_prs", 0)
+    return weight * known / count if count else weight
+
+
+def loc_estimate(row):
+    """Keep partial PR coverage useful without fetching any additional data."""
+    measured = Decimal(row.get("landed_loc_added", 0)) + Decimal(row.get("open_loc_added", 0)) / 2
+    weighted = measured
+    missing = bool(row.get("missing_loc_prs"))
+    if missing:
+        known_weight = measured_pr_weight(row)
+        total_weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
+        if known_weight > 0:
+            weighted = measured * total_weight / known_weight
+    cost = row.get("estimated_usd")
+    rate = None
+    if cost is not None:
+        cost = Decimal(cost)
+        # No measured output means zero LOC, never an invented positive denominator.
+        rate = cost / weighted if weighted else Decimal("Infinity") if cost else Decimal(0)
+    return dict(
+        measured_weighted_loc=str(measured),
+        weighted_loc=str(weighted),
+        loc_estimated=missing,
+        usd_per_loc=str(rate) if rate is not None else None,
     )
 
 
@@ -94,7 +131,8 @@ def display(value, default_kinds=()):
         ]
     cost_rows = []
     if costs.get("windows"):
-        windows = costs["windows"]
+        # Compatibility for snapshots prepared before partial-coverage estimates.
+        windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
         for key, label in (
             ("spent_usd", "API cost: completed sessions"),
             ("pending_usd", "API cost: active estimates"),
@@ -110,13 +148,21 @@ def display(value, default_kinds=()):
             (
                 "Lean LOC (landed + ½ open)",
                 [
-                    number(windows[w].get("weighted_loc", 0)) + (" + ?" if windows[w].get("missing_loc_prs") else "")
+                    "~" + number(f"{Decimal(windows[w]['weighted_loc']):.1f}")
+                    if windows[w].get("loc_estimated")
+                    else number(windows[w].get("weighted_loc", 0))
                     for w in COST_WINDOWS
                 ],
             )
         )
         cost_rows.append(
-            ("Estimated $ / weighted LOC", [amount(windows[w].get("usd_per_loc"), rate=True) for w in COST_WINDOWS])
+            (
+                "Estimated $ / weighted LOC",
+                [
+                    ("~" if windows[w].get("loc_estimated") else "") + amount(windows[w].get("usd_per_loc"), rate=True)
+                    for w in COST_WINDOWS
+                ],
+            )
         )
         if any(windows[w].get("missing_loc_prs") for w in COST_WINDOWS):
             cost_rows.append(
@@ -155,6 +201,8 @@ def display(value, default_kinds=()):
         table("Spending (completed sessions)", ("3h", "24h", "7d", "All time"), spending_rows, widths)
     if cost_rows:
         table("Costs / initiated PR output", ("All time", "7 days"), cost_rows)
+        if any(windows[w].get("loc_estimated") for w in COST_WINDOWS):
+            print("~ Missing LOC estimated from measured PRs; zero if none measured. Unknown PR states count as zero.")
     funding = costs.get("funding")
     if funding:
         print()
@@ -234,13 +282,8 @@ def combine(values):
                 if all(r.get(key) is not None for r in rows) and len(known) == len(values)
                 else None
             )
-        weighted = Decimal(row["landed_loc_added"]) + Decimal(row["open_loc_added"]) / 2
-        row["weighted_loc"] = str(weighted)
-        row["usd_per_loc"] = (
-            str(Decimal(row["estimated_usd"]) / weighted)
-            if row["estimated_usd"] is not None and weighted > 0 and not row["missing_loc_prs"]
-            else None
-        )
+        row["measured_pr_weight"] = float(sum((measured_pr_weight(r) for r in rows), Decimal(0)))
+        row.update(loc_estimate(row))
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):
         s["costs"]["spending"] = {}
