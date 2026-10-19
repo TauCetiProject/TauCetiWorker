@@ -62,7 +62,9 @@ class ActivityTests(unittest.TestCase):
         self.assertNotIn("unrecorded", output.getvalue())
         self.assertNotIn("Older resource logs", output.getvalue())
         self.assertNotIn("totals cover", output.getvalue())
-        self.assertIn("Outcome rows are subsets", output.getvalue())
+        self.assertNotIn("Outcome rows are subsets", output.getvalue())
+        pr_start = next(i for i, line in enumerate(lines) if line.startswith("PRs authored"))
+        self.assertEqual(lines[pr_start - 1], "")
 
     def test_windows_total_failures_and_idempotent_replays(self):
         for age in (10, 10800, 10801, 86400, 86401, 604800, 604801):

@@ -561,6 +561,7 @@ def display(value):
         else "no recorded history"
     )
     print("Activity since: " + since)
+    print()
     observed_kinds = {kind for rows in s["rounds"].values() for kind in rows}
     kinds = list(dict.fromkeys(s.get("round_types", ROUND_TYPES)))
     kinds += sorted(observed_kinds - set(kinds))
@@ -584,11 +585,13 @@ def display(value):
         + "  ".join(f"{header:>{width}}" for header, width in zip(headers, widths, strict=True))
     )
     for label, counts in rows:
+        if label == "PRs authored":
+            print()
         print(
             f"{label:<{label_width}}  "
             + "  ".join(f"{count:>{width}}" for count, width in zip(counts, widths, strict=True))
         )
-    print("Outcome rows are subsets of finished rounds.")
+    print()
     print(
         f"Currently: {s['running'] if s['running'] is not None else 'unknown'} rounds running; {s['open_prs']} known open authored PRs; {s['unknown_prs']} PR states unknown; {s['unknown_landings']} closed/merged PRs lack landing evidence"
     )
