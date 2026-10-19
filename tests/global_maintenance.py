@@ -13,10 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker.config import NoProgress
 from tauceti_worker.github_state import SurveyRows
 from tauceti_worker.review_state import ReviewState
+from tauceti_worker.survey import PRInfo
 from tauceti_worker.work_units import RoundOpts, run_round
 
 work = importlib.import_module("tauceti_worker.work_units")
 HEAD = "a" * 40
+branch_claimed_elsewhere = work._branch_claimed_elsewhere
 
 
 def row(number, area, *, author="science", blocking=True, complete=True, contest=None, mergeable="MERGEABLE"):
@@ -27,6 +29,7 @@ def row(number, area, *, author="science", blocking=True, complete=True, contest
             "headRefOid": HEAD,
             "headRefName": "roadmap/work",
             "headRepositoryOwner": {"login": author},
+            "headRepository": {"name": "TauCeti"},
             "labels": [{"name": "roadmap/" + area}],
             "mergeable": mergeable,
             "statusCheckRollup": [{"context": "build", "state": "SUCCESS"}],
@@ -70,6 +73,7 @@ class GlobalMaintenance(unittest.TestCase):
         self.w = SimpleNamespace(
             cfg=cfg,
             gh=gh,
+            claims=SimpleNamespace(),
             rs=ReviewState(cfg, gh),
             counters=SimpleNamespace(read=lambda key: self.counter_values.get(key, 0)),
         )
@@ -85,6 +89,7 @@ class GlobalMaintenance(unittest.TestCase):
             patch.object(work, "roadmap_only", return_value=None),
             patch("tauceti_worker.survey.me", return_value="science"),
             patch.object(work, "mirror_creds"),
+            patch.object(work, "_branch_claimed_elsewhere", return_value=False),
         ):
             item.start()
             self.addCleanup(item.stop)
@@ -121,6 +126,56 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertEqual(query.call_args.kwargs["stages"], [])
         self.assertEqual(query.call_args.args[1], "auto")
         areas.assert_not_called()
+
+    def test_git_claim_precheck_handles_owner_expiry_and_failures(self):
+        leases = [
+            ({"owner": "peer", "expires_at": 200}, True),
+            ({"owner": "test", "expires_at": 200}, False),
+            ({"owner": "peer", "expires_at": 99}, False),
+            ({"owner": "peer", "expires_at": "200"}, False),
+            (None, False),
+        ]
+        import json
+        import subprocess
+
+        with (
+            patch.object(work, "claims_repo", return_value="org/claims"),
+            patch.object(work.time, "time", return_value=100),
+        ):
+            for lease, expected in leases:
+                with patch.object(
+                    work.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(lease))
+                ) as git:
+                    self.assertEqual(branch_claimed_elsewhere(self.w, 10), expected)
+                    self.assertEqual(git.call_args.args[0][1:], ["read", "branch/10"])
+                    self.assertEqual(git.call_args.kwargs["env"]["CLAIM_REPO"], "org/claims")
+            for error in (OSError("offline"), subprocess.TimeoutExpired("git", 15)):
+                with patch.object(work.subprocess, "run", side_effect=error):
+                    self.assertFalse(branch_claimed_elsewhere(self.w, 10))
+
+    def test_known_branch_claim_skips_dispatch_and_fresh_reads(self):
+        with patch.object(work, "_branch_claimed_elsewhere", side_effect=lambda _w, pr: pr == 10):
+            self.run_round([row(10, "Other"), row(20, "Topology")])
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+
+    def test_lost_claim_race_refunds_every_retry_counter(self):
+        self.w.claims = SimpleNamespace(begin_branch_work=lambda *args: False)
+        self.w.counters.write = lambda key, value: self.counter_values.update({key: value})
+        self.counter_values.update({"per-head": 1, "per-pr": 2})
+        sv = work.Survey(worker_id="test")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        result = work._do_fixlike(
+            self.w,
+            sv,
+            work.Candidate(10, HEAD),
+            self.opts,
+            False,
+            prompt_file="fix.md",
+            label="fix-ci",
+            charged=("per-head", "per-pr"),
+        )
+        self.assertIsNone(result)
+        self.assertEqual(self.counter_values, {"per-head": 0, "per-pr": 1})
 
     def test_global_review_before_area_choice(self):
         _, _, areas = self.run_round([row(40, "Other", author="peer", blocking=False)])

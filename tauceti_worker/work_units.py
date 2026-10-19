@@ -112,6 +112,36 @@ def want(only: list[str], task: str) -> bool:
     return (not only) or (task in only)
 
 
+def _branch_claimed_elsewhere(w, pr: int) -> bool:
+    """Cheap cooperative hint before fresh PR reads; acquire remains authoritative.
+
+    The claim script reads a Git ref/commit, consuming no REST or GraphQL quota.
+    Unknown, expired, malformed and failed reads leave acquisition to the existing
+    fail-open claim path. A claim released just after this check waits one round.
+    """
+    try:
+        result = subprocess.run(
+            [CLAIM_SH, "read", f"branch/{pr}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "CLAIM_REPO": claims_repo()},
+        )
+        if result.returncode:
+            return False
+        lease = json.loads(result.stdout or "null")
+        return bool(
+            isinstance(lease, dict)
+            and isinstance(lease.get("owner"), str)
+            and lease["owner"]
+            and lease["owner"] != w.cfg.wid
+            and type(lease.get("expires_at")) is int
+            and lease["expires_at"] > time.time()
+        )
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return False
+
+
 def round_stages(opts):
     """The predictor and runtime share the same stage priority."""
     return AUTO_STAGES
@@ -492,6 +522,17 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if not want(opts.only, stage):
             continue
         for c in sv.kind(stage).actionable:
+            if (
+                global_pick
+                and not opts.dry_run
+                and stage in FILE_CHANGE_STAGES
+                and c.pr
+                and getattr(w, "claims", None) is not None
+                and _branch_claimed_elsewhere(w, c.pr)
+            ):
+                log(f"Global PR work: {stage} #{c.pr} claimed by a peer — skipping before fresh PR reads")
+                declined.append((stage, c.pr))
+                continue
             if global_pick and c.pr:
                 p = next((p for p in sv.open_prs if p.number == c.pr), None)
                 areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
@@ -1385,9 +1426,10 @@ def _do_fixlike(
             log(f"  {label} #{pr}: explicit fork repair scope is no longer valid — skipping")
             return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
-        if foreign:
-            for key in charged:
-                w.counters.write(key, max(0, w.counters.read(key) - 1))
+        # Losing a claim never launched an attempt. This race is especially
+        # common when global maintenance prefers the same oldest PRs.
+        for key in charged:
+            w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None  # claimed elsewhere → caller tries the next candidate
     held = getattr(w.claims, "held", None)
     if foreign and (not held or held[0] != f"branch/{pr}"):

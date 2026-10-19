@@ -2,8 +2,11 @@
 
 Automatic work rounds consider existing PR maintenance and reviews across all
 non-skipped roadmaps before choosing an area for new authoring. Within each
-maintenance stage, older PR numbers come first; claims and fresh launch-time
-checks skip unavailable work and continue through the remaining candidates.
+maintenance stage, older PR numbers come first. A Git-based branch-claim hint
+skips known peer work before fresh PR reads, without REST or GraphQL requests.
+Atomic acquisition remains authoritative; losing a race refunds the unlaunched
+retry. Claims and fresh launch-time checks skip unavailable work and continue
+through the remaining candidates.
 The shared GitHub state service serves a compact projection of open PRs and
 their scoreboard, review claims, newest contest reply, and trusted rebase
 handoff heads. Workers keep the scheduling cascade, budgets, counters, reviewer
