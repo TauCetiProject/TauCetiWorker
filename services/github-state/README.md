@@ -322,6 +322,14 @@ errors retain pagination and retry with exponential delays from one minute to
 one hour. Webhook redelivery auth and transport failures remain retryable while
 other gaps proceed; deleted deliveries trigger one broad repair and are skipped.
 
+The existing cron separately caches Bors promotion receipts from its public,
+read-only candidate journal, at most once per five minutes for TauCeti. This
+never calls GitHub, registers demand or changes merge authority. Receipts bind
+the original approved PR head to the constructed commit and recorded promotion
+to main. `/v1/activity` reads this cache only, allowing squash-merged PRs to count
+as landed even when GitHub describes them as closed. Failed journal reads retain
+last-known receipts and expose the current preparation error.
+
 Daily R2 archives use version-2 manifests and bounded, resumable table pages.
 They record the starting and ending revisions and are observational archives;
 Durable Object point-in-time recovery remains the database backup. Unreferenced

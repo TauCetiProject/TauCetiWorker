@@ -81,12 +81,15 @@ def display(value, default_kinds=()):
     spending_rows = []
     if costs.get("spending"):
         spending = costs["spending"]
-        hours = [spending[w].get("covered_seconds") for w in WINDOWS]
+        hours = [spending[w].get("worker_seconds") for w in WINDOWS]
         spending_rows = [
-            ("API spend ($/hour)", [amount(spending[w].get("usd_per_hour")) for w in WINDOWS]),
+            ("API spend ($/elapsed hour)", [amount(spending[w].get("usd_per_hour")) for w in WINDOWS]),
             (
-                "Hours recorded",
-                ["—" if not seconds else "<0.01" if seconds < 36 else f"{seconds / 3600:.2f}" for seconds in hours],
+                "Worker-hours recorded",
+                [
+                    "—" if seconds is None else "<0.01" if 0 < seconds < 36 else f"{seconds / 3600:.2f}"
+                    for seconds in hours
+                ],
             ),
         ]
     cost_rows = []
@@ -161,9 +164,12 @@ def display(value, default_kinds=()):
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
     print()
-    print(
-        f"Currently: {s['running'] if s['running'] is not None else 'unknown'} rounds running; {s['open_prs']} known open authored PRs; {s['unknown_prs']} PR states unknown; {s['unknown_landings']} closed/merged PRs lack landing evidence"
-    )
+    current = f"Currently: {s['running'] if s['running'] is not None else 'unknown'} rounds running; {s['open_prs']} open authored PRs"
+    if s["unknown_prs"]:
+        current += f"; {s['unknown_prs']} PR states pending"
+    if s.get("unknown_landings"):
+        current += f"; {s['unknown_landings']} merge timestamps pending"
+    print(current)
     if s.get("interrupted_unfinished"):
         print(f"Interrupted without finish receipts: {s['interrupted_unfinished']} (outside finished counts)")
     observed = s.get("pr_observed_at")
@@ -245,8 +251,16 @@ def combine(values):
             # Parallel machines share wall-clock time; neither sum durations nor
             # average their rates. A newly joined host contributes only its costs.
             covered = max((r.get("covered_seconds", 0) for r in rows), default=0)
+            worker_seconds = (
+                sum(r["worker_seconds"] for r in rows)
+                if len(known) == len(values) and all(r.get("worker_seconds") is not None for r in rows)
+                else None
+            )
             s["costs"]["spending"][w] = dict(
-                spent_usd=spent, covered_seconds=covered, usd_per_hour=hourly_rate(spent, covered)
+                spent_usd=spent,
+                covered_seconds=covered,
+                worker_seconds=worker_seconds,
+                usd_per_hour=hourly_rate(spent, covered),
             )
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):

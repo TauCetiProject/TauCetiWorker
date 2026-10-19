@@ -74,3 +74,29 @@ test('LOC uses complete cached files at the exact PR head without scheduling wor
   assert.equal(db.prepare('SELECT COUNT(*) n FROM jobs').get().n,0);
  }finally{db.close();}
 });
+test('background Bors receipt import is shared and rate limited; activity reads never fetch',async()=>{
+ const {db,state}=fixture(),original=globalThis.fetch;
+ try{
+  const head='c'.repeat(40),base='a'.repeat(40),commit='b'.repeat(40);
+  state.setMeta('repository',{name:'TauCetiProject/TauCeti'});
+  const v={schema:'tauceti-bors.candidates/v1',repo:'TauCetiProject/TauCeti',base:'main',timestamp_unit:'unix_microseconds',candidates:[{
+   snapshot:{contract:'tauceti-bors.candidate/v1',base:'main',base_sha:base,members:[{pr:7,head_sha:head}]},
+   events:[{kind:'constructed',details:{commit,base_sha:base}},{kind:'promoted',source:'github.base_push_response',observed_at:1792380591874607,details:{base:'main',base_sha:base,commit}}]
+  }]};
+  let calls=0;
+  globalThis.fetch=async(url)=>{assert.equal(new URL(url).hostname,'bors.taucetiproject.org');calls++;return Response.json(v);};
+  await state.refreshActivityLandings();await state.refreshActivityLandings();assert.equal(calls,1);
+  db.prepare('INSERT INTO resources VALUES (?,?,?,?,?,?,?,0)').run('pr','7','',JSON.stringify({state:'CLOSED',headRefOid:head}),'',Date.now(),1);
+  globalThis.fetch=()=>{throw Error('No network during activity reads');};
+  let result=await (await query(state,[7])).json();
+  assert.equal(result.prs[0].landed_at,'2026-10-19T03:29:51.874Z');
+  assert.equal(result.prs[0].landing_source,'bors-main-push-receipt');
+  db.prepare("UPDATE resources SET data=? WHERE kind='pr' AND id='7'").run(JSON.stringify({state:'CLOSED',headRefOid:'d'.repeat(40)}));
+  result=await (await query(state,[7])).json();assert.equal(result.prs[0].landed_at,null,'different PR heads cannot inherit a landing');
+  state.setMeta('activity_landings_checked',Date.now()-300001);
+  await state.refreshActivityLandings();assert.ok(state.meta('activity_landings_error'));
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM activity_landings').get().n,1,'failures retain receipts');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM demand').get().n,0);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jobs').get().n,0);
+ }finally{globalThis.fetch=original;db.close();}
+});
