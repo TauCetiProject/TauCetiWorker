@@ -13,7 +13,9 @@ tauceti activity --group FLEET_MACHINE_ID
 Finished rounds use their finish receipt in trailing 3-hour, 24-hour, and 7-day
 windows and a recorded-total column. The type is the final selected work unit,
 such as `roadmap`, `review`, `fix`, or `security-audit`; fallback candidates are
-not additional rounds. No-work surveys have their own row. Admission/GitHub
+not additional rounds. All supported round types appear even when their counts
+are zero; the prepared summary publishes the worker taxonomy for other consumers.
+No-work surveys have their own row. Admission/GitHub
 waiting attempts and dry runs are excluded. Failed/interrupted rounds are
 included, with a failure subset (including timeouts). Running rounds and
 processes interrupted without a finish receipt are separate. Discovery of an
@@ -51,7 +53,8 @@ tauceti activity refresh --backfill --history-root /path/to/old/installation
 ```
 
 Historical `resources.jsonl` receipts lack type/outcome information; those counts
-are labelled unknown. New resource receipts carry a lifecycle marker and cannot
+appear as `type unrecorded` and the `outcome unrecorded` subset. The report explains
+this gap; it does not infer missing types from transcripts. New resource receipts carry a lifecycle marker and cannot
 be counted again through backfill. Existing fleet creation journals retain their
 original machine attribution. No transcripts are parsed. Totals mean recorded
 history, not a claim of complete lifetime coverage.
