@@ -877,11 +877,11 @@ export class RepositoryState extends DurableObject<Env> {
   async refreshActivityLandings(): Promise<void> {
     if(this.meta('repository')?.name!=='TauCetiProject/TauCeti') return;
     const now=Date.now();
-    if(this.meta('activity_landings_transport')==='service-binding-v1' && now-(this.meta('activity_landings_checked') || 0)<300000) return;
+    if(this.meta('activity_landings_transport')==='service-binding-v2' && now-(this.meta('activity_landings_checked') || 0)<300000) return;
     // Reserve the interval before yielding so overlapping cron requests cannot
     // multiply reads. This path never calls configure, demand or the scheduler.
     this.setMeta('activity_landings_checked',now);
-    this.setMeta('activity_landings_transport','service-binding-v1');
+    this.setMeta('activity_landings_transport','service-binding-v2');
     try {
       const receipts=await readPromotionReceipts((url,options)=>this.env.BORS_ACTIVITY.fetch(url,options));
       for(const r of receipts) this.ctx.storage.sql.exec('INSERT INTO activity_landings VALUES(?,?,?,?) ON CONFLICT(number,head) DO UPDATE SET at=excluded.at,source=excluded.source WHERE excluded.at<activity_landings.at',r.number,r.head,r.at,r.source);
