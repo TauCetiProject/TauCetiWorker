@@ -256,7 +256,12 @@ class SharedTests(unittest.TestCase):
                 child.stdin.close()
                 child.wait(timeout=5)
                 child.stdout.close()
-        self.assertEqual(s.collect(self.pool), ["leased"])
+        # bwrap's namespace monitor can close its retained descriptor just
+        # after the outer process exits. GC skips it until that cleanup finishes.
+        deadline = time.monotonic() + 5
+        while not (removed := s.collect(self.pool)) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(removed, ["leased"])
 
     def test_toolchain_split_artifacts_must_all_be_present(self):
         (self.library / "Init.olean.server").write_bytes(b"toolchain format")
