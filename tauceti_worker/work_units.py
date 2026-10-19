@@ -344,20 +344,18 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # credential mirror.
     if not opts.dry_run:
         mirror_creds(w.cfg)
+    global_pick = False
+    scope = roadmap_only()
     if opts.only and set(opts.only) <= {"overlap-scan", "overlap-fix"}:
         from .overlaps import survey_overlaps
 
         sv = Survey(worker_id=w.cfg.wid)
         survey_overlaps(w.cfg, w.gh, sv, repair="overlap-fix" in opts.only)
     else:
-        scope = roadmap_only()
         if getattr(opts, "prs", ()):
             scope = "any"  # explicit targets override the ambient roadmap
-        elif scope is None and not opts.dry_run and want(opts.only, "roadmap"):
-            all_areas = roadmap_areas(w.gh)
-            areas = [area for area in all_areas if area not in roadmap_skip()]
-            scope = random.choice(areas) if areas else ("auto" if all_areas else "any")
-            log(f"survey roadmap: {scope} (selected before PR history reads)")
+        else:
+            global_pick = scope in (None, "", "auto", "any")
         sv = survey(
             w.cfg,
             w.gh,
@@ -365,9 +363,12 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             w.counters,
             deep=True,
             stages=[stage for stage in round_stages(opts) if want(opts.only, stage)],
-            selected_roadmap=scope,
+            selected_roadmap=("auto" if scope is None else scope),
             numbers=getattr(opts, "prs", ()),
-            count_all_roadmaps=roadmap_only() is None,
+            count_all_roadmaps=global_pick,
+            # An expanded scan must not create per-PR hydration demand or
+            # silently fall back to thousands of direct comment requests.
+            cached_only=global_pick and bool(os.environ.get("TAUCETI_GITHUB_STATE_URL")),
         )
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
@@ -430,6 +431,12 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         reason = f"its review has errored {n_err} times without completing a review"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
+    if global_pick:
+        counts = ", ".join(
+            f"{stage}={len(sv.kind(stage).actionable)}" for stage in round_stages(opts) if want(opts.only, stage)
+        )
+        log(f"Global PR work: {counts}; {sv.discovery_gaps} PR(s) need cached history")
+
     # Spread concurrent workers across different branch-writing work: shuffle each non-review stage so
     # workers starting together don't all pick the lowest-numbered PR and spend a branch-claim round-trip
     # discovering the clash. Reviews get their affinity + age-weighted order below. This only reorders
@@ -437,7 +444,12 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     for stage in round_stages(opts):
         if stage in ("review", "overlap-scan", "overlap-fix"):
             continue
-        sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
+        # PR numbers are creation ordered within the repository. Prefer older
+        # maintenance globally; existing claims skip peers' work in the cascade.
+        candidates = sv.kind(stage).actionable
+        sv.kind(stage).actionable = (
+            sorted(candidates, key=lambda c: c.pr) if global_pick else spread_candidates(candidates)
+        )
 
     # The undocumented review throttles, off unless an expert asked for them. Applied here rather than
     # in survey() so they steer only what this round PICKS: the survey (and so `status`, the dashboard,
@@ -480,6 +492,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if not want(opts.only, stage):
             continue
         for c in sv.kind(stage).actionable:
+            if global_pick and c.pr:
+                p = next((p for p in sv.open_prs if p.number == c.pr), None)
+                areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
+                log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
             rc = dispatch(stage, w, sv, c, opts)
             if rc is not None:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
@@ -488,11 +504,23 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
+        if sv.discovery_gaps:
+            raise NoProgress(
+                f"global maintenance: {sv.discovery_gaps} PR(s) need cached history — "
+                "not assuming the backlog is empty or starting new authoring"
+            )
         if sv.roadmap_backpressure:
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
                 f"(>= {sv.max_open_prs}) — backpressure, not authoring"
             )
+        if global_pick:
+            log("No available maintenance or reviews; proceeding to roadmap authoring")
+            if scope in (None, "auto") and not opts.dry_run:
+                all_areas = roadmap_areas(w.gh)
+                areas = [area for area in all_areas if area not in roadmap_skip()]
+                sv.roadmap_only = random.choice(areas) if areas else ("auto" if all_areas else "any")
+                log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
             return rc

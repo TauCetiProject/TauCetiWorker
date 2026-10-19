@@ -52,6 +52,7 @@ RUN_STDLIB=(
   github_state_rollout.py
   github_state_reconciliation.py
   github_outbox.py
+  global_maintenance.py
   github_pause.py
   host_agent_preflight.py
   host_build_cache.py

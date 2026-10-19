@@ -1,7 +1,10 @@
 # Compact roadmap surveys
 
-Each work round selects its roadmap before querying PR histories. The shared
-GitHub state service serves a compact projection of the relevant open PRs and
+Automatic work rounds consider existing PR maintenance and reviews across all
+non-skipped roadmaps before choosing an area for new authoring. Within each
+maintenance stage, older PR numbers come first; claims and fresh launch-time
+checks skip unavailable work and continue through the remaining candidates.
+The shared GitHub state service serves a compact projection of open PRs and
 their scoreboard, review claims, newest contest reply, and trusted rebase
 handoff heads. Workers keep the scheduling cascade, budgets, counters, reviewer
 affinity, and task selection. No model work or GitHub writes happen on the server.
@@ -10,9 +13,11 @@ affinity, and task selection. No model work or GitHub writes happen on the serve
 
 `survey` is a normal authenticated `/v1/query` operation. Its arguments are
 `roadmap`, comma-separated `skip`, and optional comma-separated PR `numbers`.
-An explicit worker `--pr` overrides the ambient roadmap. Unrestricted authoring
-selects an area once and passes that same area to subsequent authoring. Status
-and dashboard calls retain their existing full inventory view.
+An explicit worker `--pr` overrides the ambient roadmap. An explicit concrete
+`--roadmap-only` retains its scope, and task restrictions retain their meaning.
+Unrestricted rounds select an authoring area only after the existing-work cascade
+finds no available candidate. Status and dashboard calls retain their existing
+full inventory view.
 Automatic authoring limits still count all non-skipped roadmap PRs by that
 identity. The service supplies small inventory-wide author counts alongside the
 scoped rows; other roadmaps' histories are not fetched for this count.
@@ -26,7 +31,17 @@ do not inspect their histories.
 Each row carries `tauceti-survey-facts/v1`, compact PR metadata, and independent
 `issue_complete` and `review_complete` flags. The envelope's complete coverage
 means the open PR inventory is complete. Per-row history flags determine which
-facts can replace full histories. A missing scoreboard in a complete issue
+facts can replace full histories. Global automatic discovery requests `stages=""`
+so the broader scan creates no per-PR history hydration demand. Only completely
+cached histories enter review/fix classification; contest reaction claims are
+checked for the selected candidate at dispatch. Missing necessary coverage is
+reported and prevents new authoring, while known actionable work can proceed.
+The configured shared service becoming unavailable pauses global discovery;
+it never triggers a bulk direct-history fallback. Explicitly scoped rounds keep
+the existing fallback, and installations without a shared service continue to
+use the direct facade and its existing transport budgets.
+
+A missing scoreboard in a complete issue
 history means absence; missing issue coverage uses the existing comment reader.
 Partial review coverage similarly uses the existing contest reader. Claim expiry
 is checked against the worker clock and the exact head, never against projection
@@ -34,9 +49,9 @@ time. Existing targeted checks and post-write cache invalidation discard the
 survey seed for that PR.
 
 Clients always request the latest available projection. Age does not trigger an
-extra upstream read. Outage, authentication failure, unsupported operation, or
-incompatible/malformed contract uses the existing direct survey and comment
-facade. It applies the same roadmap filtering before reading histories, and
+extra upstream read. For explicitly scoped rounds, outage, authentication
+failure, unsupported operation, or incompatible/malformed contract uses the
+existing direct survey and comment facade. It applies the same roadmap filtering before reading histories, and
 retains the existing REST/GraphQL accounting and quota recovery paths. An empty
 successful survey is distinct from an unavailable service.
 

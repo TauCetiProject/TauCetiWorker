@@ -326,6 +326,7 @@ class Survey:
     max_open_prs: int = field(default_factory=configured_max_open_prs)
     next_auto_stage: str | None = None
     github_failed: bool = False
+    discovery_gaps: int = 0  # cached histories needed before ruling out global maintenance
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
@@ -658,6 +659,7 @@ def survey(
     selected_roadmap=None,
     numbers=(),
     count_all_roadmaps=False,
+    cached_only=False,
 ) -> Survey:
     """Classify relevant open PRs per enabled work-kind, without writes or model work.
 
@@ -669,8 +671,8 @@ def survey(
     began = time.monotonic()
     _f = selected_roadmap if selected_roadmap is not None else roadmap_only()
     enabled = set(AUTO_STAGES if stages is None else stages)
-    # Authoring rounds pass their selected area before any history reads; status
-    # and dashboard calls keep "auto" stable rather than randomly changing scope.
+    # Automatic rounds discover existing work across all areas. Explicit scopes
+    # still filter before history reads; authoring chooses its area after maintenance.
     sv = Survey(
         worker_id=cfg.wid,
         roadmap_only=("auto" if _f is None else (_f or "any")),
@@ -683,10 +685,20 @@ def survey(
         from .github_state import read_survey
 
         available, compact = (
-            read_survey(gh.repo, sv.roadmap_only, sv.roadmap_skip, numbers=numbers, stages=sorted(enabled))
+            read_survey(
+                gh.repo,
+                sv.roadmap_only,
+                sv.roadmap_skip,
+                numbers=numbers,
+                stages=[] if cached_only else sorted(enabled),
+            )
             if deep and hasattr(gh, "repo")
             else (False, [])
         )
+        if cached_only and not available:
+            sv.github_failed = True
+            sv.errors.append("global maintenance cache unavailable; waiting for the shared GitHub state service")
+            return sv
         raw = [row["pr"] for row in compact] if available else gh.open_prs()
         if available and seed:
             seed(compact)
@@ -741,6 +753,18 @@ def survey(
     tended = [
         p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
     ]
+    facts = {row["pr"]["number"]: row["review"] for row in compact or []}
+    gaps: set[int] = set()
+
+    def history_ready(p):
+        if not cached_only:
+            return True
+        covered = facts.get(p.number, {})
+        ready = covered.get("issue_complete") and covered.get("review_complete")
+        if not ready:
+            gaps.add(p.number)
+        return ready
+
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv._mine_open_prs = mine
@@ -767,6 +791,14 @@ def survey(
         foreign = p in foreign_repairs
         labels = {label.lower() for label in p.labels}
         if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
+            continue
+        if (
+            cached_only
+            and p.mergeable != "CONFLICTING"
+            and "needs-rebase" in labels
+            and not facts.get(p.number, {}).get("issue_complete")
+        ):
+            gaps.add(p.number)
             continue
         handoff = foreign or (
             p.mergeable != "CONFLICTING"
@@ -837,6 +869,8 @@ def survey(
                 Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
             )
             continue
+        if not history_ready(p):
+            continue
         m = rs.gh_meta(p.number)
         if rs.ledger_clean_head(p.number) != p.head_oid:
             # normal review path: the head moved or the last round errored.
@@ -879,7 +913,9 @@ def survey(
         # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
         # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
         # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
-        age = gh.fresh_claim_age(reply["id"])
+        # Global discovery never reads reactions for every contest. Dispatch
+        # rechecks the selected reply's claim immediately before launching.
+        age = None if cached_only else gh.fresh_claim_age(reply["id"])
         if age is not None and age < CONTEST_CLAIM_TTL:
             continue
         rubric = reply["rubric"]
@@ -911,6 +947,8 @@ def survey(
         #    green, attempts spent) so a fix-focused worker explains its idleness instead of a bare
         #    "no eligible work" — reviews are async, so a one-shot fix run can precede the scoreboard.
         for p in tended:
+            if cached_only and (not p.build_success or not history_ready(p)):
+                continue
             meta = rs.gh_meta(p.number)
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
@@ -1019,6 +1057,7 @@ def survey(
         from .overlaps import survey_overlaps
 
         survey_overlaps(cfg, gh, sv)
+    sv.discovery_gaps = len(gaps)
     sv.next_auto_stage = _next_auto_stage(sv)
     if deep:
         from .github_transport import event
@@ -1042,6 +1081,6 @@ def _next_auto_stage(sv: Survey) -> str | None:
     for stage in AUTO_STAGES:
         if sv.kind(stage).actionable:
             return stage
-    if not sv.roadmap_backpressure:
+    if not sv.roadmap_backpressure and not sv.discovery_gaps:
         return "roadmap"
     return None
