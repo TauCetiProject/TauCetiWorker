@@ -172,6 +172,15 @@ def _connect():
         state TEXT,landed REAL,observed REAL,checked REAL,head TEXT,source TEXT,PRIMARY KEY(repo,number));
       CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY,inode INTEGER,offset INTEGER);
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
+      CREATE TRIGGER IF NOT EXISTS activity_round_history_cutoff BEFORE INSERT ON rounds
+        WHEN NEW.id LIKE 'resource:%' AND EXISTS(SELECT 1 FROM meta WHERE key='history_cutoff')
+        BEGIN SELECT RAISE(IGNORE); END;
+      CREATE TRIGGER IF NOT EXISTS activity_pr_history_cutoff BEFORE INSERT ON prs
+        WHEN NEW.created < (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')
+        BEGIN SELECT RAISE(IGNORE); END;
+      CREATE TRIGGER IF NOT EXISTS activity_pr_history_cutoff_update AFTER UPDATE OF created ON prs
+        WHEN NEW.created < (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')
+        BEGIN DELETE FROM prs WHERE repo=NEW.repo AND number=NEW.number; END;
     """)
     return db
 
@@ -179,6 +188,11 @@ def _connect():
 def _ingest(db, e):
     if e.get("version") != 1 or not isinstance(e.get("at"), (int, float)):
         raise ValueError("invalid activity receipt")
+    if e.get("round_id", "").startswith("resource:"):
+        return
+    cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
+    if cutoff and e["at"] < cutoff[0]:
+        return
     if not db.execute("INSERT OR IGNORE INTO events VALUES (?)", (e["id"],)).rowcount:
         return
     kind, worker, scope = e["kind"], e.get("worker", "unknown"), e.get("group", e.get("machine_id", "local"))
@@ -253,43 +267,30 @@ def backfill_file(db, path, convert):
 
 
 def backfill(db, history_roots=()):
-    from .paths import HERE
-
-    def resource(row):
-        r = row["round"]
-        if r.get("activity_id") or r.get("activity_schema"):
-            return []  # Already recorded by the activity lifecycle; never double-count.
-        rid = r["id"]
-        # The old resource receipt has no work type or success status.
-        wid = row["worker_id"]
-        machine = os.environ.get("TAUCETI_FLEET_MACHINE_ID") or read_json(
-            Path.home() / ".config/tauceti-fleet/host.json"
-        ).get("machine_id")
-        scope = machine if machine and wid.startswith("fleet-" + machine[:8] + "-") else "local"
-        return [
-            dict(
-                version=1,
-                id="resource:" + rid,
-                at=row["sampled_at"],
-                kind="round_finished",
-                round_id="resource:" + rid,
-                worker=wid,
-                group=scope,
-                round_type="unknown",
-                outcome="unknown",
-            )
-        ]
-
-    paths = {Path(row[0]) for row in db.execute("SELECT path FROM cursors")}
-    for directory in (HERE, *history_roots):
-        paths.update((Path(directory) / "logs").glob("*/resources.jsonl"))
-    path = Path(os.environ.get("TAUCETI_FLEET_EVENTS", Path.home() / ".local/state/tauceti-fleet/worker-events.jsonl"))
-    paths.add(path)
+    # Resource logs predate typed activity recording and are intentionally ignored.
+    # Keep history_roots accepted for callers using the former backfill interface.
+    paths = {Path(row[0]) for row in db.execute("SELECT path FROM cursors") if Path(row[0]).name != "resources.jsonl"}
+    paths.add(
+        Path(os.environ.get("TAUCETI_FLEET_EVENTS", Path.home() / ".local/state/tauceti-fleet/worker-events.jsonl"))
+    )
     for path in sorted(paths):
-        converter = (
-            resource if path.name == "resources.jsonl" else lambda e: [e] if e.get("kind") == "pr_created" else []
-        )
-        backfill_file(db, path, converter)
+        backfill_file(db, path, lambda e: [e] if e.get("kind") == "pr_created" else [])
+
+
+def _clean_history(db):
+    # Pin the start once, using the first native lifecycle receipt. Preserve event
+    # deduplication tombstones so replaying a journal cannot restore discarded facts.
+    db.execute("""
+      INSERT OR IGNORE INTO meta(key,value)
+      SELECT 'history_cutoff', MIN(COALESCE(started,finished)) FROM rounds
+      WHERE id NOT LIKE 'resource:%' HAVING MIN(COALESCE(started,finished)) IS NOT NULL
+    """)
+    db.execute("DELETE FROM rounds WHERE id LIKE 'resource:%'")
+    cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
+    if cutoff:
+        db.execute("DELETE FROM rounds WHERE COALESCE(started,finished) < ?", (cutoff[0],))
+        db.execute("DELETE FROM prs WHERE created < ?", (cutoff[0],))
+    db.execute("DELETE FROM cursors WHERE path LIKE '%/resources.jsonl'")
 
 
 def _epoch(value):
@@ -503,14 +504,14 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
         with contextlib.closing(_connect()) as db:
             errors = []
             with db:
-                # Once registered, old structured files continue to be tailed by
-                # offset during a gradual runtime upgrade. No transcript parsing.
+                # Follow registered PR journals by offset; resource logs are excluded.
                 if import_history or db.execute("SELECT 1 FROM cursors LIMIT 1").fetchone():
                     try:
                         backfill(db, history_roots)
                     except (OSError, ValueError, KeyError):
-                        errors.append("Historical activity receipt is unreadable; imported history may be incomplete")
+                        errors.append("PR creation receipt is unreadable")
                 _consume(db, errors)
+                _clean_history(db)
                 _refresh_prs(db, config, now, errors)
                 _bors(db, errors)
             value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
@@ -559,7 +560,7 @@ def display(value):
         if s["history_since"]
         else "no recorded history"
     )
-    print("Recorded history begins: " + since + "; totals cover recorded activity only")
+    print("Activity since: " + since)
     observed_kinds = {kind for rows in s["rounds"].values() for kind in rows}
     kinds = list(dict.fromkeys(s.get("round_types", ROUND_TYPES)))
     kinds += sorted(observed_kinds - set(kinds))
@@ -571,14 +572,8 @@ def display(value):
             else s["rounds"][w].get(kind, {}).get("finished", 0)
             for w in WINDOWS
         ]
-        label = "type unrecorded" if kind == "unknown" else kind
-        rows.append(("  " + label, counts))
+        rows.append(("  " + kind, counts))
     rows.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in WINDOWS]))
-    unknown_outcomes = any(r.get("unknown") for rs in s["rounds"].values() for r in rs.values())
-    if unknown_outcomes:
-        rows.append(
-            ("    outcome unrecorded", [sum(r.get("unknown", 0) for r in s["rounds"][w].values()) for w in WINDOWS])
-        )
     for key, label in (("authored", "PRs authored"), ("landed", "Authored PRs landed")):
         rows.append((label, [s["pr_windows"][w][key] for w in WINDOWS]))
     headers = ("3h", "24h", "7d", "Recorded total")
@@ -594,8 +589,6 @@ def display(value):
             + "  ".join(f"{count:>{width}}" for count, width in zip(counts, widths, strict=True))
         )
     print("Outcome rows are subsets of finished rounds.")
-    if "unknown" in observed_kinds or unknown_outcomes:
-        print("Older resource logs did not record round types or outcomes; these receipts cannot supply them.")
     print(
         f"Currently: {s['running'] if s['running'] is not None else 'unknown'} rounds running; {s['open_prs']} known open authored PRs; {s['unknown_prs']} PR states unknown; {s['unknown_landings']} closed/merged PRs lack landing evidence"
     )
