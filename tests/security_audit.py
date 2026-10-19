@@ -1648,6 +1648,27 @@ class CompactingInspection(unittest.TestCase):
         for key, value in sa.inspection_profile().items():
             self.assertEqual(execution[key], value)
 
+    def test_haiku_does_not_receive_codex_only_continuation_instructions(self):
+        (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"provider-only"}}')
+
+        def model(argv, **kwargs):
+            schema = json.loads(argv[argv.index("--json-schema") + 1])
+            self.assertNotIn("unfinished", schema["properties"]["verdict"]["enum"])
+            self.assertNotIn("persistent goal", kwargs["input"])
+            self.assertNotIn('return verdict "unfinished"', kwargs["input"])
+            answer = {
+                "type": "result",
+                "subtype": "success",
+                "structured_output": {"verdict": "finding", "findings": ["IO"], "read_token": "unused"},
+            }
+            return SimpleNamespace(returncode=0, stdout=sa.serialize(answer), stderr="")
+
+        with (
+            patch.object(sa, "claude_dir", return_value=self.work),
+            patch.object(sa.subprocess, "run", side_effect=model),
+        ):
+            self.assertEqual(sa.inspect(self.batch, "claude", self.work)["verdict"], "finding")
+
     def test_claude_trace_rejects_other_tools_and_unreadable_inline_compaction(self):
         (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"provider-only"}}')
         cases = [

@@ -1072,7 +1072,8 @@ def inspect(
         if not dest.is_file():
             raise Die("security-audit: no usable subscription access token available")
         dest.chmod(0o600)
-        prompt = inspection_prompt(batch, False, goals=provider == "codex")
+        policy = MODEL_PROMPT if provider == "codex" else V2_MODEL_PROMPT
+        prompt = inspection_prompt(batch, False, policy=policy, goals=provider == "codex")
         schema_value = MODEL_SCHEMA
         receipt = (work / "read-receipt.json").resolve()
         if provider == "codex":
@@ -1096,7 +1097,9 @@ def inspect(
                     "read_token": {"type": "string"},
                     "verdict": {
                         **MODEL_SCHEMA["properties"]["verdict"],
-                        "enum": [*MODEL_SCHEMA["properties"]["verdict"]["enum"], "unfinished"],
+                        "enum": [*MODEL_SCHEMA["properties"]["verdict"]["enum"], "unfinished"]
+                        if provider == "codex"
+                        else MODEL_SCHEMA["properties"]["verdict"]["enum"],
                     },
                 },
             }
@@ -1104,7 +1107,7 @@ def inspect(
             source.write_text(serialize(batch))
             token = secrets.token_hex(16)
             reader = [str(Path(__file__).with_name("audit_reader.py").resolve()), str(source), str(receipt), token]
-            prompt = inspection_prompt(batch, True, token, goals=provider == "codex")
+            prompt = inspection_prompt(batch, True, token, policy=policy, goals=provider == "codex")
             if resume_from is not None:
                 prompt = CONTINUE_PROMPT + prompt
             if provider == "claude":
