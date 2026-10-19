@@ -132,6 +132,9 @@ class Reader:
             # token that could acknowledge unseen content. A stale request does
             # not mark its requested page read or advance to a new page.
             page = self.last_page if self.last_page is not None else 0
+        next_unread = next((i for i in range(len(self.pages)) if i not in self.seen), None)
+        if page not in self.seen and page != next_unread:
+            raise ValueError(f"Read the next unread page {next_unread}; later pages cannot be skipped to")
         self.seen.add(page)
         self.last_page = page
         self.token = secrets.token_hex(16)
@@ -158,6 +161,8 @@ class Reader:
                 "commits": self.commits,
                 "sections": self.pages[page],
                 "replayed": replayed,
+                "next_unread_page": next((i for i in range(len(self.pages)) if i not in self.seen), None),
+                "remaining_pages": len(self.pages) - len(self.seen),
                 "next_token": self.token,
             },
             ensure_ascii=False,
