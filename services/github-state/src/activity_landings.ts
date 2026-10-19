@@ -20,9 +20,9 @@ export function promotionReceipts(value:any) {
   return receipts;
 }
 
-export async function readPromotionReceipts() {
-  const response=await fetch(BORS_RECEIPTS,{redirect:'error',signal:AbortSignal.timeout(5000),headers:{'User-Agent':'TauCetiGitHubState/1.0','Accept':'application/json'}});
-  if(!response.ok || !response.body) throw new Error('Bors receipts unavailable');
+export async function readPromotionReceipts(fetcher:typeof fetch=fetch) {
+  const response=await fetcher(BORS_RECEIPTS,{method:'GET',redirect:'manual',signal:AbortSignal.timeout(5000),headers:{'User-Agent':'TauCetiGitHubState/1.0','Accept':'application/json'}});
+  if(response.status!==200 || !response.body) throw new Error('Bors receipts HTTP '+response.status);
   const reader=response.body.getReader(),chunks=[];
   let size=0;
   try {
