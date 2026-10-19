@@ -461,15 +461,20 @@ def _summary(db, now, column=None, identity=None):
         )
         for label, seconds in WINDOWS.items()
     }
+    native_since = db.execute(f"SELECT MIN(started) FROM rounds {where}", args).fetchone()[0]
     return dict(
         prepared_at=now,
         history_since=since,
         rounds=rounds,
         pr_windows=pr_windows,
-        running=db.execute(
-            f"SELECT COUNT(*) FROM rounds {where} {'AND' if where else 'WHERE'} finished IS NULL AND outcome IS NULL",
-            args,
-        ).fetchone()[0],
+        running=(
+            db.execute(
+                f"SELECT COUNT(*) FROM rounds {where} {'AND' if where else 'WHERE'} finished IS NULL AND outcome IS NULL",
+                args,
+            ).fetchone()[0]
+            if native_since is not None
+            else None
+        ),
         interrupted_unfinished=db.execute(
             f"SELECT COUNT(*) FROM rounds {where} {'AND' if where else 'WHERE'} outcome='interrupted-unfinished'", args
         ).fetchone()[0],
@@ -574,7 +579,7 @@ def display(value):
     for key, label in (("authored", "PRs authored"), ("landed", "Authored PRs landed")):
         print(f"{label:25}" + "".join(f"{s['pr_windows'][w][key]:7}" for w in WINDOWS))
     print(
-        f"Currently: {s['running']} rounds running; {s['open_prs']} authored PRs open; {s['unknown_prs']} PR states unknown; {s['unknown_landings']} closed/merged PRs lack landing evidence"
+        f"Currently: {s['running'] if s['running'] is not None else 'unknown'} rounds running; {s['open_prs']} known open authored PRs; {s['unknown_prs']} PR states unknown; {s['unknown_landings']} closed/merged PRs lack landing evidence"
     )
     if s["interrupted_unfinished"]:
         print(f"Interrupted without a finish receipt: {s['interrupted_unfinished']} (excluded from time-window counts)")
