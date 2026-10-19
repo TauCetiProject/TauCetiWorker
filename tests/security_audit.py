@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
+from tauceti_worker import audit_progress as progress
 from tauceti_worker import audit_reader as ar
 from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import cli
@@ -21,6 +23,32 @@ from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
 from tauceti_worker.work_units import want
+
+
+def append_native(home, answer, thread="11111111-2222-4333-8444-555555555555"):
+    sessions = home / ".codex/sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    files = list(sessions.rglob("*.jsonl"))
+    if not files:
+        path = sessions / "rollout.jsonl"
+        path.write_text(sa.serialize({"type": "session_meta", "payload": {"id": thread}}) + "\n")
+    else:
+        path = files[0]
+    with path.open("a") as native:
+        native.write(
+            sa.serialize(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "role": "assistant",
+                        "type": "message",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": sa.serialize(answer)}],
+                    },
+                }
+            )
+            + "\n"
+        )
 
 
 class WorkerBoundJudgments(unittest.TestCase):
@@ -83,7 +111,7 @@ class WorkerBoundJudgments(unittest.TestCase):
             mock.start()
             self.addCleanup(mock.stop)
 
-    def evidence(self, *, legacy=False, verdict="pass", findings=None, service=False, original=None):
+    def evidence(self, *, legacy=False, version2=False, verdict="pass", findings=None, service=False, original=None):
         a = original or self.original
         a.mkdir(exist_ok=True)
         (a / "input.json").write_text(sa.serialize(self.batch))
@@ -97,22 +125,40 @@ class WorkerBoundJudgments(unittest.TestCase):
             answer["commits"][0] = "21741c90ab8f06c06e120e85d3bf2ee63a008c"
             answer["read_token"] = reader.token
         home = a / "home"
-        prompt = sa.inspection_prompt(self.batch, True, "f" * 32, policy=sa.PROMPT if legacy else sa.MODEL_PROMPT)
+        prompt = sa.inspection_prompt(
+            self.batch,
+            True,
+            "f" * 32,
+            policy=sa.PROMPT if legacy else sa.V2_MODEL_PROMPT if version2 else sa.MODEL_PROMPT,
+            goals=not (legacy or version2),
+        )
         execution = {
-            **(recovery.V1_PROFILE if legacy else sa.inspection_profile()),
-            "argv": sa.codex_launch(home, True, "f" * 32, receipt=None if legacy else a / "read-receipt.json"),
-            "environment": {"HOME": str(home)},
+            **(recovery.V1_PROFILE if legacy else recovery.V2_PROFILE if version2 else sa.inspection_profile()),
+            "argv": sa.codex_launch(
+                home,
+                True,
+                "f" * 32,
+                receipt=None if legacy else a / "read-receipt.json",
+                goals=not (legacy or version2),
+            ),
+            "environment": {"HOME": str(home), "CODEX_SQLITE_HOME": str(sa.goal_state(a, self.batch))},
             "paged": True,
             "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
         }
         if not legacy:
             execution.update(
-                protocol_version=2,
+                protocol_version=2 if version2 else sa.PROTOCOL_VERSION,
                 batch_identity={
                     "input_digest": self.batch["input_digest"],
                     "commits": [c["sha"] for c in self.batch["commits"]],
                 },
             )
+        if legacy or version2:
+            for i, arg in enumerate(execution["argv"]):
+                if arg.startswith("mcp_servers.audit.args="):
+                    args = json.loads(arg.split("=", 1)[1])
+                    args[1] = str(Path(__file__).parent.resolve() / "fixtures/audit_reader_v2.py")
+                    execution["argv"][i] = "mcp_servers.audit.args=" + json.dumps(args)
         (a / "execution.json").write_text(sa.serialize(execution))
         (a / "prompt.txt").write_text(prompt)
         native = [{"type": "session_meta", "payload": {"id": self.thread}}]
@@ -382,6 +428,293 @@ class WorkerBoundJudgments(unittest.TestCase):
         ):
             self.assertTrue(recovery.recover(self.cfg, opts, self.block))
         quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=True, fresh=True)
+
+    def replace_answer(self, value):
+        native = self.original / "model-rollout-0.jsonl"
+        rows = [json.loads(line) for line in native.read_text().splitlines()]
+        rows[-1]["payload"]["content"][0]["text"] = sa.serialize(value)
+        native.write_text("\n".join(map(sa.serialize, rows)) + "\n")
+        events = [
+            {"type": "thread.started", "thread_id": self.thread},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+            {"type": "turn.completed"},
+        ]
+        (self.original / "model-transcript.jsonl").write_text("\n".join(map(sa.serialize, events)))
+
+    def unfinished_evidence(self, *, version2=False, large=False):
+        if large:
+            file = self.batch["commits"][0]["files"][0]
+            file.update(before="", diff="", after="x" * (4 * 1024 * 1024))
+            lo, hi = 0, len(file["after"])
+            while lo < hi:
+                mid = (lo + hi) // 2
+                file["after"] = "x" * mid
+                if len(ar.pages(self.batch)) < 43:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            file["after"] = "x" * lo
+            self.assertEqual(len(ar.pages(self.batch)), 43)
+            self.batch["input_digest"] = hashlib.sha256(
+                sa.serialize({k: v for k, v in self.batch.items() if k != "input_digest"}).encode()
+            ).hexdigest()
+        self.evidence(version2=version2)
+        receipt = self.original / "read-receipt.json"
+        proof = json.loads(receipt.read_text())
+        proof["read"] = [0, 1, 2, 3, 4, 5, 6, 41, 42] if large else [0]
+        proof["last_page"] = 6 if large else 0
+        receipt.write_text(sa.serialize(proof))
+        missing = progress.coverage(self.batch, receipt)["missing"]
+        value = {"verdict": "unfinished", "findings": [], "read_token": proof["last_token"]}
+        if version2:
+            value.update(
+                verdict="incomplete",
+                findings=[
+                    f"Commit 1: inspection is incomplete. Pages {missing[0]}–{missing[-1]} have not been reviewed, "
+                    "so the safety of all changed source files cannot be established."
+                ],
+            )
+        self.replace_answer(value)
+        if version2:
+            verdict = sa.bind_verdict({k: v for k, v in value.items() if k != "read_token"}, self.batch)
+            sa.record(self.work / "ledger.jsonl", {"batch": self.batch["input_digest"], "verdict": verdict})
+        return value
+
+    def test_43_page_legacy_coverage_stop_migrates_without_approval_or_lost_evidence(self):
+        value = self.unfinished_evidence(version2=True, large=True)
+        a, batch, execution, legacy = recovery.retained(self.work, self.block)
+        self.assertFalse(legacy)
+        self.assertEqual(execution["_allowed_history"], [sa.serialize(value)])
+        old = (a / "model-transcript.jsonl").read_bytes()
+        with (
+            patch.object(sa, "inspect", side_effect=OSError("network failure")) as model,
+            patch.object(sa, "advance") as advance,
+            self.assertRaises(NoProgress),
+        ):
+            recovery.recover(self.cfg, self.opts, self.block)
+        self.assertTrue(model.call_args.kwargs["continue_reading"])
+        self.assertEqual(model.call_args.kwargs["resume_from"], a)
+        self.assertEqual(model.call_args.kwargs["allowed_history"], [sa.serialize(value)])
+        advance.assert_not_called()
+        self.assertEqual((a / "model-transcript.jsonl").read_bytes(), old)
+
+    def test_unfinished_and_premature_pass_continue_but_never_bind_as_approval(self):
+        value = self.unfinished_evidence()
+        for verdict in ("unfinished", "pass"):
+            value["verdict"] = verdict
+            self.replace_answer(value)
+            self.assertTrue(
+                progress.continuable(
+                    (self.original / "model-transcript.jsonl").read_text(),
+                    self.batch,
+                    self.original / "read-receipt.json",
+                    self.original,
+                )
+            )
+        with patch.object(sa, "inspect", side_effect=OSError("retry later")), patch.object(sa, "advance") as advance:
+            with self.assertRaises(NoProgress):
+                recovery.recover(self.cfg, self.opts, self.block)
+        advance.assert_not_called()
+        self.assertTrue((self.work / "blocked.json").exists())
+
+    def test_unfinished_with_source_concern_and_inspected_code_uncertainty_are_held(self):
+        for verdict in ("finding", "incomplete", "unfinished"):
+            value = self.unfinished_evidence()
+            value.update(verdict=verdict, findings=["Macro may perform IO"])
+            self.replace_answer(value)
+            with patch.object(sa, "inspect") as model:
+                self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+            model.assert_not_called()
+
+    def test_coverage_diagnostic_requires_matching_gaps_token_native_and_known_profile(self):
+        value = self.unfinished_evidence(version2=True)
+        original_receipt = (self.original / "read-receipt.json").read_bytes()
+        for change in ({"read": []}, {"input_digest": "other"}, {"last_token": "other"}):
+            (self.original / "read-receipt.json").write_text(sa.serialize({**json.loads(original_receipt), **change}))
+            with self.assertRaises(Die):
+                recovery.retained(self.work, self.block)
+        (self.original / "read-receipt.json").write_bytes(original_receipt)
+        value["findings"].append("Uncertain initializer")
+        self.replace_answer(value)
+        with self.assertRaises(Die):
+            recovery.retained(self.work, self.block)
+
+    def test_stopped_turn_without_final_answer_continues_with_preserved_native_history(self):
+        self.unfinished_evidence()
+        p = self.original / "model-transcript.jsonl"
+        p.write_text(sa.serialize({"type": "turn.completed"}) + "\n")
+        with patch.object(sa, "inspect", side_effect=OSError("retry later")) as model, self.assertRaises(NoProgress):
+            recovery.recover(self.cfg, self.opts, self.block)
+        self.assertTrue(model.call_args.kwargs["continue_reading"])
+
+    def test_finding_before_an_unfinished_or_missing_final_is_binding(self):
+        self.unfinished_evidence()
+        p = self.original / "model-rollout-0.jsonl"
+        rows = p.read_text().splitlines()
+        finding = json.loads(rows[-1])
+        finding["payload"]["content"][0]["text"] = sa.serialize(
+            {"verdict": "finding", "findings": ["IO"], "read_token": "token"}
+        )
+        p.write_text("\n".join([rows[0], sa.serialize(finding), rows[-1]]) + "\n")
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+
+    def test_unfinished_backoff_and_goal_state_survive_restart(self):
+        self.unfinished_evidence()
+        with patch.object(sa, "inspect", side_effect=OSError("network failure")) as model:
+            with self.assertRaises(NoProgress):
+                recovery.recover(self.cfg, self.opts, self.block)
+            previous = json.loads((self.work / "blocked.json").read_text())
+            with self.assertRaisesRegex(NoProgress, "cooldown"):
+                recovery.recover(self.cfg, self.opts, previous)
+        self.assertEqual(model.call_count, 1)
+        child = self.work / "attempt-later"
+        original = sa.prepare_goal_state(self.original, self.batch)
+        with sqlite3.connect(original / "goals_1.sqlite") as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE goals (thread TEXT, status TEXT)")
+            db.execute("CREATE TABLE thread_goal_continuation_deferrals (thread_id TEXT PRIMARY KEY)")
+            db.execute("INSERT INTO goals VALUES (?, ?)", (self.thread, "active"))
+            db.commit()
+            (original / "state_5.sqlite").write_text("stale temporary rollout path")
+            successor = sa.prepare_goal_state(child, self.batch, self.original)
+            self.assertNotEqual(original, successor)
+            self.assertFalse((successor / "state_5.sqlite").exists())
+            with sqlite3.connect(successor / "goals_1.sqlite") as resumed:
+                self.assertEqual(resumed.execute("SELECT * FROM goals").fetchall(), [(self.thread, "active")])
+            sa.defer_goal_continuation(successor, self.thread)
+            sa.defer_goal_continuation(successor, self.thread)
+            with sqlite3.connect(successor / "goals_1.sqlite") as resumed:
+                self.assertEqual(resumed.execute("SELECT * FROM goals").fetchall(), [(self.thread, "active")])
+                self.assertEqual(
+                    resumed.execute("SELECT * FROM thread_goal_continuation_deferrals").fetchall(), [(self.thread,)]
+                )
+            self.assertEqual((successor / "goals_1.sqlite").stat().st_mode & 0o777, 0o600)
+
+    def test_corrupt_goal_database_cannot_silently_start_a_new_goal(self):
+        state = sa.prepare_goal_state(self.original, self.batch)
+        (state / "goals_1.sqlite").write_text("not SQLite")
+        with self.assertRaisesRegex(Die, "cannot be copied"):
+            sa.prepare_goal_state(self.work / "attempt-successor", self.batch, self.original)
+        with self.assertRaisesRegex(Die, "cannot be deferred safely"):
+            sa.defer_goal_continuation(state, self.thread)
+
+    def test_goal_state_symlink_is_rejected(self):
+        state = sa.prepare_goal_state(self.original, self.batch)
+        (state / "goals_1.sqlite").symlink_to(self.original / "input.json")
+        with self.assertRaisesRegex(Die, "invalid retained goal database"):
+            sa.prepare_goal_state(self.work / "attempt-successor", self.batch, self.original)
+        with self.assertRaisesRegex(Die, "invalid retained goal database"):
+            sa.defer_goal_continuation(state, self.thread)
+
+    def test_false_goal_completion_is_not_coverage_or_a_safety_judgment(self):
+        self.unfinished_evidence()
+        p = self.original / "model-rollout-0.jsonl"
+        with p.open("a") as stream:
+            stream.write(
+                sa.serialize(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "update_goal",
+                            "arguments": '{"status":"complete"}',
+                        },
+                    }
+                )
+                + "\n"
+            )
+        with (
+            patch.object(sa, "inspect", side_effect=OSError("retry later")),
+            patch.object(sa, "advance") as advance,
+            self.assertRaises(NoProgress),
+        ):
+            recovery.recover(self.cfg, self.opts, self.block)
+        advance.assert_not_called()
+
+    def test_reader_rejects_skips_and_reports_progress_after_source(self):
+        p = self.original / "reader-new.json"
+        reader = ar.Reader(self.batch, p, "initial")
+        with self.assertRaisesRegex(ValueError, "next unread page 0"):
+            reader.request(
+                "tools/call", {"name": ar.TOOL, "arguments": {"page": len(reader.pages) - 1, "token": "initial"}}
+            )
+        self.assertFalse(p.exists())
+        out = reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0, "token": "initial"}})["content"][
+            0
+        ]["text"]
+        value = json.loads(out)
+        self.assertEqual(value["next_unread_page"], 1)
+        self.assertEqual(value["remaining_pages"], len(reader.pages) - 1)
+        self.assertLess(out.index('"sections"'), out.index('"next_token"'))
+
+    def test_real_inspector_continues_three_turns_then_recovers_after_restart(self):
+        self.run_three_turns_then_recover_after_restart(version2=False)
+
+    def test_migrated_coverage_diagnostic_remains_verified_after_another_restart(self):
+        self.run_three_turns_then_recover_after_restart(version2=True)
+
+    def run_three_turns_then_recover_after_restart(self, *, version2):
+        self.unfinished_evidence(version2=version2)
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
+        calls = 0
+        states = []
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            self.assertEqual(argv[-3:], ["resume", self.thread, "-"])
+            self.assertIn("goals", argv)
+            states.append(kwargs["env"]["CODEX_SQLITE_HOME"])
+            args = json.loads(next(a.split("=", 1)[1] for a in argv if a.startswith("mcp_servers.audit.args=")))
+            receipt = Path(args[3])
+            batch = json.loads(Path(args[2]).read_text())
+            reader = ar.Reader(batch, receipt, args[4])
+            if calls == 4:
+                for i in range(len(reader.pages)):
+                    if i not in reader.seen:
+                        reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
+                verdict = "pass"
+            else:
+                verdict = "unfinished"
+            value = {"verdict": verdict, "findings": [], "read_token": reader.token}
+            append_native(kwargs["cwd"], value, self.thread)
+            events = [
+                {"type": "thread.started", "thread_id": self.thread},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                {"type": "turn.completed"},
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa.subprocess, "run", side_effect=model),
+            patch.object(sa.time, "sleep"),
+            patch.object(sa, "advance", return_value="b" * 40) as advance,
+        ):
+            with patch.object(recovery.time, "time", return_value=1000), self.assertRaises(NoProgress):
+                recovery.recover(self.cfg, self.opts, self.block)
+            self.assertEqual(calls, 3)
+            advance.assert_not_called()
+            previous = json.loads((self.work / "blocked.json").read_text())
+            with patch.object(recovery.time, "time", return_value=1001), self.assertRaisesRegex(NoProgress, "cooldown"):
+                recovery.recover(self.cfg, self.opts, previous)
+            self.assertEqual(calls, 3)
+            with patch.object(recovery.time, "time", return_value=1301):
+                self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
+            self.assertEqual(calls, 4)
+            advance.assert_called_once()
+        self.assertEqual(states[0], states[1])
+        self.assertEqual(states[1], states[2])
+        self.assertNotEqual(states[2], states[3])
+        self.assertFalse((self.work / "blocked.json").exists())
+        verdicts = [
+            r["verdict"]
+            for r in map(json.loads, (self.work / "ledger.jsonl").read_text().splitlines())
+            if "verdict" in r
+        ]
+        self.assertEqual([v["verdict"] for v in verdicts], ["incomplete", "pass"] if version2 else ["pass"])
 
 
 class History(unittest.TestCase):
@@ -815,6 +1148,7 @@ class Authority(unittest.TestCase):
                 self.assertEqual(catalog["shell_type"], "disabled")
                 self.assertEqual(catalog["experimental_supported_tools"], [])
                 self.assertTrue(any(a.startswith("model_catalog_json=") for a in argv))
+                append_native(kwargs["cwd"], {k: verdict[k] for k in ("verdict", "findings")})
                 events = [
                     {
                         "type": "item.completed",
@@ -1072,32 +1406,10 @@ class CompactingInspection(unittest.TestCase):
                 events.append(
                     {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "audit", "tool": ar.TOOL}}
                 )
-            if repair_once:
-                sessions = home / ".codex/sessions"
-                sessions.mkdir(parents=True, exist_ok=True)
-                if not list(sessions.rglob("*.jsonl")):
-                    (sessions / "rollout.jsonl").write_text(
-                        json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
-                    )
             answer = {"verdict": "pass", "findings": [], "read_token": reader.token}
             if repair_once and (calls == 1 or repair_always):
                 answer["verdict"] = "incomplete"
-            if repair_once:
-                with next((home / ".codex/sessions").rglob("*.jsonl")).open("a") as native:
-                    native.write(
-                        sa.serialize(
-                            {
-                                "type": "response_item",
-                                "payload": {
-                                    "role": "assistant",
-                                    "type": "message",
-                                    "phase": "final_answer",
-                                    "content": [{"type": "output_text", "text": sa.serialize(answer)}],
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
+            append_native(home, answer, thread)
             events.extend(
                 [
                     {
@@ -1314,7 +1626,7 @@ class CompactingInspection(unittest.TestCase):
                 ["codex", "exec", "--sandbox", "read-only", "-"],
                 prompt,
                 home=home,
-                env={},
+                env={"CODEX_SQLITE_HOME": str(self.work / "test-native-state")},
                 work=self.work,
                 receipt=receipt,
                 provider="codex",
@@ -1357,6 +1669,124 @@ class CompactingInspection(unittest.TestCase):
                 self.assertRaises(Die),
             ):
                 sa.inspect(batch, "claude", self.work)
+
+    def test_inline_clean_stop_without_answer_resumes_same_conversation(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
+        batch = {"input_digest": "digest", "commits": [{"sha": "b" * 40, "files": []}]}
+        calls = 0
+        thread = "11111111-2222-4333-8444-555555555555"
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                path = kwargs["cwd"] / ".codex/sessions/rollout.jsonl"
+                path.write_text(sa.serialize({"type": "session_meta", "payload": {"id": thread}}) + "\n")
+                messages = []
+            else:
+                self.assertEqual(argv[-3:], ["resume", thread, "-"])
+                self.assertIn("inline inspection", kwargs["input"])
+                value = {"verdict": "pass", "findings": []}
+                append_native(kwargs["cwd"], value, thread)
+                messages = [{"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}}]
+            events = [{"type": "thread.started", "thread_id": thread}, *messages, {"type": "turn.completed"}]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa.subprocess, "run", side_effect=model),
+            patch.object(sa.time, "sleep"),
+        ):
+            self.assertEqual(sa.inspect(batch, "codex", self.work)["verdict"], "pass")
+        self.assertEqual(calls, 2)
+        self.assertEqual(sa.retained_thread(self.work), thread)
+
+    def test_premature_pass_is_continued_until_every_page_is_delivered(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
+        calls = 0
+        thread = "11111111-2222-4333-8444-555555555555"
+        states = []
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            self.assertIn("--enable", argv)
+            self.assertIn("goals", argv)
+            self.assertNotIn("--enable shell_tool", " ".join(argv))
+            self.assertIn("persistent goal", kwargs["input"])
+            if calls > 1:
+                self.assertEqual(argv[-3:], ["resume", thread, "-"])
+                self.assertIn("next_unread_page", kwargs["input"])
+            states.append(kwargs["env"]["CODEX_SQLITE_HOME"])
+            args = json.loads(next(a.split("=", 1)[1] for a in argv if a.startswith("mcp_servers.audit.args=")))
+            reader = ar.Reader(self.batch, Path(args[3]), args[4])
+            limit = len(reader.pages) if calls == 3 else max(1, len(reader.pages) // 3)
+            for i in [i for i in range(len(reader.pages)) if i not in reader.seen][:limit]:
+                reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
+            value = {"verdict": "unfinished" if calls == 2 else "pass", "findings": [], "read_token": reader.token}
+            append_native(kwargs["cwd"], value, thread)
+            events = [
+                {"type": "thread.started", "thread_id": thread},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                {"type": "turn.completed"},
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa.subprocess, "run", side_effect=model),
+            patch.object(sa.time, "sleep"),
+        ):
+            self.assertEqual(sa.inspect(self.batch, "codex", self.work), self.verdict)
+        self.assertEqual(calls, 3)
+        self.assertEqual(len(set(states)), 1)
+        proof = json.loads((self.work / "read-receipt.json").read_text())
+        self.assertEqual(proof["read"], list(range(proof["pages"])))
+        self.assertTrue((self.work / "coverage-turn-1").exists())
+        self.assertTrue((self.work / "coverage-turn-2").exists())
+
+    def test_earlier_native_source_verdict_blocks_a_later_pass(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
+        for kind in ("finding", "incomplete"):
+            # Each case is its own isolated inspection, with no retry or voting.
+            for path in (self.work / "native-sessions").rglob("*.jsonl"):
+                path.unlink()
+
+            def model(argv, kind=kind, **kwargs):
+                args = json.loads(next(a.split("=", 1)[1] for a in argv if a.startswith("mcp_servers.audit.args=")))
+                reader = ar.Reader(self.batch, Path(args[3]), args[4])
+                for i in range(len(reader.pages)):
+                    reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
+                concern = {"verdict": kind, "findings": ["Macro can access the filesystem"], "read_token": reader.token}
+                value = {"verdict": "pass", "findings": [], "read_token": reader.token}
+                append_native(kwargs["cwd"], concern)
+                append_native(kwargs["cwd"], value)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="\n".join(
+                        map(
+                            sa.serialize,
+                            [
+                                {
+                                    "type": "item.completed",
+                                    "item": {"type": "agent_message", "text": sa.serialize(value)},
+                                },
+                                {"type": "turn.completed"},
+                            ],
+                        )
+                    ),
+                    stderr="",
+                )
+
+            with (
+                self.subTest(kind=kind),
+                patch.object(sa, "codex_dir", return_value=self.work),
+                patch.object(sa.subprocess, "run", side_effect=model) as run,
+            ):
+                actual = sa.inspect(self.batch, "codex", self.work)
+            self.assertEqual(actual["verdict"], kind)
+            self.assertEqual(actual["findings"], ["Macro can access the filesystem"])
+            self.assertEqual(run.call_count, 1)
 
 
 class Run(unittest.TestCase):
@@ -1612,7 +2042,7 @@ class Run(unittest.TestCase):
         import hashlib
 
         batch = json.loads((original / "input.json").read_text())
-        prompt = sa.PROMPT + "\n" + sa.serialize(batch)
+        prompt = sa.inspection_prompt(batch, False, policy=sa.PROMPT)
         (original / "prompt.txt").write_text(prompt)
         (original / "execution.json").write_text(
             sa.serialize(

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
+from .audit_progress import continuable, legacy_coverage_only
 from .config import Die, NoProgress, log
 
 # The reviewed version-1 launcher deployed before worker-bound judgments. This
@@ -16,6 +17,11 @@ V1_PROFILE = {
     "launcher_code_digest": "f2f06b8029f3b13ef35d9669c5e2bcd3a64b0f1d2b0b296fc9251f256e0daedd",
     "reader_digest": "f852a254efc4336cce71f853b8c86e3ccc87084f2914efbf085463c3bb57bfc0",
     "catalog_digest": "e16b921e0a354d549be4aeb439385f0fa82962eb948210f4c27ac9811a095ba3",
+}
+V2_PROFILE = {
+    "launcher_code_digest": "9b32afad37c5d2e193f4cb8c7ebad4bc8ffb33167f016b76cec0b835c773980b",
+    "reader_digest": "f852a254efc4336cce71f853b8c86e3ccc87084f2914efbf085463c3bb57bfc0",
+    "catalog_digest": "d8b52bbd35338aed56afb8a6b475cc1ebf2e57d4a7956a04a00c4794e115eebb",
 }
 
 
@@ -31,11 +37,15 @@ def safe_judgment(value, batch: dict, paged: bool, *, legacy=False, allow_empty=
         if any(not isinstance(sha, str) for sha in value["commits"]):
             return False
     return set(value) == keys and (
-        value.get("verdict") == "pass" or (allow_empty and value.get("verdict") == "incomplete")
+        value.get("verdict") == "pass"
+        or (paged and value.get("verdict") == "unfinished")
+        or (allow_empty and value.get("verdict") == "incomplete")
     )
 
 
-def safe_history(work: Path, batch: dict, paged: bool, *, legacy=False, allow_empty=False) -> bool:
+def safe_history(
+    work: Path, batch: dict, paged: bool, *, legacy=False, allow_empty=False, allowed=(), goals=True
+) -> bool:
     from . import security_audit as sa
 
     try:
@@ -45,23 +55,65 @@ def safe_history(work: Path, batch: dict, paged: bool, *, legacy=False, allow_em
         for line in rollouts[0].read_text().splitlines():
             row = json.loads(line)
             item = row.get("payload", {})
+            if row.get("type") == "response_item" and item.get("type") in ("function_call", "custom_tool_call"):
+                tools = {"read_page", "mcp__audit__read_page"}
+                if goals:
+                    tools |= {"get_goal", "create_goal", "update_goal"}
+                if item.get("name") not in tools:
+                    return False
             if row.get("type") != "response_item" or item.get("type") != "message" or item.get("role") != "assistant":
                 continue
             text = "".join(p.get("text", "") for p in item.get("content", []) if p.get("type") == "output_text")
             if item.get("phase") == "commentary":
                 if '"verdict"' in text:
                     return False
-            elif item.get("phase") not in ("final", "final_answer") or not safe_judgment(
-                json.loads(text), batch, paged, legacy=legacy, allow_empty=allow_empty
-            ):
-                return False
+            else:
+                value = json.loads(text)
+                if item.get("phase") not in ("final", "final_answer"):
+                    return False
+                if sa.serialize(value) not in allowed and not safe_judgment(
+                    value, batch, paged, legacy=legacy, allow_empty=allow_empty
+                ):
+                    return False
         return True
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
 
 
+def native_finals(work: Path) -> list[dict]:
+    from . import security_audit as sa
+
+    rollouts = sa.native_rollouts(work)
+    if len(rollouts) != 1:
+        raise Die("security-audit: retained native history is missing or ambiguous")
+    result = []
+    for line in rollouts[0].read_text().splitlines():
+        row = json.loads(line)
+        item = row.get("payload", {})
+        if (
+            row.get("type") == "response_item"
+            and item.get("type") == "message"
+            and item.get("role") == "assistant"
+            and item.get("phase") in ("final", "final_answer")
+        ):
+            result.append(
+                json.loads(
+                    "".join(p.get("text", "") for p in item.get("content", []) if p.get("type") == "output_text")
+                )
+            )
+    return result
+
+
 def mechanical_output(
-    transcript: str, batch: dict, receipt: Path, paged: bool, work: Path, *, legacy_history=False, allow_empty=True
+    transcript: str,
+    batch: dict,
+    receipt: Path,
+    paged: bool,
+    work: Path,
+    *,
+    legacy_history=False,
+    allow_empty=True,
+    allowed=(),
 ) -> bool:
     """Validate everything except a known mechanical final-output failure. Never approve it."""
     from . import security_audit as sa
@@ -84,7 +136,7 @@ def mechanical_output(
         thread = sa.retained_thread(work)
         if any(e.get("type") == "thread.started" and e.get("thread_id") != thread for e in events):
             return False
-        if not safe_history(work, batch, paged, legacy=legacy_history, allow_empty=allow_empty):
+        if not safe_history(work, batch, paged, legacy=legacy_history, allow_empty=allow_empty, allowed=allowed):
             return False
         value = sa.codex_final(transcript, paged)
         if not safe_judgment(value, batch, paged, legacy=legacy_history, allow_empty=allow_empty):
@@ -154,39 +206,79 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
             raise Die("security-audit: interrupted recovery input changed")
         return ancestor, batch, execution, legacy
     execution = json.loads((original / "execution.json").read_text())
-    legacy = execution.get("protocol_version", 1) == 1
-    if legacy:
-        if any(execution.get(k) != v for k, v in V1_PROFILE.items()):
+    version = execution.get("protocol_version", 1)
+    legacy = version == 1
+    allowed = []
+    if version in (1, 2):
+        profile = V1_PROFILE if version == 1 else V2_PROFILE
+        if any(execution.get(k) != v for k, v in profile.items()):
             raise Die("security-audit: unknown legacy inspection profile")
-        policy = sa.PROMPT
-    else:
-        if execution.get("protocol_version") != sa.PROTOCOL_VERSION:
-            raise Die("security-audit: unknown judgment protocol")
-        identity = {"input_digest": digest, "commits": [c["sha"] for c in batch["commits"]]}
-        if execution.get("batch_identity") != identity:
-            raise Die("security-audit: retained launch belongs to another batch")
+        policy = sa.PROMPT if version == 1 else sa.V2_MODEL_PROMPT
+    elif version == sa.PROTOCOL_VERSION:
         profile = sa.inspection_profile()
         if any(execution.get(k) != profile[k] for k in ("catalog_digest", "reader_digest")):
             raise Die("security-audit: retained inspection policy or reader changed")
         policy = sa.MODEL_PROMPT
-        if execution.get("legacy_history"):
-            parent = json.loads((original / "previous-block.json").read_text())
-            ancestor, ancestor_batch, _, migrated = retained(work, parent, seen=seen)
-            if ancestor_batch != batch or sa.retained_thread(ancestor) != sa.retained_thread(original) or not migrated:
-                raise Die("security-audit: invalid legacy continuation lineage")
-            legacy = True
+    else:
+        raise Die("security-audit: unknown judgment protocol")
+    if version != 1:
+        identity = {"input_digest": digest, "commits": [c["sha"] for c in batch["commits"]]}
+        if execution.get("batch_identity") != identity:
+            raise Die("security-audit: retained launch belongs to another batch")
+    if execution.get("legacy_history") or execution.get("coverage_history"):
+        parent = json.loads((original / "previous-block.json").read_text())
+        ancestor, ancestor_batch, ancestor_execution, migrated = retained(work, parent, seen=seen)
+        if ancestor_batch != batch or sa.retained_thread(ancestor) != sa.retained_thread(original):
+            raise Die("security-audit: invalid continuation lineage")
+        if execution.get("legacy_history") and not migrated:
+            raise Die("security-audit: invalid legacy continuation lineage")
+        legacy = legacy or migrated
+        allowed.extend(ancestor_execution.get("_allowed_history", ()))
+        if execution.get("coverage_history") and not allowed:
+            raise Die("security-audit: coverage continuation has no verified parent")
     if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
         raise Die("security-audit: retained inspection prompt digest mismatch")
     sa.validate_output_profile(
-        execution, original, batch, policy_prompt=policy, durable=not (execution.get("protocol_version", 1) == 1)
+        execution, original, batch, policy_prompt=policy, durable=version != 1, goals=version >= 3
     )
     paged = len(sa.serialize(batch).encode()) > sa.INLINE_BYTES
-    if not safe_history(original, batch, paged, legacy=legacy):
+    if version == 2 and paged and (original / "model-transcript.jsonl").exists():
+        transcript = (original / "model-transcript.jsonl").read_text()
+        # Service errors have no final answer and remain eligible for ordinary
+        # service recovery; only inspect a final when the stream supplies one.
+        messages = [
+            e
+            for e in map(json.loads, transcript.splitlines())
+            if e.get("type") == "item.completed" and e.get("item", {}).get("type") == "agent_message"
+        ]
+        value = (
+            sa.codex_final(transcript, True)
+            if messages
+            and any(e.get("type") == "turn.completed" for e in map(json.loads, transcript.splitlines()))
+            and not any(e.get("type") in ("turn.failed", "error") for e in map(json.loads, transcript.splitlines()))
+            else None
+        )
+        if legacy_coverage_only(value, batch, original / "read-receipt.json"):
+            if not native_finals(original) or native_finals(original)[-1] != value:
+                raise Die("security-audit: retained coverage answer differs from the native final")
+            allowed.append(sa.serialize(value))
+    if not safe_history(original, batch, paged, legacy=legacy, allowed=allowed, goals=version >= 3):
         raise Die("security-audit: previous findings or uncertainty forbid automatic recovery")
+    allowed_verdicts = {
+        sa.serialize(sa.bind_verdict({k: v for k, v in json.loads(text).items() if k != "read_token"}, batch))
+        for text in allowed
+    }
     for line in (work / "ledger.jsonl").read_text().splitlines():
         row = json.loads(line)
-        if row.get("batch") == digest and "verdict" in row and row["verdict"]["verdict"] != "pass":
+        if (
+            row.get("batch") == digest
+            and "verdict" in row
+            and row["verdict"]["verdict"] != "pass"
+            and sa.serialize(row["verdict"]) not in allowed_verdicts
+        ):
             raise Die("security-audit: a recorded source verdict remains binding")
+    execution = {**execution, "_allowed_history": allowed}
+
     return original, batch, execution, legacy
 
 
@@ -198,17 +290,33 @@ def recover(cfg, opts, previous: dict) -> bool:
     try:
         original, batch, execution, legacy = retained(work, previous)
         paged = execution["paged"]
+        allowed = execution.get("_allowed_history", ())
         transcript_path = original / "model-transcript.jsonl"
         transcript = transcript_path.read_text() if transcript_path.exists() else ""
         mechanical = mechanical_output(
-            transcript, batch, original / "read-receipt.json", paged, original, legacy_history=legacy, allow_empty=False
+            transcript,
+            batch,
+            original / "read-receipt.json",
+            paged,
+            original,
+            legacy_history=legacy,
+            allow_empty=False,
+            allowed=allowed,
         )
         service = (
-            sa.codex_service_error(transcript, paged, original, batch, protocol=2, legacy_history=legacy) is not None
+            sa.codex_service_error(
+                transcript, paged, original, batch, protocol=3, legacy_history=legacy, allowed_history=allowed
+            )
+            is not None
         )
+        progress = continuable(
+            transcript, batch, original / "read-receipt.json", original, legacy=legacy, allowed=allowed, paged=paged
+        )
+        if paged and allowed and transcript:
+            progress = progress or sa.serialize(sa.codex_final(transcript, True)) in allowed
         interrupted = previous.get("reason") == "security-audit: operational recovery interrupted"
         timed_out = previous.get("failure_kind") == "provider-timeout"
-        if not mechanical and not service and not interrupted and not timed_out:
+        if not mechanical and not service and not interrupted and not timed_out and not progress:
             return False
     except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
@@ -255,7 +363,7 @@ def recover(cfg, opts, previous: dict) -> bool:
         "to_sha": target,
         "continuation_of": str(original),
         "attempt": str(attempt),
-        "recovery_kind": "operational-v2",
+        "recovery_kind": "operational-v3",
     }
     sa.record(work / "ledger.jsonl", recovery)
     # Journal the in-flight attempt before launch. Its native history and receipt
@@ -273,7 +381,14 @@ def recover(cfg, opts, previous: dict) -> bool:
     log(f"security-audit: automatic same-session recovery {batch['from_sha'][:12]}..{target[:12]}")
     try:
         verdict = sa.inspect(
-            batch, "codex", attempt, resume_from=original, legacy_history=legacy, repair_output=mechanical
+            batch,
+            "codex",
+            attempt,
+            resume_from=original,
+            legacy_history=legacy,
+            repair_output=mechanical,
+            allowed_history=allowed,
+            continue_reading=progress,
         )
         sa.record(work / "ledger.jsonl", {**recovery, "verdict": verdict, "protocol_version": sa.PROTOCOL_VERSION})
         if verdict["verdict"] != "pass":

@@ -208,7 +208,7 @@ the prompt requires retaining findings and unresolved questions, re-reading when
 needed, and returning incomplete if the full inspection cannot be completed.
 
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
-Worker code alone verifies ancestry and moves the ref. In judgment protocol v2,
+Worker code alone verifies ancestry and moves the ref. In judgment protocol v3,
 the model returns only `verdict` and `findings`, plus the final `read_token` for
 paged inputs. The Worker attaches the immutable input digest and ordered commit
 list from the launch record. Neither commit SHAs nor a digest are copied from
@@ -244,35 +244,54 @@ the latest 100 messages in that private conversation for an earlier ambiguous de
 Notification failure preserves the audit block and allows bump/progress work to continue.
 Without this setting, reporting remains local to the worker's evidence and logs.
 
-Codex provider errors and eligible mechanical output failures share at most three
-launches per invocation, with 5- and 10-second delays. They resume the same native
-conversation, retaining all findings and notes. Every failed launch is archived
-under `service-error-N/` or `output-error-N/`, with a retry record. The inspection's
-native history and reader receipt are durable while the subprocess is running, so
-a Worker restart can retain evidence written before stdout capture finishes.
+Codex Luna has the native persistent goal tools enabled, with a goal to inspect
+the entire immutable bundle and preserve all findings and unresolved questions.
+The noninteractive `codex exec` command exits at the end of a turn, so the Worker
+owns continuation. Native goal databases are copied with SQLite backup into each
+successor attempt, including committed WAL contents; session indexes with temporary
+rollout paths are rebuilt. The native continuation-deferral marker prevents an
+active goal from starting a competing turn before `exec resume` submits the Worker's
+structured-output request. Objective, status and accounting are preserved separately
+from temporary provider credentials. A model's goal status never approves source or
+changes the cursor.
 
-After those immediate retries, ordinary `work` can recover an operational block
-without human intervention. A durable budget waits 5, 10, 20, 40, then 60 minutes
-between recovery invocations, capped at one invocation per hour thereafter. Budget
-reservation precedes launch and survives restarts. Every invocation rechecks admin
-authority, the current cursor, exact next main prefix, immutable input, original
-native UUID, launch policy, reader, catalog, prompt and all prior judgments.
-A valid fresh passing judgment and confirmed ref update are still required.
+The reader rejects skipping unread pages and reports `next_unread_page` and
+`remaining_pages` after the source, before its final delivery token. When only
+reading work remains, the reviewer returns `unfinished` with no findings. That is
+progress, not a source verdict. The Worker also detects a premature empty-finding
+pass with missing coverage, or a cleanly ended turn without a final answer. It
+resumes the SAME native conversation with receipt-derived progress and retains
+all notes. There are no independent partial approvals. A later passing answer
+cannot discard an earlier source finding or explained code uncertainty, including
+one retained only in native history.
 
-Automatic mechanical repair requires complete input delivery and an empty-finding
-pass whose final token or legacy copied identity failed validation. It does not
-approve the old answer. A reviewed version-1 launcher profile may migrate in the
-same native session to the new worker-bound response format; its old evidence is
-retained. No per-commit SHA exception is used. An unexplained empty `incomplete`
-may receive bounded immediate repair, but is not scheduled again afterward.
-Explained uncertainty, any source finding, missing coverage, unauthorized tools,
-unknown profiles and mismatched evidence remain blocked. A finding anywhere in
-the retained native history or ledger remains binding, including after a restart.
-Provider recovery likewise preserves prior mechanical answers and never rerolls a
-source finding or explained uncertainty. Private alerts retain their usual deduplication.
+Coverage continuations, recognized provider failures and mechanical output repairs
+share at most three launches per invocation, with 5- and 10-second delays. Failed
+launches and partial turns are archived under `service-error-N/`, `output-error-N/`
+or `coverage-turn-N/`. Native history, reader receipts and goal bookkeeping are
+durable while the subprocess runs, so a restart retains evidence written before
+stdout capture finishes.
+
+After those immediate requests, ordinary `work` recovers operational and unfinished
+coverage blocks without human intervention. A durable budget waits 5, 10, 20, 40,
+then 60 minutes between recovery invocations, capped at one per hour thereafter.
+Reservation precedes launch and survives restarts. Every invocation rechecks hard
+quota limits, admin authority, the current cursor, exact next main prefix,
+immutable input, original UUID, launch policy, reader, catalog, exact prompt and
+all prior judgments. Complete coverage, the final delivery token, a complete
+passing judgment and confirmed ref update remain mandatory for advancement.
+
+Reviewed version-1 and version-2 launcher profiles can migrate in their original
+native session. Version-2 coverage-only incompletes are recognized only by a closed
+diagnostic grammar whose claimed unread range and final token match the retained
+receipt. Their original native final and ledger record must agree; findings and
+unknown prose remain blocked. This migration is a protocol rule, with no exception
+for a particular commit SHA. Original evidence stays on record. Source findings,
+explained uncertainty about code, unauthorized tools, unknown profiles and
+mismatched evidence remain blocked. Private alerts retain their usual deduplication.
 
 The `retry-service` and `repair-output` administrative commands remain for their
-restricted historical recovery profiles; automatic protocol-v2 recovery uses the
+restricted historical recovery profiles; automatic protocol-v3 recovery uses the
 ordinary worker loop and does not need those commands or a human attestation.
 
 For the recorded legacy Luna failure where the final two pages were inaccessible
