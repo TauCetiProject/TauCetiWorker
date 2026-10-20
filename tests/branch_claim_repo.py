@@ -209,7 +209,9 @@ def safe_push_scopes_claim_repo():
         claim.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$CLAIM_REPO" "$1" >> "$CLAIM_LOG"\nexit 0\n')
         claim.chmod(0o755)
         git = tmp / "git"
-        git.write_text("#!/bin/sh\nexit 0\n")
+        git.write_text(
+            '#!/bin/sh\ncase "$*" in *rev-parse*|*mktag*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;; esac\nexit 0\n'
+        )
         git.chmod(0o755)
         env = {
             **os.environ,

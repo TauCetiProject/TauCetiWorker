@@ -47,6 +47,8 @@ left the source. Each record is private to its worker (mode `0700`/`0600`):
 | `unstaged.patch` | binary diff of the worktree against the index |
 | `untracked.tar` | untracked and ignored source with original relative paths, plus the bytes of conflicted and assume-unchanged/skip-worktree paths; symlinks are stored as links and never followed |
 | `status.json` | mutable disposition: `preserved`, `checkout-reset`, `retained` or `superseded` |
+| `normal-publication.json` | optional durable normal-push intent on reused source; separate from the consumer journal so concurrent journal updates cannot erase it |
+| `source-outcomes/` | optional per-handoff checkpoint or clean-inspection outcomes, including publication evidence from the original checkout |
 
 The worker writes into a `.tmp-*` directory and fsyncs every file and the
 directory. It then renames the directory into place and fsyncs the parent.
@@ -226,120 +228,184 @@ are refreshed as throwaway snapshots; nothing written there can be published.
 ## Automatic repair recovery
 
 At a new host round boundary, the worker preserves the previous checkout and
-runs a bounded recovery phase before choosing unrelated work or selecting a
-model. Loop drivers can start a recovery-only child while model funding/quota
-is unavailable. Fleet capacity admission still applies. Recovery uses an independent real checkout
-and skips a checkout with observed local users (Linux `/proc`; unavailable on other hosts). Rootless PID namespaces, global cleanup markers
-and quiescence proofs are not prerequisites.
+attempts bounded recovery before selecting normal work. Mechanical recovery can
+run without model funding. Fleet capacity, original authorization, protected PR
+labels, claims, current-head CAS and exact verification remain mandatory.
 
-The immutable `tauceti-work-recovery/v1` manifest and payloads remain intact.
-New PR repair owners also record the original GitHub actor, PR author, destination
-repository/ref, roadmap, exact provider profile, account restriction, sandbox
-permission, and repair allowance keys. Provider session IDs come from structured
-provider events and are bound to that identity/profile, never extracted from a
-final transcript.
+There is no operator recovery queue. The worker either publishes safely,
+archives a superseded intent, waits automatically for a dependency or changed
+external facts, or retains a blocked checkpoint and continues normal selection.
+Final agent output never proves publication or grants permission.
 
-Each record has a separate, private `recovery.json` consumer journal:
+The immutable `tauceti-work-recovery/v1` manifest remains intact. A separate,
+fsynced `recovery.json` consumer journal records these states:
 
 | State | Durable meaning |
 |---|---|
-| retained | Saved source is available; no invocation started |
-| eligible | Current policy permits a retry, or a structured dependency wait remains |
-| resuming | A claimed invocation owns the isolated checkout |
-| verified | An exact-input verifier succeeded; its receipt is retained |
-| publication-pending | A particular commit, expected head, destination and receipt are durable before push |
-| published | Actual remote Git state contains the intended commit and any publication intents belonging to that outcome are reconciled |
-| obsolete | The PR closed/merged, or the exact saved source is already the remote tree; source stays archived |
-| blocked | A structured failure names the condition and next action; unrelated work can continue |
+| retained | Exact source is available for recovery |
+| eligible | Recovery may run, or awaits a dependency under a scheduled retry |
+| resuming | One claimed invocation owns the isolated checkout |
+| verified | An exact-input verifier succeeded |
+| publication-pending | Commit, expected head, destination and receipt were saved before push |
+| published | Actual remote state confirms the intended commit |
+| obsolete | Closed/superseded work or an unsafe-to-replay publication intent stays archived |
+| blocked | This checkpoint cannot run under current facts or allowances; normal selection continues |
 
-The worker restores binary patches, staged/unstaged boundaries, untracked bytes,
-and symlinks into an independent clone below the record, without resetting the
-normal checkout. An interrupted restoration is retained separately. Verification
-runs synchronously through the installed `tauceti verify` implementation; exact
-receipts may be reused by its normal input/phase matching. The complete input
-fingerprint is checked again before committing. Publication requires the current
-writer's head as an ancestor, fresh PR policy, a real claim, and `git-safe-push`'s
-expected-head CAS. No recovery comment or new PR is synthesized from agent prose.
-Recovery creates no extra comments or PRs. Existing GitHub publication intents use
-the durable outbox's normal reconciliation before recovery; unrelated pending
-intents do not conceal a confirmed Git push. A crash after push reconciles the actual branch and commit ancestry before any
-replay, including after the invocation limit. A durable successful push later
-removed by another writer is archived rather than replayed. A moved head with an
-unacknowledged pending publication requires explicit reconciliation, because
-absence from rewritten history cannot prove that publication never happened.
+Only runnable recovery reserves its PR on this worker. A dependency wait gets
+a short reservation of at most five minutes; repeated waits never extend it.
+Blocked records release their reservation immediately.
+Normal work still obeys its own current authorization, holds, claims and existing
+repair counters. Before normal owned repair work receives retained source, an
+exclusive handoff pauses the old recovery attempt. Its immutable patches and
+bundles are evidence in that round, never instructions or publication authority.
+A durable normal push consumes the handoff. A refused launch returns it to
+automatic recovery; the next owned round also reconciles interrupted handoffs,
+prefers retained normal progress, and returns unused source to mechanical
+recovery when durable Git intent proves no push was attempted or the attempt
+was rejected. This also permits reintegration after another writer moves the head.
+The normal saver records the actual captured checkpoint, or a completed clean
+inspection, in independent atomic outcome files. The consumer incorporates them
+under its existing journal lock; a concurrent source save never rewrites that
+journal. These durable outcomes survive disposable-index loss and non-sequential
+checkpoint names. They retain scoped publication and uncertain-push evidence
+from the original checkout. Before replacement or destructive reset, the live
+checkout owner sheds the old handoff attribution; retained source keeps its
+original owner record. An interrupted capture
+retries through ordinary preservation while independent normal work proceeds;
+missing cache entries never prove that no newer source exists. A clean inspection
+cannot erase an earlier positive checkpoint receipt. A checked clean outcome
+returns unused source to recovery even before its replacement checkout exists;
+a missing outcome keeps the handoff retryable without reserving its PR. Reusing
+already-preserved commits also records an outcome, distinguishing a current
+round's saved progress from older branches.
+The original evidence stays available alongside a receiving round's partial progress.
+Unpublished edits made after a confirmed push remain evidence for fresh normal
+repair work even when the old round's publication authority has ended. Transferred
+or archived evidence cannot regain automatic recovery ownership through a new handoff.
+Foreign canaries and automatic bumps
+do not receive this broader source context. Recovery never replays behind a
+normal task that published or a moved head whose publication outcome is
+uncertain.
+Shared claims and the expected-head CAS coordinate writers across workers.
 
-A clean three-way integration is attempted mechanically and reverified only when
-the current head preserves the expected history. Rewritten history is blocked
-until only the retained delta has been explicitly re-integrated; removed commits
-are never merged back automatically. Owned recovery merges retain their parent
-intent across crashes. Leftovers from a round with its own durable successful
-push marker are archived without publishing another idea. Changes
-already included by another writer, including a remote tree with additional work,
-are archived as obsolete. A model runs only for failed source verification or an
-integration that needs source reasoning. Unfinished native merge/rebase operations
-whose metadata v1 did not retain are blocked until their parents/metadata are
-explicitly reconstructed; they never become an accidental single-parent replay. It receives a narrow checkpoint-only
-prompt and the original profile/permissions, plus fresh subscription admission that honors pacing even when a normal loop child
-received an internal quota override, or fresh API budget admission. A matching durable provider conversation created in this actual recovery checkout is preferred;
-a missing or mismatched stable account identity/profile or absent local session
-artifact starts a narrow new conversation. OAuth refresh preserves account
-identity when its stable account ID is bound to the credential document; separate
-cached CLI profiles do not establish that binding, so unknown accounts use a
-narrow new conversation. Conversations from historical working directories also start narrowly
-in the fresh checkout, without binding or modifying the historical path. The GitHub proxy, safe-push helper and pre-push hook reject
-continuation publication; its origin is fetch-only and GitHub token environment
-variables are removed. The supervisor verifies the resulting source before
-publication and checks committed blob bytes, paths and executable bits against
-the verified inventory. Recovery commits disable hooks. Changed
-source is retained using the same checkpoint format, including new files left by
-an interrupted continuation once no local checkout users are observed. Content repair allowances
-remain separate from infrastructure retries; known failures before model launch
-refund content allowances. Publication includes only tracked changes and declared
-untracked source covered by the verifier. Ignored drafts outside that inventory,
-provider settings, notes and logs stay archived outside the publication checkout;
-continuation diagnostics are written below the recovery record, outside source. Full verification is required;
-recovery does not introduce a new source-only push-red route.
+Recovery restores exact saved bytes into a private clone. For a head that
+preserves the original lineage, a clean three-way integration can run
+mechanically. After a rewritten head, recovery computes only the delta from the
+expected head to the saved source and applies it to a new private checkout of
+the current head. It preserves the complete previous checkout and an immutable
+source snapshot. A journaled handoff resumes after crashes before, between or
+after checkout renames. Removed ancestry is never merged back. Conflicting
+deltas receive a narrow, freshly admitted continuation under the original
+profile, billing mode, permissions and remaining repair budget. Publication
+rejects any continuation that imports the removed lineage, including former
+integration targets removed by later rewrites. Local Git refs retain all
+lineage inputs across garbage collection and checkout reconstruction.
 
-One invocation and at most eight source inspections are allowed per phase, with
-a cursor to avoid starvation. Archived and unchanged blocked metadata do not
-consume those source slots. At most one blocked PR receives a cheap current-fact
-probe per phase, at 30-minute intervals, to observe closure or changed heads. Infrastructure failures retry after 60, 300 and
-1800 seconds; three failed invocations for unchanged checkpoint/external facts
-block further invocations. Claim, policy and admission
-waits do not consume those attempts. Changed PR facts re-enable eligibility.
-Selection-local waits do not schedule recovery-only children until the original
-operator policy changes. The loop preserves its requested provider policy
-separately from its model selection for unrelated work. Failed exact-input
-receipts may avoid repeating failed builds while waiting for continuation
-admission; they never authorize publication.
-Quota-independent probes run at most once per five minutes; a probe that made no
-progress returns no-progress, preserving normal work and backoff behavior.
-An operator can place `{"retry_epoch": 1}` in a record's `operator.json` after
-repairing infrastructure; changing the epoch re-enables the bounded retries.
-`content_allowance` can explicitly authorize another narrow continuation without
-resetting the original workflow's repair counters. Legacy records lacking durable
-publication authorization, sandbox-required rounds without a supported isolated
-sandbox recovery backend, unsupported destinations, new-PR authoring without a
-structured PR target, and exact one-launch foreign canaries retain a structured
-blocked disposition rather than gaining inferred permission. A trusted operator
-may supply the original structured `authorization` and an explicitly identified
-original `pr` in `operator.json`. After reconstructing and finishing a native
-operation in `record/checkout`, `operation_repaired: true` allows exact verification
-and current-head integration under the same publication checks.
+Paid continuations use the original workflow's content allowance and counters;
+there is no additional default one-continuation limit. Failed source verification
+can schedule another content repair while that allowance remains. Content
+failures are separate from infrastructure failures. Known failures before model
+launch refund content counters, while admitted work keeps its charge. A model
+that died after resolving a delta gets mechanical verification before another
+paid launch. Every paid continuation starts a narrow new provider conversation
+in the real private checkout, with retained source and evidence. Recovery does
+not rebind a historical cwd or resume a conversation tied to the worker tree.
+It requires neither rootless PID namespaces nor containment markers/proofs.
+Original sandbox requirements remain in force: this host recovery path cannot
+weaken an explicitly selected sandbox. Ordinary owned-process-group cleanup
+and configured timeouts remain the runner's responsibility.
 
-`tauceti recovery --json` and prepared local activity expose the consumer's durable
-state/reason; status does not read GitHub. The fresh-repair fence is worker-local;
-shared claims and the expected-head CAS coordinate writers across the fleet. For the historical PR16035 case, see
-[evidence/issue-310-pr16035-disposition.json](evidence/issue-310-pr16035-disposition.json).
-Terminal and blocked recovery queue bounded housekeeping for rebuildable caches in isolated/restoration clones;
-source, Git history, immutable records and outboxes remain archived.
+Verification uses the installed `tauceti verify` implementation and exact-input
+receipts. Committed paths, blob bytes, symlink targets and executable bits are
+checked against the verified inventory before CAS publication. Undeclared
+scratch files remain archived outside the publication checkout. New source from
+an interrupted continuation is checkpointed with source-integrity checks. Full
+verification remains required; recovery adds no push-red permission.
 
-The production disposition is also retained under the main worker state tree's
-`recovery-dispositions/pr-16035.json`; its search scope is explicitly local.
+A crash after push reconciles actual remote state before replay. A confirmed
+push subsequently removed by another writer is archived. A moved head that no
+longer contains an unacknowledged pending commit archives that uncertain intent
+without replay: its absence cannot prove that publication never happened.
+The journal separately records when the push process starts. The safe-push
+helper reports permission refusal (77), stale-head rejection (78), server
+policy rejection (79), and local preflight infrastructure failure (80)
+separately from uncertain transport or remote failure.
+Only an explicit destination rejection proves that the push was not accepted;
+server policy refusals receive bounded infrastructure backoff. Known-unsent work
+can be reintegrated automatically; uncertainty always reconciles first.
+The helper retains the earliest unacknowledged normal push within its original
+round across subsequent rejections. Annotated Git tags retain source and intent
+without introducing synthetic source commits; later rounds have separate intents.
+Handoffs use their receiving round's attempt and publication refs, so a later
+unrelated push cannot consume them. A supervisor publication still awaiting
+reconciliation is offered only as forensic evidence, leaving the supervisor's
+scheduled reconciliation active. Known local failures before push clear only
+that invocation's never-sent intent.
+Source preservation carries this intent into the recovery record or
+the separate publication sidecar when identical source was already saved. A receiving
+round's checkpoint therefore cannot bypass publication reconciliation. Uncertain
+normal publication is confirmed remotely or retained as forensic evidence for
+fresh normal work; it cannot authorize automatic replay of a different commit.
+An uncertain supervisor push can only retry its exact original commit after
+verification. Changed source remains evidence for fresh normal work, and failed
+reverification cannot launch paid content repair behind an uncertain intent.
+Fresh normal work can assess retained evidence against the current remote head
+under its own unchanged policy. No human must edit a journal or resolve a queue.
+Recovery creates no extra PRs or comments; existing GitHub intents keep their
+normal durable outbox and reconciliation behavior.
+An up-to-date push of unchanged source is not a new publication outcome and cannot
+consume a retained repair. Exact no-op intents cannot change the remote ref and
+do not block mechanical verification of the unpublished edits.
 
-Set `TAUCETI_AUTO_RECOVERY=off` to stop starting recovery invocations. An invocation
-already owning work finishes; its checkout, checkpoint, receipt and outbox are
-preserved. This switch does not disable the K0 source-preservation guard.
+Each phase runs at most one recovery invocation and inspects at most eight
+source records. Scheduled metadata checks also reevaluate holds and permissions
+without model funding, with a shared thirty-minute scheduling throttle so a blocked
+backlog cannot continuously replace normal work. Checks observe PR closure or head changes
+through the existing shared state service, without a direct GitHub fallback or
+payload hashing. Infrastructure retries back off for
+60, 300 and 1800 seconds. Three failed invocations for unchanged facts block that
+checkpoint; a scheduled mechanical recheck after the backoff or changed
+external facts automatically restores eligibility, even without model funding.
+Cumulative failure counts
+remain recorded; unchanged repeated infrastructure failures increase backoff
+up to six hours. Repeated exact-input verification failures also increase their
+mechanical recheck interval up to six hours, even when source and funding have
+not changed. Changed external facts reset this delay. Exhausted content allowances permit mechanical reevaluation
+and normal work, without authorizing another identical paid attempt.
+Claim, capacity, policy, budget and content waits do not consume infrastructure
+attempts. Content remains bounded by the original workflow's existing counters.
+Consumer protocol 3 automatically re-evaluates older operator-dependent blocks
+and obsolete containment waits without resetting paid counters or granting new
+permissions. No `operator.json`
+file is read or required.
+
+Missing original authorization, unsupported destinations/providers, unsupported
+sandbox recovery and v1 native Git operations whose metadata was not retained
+cannot acquire inferred replay authority. Their exact source remains blocked as
+evidence while fresh normal work continues under current policy. This is a
+machine disposition, not a request for operator action. Source, Git history,
+immutable records and outboxes are preserved; rebuildable caches are queued for bounded housekeeping from terminal and blocked
+checkouts. Recovery integration clones use the same discoverable restoration layout.
+A live or uncertain cleanup candidate is skipped without blocking recovery.
+Eligible recovery retains its working dependency cache across ordinary waits;
+reintegration alone does not enqueue eviction of the live recovery checkout.
+
+`tauceti recovery --json` and prepared activity expose durable state, reason,
+next machine action and retry condition. Status does not read GitHub. The
+historical PR16035 disposition is retained in
+[evidence/issue-310-pr16035-disposition.json](evidence/issue-310-pr16035-disposition.json)
+and the main worker state tree's `recovery-dispositions/pr-16035.json`.
+
+Set `TAUCETI_AUTO_RECOVERY=off` to stop starting recovery invocations and release
+recovery reservations. Current owned invocations finish. Every checkpoint,
+checkout, receipt and outbox is preserved, and the K0 source-preservation guard
+remains enabled. Normal workflow permissions, holds and budgets still apply.
+
+The containment framework was removed by
+[#366](https://github.com/TauCetiProject/TauCetiWorker/pull/366), tracked by
+[#364](https://github.com/TauCetiProject/TauCetiWorker/issues/364). Recovery builds
+on that baseline, including its runner, doctor, audit and shared-cache changes. Implementation fixture
+evidence does not establish deployment or naturally observed production recovery.
 
 ## K3 validation and canary evidence
 

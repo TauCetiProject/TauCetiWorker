@@ -661,6 +661,11 @@ def prepare_checkout(
 
     def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            work_recovery.detach_handoff_owner(cfg)
+        except OSError as error:
+            log(f"checkout ownership detach deferred: {error}")
+            return False
         log(f"cloning {TAUCETI} → {co} ({why})")
         return subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)]).returncode == 0
 
@@ -687,6 +692,11 @@ def prepare_checkout(
         return False
     if g("fetch", "-q", "origin"):
         return False  # usually the network; the next round retries
+    try:
+        work_recovery.detach_handoff_owner(cfg)
+    except OSError as error:
+        log(f"checkout ownership detach deferred: {error}")
+        return False
     # -f discards a prior round's leftover edits (now saved) and lands us on main in one step; a plain
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
     # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves

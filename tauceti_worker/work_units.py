@@ -1739,25 +1739,70 @@ def _do_fixlike(
 
         push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
         published_before = _rev(co, push_marker)
-        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before))
+        push_scope = conversation_round or os.urandom(16).hex()
+        scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
+        scoped_published_before = _rev(co, scoped_push_marker)
+        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before, scope=push_scope))
+        handoffs = []
+        if (
+            not foreign
+            and label != "bump"
+            and not getattr(p, "automatic_bump", False)
+            and getattr(p, "author", None)
+            and getattr(sv, "me_login", None)
+            and p.author.lower() == sv.me_login.lower()
+        ):
+            from .repair_recovery import Wait as RecoveryWait
+            from .repair_recovery import handoff_context
+            from .work_recovery import RecordError as RecoveryRecordError
+
+            try:
+                retained, handoffs = handoff_context(
+                    w.cfg,
+                    getattr(getattr(w, "gh", None), "repo", TAUCETI),
+                    pr,
+                    head=checked,
+                    actor=getattr(sv, "me_login", ""),
+                    checkout=co,
+                    push_marker=push_marker,
+                    published_before=published_before,
+                    push_scope=push_scope,
+                )
+                prompt += retained
+            except (OSError, RuntimeError, RecoveryWait, RecoveryRecordError) as error:
+                log(f"  #{pr}: source handoff deferred without model launch: {error}")
+                return decline_foreign_repair()
         agent_rc = None
+        from .config import AdmissionUnavailable
+
         try:
-            rc = run_agent_host(
-                co,
-                prompt,
-                _effective_authoring_profile(opts),
-                w.cfg.logdir,
-                cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
-                session_path=conversation_path,
-                session_actor=getattr(sv, "me_login", ""),
-                session_scope=conversation_scope,
-            )
+            from .repair_recovery import environment
+
+            with environment(TAUCETI_PUSH_SCOPE=push_scope):
+                rc = run_agent_host(
+                    co,
+                    prompt,
+                    _effective_authoring_profile(opts),
+                    w.cfg.logdir,
+                    cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
+                    session_path=conversation_path,
+                    session_actor=getattr(sv, "me_login", ""),
+                    session_scope=conversation_scope,
+                )
             agent_rc = rc
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
+            from .repair_recovery import return_handoffs
+
+            return_handoffs(handoffs)
+            raise
+        except AdmissionUnavailable:
+            from .repair_recovery import return_handoffs
+
+            return_handoffs(handoffs)
             raise
         finally:
             # The owned agent process group has been swept before this returns or raises.
@@ -1766,14 +1811,22 @@ def _do_fixlike(
             from .work_recovery import guard, note_owner
 
             if (co / ".git").exists():
-                published_after = _rev(co, push_marker)
+                published_after = _rev(co, scoped_push_marker)
                 note_owner(
                     w.cfg,
+                    recovery_handoffs=handoffs,
                     round_outcome=dict(
                         exit_code=agent_rc,
-                        published_head=published_after if published_after != published_before else None,
+                        published_head=published_after if published_after != scoped_published_before else None,
                     ),
                 )
+                if handoffs and published_after and published_after != scoped_published_before:
+                    from .repair_recovery import complete_handoffs
+
+                    try:
+                        complete_handoffs(w.cfg, handoffs, published_after)
+                    except OSError as error:
+                        log(f"recovery handoff acknowledgement deferred; durable push marker retained: {error}")
                 guard(w.cfg, co)
     if rc == 0:
         w.rs.bust(pr)
