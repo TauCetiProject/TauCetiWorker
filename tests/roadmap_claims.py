@@ -4,17 +4,20 @@ intentions board, but not unclaimed intentions or claims held by its own (or ope
 identities. Assigned administrative holds bind every identity.
 
 These exercise the pure pieces (no network): parse_scope (pull "Items in scope" from an Intention
-issue body), select_foreign (ours/theirs/unassigned filtering), and claimed_block (prompt rendering).
+issue body), in_area (which area an intention belongs to), select_foreign (ours/theirs/unassigned
+filtering), claimed_block (prompt rendering), and avoid_list against a fake `gh`.
 
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
+import re
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from tauceti_worker import intentions as it  # noqa: E402
+from tauceti_worker.github import GitHubError  # noqa: E402
 
 fails = 0
 
@@ -127,6 +130,117 @@ blank = it.select_foreign(
     {"kim-em"},
 )
 check("blank scope falls back to title", blank and blank[0].scope == "fallback title")
+
+
+# --- in_area ---------------------------------------------------------------
+# Real intentions mostly carry no `roadmap/<area>` label: the area is the form's dropdown answer,
+# free text after it when filed through the API, or only a mention in a free-form body.
+def form(area, scope="some targets"):
+    return f"### Roadmap area\n\n{area}\n\n### Items in scope\n\n{scope}\n\n### Notes\n\n_No response_\n"
+
+
+def issue(body="", title="[Intention]: t", labels=()):
+    return {"title": title, "body": body, "labels": [{"name": n} for n in labels]}
+
+
+gqf, scheme = {"GlobalQuadraticForms"}, {"SchemeAndStackFoundations"}
+rep = {"RepresentationTheory", "CharacterTheory", "RootSystems"}
+check("area label alone places an intention", it.in_area(issue(labels=["roadmap/GlobalQuadraticForms"]), gqf))
+check("form answer alone places an intention", it.in_area(issue(form("SchemeAndStackFoundations")), scheme))
+check("form answer for another area does not", not it.in_area(issue(form("AlgebraicCurves")), scheme))
+check(
+    "free text after the area name still places it",
+    it.in_area(issue(form("EnriquesSurfaces (new complete roadmap)")), {"EnriquesSurfaces"}),
+)
+check("area/sub-roadmap path places it in the area", it.in_area(issue(form("RepresentationTheory/RootSystems")), rep))
+check("a sub-roadmap name alone places it in the area", it.in_area(issue(form("CharacterTheory")), rep))
+check(
+    "a sub-roadmap name needs the area's sub-roadmap list",
+    not it.in_area(issue(form("CharacterTheory")), {"RepresentationTheory"}),
+)
+check(
+    "with a form answer, a scope mention of another area does not count",
+    not it.in_area(issue(form("AlgebraicCurves", "consumes ModularCurves 3.2")), {"ModularCurves"}),
+)
+check(
+    "without the section, the free-form body places it",
+    it.in_area(issue("Extend CharacterTheory Layer 3 with faithful tensor generation."), rep),
+)
+check(
+    "an unanswered section falls back to the title",
+    it.in_area(issue(form("_No response_"), title="[Intention]: PDE — energy estimates"), {"PDE"}),
+)
+check("names match whole words only", not it.in_area(issue(form("AdicSpacesPartII")), {"AdicSpaces"}))
+check("names match case-sensitively", not it.in_area(issue("Left and right Fueter regularity."), {"Regularity"}))
+
+
+# --- avoid_list: one read per round, no area label in the query --------------
+class FakeGH:
+    def __init__(self, issues, error=None):
+        self.issues, self.error, self.calls = issues, error, []
+
+    def issue_list(self, repo, *, labels=None, fields, state="open", limit=200):
+        self.calls.append((list(labels or []), limit))
+        if self.error:
+            raise self.error
+        return [i for i in self.issues if all(lb in it._label_names(i) for lb in labels or [])]
+
+
+def intention(n, body, assignee, *labels):
+    return {
+        "number": n,
+        "url": f"u{n}",
+        "title": f"[Intention]: {n}",
+        "body": body,
+        "assignees": [{"login": assignee}] if assignee else [],
+        "labels": [{"name": lb} for lb in ("intention", *labels)],
+    }
+
+
+it.roadmap_subareas = lambda _gh, area: ["CharacterTheory"] if area == "RepresentationTheory" else []
+it.own_identities = lambda: {"kim-em"}
+hold_labels = ("administrative-hold", "roadmap/GlobalQuadraticForms", "roadmap/IntegralLattices")
+board = [
+    intention(11, form("CharacterTheory", "faithful tensor generation"), "someone"),
+    intention(12, form("AlgebraicCurves"), "someone"),
+    intention(13, form("RepresentationTheory"), "kim-em"),  # ours
+    intention(14, form("GlobalQuadraticForms", "Hasse-Minkowski"), "roed-math", *hold_labels),
+]
+ALL = (["intention"], it.INTENTION_LIMIT)
+HOLDS = (["intention", "administrative-hold"], it.INTENTION_LIMIT)
+
+
+def round_(area, respect=True):
+    gh = FakeGH(board)
+    text = it.avoid_list(gh, area, respect)
+    return gh.calls, [int(n) for n in re.findall(r"^- #(\d+)", text, re.M)]
+
+
+calls, nums = round_("RepresentationTheory")
+check("a pinned round reads every open intention once", calls == [ALL])
+check("an unlabelled claim reaches its area through a sub-roadmap", nums == [11])
+check("a hold applies through its form answer, whoever holds it", round_("GlobalQuadraticForms")[1] == [14])
+check("a hold applies through either area label", round_("IntegralLattices")[1] == [14])
+check("a hold does not reach other areas", round_("AlgebraicCurves")[1] == [12])
+check("an unpinned round reads only the holds and gets all of them", round_(None) == ([HOLDS], [14]))
+check("an ignore-claims round reads only the holds", round_("RepresentationTheory", respect=False) == ([HOLDS], []))
+check("nothing to avoid renders as none", it.avoid_list(FakeGH([]), "PDE", True) == "none")
+
+try:
+    it.avoid_list(FakeGH(board, error=GitHubError("HTTP 504")), "PDE", True)
+    raised = False
+except GitHubError:
+    raised = True
+check("a failed read stops authoring, since holds fail closed", raised)
+
+
+def no_identity():
+    raise RuntimeError("gh auth unavailable")
+
+
+it.own_identities = no_identity
+check("unresolvable claims fail open", round_("RepresentationTheory")[1] == [])
+check("...and keep the holds", round_("GlobalQuadraticForms")[1] == [14])
 
 
 # --- claimed_block ---------------------------------------------------------

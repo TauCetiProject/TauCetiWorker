@@ -155,7 +155,7 @@ def test_roadmap():
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     os.environ["TAUCETI_PUSH_EXPECT"] = "stale"  # must be popped by do_roadmap (create-only on the fork)
     tc.work_units.ensure_fork = lambda: FORK
-    tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
+    tc.work_units.avoid_list = lambda *_args: "none"
 
     # A real review checkout, so the round exercises the BUNDLED path rather than the fallback:
     # stage_rubrics only produces a bundle when it finds rubrics to concatenate.
@@ -199,8 +199,8 @@ def test_roadmap():
     )
     check("roadmap: prompt encourages cross-roadmap prerequisites", "Follow prerequisites across roadmaps" in prompt)
     check(
-        "roadmap: switched target checks its own intention board",
-        '--label "roadmap/<target-roadmap>"' in prompt,
+        "roadmap: switched target checks its own intention board by name, not by area label",
+        r'test("\\b<target-roadmap>\\b")' in prompt and '--label "roadmap/<target-roadmap>"' not in prompt,
     )
     check("roadmap: claim follows the actual target", "author/<target-roadmap>/<slug>" in prompt)
     check("roadmap: marker follows the actual target", '"focus":"<target-roadmap>"' in prompt)

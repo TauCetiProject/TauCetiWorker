@@ -110,6 +110,25 @@ def roadmap_areas(gh) -> list[str]:
     return sorted(out.splitlines()) if out else []
 
 
+def roadmap_subareas(gh, area: str) -> list[str]:
+    """The sub-roadmaps nested in `area`: its subdirectories holding a Suggested.lean (a references
+    folder holds none). An intention may name only the sub-roadmap. Returns [] if it can't be fetched."""
+    from .shared_repositories import snapshot
+
+    try:
+        tree = snapshot(ROADMAP, ttl=3600)
+        if tree:
+            root = tree / ROADMAP_DIR / area
+            return sorted(p.name for p in root.iterdir() if (p / "Suggested.lean").is_file()) if root.is_dir() else []
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        pass
+    out = gh.api_jq(
+        f"repos/{ROADMAP}/git/trees/HEAD:{ROADMAP_DIR}/{area}?recursive=1",
+        r'.tree[] | select(.type=="blob") | .path | select(test("^[^/]+/Suggested\\.lean$")) | split("/")[0]',
+    )
+    return sorted(out.splitlines()) if out else []
+
+
 def sanitize_wid(raw: str) -> str:
     s = raw.lower()
     return re.sub(r"[^a-z0-9-]", "-", s)

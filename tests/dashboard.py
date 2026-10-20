@@ -245,13 +245,13 @@ def test_random_default():
             "run_agent_host",
             "roadmap_areas",
             "ensure_fork",
-            "administrative_hold_avoid_list",
+            "avoid_list",
         )
     }
     orig_choice = tc.random.choice
     tc.work_units.fetch_ref = lambda *a, **k: True
     tc.work_units.ensure_fork = lambda: "alice/TauCeti"  # do_roadmap forks before launching; stub it
-    tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
+    tc.work_units.avoid_list = lambda *_args: "none"
     tc.work_units.prepare_checkout = lambda cfg, **_: True
     tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
     cfg = SimpleNamespace(
@@ -304,12 +304,12 @@ def test_skip_edge_cases():
             "run_agent_host",
             "roadmap_areas",
             "ensure_fork",
-            "administrative_hold_avoid_list",
+            "avoid_list",
         )
     }
     tc.work_units.fetch_ref = lambda *a, **k: True
     tc.work_units.ensure_fork = lambda: "alice/TauCeti"  # do_roadmap forks before launching; stub it
-    tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
+    tc.work_units.avoid_list = lambda *_args: "none"
     tc.work_units.prepare_checkout = lambda cfg, **_: True
     tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
     tc.work_units.roadmap_areas = lambda gh: ["algebra", "topology"]
