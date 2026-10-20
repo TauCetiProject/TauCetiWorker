@@ -1413,12 +1413,13 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
         p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
         return p.stdout.strip() if p.returncode == 0 else ""
 
-    main = git("rev-parse", "--verify", "origin/main")
+    base_ref = "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")
+    main = git("rev-parse", "--verify", base_ref)
     head = git("rev-parse", "HEAD")
     if main and main != head:
         # An explicit toolchain fetch also primes the store for a rebase that changes Lean versions.
-        toolchain = git("show", "origin/main:lean-toolchain")
-        revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), "origin/main")
+        toolchain = git("show", base_ref + ":lean-toolchain")
+        revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), base_ref)
         for revision in revisions.splitlines():
             status = fetch(
                 "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])]
