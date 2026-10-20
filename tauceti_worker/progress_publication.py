@@ -63,7 +63,7 @@ def retained(cfg):
         # arbitrary leftover model files without the matching publication evidence.
         env = dict(os.environ)
         paths = outbox.intent_paths(env)
-        paths |= set(outbox.directory(env).glob("*.complete"))
+        paths |= outbox.intent_paths(env, suffix="complete")
         plan = json.loads((work / "plan.json").read_text())
         for path in paths:
             try:

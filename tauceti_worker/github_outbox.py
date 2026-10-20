@@ -61,10 +61,10 @@ def semantic_key(payload):
     return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
 
 
-def intent_paths(env=None):
+def intent_paths(env=None, *, suffix="json"):
     env = os.environ if env is None else env
     legacy = tr.root() / "outbox" / (tr.scope(env) or "unselected") / env.get("TAUCETI_WORKER_ID", "unknown")
-    return set(directory(env).glob("*.json")) | set(legacy.glob("*.json"))
+    return set(directory(env).glob(f"*.{suffix}")) | set(legacy.glob(f"*.{suffix}"))
 
 
 def fork_upstream(args):

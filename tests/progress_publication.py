@@ -17,7 +17,7 @@ from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
 from tauceti_worker.constants import EX_NOPROGRESS, PROGRESS_REF, ROADMAP
 from tauceti_worker.github_outbox import directory
-from tauceti_worker.github_transport import atomic
+from tauceti_worker.github_transport import atomic, register_principal
 from tauceti_worker.survey import progress_due
 
 with (
@@ -79,6 +79,9 @@ with (
             "context": {"actor": "author"},
         },
     )
+    # Completed legacy receipts remain discoverable after quota/principal migration.
+    register_principal(123, "author")
+    assert directory() != intent.parent
     # A malformed unrelated intent cannot hide valid recovery evidence.
     atomic(directory() / "broken.json", ["invalid"])
     assert publication.retained(cfg)["legacy"]
