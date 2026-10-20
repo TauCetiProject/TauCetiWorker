@@ -1233,6 +1233,51 @@ with patch('os.readlink', side_effect=OSError('PID namespaces unavailable')):
         self.tick()
         self.assertFalse(doomed.exists())
 
+    def test_interrupted_verification_temp_files_do_not_block_cleanup(self):
+        expected = self.dirty()
+        tree = self.retained()
+        pending = self.cfg.state / "verification-pending"
+        pending.mkdir()
+        for name in (".verification-interrupted", ".job.json.abcd", "unpublished.tmp"):
+            (pending / name).write_text("{partial")
+        self.tick()
+        self.assertFalse(tree.exists())
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+
+    def test_aliased_root_registrations_share_one_deletion_cursor(self):
+        expected = self.dirty()
+        tree = self.retained()
+        alias = self.root / "checkout-alias"
+        alias.symlink_to(tree.parent, target_is_directory=True)
+        # register canonicalizes new aliases; fixtures also emulate an older root file.
+        maintenance.register(self.cfg.state, alias, "TauCeti", "fixture")
+        registry = self.cfg.state / "recovery-cleanup" / "roots"
+        self.assertEqual(len(list(registry.glob("*.json"))), 1)
+        wr.atomic_json(
+            registry / "old-alias.json", dict(version=1, parent=str(alias), label="TauCeti", repository="fixture")
+        )
+        # A symlink at the root itself is rejected. An aliased ancestor is canonicalized.
+        alias_parent = self.root / "aliased-parent"
+        alias_parent.symlink_to(tree.parent.parent, target_is_directory=True)
+        wr.atomic_json(
+            registry / "old-parent-alias.json",
+            dict(version=1, parent=str(alias_parent / tree.parent.name), label="TauCeti", repository="fixture"),
+        )
+        seen = []
+
+        def hold(state, candidate, root, work, observation):
+            seen.append(str(candidate))
+            observation.update(next_action="fixture-budget", created_at=time.time())
+
+        with patch.object(maintenance, "_cleanup", hold):
+            self.tick()
+        self.assertEqual(seen, [str(tree.resolve())])
+        self.tick()
+        self.assertFalse(tree.exists())
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+
     def test_prepared_summary_and_rollback_do_no_payload_analysis(self):
         self.dirty()
         tree = Path(wr.retain(self.cfg, self.co, "fixture").details["retained"])

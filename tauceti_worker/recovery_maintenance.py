@@ -69,8 +69,9 @@ def _name(path):
 
 def register(state, parent, label, repository):
     """Register before moving a checkout: a crash cannot orphan its discovery root."""
+    parent = parent.resolve()
     path = state / "recovery-cleanup" / "roots" / f"{_name(parent)}.json"
-    expected = dict(version=1, parent=str(parent.absolute()), label=label, repository=repository)
+    expected = dict(version=1, parent=str(parent), label=label, repository=repository)
     if _metadata(path) == expected:
         return
     atomic_json(
@@ -170,6 +171,8 @@ def _referenced(state, tree):
         with os.scandir(directory) as entries:
             for entry in entries:
                 _charge(entries=1)
+                if entry.name.startswith(".") or not entry.name.endswith(".json"):
+                    continue  # interrupted atomic writes never became pending jobs
                 job = _metadata(Path(entry.path))
                 if not job:
                     return True  # malformed reference withholds only this destructive candidate
@@ -651,6 +654,7 @@ class Sweep:
         self.items = self.scan()
         self.pending = None
         self.current_registration = {}
+        self.registered_roots = {}
 
     def scan(self):
         if not self.base.is_dir():
@@ -686,6 +690,7 @@ class Sweep:
             or (state / "recovery-preparation.json").exists()
         ):
             return
+        self.registered_roots[state] = set()
         self.rows[state] = dict.fromkeys(COUNTS, 0) | {
             "reasons": [],
             "cleanup_backlog": 0,
@@ -743,6 +748,18 @@ class Sweep:
                     or not all(k in registry for k in ("label", "repository"))
                 ):
                     return
+            # Older index roots may use different aliases for the same directory. Enumerate
+            # its inode only once so deletion has one journal/cursor after a partial rename.
+            parent = Path(name).resolve()
+            try:
+                info = parent.stat()
+            except FileNotFoundError:
+                return
+            identity = (root["category"], info.st_dev, info.st_ino)
+            if identity in self.registered_roots[state]:
+                return
+            self.registered_roots[state].add(identity)
+            registry["record" if root["category"] == "cache" else "parent"] = str(parent)
             self.current_registration = registry
             return
         if kind in {"cache-entry", "retained-entry"}:
