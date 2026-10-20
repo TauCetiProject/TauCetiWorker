@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import activity, config, retention, shared_mathlib, work_recovery
+from tauceti_worker import activity, config, processes, retention, shared_mathlib, work_recovery
 from tauceti_worker import round as round_
 from tauceti_worker.runtime_status import atomic_json, read_json
 
@@ -191,19 +191,30 @@ class Retention(unittest.TestCase):
         signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
         try:
             with (
+                patch.dict(os.environ, {"TAUCETI_PROCESS_CONTAINMENT": "required"}),
                 patch.object(subprocess, "Popen", side_effect=without_namespaces),
                 patch("tauceti_worker.resources.RoundResources.start"),
             ):
                 with round_.RoundContext(self.cfg):
                     self.assertFalse(cache.exists())
                     self.assertEqual((self.checkout / "Source.lean").read_text(), "unpublished work")
-                    (self.checkout / "next-action").write_text("useful progress")
+                    result = processes.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            "from pathlib import Path; Path('next-action').write_text('useful progress')",
+                        ],
+                        cwd=self.checkout,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
                 with round_.RoundContext(self.cfg):
-                    self.assertTrue((self.checkout / "next-action").exists())
+                    self.assertEqual((self.checkout / "next-action").read_text(), "useful progress")
         finally:
             for sig, handler in signals.items():
                 signal.signal(sig, handler)
-        for marker in (markers[0], markers[2], markers[3]):
+        for marker in markers:
             self.assertEqual(marker.read_text(), "malformed historical evidence")
 
     def test_live_supervisor_recycles_only_at_its_own_round_boundary(self):
