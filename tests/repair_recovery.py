@@ -925,7 +925,7 @@ class Fixture(unittest.TestCase):
         self.assertIn("Committed source differs", self.journal()["reason"]["detail"])
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
-    def test_terminal_recovery_evicts_only_rebuildable_caches(self):
+    def test_terminal_recovery_defers_cache_eviction(self):
         actual = self.backend.verify
 
         def cache(checkout, *args):
@@ -935,17 +935,20 @@ class Fixture(unittest.TestCase):
 
         with patch.object(self.backend, "verify", cache):
             self.assertTrue(self.run_recovery())
-        self.assertFalse((self.record / "checkout/.lake").exists())
+        self.assertTrue((self.record / "checkout/.lake").exists())
+        self.assertTrue(list((self.cfg.state / "recovery-cleanup" / "cache-roots").glob("*.json")))
         self.assert_retained()
 
     def test_consumer_status_is_distinct_from_moved_aside_checkout(self):
         rr.write(self.record, {}, "retained")
+        saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
         summary = saved.summary(self.cfg.state.parent, workers={"w"})
         self.assertEqual(summary["recovery_retained"], 1)
         self.assertEqual(summary["retained"], 0)
         rr.write(
             self.record, {}, "blocked", reason=rr.reason(rr.Block("repair", "precise failure", "restore dependency"))
         )
+        saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
         summary = saved.summary(self.cfg.state.parent, workers={"w"})
         self.assertIn("next action: restore dependency", summary["reasons"][0])
 

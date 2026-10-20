@@ -38,6 +38,11 @@ class ActivityTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.addCleanup(setattr, a, "_round", None)
+        from tauceti_worker import work_recovery
+
+        recovery_home = patch.object(work_recovery, "HERE", Path(self.tmp.name) / "worker")
+        recovery_home.start()
+        self.addCleanup(recovery_home.stop)
         self.now = time.time()
 
     def finish(self, age, kind="review", outcome="completed", rid=None):
@@ -81,6 +86,14 @@ class ActivityTests(unittest.TestCase):
         self.assertNotIn("Outcome rows are subsets", output.getvalue())
         pr_start = next(i for i, line in enumerate(lines) if line.startswith("PRs authored"))
         self.assertEqual(lines[pr_start - 1], "")
+
+    def test_housekeeping_failure_does_not_abort_activity_refresh(self):
+        from tauceti_worker import work_recovery
+
+        with patch.object(work_recovery, "housekeep", side_effect=OSError("fixture housekeeping failure")):
+            value = a.prepare(now=self.now)
+        self.assertTrue(a.cached()["available"])
+        self.assertTrue(any("Recovery housekeeping deferred" in error for error in value["errors"]))
 
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)

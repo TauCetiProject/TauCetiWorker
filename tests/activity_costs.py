@@ -41,6 +41,11 @@ class CostTests(unittest.TestCase):
                 "TAUCETI_FLEET_EVENTS": str(self.root / "worker-events.jsonl"),
             },
         )
+        from tauceti_worker import work_recovery
+
+        recovery_home = patch.object(work_recovery, "HERE", self.root / "worker")
+        recovery_home.start()
+        self.addCleanup(recovery_home.stop)
         env.start()
         self.addCleanup(env.stop)
         with patch.object(a.time, "time", return_value=self.now - 10 * DAY):

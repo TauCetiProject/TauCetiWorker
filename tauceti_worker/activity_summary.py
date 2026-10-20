@@ -19,6 +19,8 @@ RECOVERY_COUNTS = (
     "superseded",
     "incomplete",
     "corrupt",
+    "errors",
+    "cleanup_backlog",
 ) + tuple(
     "recovery_" + state
     for state in (
@@ -288,12 +290,12 @@ def display(value, default_kinds=()):
         for reason in sharing.get("reasons", []):
             print("  " + reason)
     recovery = s.get("work_recovery")
-    if recovery and any(recovery.get(key) for key in RECOVERY_COUNTS):
+    if recovery and (any(recovery.get(key) for key in RECOVERY_COUNTS) or recovery.get("preparation_metadata_entries")):
         print()
         print(
             f"Local work recovery: {recovery.get('records', 0)} saved, "
             f"{recovery.get('retained', 0)} checkouts moved aside, "
-            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt"
+            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt, {recovery.get('errors', 0)} errors"
         )
         if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):
             print(
@@ -311,6 +313,13 @@ def display(value, default_kinds=()):
                     )
                 )
             )
+        print(
+            f"  Cleanup: {recovery.get('cleanup_backlog', 0)} queued, "
+            f"oldest {int(recovery.get('cleanup_oldest_age_seconds', 0))}s; "
+            f"preparation {recovery.get('preparation_seconds', 0):.3f}s, "
+            f"read {recovery.get('preparation_read_bytes', 0)}B, "
+            f"hashed {recovery.get('preparation_hash_bytes', 0)}B"
+        )
         for reason in recovery.get("reasons", []):
             print("  " + reason)
     if ci_rows:
@@ -458,6 +467,16 @@ def combine(values):
     recovery = [v.get("work_recovery", {}) for v in known]
     if any(recovery):
         s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
+        for key in (
+            "preparation_seconds",
+            "preparation_read_bytes",
+            "preparation_hash_bytes",
+            "preparation_metadata_entries",
+        ):
+            s["work_recovery"][key] = sum(row.get(key, 0) for row in recovery)
+        s["work_recovery"]["cleanup_oldest_age_seconds"] = max(
+            (row.get("cleanup_oldest_age_seconds", 0) for row in recovery), default=0
+        )
         s["work_recovery"]["reasons"] = sorted({reason for row in recovery for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):

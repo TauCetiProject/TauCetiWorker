@@ -504,6 +504,9 @@ class WorkerBackend:
         return self.w.claims.lost.is_set() or not self.owned
 
     def restore(self, record, m, j):
+        # Only an actual invocation invalidates completed cache housekeeping. Terminal history
+        # scans leave its original age, owner and progress untouched.
+        atomic_json(record / "cache-use.json", dict(generation=uuid.uuid4().hex))
         self.record, self.journal = record, j
         checkout = record / "checkout"
         if j.get("checkout_ready"):
@@ -596,21 +599,12 @@ class WorkerBackend:
             write(record, j, "resuming", retained_extra=str(dest))
 
     def evict_caches(self, record):
-        marker = record / "cache-evicted.json"
-        if read_json(marker).get("done"):
-            return
-        # Never delete source or Git history on a terminal transition. Build caches
-        # are rebuildable; interrupted restores never ran a model and keep their bytes.
-        for checkout in [record / "checkout", *record.glob("restore-*"), *record.glob("interrupted-restore-*")]:
-            if checkout.is_dir():
-                if saved.live_users(checkout):
-                    return
-                try:
-                    saved._evict_caches(checkout)
-                except OSError as error:
-                    log(f"recovery cache eviction deferred: {error}")
-                    return
-        atomic_json(marker, dict(done=True))
+        from .recovery_maintenance import defer_caches
+
+        try:
+            defer_caches(self.w.cfg.state, record)
+        except OSError as error:
+            log(f"recovery cache housekeeping deferred: {error}")
 
     def commit_source(self, checkout, m):
         snap = saved.inspect(checkout)
