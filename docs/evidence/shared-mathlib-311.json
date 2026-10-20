@@ -93,10 +93,23 @@
       "no comparable completed natural shared round",
       "actual storage reads and stalls absent from prior resource receipt; unknown, not zero"
     ],
-    "next_gate": "One existing worker, expiring auto policy; full natural round, isolation, preparation and cleanup evidence required before expansion",
+    "next_gate": "Deploy patched namespace protection at natural boundaries; preserve active paid sessions; resolve publication disk guard; then explicitly clear safety stop and enable worker7 auto for 24h before natural-round validation.",
     "capacity_or_spending_increased": false,
     "paid_measurement_work_launched": false,
     "active_sessions_restarted": false,
-    "synthetic_benchmarks_run": false
+    "synthetic_benchmarks_run": false,
+    "policy": {
+      "expires_at": 1792556220.029676,
+      "expiry_mode": "off",
+      "issue": 311,
+      "mode": "off",
+      "workers": [
+        "worker7"
+      ]
+    },
+    "safety_stop": {
+      "reason": "Installed release lacks private-namespace pool protection; keep future rounds off until patched deployment and natural isolation validation. Disk guard also blocks publication.",
+      "stopped_at": 1792469820.0264835
+    }
   }
 }
