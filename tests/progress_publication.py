@@ -271,6 +271,10 @@ with (
     value = publication.save(cfg, "author", PROGRESS_REF)
     parked = publication.park(cfg, value, "fixture")
     assert (parked / name).read_bytes() == bundle
+    assert (parked / name).stat().st_ino == (work / name).stat().st_ino
+    with patch.object(publication.os, "link", side_effect=OSError("cross-device")):
+        publication.retain_facts_bundle(work / name, parked / "fallback.json.gz")
+    assert (parked / "fallback.json.gz").read_bytes() == bundle
     assert publication.fingerprints(parked) == value["files"]
     value = publication.save(cfg, "author", PROGRESS_REF)
     (work / name).unlink()

@@ -2328,7 +2328,10 @@ def _do_progress_inner(w, opts) -> int | None:
             pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
         for artifact in artifacts:
             if artifact.exists():
-                shutil.copyfile(artifact, previous / artifact.name)
+                if artifact.name.startswith("plan.json.facts-"):
+                    publication.retain_facts_bundle(artifact, previous / artifact.name)
+                else:
+                    shutil.copyfile(artifact, previous / artifact.name)
         if not any(previous.iterdir()):
             previous.rmdir()
         for body in (status_body, section_body):
@@ -2336,7 +2339,7 @@ def _do_progress_inner(w, opts) -> int | None:
     # Install the retained immutable bytes durably before the plan that refers to them.
     try:
         if bundle := publication.facts_bundle(new_plan, verify=True):
-            _install_progress_body(bundle, work / bundle.name)
+            publication.retain_facts_bundle(bundle, work / bundle.name)
         _install_progress_body(new_plan, plan_file)
         _install_progress_body(new_facts, facts_file)
     except (OSError, ValueError) as exc:

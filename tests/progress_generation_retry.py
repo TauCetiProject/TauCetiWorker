@@ -200,10 +200,62 @@ class GenerationRetryTests(unittest.TestCase):
         with patch.dict(PLAN, documentation=pin), patch.dict(FACTS, documentation=pin):
             self.assertEqual(self.drive_inner(), 0)
         self.assertEqual((self.work / pin["bundle_file"]).read_bytes(), bundle)
+        source = next((self.root / "progress/mechanical").glob("attempt-*/1/" + pin["bundle_file"]))
+        self.assertEqual(source.stat().st_ino, (self.work / pin["bundle_file"]).stat().st_ino)
         saved = list((self.root / "progress/mechanical").glob("attempt-*/previous"))
         self.assertEqual(len(saved), 1)
         self.assertEqual((saved[0] / old_pin["bundle_file"]).read_bytes(), old_bytes)
         self.assertEqual(json.loads((saved[0] / "plan.json").read_text())["documentation"], old_pin)
+
+    def test_bundle_installed_before_interrupted_plan_recovers_next_round(self):
+        bundle, pin = self.pages_fixture()
+        original_run = self.run_tool
+        original_install = wu._install_progress_body
+
+        def bundled(stage, *args, **kwargs):
+            result = original_run(stage, *args, **kwargs)
+            if stage == "plan":
+                (Path(args[args.index("--out") + 1]).parent / pin["bundle_file"]).write_bytes(bundle)
+            return result
+
+        def interrupted(source, target):
+            if target.name == "plan.json":
+                raise OSError("simulated interrupted plan install")
+            return original_install(source, target)
+
+        self.run_tool = bundled
+        with patch.dict(PLAN, documentation=pin), patch.dict(FACTS, documentation=pin):
+            with patch.object(wu, "_install_progress_body", side_effect=interrupted):
+                with self.assertRaises(DocumentationUnavailable):
+                    self.drive_inner()
+            self.assertEqual((self.work / pin["bundle_file"]).read_bytes(), bundle)
+            self.assertFalse((self.work / "plan.json").exists())
+            self.assert_uncharged()
+            self.calls.clear()
+            self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual(self.calls, ["plan", "facts", "prompt", "writer"])
+        self.assertEqual(json.loads((self.work / "plan.json").read_text())["documentation"], pin)
+
+    def test_facts_cache_survives_isolated_attempts_and_respects_override(self):
+        original_run = self.run_tool
+        cache = self.root / "progress/facts-cache"
+        sentinel = cache / "immutable-generation"
+
+        def caching(stage, *args, **kwargs):
+            cache.mkdir(parents=True, exist_ok=True)
+            if stage == "plan" and not sentinel.exists():
+                sentinel.write_bytes(b"cached immutable bytes")
+            self.assertEqual(sentinel.read_bytes(), b"cached immutable bytes")
+            return original_run(stage, *args, **kwargs)
+
+        self.run_tool = caching
+        self.assertEqual(self.drive_inner(failures=2), 0)
+        self.assertEqual(len({path for _, path in self.caches}), 3)
+        self.assertTrue(all(not Path(path).exists() for _, path in self.caches))
+        self.assertEqual(sentinel.read_bytes(), b"cached immutable bytes")
+        with patch.dict(os.environ, TAUCETI_FACTS_CACHE=str(self.root / "configured-cache")):
+            self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual(sentinel.read_bytes(), b"cached immutable bytes")
 
     def test_missing_or_corrupt_bundle_never_launches_writer(self):
         bundle, pin = self.pages_fixture()
@@ -294,7 +346,10 @@ class GenerationRetryTests(unittest.TestCase):
             if stage == timeout_stage:
                 raise subprocess.TimeoutExpired(args, 1800, output=b"partial stdout", stderr=b"partial stderr")
             if stage in ("plan", "facts"):
-                self.assertEqual(kwargs["env"]["TAUCETI_FACTS_CACHE"], str(self.root / "progress/facts-cache"))
+                self.assertEqual(
+                    kwargs["env"]["TAUCETI_FACTS_CACHE"],
+                    os.environ.get("TAUCETI_FACTS_CACHE") or str(self.root / "progress/facts-cache"),
+                )
                 if stage == fail_stage and remaining:
                     remaining -= 1
                     self.calls.append(stage)

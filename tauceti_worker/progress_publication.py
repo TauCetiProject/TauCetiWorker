@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
 from . import github_outbox as outbox
 from . import github_transport as tr
@@ -42,6 +45,24 @@ def facts_bundle(plan_file, *, verify=False):
     if verify and hashlib.sha256(bundle.read_bytes()).hexdigest() != digest:
         raise ValueError("pinned facts bundle hash mismatch")
     return bundle
+
+
+def retain_facts_bundle(source, target):
+    """Keep immutable history without duplicating its bytes on the same filesystem."""
+    with tempfile.TemporaryDirectory(prefix=".facts-", dir=target.parent) as tmp:
+        candidate = Path(tmp) / "bundle"
+        try:
+            os.link(source, candidate)
+        except OSError:
+            shutil.copyfile(source, candidate)
+        with candidate.open("rb") as retained:
+            os.fsync(retained.fileno())
+        os.replace(candidate, target)
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def fingerprints(work):
@@ -159,6 +180,9 @@ def park(cfg, value, reason):
     for name in names:
         source = work / name
         if source.is_file():
+            if name.startswith("plan.json.facts-"):
+                retain_facts_bundle(source, saved / name)
+                continue
             with open(saved / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:
                 target.write(source.read_bytes())
                 target.flush()
