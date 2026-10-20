@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -802,7 +802,19 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
     return argv, env
 
 
-def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path, *, cancel_event=None) -> int:
+def run_agent_host(
+    cwd: Path,
+    prompt: str,
+    profile: AuthoringProfile | str,
+    logdir: Path,
+    *,
+    cancel_event=None,
+    resume=None,
+    session_path=None,
+    session_actor=None,
+    session_scope=None,
+    original_cwd=None,
+) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     if TAUCETI_CACHE_SERVICE and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
@@ -820,6 +832,45 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
             "and fetch again before building; if that cannot be done, report the cache miss and stop."
         )
     argv, env = host_agent_argv(prompt, profile)
+    if resume:
+        if profile.provider == "codex":
+            # exec resume does not accept the fresh-run sandbox/repo-check flags.
+            argv = [
+                "codex",
+                "exec",
+                "resume",
+                "--json",
+                "--model",
+                profile.model,
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
+            if profile.effort:
+                argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
+            argv += [resume, prompt]
+        elif profile.provider == "claude":
+            argv += ["--resume", resume]
+    if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
+    if session_path:
+        from .repair_recovery import conversation_identity
+        from .runtime_status import atomic_json
+
+        try:
+            atomic_json(
+                session_path,
+                dict(
+                    profile=asdict(profile),
+                    actor=session_actor,
+                    identity=conversation_identity(profile.provider),
+                    scope=session_scope,
+                    session=resume,
+                    cwd=str(original_cwd or cwd),
+                ),
+            )
+        except OSError as error:
+            log(f"provider session identity could not be saved: {error}; starting without resumable identity")
+            session_path = None
     if not env.get("TAUCETI_VERIFY_BASE") and (cwd / ".git").exists():
         from .verification_scope import local_main
 
@@ -831,6 +882,15 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
         return 0
     _LAST_AGENT_FAILURE = None
     with host_build_cache_context(cwd, env, logdir) as prefix:
+        if original_cwd is not None:
+            if not containment.strong():
+                raise BuildCacheUnavailable("Recovery conversation cwd isolation requires strong containment")
+            # Keep one containing boundary. Existing conversation cwd lookup and
+            # absolute paths resolve to the recovery source through this bind.
+            prefix = list(prefix or containment.command())
+            if prefix[-1] != "--":
+                raise BuildCacheUnavailable("Cannot compose the recovery cwd view with this containment prefix")
+            prefix[-1:-1] = ["--bind", str(cwd), str(original_cwd), "--chdir", str(original_cwd)]
         rc = run_agent_proc(
             argv,
             env=env,
@@ -840,6 +900,7 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
             provider=profile.provider,
             cancel_event=cancel_event,
             containment_prefix=prefix or (),
+            session_path=session_path,
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
@@ -964,6 +1025,7 @@ def run_agent_proc(
     cancel_event=None,
     contain: bool = True,
     containment_prefix=(),
+    session_path=None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -1027,10 +1089,12 @@ def run_agent_proc(
                 start_new_session=cancel_event is not None,
                 pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env), *boundary.pass_fds),
             )
-        except BaseException:
+        except BaseException as error:
             if writer is not None:
                 os.close(writer)
             boundary.finish(None)
+            if isinstance(error, OSError):
+                raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
             raise
         finally:
             if reader is not None:
@@ -1060,6 +1124,28 @@ def run_agent_proc(
                 thread.start()
                 monitor = thread
             for line in proc.stdout:
+                if session_path:
+                    try:
+                        event = json.loads(line)
+                        session = (
+                            event.get("thread_id")
+                            if event.get("type") == "thread.started"
+                            else event.get("session_id")
+                            if event.get("type") == "system" and event.get("subtype") == "init"
+                            else None
+                        )
+                        if session:
+                            from .runtime_status import atomic_json, read_json
+                            from .work_recovery import _fsync_dir
+
+                            value = read_json(session_path)
+                            value["session"] = session
+                            atomic_json(session_path, value)
+                            _fsync_dir(session_path.parent)
+                    except (ValueError, AttributeError):
+                        pass
+                    except OSError as error:
+                        log(f"provider session identity could not be saved: {error}; source remains recoverable")
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
@@ -1205,6 +1291,10 @@ class BuildCacheUnavailable(NoProgress):
     def __init__(self, message: str, *, log_file: Path | None = None):
         super().__init__(message)
         self.log_file = log_file
+
+
+class AgentLaunchUnavailable(BuildCacheUnavailable):
+    """A process creation failure before the agent existed."""
 
 
 HOST_CACHE_TIMEOUT = 1200

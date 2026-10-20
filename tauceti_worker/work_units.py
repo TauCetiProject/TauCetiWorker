@@ -1051,6 +1051,12 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if c.pr and w is not None and pending_for(getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
         log(f"  #{c.pr}: retained publication pending; selecting unrelated work")
         return None
+    if c.pr and stage in FILE_CHANGE_STAGES and w is not None:
+        from .repair_recovery import pending_for as retained_repair
+
+        if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
+            log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
+            return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
@@ -1675,6 +1681,11 @@ def _do_fixlike(
             )
             return 1
         co = w.cfg.checkout
+        from .activity import current_round_id
+
+        conversation_round = current_round_id()
+        conversation_path = w.cfg.state / "provider-conversations" / f"{conversation_round or time.time_ns()}.json"
+        conversation_scope = dict(repository=TAUCETI, pr=pr, source_round=conversation_round)
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
         chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
@@ -1702,8 +1713,43 @@ def _do_fixlike(
             # The remote head is published by definition; a later recovery record names it as the
             # expected head and bundles only commits made on top of it.
             mark_published(co, f"pr/{pr}", checked)
-            note_owner(w.cfg, expected_head=checked)
+            from dataclasses import asdict
+
+            note_owner(
+                w.cfg,
+                expected_head=checked,
+                authorization=dict(
+                    actor=getattr(sv, "me_login", ""),
+                    git_author=dict(
+                        name=subprocess.run(
+                            ["git", "config", "user.name"], cwd=co, capture_output=True, text=True
+                        ).stdout.strip(),
+                        email=subprocess.run(
+                            ["git", "config", "user.email"], cwd=co, capture_output=True, text=True
+                        ).stdout.strip(),
+                    ),
+                    author=getattr(p, "author", ""),
+                    repository=f"{p.head_owner}/{p.head_repo}",
+                    ref=p.head_ref,
+                    foreign=bool(foreign),
+                    automatic_bump=getattr(p, "automatic_bump", False),
+                    profile=asdict(_effective_authoring_profile(opts)),
+                    billing="api" if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else "subscription",
+                    account=getattr(opts, "account", None),
+                    sandbox_host=getattr(opts, "sandbox_host", True),
+                    charged=list(charged),
+                    budget=getattr(c, "budget", 0) or 3,
+                    roadmap=getattr(sv, "roadmap_only", None),
+                ),
+                conversation_path=str(conversation_path),
+            )
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
+        from .work_recovery import _rev
+
+        push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
+        published_before = _rev(co, push_marker)
+        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before))
+        agent_rc = None
         try:
             rc = run_agent_host(
                 co,
@@ -1711,13 +1757,33 @@ def _do_fixlike(
                 _effective_authoring_profile(opts),
                 w.cfg.logdir,
                 cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
+                session_path=conversation_path,
+                session_actor=getattr(sv, "me_login", ""),
+                session_scope=conversation_scope,
             )
+            agent_rc = rc
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             raise
+        finally:
+            # Agent containment is empty before run_agent_host returns or raises.
+            # Capture the final source now, so a quota-blocked loop can recover it
+            # without needing another paid round to reach checkout preparation.
+            from .work_recovery import guard, note_owner
+
+            if (co / ".git").exists():
+                published_after = _rev(co, push_marker)
+                note_owner(
+                    w.cfg,
+                    round_outcome=dict(
+                        exit_code=agent_rc,
+                        published_head=published_after if published_after != published_before else None,
+                    ),
+                )
+                guard(w.cfg, co)
     if capacity_wait():
         from .config import VerificationUnavailable
 
