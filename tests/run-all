@@ -17,8 +17,8 @@ cd "$(dirname "$0")/.." || exit 1
 FAIL_FAST=0
 [ "${1:-}" = "--fail-fast" ] && FAIL_FAST=1
 
-# No test may write receipts or containment markers into the operator's real activity store: a
-# stray "unconfirmed" marker there pauses that host's automatic recovery until someone removes it.
+# Tests must keep receipts, usage history and legacy migration fixtures out of the operator's
+# real activity store. Legacy containment markers are ignored by current workers.
 TAUCETI_ACTIVITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-activity-XXXXXX")"
 TAUCETI_FLEET_EVENTS="$TAUCETI_ACTIVITY_DIR/worker-events.jsonl"
 TAUCETI_SHARED_MATHLIB_ROOT="$TAUCETI_ACTIVITY_DIR/mathlib-builds"
@@ -96,6 +96,7 @@ RUN_STDLIB=(
   progress_tool_failure_log.py
   progress_generation_retry.py
   progress_publication.py
+  process_cleanup.py
   prompt_wrapper_paths.py
   provider_usage.py
   quota_auto_refresh.py
@@ -120,7 +121,6 @@ RUN_STDLIB=(
   roadmap_claims.py
   round_file_changes.py
   round_group_sweep.py
-  process_containment.py
   resources.py
   rubric_bundle.py
   safe_exists.py

@@ -1,4 +1,4 @@
-"""Local usage recovery outside round process groups and containment boundaries.
+"""Local usage recovery outside round process groups and agent sandboxes.
 
 Only new, explicitly registered invocations participate. Journals, receipts and
 ledger corrections remain the authority; lifecycle observations never close a
@@ -489,7 +489,7 @@ def ensure_supervisor(directory, *, refresh=False):
     from .paths import self_env
 
     # This process is created by the host bridge/outer worker, never by the
-    # copied shim inside agent containment. setsid survives round group teardown.
+    # copied shim inside an agent sandbox. setsid survives round group teardown.
     with (directory / "usage-supervisor.log").open("ab") as output:
         process = subprocess.Popen(
             [sys.executable, "-m", "tauceti_worker.usage_supervisor", str(directory)],

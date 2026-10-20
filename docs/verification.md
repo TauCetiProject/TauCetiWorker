@@ -58,8 +58,8 @@ failures are incomplete verification, distinct from a found axiom violation.
 
 Each invocation atomically writes `state/<worker>/verification/<id>/receipt.json` before launching
 anything and updates it through completion. File and directory fsync precede publication. The receipt
-records requested phases, scope, start/end timestamps, original audit timing lines, tool exits,
-containment capability and full log paths. Reused phases refer to their original receipt.
+records requested phases, scope, start/end timestamps, tool exits, best-effort cleanup
+and full log paths. Reused phases refer to their original receipt.
 Receipts and logs are retained on failure or interruption. SIGKILL leaves the last durable receipt
 incomplete, even if a tool appeared to finish. No background completion is assumed.
 
@@ -145,13 +145,13 @@ verification continuation does not require #310. Claude Bash timeout variables c
 round; Codex prompts instruct the agent to wait on its returned execution session. SIGINT, SIGTERM
 and SIGHUP cause owned cleanup and incomplete receipts.
 
-Tools use #306's `containment.Boundary`. Strong hosts contain children in owned PID namespaces;
-legacy hosts accurately report best-effort process-group cleanup. Bubble owns its outer boundary and
-uses the legacy inner fallback. Normal exits check each command directly; shell lint drivers use
-Bash pipefail. No process-name polling is used. Job/invocation lease descriptors are never inherited by tools, so
-owner death releases ownership for recovery. On legacy hosts, a SIGKILLed owner can leave an escaped child running;
-recovery verifies in an independent workspace. Publication of an original recovery workspace
-requires #310's separate ownership gate.
+Tools run in owned process groups. Interruption and deadlines terminate the group, and normal
+completion sweeps leftover background tools. Cleanup is best effort: deliberately detached
+descendants can escape. Host verification needs no rootless PID namespace or historical cleanup
+proof. Explicit Bubble execution retains its existing outer sandbox. Normal exits check each command
+directly; shell lint drivers use Bash pipefail. No process-name polling is used. Job/invocation lease
+descriptors are never inherited by tools, so owner death releases ownership for recovery. Recovery
+verifies in an independent workspace; publication retains its separate source, claim and CAS checks.
 
 `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS=/absolute/installations.json` can register trusted
 installations with a mapping such as `{"/nix/store/example-lean": "publisher-revision-1"}`. Paths
@@ -180,7 +180,7 @@ blanket fleet dispatch.
 
 `tests/verification.py` covers real exits, pipefail, exact and phase reuse, source mutations,
 pin/base/toolchain/executable changes, deletions, renames, untracked/ignored sources, owner death,
-deadlines and containment. Twenty independent fake verifiers must enter their builds together,
+deadlines and owned-group cleanup. Twenty independent fake verifiers must enter their builds together,
 even with an old one-slot lock held and stale wait records present. `tests/verification_audit.py` adds
 repeated deadlines followed by an actual successful build in the isolated candidate, Bubble namespace recovery after original deletion,
 phase evidence after interruption, dispatch gating and immutable preparation costs. Its 30,000-file,

@@ -1760,7 +1760,7 @@ def _do_fixlike(
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             raise
         finally:
-            # Agent containment is empty before run_agent_host returns or raises.
+            # The owned agent process group has been swept before this returns or raises.
             # Capture the final source now, so a quota-blocked loop can recover it
             # without needing another paid round to reach checkout preparation.
             from .work_recovery import guard, note_owner

@@ -4,6 +4,7 @@ Host coding rounds can reuse one extracted Mathlib build per dependency/configur
 key. Source files, TauCeti outputs and changes to Mathlib outputs stay private to a
 worker. Reviews retain their existing execution path.
 
+Sharing remains **off during the #364 cutover**. This change does not authorize reactivation.
 Sharing defaults to `off` without an opt-in policy or explicit environment mode.
 An unreadable or invalid policy fails to private mode. `off` uses ordinary private
 cache preparation; `auto` attempts sharing with private fallback. `required` refuses to start inference if sharing is unavailable.
@@ -56,18 +57,19 @@ Both writes are attempted independently, followed by a directory sync. Failures
 are logged explicitly and recorded when possible; inability to persist the stop
 never replaces a paid outcome or prevents upper restoration.
 
-Each agent runs inside rootless bubblewrap mount and PID namespaces; this view is the
-same boundary as [process containment](process-containment.md), not a second one nested
-around it. The published pool
-is read-only in all supported containment namespaces, including private agents,
-cache fetches and verification tools. Trusted publication alone gets a writable
-bind of its fresh staging project inside that pool. OverlayFS combines the shared Mathlib lower with that worker's
+A shared agent runs inside a rootless bubblewrap mount namespace. It deliberately has no
+PID namespace: agents and their tools see ordinary host PIDs and `/proc`, because tools
+that report a PID to a service outside the namespace (systemd, D-Bus) break otherwise.
+The published pool is read-only inside the view and trusted extraction keeps only its staging
+project writable. Ordinary private agents, private cache fetches and verification tools run
+outside this mount view and can write to the pool, so sharing must
+stay off on a host with private writers. OverlayFS combines the shared Mathlib lower with that worker's
 fresh private upper per round; in-place writes copy up. The entire coding process and
 its tools see this view. Networking, credentials and the existing cancellation
 lifecycle are retained. This is build storage isolation, not an additional security
-boundary for untrusted code. Processes outside these namespaces (including legacy
-containment and pre-deployment active agents), other writable filesystem aliases,
-and the host owner can bypass the mount protection. Keep sharing off on a host
+boundary for untrusted code. Processes outside the view (private agents and tools,
+and pre-deployment active agents), other writable filesystem aliases, and the host
+owner can bypass the mount protection. Keep sharing off on a host
 with such writers; do not terminate paid agents to establish this condition.
 Lower file modes permit private copy-up writes; changing them to read-only would
 also prohibit ordinary upper writes through OverlayFS.
@@ -88,8 +90,8 @@ overlay stops sharing.
 Running readers hold shared leases; the sandbox also retains the lease descriptor
 so collection cannot race a surviving process. Trusted staging downloaders never
 inherit the exclusive publication lease; only completed shared views pass reader
-leases to children. A preparation namespace with unconfirmed cleanup stops future
-sharing and refuses inference. Lock waits are bounded to 25 minutes (the normal
+leases to children. The optional mount view has its own capability check; it does not consult
+round containment policy, historical process markers or quiescence proofs. Lock waits are bounded to 25 minutes (the normal
 extraction timeout is 20 minutes), then auto falls back privately and required
 mode fails with an actionable reason. Cleanup removes unused snapshots
 after seven days, or oldest unused snapshots under disk pressure, until at least
@@ -109,13 +111,11 @@ content-free coding invocation results, cleanup phase receipts and native round 
 for joining the existing round/phase/resource records. A released shared view
 becomes idle rather than continuing to count as a current shared worker. Cleanup
 of a view is separate from completion of a full work round. Cleanup records body
-and backup-removal errors, retained backups, and the existing containment proof;
+and backup-removal errors and retained backups;
 a successful invocation does not imply successful cleanup. Backup-removal errors
 preserve the paid invocation result. Supervisor PID/start/boot identity prevents
 stale per-worker preparation from counting another worker's lease as its own.
-Receipts include upper file count/bytes, stop-write outcome and nullable boundary
-proof outside native rounds. New shared rounds require a fresh strong namespace
-probe and refuse sharing while a live worker receipt reports weaker containment.
+Receipts include upper file count/bytes and stop-write outcome.
 Unregistered and pre-deployment writers still require operator verification.
 
 Existing `resources.jsonl` round receipts now include `read_bytes` deltas from
@@ -128,6 +128,9 @@ The [Linux I/O accounting manual](https://man7.org/linux/man-pages/man5/proc_pid
 describes the kernel read counter and its scope.
 
 ## Rollout
+
+Sharing stays off throughout the #364 cutover. Any later rollout belongs to the existing
+rollout owner at idle boundaries; the optional procedure below is for that later decision.
 
 Keep funding and worker capacity unchanged. Use only naturally selected work;
 do not trigger CI, run synthetic benchmarks, start paid measurement sessions or
@@ -155,8 +158,8 @@ cache warmth, co-tenants and disk pressure as confounders.
 On any isolation, integrity or lease failure set future-round policy off
 immediately. Preserve the lower and evidence, all active leases/readers, usage
 journals and the append-only budget ledger. Never delete an active lower or kill
-paid agents to roll back. Lower-integrity, demonstrated probe-isolation, lease-lock
-and unconfirmed shared-round boundary failures latch this stop automatically;
+paid agents to roll back. Lower-integrity, demonstrated probe-isolation and lease-lock
+failures latch this stop automatically;
 other observed isolation/lease failures require the same operator rollback. An unsupported capability or insufficient space in auto uses
 private preparation; required mode refuses inference with the reason.
 

@@ -29,7 +29,6 @@ from pathlib import Path
 
 from .config import Die
 from .constants import LEAN_ROOT
-from .containment import Boundary
 from .paths import HERE
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
@@ -278,23 +277,19 @@ class Verification:
         self.receipt["commands"].append(entry)
         self.save()
         self.progress(f"{phase}: start {json.dumps(argv)} (log {log})")
-        boundary = Boundary(f"verify-{phase}", env=env)
-        entry["containment"] = dict(mode=boundary.mode, strong=boundary.strong, reason=boundary.reason)
         process = None
         stdout_path = log.with_suffix(".stdout")
         offset = 0
         try:
             with log.open("wb") as output, stdout_path.open("wb") as captured:
                 process = subprocess.Popen(
-                    boundary.argv(argv),
+                    argv,
                     cwd=self.root,
                     env=env,
                     stdout=captured if capture else output,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
-                    pass_fds=boundary.pass_fds,
                 )
-                boundary.launched()
                 while process.poll() is None:
                     if not capture:
                         with log.open("rb") as progress:
@@ -310,16 +305,14 @@ class Verification:
                 entry["exit"] = process.returncode
         finally:
             try:
-                if process is not None and process.poll() is None:
-                    boundary.abort()
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
+                if process is not None:
+                    # Best effort TERM/KILL cleanup, including on normal completion.
+                    from .round import reap_round_group
+
+                    reap_round_group(process.pid)
+                    entry["cleanup"] = "process-group-best-effort"
                     process.wait()
                     entry["exit"] = process.returncode
-                entry["cleanup"] = boundary.finish(
-                    process.returncode if process is not None else None,
-                    pgid=process.pid if process is not None else None,
-                )
             finally:
                 entry["ended_at"] = time.time()
                 self.save()

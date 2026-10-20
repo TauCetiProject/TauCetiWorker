@@ -251,14 +251,12 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
 
     proc = SimpleNamespace(pid=12345, wait=interrupted_wait)
     with (
-        # A fake process never reports a namespace; this case is about the legacy group signals.
-        patch.dict(os.environ, {"TAUCETI_PROCESS_CONTAINMENT": "legacy"}),
         patch.object(agents.subprocess, "Popen", lambda *a, **kw: proc),
         patch.object(agents.os, "killpg", lambda pid, sig: signals.append((pid, sig))),
         (root / "interrupt.log").open("ab") as output,
     ):
         try:
-            agents._cache_fetch(["lake"], co, {**env, "TAUCETI_PROCESS_CONTAINMENT": "legacy"}, output, 10)
+            agents._cache_fetch(["lake"], co, env, output, 10)
         except SystemExit as e:
             assert e.code == 143
         else:

@@ -23,7 +23,6 @@ from collections import Counter
 from contextlib import closing
 from pathlib import Path
 
-from . import containment
 from .audit_alerts import notify_block, save
 from .audit_progress import (
     GOAL_REQUEST,
@@ -39,6 +38,7 @@ from .audit_recovery import mechanical_output, recover, safe_history
 from .config import Die, NoProgress, log
 from .constants import TAUCETI
 from .github_transport import execute
+from .processes import run as run_process
 from .quota import CODEX_RT_PLACEHOLDER, _mirror_creds_file, claude_dir, codex_dir
 
 CURSOR = "security-audit"
@@ -818,19 +818,8 @@ def run_client(
             )
         if provider == "codex" and "resume" in cmd:
             defer_goal_continuation(Path(env["CODEX_SQLITE_HOME"]), cmd[cmd.index("resume") + 1])
-        # The client and every tool it starts share one PID namespace, so a timeout or a torn-down
-        # round cannot leave a detached reader running (or reading) after the attempt is recorded.
         try:
-            result = containment.run(
-                cmd,
-                label="security-audit",
-                input=prompt,
-                cwd=home,
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=1800,
-            )
+            result = run_process(cmd, input=prompt, cwd=home, env=env, text=True, capture_output=True, timeout=1800)
         except subprocess.TimeoutExpired as exc:
             (work / "model-transcript.jsonl").write_bytes(
                 (exc.stdout or b"") if isinstance(exc.stdout, bytes) else (exc.stdout or "").encode()
