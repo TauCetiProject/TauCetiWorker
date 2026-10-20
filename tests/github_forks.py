@@ -207,11 +207,14 @@ with (
     with patch.object(tr, "execute") as write:
         assert outbox.drain(env) == [path.stem]
         write.assert_not_called()
+    # Malformed legacy evidence must not hide another PR's repair either.
+    broken = outbox.directory(env) / "malformed.json"
+    tr.atomic(broken, ["legacy-corrupt"])
     # A different PR's repair can still publish despite this uncertain fork.
     comment = outbox.prepare(["gh", "pr", "comment", "7", "--repo", "org/repo", "--body", "saved"], env, tmp)
     with patch.object(tr, "execute", return_value=subprocess.CompletedProcess([], 0, "ok", "")) as write:
-        assert outbox.drain(env) == [path.stem] and write.call_count == 1 and not comment.exists()
-    assert path.exists()
+        assert set(outbox.drain(env)) == {path.stem, broken.stem} and write.call_count == 1 and not comment.exists()
+    assert path.exists() and broken.exists()
 
 print("PASS: exact fork ancestry, ownership, visibility, legacy migration and bounded reconciliation")
 

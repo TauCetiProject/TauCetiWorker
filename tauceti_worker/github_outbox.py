@@ -618,7 +618,8 @@ def drain(env=None):
 
     def creation_order(path):
         try:
-            return json.loads(path.read_text()).get("created", 0), str(path)
+            created = json.loads(path.read_text()).get("created", 0)
+            return created if isinstance(created, (int, float)) else 0, str(path)
         except (OSError, ValueError, AttributeError):
             return 0, str(path)
 
@@ -632,6 +633,16 @@ def drain(env=None):
             except (OSError, ValueError):
                 remaining.append(path.stem)
                 continue
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("argv"), list)
+                or not value["argv"]
+                or not all(isinstance(a, str) for a in value["argv"])
+                or not isinstance(value.get("context", {}), dict)
+                or not isinstance(value.get("retry_at", 0), (int, float))
+            ):
+                remaining.append(path.stem)
+                continue  # Preserve malformed legacy evidence without blocking other repairs.
             destination = target(value)
             if value.get("retry_at", 0) > time.time():
                 remaining.append(path.stem)
@@ -679,6 +690,9 @@ def drain(env=None):
                 # R0's valid CLI form. Preserve original argv in the intent.
                 args = ["repo", "fork", fork_upstream(args), "--clone=false"]
                 value["fork_retries"] = value.get("fork_retries", 0) + 1
+            if not isinstance(value.get("cwd"), str):
+                remaining.append(path.stem)
+                continue
             if not Path(value["cwd"]).is_dir():
                 archive(path, value, "Publication checkout no longer exists; retained for manual recovery")
                 continue
