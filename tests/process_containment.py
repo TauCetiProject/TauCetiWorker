@@ -21,6 +21,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -111,9 +112,9 @@ class Base(unittest.TestCase):
     def agent(self, mode="exit"):
         return [sys.executable, "-c", FIXTURE, self.token, str(self.ready), mode]
 
-    def events(self):
+    def events(self, kind="containment_result"):
         rows = [json.loads(p.read_text()) for p in (self.tmp / "activity" / "pending").glob("*.json")]
-        return [r for r in rows if r["kind"] == "containment_result"]
+        return [r for r in rows if r["kind"] == kind]
 
     def assert_bystander_alive(self):
         self.assertIsNone(self.bystander.poll(), "an unrelated process group was signalled")
@@ -150,10 +151,15 @@ class Namespace(Base):
         self.assertIsInstance(event["child_pid"], int)
         self.assertIsInstance(event["pid_namespace"], int)
         self.assertNotIn(self.token, json.dumps(event), "argv must not be recorded")
+        # The identity was durable from launch, before the outcome was known.
+        [started] = self.events("containment_started")
+        self.assertEqual(started["boundary"], event["boundary"])
+        self.assertEqual(started["pid_namespace"], event["pid_namespace"])
+        self.assertLess(started["at"], event["at"])
         db = activity._connect()
         activity._consume(db, [])
-        row = db.execute("SELECT mode, cleanup, round_id FROM containment").fetchone()
-        self.assertEqual(tuple(row), ("pid-namespace", "namespace-empty", self.round.id))
+        row = db.execute("SELECT mode, cleanup, round_id, exit_code, pid_namespace FROM containment").fetchone()
+        self.assertEqual(tuple(row), ("pid-namespace", "namespace-empty", self.round.id, 0, event["pid_namespace"]))
 
     def test_cancellation_and_claim_loss_kill_every_descendant(self):
         lost = threading.Event()
@@ -260,6 +266,51 @@ class Namespace(Base):
         [event] = self.events()
         self.assertEqual((event["mode"], event["cleanup"]), ("pid-namespace", "namespace-empty"))
 
+    def test_branch_claim_loss_cancels_the_agent(self):
+        # The real heartbeat watcher: its child reports the lease lost while the agent is running.
+        claims = round_.Claims(SimpleNamespace(), SimpleNamespace(add_cleanup=lambda fn: None))
+        lose = [sys.executable, "-c", f"import sys,time; time.sleep(2); sys.exit({round_.HEARTBEAT_LOST})"]
+        with patch.object(round_, "self_argv", lambda *a: lose), patch.object(round_, "self_env", lambda e: e):
+            claims.start_heartbeat("branch/1", "owner/claims")
+        rc = self.run_agent(mode="hang", cancel_event=claims.lost)
+        self.assertTrue(claims.lost.is_set())
+        self.assertLess(rc, 0)
+        self.assertEqual(tagged(self.token), [])
+        claims.stop_heartbeat()
+
+    def test_stopped_heartbeat_is_not_a_lost_claim(self):
+        claims = round_.Claims(SimpleNamespace(), SimpleNamespace(add_cleanup=lambda fn: None))
+        lose = [sys.executable, "-c", f"import sys,time; time.sleep(0.5); sys.exit({round_.HEARTBEAT_LOST})"]
+        with patch.object(round_, "self_argv", lambda *a: lose), patch.object(round_, "self_env", lambda e: e):
+            claims.start_heartbeat("branch/1", "owner/claims")
+        claims._stopping = True  # stop_heartbeat would also terminate it; the race is the point
+        time.sleep(1)
+        self.assertFalse(claims.lost.is_set())
+        claims.stop_heartbeat()
+
+    def test_unconfirmed_namespace_is_reported_and_blocks_reuse(self):
+        boundary = containment.Boundary("stuck")
+        argv = boundary.argv([sys.executable, "-c", "import time; time.sleep(60)", self.token])
+        proc = subprocess.Popen(argv, pass_fds=boundary.pass_fds)
+        boundary.launched()
+        if hasattr(os, "pidfd_open"):
+            self.assertIsNotNone(boundary._pidfd, "init is addressed by pidfd, not a reusable pid")
+        try:
+            with (
+                patch.object(containment, "_namespace_state", return_value=None),
+                self.assertRaises(containment.ContainmentUnconfirmed),
+            ):
+                boundary.finish(None, grace=0.2)
+            [event] = self.events()
+            self.assertEqual(event["cleanup"], "namespace-unconfirmed")
+            with patch.object(containment, "_namespace_state", return_value=None):
+                self.assertEqual([m["label"] for m in containment.unconfirmed()], ["stuck"])
+        finally:
+            proc.kill()
+            proc.wait()
+        # Once its own namespace is observed gone, the marker retires.
+        self.assertTrue(wait_for(lambda: not containment.unconfirmed(), 5))
+
     def test_namespace_init_is_killed_if_it_outlives_its_command(self):
         boundary = containment.Boundary("stuck")
         argv = boundary.argv([sys.executable, "-c", "import time; time.sleep(60)", self.token])
@@ -327,6 +378,23 @@ class Legacy(Base):
             self.assertIn("Linux-only", cap.reason)
             self.assertNotIn("install bubblewrap", cap.reason)
             self.assertEqual(containment.Boundary("x").argv(["agent"]), ["agent"])
+
+    def test_legacy_rollback_also_disables_the_namespace_based_shared_view(self):
+        checkout = self.tmp / "checkout"
+        (checkout / ".lake/packages/mathlib").mkdir(parents=True)
+        env = {
+            **os.environ,
+            containment.POLICY_ENV: "legacy",
+            "TAUCETI_SHARED_MATHLIB_ROOT": str(self.tmp / "pool"),
+            "TAUCETI_SHARED_MATHLIB_BUILDS": "auto",
+        }
+        with patch.dict(os.environ, {containment.POLICY_ENV: "legacy"}):
+            with shared_mathlib.view(checkout, env, self.tmp / "logs", None) as prefix:
+                self.assertEqual(prefix, [])
+            env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
+            with self.assertRaisesRegex(shared_mathlib.Unavailable, "legacy"):
+                with shared_mathlib.view(checkout, env, self.tmp / "logs", None):
+                    pass
 
     def test_invalid_policy_is_refused(self):
         with patch.dict(os.environ, {containment.POLICY_ENV: "sometimes"}), self.assertRaises(Die):

@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
     from .work_units import RoundOpts, Worker
 
-from . import build_caches
+from . import build_caches, containment
 from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
@@ -248,8 +248,9 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
         _CODEX_MODEL_ACCESS_PROMPT,
     ]
     try:
-        return subprocess.run(
+        return containment.run(
             command,
+            label="codex-probe",
             cwd=cfg.state,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -874,9 +875,7 @@ def run_agent_proc(
     def run_rendered(destination) -> int:
         if cancel_event is not None and cancel_event.is_set():
             raise NoProgress("shared lease lost before agent launch")
-        from .containment import Boundary
-
-        boundary = Boundary(label, prefix=containment_prefix, contain=contain)
+        boundary = containment.Boundary(label, prefix=containment_prefix, contain=contain)
         command = boundary.argv(argv)
         # A separate group permits lease-loss cancellation without signalling
         # the worker's caller. A PID namespace dies with the worker by itself
@@ -908,7 +907,6 @@ def run_agent_proc(
             boundary.finish(None)
             raise
         finally:
-            boundary.launched()
             if reader is not None:
                 os.close(reader)
         assert proc.stdout is not None
@@ -924,19 +922,23 @@ def run_agent_proc(
                     if not finished.wait(2):
                         with contextlib.suppress(ProcessLookupError):
                             os.killpg(proc.pid, signal.SIGKILL)
+                        boundary.abort()
                     return
 
         monitor = None
-        if cancel_event is not None:
-            monitor = threading.Thread(target=cancel_on_lease_loss, daemon=True)
-            monitor.start()
+        # One guard from launch to teardown: nothing below may leave the boundary running.
         try:
+            boundary.launched()
+            if cancel_event is not None:
+                monitor = threading.Thread(target=cancel_on_lease_loss, daemon=True)
+                monitor.start()
             for line in proc.stdout:
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
             rc = proc.wait()
         except BaseException:
+            boundary.abort()
             if cancel_event is not None:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -1014,8 +1016,6 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     if label.startswith("review #"):
         api_env = {**(os.environ if api_env is None else api_env), "TAUCETI_GITHUB_HISTORY_BRIDGE": "1"}
     env_kwargs = {"env": api_env} if api_env is not None else {}
-    from . import containment
-
     tag = "review-engine" if label.startswith("review #") else "engine"
     if os.environ.get("TAUCETI_STREAM"):
         return containment.run(argv, label=tag, **env_kwargs).returncode
@@ -1138,10 +1138,9 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
     kills its process group if the worker disappears. Ordinary timeout/interruption also tears down
     the group, and the boundary is confirmed empty before this returns.
     """
-    from .containment import Boundary
     from .shared_mathlib import lease_fds
 
-    boundary = Boundary("cache-fetch", prefix=prefix)
+    boundary = containment.Boundary("cache-fetch", prefix=prefix)
     command = boundary.argv(command)
     reader = writer = None
     if not boundary.strong:
@@ -1163,15 +1162,16 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
         boundary.finish(None)
         raise
     finally:
-        boundary.launched()
         if reader is not None:
             os.close(reader)
     sweep = None if boundary.strong else proc.pid
     try:
         try:
+            boundary.launched()
             return proc.wait(timeout=timeout)
         except BaseException:
             sweep = None  # the group is SIGKILLed below
+            boundary.abort()
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGTERM)
             try:

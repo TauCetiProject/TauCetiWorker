@@ -29,6 +29,7 @@ from tauceti_worker.work_units import want
 # containment probe. Model a host whose PID namespaces work, so automatic recovery stays enabled.
 containment._probed = (True, "test fixture")
 os.environ.pop(containment.POLICY_ENV, None)
+os.environ["TAUCETI_ACTIVITY_DIR"] = tempfile.mkdtemp(prefix="tauceti-audit-activity-")
 
 
 def append_native(home, answer, thread="11111111-2222-4333-8444-555555555555"):
@@ -626,6 +627,17 @@ class WorkerBoundJudgments(unittest.TestCase):
             model.assert_not_called()
             self.assertFalse((self.work / "operational-recovery.json").exists())
 
+    def test_unconfirmed_boundary_pauses_automatic_recovery(self):
+        with (
+            patch.object(containment, "unconfirmed", return_value=[{"boundary": "b"}]),
+            patch("tauceti_worker.loop.resolve_work_model") as quota,
+            patch.object(sa, "inspect") as model,
+            self.assertRaisesRegex(NoProgress, "never confirmed empty"),
+        ):
+            recovery.recover(self.cfg, self.opts, self.block)
+        quota.assert_not_called()
+        model.assert_not_called()
+
     def test_recovery_preserves_round_pacing_override(self):
         opts = wu.RoundOpts(
             only=["security-audit"],
@@ -903,7 +915,7 @@ class WorkerBoundJudgments(unittest.TestCase):
 
         with (
             patch.object(sa, "codex_dir", return_value=self.work),
-            patch.object(sa.subprocess, "run", side_effect=model),
+            patch.object(sa.containment, "run", side_effect=model),
             patch.object(sa.time, "sleep"),
             patch.object(sa, "advance", return_value="b" * 40) as advance,
         ):
@@ -1478,7 +1490,7 @@ class Authority(unittest.TestCase):
                     },
                 ),
                 patch.object(sa, "codex_dir", return_value=work),
-                patch.object(sa.subprocess, "run", side_effect=model),
+                patch.object(sa.containment, "run", side_effect=model),
             ):
                 self.assertEqual(sa.inspect(batch, "codex", work), verdict)
         self.assertIn("--ignore-user-config", sa.reviewer_argv("codex"))
@@ -1743,7 +1755,7 @@ class CompactingInspection(unittest.TestCase):
 
         with (
             patch.object(sa, "codex_dir", return_value=self.work),
-            patch.object(sa.subprocess, "run", side_effect=model) as run,
+            patch.object(sa.containment, "run", side_effect=model) as run,
             patch.object(sa.time, "sleep"),
         ):
             if repair_always:
@@ -1938,7 +1950,7 @@ class CompactingInspection(unittest.TestCase):
             ]
             return SimpleNamespace(returncode=1, stdout="\n".join(map(json.dumps, events)), stderr="service error")
 
-        with patch.object(sa.subprocess, "run", side_effect=model) as run, patch.object(sa.time, "sleep") as sleep:
+        with patch.object(sa.containment, "run", side_effect=model) as run, patch.object(sa.time, "sleep") as sleep:
             result = sa.run_client(
                 ["codex", "exec", "--sandbox", "read-only", "-"],
                 prompt,
@@ -1982,7 +1994,7 @@ class CompactingInspection(unittest.TestCase):
 
         with (
             patch.object(sa, "claude_dir", return_value=self.work),
-            patch.object(sa.subprocess, "run", side_effect=model),
+            patch.object(sa.containment, "run", side_effect=model),
         ):
             self.assertEqual(sa.inspect(self.batch, "claude", self.work)["verdict"], "finding")
 
@@ -2000,7 +2012,7 @@ class CompactingInspection(unittest.TestCase):
                 self.subTest(event=event),
                 patch.object(sa, "claude_dir", return_value=self.work),
                 patch.object(
-                    sa.subprocess,
+                    sa.containment,
                     "run",
                     return_value=SimpleNamespace(returncode=0, stdout=json.dumps(event), stderr=""),
                 ),
@@ -2032,7 +2044,7 @@ class CompactingInspection(unittest.TestCase):
 
         with (
             patch.object(sa, "codex_dir", return_value=self.work),
-            patch.object(sa.subprocess, "run", side_effect=model),
+            patch.object(sa.containment, "run", side_effect=model),
             patch.object(sa.time, "sleep"),
         ):
             self.assertEqual(sa.inspect(batch, "codex", self.work)["verdict"], "pass")
@@ -2072,7 +2084,7 @@ class CompactingInspection(unittest.TestCase):
 
         with (
             patch.object(sa, "codex_dir", return_value=self.work),
-            patch.object(sa.subprocess, "run", side_effect=model),
+            patch.object(sa.containment, "run", side_effect=model),
             patch.object(sa.time, "sleep"),
         ):
             self.assertEqual(sa.inspect(self.batch, "codex", self.work), self.verdict)
@@ -2119,7 +2131,7 @@ class CompactingInspection(unittest.TestCase):
             with (
                 self.subTest(kind=kind),
                 patch.object(sa, "codex_dir", return_value=self.work),
-                patch.object(sa.subprocess, "run", side_effect=model) as run,
+                patch.object(sa.containment, "run", side_effect=model) as run,
             ):
                 actual = sa.inspect(self.batch, "codex", self.work)
             self.assertEqual(actual["verdict"], kind)

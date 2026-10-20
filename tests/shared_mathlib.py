@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tauceti_worker import containment
 from tauceti_worker import shared_mathlib as s
 from tauceti_worker.runtime_status import atomic_json
 
@@ -81,18 +82,27 @@ class SharedTests(unittest.TestCase):
         self.library = self.root / "toolchain/lib/lean"
         self.library.mkdir(parents=True)
         (self.library / "Init.olean").write_text("fixture ABI")
-        real_run = subprocess.run
+        real_run, real_contained = subprocess.run, containment.run
 
-        def run(command, *args, **kwargs):
+        def fake_lake(command):
             if command == ["lake", "env", "lean", "--version"]:
                 return subprocess.CompletedProcess(command, 0, "Lean fixture ABI\n", "")
             if command == ["lake", "env", "lean", "--print-prefix"]:
                 return subprocess.CompletedProcess(command, 0, str(self.library.parents[1]) + "\n", "")
-            return real_run(command, *args, **kwargs)
+            return None
 
-        patcher = patch.object(s.subprocess, "run", side_effect=run)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        def run(command, *args, **kwargs):
+            return fake_lake(command) or real_run(command, *args, **kwargs)
+
+        def contained(command, *args, **kwargs):
+            return fake_lake(command) or real_contained(command, *args, **kwargs)
+
+        for patcher in (
+            patch.object(s.subprocess, "run", side_effect=run),
+            patch.object(containment, "run", side_effect=contained),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.downloads = 0
         disk = patch.object(
             s.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100_000_000, 20_000_000, 80_000_000)
@@ -380,6 +390,8 @@ class SharedTests(unittest.TestCase):
         # A contained downloader's own pid is namespace-local; identify it by a unique argv token.
         for policy in ("legacy", "auto"):
             with self.subTest(policy=policy):
+                if policy == "auto" and not containment.probe()[0]:
+                    continue  # auto falls back to the legacy sweep, which a setsid escapes by design
                 token = f"tauceti-downloader-{os.getpid()}-{policy}"
                 ready = self.root / f"downloader-{policy}.ready"
                 # Only a namespace can catch a downloader that escapes its session.

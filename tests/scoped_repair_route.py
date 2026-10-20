@@ -463,7 +463,8 @@ def test_declined_foreign_claim_lifecycle_before_next_candidate():
                     assert claims.held is None and claims._hb is None and claims._hb_wfd is None
                     assert "TAUCETI_CLAIM_KEY" not in os.environ and "TAUCETI_CLAIM_REPO" not in os.environ
                 assert events == expected
-                children[0].wait.assert_called_once_with(5)
+                # stop_heartbeat's bounded wait; the lease-loss watcher's own wait(None) is separate.
+                children[0].wait.assert_any_call(5)
                 launch.assert_not_called()
                 assert counters.read(c.rebase_budget_key) == 0 and not counters.foreign_repair_launched(13940)
                 if refusal != "claim_replaced_during_prompt":

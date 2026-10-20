@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from .config import Config, Die, log
@@ -202,6 +203,10 @@ class Claims:
         self.held: tuple[str, str] | None = None
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
+        # Set when the heartbeat reports the lease lost; branch work passes it to the agent as its
+        # cancellation event, so a lost claim tears the agent's containment boundary down.
+        self.lost = threading.Event()
+        self._stopping = False
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -254,9 +259,18 @@ class Claims:
         self._hb = subprocess.Popen(cmd, pass_fds=[rfd], env=env)
         os.close(rfd)  # parent keeps only the write end; its closure (or death) is the EOF signal
         self._hb_wfd = wfd
+        self._stopping = False
         self.ctx.add_cleanup(self.stop_heartbeat)
 
+        def watch(hb=self._hb):
+            if hb.wait(None) == HEARTBEAT_LOST and not self._stopping:
+                log(f"claim {key}: lease lost; cancelling the branch work that depends on it")
+                self.lost.set()
+
+        threading.Thread(target=watch, daemon=True).start()
+
     def stop_heartbeat(self) -> None:
+        self._stopping = True
         if self._hb_wfd is not None:
             try:
                 os.close(self._hb_wfd)  # EOF → the heartbeat child exits on its own
@@ -282,6 +296,9 @@ class Claims:
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
 
 
+HEARTBEAT_LOST = 3
+
+
 def cmd_heartbeat(args) -> int:
     """Internal: renew a claim lease every CLAIM_HEARTBEAT_S until the parent dies (pipe EOF) or the
     lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext)."""
@@ -301,7 +318,7 @@ def cmd_heartbeat(args) -> int:
         else:
             time.sleep(CLAIM_HEARTBEAT_S)
         if subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode != 0:
-            return 0  # lease lost → stop renewing so it can expire
+            return HEARTBEAT_LOST  # stop renewing so it can expire, and tell the round
 
 
 def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:

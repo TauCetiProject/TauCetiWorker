@@ -417,11 +417,16 @@ def recover(cfg, opts, previous: dict) -> bool:
         raise NoProgress("security-audit: retained operational recovery is waiting for its cooldown")
     from . import containment
 
-    if not containment.strong():
-        # A relaunched client could again outlive its round. Manual `resume` still works.
+    if not containment.strong() or containment.unconfirmed():
+        # A relaunched client could again outlive its round, or an earlier one may still be alive.
+        reason = (
+            containment.status().reason
+            if not containment.strong()
+            else "an earlier containment boundary was never confirmed empty"
+        )
         raise NoProgress(
             "security-audit: automatic recovery paused: "
-            + containment.status().reason
+            + reason
             + "; resume manually with `python -m tauceti_worker.security_audit resume`"
         )
     from .loop import resolve_work_model

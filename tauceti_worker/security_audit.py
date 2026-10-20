@@ -816,18 +816,16 @@ def run_client(
             defer_goal_continuation(Path(env["CODEX_SQLITE_HOME"]), cmd[cmd.index("resume") + 1])
         # The client and every tool it starts share one PID namespace, so a timeout or a torn-down
         # round cannot leave a detached reader running (or reading) after the attempt is recorded.
-        boundary = containment.Boundary("security-audit")
-        result = None
         try:
-            result = subprocess.run(
-                boundary.argv(cmd),
+            result = containment.run(
+                cmd,
+                label="security-audit",
                 input=prompt,
                 cwd=home,
                 env=env,
                 text=True,
                 capture_output=True,
                 timeout=1800,
-                pass_fds=boundary.pass_fds,
             )
         except subprocess.TimeoutExpired as exc:
             (work / "model-transcript.jsonl").write_bytes(
@@ -841,7 +839,6 @@ def run_client(
             (work / "model-transcript.jsonl").write_text(result.stdout)
             (work / "model-stderr.txt").write_text(result.stderr)
         finally:
-            boundary.finish(None if result is None else result.returncode)
             retain_client(work, home, receipt)
         if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
             raise Die("security-audit: resumed client changed the retained conversation identity")

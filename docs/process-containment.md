@@ -1,8 +1,9 @@
 # Process containment
 
-A host round's long-running processes each run as the first process of their own rootless
-bubblewrap PID namespace: the coding agent, cache preparation downloads (with or without
-shared Mathlib), the review engine and the security-audit client. Everything those
+A host round's agent and tool processes each run as the first process of their own rootless
+bubblewrap PID namespace: the coding agent, cache preparation (downloads with or without
+shared Mathlib, and the `lake env` calls that select a shared snapshot), the Codex
+model-access probe, the review engine and the security-audit client. Everything those
 processes start stays inside the namespace, including tools that call `setsid` or
 double-fork. When the first process exits, the kernel kills everything left in the
 namespace before bubblewrap returns. `--die-with-parent` does the same if the worker is
@@ -13,14 +14,25 @@ namespace is the boundary, so namespaces are never nested.
 The round supervisor stays outside: the round lock, branch claims, activity and usage
 accounting, and recovery journals. It confirms each namespace is empty before
 continuing, so a checkout is only cleaned up once nothing can still write to it. If the
-namespace outlives its first process, the supervisor kills that namespace's own init and
-nothing else. It never searches the host for processes. Filesystem, network, credentials
+namespace outlives its first process, the supervisor kills that namespace's own init,
+addressed by a pidfd taken at launch, and nothing else. On timeout or interruption, it
+kills the namespace before draining its output. It never searches the host for processes.
+If emptiness cannot be confirmed, the round fails rather than reusing the checkout. A
+marker under the activity directory then pauses automatic recovery until that namespace
+is observed gone. Losing a branch claim cancels the agent working on that branch, which
+tears its namespace down.
+
+One window remains: bubblewrap arms `--die-with-parent` in the namespace's init a few
+milliseconds after creating it. The supervisor waits out that setup before treating the
+launch as complete, and kills the init itself if interrupted meanwhile. A supervisor that
+is SIGKILLed inside those milliseconds can still orphan the namespace. Filesystem, network, credentials
 and provider sandboxes behave as before: the whole filesystem and `/dev` are bound
 unchanged. As inside any unprivileged user namespace, setuid programs such as `sudo` do
 not gain privileges.
 
-Each boundary is recorded with its round as a `containment_result` activity receipt: the
-label, mode, namespace init pid, PID namespace inode, exit status and cleanup result.
+Each boundary is recorded with its round as activity receipts: `containment_started` at
+launch, with the label, mode, namespace init pid and PID namespace inode, then
+`containment_result` with the exit status and cleanup result.
 Command lines are never recorded, because they can carry prompts and credentials.
 
 ## Capability and rollback
@@ -37,11 +49,14 @@ unprivileged user namespaces. On Ubuntu that means an AppArmor profile for `bwra
   round's receipts. That cleanup cannot reach a process that left its session.
 - `required` refuses to launch a host agent or tool without a namespace.
 - `legacy` is the rollback for a provider that misbehaves inside a namespace. It restores
-  best-effort process-group cleanup explicitly.
+  best-effort process-group cleanup explicitly. It also turns off the shared Mathlib view,
+  which is itself a namespace: rounds use private builds, or pause under
+  `TAUCETI_SHARED_MATHLIB_BUILDS=required`.
 
 Non-Linux hosts keep running with best-effort cleanup and report it accurately.
 Whenever containment is not strong (rollback, unsupported host, or `required` that cannot
-be met), automatic security-audit recovery is paused, because a relaunched client could
+be met), or an earlier boundary was never confirmed empty, automatic security-audit
+recovery is paused, because a relaunched client could
 again outlive its round. Recover manually with `security_audit resume`.
 
 The policy is read when each boundary starts, so a change applies at the next round

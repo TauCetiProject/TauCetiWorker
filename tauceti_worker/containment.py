@@ -27,6 +27,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import Die, log
 
@@ -138,36 +139,76 @@ def strong(env=None) -> bool:
     return status(env).strong
 
 
-def _namespace_alive(pid: int, namespace: int) -> bool:
-    # The namespace's init keeps this link until every other member is dead and reaped, so the
-    # link names the boundary, not just a pid that the kernel might have reused.
+class ContainmentUnconfirmed(Die):
+    """A boundary could not be confirmed empty; its checkout and leases must not be reused yet."""
+
+
+def _namespace_state(pid: int, namespace: int) -> bool | None:
+    """True while the namespace lives, False once it is gone, None if this cannot be determined.
+
+    The namespace's init keeps this link until every other member is dead and reaped, so the link
+    names the boundary, not just a pid that the kernel might have reused."""
     try:
         return os.readlink(f"/proc/{pid}/ns/pid") == f"pid:[{namespace}]"
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
+    except OSError:
+        return None
+
+
+def _marker_dir():
+    from . import activity
+
+    return activity.root() / "containment-unconfirmed"
+
+
+def unconfirmed() -> list[dict]:
+    """Boundaries whose emptiness was never confirmed and that may still be alive. A marker is
+    retired only once its own namespace is observed gone; nothing else on the host is examined."""
+    import json
+
+    live = []
+    for path in sorted(_marker_dir().glob("*.json")) if _marker_dir().is_dir() else ():
+        try:
+            entry = json.loads(path.read_text())
+            gone = _namespace_state(int(entry["child_pid"]), int(entry["pid_namespace"])) is False
+        except (OSError, ValueError, KeyError, TypeError):
+            entry, gone = {"marker": path.name}, False
+        if gone:
+            path.unlink(missing_ok=True)
+        else:
+            live.append(entry)
+    return live
 
 
 class Boundary:
     """One owned PID namespace (or, on a legacy host, best-effort process group) for one command.
 
-    Use: `argv = b.argv(cmd)`, launch it with `pass_fds=b.pass_fds`, call `b.launched()` once the
-    child exists, and `b.finish(rc)` after it exits. `finish` confirms the namespace is empty, and
-    kills only that namespace if it is not, before the caller treats the checkout as quiescent. It
-    records identity and result with the current round; it never records argv, which can carry
-    prompts and credentials, and never searches the host for processes it does not own."""
+    Use: `argv = b.argv(cmd)`, launch it with `pass_fds=b.pass_fds`, call `b.launched()` as soon as
+    the child exists, and `b.finish(rc)` after it exits; `b.abort()` tears the namespace down at once
+    (before draining its pipes). `launched` takes bwrap's identity handshake and a pidfd for the
+    namespace's init, and records a start receipt. `finish` confirms the namespace is empty, killing
+    only its own init if it is not, before the caller treats the checkout as quiescent, and raises
+    `ContainmentUnconfirmed` if emptiness cannot be established. Receipts never carry argv, which can
+    hold prompts and credentials, and nothing here searches the host for processes it does not own."""
 
     def __init__(self, label: str, *, prefix=(), contain=True):
+        self.id = uuid.uuid4().hex
         self.label = label
         self.prefix = list(prefix)
         self.identity: dict = {}
         self._info_r: int | None = None
         self._info_w: int | None = None
+        self._pidfd: int | None = None
+        self._buffer = b""
         self._started = time.time()
         self._finished = False
+        self._launched = False
         if not contain:
             self.strong, self.mode, self.reason = False, UNCONTAINED, "runs in a sandbox owned elsewhere"
         elif self.prefix:
-            # The shared Mathlib view is already a bwrap PID namespace: it is the boundary.
+            # The shared Mathlib view is already a bwrap PID namespace: it is the boundary. The view
+            # is never offered under the legacy rollback (shared_mathlib.view refuses it).
             self.strong, self.mode, self.reason = True, NAMESPACE, "shared Mathlib overlay namespace"
         else:
             cap = capability()
@@ -186,73 +227,131 @@ class Boundary:
     def pass_fds(self) -> tuple[int, ...]:
         return () if self._info_w is None else (self._info_w,)
 
-    def launched(self) -> None:
+    def launched(self, *, timeout: float = 5.0) -> None:
+        """Close our copy of the handshake pipe and take the namespace's identity."""
+        self._launched = True
         if self._info_w is not None:
             with contextlib.suppress(OSError):
                 os.close(self._info_w)
             self._info_w = None
+        if self._info_r is not None and not self.identity:
+            self._read_identity(timeout)
+            if self.identity:
+                self._await_setup(timeout)
+                record(self, "containment_started")
 
-    def _read_identity(self) -> dict:
-        if self._info_r is None:
-            return self.identity
+    def _read_identity(self, timeout: float) -> None:
         import json
+        import select
 
-        data = b""
-        try:
-            os.set_blocking(self._info_r, False)
-            while chunk := os.read(self._info_r, 65536):
-                data += chunk
-        except (BlockingIOError, OSError):
-            pass
-        finally:
+        deadline = time.monotonic() + timeout
+        value, chunk = None, b"pending"
+        while self._info_r is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self._info_r], [], [], remaining)[0]:
+                break
+            try:
+                chunk = os.read(self._info_r, 65536)
+            except OSError:
+                chunk = b""
+            self._buffer += chunk
+            try:
+                value = json.loads(self._buffer.decode())
+                break
+            except ValueError:
+                if not chunk:
+                    break  # EOF: bwrap exited before reporting a namespace
+        if self._info_r is not None and (value is not None or time.monotonic() >= deadline or not chunk):
             with contextlib.suppress(OSError):
                 os.close(self._info_r)
             self._info_r = None
-        try:
-            value = json.loads(data.decode() or "{}")
-        except ValueError:
-            value = {}
         if isinstance(value, dict):
-            self.identity = {
+            identity = {
                 key: value[key]
                 for key in ("child-pid", "pid-namespace")
                 if type(value.get(key)) is int and value[key] > 0
             }
-        return self.identity
+            if len(identity) == 2:
+                self.identity = identity
+                self._open_pidfd()
 
-    def _await_empty(self, grace: float) -> str:
-        pid, namespace = self.identity.get("child-pid"), self.identity.get("pid-namespace")
-        if pid is None or namespace is None:
-            return "not-started"  # bwrap failed before creating the namespace
-        deadline = time.monotonic() + grace
-        while _namespace_alive(pid, namespace):
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.02)
+    def _await_setup(self, timeout: float) -> None:
+        # bwrap reports the namespace before its init arms --die-with-parent; until init forks the
+        # command, losing bwrap would orphan the namespace. Wait for that fork, so the unprotected
+        # window is bwrap's own setup, and abort() still covers it while this process lives.
+        pid = self.identity["child-pid"]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if Path(f"/proc/{pid}/task/{pid}/children").read_text().split():
+                    return
+            except OSError:
+                return  # gone, or this kernel does not expose children
+            time.sleep(0.005)
+
+    def _open_pidfd(self) -> None:
+        # Open first, then verify the pid still names our namespace: a pidfd cannot follow pid
+        # reuse, so every later signal reaches this init or nobody.
+        if not hasattr(os, "pidfd_open"):
+            return
+        try:
+            fd = os.pidfd_open(self.identity["child-pid"])
+        except OSError:
+            return
+        if self._state() is True:
+            self._pidfd = fd
         else:
-            return "namespace-empty"
-        # Signal the boundary's own init, after rechecking that the pid still names it. Killing a
-        # namespace's init makes the kernel kill every other member.
-        if _namespace_alive(pid, namespace):
+            os.close(fd)
+
+    def _state(self) -> bool | None:
+        return _namespace_state(self.identity["child-pid"], self.identity["pid-namespace"])
+
+    def _kill_init(self) -> None:
+        """Kill the namespace's own init, which makes the kernel kill every other member."""
+        if self._pidfd is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
-        deadline = time.monotonic() + 5
-        while _namespace_alive(pid, namespace) and time.monotonic() < deadline:
+                signal.pidfd_send_signal(self._pidfd, signal.SIGKILL)
+        elif self.identity and self._state() is True:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(self.identity["child-pid"], signal.SIGKILL)
+
+    def abort(self) -> None:
+        """Tear the namespace down now: on timeout or interruption, before draining its pipes."""
+        if not self.strong:
+            return
+        self.launched(timeout=1.0)
+        if self.identity:
+            self._kill_init()
+
+    def _await_empty(self, rc: int | None, grace: float) -> str:
+        if not self._launched:
+            return "not-started"  # Popen itself failed
+        if not self.identity:
+            self.launched(timeout=0.5)
+        if not self.identity:
+            # bwrap reports the namespace right after creating it. Without a report, a normal exit
+            # means it never got that far; a killed bwrap might have died just after creating it.
+            return "not-started" if rc is not None and rc >= 0 else "namespace-unconfirmed"
+        deadline = time.monotonic() + grace
+        while (state := self._state()) is True and time.monotonic() < deadline:
             time.sleep(0.02)
-        if _namespace_alive(pid, namespace):
-            log(f"WARNING: {self.label}: PID namespace {namespace} survived SIGKILL of its init {pid}")
-            return "namespace-survived"
-        return "namespace-killed"
+        if state is False:
+            return "namespace-empty"
+        if state is True:
+            self._kill_init()
+            deadline = time.monotonic() + 5
+            while (state := self._state()) is True and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if state is False:
+                return "namespace-killed"
+        return "namespace-unconfirmed"
 
     def finish(self, rc: int | None, *, pgid: int | None = None, grace: float = 5.0) -> str:
         """Confirm the boundary is empty, record the outcome with the round, and return it."""
         if self._finished:
             return "finished"
-        self._finished = True
-        self.launched()
-        self._read_identity()
         if self.strong:
-            cleanup = self._await_empty(grace)
+            cleanup = self._await_empty(rc, grace)
         elif self.mode == UNCONTAINED:
             cleanup = "external"
         elif pgid is not None:
@@ -262,34 +361,73 @@ class Boundary:
             cleanup = "process-group-swept-best-effort"
         else:
             cleanup = "round-group-best-effort"
-        record(self, rc, cleanup)
+        self._finished = True
+        if self._info_w is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._info_w)
+            self._info_w = None
+        if self._pidfd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._pidfd)
+            self._pidfd = None
+        if self._info_r is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._info_r)
+            self._info_r = None
+        record(self, "containment_result", rc=rc, cleanup=cleanup)
+        if cleanup == "namespace-unconfirmed":
+            self._mark_unconfirmed(rc)
+            raise ContainmentUnconfirmed(
+                f"{self.label}: could not confirm that PID namespace {self.identity.get('pid-namespace')} "
+                "is empty; leaving its checkout and leases alone, and automatic recovery is paused"
+            )
         return cleanup
 
+    def _mark_unconfirmed(self, rc: int | None) -> None:
+        from . import activity
+        from .runtime_status import atomic_json
 
-def record(boundary: Boundary, rc: int | None, cleanup: str) -> None:
+        log(f"WARNING: containment: {self.label} exited {rc}; namespace {self.identity or 'unreported'} unconfirmed")
+        with contextlib.suppress(OSError):
+            _marker_dir().mkdir(parents=True, exist_ok=True)
+            atomic_json(
+                _marker_dir() / f"{self.id}.json",
+                dict(
+                    boundary=self.id,
+                    round_id=activity.current_round_id(),
+                    label=self.label,
+                    child_pid=self.identity.get("child-pid"),
+                    pid_namespace=self.identity.get("pid-namespace"),
+                    at=time.time(),
+                ),
+            )
+
+
+def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str | None = None) -> None:
     from . import activity
 
-    round_id = activity.current_round_id()
-    if cleanup in {"namespace-killed", "namespace-survived"} or (rc is not None and rc < 0):
+    if cleanup in {"namespace-killed", "namespace-unconfirmed"} or (rc is not None and rc < 0):
         log(f"containment: {boundary.label} exited {rc}; {boundary.mode} cleanup {cleanup}")
+    round_id = activity.current_round_id()
     if round_id is None:
         return  # recorded only with a round; ad hoc commands have none to attach it to
     activity.emit(
-        "containment_result",
-        key=f"{round_id or 'no-round'}:{boundary.label}:{uuid.uuid4().hex}",
+        kind,
+        key=f"{boundary.id}:{kind}",
+        boundary=boundary.id,
         round_id=round_id,
         label=boundary.label,
         mode=boundary.mode,
         child_pid=boundary.identity.get("child-pid"),
         pid_namespace=boundary.identity.get("pid-namespace"),
-        exit_code=rc,
-        cleanup=cleanup,
         started_at=boundary._started,
+        **({} if kind == "containment_started" else {"exit_code": rc, "cleanup": cleanup}),
     )
 
 
 def run(argv, *, label: str, input=None, timeout: float | None = None, env=None, capture_output=False, **kwargs):
-    """`subprocess.run` inside one boundary. A timeout kills bwrap, and with it the namespace."""
+    """`subprocess.run` inside one boundary. On timeout or interruption the namespace is killed
+    before its pipes are drained, so a survivor holding them cannot block cleanup."""
     boundary = Boundary(label)
     if capture_output:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -303,13 +441,19 @@ def run(argv, *, label: str, input=None, timeout: float | None = None, env=None,
             boundary.launched()
             try:
                 stdout, stderr = proc.communicate(input, timeout=timeout)
-            except subprocess.TimeoutExpired as error:
+            except subprocess.TimeoutExpired:
+                boundary.abort()
                 proc.kill()
-                error.output, error.stderr = proc.communicate()
-                error.cmd = argv
-                raise
+                try:
+                    stdout, stderr = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    stdout = stderr = None
+                rc = proc.wait()
+                raise subprocess.TimeoutExpired(argv, timeout, stdout, stderr) from None
             except BaseException:
+                boundary.abort()
                 proc.kill()
+                rc = proc.wait()
                 raise
             rc = proc.returncode
             return subprocess.CompletedProcess(argv, rc, stdout, stderr)
