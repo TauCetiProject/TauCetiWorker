@@ -97,6 +97,7 @@ def identity(pid=None):
         boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         start=fields[19],
         namespace=os.readlink(f"/proc/{pid}/ns/pid"),
+        view=os.readlink("/proc/self/ns/pid"),
     )
 
 
@@ -141,12 +142,14 @@ def alive(owner):
     if not owner or owner.get("unsupported") or owner.get("remote"):
         return True  # Unknown is never proof of termination.
     try:
+        if sys.platform == "linux" and owner.get("view") and owner["view"] != os.readlink("/proc/self/ns/pid"):
+            return True  # A PID in another observer namespace is not our PID.
         if sys.platform == "darwin":
             current, status = darwin_process(int(owner["pid"]))
             return current == owner and status != 5
         current = identity(int(owner["pid"]))
         fields = Path(f"/proc/{owner['pid']}/stat").read_text().rsplit(")", 1)[1].split()
-        return current == owner and fields[0] not in {"Z", "X"}
+        return all(current.get(key) == value for key, value in owner.items()) and fields[0] not in {"Z", "X"}
     except (ProcessLookupError, FileNotFoundError):
         return False
     except (OSError, ValueError, KeyError, IndexError):

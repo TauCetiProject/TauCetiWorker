@@ -19,7 +19,7 @@ POLICY = "stopped-usage-v1"
 WEEK = 7 * 86400
 
 
-def live_identity(session, now):
+def live_identity(session, now, directory=None):
     owner = accounting.bridge_owner_alive(session.get("owner"))
     heartbeat = None
     if session.get("bridge"):
@@ -27,7 +27,12 @@ def live_identity(session, now):
             heartbeat = (Path(session["bridge"]) / "outbox/heartbeat").stat().st_mtime
         except FileNotFoundError:
             pass
-    live = owner or heartbeat is not None and now - heartbeat <= 30
+    native = False
+    if session.get("lifecycle"):
+        from .usage_supervisor import invocation_alive
+
+        native = invocation_alive(directory or accounting.budget_dir(), session)
+    live = native or owner or heartbeat is not None and now - heartbeat <= 30
     return dict(live=bool(live), owner=session.get("owner"), owner_alive=owner, heartbeat=heartbeat)
 
 
@@ -150,7 +155,7 @@ def recover(budget, note, *, dry_run=False, plan=None):
             len(key) == 32
             and all(c in "0123456789abcdef" for c in key)
             and session["status"] != "settled"
-            and not live_identity(session, now)["live"]
+            and not live_identity(session, now, budget.directory)["live"]
         ):
             try:
                 evidence(budget.directory, session, initial["sessions"], checkpoints=usage_evidence)
@@ -161,7 +166,7 @@ def recover(budget, note, *, dry_run=False, plan=None):
         records = budget.records()
         before = budget.replay(copy.deepcopy(records))
         original = before["sessions"]
-        identities = {key: live_identity(s, budget.clock()) for key, s in original.items()}
+        identities = {key: live_identity(s, budget.clock(), budget.directory) for key, s in original.items()}
         projection = Projection(budget, records, now)
         rows, errors, checkpoints = [], [], []
         for key, session in original.items():
@@ -369,7 +374,7 @@ def recover(budget, note, *, dry_run=False, plan=None):
         if not dry_run and projection.events:
             # Recheck identities immediately before committing the single append-only transaction.
             changed = {e.get("id") for e in projection.events if e.get("id")}
-            if any(live_identity(original[k], budget.clock())["live"] for k in changed):
+            if any(live_identity(original[k], budget.clock(), budget.directory)["live"] for k in changed):
                 raise BudgetError(f"session became live; rerun recovery (plan retained at {path})")
             from .usage_accounting import usage_path
 
@@ -391,7 +396,7 @@ def recover(budget, note, *, dry_run=False, plan=None):
                     and session.get("bridge")
                     and not row["identity"]["live"]
                     and after["sessions"][row["id"]]["status"] == "settled"
-                    and not live_identity(session, budget.clock())["live"]
+                    and not live_identity(session, budget.clock(), budget.directory)["live"]
                 ):
                     (Path(session["bridge"]) / "key").unlink(missing_ok=True)
     return dict(

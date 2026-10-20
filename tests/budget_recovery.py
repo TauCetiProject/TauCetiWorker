@@ -508,7 +508,7 @@ class RecoveryTests(unittest.TestCase):
         original = self.budget.ledger.read_bytes()
         from tauceti_worker.budget import BudgetError
 
-        def identity(session, now):
+        def identity(session, now, directory=None):
             return dict(live=next(ticks), owner=None, owner_alive=False, heartbeat=None)
 
         with patch("tauceti_worker.budget_recovery.live_identity", side_effect=identity):

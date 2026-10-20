@@ -240,6 +240,9 @@ class ClaudeAPIContext:
 
             ensure_supervisor(self.budget.directory)
 
+            boundary = request.get("boundary")
+            if boundary is not None and boundary != safe_message(self.outbox / "active-boundary.json").get("boundary"):
+                raise BudgetError("API admission belongs to a different container boundary")
             invocation = self.admission_ids.setdefault(ticket, uuid.uuid4().hex)
             lifecycle = registration(
                 invocation,
@@ -248,6 +251,8 @@ class ClaudeAPIContext:
                 request.get("process"),
                 enabled=self.enabled,
                 allow_remote=not self.host,
+                boundary=boundary,
+                supervisor_view=safe_message(self.budget.directory / "usage-supervisor.json")["owner"].get("view"),
                 owner=process_identity(),
                 parent=identity(os.getppid()),
                 deadline=float(os.environ["TAUCETI_ROUND_DEADLINE"])

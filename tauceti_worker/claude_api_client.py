@@ -125,7 +125,15 @@ def main():
             resume = args[index + 1]
     previous_reason = None
     while True:
-        admission = request(bridge, "admit", id=invocation, model=model, resume=resume, process=identity())
+        admission = request(
+            bridge,
+            "admit",
+            id=invocation,
+            model=model,
+            resume=resume,
+            process=identity(),
+            boundary=config.get("boundary"),
+        )
         if admission["allowed"]:
             invocation = admission["id"]
             break
@@ -286,12 +294,16 @@ def main():
         else:
             raise
     finally:
+        successful_result = (
+            final is not None and final.get("subtype") in (None, "success") and not final.get("is_error")
+        )
+        successful_exit = process_exited and rc == 0 and successful_result
         if journal is not None:
             try:
-                journal.flush(closed=process_exited and rc == 0 and final is not None and journal_healthy)
+                journal.flush(closed=successful_exit and journal_healthy)
             except OSError as error:
                 warning(f"tauceti usage checkpoint pending: {type(error).__name__}")
-        authoritative = outcome == "launch-failed" or process_exited and rc == 0
+        authoritative = outcome == "launch-failed" or successful_exit
         receipt = dict(
             id=invocation,
             totals=totals if totals and not unknown_segments and authoritative else None,

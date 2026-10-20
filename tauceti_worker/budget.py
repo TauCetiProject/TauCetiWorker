@@ -67,6 +67,7 @@ def process_identity(pid=None):
         return dict(
             pid=pid,
             boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            view=os.readlink("/proc/self/ns/pid"),
             start=Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
         )
     except (OSError, IndexError):
@@ -81,6 +82,8 @@ def bridge_owner_alive(owner):
     if not owner or sys.platform != "linux":
         return False
     try:
+        if owner.get("view") and owner["view"] != os.readlink("/proc/self/ns/pid"):
+            return True
         fields = Path(f"/proc/{int(owner['pid'])}/stat").read_text().rsplit(")", 1)[1].split()
         return (
             owner["boot"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -998,7 +1001,6 @@ class Budget:
         from .budget_recovery import recover
 
         return recover(self, note, dry_run=dry_run, plan=plan)
-
 
     def cooldown(self, model, seconds):
         with self.locked():

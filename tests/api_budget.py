@@ -28,6 +28,7 @@ from tauceti_worker.config import AdmissionUnavailable
 from tauceti_worker.constants import PROGRESS_ERROR_KEY
 from tauceti_worker.survey import Counters
 from tauceti_worker.usage_lifecycle import identity
+from tauceti_worker.usage_supervisor import read_lifecycle
 from tauceti_worker.worker_manager import WorkersError, WorkerSpec
 
 
@@ -772,7 +773,7 @@ with ClaudeAPIContext("crash-fixture", "fix"):
                 time.sleep(0.02)
             self.assertTrue(journal and journal["messages"], (self.root / "driver.log").read_text())
             invocation = journal["id"]
-            lifecycle = json.loads((self.root / "budget/lifecycles" / (invocation + ".json")).read_text())
+            lifecycle = read_lifecycle(self.root / "budget", invocation)
             supervisor = json.loads((self.root / "budget/usage-supervisor.json").read_text())["owner"]
             self.assertEqual(lifecycle["owner"]["pid"], driver.pid)
             os.killpg(driver.pid, signal.SIGKILL)
@@ -792,6 +793,45 @@ with ClaudeAPIContext("crash-fixture", "fix"):
             if driver.poll() is None:
                 os.killpg(driver.pid, signal.SIGKILL)
             driver.wait()
+
+    def test_error_result_with_zero_exit_keeps_uncertain_tail(self):
+        from tauceti_worker.usage_accounting import read_usage
+
+        os.environ["FAKE_EVENTS"] = json.dumps(
+            [
+                dict(
+                    type="assistant",
+                    session_id="provider",
+                    message=dict(
+                        id="response", model="claude-opus-5-5", usage=dict(input_tokens=100, output_tokens=100000)
+                    ),
+                ),
+                dict(
+                    type="result",
+                    session_id="provider",
+                    subtype="error_during_execution",
+                    is_error=True,
+                    total_cost_usd=3,
+                ),
+            ]
+        )
+        with ClaudeAPIContext("worker1", "fix") as context:
+            result = self.run_claude()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.budget.snapshot()["provisional"]), 1)
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+        self.assertFalse(read_usage(next(Path(context.config["usage_dir"]).glob("*.json")))["closed"])
+
+    def test_stale_container_boundary_is_rejected_before_admission(self):
+        from tauceti_worker.usage_supervisor import prepare_boundary
+
+        with ClaudeAPIContext("worker1", "fix") as context:
+            stale = prepare_boundary(context.directory)
+            prepare_boundary(context.directory)
+            with self.assertRaisesRegex(BudgetError, "different container boundary"):
+                context.handle(dict(action="admit", id="f" * 32, model="opus", process=identity(), boundary=stale))
+            self.assertFalse(context.invocations)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
 
     def test_admission_restarts_a_supervisor_lost_mid_context(self):
         from tauceti_worker.usage_lifecycle import alive
@@ -824,7 +864,7 @@ with ClaudeAPIContext("crash-fixture", "fix"):
             self.assertEqual(result.returncode, 0, result.stderr)
             native_pid = json.loads(result.stdout.splitlines()[0])["pid"]
             invocation = next(iter(context.invocations))
-            lifecycle = json.loads((self.root / "budget/lifecycles" / (invocation + ".json")).read_text())
+            lifecycle = read_lifecycle(self.root / "budget", invocation)
             self.assertNotEqual(lifecycle["native"]["pid"], native_pid)
             self.assertEqual(lifecycle["gate"]["pid"], native_pid)
             self.assertEqual(lifecycle["native"]["start"], lifecycle["gate"]["start"])

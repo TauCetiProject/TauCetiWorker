@@ -21,6 +21,7 @@ from tauceti_worker.usage_supervisor import (
     ensure_supervisor,
     lifecycle_path,
     read_lifecycle,
+    record_boundary_stopped,
     record_round_end,
     register,
     registration,
@@ -276,6 +277,24 @@ class SupervisorTests(unittest.TestCase):
         with patch("tauceti_worker.usage_lifecycle.identity", side_effect=FileNotFoundError("gone")):
             self.assertFalse(alive(owner))
 
+    def test_pid_from_another_observer_namespace_is_not_declared_dead(self):
+        owner = {**identity(), "view": "pid:[another-observer]", "start": "unrelated-local-process"}
+        self.assertTrue(alive(owner))
+
+    def test_shared_budget_across_pid_views_uses_remote_birth_identity(self):
+        value = registration(
+            uuid.uuid4().hex,
+            uuid.uuid4().hex,
+            self.bridge,
+            identity(self.shim.pid),
+            enabled=True,
+            owner=self.owner,
+            parent=identity(),
+            supervisor_view="pid:[other-supervisor]",
+        )
+        self.assertTrue(value["external"])
+        self.assertEqual(value["shim"]["remote"], identity(self.shim.pid))
+
     def test_reused_pid_is_not_the_registered_process(self):
         owner = identity()
         self.assertFalse(alive({**owner, "start": "different-birth"}))
@@ -333,7 +352,10 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNone(self.budget.recover_usage(self.id, allow_live_owner=True))
         with self.assertRaisesRegex(BudgetError, "live native"):
             self.budget.settle_receipt(dict(id=self.id, totals={"provider": "3"}, outcome="exit:0"))
+        with patch("tauceti_worker.budget.bridge_owner_alive", return_value=False):
+            self.budget.recover("live native cannot be historically estimated")
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertEqual(self.saved()["status"], "active")
 
     def test_lost_sidecar_before_first_recovery_charges_usage_instead_of_zero(self):
         native = self.launch()
@@ -411,6 +433,7 @@ class SupervisorTests(unittest.TestCase):
                 owner=self.owner,
                 parent=identity(),
                 allow_remote=True,
+                boundary=uuid.uuid4().hex,
             )
         self.assertTrue(
             self.budget.admit(self.id, "fixture", MODEL, "fix", bridge=str(self.bridge), lifecycle=value)["allowed"]
@@ -460,6 +483,62 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
         self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
         self.assertIn("remote-liveness-unconfirmed", {e["kind"] for e in read_lifecycle(self.root, self.id)["events"]})
+
+    def test_remote_unknown_reserves_known_usage_without_charging(self):
+        self.remote_launch()
+        self.response()
+        value = read_lifecycle(self.root, self.id)
+        value["owner"]["start"] = "stopped-owner"
+        durable(lifecycle_path(self.root, self.id), value)
+        tick(self.budget)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertGreaterEqual(Decimal(self.budget.snapshot()["pending"]), Decimal("4.0008"))
+        with self.assertRaises(BudgetError):
+            self.budget.reconcile(self.id, 3, "liveness remains unknown")
+        record_boundary_stopped(self.bridge, value["boundary"])
+        tick(self.budget)
+        self.assertGreater(Decimal(self.budget.snapshot()["spent"]), 2)
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_prior_container_cleanup_cannot_settle_a_new_boundary(self):
+        self.remote_launch()
+        self.response()
+        record_boundary_stopped(self.bridge, uuid.uuid4().hex)
+        tick(self.budget)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertGreaterEqual(Decimal(self.budget.snapshot()["pending"]), Decimal("4.0008"))
+
+    def test_completed_and_unchanged_journals_are_not_parsed_on_restart(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        tick(self.budget)
+        with patch("tauceti_worker.usage_supervisor.session_usage", side_effect=AssertionError("journal reread")):
+            tick(self.budget, cache={})
+
+    def test_compatible_supervisor_from_other_install_is_usable(self):
+        durable(
+            self.root / "usage-supervisor.json",
+            dict(
+                owner=identity(),
+                heartbeat=time.time(),
+                protocol=1,
+                source="/another/install/usage_supervisor.py",
+                code_version="other",
+            ),
+        )
+        with patch("tauceti_worker.usage_supervisor.subprocess.Popen") as start:
+            ensure_supervisor(self.root)
+            start.assert_not_called()
+
+    def test_explicit_refresh_retires_the_exact_supervisor(self):
+        ensure_supervisor(self.root)
+        first = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
+        ensure_supervisor(self.root, refresh=True)
+        second = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
+        self.assertFalse(alive(first))
+        self.assertNotEqual(first, second)
 
     def test_round_end_reporting_failure_preserves_round_returncode(self):
         from types import SimpleNamespace

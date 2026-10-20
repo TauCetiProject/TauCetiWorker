@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
-from .budget import Budget, BudgetError, bridge_owner_alive
+from .budget import Budget, BudgetError, bridge_owner_alive, money
 from .claude_api import safe_message
 from .usage_accounting import session_usage, usage_path
 from .usage_lifecycle import alive, durable, identity, resolve
@@ -27,7 +29,11 @@ def lifecycle_path(directory, invocation):
 
 def read_lifecycle(directory, invocation):
     try:
-        value = safe_message(lifecycle_path(directory, invocation))
+        path = lifecycle_path(directory, invocation)
+        try:
+            value = safe_message(path)
+        except FileNotFoundError:
+            value = safe_message(path.parent / "done" / path.name)
         if value.get("version") != 1 or value.get("id") != invocation:
             raise ValueError("invalid usage lifecycle")
         return value
@@ -57,6 +63,8 @@ def invocation_alive(directory, session, *, legacy_owner=True):
     value = invocation_lifecycle(directory, session)
     if value is None:
         return legacy_owner and bridge_owner_alive(session.get("owner"))
+    if value.get("phase") == "reconciled":
+        return False
     if value.get("external"):
         return not external_exit_proved(value)
     return alive(value["shim"]) or bool(value.get("native") and alive(value["native"]))
@@ -69,6 +77,16 @@ def external_exit_proved(value):
     The copied shim records its native wait result with the exec gate's birth ID.
     """
     bridge, invocation = Path(value["bridge"]), value["id"]
+    try:
+        boundary = safe_message(bridge / "outbox" / ("boundary-" + str(value.get("boundary")) + ".stopped.json"))
+        if (
+            value.get("boundary")
+            and boundary.get("bridge") == bridge.name
+            and boundary.get("boundary") == value["boundary"]
+        ):
+            return True
+    except FileNotFoundError:
+        pass
     for suffix in ("terminal", "no-exec"):
         try:
             proof = safe_message(bridge / "inbox" / (invocation + "." + suffix))
@@ -94,7 +112,20 @@ def external_exit_proved(value):
     return False
 
 
-def registration(invocation, ticket, bridge, shim, *, enabled, owner, parent, deadline=None, allow_remote=False):
+def registration(
+    invocation,
+    ticket,
+    bridge,
+    shim,
+    *,
+    enabled,
+    owner,
+    parent,
+    deadline=None,
+    allow_remote=False,
+    boundary=None,
+    supervisor_view=None,
+):
     try:
         process = resolve(shim)
     except (OSError, ValueError):
@@ -110,6 +141,8 @@ def registration(invocation, ticket, bridge, shim, *, enabled, owner, parent, de
         and shim.get("boot")
     ):
         process = dict(remote=shim)
+    if process is not None and supervisor_view and process.get("view") and process["view"] != supervisor_view:
+        process = dict(remote=shim)
     if process is None:
         raise ValueError("admission requester stopped before identity was recorded")
     return dict(
@@ -119,6 +152,7 @@ def registration(invocation, ticket, bridge, shim, *, enabled, owner, parent, de
         bridge=str(bridge),
         shim=process,
         external=bool(process.get("remote")),
+        boundary=boundary,
         owner=owner,
         parent=parent,
         deadline=deadline,
@@ -131,8 +165,95 @@ def registration(invocation, ticket, bridge, shim, *, enabled, owner, parent, de
 def register(directory, value):
     path = lifecycle_path(directory, value["id"])
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not path.exists():
+    if not path.exists() and not (path.parent / "done" / path.name).exists():
         durable(path, value)
+
+
+def prepare_boundary(bridge):
+    boundary = uuid.uuid4().hex
+    durable(Path(bridge) / "outbox/active-boundary.json", dict(boundary=boundary))
+    return boundary
+
+
+def record_boundary_stopped(bridge, boundary):
+    bridge = Path(bridge)
+    durable(
+        bridge / "outbox" / ("boundary-" + boundary + ".stopped.json"),
+        dict(bridge=bridge.name, boundary=boundary, at=time.time()),
+    )
+
+
+def archive_lifecycle(path, value):
+    value["phase"] = "reconciled"
+    durable(path, value)
+    done = path.parent / "done"
+    done.mkdir(exist_ok=True, mode=0o700)
+    path.rename(done / path.name)
+    for directory in (done, path.parent):
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def evidence_stamp(directory, value):
+    inbox = Path(value["bridge"]) / "inbox"
+    paths = [inbox / (value["id"] + suffix) for suffix in (".receipt", ".exec-failed", ".no-exec")]
+    journals = [usage_path(directory, value["id"], value["bridge"]), usage_path(directory, value["id"])]
+    proofs = [
+        inbox / (value["id"] + ".terminal"),
+        Path(value["bridge"]) / "outbox" / ("boundary-" + str(value.get("boundary")) + ".stopped.json"),
+    ]
+    return [stat_stamp(p) for p in paths + journals + [p.with_suffix(".jsonl") for p in journals] + proofs]
+
+
+def reserve_unknown_usage(budget, value, stamp):
+    """Unknown remote liveness can enlarge a reserve, never commit expenditure."""
+    if value.get("unknown_reserve_stamp") == stamp:
+        return
+    from .budget_usage import evidence
+
+    with budget.locked():
+        sessions = budget.replay()["sessions"]
+    session = sessions.get(value["id"])
+    if not session or session["status"] == "settled":
+        return
+    saved = evidence(budget.directory, session, sessions)
+    if not saved:
+        return
+    with budget.locked():
+        state = budget.replay()
+        session = state["sessions"][value["id"]]
+        if session["status"] == "settled":
+            return
+        known = max(saved["cost"], money(session.get("lower_bound_cost", "0")))
+        tail = max(
+            money(session["estimate"]),
+            budget.estimate(state, session["model"], session["phase"], include_pending=False)[1],
+            known,
+        )
+        reserve = max(
+            money(session.get("reserve", session["estimate"])),
+            max(money(0), known - money(session.get("cost", "0"))) + tail,
+        )
+        if money(session.get("reserve", session["estimate"])) < reserve or session["status"] != "provisional":
+            budget.append(
+                state,
+                [
+                    budget.accrue(state),
+                    dict(
+                        type="unresolved",
+                        id=value["id"],
+                        provisional=True,
+                        reserve=str(reserve),
+                        lower_bound_cost=str(known),
+                        lower_bound_totals=session.get("lower_bound_totals", {}),
+                        outcome="remote liveness unknown; token-priced usage plus uncertain tail reserved",
+                    ),
+                ],
+            )
+    value["unknown_reserve_stamp"] = stamp
 
 
 def round_key(owner):
@@ -169,7 +290,9 @@ def tick(budget, cache=None, stop=None):
                 register(budget.directory, session["lifecycle"])
         cache.update(ledger_stamp=ledger_stamp, sessions=sessions)
     errors = cache.setdefault("errors", {})
-    for path in (budget.directory / "lifecycles").glob("*.json"):
+    paths = list((budget.directory / "lifecycles").glob("*.json"))
+    paths.sort(key=lambda path: cache["sessions"].get(path.stem, {}).get("status") != "active")
+    for path in paths:
         if stop is not None and stop.is_set():
             return
         try:
@@ -197,6 +320,28 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     value = read_lifecycle(budget.directory, path.stem)
     bridge, invocation = Path(value["bridge"]), value["id"]
     inbox, outbox = bridge / "inbox", bridge / "outbox"
+    stamp = evidence_stamp(budget.directory, value)
+    if value["phase"] in {"stopped", "no-inference"} and value.get("recovery_stamp") == stamp:
+        return
+    if value.get("unknown_reserve_stamp") == stamp and any(
+        e["kind"] == "remote-liveness-unconfirmed" for e in value["events"]
+    ):
+        return
+    if (session and session["status"] == "settled" and session.get("cost_provenance") == "native-reported") or (
+        not value["budgeted"] and value["phase"] == "stopped"
+    ):
+        if session:
+            kind = (
+                "failed-launch"
+                if session.get("outcome") == "launch-failed"
+                else "successful-exit"
+                if session.get("outcome") == "exit:0"
+                else "native-receipt"
+            )
+            if not any(e["kind"] == kind for e in value["events"]):
+                value["events"].append(dict(kind=kind, at=time.time()))
+        archive_lifecycle(path, value)
+        return
     changed = False
 
     def event(kind, value=value, **fields):
@@ -259,12 +404,10 @@ def recover_invocation(budget, path, *, cache=None, session=None):
         if value.get("external")
         else not alive(value["shim"]) and not (value.get("native") and alive(value["native"]))
     )
-    if value.get("external") and not stopped and not bridge_owner_alive(value.get("owner")):
+    if value.get("external") and not stopped:
         event("remote-liveness-unconfirmed")
     journal = session_usage(budget.directory, value)
-    has_usage = bool(journal and journal["messages"]) or bool(
-        session and session.get("cost") and float(session["cost"]) > 0
-    )
+    has_usage = bool(journal and journal["messages"]) or bool(session and money(session.get("cost", "0")) > 0)
     if stopped:
         event("stopped")
         if value["phase"] == "admitted" and not launch.exists() and not has_usage:
@@ -278,19 +421,17 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     if changed:
         durable(path, value)
     if not stopped or not value["budgeted"]:
+        if value["budgeted"] and value.get("external") and mode == "auto":
+            prior_stamp = value.get("unknown_reserve_stamp")
+            reserve_unknown_usage(budget, value, stamp)
+            if prior_stamp != value.get("unknown_reserve_stamp"):
+                durable(path, value)
+        if stopped and not value["budgeted"]:
+            archive_lifecycle(path, value)
         return
     if mode == "record-only":
         return
     receipt_path = inbox / (invocation + ".receipt")
-    evidence_paths = [
-        receipt_path,
-        inbox / (invocation + ".exec-failed"),
-        inbox / (invocation + ".no-exec"),
-        usage_path(budget.directory, invocation, value["bridge"]),
-        usage_path(budget.directory, invocation),
-    ]
-    evidence_paths += [p.with_suffix(".jsonl") for p in evidence_paths[-2:]]
-    stamp = [stat_stamp(p) for p in evidence_paths]
     if value.get("recovery_stamp") == stamp or (cache is not None and cache.get(invocation) == stamp):
         return
     if session and session["status"] == "settled" and session.get("cost_provenance") == "native-reported":
@@ -327,7 +468,7 @@ def recover_invocation(budget, path, *, cache=None, session=None):
         cache[invocation] = stamp
 
 
-def ensure_supervisor(directory):
+def ensure_supervisor(directory, *, refresh=False):
     """Called by outer workers and before contexts; restarting replays saved evidence."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -335,11 +476,13 @@ def ensure_supervisor(directory):
     version = code_version()
     try:
         value = safe_message(ready)
-        if alive(value["owner"]) and value.get("code_version") != version:
+        same_source = value.get("source") == str(Path(__file__).resolve())
+        if alive(value["owner"]) and (refresh or same_source and value.get("code_version") != version):
+            durable(directory / "usage-supervisor-retire.json", dict(owner=value["owner"], at=time.time()))
             deadline = time.monotonic() + 10
             while alive(value["owner"]) and time.monotonic() < deadline:
                 time.sleep(0.05)
-        elif alive(value["owner"]) and time.time() - value["heartbeat"] < 10:
+        elif alive(value["owner"]) and value.get("protocol") == 1 and time.time() - value["heartbeat"] < 10:
             return
     except (OSError, ValueError, KeyError):
         pass
@@ -360,7 +503,7 @@ def ensure_supervisor(directory):
     while time.monotonic() < deadline:
         try:
             value = safe_message(ready)
-            if alive(value["owner"]) and value.get("code_version") == version and time.time() - value["heartbeat"] < 10:
+            if alive(value["owner"]) and value.get("protocol") == 1 and time.time() - value["heartbeat"] < 10:
                 # Reap duplicate starters which lost the singleton lock.
                 threading.Thread(target=process.wait, daemon=True).start()
                 return
@@ -393,12 +536,22 @@ def run(directory):
         def heartbeat():
             while not stop.is_set():
                 try:
-                    if code_version() != version:
+                    try:
+                        retirement = safe_message(budget.directory / "usage-supervisor-retire.json")
+                    except FileNotFoundError:
+                        retirement = {}
+                    if retirement.get("owner") == owner or code_version() != version:
                         stop.set()  # Let the next new-launch check load current code.
                         return
                     durable(
                         budget.directory / "usage-supervisor.json",
-                        dict(owner=owner, heartbeat=time.time(), code_version=version),
+                        dict(
+                            owner=owner,
+                            heartbeat=time.time(),
+                            code_version=version,
+                            protocol=1,
+                            source=str(Path(__file__).resolve()),
+                        ),
                     )
                 except OSError:
                     stop.set()
