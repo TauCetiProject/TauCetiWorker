@@ -38,7 +38,7 @@ from .verification_storage import Limit, Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 5
-LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "LocalLint.lean")
+LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
@@ -622,7 +622,9 @@ class Verification:
                     lint_modules.add(module)
             lint_list.write_text("".join(f"{m}\n" for m in sorted(lint_modules)))
             if lint_modules:
-                commands.append(([sys.executable, "-m", "tauceti_worker.local_lint", "--modules", str(lint_list)], env))
+                commands.append(
+                    ([sys.executable, "-I", str(HERE / "scripts/tauceti-local-lint"), "--modules", str(lint_list)], env)
+                )
             return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
@@ -791,7 +793,7 @@ class Verification:
                     try:
                         self.command(phase, argv, env=env)
                     except subprocess.CalledProcessError as error:
-                        local_lint = "tauceti_worker.local_lint" in error.cmd
+                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in error.cmd)
                         if (phase == "axioms" or local_lint) and error.returncode in {2, 75}:
                             raise Incomplete(
                                 f"local {phase} checker unavailable; see the phase log",

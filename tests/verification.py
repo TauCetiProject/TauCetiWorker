@@ -54,6 +54,7 @@ class Receipts(unittest.TestCase):
         write(self.root, ".gitignore", ".lake/\nTauCeti/Ignored.lean\n")
         write(self.root, "scripts/lint-env.sh", 'echo "LINT-ENV: PASS"\n')
         write(self.root, "scripts/lint-style.sh", 'echo "LINT-STYLE: PASS"\n')
+        write(self.root, ".lake/packages/batteries/Batteries/Tactic/Lint.lean", "fixture\n")
         git(self.root, "add", ".")
         git(self.root, "commit", "-qm", "base")
         self.base = git(self.root, "rev-parse", "HEAD")
@@ -480,7 +481,9 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
-        lint = next(c for c in result["commands"] if "tauceti_worker.local_lint" in c["argv"])
+        lint = next(
+            c for c in result["commands"] if any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in c["argv"])
+        )
         self.assertIn("TauCeti.B", Path(lint["argv"][-1]).read_text())
         self.assertFalse(any("scripts/lint-env.sh" in c["argv"] for c in result["commands"]))
         modules.write_text("TauCeti.A\n")

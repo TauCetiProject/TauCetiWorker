@@ -1087,7 +1087,7 @@ class Fixture(unittest.TestCase):
             patch.dict(os.environ, TAUCETI_USE_BUDGET="0"),
         ):
             self.assertEqual(loop.cmd_loop(args, self.cfg, only=["fix"], agent="claude"), 130)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2, 3, 4, 5, 5, 5, 5])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 10, 15, 20, 25, 30, 30, 30])
 
     def test_loop_recovery_precedes_model_budget(self):
         from tauceti_worker import loop

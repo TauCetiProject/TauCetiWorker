@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Scoped local environment/docstring checks; never run a checkout's full-library driver."""
 
 from __future__ import annotations
@@ -10,21 +11,34 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
 from pathlib import Path
 
-from .paths import HERE
+SOURCE = Path(__file__).resolve().with_name("LocalLint.lean")
+
+
+def copy_file(source, destination):
+    with open(source, "rb") as src, open(destination, "wb") as dst:
+        try:
+            fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())
+        except OSError:
+            shutil.copyfileobj(src, dst)
+    shutil.copystat(source, destination)
+    return str(destination)
+
 
 MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*")
 
 
 def checker(project, source):
-    root = Path(
-        os.environ.get("TAUCETI_LOCAL_LINT_CACHE")
-        or Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cache/tauceti/local-lint"
-    )
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:
+        home = Path.home()
+    root = Path(os.environ.get("TAUCETI_LOCAL_LINT_CACHE") or home / ".cache/tauceti/local-lint")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     info = root.lstat()
     if root.is_symlink() or not root.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -44,9 +58,12 @@ def checker(project, source):
     lint_sources = [batteries / "Batteries/Tactic/Lint.lean"]
     lint_sources += sorted((batteries / "Batteries/Tactic/Lint").glob("*.lean"))
     content = {str(p.relative_to(batteries)): p.read_text() for p in lint_sources if p.is_file()}
-    key = hashlib.sha256(
-        json.dumps([source.read_text(), (project / "lake-manifest.json").read_text(), identities, content]).encode()
-    ).hexdigest()
+    try:
+        packages = json.loads((project / "lake-manifest.json").read_text()).get("packages", [])
+        revision = next((p.get("rev") or p.get("version") for p in packages if p.get("name") == "batteries"), None)
+    except (ValueError, AttributeError):
+        revision = None
+    key = hashlib.sha256(json.dumps([source.read_text(), revision, identities, content]).encode()).hexdigest()
     target = root / key
     # One brief build lease; no worker round owns it after the checker is published.
     with (root / "build.lock").open("a+") as lock:
@@ -62,9 +79,24 @@ def checker(project, source):
                 work = Path(directory)
                 shutil.copyfile(source, work / "LocalLint.lean")
                 shutil.copyfile(project / "lean-toolchain", work / "lean-toolchain")
+                private_batteries = work / "batteries"
+                shutil.copytree(
+                    batteries,
+                    private_batteries,
+                    copy_function=copy_file,
+                    ignore=shutil.ignore_patterns(".git", "__pycache__"),
+                )
+                # Published dependency installations may be read-only. Only this private
+                # reflink/copy becomes writable; compiler outputs never touch the source.
+                for directory, _, files in os.walk(private_batteries):
+                    path = Path(directory)
+                    path.chmod(path.stat().st_mode | stat.S_IWUSR)
+                    for name in files:
+                        path = Path(directory) / name
+                        path.chmod(path.stat().st_mode | stat.S_IWUSR)
                 (work / "lakefile.toml").write_text(
                     'name = "local-lint"\n[[require]]\nname = "batteries"\npath = '
-                    + json.dumps(str(batteries))
+                    + json.dumps(str(private_batteries))
                     + '\n[[lean_exe]]\nname = "local-lint"\nroot = "LocalLint"\nsupportInterpreter = true\n'
                 )
                 env = {
@@ -80,7 +112,8 @@ def checker(project, source):
         os.utime(target, None)
         versions = [p for p in root.iterdir() if re.fullmatch(r"[0-9a-f]{64}", p.name)]
         for p in sorted(versions, key=lambda p: p.stat().st_mtime, reverse=True)[8:]:
-            p.unlink(missing_ok=True)
+            if __import__("time").time() - p.stat().st_mtime > 3600:
+                p.unlink(missing_ok=True)
     return target
 
 
@@ -111,14 +144,14 @@ def main(argv=None):
     parser.add_argument("--modules", required=True, type=Path)
     args = parser.parse_args(argv)
     project = Path.cwd()
-    modules = sorted(set(args.modules.read_text().splitlines()))
+    modules = sorted({line.strip() for line in args.modules.read_text().splitlines() if line.strip()})
     for module in modules:
         if not MODULE.fullmatch(module) or not (project / (module.replace(".", "/") + ".lean")).is_file():
             raise ValueError(f"local-lint: invalid requested module: {module!r}")
     if not modules:
         print("local-lint: checked 0 changed modules; full checks run in CI")
         return 0
-    native = checker(project, HERE / "scripts/LocalLint.lean")
+    native = checker(project, SOURCE)
     with tempfile.TemporaryDirectory(prefix="local-lint-") as directory:
         directory = Path(directory)
         selected = directory / "modules.txt"
@@ -126,7 +159,15 @@ def main(argv=None):
         marker = "LOCAL-LINT-" + uuid.uuid4().hex
         nonce = directory / "marker.txt"
         nonce.write_text(marker)
-        result = subprocess.run(["lake", "env", str(native), str(selected), str(nonce)], capture_output=True, text=True)
+        catalogs = ["Batteries.Tactic.Lint"]
+        for name in ("Lint", "Style", "TacticDocumentation"):
+            if (project / f".lake/packages/mathlib/Mathlib/Tactic/Linter/{name}.lean").is_file():
+                catalogs.append("Mathlib.Tactic.Linter." + name)
+        catalog = directory / "catalog.txt"
+        catalog.write_text("\n".join(catalogs) + "\n")
+        result = subprocess.run(
+            ["lake", "env", str(native), str(selected), str(nonce), str(catalog)], capture_output=True, text=True
+        )
         print(result.stderr, end="")
         lines = result.stdout.splitlines()
         for line in lines:
@@ -153,6 +194,6 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except Exception as error:
         print(f"local-lint: {error}")
         raise SystemExit(75) from None

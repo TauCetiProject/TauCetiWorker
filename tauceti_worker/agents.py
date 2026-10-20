@@ -491,6 +491,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
             HERE / "prompts" / "local-verification.md",
             SCOPE_POLICY=policy,
             LOCAL_AXIOMS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-axioms"',
+            LOCAL_LINT=f'"{python}" -I "{wrapper_bin(bubble)}/tauceti-local-lint"',
         )
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
@@ -2118,11 +2119,13 @@ def run_in_bubble(
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
     # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
-    for name in ("tauceti-local-axioms", "LocalAxioms.lean"):
+    for name in ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean"):
         shutil.copy(HERE / "scripts" / name, rounddir / name)
     # Container-produced executables must never enter the host's checker cache.
     local_axioms_cache = cfg.state / "bubble-local-axioms"
     local_axioms_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    local_lint_cache = cfg.state / "bubble-local-lint"
+    local_lint_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     if helper_on:
         from .verification import cache_root
         from .verification_storage import root as storage_root
@@ -2158,6 +2161,8 @@ def run_in_bubble(
         f"{rounddir}:/opt/round:ro",
         "--mount",
         f"{local_axioms_cache}:/opt/local-axioms-cache:rw",
+        "--mount",
+        f"{local_lint_cache}:/opt/local-lint-cache:rw",
     ]
     if helper_on:
         mount_flags += [
@@ -2234,6 +2239,7 @@ def run_in_bubble(
         tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
+    tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache"
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",

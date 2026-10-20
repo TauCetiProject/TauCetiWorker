@@ -13,7 +13,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import local_lint as lint
+import importlib.machinery
+import importlib.util
+
+HELPER = Path(__file__).resolve().parents[1] / "scripts/tauceti-local-lint"
+loader = importlib.machinery.SourceFileLoader("local_lint", str(HELPER))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+lint = importlib.util.module_from_spec(spec)
+loader.exec_module(lint)
 
 
 class LocalLint(unittest.TestCase):
@@ -34,6 +41,24 @@ class LocalLint(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(lint.main(["--modules", str(modules)]), 0)
+
+    def test_standalone_entry_point_needs_no_worker_package(self):
+        import shutil
+
+        with tempfile.TemporaryDirectory() as t:
+            directory = Path(t)
+            shutil.copyfile(HELPER, directory / "tauceti-local-lint")
+            modules = directory / "modules.txt"
+            modules.write_text("\n")
+            result = subprocess.run(
+                [sys.executable, "-I", str(directory / "tauceti-local-lint"), "--modules", str(modules)],
+                cwd=directory,
+                env={"PATH": os.environ["PATH"]},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("0 changed modules", result.stdout)
 
     def test_invalid_scope_never_reaches_lake(self):
         with tempfile.TemporaryDirectory() as t:
@@ -87,6 +112,11 @@ class NativeLint(unittest.TestCase):
             (root / "Fixture/Good.lean").write_text(
                 "import Fixture.Dependency\nnamespace Foreign\n/-- Documented changed definition. -/\ndef documented : Nat := 2\nend Foreign\n"
             )
+            with (root / "Fixture/Good.lean").open("a") as out:
+                out.write("/-- A documented inductive. -/\ninductive Shape where | node\n")
+                out.write(
+                    "/-- A documented structure. -/\nstructure Record where\n  /-- Its value. -/\n  value : Nat\n"
+                )
             (root / "Fixture/Bad.lean").write_text(
                 "import Fixture.Dependency\nnamespace Foreign\ndef undocumentedChanged : Nat := 3\nend Foreign\n"
             )
@@ -111,11 +141,20 @@ class NativeLint(unittest.TestCase):
             base = Path(__file__).resolve().parents[1]
             env["PYTHONPATH"] = str(base)
 
+            def dependency_snapshot():
+                return {
+                    str(p.relative_to(batteries)): (p.stat().st_size, p.stat().st_mtime_ns)
+                    for p in (batteries / ".lake/build").rglob("*")
+                    if p.is_file()
+                }
+
+            before = dependency_snapshot()
+
             def run(module):
                 selected = root / "modules.txt"
                 selected.write_text(module + "\n")
                 return subprocess.run(
-                    [sys.executable, "-m", "tauceti_worker.local_lint", "--modules", str(selected)],
+                    [sys.executable, "-I", str(HELPER), "--modules", str(selected)],
                     cwd=root,
                     env=env,
                     capture_output=True,
@@ -139,6 +178,7 @@ class NativeLint(unittest.TestCase):
             self.assertEqual(nolint.returncode, 1, nolint.stdout + nolint.stderr)
             self.assertIn("unaccounted nolint: unusedArguments Foreign.nolintDef", nolint.stdout)
             self.assertNotIn("compiling the small checker", bad.stdout + empty.stdout)
+            self.assertEqual(dependency_snapshot(), before, "checker compilation modified candidate dependencies")
 
 
 if __name__ == "__main__":

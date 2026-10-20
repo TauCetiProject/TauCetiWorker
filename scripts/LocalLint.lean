@@ -27,14 +27,16 @@ def documentable (name : Name) : MetaM Bool := do
   | _ => return false
 
 unsafe def main (args : List String) : IO UInt32 := do
-  let [modulesFile, markerFile] := args
-    | IO.eprintln "usage: local-lint <modules-file> <marker-file>"; return 2
+  let [modulesFile, markerFile, catalogFile] := args
+    | IO.eprintln "usage: local-lint <modules-file> <marker-file> <linter-catalog>"; return 2
   let modules := (← IO.FS.lines modulesFile).filter (!·.isEmpty) |>.map String.toName
   if modules.isEmpty then
     IO.eprintln "local-lint: no modules requested"; return 2
   initSearchPath (← findSysroot)
   enableInitializersExecution
-  let env ← importModules (modules.map ({ module := · })) {} (trustLevel := 1024)
+  let catalogs := (← IO.FS.lines catalogFile).filter (!·.isEmpty) |>.map String.toName
+  let imports := modules ++ catalogs.filter (!modules.contains ·)
+  let env ← importModules (imports.map ({ module := · })) {} (trustLevel := 1024)
     (loadExts := true)
   let ctx : Core.Context := { fileName := "local-lint", fileMap := default }
   let result ← Prod.fst <$> (CoreM.toIO · ctx { env }) do

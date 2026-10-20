@@ -348,7 +348,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 collision_streak += 1
                 # First collision reselects immediately. Repeated all-busy passes get only
                 # a tiny capped pause to avoid hammering shared claims or GitHub.
-                nap = min(5, collision_streak - 1)
+                nap = min(30, 5 * (collision_streak - 1))
                 report_runtime(
                     "idle", detail="peer claims busy; selecting other work", next_action_at=time.time() + nap
                 )

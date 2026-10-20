@@ -104,12 +104,14 @@ scope="$(git rev-parse --show-toplevel)/.lake/tauceti-scope"
 case "$(head -n 1 "$scope/mode" 2>/dev/null)" in
   unknown*) echo "lint-env: changed modules unknown; CI runs the environment lint" ;;
   scoped*|full*)
-    if [ -s "$scope/modules.txt" ]; then LINT_ONLY_MODULES="$scope/modules.txt" bash scripts/lint-env.sh
+    if [ -s "$scope/modules.txt" ]; then __LOCAL_LINT__ --modules "$scope/modules.txt"
     else echo "lint-env: no changed TauCeti module to lint"; fi ;;
   *) echo "no lint scope: run the scope recipe first" >&2; false ;;
 esac
 ```
-Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`; CI owns the whole-library lint.
+Never run the checkout's `scripts/lint-env.sh` locally: even its scoped mode can import the
+whole library for documentation checks. The Worker-owned helper checks only the listed modules;
+CI owns whole-library lint and documentation coverage.
 
 In your final report, quote the `scope:` and `local-axioms:` lines and label them as local changed-file
 checks. A `full:` scope means full CI is required; it does not claim a full local audit ran.

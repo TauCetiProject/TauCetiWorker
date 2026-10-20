@@ -15,7 +15,7 @@ If the merge conflicts, resolve it (conflicts can only be in `TauCeti/`), or fol
 
 Repair existing declarations only: restate, re-annotate, or (if redundant) remove them. Do NOT add new lemmas or definitions: new mathematics needs a roadmap target, which a repair PR does not have. If a violation can only be fixed by adding one, follow the durable blocked-PR procedure below.
 
-The PR body and its comments list the violations the daily lint found, and this PR's CI build lints the whole library, so its failing log is the current list: each violation with the linter's explanation. Work from that list, and from the latest daily-lint comment if it is newer than the last build. Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it. To check your repairs locally, lint the modules you changed plus the modules that define the flagged declarations. The log names each one as `<linter> <declaration>`. After the scope recipe below has written its list, append the modules whose source mentions each declaration's last name component (a few extra modules only cost a little time):
+The PR body and its comments list the violations the daily lint found, and this PR's CI build lints the whole library, so its failing log is the current list: each violation with the linter's explanation. Work from that list, and from the latest daily-lint comment if it is newer than the last build. Never run the checkout's `scripts/lint-env.sh` locally: even its scoped mode runs a whole-library documentation scan. Use the Worker-owned scoped lint command in the recipe below. CI runs the environment lint; leave the whole-library lint to it. To check your repairs locally, lint the modules you changed plus the modules that define the flagged declarations. The log names each one as `<linter> <declaration>`. After the scope recipe below has written its list, append the modules whose source mentions each declaration's last name component (a few extra modules only cost a little time):
 ```
 list="$(git rev-parse --show-toplevel)/.lake/tauceti-scope/modules.txt"
 for name in <the last component of each flagged declaration name>; do
@@ -23,7 +23,7 @@ for name in <the last component of each flagged declaration name>; do
 done | sed 's/\.lean$//; s|/|.|g' | cat - "$list" | LC_ALL=C sort -u -o "$list"
 test -s "$list" && cat "$list"
 ```
-If `test -s` fails, or a name is auto-generated (for example an `inst...` instance) and grep misses its file, add the defining module to that list by hand: the scoped lint silently skips the `#lint` driver when the list names no real module, so an empty list passes without checking anything. Confirm the output line `lint-env: linted N changed module(s)` has N > 0. CI re-runs the full lint when you push. Rerun the recipe only after further source edits, and append the flagged modules again when you do.
+If `test -s` fails, or a name is auto-generated (for example an `inst...` instance) and grep misses its file, add the defining module to that list by hand: the scoped lint silently skips the `#lint` driver when the list names no real module, so an empty list passes without checking anything. Confirm the output line `local-lint: checked N changed module(s)` has N > 0. CI re-runs the full lint when you push. Rerun the recipe only after further source edits, and append the flagged modules again when you do.
 
 - For a failing check's CI logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and everything below passes locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
@@ -59,7 +59,7 @@ bash scripts/lint-style.sh
 ```
 then the scope recipe, the cheap changed-file axiom check (global duplicates and transitive axioms
 are checked in CI), the flagged-module
-append above, and the scoped environment lint. The scoped `lint-env.sh` must print `LINT-ENV: PASS`.
+append above, and the scoped environment lint. The Worker-owned local lint command must finish successfully and report the selected module count.
 If a step fails, fix it and rerun only the steps whose inputs your fix changed. Never push red.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.

@@ -1436,6 +1436,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                     )
                 )
             if getattr(args, "recovery_only", False):
+                if ctx.activity:
+                    ctx.activity.rc = EX_RECOVERY_IDLE
                 return EX_RECOVERY_IDLE
 
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
@@ -1780,6 +1782,9 @@ def cli_main() -> int:
         )
         return EX_ADMISSION_WAIT
     except ClaimCollision as e:
+        event = blocking_event_since(started)
+        if event:
+            return github_pause(e, event.get("reset"))
         log(str(e))
         report_runtime("idle", detail=str(e), failure_reason=None, failure_code=None, failure_log=None)
         return EX_CLAIM_COLLISION
@@ -1800,7 +1805,14 @@ def cli_main() -> int:
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
     can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "tauceti-verify", "tauceti-local-axioms"):
+    for f in (
+        "claim.sh",
+        "git-safe-push",
+        "gh-safe-pr-create",
+        "tauceti-verify",
+        "tauceti-local-axioms",
+        "tauceti-local-lint",
+    ):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

@@ -139,6 +139,14 @@ class ActivityTests(unittest.TestCase):
         r = a.Round("worker")
         r.rc = 76
         r.finish()
+        for code in (80, 81):
+            r = a.Round("worker")
+            r.rc = code
+            r.finish()
+        from tauceti_worker.config import ClaimCollision
+
+        r = a.Round("worker")
+        r.finish(ClaimCollision("peer owns this PR"))
         r = a.Round("worker")
         r.finish()
         a.emit("round_started", round_id="killed", pid=999999999, hostname=__import__("socket").gethostname())
