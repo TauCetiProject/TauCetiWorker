@@ -22,6 +22,8 @@ def page(*, fork=True, name="author/renamed", parent="UPSTREAM", permission="WRI
         "nameWithOwner": name,
         "owner": {"login": "author"},
         "isFork": True,
+        "isArchived": False,
+        "isLocked": False,
         "viewerPermission": permission,
         "parent": {"id": parent, "nameWithOwner": "org/repo" if parent == "UPSTREAM" else "other/repo", "parent": None},
     }
@@ -57,11 +59,15 @@ nested = page()
 node = nested[0]["data"]["viewer"]["repositories"]["nodes"][0]
 node["parent"] = {"id": "INTERMEDIATE", "nameWithOwner": "peer/repo", "parent": node["parent"]}
 assert discover(lambda _: json.dumps(nested), "org/repo")["fork"] == "author/renamed"
-for change in ("permission", "errors", "truncated", "owner", "ancestry", "upstream-id"):
+for change in ("permission", "archived", "locked", "errors", "truncated", "owner", "ancestry", "upstream-id"):
     data = page()
     node = data[0]["data"]["viewer"]["repositories"]["nodes"][0]
     if change == "permission":
         node["viewerPermission"] = "READ"
+    elif change == "archived":
+        node["isArchived"] = True
+    elif change == "locked":
+        node["isLocked"] = True
     elif change == "errors":
         data[0]["errors"] = [{"message": "partial outage"}]
     elif change == "truncated":
@@ -79,6 +85,23 @@ for change in ("permission", "errors", "truncated", "owner", "ancestry", "upstre
         pass
     else:
         raise AssertionError(change)
+
+# A deep unrelated fork does not hide a fully verified candidate.
+deep = page()
+deep[0]["data"]["viewer"]["repositories"]["nodes"].insert(
+    0,
+    {
+        "id": "DEEP",
+        "nameWithOwner": "author/deep",
+        "owner": {"login": "author"},
+        "isFork": True,
+        "isArchived": False,
+        "isLocked": False,
+        "viewerPermission": "ADMIN",
+        "parent": {"id": "OTHER", "nameWithOwner": "other/repo"},
+    },
+)
+assert discover(lambda _: json.dumps(deep), "org/repo")["fork"] == "author/renamed"
 
 with (
     tempfile.TemporaryDirectory() as tmp,
@@ -166,6 +189,14 @@ with (
         assert outbox.reconcile(check, env) is None, "cached observations must be separated by the full grace period"
     value.update(fork_absent_since=time.time() - 301, retry_at=0)
     tr.atomic(path, value)
+    rejected = subprocess.CompletedProcess([], 1, "", "API rate limit exceeded")
+    rejected.github_before_request = True
+    with patch.object(tr, "execute", return_value=rejected) as write:
+        assert outbox.drain(env) == [path.stem] and write.call_count == 1
+    value = json.loads(path.read_text())
+    assert value["fork_retries"] == 0 and value["status"] == "rejected", "no request must not spend replay allowance"
+    value.update(updated=time.time() - 301, retry_at=0)
+    tr.atomic(path, value)
     with patch.object(tr, "execute", return_value=subprocess.CompletedProcess([], 1, "", "lost response")) as write:
         assert outbox.drain(env) == [path.stem] and write.call_count == 1
         assert write.call_args.args[0] == argv, "legacy retry uses R0's supported CLI form"
@@ -183,3 +214,16 @@ with (
     assert path.exists()
 
 print("PASS: exact fork ancestry, ownership, visibility, legacy migration and bounded reconciliation")
+
+# A bare PR head refers to the canonical repository's owner, not an unknown fork.
+value = {
+    "argv": ["pr", "create", "--repo", "org/repo", "--head", "progress/window/Area"],
+    "context": {"repository": "org/repo", "head": "progress/window/Area"},
+}
+for nodes, expected in (
+    ([{"url": "https://example.invalid/pr/7", "headRepositoryOwner": {"login": "org"}}], True),
+    ([], False),
+):
+    data = {"data": {"repository": {"pullRequests": {"nodes": nodes, "pageInfo": {"hasNextPage": False}}}}}
+    with patch.object(tr, "execute", return_value=result(data)):
+        assert outbox.reconcile(value, {}) is expected

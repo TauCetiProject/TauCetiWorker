@@ -23,7 +23,7 @@ def discover(read, upstream):
         "query($owner:String!,$name:String!,$endCursor:String){"
         "viewer{login repository(name:$name){id} "
         "repositories(first:100,after:$endCursor,isFork:true,ownerAffiliations:[OWNER]){"
-        "nodes{id nameWithOwner isFork viewerPermission owner{login} parent{" + ancestry + "}}"
+        "nodes{id nameWithOwner isFork isArchived isLocked viewerPermission owner{login} parent{" + ancestry + "}}"
         "pageInfo{hasNextPage endCursor}}}"
         "repository(owner:$owner,name:$name){id nameWithOwner isPrivate}}"
     )
@@ -49,6 +49,7 @@ def discover(read, upstream):
         identity = None
         matches = []
         collision = False
+        uncertain = False
         for page in pages:
             if page.get("errors"):
                 raise ForkUnknown("partial fork discovery response")
@@ -73,15 +74,25 @@ def discover(read, upstream):
                     if parent["id"] == current[1] and parent["nameWithOwner"].lower() == current[2]:
                         found = True
                         break
-                    parent = parent["parent"]  # Truncation is uncertainty, never absence.
+                    if "parent" not in parent:
+                        uncertain = True
+                        break
+                    parent = parent["parent"]
                 if found:
-                    if node["viewerPermission"] not in ("WRITE", "MAINTAIN", "ADMIN"):
-                        raise ForkUnknown("matching fork lacks verified push permission")
+                    if (
+                        node["viewerPermission"] not in ("WRITE", "MAINTAIN", "ADMIN")
+                        or node["isArchived"] is not False
+                        or node["isLocked"] is not False
+                    ):
+                        uncertain = True
+                        continue
                     if node["nameWithOwner"].split("/")[0].lower() != current[0]:
                         raise ForkUnknown("fork name and owner disagree")
                     matches.append(node["nameWithOwner"])
         if connection["pageInfo"]["hasNextPage"] is not False:
             raise ForkUnknown("fork discovery stopped before the final page")
+        if not matches and uncertain:
+            raise ForkUnknown("fork ancestry, push permission or usability remains uncertain")
         return {
             "actor": identity[0],
             "upstream_id": identity[1],

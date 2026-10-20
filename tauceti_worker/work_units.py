@@ -1826,9 +1826,18 @@ def _do_progress_inner(w, opts) -> int | None:
     retained = publication.retained(w.cfg)
     marker = w.cfg.state / "progress/work/publication.json"
     if marker.exists() and not retained:
-        raise Die("Prepared progress receipt does not match its files; preserving it for recovery")
+        log("Prepared progress receipt does not match its files; preserving it for recovery")
+        return None
     if retained and retained["actor"] != me().lower():
-        raise Die("Prepared progress belongs to another GitHub actor; preserving its bodies and branch")
+        log("Prepared progress belongs to another GitHub actor; preserving its bodies and branch")
+        return None
+    if retained:
+        if retained.get("attempts", 0) >= publication.MAX_ATTEMPTS:
+            saved = publication.park(w.cfg, retained, "publication recovery attempt limit reached")
+            log(f"progress: parked prepared report for recovery at {saved}; selecting unrelated work")
+            w.counters.write(PROGRESS_ERROR_KEY, 0)
+            return None
+        retained = publication.defer(w.cfg, retained)
     # Record the ATTEMPT before anything fallible. The cadence check keys on the last *landed* report,
     # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
     # round, for ever.
@@ -1898,7 +1907,6 @@ def _do_progress_inner(w, opts) -> int | None:
 
     if retained:
         log("progress: resuming prepared report publication with retained prose and window")
-        publication.defer(w.cfg, retained)
         return _apply_prepared_progress(w, run_tool, roadmap_dir, work, retained)
 
     # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
@@ -1923,6 +1931,9 @@ def _do_progress_inner(w, opts) -> int | None:
         w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "plan", proc))
     plan = json.loads(plan_file.read_text())
+    if saved := publication.parked_window(w.cfg, plan):
+        log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
+        return None
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
     # 2) Ground truth from git, so the prose can be checked against what really landed.
@@ -1972,7 +1983,7 @@ def _do_progress_inner(w, opts) -> int | None:
             raise Die(f"the agent did not write {f.name}")
 
     receipt = publication.save(w.cfg, me(), PROGRESS_REF)
-    publication.defer(w.cfg, receipt)
+    receipt = publication.defer(w.cfg, receipt)
     return _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt)
 
 
@@ -2003,7 +2014,13 @@ def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
     # excerpt below — otherwise the same text lands in the log twice, once uselessly clipped.
     if proc.returncode not in (0, EX_NOPROGRESS):
         w.counters.incr(PROGRESS_ERROR_KEY)
-        raise Die(_progress_tool_failed(w, "apply", proc))
+        reason = _progress_tool_failed(w, "apply", proc)
+        if receipt.get("attempts", 0) >= publication.MAX_ATTEMPTS or proc.returncode == 78:
+            saved = publication.park(w.cfg, receipt, reason)
+            log(f"progress: saved report needs recovery at {saved}; selecting unrelated work")
+            w.counters.write(PROGRESS_ERROR_KEY, 0)
+            return None
+        raise Die(reason)
     log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
     publication.complete(w.cfg, receipt)
     if proc.returncode == EX_NOPROGRESS:

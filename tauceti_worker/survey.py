@@ -599,8 +599,15 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
 
     prepared = retained(cfg)
     if prepared:
-        selected = os.environ.get("TAUCETI_GITHUB_ACCOUNT", "").lower()
-        if selected and prepared["actor"] != selected:
+        from .github_outbox import actor
+
+        try:
+            selected = actor(dict(os.environ))
+        except Exception:
+            selected = None
+        if not selected:
+            return False, "prepared progress waiting for authenticated actor"
+        if prepared["actor"] != selected:
             return False, "prepared progress belongs to another GitHub actor"
         if prepared.get("retry_at", 0) > time.time():
             return False, "prepared progress publication waiting for reconciliation"

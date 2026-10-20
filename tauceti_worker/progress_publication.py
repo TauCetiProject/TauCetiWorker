@@ -4,11 +4,15 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
+import uuid
 
 from . import github_outbox as outbox
 from . import github_transport as tr
-from .constants import ROADMAP
+from .constants import PROGRESS_REF, ROADMAP
+
+MAX_ATTEMPTS = 6
 
 FILES = ("plan.json", "status-body.md", "section-body.md")
 
@@ -41,6 +45,8 @@ def retained(cfg):
                 and isinstance(value.get("actor"), str)
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", value["actor"])
                 and isinstance(value.get("retry_at", 0), (int, float))
+                and isinstance(value.get("attempts", 0), int)
+                and value.get("attempts", 0) >= 0
                 and (value.get("version") is None or isinstance(value["version"], str))
                 and value.get("files") == hashes
             ):
@@ -54,19 +60,79 @@ def retained(cfg):
         env = dict(os.environ)
         paths = outbox.intent_paths(env)
         paths |= set(outbox.directory(env).glob("*.complete"))
+        plan = json.loads((work / "plan.json").read_text())
         for path in paths:
-            value = json.loads(path.read_text())
-            if (outbox.fork_upstream(value["argv"]) or "").lower() != ROADMAP.lower():
+            try:
+                value = json.loads(path.read_text())
+                if (outbox.fork_upstream(value["argv"]) or "").lower() != ROADMAP.lower():
+                    continue
+                who = value.get("context", {}).get("actor") or env.get("TAUCETI_GITHUB_ACCOUNT")
+                if who and legacy_branch_matches(cfg, plan):
+                    return {
+                        "actor": who.lower(),
+                        "files": hashes,
+                        "legacy": True,
+                        "retry_at": 0,
+                        "version": PROGRESS_REF,
+                        "attempts": 0,
+                        "fork_intent": str(path),
+                    }
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 continue
-            if value.get("cwd") != str((cfg.state / "progress/roadmap").resolve()):
-                continue
-            if any((work / name).stat().st_mtime > value.get("created", 0) for name in FILES):
-                continue
-            who = value.get("context", {}).get("actor") or env.get("TAUCETI_GITHUB_ACCOUNT")
-            if who:
-                return {"actor": who.lower(), "files": hashes, "legacy": True, "retry_at": 0}
+
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
+    return None
+
+
+def legacy_branch_matches(cfg, plan):
+    """The old proxy recorded Worker cwd, not the roadmap cwd. Bind the saved
+    window to its actual local report commit instead of guessing from cwd/mtime.
+    """
+    try:
+        branch = f"progress/{plan['from_sha'][:7]}-{plan['to_sha'][:7]}/{plan['roadmap']}"
+        result = subprocess.run(
+            ["git", "-C", str(cfg.state / "progress/roadmap"), "show", f"{branch}:{plan['progress_path']}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode:
+            return False
+        headers = re.findall(r"<!--\s*tauceti-progress:v1\s*(\{.*?\})\s*-->", result.stdout, re.S)
+        header = json.loads(headers[-1])
+        return all(header.get(k) == plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "prs"))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, IndexError):
+        return False
+
+
+def park(cfg, value, reason):
+    """Keep a private recovery bundle before allowing a new report to be planned."""
+    work = cfg.state / "progress/work"
+    saved = cfg.state / "progress/retained" / uuid.uuid4().hex
+    saved.mkdir(parents=True, mode=0o700)
+    for name in (*FILES, "facts.json", "progress-prompt.md"):
+        source = work / name
+        if source.is_file():
+            with open(saved / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:
+                target.write(source.read_bytes())
+                target.flush()
+                os.fsync(target.fileno())
+    record = {**value, "status": "parked", "reason": reason, "saved": str(saved)}
+    tr.atomic(saved / "publication.json", record)
+    complete(cfg, record)
+    return saved
+
+
+def parked_window(cfg, plan):
+    """Never pay to regenerate the exact window already saved for inspection."""
+    for path in (cfg.state / "progress/retained").glob("*/plan.json"):
+        try:
+            previous = json.loads(path.read_text())
+            if all(previous.get(key) == plan.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs")):
+                return path.parent
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
     return None
 
 
@@ -78,7 +144,14 @@ def save(cfg, actor, version):
 
 
 def defer(cfg, value):
-    tr.atomic(cfg.state / "progress/work/publication.json", {**value, "retry_at": time.time() + 300})
+    value = {
+        **value,
+        "version": value.get("version") or PROGRESS_REF,
+        "attempts": value.get("attempts", 0) + 1,
+        "retry_at": time.time() + 300,
+    }
+    tr.atomic(cfg.state / "progress/work/publication.json", value)
+    return value
 
 
 def complete(cfg, value):

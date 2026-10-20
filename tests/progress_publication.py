@@ -37,7 +37,16 @@ with (
     work = state / "progress/work"
     work.mkdir(parents=True)
     roadmap = state / "progress/roadmap"
-    (roadmap / ".git").mkdir(parents=True)
+    roadmap.mkdir(parents=True)
+    real_run = subprocess.run
+
+    def git(*args):
+        return real_run(["git", "-C", str(roadmap), *args], capture_output=True, text=True, check=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "fixture@example.invalid")
+    git("config", "user.name", "Fixture")
+    git("commit", "--allow-empty", "-qm", "base")
     plan = {
         "roadmap": "Area",
         "from_sha": "a" * 40,
@@ -50,17 +59,26 @@ with (
     (work / "status-body.md").write_text("Prepared status prose\n")
     (work / "section-body.md").write_text("Prepared section prose\n")
     original = publication.fingerprints(work)
+    branch = "progress/aaaaaaa-bbbbbbb/Area"
+    git("checkout", "-qb", branch)
+    (roadmap / "Area").mkdir()
+    (roadmap / plan["progress_path"]).write_text("<!--tauceti-progress:v1 " + json.dumps(plan) + "-->\nSaved report")
+    git("add", ".")
+    git("commit", "-qm", "prepared report")
     # Upgrade from a legacy retained fork, already reconciled before the survey.
     intent = directory() / "fork.complete"
     atomic(
         intent,
         {
             "argv": ["repo", "fork", ROADMAP, "--clone=false", "--remote=false"],
-            "cwd": str(roadmap),
-            "created": time.time() + 1,
+            "cwd": str(state / "worker-process-directory"),
+            "created": time.time() - 1000,
+            "updated": time.time() - 500,
             "context": {"actor": "author"},
         },
     )
+    # A malformed unrelated intent cannot hide valid recovery evidence.
+    atomic(directory() / "broken.json", ["invalid"])
     assert publication.retained(cfg)["legacy"]
     writes, calls = [], []
     worker = SimpleNamespace(
@@ -70,8 +88,10 @@ with (
         ),
     )
 
-    def run(args, **kwargs):
+    def publication_run(args, **kwargs):
         calls.append(args)
+        if args[:1] == ["git"] and "show" in args:
+            return real_run(args, **kwargs)
         assert "plan" not in args and "facts" not in args and "prompt" not in args
         if "apply" in args:
             assert publication.fingerprints(work) == original
@@ -83,7 +103,7 @@ with (
     assert progress_due(cfg, worker.counters)[0]
     with (
         patch.object(wu, "me", return_value="author"),
-        patch.object(wu.subprocess, "run", side_effect=run),
+        patch.object(wu.subprocess, "run", side_effect=publication_run),
         patch.object(wu, "prepare_checkout") as checkout,
         patch.object(wu, "run_agent_host") as model,
     ):
@@ -119,13 +139,38 @@ with (
     # A changed author cannot publish the same saved report.
     publication.save(cfg, "author", PROGRESS_REF)
     with patch.object(wu, "me", return_value="another"), patch.object(wu.subprocess, "run") as run:
-        try:
-            wu._do_progress_inner(worker, None)
-        except Die:
-            pass
-        else:
-            raise AssertionError("author change must not publish")
+        assert wu._do_progress_inner(worker, None) is None
         run.assert_not_called()
+    with patch.dict(os.environ):
+        os.environ.pop("TAUCETI_GITHUB_ACCOUNT", None)
+        with patch("tauceti_worker.github_outbox.actor", return_value="another"):
+            assert progress_due(cfg, worker.counters)[0] is False
+    # Exhausted recovery parks all artifacts and releases future rounds.
+    receipt = publication.retained(cfg)
+    atomic(work / "publication.json", {**receipt, "attempts": publication.MAX_ATTEMPTS - 1})
+    with (
+        patch.object(wu, "me", return_value="author"),
+        patch.object(wu.subprocess, "run", side_effect=publication_run),
+        patch.object(wu, "run_agent_host") as model,
+    ):
+        assert wu._do_progress_inner(worker, None) is None
+        model.assert_not_called()
+    assert publication.retained(cfg) is None and not (work / "publication.json").exists()
+    bundles = list((state / "progress/retained").iterdir())
+    assert len(bundles) == 1 and publication.fingerprints(bundles[0]) == original
+    assert intent.exists()
+    assert publication.parked_window(cfg, plan) == bundles[0]
+    assert publication.parked_window(cfg, {**plan, "to_sha": "c" * 40}) is None
+    # Deterministic/stale reports are parked immediately.
+    receipt = publication.save(cfg, "author", PROGRESS_REF)
+    assert (
+        wu._apply_prepared_progress(
+            worker, lambda *a, **kw: subprocess.CompletedProcess([], 78, "stale", ""), roadmap, work, receipt
+        )
+        is None
+    )
+    assert not (work / "publication.json").exists()
+    publication.save(cfg, "author", PROGRESS_REF)
     # Malformed receipt fields never wedge survey selection or delete prose.
     marker = work / "publication.json"
     saved = marker.read_text()
@@ -142,12 +187,7 @@ with (
     # Receipt corruption or edited bodies preserve everything for recovery.
     (work / "status-body.md").write_text("changed")
     with patch.object(wu.subprocess, "run") as run:
-        try:
-            wu._do_progress_inner(worker, None)
-        except Die:
-            pass
-        else:
-            raise AssertionError("mismatched receipt must not regenerate prose")
+        assert wu._do_progress_inner(worker, None) is None
         run.assert_not_called()
     assert (work / "publication.json").exists()
 print("PASS: saved progress resumes publication without model calls, author changes or duplicate reports")

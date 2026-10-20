@@ -319,6 +319,8 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
     definitive = (
         before_request or logical_quota_rejection or (writes and all(r.get("status") in (403, 429) for r in writes))
     )
+    if definitive and value["argv"][:2] == ["repo", "fork"] and value.get("fork_retries", 0):
+        value["fork_retries"] -= 1  # Rejection before effects does not spend the ambiguous replay.
     value["status"] = "rejected" if definitive else "ambiguous"
     value["updated"] = time.time()
     tr.atomic(path, value)
@@ -477,10 +479,10 @@ def reconcile(value, env):
         context = value.get("context", {})
         repository_target = context.get("repository")
         head = context.get("head")
-        if not repository_target or not head or ":" not in head:
+        if not repository_target or not head:
             return None
         owner, name = repository_target.split("/", 1)
-        who, branch = head.split(":", 1)
+        who, branch = head.split(":", 1) if ":" in head else (owner, head)
         q = "query($owner:String!,$name:String!,$head:String!){repository(owner:$owner,name:$name){pullRequests(headRefName:$head,first:100,states:[OPEN,CLOSED,MERGED]){nodes{url createdAt headRepositoryOwner{login}} pageInfo{hasNextPage}}}}"
         result = tr.execute(
             [
@@ -665,7 +667,7 @@ def drain(env=None):
                 # review was posted. Preserve it for later reconciliation,
                 # while allowing this worker to select unrelated useful work.
                 if not optional_resolution:
-                    value["retry_at"] = time.time() + 60
+                    value["retry_at"] = time.time() + (3600 if fork_operation and value.get("fork_retries", 0) else 60)
                     tr.atomic(path, value)
                     remaining.append(path.stem)
                     blocked_targets.add(destination)
