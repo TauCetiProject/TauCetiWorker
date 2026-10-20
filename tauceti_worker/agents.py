@@ -1386,6 +1386,10 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
             if rc == 0:
                 log(f"host build caches: {label} cache ready")
                 return "ready"
+            if attempt == 1 and re.search(r"(?i)no space left on device|disk quota exceeded|\bENOSPC\b", detail):
+                from .retention import pressure_cleanup
+
+                pressure_cleanup()
             # Preserve real outages even when Lake also wraps them in a dependency-fetch error.
             transport_error = re.search(
                 r"(?i)(?:\bHTTP\b|status(?: code)?|response)[^\n]*\b(?:401|403|429|5\d\d)\b|"

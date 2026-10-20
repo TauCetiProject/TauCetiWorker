@@ -118,6 +118,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            from .config import rotate_console_log
+
+            rotate_console_log()
             from .verification_jobs import reap_continuations, resume_pending
 
             reap_continuations(cfg)

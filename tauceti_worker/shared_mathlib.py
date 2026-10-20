@@ -308,13 +308,21 @@ def signature(cwd, env):
 
 
 @contextlib.contextmanager
-def key_lock(pool, key, exclusive=True, nonblocking=False, timeout=None):
+def key_lock(pool, key, exclusive=True, nonblocking=False, timeout=None, readonly=False):
     locks = pool / "locks"
-    locks.mkdir(parents=True, exist_ok=True)
-    with (locks / (key + ".lock")).open("a+") as stream:
+    path = locks / (key + ".lock")
+    if readonly and not path.exists():
+        yield None
+        return
+    if not readonly:
+        locks.mkdir(parents=True, exist_ok=True)
+    with path.open("r" if readonly else "a+") as stream:
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         lease_lock(stream, flags | (fcntl.LOCK_NB if nonblocking else 0), timeout=timeout)
-        yield stream
+        if not readonly:
+            yield stream
+            return
+    yield None  # dry-run eligibility probe; release before any recursive inspection
 
 
 def lease_lock(stream, flags, *, timeout=None):
@@ -491,22 +499,27 @@ def discard_entry(pool, entry):
     remove_tree(retired)
 
 
-def collect(pool, *, protect=(), now=None):
+def collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
     try:
-        with key_lock(pool, "gc", nonblocking=True):
-            return _collect(pool, protect=protect, now=now)
+        with key_lock(pool, "gc", nonblocking=True, readonly=dry_run):
+            return _collect(pool, protect=protect, now=now, max_age=max_age, dry_run=dry_run)
     except BlockingIOError:
         return []
 
 
-def _collect(pool, *, protect=(), now=None):
+def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
     """Bounded by snapshot count. Locked readers/builders are never reclaimed."""
     now = time.time() if now is None else now
     entries = pool / "entries"
-    entries.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        if not entries.is_dir():
+            return []
+    else:
+        entries.mkdir(parents=True, exist_ok=True)
     for retired in (pool / "trash").glob("*"):
         with contextlib.suppress(FileNotFoundError):
-            remove_tree(retired)
+            if not dry_run:
+                remove_tree(retired)
     # A killed builder cannot run TemporaryDirectory cleanup. Reclaim its
     # staging tree before evicting useful published snapshots for disk pressure.
     for stage in (pool / "staging").glob("*"):
@@ -516,8 +529,9 @@ def _collect(pool, *, protect=(), now=None):
         try:
             if not stage.is_dir() or now - stage.stat().st_mtime < 4 * 3600:
                 continue
-            with key_lock(pool, key, nonblocking=True):
-                remove_tree(stage)
+            with key_lock(pool, key, nonblocking=True, readonly=dry_run):
+                if not dry_run:
+                    remove_tree(stage)
         except (BlockingIOError, FileNotFoundError):
             pass
     candidates = sorted((p for p in entries.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime)
@@ -526,11 +540,12 @@ def _collect(pool, *, protect=(), now=None):
         if entry.name in protect:
             continue
         usage = shutil.disk_usage(pool)
-        if now - entry.stat().st_mtime < 7 * 86400 and usage.free / usage.total >= 0.1:
+        if now - entry.stat().st_mtime < max_age and usage.free / usage.total >= 0.1:
             continue
         try:
-            with key_lock(pool, entry.name, nonblocking=True):
-                discard_entry(pool, entry)
+            with key_lock(pool, entry.name, nonblocking=True, readonly=dry_run):
+                if not dry_run:
+                    discard_entry(pool, entry)
                 removed.append(entry.name)
         except (BlockingIOError, FileNotFoundError):
             pass

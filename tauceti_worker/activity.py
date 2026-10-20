@@ -660,6 +660,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
             value["all"]["shared_mathlib"] = sharing
             value["all"]["work_recovery"] = work_recovery.summary()
+            value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
             for column, key in (("worker", "workers"), ("scope", "groups")):
                 ids = db.execute(
                     f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
