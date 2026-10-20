@@ -279,8 +279,12 @@ def recycle(cfg, *, now=None, dry=False):
         "workers" not in request or cfg.wid in request["workers"]
     )
     last_pressure = row.get("last_pressure_at", 0)
-    usage = shutil.disk_usage(cfg.state)
-    critical = usage.free / usage.total < 0.05
+    critical = False
+    for location in (cfg.state, cfg.checkout):
+        while not location.exists():
+            location = location.parent
+        usage = shutil.disk_usage(location)
+        critical = critical or usage.free / usage.total < 0.05
     forced = (
         applicable and request.get("until", 0) > now and (not valid or request.get("requested_at", 0) > last_pressure)
     ) or (critical and (not valid or now - last_pressure > 300))

@@ -101,27 +101,35 @@ def admit(cfg):
     from .activity import root as activity_root
     from .config import AdmissionUnavailable
 
-    usage = shutil.disk_usage(cfg.state)
-    marker = activity_root() / f"critical-{cfg.state.stat().st_dev}.json"
-    critical = usage.free / usage.total < CRITICAL
-    if usage.free / usage.total < LOW:
-        from .retention import request_cleanup
+    checked = set()
+    for location in (cfg.state, getattr(cfg, "checkout", cfg.state)):
+        while not location.exists():
+            location = location.parent
+        device = location.stat().st_dev
+        if device in checked:
+            continue
+        checked.add(device)
+        usage = shutil.disk_usage(location)
+        marker = activity_root() / f"critical-{location.stat().st_dev}.json"
+        critical = usage.free / usage.total < CRITICAL
+        if usage.free / usage.total < LOW:
+            from .retention import request_cleanup
 
-        request_cleanup()
-    if critical:
-        # Keep the hysteresis marker separate from GC requests so collection cannot clear
-        # the critical threshold while free space is still below the recovery threshold.
-        with contextlib.suppress(OSError, ValueError):
-            atomic_json(marker, dict(active=True))
-    critical = critical or read_json(marker).get("active", False)
-    if critical and usage.free / usage.total < LOW:
-        raise AdmissionUnavailable(
-            f"disk headroom low: {usage.free / 1024**3:.1f} GiB free; new work retries automatically above 15% free",
-            state="waiting-storage",
-        )
-    if critical:
-        with contextlib.suppress(OSError):
-            marker.unlink(missing_ok=True)
+            request_cleanup()
+        if critical:
+            # Keep the hysteresis marker separate from GC requests so collection cannot clear
+            # the critical threshold while free space is still below the recovery threshold.
+            with contextlib.suppress(OSError, ValueError):
+                atomic_json(marker, dict(active=True))
+        critical = critical or read_json(marker).get("active", False)
+        if critical and usage.free / usage.total < LOW:
+            raise AdmissionUnavailable(
+                f"disk headroom low: {usage.free / 1024**3:.1f} GiB free; new work retries automatically above 15% free",
+                state="waiting-storage",
+            )
+        if critical:
+            with contextlib.suppress(OSError):
+                marker.unlink(missing_ok=True)
 
 
 def collect(configs, *, dry=False, now=None, opened=...):
