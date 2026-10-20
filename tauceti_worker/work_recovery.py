@@ -241,7 +241,8 @@ class Decision:
 def _git_environment(repo):
     env = {
         **os.environ,
-        "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
         "LC_ALL": "C",
         "GIT_CEILING_DIRECTORIES": str(repo.parent.resolve()),
     }

@@ -19,7 +19,6 @@ from .paths import HERE, self_env
 from .runtime_status import atomic_json, read_json
 
 LIFETIME = 3 * 86400
-RETIRED_BATCH = 3
 
 
 def safe(path, root):
@@ -236,42 +235,19 @@ def collect_retired(cfg, report, *, now, dry=False, discard_checkout=False):
     anchor = cfg.checkout.parent.parent if legacy_project() else cfg.state
     if discard_checkout:
         evict_tree(cfg, cfg.checkout, anchor, report, dry=dry, discard=True)
-    candidates = []
-    for tree in (cfg.checkout.parent / recovery.RETAINED_DIR).glob(f"{cfg.checkout.name}-*"):
-        try:
-            if not safe(tree, anchor) or not tree.is_dir():
-                continue
-            if tree.name.endswith((".retention-deleting", ".deleting")) or now - tree.stat().st_mtime >= LIFETIME:
-                candidates.append(tree)
-        except OSError as error:
-            note(report, "errors", f"{tree}: {error}")
-    # Limit expensive source preservation to three trees per daily pass. A local cursor ensures
-    # an uncertain tree cannot starve the others, even when every attempt leaves it in place.
-    cursor = cfg.state / "cleanup-retained.json"
-    last = read_json(cursor).get("last", "")
-    if not isinstance(last, str):
-        last = ""
-    candidates.sort(key=lambda tree: (tree.name <= last, tree.name))
-    for tree in candidates[:RETIRED_BATCH]:
-        if not dry:
-            try:
-                atomic_json(cursor, dict(last=tree.name))
-            except OSError as error:
-                note(report, "errors", f"{cursor}: {error}")
-        try:
-            name = tree.name.removesuffix(".retention-deleting").removesuffix(".deleting")
-            sidecar = tree.with_name(name + ".owner.json")
-            if tree.name.endswith((".retention-deleting", ".deleting")):
-                if referenced_attempt(cfg, tree):
-                    note(report, "protected", str(tree))
-                    continue
-                remove(tree, anchor, report, dry=dry)
-            else:
-                evict_tree(cfg, tree, anchor, report, dry=dry, discard=True, owner=read_json(sidecar))
-            if not dry and not tree.exists():
-                sidecar.unlink(missing_ok=True)
-        except OSError as error:
-            note(report, "errors", f"{tree}: {error}")
+    # Retained roots have exactly one recursive collector: bounded recovery housekeeping.
+    # Registration is constant metadata work and never inspects history on this timer path.
+    parent = cfg.checkout.parent / recovery.RETAINED_DIR
+    if not parent.is_dir():
+        return
+    if dry:
+        note(report, "protected", f"{parent}: bounded recovery housekeeping owns retained trees")
+        return
+    from .constants import TAUCETI
+    from .recovery_maintenance import register
+
+    register(cfg.state, parent, "TauCeti", TAUCETI)
+    note(report, "protected", f"{parent}: queued for bounded recovery housekeeping")
 
 
 def recycle(cfg, *, now=None, dry=False):

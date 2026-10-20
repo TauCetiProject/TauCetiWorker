@@ -156,6 +156,34 @@ def _cleanup_cache_tree(state, tree, registry, work, observation):
             atomic_json(job_path, job)
 
 
+def _referenced(state, tree):
+    """Honor pending verification references with the same ordinary housekeeping budget."""
+    from .work_recovery import _charge
+
+    target = tree.resolve()
+    for source in (state, state / "verification-state"):
+        directory = source / "verification-pending"
+        if not directory.is_dir():
+            continue
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                _charge(entries=1)
+                job = _metadata(Path(entry.path))
+                if not job:
+                    return True  # malformed reference withholds only this destructive candidate
+                for key in ("lease", "receipt", "lint_modules", "root"):
+                    value = job.get(key)
+                    if isinstance(value, str):
+                        reference = Path(value)
+                        if reference.is_relative_to("/opt/verification-state"):
+                            reference = source / reference.relative_to("/opt/verification-state")
+                        if not reference.is_absolute():
+                            reference = source / reference
+                        if reference.resolve().is_relative_to(target):
+                            return True
+    return False
+
+
 def _safe(state, tree, owner):
     """Ordinary stopped-owner and live-reference checks; uncertainty skips only this tree."""
     from . import work_recovery as wr
@@ -163,6 +191,8 @@ def _safe(state, tree, owner):
     birth = owner.get("process") if isinstance(owner, dict) else None
     if not wr.owner_stopped(birth):
         return "await-owner"
+    if _referenced(state, tree):
+        return "await-verification-reference"
     session = birth.get("session")
     if session is not None:
         if not isinstance(session, int) or session <= 0:

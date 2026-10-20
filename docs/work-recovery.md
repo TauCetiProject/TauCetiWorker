@@ -373,6 +373,9 @@ and log rotation belong to [PR #357](https://github.com/TauCetiProject/TauCetiWo
 This change adds no expiry policy, namespace lifecycle or deployment action.
 The retained-checkout roots registered here, `.deleting` trees and
 `recovery-cleanup/jobs` journals have one collector owner: this housekeeping path.
-Storage collectors reuse registration/housekeeping and the existing
-`.recovery-housekeeping.lock`, rather than independently recursively deleting those
-same trees or restoring historical preservation scans.
+The storage collector registers retained roots without enumerating or deleting
+those trees; activity housekeeping uses the existing `.recovery-housekeeping.lock`
+and journals. Its `save_for_cleanup` helper inspects only the current candidate
+and uses indexed descriptors, preserving storage expiry/rotation for other roots.
+Pending verification references are checked within housekeeping budgets and
+withhold only their candidate. Neither path restores historical preservation scans.

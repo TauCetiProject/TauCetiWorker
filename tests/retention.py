@@ -1,5 +1,6 @@
 """Local storage-reclamation fixtures; never inspect or mutate the real worker fleet."""
 
+import json
 import os
 import shutil
 import signal
@@ -376,12 +377,13 @@ class Retention(unittest.TestCase):
         retention.sweep(now=self.clock)
         self.assertFalse(trash.exists())
 
-    def test_existing_recovery_deletion_on_retired_worker_is_reclaimed(self):
+    def test_existing_recovery_deletion_is_left_to_descriptor_housekeeping(self):
         trash = self.checkout.parent / work_recovery.RETAINED_DIR / "TauCeti-old.deleting"
         trash.mkdir(parents=True)
         (trash / "partial").write_text("source already saved by recovery")
         retention.sweep(now=self.clock)
-        self.assertFalse(trash.exists())
+        self.assertTrue(trash.exists())
+        self.assertEqual((trash / "partial").read_text(), "source already saved by recovery")
 
     def test_inaccessible_generated_directory_can_be_removed(self):
         target = self.checkout / ".lake"
@@ -488,9 +490,21 @@ class Retention(unittest.TestCase):
         (retained / "Source.lean").write_text("retained repair")
         atomic_json(work_recovery.owner_path(self.cfg, "TauCeti"), dict(pr=99, round_id="new-round"))
         sidecar = retained.with_name(retained.name + ".owner.json")
-        atomic_json(sidecar, dict(pr=42, round_id="old-round", work="fix"))
+        dead = json.loads(
+            subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json; from tauceti_worker.work_recovery import process_owner; print(json.dumps(process_owner()))",
+                ],
+                text=True,
+            )
+        )
+        atomic_json(sidecar, dict(pr=42, round_id="old-round", work="fix", process=dead))
         os.utime(retained, (0, 0))
         retention.sweep(now=self.clock)
+        self.assertTrue(retained.exists())  # storage timer only registers the retained root
+        work_recovery.housekeep(self.state.parent, seconds=5, entries=50000)
         self.assertFalse(retained.exists())
         self.assertFalse(sidecar.exists())
         [record] = list(work_recovery.records(self.state.parent))
@@ -512,11 +526,15 @@ class Retention(unittest.TestCase):
         self.git("commit", "-qam", "unpublished")
         commit = self.git("rev-parse", "HEAD").strip()
         self.git("reset", "--hard", "HEAD~1")
+        saved = work_recovery.save_for_cleanup(self.cfg, self.checkout)
+        self.assertTrue(saved.ok)
+        self.assertIsNotNone(saved.record)
+        self.assertIn(f"history/{commit}", read_json(saved.record / "manifest.json")["bundle_refs"])
+        (self.checkout / ".env").write_text("secret")
         report = retention.fresh_report()
         retention.collect_retired(self.cfg, report, now=self.clock, discard_checkout=True)
         self.assertTrue(self.checkout.exists())
         self.assertEqual(self.git("show", f"{commit}:Source.lean"), "reflog-only")
-        (self.checkout / ".env").write_text("secret")
         decision = work_recovery.save_for_cleanup(self.cfg, self.checkout)
         self.assertFalse(decision.ok)
         self.assertEqual((self.checkout / ".env").read_text(), "secret")
@@ -642,18 +660,21 @@ class Retention(unittest.TestCase):
 
     def test_retained_cleanup_is_bounded_and_uncertain_candidates_do_not_starve_others(self):
         parent = self.checkout.parent / work_recovery.RETAINED_DIR
-        for n in range(retention.RETIRED_BATCH + 1):
+        for n in range(4):
             tree = parent / f"TauCeti-{n}"
             tree.mkdir(parents=True)
             (tree / "source").write_text("uncertain source")
             cache = tree / ".lake"
             cache.mkdir()
             os.utime(tree, (0, 0))
-        retention.collect_retired(self.cfg, retention.fresh_report(), now=self.clock)
-        self.assertEqual(len(list(parent.glob("*/.lake"))), 1)
-        retention.collect_retired(self.cfg, retention.fresh_report(), now=self.clock)
-        self.assertEqual(len(list(parent.glob("*/.lake"))), 0)
-        self.assertEqual(len(list(parent.glob("*/source"))), retention.RETIRED_BATCH + 1)
+        with patch.object(retention, "evict_tree", side_effect=AssertionError("second retained-tree collector")):
+            retention.collect_retired(self.cfg, retention.fresh_report(), now=self.clock)
+            retention.collect_retired(self.cfg, retention.fresh_report(), now=self.clock)
+        self.assertEqual(len(list(parent.glob("*/.lake"))), 4)
+        self.assertEqual(len(list(parent.glob("*/source"))), 4)
+        # Unknown Git/ownership stays recoverable; bounded housekeeping can still process others.
+        work_recovery.housekeep(self.state.parent, seconds=5, entries=50000)
+        self.assertEqual(len(list(parent.glob("*/source"))), 4)
 
     def test_dry_run_retains_checkout_with_uncaptured_git_refs(self):
         self.old()

@@ -1192,6 +1192,25 @@ with patch('os.readlink', side_effect=OSError('PID namespaces unavailable')):
         self.assertFalse(tree.exists())
         self.assertIsNone(proc.poll())  # unrelated replacement session remains healthy
 
+    def test_pending_verification_reference_withholds_only_its_tree(self):
+        expected = self.dirty()
+        tree = self.retained()
+        pending = self.cfg.state / "verification-pending" / "fixture.json"
+        wr.atomic_json(pending, dict(root=str(tree)))
+        self.tick()
+        self.assertTrue(tree.exists())
+        self.assertEqual(
+            maintenance._read_job(maintenance._job_path(self.cfg.state, tree))["next_action"],
+            "await-verification-reference",
+        )
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.co)], check=True)
+        self.assertTrue(wr.guard(self.cfg, self.co).ok)
+        pending.unlink()
+        self.tick()
+        self.assertFalse(tree.exists())
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+
     def test_prepared_summary_and_rollback_do_no_payload_analysis(self):
         self.dirty()
         tree = Path(wr.retain(self.cfg, self.co, "fixture").details["retained"])
