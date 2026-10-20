@@ -197,6 +197,8 @@ def tool_readiness(job):
     paths += [str(p) for p in Path(__file__).parent.glob("*.py")]
     paths += [str(HERE / "scripts" / name) for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")]
     paths.append(str(Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))) / "toolchains"))
+    if registration := os.environ.get("TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS"):
+        paths.append(registration)
     if job.get("toolchain_wait_path"):
         prefix = Path(job["toolchain_wait_path"])
         paths += [str(prefix), str(prefix / "bin" / "lean")]

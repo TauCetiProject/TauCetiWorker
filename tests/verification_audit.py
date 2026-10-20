@@ -845,6 +845,24 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         self.assertEqual(complete["status"], "success")
         self.assertEqual(complete["attempts"], 1)
 
+    def test_registration_update_wakes_dormant_verification(self):
+        manifest = self.home / "publisher.json"
+        v.atomic(manifest, {})
+        os.environ["TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS"] = str(manifest)
+        os.environ["FIXTURE_PROBE_TRAILER"] = "1"
+        result = self.verify(stage="build")
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        job["next_at"] = 0
+        v.atomic(path, job)
+        del os.environ["FIXTURE_PROBE_TRAILER"]
+        self.assertFalse(resume_pending(SimpleNamespace(state=self.state)))
+        v.atomic(manifest, {str(self.prefix): "publisher-updated"})
+        self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        complete = v.read_json(self.state / "verification-jobs" / path.name)
+        self.assertEqual(complete["status"], "success")
+        self.assertEqual(complete["attempts"], 1)
+
     def test_external_source_symlink_preservation_fails_incomplete_without_source_loss(self):
         outside = write(self.home, "external.lean", "external source")
         (self.root / "TauCeti/Linked.lean").symlink_to(outside)
