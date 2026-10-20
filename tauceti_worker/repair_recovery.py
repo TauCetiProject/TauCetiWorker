@@ -79,6 +79,11 @@ def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def uncertain_publication(journal):
+    intent = journal.get("publication")
+    return bool(intent and intent.get("push_started") is not False)
+
+
 def write(record, journal, state, **fields):
     assert state in STATES
     journal.update(
@@ -234,6 +239,13 @@ class Recovery:
             if normal_pending:
                 j["forensic_only"] = True
                 if b.reconcile(m, normal_pending, facts) == "published":
+                    j["normal_publication_confirmed"] = normal_pending["oid"]
+                    if m.get("local_head") != normal_pending["oid"] or (m.get("publication") or {}).get("dirty"):
+                        j["forensic_only"] = False
+                        raise Obsolete(
+                            "post-publication-leftovers",
+                            "Normal push confirmed; later unpublished source remains evidence for fresh normal work",
+                        )
                     self.transition(
                         "published", evidence=dict(remote_head=facts["head"], commit=normal_pending["oid"]), reason=None
                     )
@@ -339,6 +351,9 @@ class Recovery:
                     "publication-uncertain", "Uncertain publication can only replay its exact original commit"
                 )
             why = b.integration_reason(checkout, m, facts, j)
+            if pending and why:
+                j["forensic_only"] = True
+                raise Obsolete("publication-uncertain", "Source reasoning cannot replace an uncertain publication")
             if not why and b.superseded(checkout, m, facts):
                 raise Obsolete(
                     "source-superseded",
@@ -381,7 +396,12 @@ class Recovery:
                 if publication["oid"] != pending["oid"]:
                     j["forensic_only"] = True
                     raise Obsolete("publication-uncertain", "A different commit cannot replace uncertain publication")
-                j.setdefault("publication_history", []).append(pending)
+                history = j.setdefault("publication_history", [])
+                if not any(
+                    (p.get("oid"), p.get("fingerprint")) == (pending["oid"], pending.get("fingerprint"))
+                    for p in history
+                ):
+                    history.append(pending)
                 publication.update(prior_uncertain=True, push_started=True)
             self.transition("publication-pending", publication=publication)
             b.publish(checkout, m, facts, publication)
@@ -1716,6 +1736,7 @@ def evidence_records(cfg, repository, pr):
             "source-handed-to-normal-round",
             "source-handoff-checkpoint",
             "publication-uncertain",
+            "post-publication-leftovers",
         }:
             continue
         if (m.get("authorization") or {}).get("foreign") or (m.get("authorization") or {}).get("automatic_bump"):
@@ -1737,9 +1758,14 @@ def immutable_evidence(record, m, j):
         ],
         delta_patch=(j.get("delta_integration") or {}).get("patch"),
         reason=j.get("reason"),
-        pending_publication=j.get("publication"),
+        pending_publication=j.get("publication")
+        or j.get("normal_publication")
+        or (m.get("round_outcome") or {}).get("pending_push"),
+        confirmed_publication=j.get("normal_publication_confirmed")
+        or (m.get("round_outcome") or {}).get("published_head"),
         possibly_published_then_removed=j.get("forensic_only", False)
-        or (j.get("reason") or {}).get("code") == "publication-head-moved",
+        or (j.get("reason") or {}).get("code") == "publication-head-moved"
+        or uncertain_publication(j),
     )
 
 
@@ -1777,7 +1803,11 @@ def complete_handoffs(cfg, handoffs, published_head):
             fcntl.flock(lock, fcntl.LOCK_EX)
             j = read_json(record / "recovery.json")
             h = j.get("handoff") or {}
-            if h.get("id") == identity and h.get("state") == "offered":
+            if (
+                h.get("id") == identity
+                and h.get("state") == "offered"
+                and saved._rev(Path(h["checkout"]), h["push_marker"]) == published_head
+            ):
                 write(
                     record,
                     j,
@@ -1872,7 +1902,7 @@ def reconcile_handoff(cfg, record, j):
     attempted_commit = None
     if h.get("attempt_marker") and (checkout / ".git").exists():
         attempt = saved.ref_object(checkout, h["attempt_marker"])
-        rejected_marker = h["attempt_marker"].replace("refs/tauceti/push-attempt/", "refs/tauceti/push-rejected/", 1)
+        rejected_marker = h["attempt_marker"].replace("push-attempt", "push-rejected", 1)
         rejected = saved.ref_object(checkout, rejected_marker)
         pending = saved.ref_object(
             checkout, h.get("pending_marker") or saved.pending_push_ref(dict(ref=h["push_marker"]))
@@ -1959,6 +1989,7 @@ def handoff_context(
                     "source-handed-to-normal-round",
                     "source-handoff-checkpoint",
                     "publication-uncertain",
+                    "post-publication-leftovers",
                 }:
                     continue
                 if h.get("state") == "published":
@@ -1972,11 +2003,17 @@ def handoff_context(
                         )
                     if h.get("state") == "published":
                         continue
-                if j.get("forensic_only") or (j.get("reason") or {}).get("code") in {
-                    "publication-head-moved",
-                    "publication-uncertain",
-                    "source-handoff-checkpoint",
-                }:
+                if (
+                    j.get("forensic_only")
+                    or uncertain_publication(j)
+                    or (j.get("reason") or {}).get("code")
+                    in {
+                        "publication-head-moved",
+                        "publication-uncertain",
+                        "source-handoff-checkpoint",
+                        "post-publication-leftovers",
+                    }
+                ):
                     evidence.append(immutable_evidence(record, m, j))
                     if len(evidence) >= 4:
                         break
@@ -1993,7 +2030,9 @@ def handoff_context(
                     )
                     j["source_checkpoint"] = str(snapshot)
                 identity = uuid.uuid4().hex
-                attempt_marker = push_marker.replace("refs/tauceti/published/push/", "refs/tauceti/push-attempt/", 1)
+                branch = push_marker.removeprefix("refs/tauceti/published/push/")
+                scoped_marker = f"refs/tauceti/published/scope/{push_scope}/{branch}"
+                attempt_marker = f"refs/tauceti/push-attempt-scope/{push_scope}/{branch}"
                 pending_marker = saved.pending_push_ref(dict(ref=push_marker, scope=push_scope))
                 h = dict(
                     id=identity,
@@ -2002,16 +2041,18 @@ def handoff_context(
                     head=head,
                     actor=actor,
                     checkout=str(checkout),
-                    push_marker=push_marker,
-                    published_before=published_before,
+                    push_marker=scoped_marker,
+                    published_before=saved._rev(checkout, scoped_marker),
                     attempt_marker=attempt_marker,
                     attempt_before=saved.ref_object(checkout, attempt_marker),
                     pending_marker=pending_marker,
                     pending_before=saved.ref_object(checkout, pending_marker),
                 )
                 # An uncertain wire intent remains forensic evidence, not a repair recipe.
-                uncertain = (j.get("reason") or {}).get("code") == "publication-head-moved" or j.get(
-                    "forensic_only", False
+                uncertain = (
+                    uncertain_publication(j)
+                    or (j.get("reason") or {}).get("code") == "publication-head-moved"
+                    or j.get("forensic_only", False)
                 )
                 write(
                     record,

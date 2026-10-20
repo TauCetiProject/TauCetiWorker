@@ -1740,6 +1740,8 @@ def _do_fixlike(
         push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
         published_before = _rev(co, push_marker)
         push_scope = conversation_round or os.urandom(16).hex()
+        scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
+        scoped_published_before = _rev(co, scoped_push_marker)
         note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before, scope=push_scope))
         handoffs = []
         if (
@@ -1809,15 +1811,15 @@ def _do_fixlike(
             from .work_recovery import guard, note_owner
 
             if (co / ".git").exists():
-                published_after = _rev(co, push_marker)
+                published_after = _rev(co, scoped_push_marker)
                 note_owner(
                     w.cfg,
                     round_outcome=dict(
                         exit_code=agent_rc,
-                        published_head=published_after if published_after != published_before else None,
+                        published_head=published_after if published_after != scoped_published_before else None,
                     ),
                 )
-                if handoffs and published_after and published_after != published_before:
+                if handoffs and published_after and published_after != scoped_published_before:
                     from .repair_recovery import complete_handoffs
 
                     try:

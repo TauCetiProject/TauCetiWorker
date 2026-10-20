@@ -35,7 +35,14 @@ CLAIM_REPO_OVERRIDE="${TAUCETI_CLAIM_REPO:-}"
 CLAIM_SH="${TAUCETI_CLAIM_SH:-$(cd "$(dirname "$0")" && pwd)/claim.sh}"
 
 die() { echo "git-safe-push: $*" >&2; exit 77; }
-infra_die() { echo "git-safe-push: $*" >&2; exit 80; }
+infra_die() {
+    # Only remove this invocation's never-sent intent, preserving any older
+    # uncertain push. A failed cleanup remains conservatively recoverable.
+    if [[ -n "${PENDING:-}" && -n "${ATTEMPT:-}" ]]; then
+        git update-ref -d "$PENDING" "$ATTEMPT" 2>/dev/null || true
+    fi
+    echo "git-safe-push: $*" >&2; exit 80
+}
 claim() {
     if [[ -n "$CLAIM_REPO_OVERRIDE" ]]; then
         CLAIM_REPO="$CLAIM_REPO_OVERRIDE" "$CLAIM_SH" "$@"
@@ -66,17 +73,20 @@ trap 'rm -f "$PUSH_STATUS"' EXIT
 SCOPE="${TAUCETI_PUSH_SCOPE:-unscoped}"
 ATTEMPT="$(printf 'object %s\ntype commit\ntag tauceti-push-attempt\ntagger tauceti-worker <tauceti-worker@localhost> 0 +0000\n\n%s\n%s\n%s\n' "$OID" "$OID" "$EXPECT" "$PUSH_STATUS" | git mktag)" || infra_die "cannot record push attempt"
 PENDING="refs/tauceti/pending-push/$SCOPE/${REF#refs/heads/}"
+ATTEMPT_REF="refs/tauceti/push-attempt-scope/$SCOPE/${REF#refs/heads/}"
+REJECTED_REF="refs/tauceti/push-rejected-scope/$SCOPE/${REF#refs/heads/}"
 # Keep the earliest unacknowledged attempt across subsequent attempts. A later
 # rejection cannot prove that an earlier transport failure was never accepted.
 if ! git rev-parse --verify "$PENDING" >/dev/null 2>&1; then
     git update-ref "$PENDING" "$ATTEMPT" "" || infra_die "cannot retain pending publication"
 fi
-git update-ref "refs/tauceti/push-attempt/${REF#refs/heads/}" "$ATTEMPT" || infra_die "cannot retain push attempt"
+git update-ref "$ATTEMPT_REF" "$ATTEMPT" || infra_die "cannot retain push attempt"
 if git -c push.followTags=false push --porcelain --force-with-lease="$REF:$EXPECT" "$REMOTE" "$OID:$DEST" >"$PUSH_STATUS"; then
     cat "$PUSH_STATUS"
     # Local publication evidence: checkout preparation treats commits reachable from
     # refs/tauceti/published/* as published, so pushed work is not mistaken for unfinished source.
-    if git update-ref "refs/tauceti/published/push/${REF#refs/heads/}" "$OID" 2>/dev/null; then
+    if git update-ref "refs/tauceti/published/scope/$SCOPE/${REF#refs/heads/}" "$OID" 2>/dev/null &&
+       git update-ref "refs/tauceti/published/push/${REF#refs/heads/}" "$OID" 2>/dev/null; then
         git update-ref -d "$PENDING" 2>/dev/null || true
     fi
     if [[ -n "${TAUCETI_FLEET_EVENTS:-}" && -n "${TAUCETI_FLEET_PYTHON:-}" && -n "${TAUCETI_FLEET_EMITTER:-}" ]]; then
@@ -89,11 +99,11 @@ while IFS=$'\t' read -r flag destination summary; do
     if [[ "$flag" == '!' && "$destination" == "$OID:$DEST" ]]; then
         case "$summary" in
             '[rejected]'*)
-                git update-ref "refs/tauceti/push-rejected/${REF#refs/heads/}" "$ATTEMPT" 2>/dev/null || true
+                git update-ref "$REJECTED_REF" "$ATTEMPT" 2>/dev/null || true
                 git update-ref -d "$PENDING" "$ATTEMPT" 2>/dev/null || true
                 echo "git-safe-push: stale destination; re-integrate before another CAS push" >&2; exit 78 ;;
             '[remote rejected]'*)
-                git update-ref "refs/tauceti/push-rejected/${REF#refs/heads/}" "$ATTEMPT" 2>/dev/null || true
+                git update-ref "$REJECTED_REF" "$ATTEMPT" 2>/dev/null || true
                 git update-ref -d "$PENDING" "$ATTEMPT" 2>/dev/null || true
                 echo "git-safe-push: server policy rejected this push" >&2; exit 79 ;;
         esac

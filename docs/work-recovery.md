@@ -262,6 +262,9 @@ prefers retained normal progress, and returns unused source to mechanical
 recovery when durable Git intent proves no push was attempted or the attempt
 was rejected. This also permits reintegration after another writer moves the head.
 The original evidence stays available alongside a receiving round's partial progress.
+Unpublished edits made after a confirmed push remain evidence for fresh normal
+repair work even when the old round's publication authority has ended. Transferred
+or archived evidence cannot regain automatic recovery ownership through a new handoff.
 Foreign canaries and automatic bumps
 do not receive this broader source context. Recovery never replays behind a
 normal task that published or a moved head whose publication outcome is
@@ -316,6 +319,11 @@ can be reintegrated automatically; uncertainty always reconciles first.
 The helper retains the earliest unacknowledged normal push within its original
 round across subsequent rejections. Annotated Git tags retain source and intent
 without introducing synthetic source commits; later rounds have separate intents.
+Handoffs use their receiving round's attempt and publication refs, so a later
+unrelated push cannot consume them. A supervisor publication still awaiting
+reconciliation is offered only as forensic evidence, leaving the supervisor's
+scheduled reconciliation active. Known local failures before push clear only
+that invocation's never-sent intent.
 Source preservation carries this intent into the recovery record or
 its existing consumer journal when identical source was already saved. A receiving
 round's checkpoint therefore cannot bypass publication reconciliation. Uncertain

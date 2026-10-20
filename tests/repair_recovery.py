@@ -1556,6 +1556,7 @@ class Fixture(unittest.TestCase):
         self.assertTrue(rr.due(self.cfg, only=["fix"]))
         self.assertFalse(self.run_recovery())
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+        git(self.co, "update-ref", self.journal()["handoff"]["push_marker"], self.base)
         rr.complete_handoffs(self.cfg, handoffs, self.base)
         self.assertEqual(rr.retained_context(self.cfg, "upstream/repo", 10), "")
         self.assertEqual(self.journal()["handoff"]["published_head"], self.base)
@@ -1571,7 +1572,7 @@ class Fixture(unittest.TestCase):
 
     def test_normal_push_survives_death_before_handoff_acknowledgement(self):
         self.handoff()
-        git(self.co, "update-ref", "refs/tauceti/published/push/main", self.base)
+        git(self.co, "update-ref", self.journal()["handoff"]["push_marker"], self.base)
         context, handoffs = self.handoff()
         self.assertEqual((context, handoffs), ("", []))
         self.assertEqual(self.journal()["reason"]["code"], "source-handoff-published")
@@ -2119,7 +2120,7 @@ fi
             "-m",
             "attempt",
         )
-        git(self.co, "update-ref", "refs/tauceti/push-attempt/main", attempt)
+        git(self.co, "update-ref", self.journal()["handoff"]["attempt_marker"], attempt)
         self.advance_writer()
         self.assertFalse(rr.recover(self.w, self.opts))
         self.assertEqual(self.journal()["reason"]["code"], "publication-uncertain")
@@ -2250,6 +2251,62 @@ fi
         decision = saved.save_for_cleanup(self.cfg, self.co, owner=self.owner)
         self.assertTrue(decision.ok, decision.reason)
 
+    def test_round_publication_receipts_remain_cleanup_evidence_after_rewrite(self):
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "first published source")
+        first = git(self.co, "rev-parse", "HEAD")
+        with patch.dict(os.environ, TAUCETI_PUSH_SCOPE="first-round"):
+            self.assertEqual(self.normal_push().returncode, 0)
+        git(self.co, "reset", "--hard", self.base)
+        (self.co / "B.lean").write_text("replacement source\n")
+        git(self.co, "add", "B.lean")
+        git(self.co, "commit", "-qm", "replacement")
+        env = {
+            **os.environ,
+            "TAUCETI_PUSH_SCOPE": "second-round",
+            "TAUCETI_PUSH_REF": "main",
+            "TAUCETI_PUSH_EXPECT": first,
+            "TAUCETI_PUSH_REMOTE": str(self.remote),
+        }
+        result = subprocess.run(
+            [str(Path(__file__).resolve().parent.parent / "scripts/git-safe-push")],
+            cwd=self.co,
+            env=env,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = saved.save_for_cleanup(self.cfg, self.co, owner=self.owner)
+        self.assertTrue(decision.ok, decision.reason)
+
+    def test_post_publication_leftovers_stay_available_to_fresh_normal_work(self):
+        self.owner["round_outcome"] = dict(published_head=self.base)
+        (self.co / "A.lean").write_text("useful unpublished follow-up\n")
+        self.save_updated_checkpoint()
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "post-publication-leftovers")
+        context, handoffs = self.handoff()
+        self.assertIn(str(self.record), context)
+        self.assertNotIn(str(self.record), [record for record, _ in handoffs])
+        rr.return_handoffs(handoffs)
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertFalse(self.journal().get("forensic_only", False))
+
+    def test_confirmed_normal_push_preserves_later_unpublished_edits_as_evidence(self):
+        self.normal_lost_push()
+        (self.co / "A.lean").write_text("useful unpublished follow-up\n")
+        owner = {
+            **self.owner,
+            "round_id": "receiving-round",
+            "publication_marker": dict(ref="refs/tauceti/published/push/main", before=None),
+        }
+        self.record = saved._record(self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=owner)
+        self.manifest = saved._complete(self.record)
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "post-publication-leftovers")
+        self.assertIn(str(self.record), rr.retained_context(self.cfg, "upstream/repo", 10))
+        self.assertFalse(self.journal().get("forensic_only", False))
+        self.assertEqual(FakeVerification.calls, 0)
+
     def test_reoffered_handoff_cannot_reset_an_uncertain_attempt(self):
         self.handoff()
         git(self.co, "add", "-A")
@@ -2300,7 +2357,7 @@ fi
 
         def lock_ref(checkout, *args):
             result = prepare(checkout, *args)
-            lock = checkout / ".git/refs/tauceti/push-attempt/main.lock"
+            lock = checkout / ".git/refs/tauceti/push-attempt-scope/unscoped/main.lock"
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.write_text("stale local lock\n")
             return result
@@ -2359,6 +2416,44 @@ fi
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "publication-head-moved")
         self.assertEqual(git(self.remote, "rev-parse", "main"), current)
+
+    def test_unreconciled_supervisor_publication_is_forensic_evidence_without_handoff(self):
+        intent = self.lost_push_response()
+        git(self.remote, "update-ref", "refs/heads/main", self.base)
+        self.advance_writer()
+        with patch.object(rr.time, "time", return_value=self.journal()["retry_at"] + 301):
+            context, handoffs = self.handoff()
+        self.assertEqual(handoffs, [])
+        self.assertIn('"possibly_published_then_removed": true', context)
+        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["publication"]["oid"], intent["oid"])
+        self.retry_now()
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "publication-head-moved")
+
+    def test_another_round_push_cannot_consume_an_unused_handoff(self):
+        self.handoff()
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "unrelated round source")
+        with patch.dict(os.environ, TAUCETI_PUSH_SCOPE="another-round"):
+            self.assertEqual(self.normal_push().returncode, 0)
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "returned")
+        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertIn(str(self.record), rr.retained_context(self.cfg, "upstream/repo", 10))
+
+    def test_normal_local_ref_failure_retains_retryable_source_without_pending_intent(self):
+        self.handoff()
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "normal source")
+        lock = self.co / ".git/refs/tauceti/push-attempt-scope/unscoped/main.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("stale local lock\n")
+        self.assertEqual(self.normal_push().returncode, 80)
+        self.assertIsNone(saved.ref_object(self.co, "refs/tauceti/pending-push/unscoped/main"))
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["handoff"]["state"], "returned")
 
 
 class ConversationIsolation(unittest.TestCase):
