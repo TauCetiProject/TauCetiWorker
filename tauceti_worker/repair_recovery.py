@@ -825,8 +825,6 @@ class WorkerBackend:
                     failed_source=saved.inspect(checkout).fingerprint,
                     failed_receipt=result,
                 )
-        if result.get("status") == "incomplete" and result.get("waiting_for_capacity"):
-            raise Wait("verification-capacity", result["error"])
         return result
 
     def continuation_admission(self, record, m, j):

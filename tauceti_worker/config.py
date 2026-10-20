@@ -313,10 +313,6 @@ class DocumentationUnavailable(ProgressPreparationUnavailable):
     state = "waiting-documentation"
 
 
-class VerificationUnavailable(NoProgress):
-    """Heavy verification capacity wait; separate from inference/API admission."""
-
-
 class AdmissionUnavailable(NoProgress):
     """Inference admission needs a bounded recheck, without no-progress backoff."""
 

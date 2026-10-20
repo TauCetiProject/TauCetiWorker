@@ -1,4 +1,4 @@
-# Local verification receipts and host capacity
+# Concurrent local verification and exact-input receipts
 
 `tauceti verify [--stage build|axioms|module-system|lint|shim-expiry|all]
 [--base SHA] [--json] [--no-reuse] [--lint-modules FILE]` runs synchronously in a TauCeti checkout. It exits zero
@@ -52,47 +52,32 @@ device, inode, size, mtime and ctime; any metadata change rereads the bytes. The
 bounded. Receipts and logs remain retained; there is no automatic deletion of incomplete evidence.
 Temporary shim archives are removed after use. Source metadata sampling every two seconds catches mutations restored to their original bytes; a final full digest
 check rejects changed inputs. Mutable toolchain/dependency metadata is checked at phase boundaries rather
-than repeatedly scanning large installations while queued. Environment hashing is limited to build
+than repeatedly scanning large installations during tool execution. Environment hashing is limited to build
 configuration and tool-search variables; provider credentials and agent-session variables are excluded. Generated Lake outputs are not source inputs. These fingerprints identify
 built inputs; they do not establish proof correctness or make writable caches or local receipts a
 security boundary. Verification never weakens the axiom checks.
 
-Build, axiom/duplicate audit, module-system audit and environment lint acquire a host-shared
-flock slot, released between commands and never held during the conversation. Shim and source
-style checks bypass heavy admission. The default `all` request runs style before waiting for its
-build, and stage-only lint runs style before environment lint. `TAUCETI_VERIFY_HEAVY_SLOTS` must be a positive integer and defaults to 1. All workers
-on a host should use the same setting. The default lock directory uses the real host boot/machine
-identity and UID under `/tmp`, independent of worker ID, HOME, checkout or fleet labels. The directory
-must be owned by the user and not writable by others. Bubble mounts the host's same directory at
-`/opt/verification-queue` and persists receipts back under worker state. Other container deployments
-must bind a common host directory via `TAUCETI_VERIFY_HOST_QUEUE`; isolated container filesystems
-cannot coordinate flocks. The mounted directory must remain accessible with the same user ownership;
-UID-remapped deployments must configure their mounts accordingly. Unsupported ownership fails the helper
-with incomplete evidence, rather than aborting review rounds or V0 startup. Separate Unix users need
-an explicitly shared queue arrangement. Bubble's preliminary build also uses the queue.
+Independent workers run build, axiom/duplicate audit, module-system audit and lint commands
+concurrently. Verification adds no host-wide slot limit, ticket scheduler, polling wait or
+capacity-specific retry/accounting path. Existing worker/fleet admission and host CPU/memory
+limits continue to apply. The obsolete `TAUCETI_VERIFY_HEAVY_SLOTS` and
+`TAUCETI_VERIFY_HOST_QUEUE` variables are ignored, including by Bubble's preliminary build.
+Per-job leases prevent duplicate execution of the same candidate; they never serialize independent
+candidates. Source style still runs before the default build so inexpensive diagnostics arrive early.
 
-Waiting prints and publishes `waiting-verification-capacity`, keeps the existing candidate/claim
-heartbeat running, performs no claim reads, and observes the round deadline. A short scheduler
-flock serializes ticket registration and grants. Only the oldest leased ticket may acquire a free
-slot; dead-owner tickets are pruned by attempting their flock. Pending jobs retain their original
-age across interrupted waits and across their heavy commands; admission is FIFO by job age rather
-than a fresh age for each phase. Admission is checked every 100 ms; status is refreshed at most
-every fifteen seconds. Each invocation resets its wait record
-and holds a separate live-invocation flock, so a cancelled helper cannot grant a later successful
-invocation a stale retry refund. It does not alter
-inference admission. An interrupted queue wait records unfinished work and a durable counter journal;
-the worker refunds PR attempt counters idempotently during cleanup or before the next survey after
-a crash. Normal completion closes the attempt journal. The loop consults fresh local journals for
-host and Bubble rounds and uses exit 78 for verification-capacity waits, outside both no-work streaks
-and API budget/admission accounting.
+`TAUCETI_VERIFY_CACHE_DIR` selects the shared immutable-installation identity cache. The default
+uses the host boot/machine identity and UID under `/tmp`. The directory must be owned by the user
+and not writable by others. Bubble mounts it at `/opt/verification-cache` and persists receipts
+separately under worker state. Cache locks protect creation/validation of one installation identity;
+they are released before expensive verification commands run. Unregistered writable installations
+retain complete inventory validation without requiring a shared cache.
 
 `TAUCETI_VERIFY_CHECKPOINT_MARGIN` reserves 600 seconds before the round deadline by default (a
 nonnegative number of seconds; fixtures explicitly use zero). At that boundary the helper returns
 incomplete with “checkpoint now”. Bubble candidate edits are saved as a base-bound binary patch and
 an untracked-file archive in `verification-checkpoints/` before checks begin, including when there is
 insufficient time to start verification. These artifacts are retained alongside a durable verification job in `verification-pending/`.
-Capacity wait/refund evidence is published before candidate preservation. Queued candidates are
-copied to independent `verification-candidates/` workspaces; disposable Bubble candidates are
+Interrupted candidates are copied to independent `verification-candidates/` workspaces; disposable Bubble candidates are
 preserved before a non-reused phase starts. A fully reused invocation copies no dependencies or
 Git history. Copies preserve actual sources/index, local Git history and warm Lake/Mathlib build
 caches. The original Git index is read through a private copy. Linux uses independent CoW extents
@@ -107,21 +92,20 @@ reason, `result_type: pending`, the continuation job and its next automatic acti
 the published job eligible once its live flocks release. The ordinary supervisor checks fleet/CI
 admission, then launches an owned fresh installed helper before model selection or GitHub reads.
 The helper inherits the job lease, works only in the isolated candidate, and does not hold the
-worker's round lock while waiting/building. Its queue wait leaves inference scheduling available.
+worker's round lock while building. Independent verification leaves inference scheduling available.
 One continuation per worker bounds preparation concurrency. Ordinary child polling reaps results;
 supervisor shutdown terminates its owned helper, preserving a durable interrupted job.
 
-Counter refunds happen before replay starts. Continuation capacity/runtime journals are separate
-from model-round journals, so concurrent replay cannot overwrite a newer authoring attempt. Repeated queue deadlines retain
-job age, candidate and validated phase evidence. Phase boundaries finish metadata/source validation
-and index publication even if the checkpoint margin arrives at command completion. Complete
-input/tool-version preparation runs at invocation boundaries; phase checkpoints use existing input
-metadata and exact source/configuration checks. Job/index leases suppress duplicate exact-candidate
-jobs. Permanent scope/configuration/ownership errors become terminal incomplete results with retained
-artifacts, so they cannot starve inference. Missing tools remain dormant without repeated verifier
-launches until local toolchain availability/provenance changes. Capacity/signal jobs remain eligible;
-there is no expiry that discards a legitimately queued candidate. Terminal jobs move out of the
-active queue into `verification-jobs/`.
+Continuation runtime status is separate from model-round status, so concurrent replay cannot
+overwrite authoring progress. Repeated deadlines retain the candidate and validated phase evidence.
+Phase boundaries finish metadata/source validation and index publication even if the checkpoint
+margin arrives at command completion. Complete input/tool-version preparation runs at invocation
+boundaries; phase checkpoints use existing input metadata and exact source/configuration checks.
+Job/index leases suppress duplicate exact-candidate jobs. Permanent scope/configuration/ownership
+errors become terminal incomplete results with retained artifacts, so they cannot starve inference.
+Missing tools remain dormant without repeated verifier launches until local toolchain availability
+or provenance changes. Deadline/signal jobs remain eligible without an expiry that discards their
+candidate. Terminal jobs move from `verification-pending/` into `verification-jobs/`.
 
 Recovery builds only in an independent candidate, never resets the original source and never pushes,
 creates a PR or bypasses accounting/publication guards. Receipts bind the actual replay environment;
@@ -135,8 +119,8 @@ and SIGHUP cause owned cleanup and incomplete receipts.
 Tools use #306's `containment.Boundary`. Strong hosts contain children in owned PID namespaces;
 legacy hosts accurately report best-effort process-group cleanup. Bubble owns its outer boundary and
 uses the legacy inner fallback. Normal exits check each command directly; shell lint drivers use
-Bash pipefail. No process-name polling is used. Lock descriptors are never inherited by tools, so
-owner death releases capacity. On legacy hosts, a SIGKILLed owner can leave an escaped child running;
+Bash pipefail. No process-name polling is used. Job/invocation lease descriptors are never inherited by tools, so
+owner death releases ownership for recovery. On legacy hosts, a SIGKILLed owner can leave an escaped child running;
 recovery verifies in an independent workspace. Publication of an original recovery workspace
 requires #310's separate ownership gate.
 
@@ -147,7 +131,7 @@ and replace the installation/provenance token on updates. Registration alone gra
 Linux must report a read-only filesystem, all nested mounts must be read-only, and cold validation
 rejects external symlink targets. Unsupported hosts and writable/unregistered installations retain
 complete inventory and stat-keyed hash validation. A cold validation stores a content digest and
-file count in a host-shared cache under the same private queue directory, serialized per identity.
+file count in a host-shared cache under the private verification cache directory, serialized per identity.
 Separate worker states reuse that validated installation. Warm validation binds that digest to the root device/inode/metadata, mount topology and
 publisher provenance; it performs no recursive immutable walk. A currently writable mount,
 replacement root, changed mount topology or changed provenance invalidates the identity, including
@@ -160,17 +144,16 @@ accidental-mutation guards, not protection from an adversary changing read-only 
 Set `TAUCETI_VERIFY_HELPER=0` to retain/restore bundled V0 prompts at the next round. This changes
 dispatch only: it does not delete receipts/checkpoints/jobs or terminate active verification.
 `TAUCETI_VERIFY_CONTINUATION=0` separately pauses launching new mechanical continuations while
-retaining eligible jobs and allowing active helpers to finish. Host
-slot count and containment policy are also read at the next phase/boundary. One heavy slot is an
-initial canary configuration, not a measured fleet optimum. Green fixture tests do not authorize
+retaining eligible jobs and allowing active helpers to finish. Green fixture tests do not authorize
 blanket fleet dispatch.
 
 ## Implementation evidence
 
 `tests/verification.py` covers real exits, pipefail, exact and phase reuse, source mutations,
 pin/base/toolchain/executable changes, deletions, renames, untracked/ignored sources, owner death,
-deadlines, containment and accounting. `tests/verification_audit.py` adds twenty local fake FIFO
-contenders (including owner death), cheap-check bypass, repeated deadlines followed by an actual
+deadlines and containment. Twenty independent fake verifiers must enter their builds together,
+even with an old one-slot lock held and stale wait records present. `tests/verification_audit.py` adds
+repeated deadlines followed by an actual
 successful build in the isolated candidate, Bubble namespace recovery after original deletion,
 phase evidence after interruption, dispatch gating and immutable preparation costs. Its 30,000-file,
 122,880,000-byte installation uses fixture read-only `statvfs` flags with the real mountinfo
@@ -183,16 +166,16 @@ reads (108,680 bytes on that host). This fixed mount-metadata cost depends on ho
 These are fixture preparation costs,
 not a production throughput measurement. Warm payload bytes/file records/walks
 must be zero, and metadata work remains bounded independently of immutable payload/history.
-All fixtures use private activity/queue/state paths and fake verifiers; they launch no paid agents.
+All fixtures use private activity/cache/state paths and fake verifiers; they launch no paid agents.
 
 ## Deployment evidence
 
 No fleet dispatch, capacity, spending or active-session changes are made by these fixtures. V0
-remains the default. Opt-in natural canary measurements of useful completions, bounded waits,
+remains the default. Opt-in natural canary measurements of useful completions,
 copying cost and host concurrency are still required before broad dispatch.
 
 ## Natural recovery evidence
 
 No natural production recovery or numerical throughput improvement is asserted by local fixture
 results. Record observed candidate/job/receipt IDs, next automatic action, completed useful work,
-queue waits and immutable preparation cost separately when a canary naturally selects work.
+verification concurrency and immutable preparation cost separately when a canary naturally selects work.

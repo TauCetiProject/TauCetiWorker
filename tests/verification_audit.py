@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Private-state scaling, FIFO and mechanical recovery fixtures; no agents, Lean or network."""
+"""Private-state scaling, concurrent verification and mechanical recovery fixtures; no agents, Lean or network."""
 
 import contextlib
-import fcntl
 import io
 import json
 import os
@@ -25,21 +24,20 @@ from tauceti_worker.verification_jobs import resume_pending
 class Recovery(Receipts):
     # Reuse the private Git/fake-verifier fixture; load_tests collects only these audit cases.
     def test_repeated_deadlines_resume_without_model_or_remote_reads(self):
-        with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-            fcntl.flock(owner, fcntl.LOCK_EX)
+        with patch.dict(os.environ, FIXTURE_MODE="sleep", FIXTURE_SLEEP="60"):
             result = self.verify(stage="build", deadline=time.time() + 1)
             self.assertEqual(result["status"], "incomplete")
             self.assertEqual(result["result_type"], "pending")
             self.assertIn("without a model", result["next_action"])
             job_path = Path(result["continuation_job"])
-            priority = json.loads(job_path.read_text())["priority"]
+            priority = v.read_json(job_path)["priority"]
             for _ in range(2):
-                job = json.loads(job_path.read_text())
+                job = v.read_json(job_path)
                 job["next_at"] = 0
                 v.atomic(job_path, job)
                 with contextlib.redirect_stderr(io.StringIO()):
                     self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=0.5))
-                job = json.loads(job_path.read_text())
+                job = v.read_json(job_path)
                 self.assertEqual(job["priority"], priority)
                 self.assertEqual(job["status"], "pending")
                 self.assertTrue(job["isolated"])
@@ -48,57 +46,35 @@ class Recovery(Receipts):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
         self.assertFalse(job_path.exists())
-        complete = json.loads((self.state / "verification-jobs" / job_path.name).read_text())
-        receipt = json.loads(Path(complete["receipt"]).read_text())
+        complete = v.read_json(self.state / "verification-jobs" / job_path.name)
+        receipt = v.read_json(Path(complete["receipt"]))
         self.assertEqual(receipt["status"], "success", receipt.get("error"))
         self.assertEqual(complete["attempts"], 3)
         self.assertTrue(any(c["argv"] == ["lake", "build", "--iofail"] and c["exit"] == 0 for c in receipt["commands"]))
-        self.assertFalse((self.root / ".lake/calls").exists())  # only the isolated candidate was built
+        self.assertEqual(len(self.calls()), 1)  # all further work ran in the isolated candidate
 
-    def test_supervisor_refunds_capacity_before_resetting_wait_evidence(self):
-        from tauceti_worker.survey import Counters
-
-        cfg = SimpleNamespace(state=self.state)
-        counters = Counters(cfg)
-        counters.write("fix-1", 3)
-        v.begin_attempt(SimpleNamespace(cfg=cfg, counters=counters), ("fix-1",))
-        with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-            fcntl.flock(owner, fcntl.LOCK_EX)
-            result = self.verify(stage="build", deadline=time.time() + 1)
-        path = Path(result["continuation_job"])
-        job = json.loads(path.read_text())
-        job["next_at"] = 0
-        v.atomic(path, job)
-        self.assertEqual(counters.read("fix-1"), 3)
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertTrue(resume_pending(cfg, seconds=10))
-        self.assertEqual(counters.read("fix-1"), 2)
-        self.assertFalse(resume_pending(cfg, seconds=10))
-        self.assertEqual(counters.read("fix-1"), 2)
-
-    def test_sigkill_queued_owner_retains_mechanical_next_action(self):
-        with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-            fcntl.flock(owner, fcntl.LOCK_EX)
-            process = self.spawn()
-            try:
-                limit = time.monotonic() + 10
-                while not (
-                    v.read_json(self.state / "verification-capacity.json").get("waiting")
-                    and any(
-                        v.read_json(p).get("isolated") for p in (self.state / "verification-pending").glob("*.json")
-                    )
-                ):
-                    self.assertIsNone(process.poll())
-                    self.assertLess(time.monotonic(), limit)
-                    time.sleep(0.02)
-                [path] = list((self.state / "verification-pending").glob("*.json"))
-                self.assertTrue(v.read_json(path)["isolated"])
+    def test_sigkill_build_owner_retains_mechanical_next_action(self):
+        process = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60")
+        tool = None
+        try:
+            limit = time.monotonic() + 10
+            while not (self.root / ".lake/tool.pid").exists():
+                self.assertIsNone(process.poll())
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(0.02)
+            tool = int((self.root / ".lake/tool.pid").read_text())
+            [path] = list((self.state / "verification-pending").glob("*.json"))
+            process.kill()
+            process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
                 process.kill()
                 process.communicate(timeout=10)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.communicate(timeout=10)
+            if tool is not None:
+                import signal
+
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(tool, signal.SIGKILL)
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
         complete = v.read_json(self.state / "verification-jobs" / path.name)
@@ -171,13 +147,12 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         (self.root / ".lake/packages").symlink_to(packages, target_is_directory=True)
         manifest = self.home / "installations.json"
         v.atomic(manifest, {str(packages): "publisher-1"})
-        with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-            fcntl.flock(owner, fcntl.LOCK_EX)
+        with patch.dict(os.environ, FIXTURE_MODE="sleep", FIXTURE_SLEEP="60"):
             with (
                 patch.dict(os.environ, TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS=str(manifest)),
                 patch("tauceti_worker.verification_installations.mount_identity", return_value=["fixture-read-only"]),
             ):
-                result = self.verify(stage="build", deadline=time.time() + 1)
+                result = self.verify(stage="build", deadline=time.time() - 1)
         job = v.read_json(Path(result["continuation_job"]))
         preserved = Path(job["root"]) / ".lake/packages"
         self.assertTrue(preserved.is_symlink())
@@ -191,7 +166,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             patch("tauceti_worker.verification_installations.mount_identity", return_value=["fixture-read-only"]),
         ):
             self.assertEqual(self.verify(stage="build")["status"], "success")
-            [path] = list((v.queue_root() / "installations").glob("*.json"))
+            [path] = list((v.cache_root() / "installations").glob("*.json"))
             old = v.read_json(path)
             old.update(sha256="invalid")
             old.pop("files")
@@ -218,7 +193,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             )
         model.assert_called_once()
 
-    def test_background_wait_leaves_inference_admission_available_and_drains(self):
+    def test_background_verification_leaves_inference_admission_available_and_drains(self):
         from tauceti_worker import loop
         from tauceti_worker.verification_jobs import stop_continuations
 
@@ -228,8 +203,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         job["next_at"] = 0
         v.atomic(path, job)
         cfg = SimpleNamespace(state=self.state, wid="fixture")
-        with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-            fcntl.flock(owner, fcntl.LOCK_EX)
+        with patch.dict(os.environ, FIXTURE_MODE="sleep", FIXTURE_SLEEP="60"):
             with (
                 patch.object(loop, "fleet_admission_reason", return_value="reserved for CI"),
                 patch("tauceti_worker.verification_jobs.resume_pending") as resume,
@@ -255,15 +229,15 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         self.assertTrue(resume_pending(cfg, seconds=10))
         self.assertEqual(v.read_json(self.state / "verification-jobs" / path.name)["status"], "success")
 
-    def test_default_all_runs_style_before_waiting_for_build(self):
+    def test_default_all_runs_style_before_build(self):
         write(self.root, "scripts/lint-style.sh", "mkdir -p .lake; echo checked > .lake/style-ran\n")
-        with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-            fcntl.flock(owner, fcntl.LOCK_EX)
-            result = self.verify(stage="all", deadline=time.time() + 1)
-        self.assertEqual(result["result_type"], "pending")
+        result = self.verify(stage="all")
+        self.assertEqual(result["status"], "success", result.get("error"))
         self.assertTrue((self.root / ".lake/style-ran").is_file())
-        self.assertTrue(any("scripts/lint-style.sh" in c["argv"] and c["exit"] == 0 for c in result["commands"]))
-        self.assertFalse(any(c["argv"] == ["lake", "build", "--iofail"] for c in result["commands"]))
+        commands = result["commands"]
+        style = next(i for i, c in enumerate(commands) if "scripts/lint-style.sh" in c["argv"])
+        build = next(i for i, c in enumerate(commands) if c["argv"] == ["lake", "build", "--iofail"])
+        self.assertLess(style, build)
 
     def test_completed_phase_indexes_even_when_deadline_arrives_at_its_boundary(self):
         verification = v.Verification(self.root, self.state, stage="all")
@@ -297,35 +271,6 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         self.assertEqual(duplicate["continuation_job"], result["continuation_job"])
         self.assertEqual(len(list((self.state / "verification-pending").glob("*.json"))), 1)
 
-    def test_two_slots_and_corrupt_sequence_recovery(self):
-        import threading
-
-        from tauceti_worker.verification_queue import admitted
-
-        queue = v.queue_root()
-        (queue / "sequence").write_text("interrupted counter")
-        active = 0
-        maximum = 0
-        lock = threading.Lock()
-        together = threading.Event()
-
-        def contender(_):
-            nonlocal active, maximum
-            with admitted(queue, 2, watch=lambda: None, waiting=lambda: None):
-                with lock:
-                    active += 1
-                    maximum = max(maximum, active)
-                    if active == 2:
-                        together.set()
-                self.assertTrue(together.wait(5))
-                time.sleep(0.02)
-                with lock:
-                    active -= 1
-
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(contender, range(4)))
-        self.assertEqual(maximum, 2)
-
     def test_missing_tools_wait_for_real_availability_change_then_resume(self):
         import shutil
 
@@ -356,73 +301,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         self.assertEqual(outside.read_text(), "external source")
         self.assertTrue((self.root / "TauCeti/Linked.lean").is_symlink())
 
-    def test_candidate_preservation_does_not_stall_ready_waiters(self):
-        import threading
-
-        from tauceti_worker.verification_queue import admitted
-
-        queue = v.queue_root()
-        preparing, release, second = threading.Event(), threading.Event(), threading.Event()
-        order = []
-
-        def slow_prepare():
-            preparing.set()
-            self.assertTrue(release.wait(5))
-
-        def first():
-            with admitted(queue, 1, watch=lambda: None, waiting=slow_prepare):
-                order.append("first")
-
-        def other():
-            with admitted(queue, 1, watch=lambda: None, waiting=lambda: None):
-                order.append("second")
-                second.set()
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            with (queue / "slot-0.lock").open("a+") as owner:
-                fcntl.flock(owner, fcntl.LOCK_EX)
-                oldest = pool.submit(first)
-                self.assertTrue(preparing.wait(5))
-                newer = pool.submit(other)
-            try:
-                self.assertTrue(second.wait(5))
-            finally:
-                release.set()
-            oldest.result(timeout=5)
-            newer.result(timeout=5)
-        self.assertEqual(order, ["second", "first"])
-
-    def test_background_capacity_journal_does_not_overwrite_new_model_attempt(self):
-        from tauceti_worker.verification_jobs import reap_continuations, stop_continuations
-
-        result = self.verify(stage="build", deadline=time.time() - 1)
-        path = Path(result["continuation_job"])
-        job = v.read_json(path)
-        job["next_at"] = 0
-        v.atomic(path, job)
-        cfg = SimpleNamespace(state=self.state)
-        try:
-            with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-                fcntl.flock(owner, fcntl.LOCK_EX)
-                self.assertTrue(resume_pending(cfg, background=True, seconds=10))
-                private = self.state / "verification-job-capacity" / path.name
-                limit = time.monotonic() + 10
-                while not v.read_json(private).get("waiting"):
-                    self.assertLess(time.monotonic(), limit)
-                    time.sleep(0.02)
-                marker = dict(attempt="new-model-round", waiting=True, at=time.time())
-                v.atomic(self.state / "verification-capacity.json", marker)
-            while path.exists():
-                reap_continuations(cfg)
-                self.assertLess(time.monotonic(), limit)
-                time.sleep(0.02)
-            reap_continuations(cfg)
-            self.assertEqual(v.read_json(self.state / "verification-capacity.json"), marker)
-            self.assertEqual(v.read_json(self.state / "verification-jobs" / path.name)["status"], "success")
-        finally:
-            stop_continuations(cfg)
-
-    def test_partial_phase_survives_next_queue_deadline(self):
+    def test_partial_phase_survives_next_deadline(self):
         # A phase can establish durable evidence even when a later requested phase is interrupted.
         verification = v.Verification(self.root, self.state, stage="all")
         original = verification.phase_commands
@@ -470,17 +349,6 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         admission.assert_called_once()
         github.assert_not_called()
         model.assert_not_called()
-
-    def test_cheap_checks_bypass_occupied_slot(self):
-        with (v.queue_root() / "slot-0.lock").open("a+") as owner:
-            fcntl.flock(owner, fcntl.LOCK_EX)
-            for stage in ("shim-expiry", "lint"):
-                result = self.verify(stage=stage, deadline=time.time() + 5)
-                self.assertEqual(result["status"], "success", result.get("error"))
-                self.assertEqual(result["queue_wait_seconds"], 0)
-            write(self.root, "TauCeti/A.lean", "changed")
-            result = self.verify(stage="lint", deadline=time.time() + 1)
-            self.assertEqual(result["result_type"], "pending")  # environment lint is expensive
 
     def test_bubble_candidate_survives_namespace_and_original_deletion(self):
         import shutil
@@ -555,7 +423,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
                 files_under=files,
                 file_record=record,
                 stamps=v.stamps,
-                cache_directory=lambda: v.queue_root() / "installations",
+                cache_directory=lambda: v.cache_root() / "installations",
             )
 
         # Fixture-only read-only mount identity. Real mutable directories never take this path.
@@ -573,16 +441,11 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             # Unrelated historical receipts must have no effect on preparation.
             for index in range(2000):
                 write(self.state, f"verification/history-{index}/receipt.json", "{}")
-            from tauceti_worker.verification_queue import admitted
-
-            queue = v.queue_root()
 
             def contender(index):
                 installation = installations(self.home / f"worker-{index}-state")
                 identity = installation.inventory(large)
                 installation.validate()
-                with admitted(queue, 1, watch=lambda: None, waiting=lambda: None):
-                    time.sleep(0.005)  # local fake heavy work after immutable preparation
                 return identity, installation
 
             with ThreadPoolExecutor(max_workers=20) as contenders:
@@ -649,44 +512,6 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             v.atomic(manifest, {str(self.prefix): "lean-2", str(deps): "mathlib-1"})
             third = self.verify(stage="build")
             self.assertNotIn("reused_from", third["phases"]["build"])
-
-    def test_twenty_fifo_contenders_and_dead_waiter(self):
-        queue = v.queue_root()
-        output = self.home / "order"
-        script = """
-import sys, time
-from pathlib import Path
-from tauceti_worker.verification_queue import admitted
-with admitted(Path(sys.argv[1]), 1, watch=lambda: None, waiting=lambda: None):
-    with Path(sys.argv[2]).open('a') as out: out.write(sys.argv[3]+'\\n')
-    time.sleep(0.02)
-"""
-        processes = []
-        try:
-            with (queue / "slot-0.lock").open("a+") as owner:
-                fcntl.flock(owner, fcntl.LOCK_EX)
-                for index in range(20):
-                    process = subprocess.Popen(
-                        [sys.executable, "-c", script, str(queue), str(output), str(index)], cwd=REPO
-                    )
-                    processes.append(process)
-                    limit = time.monotonic() + 10
-                    while len(list(queue.glob("wait-*"))) < index + 1:
-                        self.assertIsNone(process.poll())
-                        self.assertLess(time.monotonic(), limit)
-                        time.sleep(0.01)
-                for index in (0, 5):
-                    processes[index].kill()
-                    processes[index].wait()
-            for process in processes:
-                process.wait(timeout=20)
-            self.assertEqual(output.read_text().splitlines(), [str(i) for i in range(20) if i not in {0, 5}])
-            self.assertFalse(list(queue.glob("wait-*")))
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
 
     def test_v0_dispatch_default_and_explicit_opt_in(self):
         from tauceti_worker.agents import local_verification

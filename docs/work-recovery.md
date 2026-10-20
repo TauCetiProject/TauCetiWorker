@@ -200,7 +200,7 @@ a cursor to avoid starvation. Archived and unchanged blocked metadata do not
 consume those source slots. At most one blocked PR receives a cheap current-fact
 probe per phase, at 30-minute intervals, to observe closure or changed heads. Infrastructure failures retry after 60, 300 and
 1800 seconds; three failed invocations for unchanged checkpoint/external facts
-block further invocations. Claim, verification-capacity, policy and admission
+block further invocations. Claim, policy and admission
 waits do not consume those attempts. Changed PR facts re-enable eligibility.
 Selection-local waits do not schedule recovery-only children until the original
 operator policy changes. The loop preserves its requested provider policy
