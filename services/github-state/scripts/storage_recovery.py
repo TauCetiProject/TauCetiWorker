@@ -59,18 +59,22 @@ def status(environment):
     }
 
 
-def export(environment, tables, limit, recovery_id=None):
+def export(environment, tables, limit, recovery_id=None, classes=(), page_bytes=None):
     # An existing recovery continues from its manifest; a new one records a bookmark.
     recovery = {"id": recovery_id} if recovery_id else call(environment, "/admin/storage/recovery", {})
     print(json.dumps({"recovery": recovery["id"], "bookmark": recovery.get("bookmark")}), file=sys.stderr, flush=True)
-    for table in tables:
-        while not (
-            page := call(
-                environment, "/admin/storage/export", {"recovery": recovery["id"], "table": table, "limit": limit}
-            )
-        )["complete"]:
+    # A class export archives only the rows that cleanup class deletes.
+    scopes = [{"table": table} for table in tables] + [{"class": name} for name in classes]
+    for scope in scopes:
+        body = {
+            "recovery": recovery["id"],
+            "limit": limit,
+            **scope,
+            **({"page_bytes": page_bytes} if page_bytes else {}),
+        }
+        while not (page := call(environment, "/admin/storage/export", body))["complete"]:
             print(json.dumps(page), file=sys.stderr)
-        while not (check := call(environment, "/admin/storage/verify", {"recovery": recovery["id"], "table": table}))[
+        while not (check := call(environment, "/admin/storage/verify", {"recovery": recovery["id"], **scope}))[
             "verified"
         ]:
             print(json.dumps(check), file=sys.stderr)
@@ -147,7 +151,11 @@ def main():
     scan.add_argument("--after", type=int, default=0)
     scan.add_argument("--limit", type=int, default=2000)
     exporting = commands.add_parser("export")
-    exporting.add_argument("--table", action="append", required=True)
+    exporting.add_argument("--table", action="append", default=[])
+    exporting.add_argument(
+        "--class", dest="classes", action="append", default=[], help="cleanup class, e.g. ci_resources"
+    )
+    exporting.add_argument("--page-bytes", type=int, help="logical bytes per page, up to 8000000")
     exporting.add_argument("--limit", type=int, default=1000)
     exporting.add_argument("--recovery", help="continue an existing recovery manifest")
     cleaning = commands.add_parser("cleanup")
@@ -185,7 +193,9 @@ def main():
     elif args.command == "scan":
         result = call(env, "/admin/storage/scan", {"table": args.table, "after": args.after, "limit": args.limit})
     elif args.command == "export":
-        result = export(env, args.table, args.limit, args.recovery)
+        if not args.table and not args.classes:
+            parser.error("export needs --table or --class")
+        result = export(env, args.table, args.limit, args.recovery, args.classes, args.page_bytes)
     elif args.command == "cleanup":
         result = cleanup(env, args.cleanup_class, args.recovery, args.limit, args.batches)
     elif args.command == "probe":

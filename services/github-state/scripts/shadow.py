@@ -364,26 +364,11 @@ def main():
                     "review_threads",
                     "reactions",
                     "statuses",
-                    "checks",
-                    "workflow_runs",
-                    "workflow_jobs",
-                )
+                )  # CI records are not mirrored; the service answers not_mirrored.
                 operation = operations[turn % len(operations)]
-                if operation in ("statuses", "checks"):
+                if operation == "statuses":
                     sha = next(d[target]["headRefOid"] for d in data.values() if target in d)
                     verify(operation, sha=sha)
-                elif operation in ("workflow_runs", "workflow_jobs"):
-                    if operation == "workflow_runs":
-                        verify(operation)
-                    elif summary.get("workflow_candidates"):
-                        runs = summary["workflow_candidates"]
-                        important = [
-                            r
-                            for r in runs
-                            if r.get("head_branch") in ("staging", "trying") and r.get("status") != "completed"
-                        ]
-                        chosen = (important or runs)[turn % len(important or runs)]
-                        verify(operation, id=str(chosen["id"]))
                 elif operation == "reactions":
                     with gateway("https://github-state-test.taucetiproject.org", directory / "client-token"):
                         available, comments = read(repo, "review_comments", number=target)
