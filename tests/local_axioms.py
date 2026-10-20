@@ -16,6 +16,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,24 @@ LEAN = os.environ.get("LEAN") or shutil.which("lean")
 
 
 class NativeCache(unittest.TestCase):
+    def test_cache_shared_across_isolated_homes_and_explicit_bubble_override(self):
+        wrapper = runpy.run_path(str(ROOT / "scripts/tauceti-local-axioms"))
+        with tempfile.TemporaryDirectory() as name:
+            login = Path(name)
+            with (
+                patch.dict(os.environ, HOME=str(login / "isolated")),
+                patch("pwd.getpwuid", return_value=SimpleNamespace(pw_dir=str(login))),
+            ):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("TAUCETI_LOCAL_AXIOMS_CACHE", None)
+                    self.assertEqual(wrapper["cache_root"](), login / ".cache/tauceti/local-axioms")
+            override = login / "bubble"
+            with (
+                patch.dict(os.environ, TAUCETI_LOCAL_AXIOMS_CACHE=str(override)),
+                patch("pwd.getpwuid", side_effect=KeyError("unmapped uid")),
+            ):
+                self.assertEqual(wrapper["cache_root"](), override)
+
     def test_concurrent_build_reuse_invalidation_and_interrupted_build(self):
         wrapper = runpy.run_path(str(ROOT / "scripts/tauceti-local-axioms"))
         with tempfile.TemporaryDirectory() as name:
