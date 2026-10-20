@@ -21,7 +21,7 @@ function fixture(){
   if(!bindings.length && sql.includes(';')) db.exec(sql);
   else {const statement=db.prepare(sql);if(statement.columns().length)rows=statement.all(...bindings);else statement.run(...bindings);}
   return {toArray:()=>rows,one:()=>{assert.equal(rows.length,1);return rows[0];}};
- }},getAlarm:async()=>alarm,setAlarm:async value=>{alarm=value;}}};
+ }},transactionSync(fn){db.exec('SAVEPOINT tx');try{const value=fn();db.exec('RELEASE tx');return value;}catch(error){db.exec('ROLLBACK TO tx');db.exec('RELEASE tx');throw error;}},getAlarm:async()=>alarm,setAlarm:async value=>{alarm=value;}}};
  const state=new RepositoryState(ctx,env);
  const insert=(operation,number,priority,due,attempt=0)=>{
   const q={operation,args:{number}},key=operation+':'+JSON.stringify(q.args);

@@ -5,7 +5,7 @@ export interface Env {
   ALLOWED_REPOSITORIES: string; GITHUB_APP_ID: string; GITHUB_INSTALLATION_ID: string;
   GITHUB_PRIVATE_KEY: string; WEBHOOK_SECRET: string;
   CLIENT_TOKENS: string; ADMIN_TOKEN_HASH: string;
-  RECONCILIATION_SETTINGS?: string; REFERENCE_READS?: string;
+  RECONCILIATION_SETTINGS?: string; REFERENCE_READS?: string; FAULT_INJECTION?: string;
   CF_VERSION?: {id:string};
   BORS_ACTIVITY: Fetcher;
 }
