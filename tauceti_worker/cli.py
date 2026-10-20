@@ -1452,7 +1452,7 @@ def cmd_doctor(args) -> int:
     if os.environ.get("TAUCETI_CONF"):
         from tauceti_tools.cli import main as project_doctor
 
-        flags = ["doctor", "--conf", os.environ["TAUCETI_CONF_SNAPSHOT"]]
+        flags = ["doctor", "--conf", os.environ.get("TAUCETI_CONF_SOURCE", os.environ["TAUCETI_CONF"])]
         for flag in ("extras", "online", "apply", "json"):
             if getattr(args, flag, False):
                 flags.append("--" + flag)
