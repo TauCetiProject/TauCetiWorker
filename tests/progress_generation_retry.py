@@ -55,13 +55,11 @@ class GenerationRetryTests(unittest.TestCase):
                 incr=lambda key: self.values.__setitem__(key, self.values.get(key, 0) + 1),
             ),
         )
-        self.calls, self.caches, self.timeouts = [], [], []
+        self.calls, self.timeouts = [], []
 
-    def run_tool(self, stage, *args, capture=False, docs_cache=None):
+    def run_tool(self, stage, *args, capture=False):
         self.calls.append(stage)
         assert capture
-        assert Path(docs_cache).is_dir()
-        self.caches.append((stage, docs_cache))
         if stage == "plan":
             Path(args[args.index("--out") + 1]).write_text(json.dumps(PLAN))
         else:
@@ -86,9 +84,6 @@ class GenerationRetryTests(unittest.TestCase):
             wu._prepare_progress(self.worker, churning, self.roadmap, self.work)
         self.assertIn("3 attempts", str(raised.exception))
         self.assertEqual(self.calls, ["plan", "facts"] * 3)
-        self.assertEqual(len({cache for _, cache in self.caches}), 3)
-        for a, b in zip(self.caches[::2], self.caches[1::2], strict=True):
-            self.assertEqual(a[1], b[1])
         for name, body in before.items():
             self.assertEqual((self.work / name).read_bytes(), body)
         self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
@@ -114,7 +109,6 @@ class GenerationRetryTests(unittest.TestCase):
         bundle = b"exact compressed generation bytes"
         digest = hashlib.sha256(bundle).hexdigest()
         pin = {
-            "mode": "pages",
             "schema_version": 1,
             "source_commit": NEW,
             "generation": f"pages/{NEW}/{digest}",
@@ -250,8 +244,6 @@ class GenerationRetryTests(unittest.TestCase):
 
         self.run_tool = caching
         self.assertEqual(self.drive_inner(failures=2), 0)
-        self.assertEqual(len({path for _, path in self.caches}), 3)
-        self.assertTrue(all(not Path(path).exists() for _, path in self.caches))
         self.assertEqual(sentinel.read_bytes(), b"cached immutable bytes")
         with patch.dict(os.environ, TAUCETI_FACTS_CACHE=str(self.root / "configured-cache")):
             self.assertEqual(self.drive_inner(), 0)
@@ -356,9 +348,8 @@ class GenerationRetryTests(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         args, code, "mechanical stdout", LEGACY if code == 76 else "invalid mechanical input"
                     )
-                return self.run_tool(
-                    stage, *args[2:], capture=kwargs["capture_output"], docs_cache=kwargs["env"]["TAUCETI_DOCS_CACHE"]
-                )
+                self.assertNotIn("TAUCETI_DOCS_CACHE", kwargs["env"])
+                return self.run_tool(stage, *args[2:], capture=kwargs["capture_output"])
             self.calls.append(stage)
             return subprocess.CompletedProcess(args, 0, "writer prompt", "prompt stderr")
 
