@@ -37,17 +37,24 @@ def page(*, fork=True, name="author/renamed", parent="UPSTREAM", permission="WRI
                 "viewer": {
                     "login": "author",
                     "repositories": {
-                        "nodes": ([node] if fork else []) + ([{
-                            "id": "COLLISION",
-                            "name": "repo",
-                            "nameWithOwner": "author/repo",
-                            "owner": {"login": "author"},
-                            "isFork": False,
-                            "isArchived": False,
-                            "isLocked": False,
-                            "viewerPermission": "ADMIN",
-                            "parent": None,
-                        }] if collision else []),
+                        "nodes": ([node] if fork else [])
+                        + (
+                            [
+                                {
+                                    "id": "COLLISION",
+                                    "name": "repo",
+                                    "nameWithOwner": "author/repo",
+                                    "owner": {"login": "author"},
+                                    "isFork": False,
+                                    "isArchived": False,
+                                    "isLocked": False,
+                                    "viewerPermission": "ADMIN",
+                                    "parent": None,
+                                }
+                            ]
+                            if collision
+                            else []
+                        ),
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
                     },
                 },

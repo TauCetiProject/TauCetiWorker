@@ -22,7 +22,10 @@ def discover(read, upstream):
     # Every repository the actor owns, not only forks, because a name collision has to be read from
     # the same listing. Asking `viewer{repository(name:)}` directly does not work: when no such
     # repository exists GitHub answers `null` together with a NOT_FOUND error, so the query fails in
-    # exactly the case this exists for, an actor with no fork yet.
+    # exactly the case this exists for, an actor with no fork yet. What the listing cannot see is a
+    # repository hidden from a token restricted to selected repositories, or a redirect left by a
+    # rename; either way GitHub still refuses to overwrite a repository, and forks under a suffixed
+    # name, which the ancestry check then finds.
     query = (
         "query($owner:String!,$name:String!,$endCursor:String){"
         "viewer{login "
