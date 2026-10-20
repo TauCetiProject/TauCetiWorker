@@ -338,7 +338,9 @@ durations, median rate and pricing-table hash when available. It contains no
 prompts, response text, credentials or receipt outcome text.
 
 Apply with `tauceti budget --recover --note 'stopped usage policy v1' --json`.
-Application produces a fresh manifest and rechecks process identities immediately
+To bind application to the reviewed proposal, pass `--plan /path/to/dry-run.json`;
+a changed ledger or proposal requires another dry run. Application produces a fresh
+manifest and rechecks process identities immediately
 before its single append-only ledger transaction. Inspect the dry run's identities,
 evidence and totals first. Both a live process identity and a fresh bridge heartbeat
 protect **all** session statuses from modification, including late cumulative
@@ -361,11 +363,15 @@ For stopped incomplete usage (including sessions with no journal), policy
 of the same model and phase completed in the seven days preceding admission.
 With fewer than three, it uses at least three sessions of that model in the same
 window. Estimates, manually reconciled totals, the invocation itself, negative
-costs, missing/zero/invalid intervals and future endpoints are excluded. The rate
-is multiplied by this invocation's recorded duration and rounded to twelve decimal
-places in USD (half-even). Native settlement timestamps or explicitly recorded
-finish times supply endpoints; if absent, a usage observation time can supply the
-invocation's end. Orphan detection and repair time never supply an endpoint.
+or zero costs, failed launches, missing/zero/invalid intervals and future endpoints
+are excluded. The rate is multiplied by this invocation's recorded duration and
+rounded to twelve decimal places in USD (half-even). Normal native settlement
+timestamps or explicitly recorded finish times supply endpoints. The native shim records exit time in its final receipt when process exit
+is confirmed, including interrupted exits; provisional in-flight checkpoints never
+claim an exit. Old recovery timestamps without recorded endpoints are excluded.
+If a target has no recorded exit, a usage observation time can supply its end.
+That measures the observed portion rather than a confirmed process lifetime; the
+duration source remains labelled in the audit. Orphan detection and repair time never supply an endpoint.
 Replayed native receipts retain the original recorded endpoint; missing endpoints
 exclude them from rate comparables. An unusable duration or insufficient
 comparables uses the **saved prelaunch estimate**, without recalculating admission
@@ -381,14 +387,24 @@ During ordinary live teardown, `recover_usage` still charges known prefixes and
 retains reservations when evidence is incomplete; only explicit stopped recovery
 applies this policy.
 
+Usage evidence is collected outside the fleet ledger lock; planning replays the
+current ledger incrementally inside the lock and skips estimates with no new native
+receipt. Full comparable details stay in the manifest; ledger events retain a compact
+policy/rate/duration summary, count, audit hash and manifest reference.
+
 Prepared activity caches distinguish live usage, settled estimates (including
 recovered estimates), and unresolved stopped accounting. Existing spend and dollars
-per LOC measurements remain available. Reservations never enter spend reports;
+per LOC measurements remain available, including during mixed version 2/3 rollouts.
+Estimates use their recorded interval in rate windows; without an interval they are
+placed at admission instead of being spread across downtime until repair.
+Reservations never enter spend reports;
 `status` still reads prepared local data without GitHub calls or recovery analysis.
 
 The authoritative ledger and retained recovery manifests are append-only evidence.
 Ledger repair transactions name their manifest; a manifest records a plan, and the
-matching ledger transaction establishes application. If a run stops before append,
+matching ledger transaction establishes application. Manifests explicitly have
+`status: planned`; a separate `.application.json` records the committed transaction
+and sequence (or a no-change result). If a run stops before append,
 rerun dry-run and recovery. Do not truncate evidence or recreate consumed reservations.
 Correct a mistaken total with `tauceti budget --reconcile INVOCATION --cost USD
 --note 'reason and supporting evidence'`; this appends a compensating adjustment.

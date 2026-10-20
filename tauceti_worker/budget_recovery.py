@@ -63,14 +63,14 @@ def historical_estimate(session, sessions, now, duration):
                 or other["status"] != "settled"
                 or other.get("cost_provenance", "native-reported") != "native-reported"
                 or ("estimat" in other.get("outcome", "").lower() and not other.get("totals"))
-                or other.get("outcome") == "reconciled"
+                or other.get("outcome") in {"reconciled", "launch-failed"}
             ):
                 continue
             span = interval(other, now)
             if span["seconds"] is None or not end - WEEK <= money(span["finish"]) <= end:
                 continue
             cost = money(other["cost"])
-            if cost < 0:
+            if cost <= 0:
                 continue
             candidates.append((other, cost / money(span["seconds"])))
         phased = [(other, rate) for other, rate in candidates if other["phase"] == session["phase"]]
@@ -99,41 +99,71 @@ class Projection(Budget):
 
     def __init__(self, budget, records, now):
         super().__init__(budget.directory, clock=lambda: now)
-        self.projected_records = copy.deepcopy(records)
+        self.state = super().replay(copy.deepcopy(records))
         self.events = []
 
     def locked(self):
         return contextlib.nullcontext()
 
-    def replay(self, records=None):
-        # Budget replay updates admission dictionaries in place.
-        return super().replay(copy.deepcopy(self.projected_records if records is None else records))
+    def replay(self, records=None, *, _state=None):
+        if records is not None:
+            return super().replay(records, _state=_state)
+        # Callers only mutate top-level accrual fields; append uses copy-on-write
+        # sessions so prior snapshots remain valid for candidate rollback.
+        return dict(self.state)
 
     def append(self, state, events):
         for event in events:
             if event["type"] == "settle" and event.get("cost_provenance") == "native-reported":
-                # Replaying an old receipt now does not make downtime part of its duration.
-                event["finished"] = state["sessions"][event["id"]].get("finished")
+                event.setdefault("finished", state["sessions"][event["id"]].get("finished"))
+        working = {**self.state, "sessions": dict(self.state["sessions"]), "samples": {}}
+        for key in {e.get("id") for e in events if e.get("id")}:
+            working["sessions"][key] = dict(working["sessions"][key])
+        record = json.loads(self.record_bytes(self.state, events))
+        self.state = super().replay([record], _state=working)
         self.events.extend(e for e in events if e["type"] != "accrue")
-        self.projected_records.append(json.loads(self.record_bytes(state, events)))
 
 
 def pending(session):
     return Decimal(0) if session["status"] == "settled" else money(session.get("reserve", session["estimate"]))
 
 
-def recover(budget, note, *, dry_run=False):
+def recover(budget, note, *, dry_run=False, plan=None):
     if not dry_run and not note.strip():
         raise BudgetError("receipt recovery requires --note")
+    expected = None
+    if plan:
+        if dry_run:
+            raise BudgetError("--plan requires an apply, not --dry-run")
+        from .usage_accounting import _read
+
+        expected = json.loads(_read(Path(plan), 128 * 1024**2))
+        if not isinstance(expected, dict) or expected.get("policy") != POLICY or not expected.get("dry_run"):
+            raise BudgetError("--plan requires a dry-run manifest for this policy")
     now = budget.clock()
     with budget.locked():
+        initial = budget.replay()
+    # Large transcript/journal reads happen without the fleet accounting lock.
+    usage_evidence = {}
+    for key, session in initial["sessions"].items():
+        if (
+            len(key) == 32
+            and all(c in "0123456789abcdef" for c in key)
+            and session["status"] != "settled"
+            and not live_identity(session, now)["live"]
+        ):
+            try:
+                evidence(budget.directory, session, initial["sessions"], checkpoints=usage_evidence)
+            except (ValueError, OSError, TypeError, KeyError):
+                usage_evidence[key] = None
+    with budget.locked():
+        # Plan against fresh ledger state, not the state used to collect evidence.
         records = budget.records()
         before = budget.replay(copy.deepcopy(records))
         original = before["sessions"]
-        identities = {key: live_identity(s, now) for key, s in original.items()}
+        identities = {key: live_identity(s, budget.clock()) for key, s in original.items()}
         projection = Projection(budget, records, now)
         rows, errors, checkpoints = [], [], []
-        usage_evidence = {}
         for key, session in original.items():
             row = dict(
                 id=key,
@@ -157,7 +187,11 @@ def recover(budget, note, *, dry_run=False):
                 session["status"] == "settled" and session.get("cost_provenance") not in ESTIMATE_PROVENANCES
             ):
                 continue
-            event_count, record_count = len(projection.events), len(projection.projected_records)
+            if session["status"] == "settled" and (
+                not session.get("bridge") or not (Path(session["bridge"]) / "inbox" / (key + ".receipt")).exists()
+            ):
+                continue
+            event_count, prior_state = len(projection.events), projection.state
             try:
                 if len(key) != 32 or any(c not in "0123456789abcdef" for c in key):
                     raise BudgetError("invalid receipt invocation ID")
@@ -166,21 +200,41 @@ def recover(budget, note, *, dry_run=False):
                 if session.get("bridge"):
                     path = Path(session["bridge"]) / "inbox" / (key + ".receipt")
                     if path.exists():
-                        receipt = safe_message(path)
-                        if not isinstance(receipt, dict) or receipt.get("id") != key:
-                            raise BudgetError("receipt invocation mismatch")
-                        row["audit_inputs"]["receipt_sha256"] = hashlib.sha256(
-                            json.dumps(receipt, sort_keys=True).encode()
-                        ).hexdigest()
-                        projection.settle_receipt(receipt, note=note)
-                        current = projection.replay()["sessions"][key]
-                        if current["status"] == "settled" and current["cost_provenance"] == "native-reported":
-                            row.update(source="native-receipt", native_amount_usd=current["cost"], confidence="native")
-                        else:
-                            row["source"] = "native-prefix"
+                        try:
+                            receipt = safe_message(path)
+                            if not isinstance(receipt, dict) or receipt.get("id") != key:
+                                raise BudgetError("receipt invocation mismatch")
+                            digest = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
+                            row["audit_inputs"]["receipt_sha256"] = digest
+                            if (
+                                session["status"] == "settled"
+                                and (session.get("recovery_audit") or {}).get("receipt_sha256") == digest
+                            ):
+                                continue
+                            projection.settle_receipt(receipt, note=note)
+                            current = projection.replay()["sessions"][key]
+                            if current["status"] == "settled" and current["cost_provenance"] == "native-reported":
+                                row.update(
+                                    source="native-receipt", native_amount_usd=current["cost"], confidence="native"
+                                )
+                            else:
+                                row["source"] = "native-prefix"
+                        except (ValueError, OSError, TypeError, KeyError):
+                            del projection.events[event_count:]
+                            projection.state = prior_state
+                            row["source"] = "unusable-receipt"
+                            row["audit_inputs"]["receipt_error"] = "unreadable-or-invalid-native-receipt"
+                            try:
+                                from .usage_accounting import _read
+
+                                row["audit_inputs"]["receipt_sha256"] = hashlib.sha256(_read(path, 65536)).hexdigest()
+                            except (ValueError, OSError):
+                                row["audit_inputs"]["receipt_sha256"] = None
                 state = projection.replay()
                 current = state["sessions"][key]
                 if current["status"] != "settled":
+                    if key not in usage_evidence:
+                        raise BudgetError("usage evidence changed; rerun recovery")
                     saved = evidence(budget.directory, current, state["sessions"], checkpoints=usage_evidence)
                     floor = max(
                         money(current.get("cost", "0")),
@@ -235,7 +289,17 @@ def recover(budget, note, *, dry_run=False):
                             outcome="recovered stopped usage estimate",
                             cost_provenance=provenance,
                             finished=duration["finish"],
-                            recovery_audit=row["audit_inputs"],
+                            recovery_audit={
+                                "policy": POLICY,
+                                "tier": audit["tier"],
+                                "duration": duration,
+                                "rate_usd_per_second": audit.get("rate_usd_per_second"),
+                                "comparable_count": len(audit["comparable_ids"]),
+                                "inputs_sha256": hashlib.sha256(
+                                    json.dumps(row["audit_inputs"], sort_keys=True).encode()
+                                ).hexdigest(),
+                                "receipt_sha256": row["audit_inputs"].get("receipt_sha256"),
+                            },
                             note=note,
                         )
                     )
@@ -248,9 +312,16 @@ def recover(budget, note, *, dry_run=False):
                     raise BudgetError("cumulative correction would change a live session; reconcile after it stops")
             except (ValueError, OSError, TypeError, KeyError) as error:
                 del projection.events[event_count:]
-                del projection.projected_records[record_count:]
-                errors.append(f"{key}: {type(error).__name__}")
-                row.update(confidence="unresolved-stopped", error=type(error).__name__)
+                projection.state = prior_state
+                reasons = {
+                    "invalid receipt invocation ID": "invalid-invocation-id",
+                    "torn-ledger reservation requires explicit reconciliation": "torn-ledger-reconciliation-required",
+                    "usage evidence changed; rerun recovery": "evidence-not-prefetched-rerun",
+                    "cumulative correction would change a live session; reconcile after it stops": "live-cumulative-correction-deferred",
+                }
+                code = reasons.get(str(error), "invalid-evidence-or-policy-input")
+                errors.append(f"{key}: {code}")
+                row.update(confidence="unresolved-stopped", error=code)
         after = projection.replay()
         for row in rows:
             old, new = original[row["id"]], after["sessions"][row["id"]]
@@ -265,6 +336,7 @@ def recover(budget, note, *, dry_run=False):
             raise BudgetError("recovery deltas do not reconcile")
         manifest = dict(
             policy=POLICY,
+            status="planned",
             generated_at=now,
             dry_run=dry_run,
             ledger_sequence=before["seq"],
@@ -278,10 +350,22 @@ def recover(budget, note, *, dry_run=False):
             invocations=rows,
             errors=errors,
         )
+        if expected:
+
+            def proposals(values):
+                return [{k: v for k, v in row.items() if k != "identity"} for row in values]
+
+            if (
+                expected["ledger_sequence"] != manifest["ledger_sequence"]
+                or expected["ledger_sha256"] != manifest["ledger_sha256"]
+                or proposals(expected["invocations"]) != proposals(rows)
+            ):
+                raise BudgetError("dry-run plan no longer matches ledger/evidence; run dry-run again")
         path = budget.directory / "recovery-audits" / (uuid.uuid4().hex + ".json")
         atomic_json(path, manifest)
         Budget(path.parent).sync_directory()
         budget.sync_directory()
+        application = dict(status="no-change", manifest=path.name, ledger_sequence=before["seq"])
         if not dry_run and projection.events:
             # Recheck identities immediately before committing the single append-only transaction.
             changed = {e.get("id") for e in projection.events if e.get("id")}
@@ -291,11 +375,14 @@ def recover(budget, note, *, dry_run=False):
 
             for session, checkpoint in checkpoints:
                 atomic_json(usage_path(budget.directory, session["id"], session.get("bridge")), checkpoint)
-            budget.append(
+            committed = budget.append(
                 before,
                 [budget.accrue(before), *[dict(event, recovery_manifest=path.name) for event in projection.events]],
             )
+            application.update(status="committed", **committed)
         if not dry_run:
+            atomic_json(path.with_suffix(".application.json"), application)
+            Budget(path.parent).sync_directory()
             changed = {e.get("id") for e in projection.events if e.get("id")}
             for row in rows:
                 session = original[row["id"]]

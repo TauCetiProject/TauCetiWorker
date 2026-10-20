@@ -295,7 +295,7 @@ def combine(values):
     if len(known) != len(values):
         errors.append("Some hosts have no prepared activity")
     accounting_versions = {v.get("costs", {}).get("accounting_version", 1) for v in known}
-    compatible_costs = len(accounting_versions) == 1
+    compatible_costs = len(accounting_versions) == 1 or accounting_versions <= {2, 3}
     if not compatible_costs:
         errors.append("Hosts use different cost accounting versions; refresh their native activity collectors")
     s = dict(
@@ -352,6 +352,21 @@ def combine(values):
                 else None
             )
         row["measured_pr_weight"] = float(sum((measured_pr_weight(r) for r in rows), Decimal(0)))
+        if accounting_versions == {2, 3} and row.get("active_accrued_usd") is not None:
+            row["active_accrued_usd"] = str(
+                sum(
+                    (
+                        Decimal(v["costs"]["windows"][w]["active_accrued_usd"])
+                        + (
+                            Decimal(v["costs"]["windows"][w].get("unresolved_stopped_usd") or "0")
+                            if v["costs"].get("accounting_version") == 3
+                            else Decimal(0)
+                        )
+                        for v in known
+                    ),
+                    Decimal(0),
+                )
+            )
         row.update(loc_estimate(row))
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):

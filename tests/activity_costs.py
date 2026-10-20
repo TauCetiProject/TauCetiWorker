@@ -137,6 +137,17 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(costs["spending"]["24h"]["spent_usd"]), 90)
         self.assertEqual(Decimal(costs["windows"]["total"]["estimated_usd"]), 106)
 
+    def test_missing_duration_estimate_is_at_start_not_smeared_to_repair(self):
+        self.session("e" * 32, 2 * DAY, "author", "6", settled=True)
+        self.records[-1]["timestamp"] = self.now
+        self.records[-1]["events"][0].update(
+            cost_provenance="prelaunch-estimate", finished=None, recovery_audit={"policy": "v1"}
+        )
+        self.write_ledger()
+        costs = self.summary()["costs"]
+        self.assertEqual(Decimal(costs["spending"]["24h"]["spent_usd"]), 90)
+        self.assertEqual(Decimal(costs["windows"]["total"]["estimated_usd"]), 106)
+
     def test_prepared_accounting_separates_live_recovered_and_unresolved(self):
         self.session("b" * 32, 30, "author", "5", settled=False)
         self.records[-1]["events"][0]["owner"] = process_identity()
@@ -338,10 +349,13 @@ class CostTests(unittest.TestCase):
         legacy = json.loads(json.dumps(modern))
         version_two = json.loads(json.dumps(modern))
         version_two["costs"]["accounting_version"] = 2
+        for row in version_two["costs"]["windows"].values():
+            row["active_accrued_usd"] = row.pop("unresolved_stopped_usd")
         mixed = activity_summary.combine(
             [dict(available=True, summary=modern), dict(available=True, summary=version_two)]
         )
-        self.assertIsNone(mixed["summary"]["costs"]["windows"]["total"]["estimated_usd"])
+        self.assertEqual(Decimal(mixed["summary"]["costs"]["windows"]["total"]["estimated_usd"]), 200)
+        self.assertEqual(Decimal(mixed["summary"]["costs"]["windows"]["total"]["active_accrued_usd"]), 80)
         legacy["costs"]["accounting_version"] = 1
         for row in legacy["costs"]["windows"].values():
             row["pending_usd"] = row.pop("active_accrued_usd")

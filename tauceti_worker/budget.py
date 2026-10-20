@@ -111,17 +111,21 @@ class Budget:
                 raise BudgetError(f"invalid ledger record {i}: {self.ledger}") from None
         return records
 
-    def replay(self, records: list[dict] | None = None):
-        state = dict(
-            balance=Decimal(0),
-            rate=Decimal(0),
-            spent=Decimal(0),
-            watermark=Decimal(0),
-            sessions={},
-            waiting={},
-            cooldowns={},
-            samples={},
-            seq=0,
+    def replay(self, records: list[dict] | None = None, *, _state=None):
+        state = (
+            _state
+            if _state is not None
+            else dict(
+                balance=Decimal(0),
+                rate=Decimal(0),
+                spent=Decimal(0),
+                watermark=Decimal(0),
+                sessions={},
+                waiting={},
+                cooldowns={},
+                samples={},
+                seq=0,
+            )
         )
         try:
             for rec in self.records() if records is None else records:
@@ -136,7 +140,13 @@ class Budget:
                         if kind == "correction":
                             state["spent"] -= money(event["delta"])
                             state["sessions"][event["id"]]["cost"] = event["cost"]
-                            for field in ("cost_provenance", "totals", "recovery_audit"):
+                            for field in (
+                                "cost_provenance",
+                                "totals",
+                                "recovery_audit",
+                                "finished",
+                                "recovery_manifest",
+                            ):
                                 if field in event:
                                     state["sessions"][event["id"]][field] = event[field]
                     elif kind == "rate":
@@ -154,7 +164,8 @@ class Budget:
                             outcome=event["outcome"],
                             totals=event.get("totals", {}),
                             cost_provenance=event.get("cost_provenance", "native-reported"),
-                            finished=event.get("finished", rec["timestamp"]),
+                            finished=event.get("finished", None if event.get("note") else rec["timestamp"]),
+                            recovery_manifest=event.get("recovery_manifest"),
                             recovery_audit=event.get("recovery_audit"),
                         )
                         cost = money(event["cost"])
@@ -217,6 +228,7 @@ class Budget:
 
     def append(self, state, events):
         data = self.record_bytes(state, events)
+        transaction = json.loads(data)["transaction"]
         fd = os.open(self.ledger, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         try:
             while data:
@@ -229,6 +241,7 @@ class Budget:
             os.close(fd)
         # Persist a newly created ledger's directory entry as well as its contents.
         self.sync_directory()
+        return dict(transaction=transaction, ledger_sequence=state["seq"] + 1)
 
     def configure(self, *, grant=None, set_grant=None, rate=None):
         if grant is not None and set_grant is not None:
@@ -466,7 +479,17 @@ class Budget:
             self.save_waiting(queue)
             return dict(allowed=True, estimate=str(estimate))
 
-    def settle(self, invocation, cost, outcome="completed", *, note=None, totals=None, provenance="native-reported"):
+    def settle(
+        self,
+        invocation,
+        cost,
+        outcome="completed",
+        *,
+        note=None,
+        totals=None,
+        provenance="native-reported",
+        finished=None,
+    ):
         value = money(cost) if cost is not None else None
         if value is not None and value < 0:
             raise BudgetError("session cost cannot be negative")
@@ -481,7 +504,10 @@ class Budget:
                 return
             events = [self.accrue(state)]
             if value is None:
-                events.append(dict(type="unresolved", id=invocation, outcome=outcome))
+                event = dict(type="unresolved", id=invocation, outcome=outcome)
+                if finished is not None:
+                    event["finished"] = finished
+                events.append(event)
             else:
                 if "cost" in session:
                     # Prefixes use ordinary correction events, so older ledger
@@ -504,6 +530,7 @@ class Budget:
                         note=note,
                         totals=totals or {},
                         cost_provenance=provenance,
+                        **({"finished": finished} if finished is not None else {}),
                     )
                 )
             self.append(state, events)
@@ -593,6 +620,13 @@ class Budget:
                 raise BudgetError("receipt has no recorded admission")
             if session["status"] == "settled" and session.get("cost_provenance") not in ESTIMATE_PROVENANCES:
                 return
+            finished = receipt.get("finished")
+            if finished is not None and (
+                isinstance(finished, bool)
+                or money(finished) < money(session["started"])
+                or money(finished) > money(self.clock())
+            ):
+                raise BudgetError("invalid receipt finish time")
             ordered = list(state["sessions"].values())
             position = next(i for i, entry in enumerate(ordered) if entry["id"] == receipt["id"])
             baseline = {}
@@ -634,6 +668,7 @@ class Budget:
                         lower_bound_totals=lower,
                         outcome=receipt["outcome"],
                         note=note,
+                        **({"finished": finished} if finished is not None else {}),
                     )
                     self.append(state, [self.accrue(state), event])
                     return
@@ -697,6 +732,7 @@ class Budget:
                                 totals=totals,
                                 cost_provenance="native-reported",
                                 note=note or "native receipt replaces estimate",
+                                **({"finished": finished} if finished is not None else {}),
                             )
                         )
                         # Correcting an earlier estimated resume baseline must
@@ -758,12 +794,13 @@ class Budget:
                                 outcome=receipt["outcome"],
                                 cost_provenance="native-reported",
                                 note=note,
+                                **({"finished": finished} if finished is not None else {}),
                             )
                         )
                     self.append(state, events)
                     return
         if session["status"] != "settled":
-            self.settle(receipt["id"], None, receipt["outcome"], note=note)
+            self.settle(receipt["id"], None, receipt["outcome"], note=note, finished=finished)
 
     def recover_usage(self, invocation, *, note="saved usage checkpoint", allow_live_owner=False, dry_run=False):
         """Settle a stopped complete journal, or charge its prefix and reserve uncertainty.
@@ -886,10 +923,10 @@ class Budget:
             self.append(state, [self.accrue(state), *events])
             return result
 
-    def recover(self, note, *, dry_run=False):
+    def recover(self, note, *, dry_run=False, plan=None):
         from .budget_recovery import recover
 
-        return recover(self, note, dry_run=dry_run)
+        return recover(self, note, dry_run=dry_run, plan=plan)
 
     def cooldown(self, model, seconds):
         with self.locked():

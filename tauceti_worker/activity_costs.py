@@ -146,7 +146,11 @@ def prepare(db, now, scope_for_worker):
             finish = (
                 float(recorded["finish"])
                 if recorded["finish"] is not None
-                else settled_at.get(identity, saved["observed_at"] if saved else now)
+                else session["started"]
+                if settled
+                else saved["observed_at"]
+                if saved
+                else now
             )
             accruals.append(
                 (

@@ -37,6 +37,7 @@ class RecoveryTests(unittest.TestCase):
         estimate="7",
         age=1000,
         provenance="native-reported",
+        outcome="completed",
         prefix=None,
         reserve=None,
         owner=None,
@@ -62,6 +63,19 @@ class RecoveryTests(unittest.TestCase):
         )
         with self.budget.locked():
             self.budget.append(self.budget.replay(), [event])
+        recorded_exit = cost is None and duration is not None and 0 < duration <= age
+        if recorded_exit:
+            self.budget.settle_receipt(
+                dict(
+                    id=key,
+                    totals=None,
+                    provisional=True,
+                    lower_bound_totals={"provider-" + key: "0"},
+                    outcome="exit:-15",
+                    finished=start + duration,
+                )
+            )
+        with self.budget.locked():
             events = []
             if cost is not None:
                 events.append(
@@ -69,12 +83,12 @@ class RecoveryTests(unittest.TestCase):
                         type="settle",
                         id=key,
                         cost=str(cost),
-                        outcome="completed",
+                        outcome=outcome,
                         cost_provenance=provenance,
                         finished=start + duration if duration is not None else None,
                     )
                 )
-            elif duration is not None:
+            elif duration is not None and not recorded_exit:
                 events.append(dict(type="unresolved", id=key, outcome="stopped", finished=start + duration))
             if prefix is not None:
                 events.append(
@@ -213,6 +227,62 @@ class RecoveryTests(unittest.TestCase):
         _, rows = self.repair()
         self.assertEqual(Decimal(rows[key]["delta_usd"]), 7)
         self.assertEqual(Decimal(rows[key]["released_reservation_usd"]), 221)
+
+    def test_usage_observation_drives_historical_duration_without_terminal_receipt(self):
+        for c in (10, 20, 30):
+            self.session(cost=c, age=5000 + c)
+        target = self.session(duration=None)
+        self.saved(target)
+        _, rows = self.repair()
+        self.assertEqual(rows[target]["confidence"], "historical-estimate")
+        self.assertEqual(rows[target]["audit_inputs"]["duration"]["source"], "usage-observed-at")
+        self.assertEqual(Decimal(rows[target]["final_charge_usd"]), 20)
+
+    def test_zero_cost_and_failed_launches_do_not_supply_rates(self):
+        for _ in range(5):
+            self.session(cost=0, age=5000)
+        target = self.session()
+        _, rows = self.repair(True)
+        self.assertEqual(rows[target]["confidence"], "prelaunch-estimate")
+        for _ in range(3):
+            self.session(cost=20, age=5000, outcome="launch-failed")
+        _, rows = self.repair(True)
+        self.assertEqual(rows[target]["confidence"], "prelaunch-estimate")
+
+    def test_invalid_receipt_falls_back_to_policy_with_audit_reason(self):
+        target = self.session()
+        receipt = Path(self.state(target)["bridge"]) / "inbox" / (target + ".receipt")
+        receipt.write_text("not-json-private-sentinel")
+        result, rows = self.repair()
+        self.assertEqual(Decimal(rows[target]["final_charge_usd"]), 7)
+        self.assertEqual(rows[target]["audit_inputs"]["receipt_error"], "unreadable-or-invalid-native-receipt")
+        self.assertNotIn("private-sentinel", Path(result["recovery_manifest"]).read_text())
+        self.assertNotIn("comparables", self.state(target)["recovery_audit"])
+
+    def test_old_native_repair_timestamp_is_not_a_comparable_duration(self):
+        for _ in range(3):
+            key = self.session(duration=None, age=5000)
+            with self.budget.locked():
+                self.budget.append(
+                    self.budget.replay(),
+                    [dict(type="settle", id=key, cost="20", outcome="recovered", note="legacy recovery")],
+                )
+        target = self.session()
+        _, rows = self.repair(True)
+        self.assertEqual(rows[target]["confidence"], "prelaunch-estimate")
+
+    def test_reviewed_plan_pin_and_application_receipt(self):
+        from tauceti_worker.budget import BudgetError
+
+        target = self.session()
+        preview = self.budget.recover("", dry_run=True)
+        result = self.budget.recover("reviewed plan", plan=preview["recovery_manifest"])
+        application = json.loads(Path(result["recovery_manifest"]).with_suffix(".application.json").read_text())
+        self.assertEqual(application["status"], "committed")
+        self.assertEqual(application["transaction"], self.budget.records()[-1]["transaction"])
+        self.assertEqual(Decimal(self.state(target)["cost"]), 7)
+        with self.assertRaisesRegex(BudgetError, "no longer matches"):
+            self.budget.recover("stale plan", plan=preview["recovery_manifest"])
 
     def test_existing_308_charge_and_221_reservation_are_separate(self):
         charged = self.session(prefix="308", reserve="308")
@@ -439,15 +509,14 @@ class RecoveryTests(unittest.TestCase):
         from tauceti_worker.budget import BudgetError
 
         def identity(session, now):
-            return dict(live=now > NOW, owner=None, owner_alive=now > NOW, heartbeat=None)
+            return dict(live=next(ticks), owner=None, owner_alive=False, heartbeat=None)
 
         with patch("tauceti_worker.budget_recovery.live_identity", side_effect=identity):
-            ticks = iter([NOW, NOW + 1])
-            self.budget.clock = lambda: next(ticks)
+            ticks = iter([False, False, True])
             with self.assertRaisesRegex(BudgetError, "became live"):
                 self.budget.recover("identity changed")
         self.assertEqual(original, self.budget.ledger.read_bytes())
-        self.assertEqual(self.state(key)["status"], "unresolved")
+        self.assertEqual(self.state(key)["status"], "provisional")
 
     def test_accrual_is_not_applied_twice(self):
         self.budget.configure(rate="3600")

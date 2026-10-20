@@ -695,6 +695,7 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 receipt = json.loads(next(context.inbox.glob("*.receipt")).read_text())
                 self.assertIsNone(receipt["totals"])
                 self.assertTrue(receipt["provisional"])
+                self.assertIn("finished", receipt)
                 self.assertEqual(receipt["lower_bound_totals"], {"completed-model": "12"})
                 self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
             finally:

@@ -6,10 +6,12 @@ from .usage_accounting import session_usage
 
 
 def evidence(directory, session, sessions, *, checkpoints=None):
-    checkpoints = checkpoints or {}
-    value = checkpoints.get(session["id"]) or session_usage(directory, session)
-    if value is None:
-        value = linked_transcript(directory, session, sessions)
+    checkpoints = {} if checkpoints is None else checkpoints
+    if session["id"] in checkpoints:
+        value = checkpoints[session["id"]]
+    else:
+        value = session_usage(directory, session) or linked_transcript(directory, session, sessions)
+        checkpoints[session["id"]] = value
     if value is None:
         return None
     # A resumed CLI can replay old responses. Charge each provider response once,
@@ -23,7 +25,9 @@ def evidence(directory, session, sessions, *, checkpoints=None):
             prior.get("resume") != session["resume"] and session["resume"] not in prior.get("totals", {})
         ):
             continue
-        saved = checkpoints.get(prior["id"]) or session_usage(directory, prior)
+        if prior["id"] not in checkpoints:
+            checkpoints[prior["id"]] = session_usage(directory, prior)
+        saved = checkpoints[prior["id"]]
         if saved:
             seen.update((m["session"], m["message_id"]) for m in saved["messages"].values())
     items = [m for m in value["messages"].values() if (m["session"], m["message_id"]) not in seen]
@@ -131,7 +135,7 @@ def linked_transcript(directory, session, sessions=None):
                     file=str(path),
                     size=info.st_size,
                     mtime_ns=info.st_mtime_ns,
-                    until=until,
+                    until=until if session.get("finished") is not None else None,
                     resume_before=resume_before,
                 )
             )
