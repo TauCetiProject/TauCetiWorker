@@ -120,9 +120,9 @@ stop a worker. Preparation always saves first and then always continues:
   keep the original tree intact.
   A larger source candidate stays recoverable while its next bounded allowance is
   scheduled. Candidates beyond the maximum allowance keep their source and
-  retryable disposition. Unarchived metadata parks only that candidate, resetting
-  its larger allowance; subsequent ticks check a fixed set of metadata stamps until
-  they change or the 30-minute retry is due. A missing or indirect `.git` never runs
+  retryable disposition. Unarchived metadata parks only that candidate, keeping
+  its last source allowance; subsequent ticks check a fixed set of metadata stamps
+  until they change or the daily retry is due. A missing or indirect `.git` never runs
   Git discovery against an enclosing repository; Git commands have a checkout-parent
   ceiling and cache removal requires the expected top-level checkout. No marker removal is needed after failures.
 
@@ -194,8 +194,9 @@ prepared JSON and never reads GitHub or inspects trees.
 
 Rollout does not reset existing checkouts. On a worker's first preparation, its
 clean local-only commits reuse their completed bundle; any dirty tree is saved
-before the reset, with independent payloads for each changed source snapshot. Historical `recovery-blocked` dispositions are diagnostic only and never
-gate later work starts.
+before the reset, with independent payloads for each changed source snapshot.
+Historical `recovery-blocked` dispositions are diagnostic only and never gate later
+work starts.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
 table). This stops index lookup/publication and background housekeeping, including

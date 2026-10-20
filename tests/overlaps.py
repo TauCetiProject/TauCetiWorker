@@ -650,9 +650,10 @@ class InterfaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ready = Path(tmp) / "ready.json"
             child = (
-                "import json,os,subprocess,sys,time; "
+                "import json,os,subprocess,sys,time; from pathlib import Path; "
                 "tool=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-                f"open({str(ready)!r},'w').write(json.dumps([os.getpid(),tool.pid])); "
+                f"Path({str(ready.with_suffix('.tmp'))!r}).write_text(json.dumps([os.getpid(),tool.pid])); "
+                f"os.replace({str(ready.with_suffix('.tmp'))!r}, {str(ready)!r}); "
                 "time.sleep(30)"
             )
             worker = (
