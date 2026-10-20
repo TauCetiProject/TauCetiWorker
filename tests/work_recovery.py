@@ -78,6 +78,9 @@ def fixture(root: Path):
     subprocess.run(["git", "clone", "-q", str(origin), str(co)], check=True)
     identity(co)
     cfg = SimpleNamespace(wid="w", state=root / "state" / "w", checkout=co, data_home=root / "home")
+    # This fixture's bare repository is canonical: prepare_checkout restores any other origin to
+    # CHECKOUT_URL, which would otherwise send these tests to GitHub.
+    tc.agents.CHECKOUT_URL = str(origin)
     return origin, co, cfg
 
 
@@ -571,6 +574,44 @@ def test_prepare_checkout(root):
         agents.sync_mathlib_pool, agents.CHECKOUT_URL = saved_sync, saved_url
 
 
+def test_prepare_checkout_restores_canonical_origin(root):
+    """A clone re-pointed at a stale fork returns to canonical main, keeping the fork remote."""
+    origin, co, cfg = fixture(root / "fork-origin")
+    fork = root / "fork-origin" / "fork.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(origin), str(fork)], check=True)
+    seed = root / "fork-origin" / "seed"
+    (seed / "C.lean").write_text("theorem c : True := trivial\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-qm", "canonical moves on")
+    git(seed, "push", "-q", str(origin), "main")
+    git(co, "remote", "set-url", "origin", str(fork))
+    agents = tc.agents
+    saved_sync, saved_url = agents.sync_mathlib_pool, agents.CHECKOUT_URL
+    agents.sync_mathlib_pool = lambda cfg: None
+    agents.CHECKOUT_URL = str(origin)
+    try:
+        ok = agents.prepare_checkout(cfg, work="fix")
+        check("non-canonical origin: preparation succeeds", ok)
+        check("origin is canonical again", git(co, "config", "--get", "remote.origin.url").strip() == str(origin))
+        check("the fork is kept", git(co, "config", "--get", "remote.previous-origin.url").strip() == str(fork))
+        check("main is canonical main, not the fork's", (co / "C.lean").exists())
+        check(
+            "a canonical origin is left alone",
+            agents.repair_origin(co) and not agents._remote_url(co, "previous-origin-2"),
+        )
+        check(
+            "GitHub URL spellings compare equal",
+            agents._same_repository(
+                "git@github.com:TauCetiProject/TauCeti.git", "https://github.com/TauCetiProject/TauCeti"
+            )
+            and not agents._same_repository(
+                "git@github.com:kim-em/TauCeti.git", "https://github.com/TauCetiProject/TauCeti"
+            ),
+        )
+    finally:
+        agents.sync_mathlib_pool, agents.CHECKOUT_URL = saved_sync, saved_url
+
+
 def test_work_paths(root):
     """Host roadmap work and progress preparation save leftovers and carry on."""
     origin, co, cfg = fixture(root / "paths")
@@ -666,6 +707,7 @@ def main():
             test_late_write,
             test_push_and_owner,
             test_prepare_checkout,
+            test_prepare_checkout_restores_canonical_origin,
             test_work_paths,
             test_activity,
         ):
