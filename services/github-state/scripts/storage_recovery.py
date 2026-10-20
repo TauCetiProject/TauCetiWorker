@@ -137,6 +137,11 @@ def main():
     parser.add_argument("--environment", choices=["test", "production"], default="test")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
+    retention = commands.add_parser("retention")
+    retention.add_argument("--mode", choices=["dry_run", "enforce"])
+    retention.add_argument("--disable", action="append", default=[])
+    retention.add_argument("--pin", action="append", default=[])
+    retention.add_argument("--archive-ci", action="store_true")
     scan = commands.add_parser("scan")
     scan.add_argument("--table", required=True)
     scan.add_argument("--after", type=int, default=0)
@@ -166,8 +171,17 @@ def main():
     receipting.add_argument("--probe-bytes", type=int, default=0)
     args = parser.parse_args()
     env = args.environment
+    if args.command == "retention" and not args.mode and (args.disable or args.pin or args.archive_ci):
+        parser.error("retention overrides require --mode")
     if args.command == "status":
         result = status(env)
+    elif args.command == "retention":
+        policy = (
+            {"mode": args.mode, "disabled": args.disable, "pinned": args.pin, "archive_ci": args.archive_ci}
+            if args.mode
+            else None
+        )
+        result = call(env, "/admin/storage/retention", {"policy": policy} if policy is not None else {})
     elif args.command == "scan":
         result = call(env, "/admin/storage/scan", {"table": args.table, "after": args.after, "limit": args.limit})
     elif args.command == "export":
