@@ -201,8 +201,8 @@ prepared JSON and never reads GitHub or inspects trees.
 Rollout does not reset existing checkouts. On a worker's first preparation, its
 clean local-only commits reuse their completed bundle; any dirty tree is saved
 before the reset, with independent payloads for each changed source snapshot.
-Historical `recovery-blocked` dispositions are diagnostic only and never gate later
-work starts.
+Finished and unrecoverable recovery records are removed from discovery and deleted by
+bounded activity housekeeping; they are not kept as an operator task history.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
 table). This stops index lookup/publication and background housekeeping, including
@@ -233,8 +233,8 @@ run without model funding. Fleet capacity, original authorization, protected PR
 labels, claims, current-head CAS and exact verification remain mandatory.
 
 There is no operator recovery queue. The worker either publishes safely,
-archives a superseded intent, waits automatically for a dependency or changed
-external facts, or retains a blocked checkpoint and continues normal selection.
+deletes a superseded or unusable checkpoint, or retries automatically after a temporary
+dependency failure while continuing normal selection.
 Final agent output never proves publication or grants permission.
 
 The immutable `tauceti-work-recovery/v1` manifest remains intact. A separate,
@@ -244,12 +244,12 @@ fsynced `recovery.json` consumer journal records these states:
 |---|---|
 | retained | Exact source is available for recovery |
 | eligible | Recovery may run, or awaits a dependency under a scheduled retry |
-| resuming | One claimed invocation owns the isolated checkout |
+| resuming | One claimed invocation or an active handoff owns the saved source |
 | verified | An exact-input verifier succeeded |
 | publication-pending | Commit, expected head, destination and receipt were saved before push |
-| published | Actual remote state confirms the intended commit |
-| obsolete | Closed/superseded work or an unsafe-to-replay publication intent stays archived |
-| blocked | This checkpoint cannot run under current facts or allowances; normal selection continues |
+| published | Actual remote state confirms the intended commit; record queued for deletion |
+| obsolete | Finished/unusable record queued for deletion |
+| blocked | Legacy or transient classification; housekeeping deletes unusable records and migrates timed retries to eligible |
 
 Only runnable recovery reserves its PR on this worker. A dependency wait gets
 a short reservation of at most five minutes; repeated waits never extend it.
@@ -363,9 +363,9 @@ without model funding, with a shared thirty-minute scheduling throttle so a bloc
 backlog cannot continuously replace normal work. Checks observe PR closure or head changes
 through the existing shared state service, without a direct GitHub fallback or
 payload hashing. Infrastructure retries back off for
-60, 300 and 1800 seconds. Three failed invocations for unchanged facts block that
-checkpoint; a scheduled mechanical recheck after the backoff or changed
-external facts automatically restores eligibility, even without model funding.
+60, 300 and 1800 seconds. Failed invocations remain eligible for scheduled mechanical
+rechecks, even without model funding. They never become a permanent blocked task and
+do not evict their warm artifacts on an infrastructure pause.
 Cumulative failure counts
 remain recorded; unchanged repeated infrastructure failures increase backoff
 up to six hours. Repeated exact-input verification failures also increase their
@@ -381,11 +381,11 @@ file is read or required.
 
 Missing original authorization, unsupported destinations/providers, unsupported
 sandbox recovery and v1 native Git operations whose metadata was not retained
-cannot acquire inferred replay authority. Their exact source remains blocked as
-evidence while fresh normal work continues under current policy. This is a
-machine disposition, not a request for operator action. Source, Git history,
-immutable records and outboxes are preserved; rebuildable caches are queued for bounded housekeeping from terminal and blocked
-checkouts. Recovery integration clones use the same discoverable restoration layout.
+cannot acquire inferred replay authority. Their unusable recovery records are discarded
+while fresh normal work continues under current policy. Finished source, bundles and
+derived checkouts are removed with the existing bounded deletion machinery; live
+checkouts and visible mounts remain protected. GitHub outboxes retain their separate
+publication reconciliation. Recovery integration clones use the same discoverable restoration layout.
 A live or uncertain cleanup candidate is skipped without blocking recovery.
 Eligible recovery retains its working dependency cache across ordinary waits;
 reintegration alone does not enqueue eviction of the live recovery checkout.

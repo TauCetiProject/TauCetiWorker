@@ -582,7 +582,7 @@ class Fixture(unittest.TestCase):
         self.values["fix-10-head"] = 3
         FakeVerification.failures = 1
         self.assertFalse(self.run_recovery())
-        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(self.journal()["state"], "eligible")
         self.assertEqual(self.journal()["reason"]["next_action"], "continue-normal-selection")
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.assertEqual(self.values["fix-10-head"], 3)
@@ -830,7 +830,7 @@ class Fixture(unittest.TestCase):
                 self.assertFalse(self.run_recovery())
                 self.assertEqual(self.journal()["attempts"], n)
                 self.retry_now()
-            self.assertEqual(self.journal()["state"], "blocked")
+            self.assertEqual(self.journal()["state"], "eligible")
             self.assertFalse(self.run_recovery())
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.advance_writer()
@@ -940,7 +940,7 @@ class Fixture(unittest.TestCase):
             for _ in range(3):
                 self.assertFalse(self.run_recovery())
                 self.retry_now()
-        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(self.journal()["state"], "eligible")
         self.assertTrue(self.run_recovery())
         self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
 
@@ -1187,7 +1187,7 @@ class Fixture(unittest.TestCase):
                 self.retry_now() if self.journal() else None
                 self.assertFalse(self.run_recovery())
                 self.assertEqual(self.journal()["attempts"], count)
-        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(self.journal()["state"], "eligible")
 
     def test_no_model_cache_outage_preserves_content_allowance(self):
         from tauceti_worker.agents import BuildCacheUnavailable
@@ -1297,7 +1297,9 @@ class Fixture(unittest.TestCase):
         )
         saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
         summary = saved.summary(self.cfg.state.parent, workers={"w"})
-        self.assertIn("next action: continue-normal-selection", summary["reasons"][0])
+        self.assertEqual(summary["reasons"], [])
+        self.assertEqual(summary["recovery_blocked"], 0)
+        self.assertFalse(self.record.exists())
 
     def test_valid_original_conversation_uses_fresh_checkout_without_rebinding(self):
         FakeVerification.failures = 1
@@ -1625,7 +1627,7 @@ class Fixture(unittest.TestCase):
         text, handoffs = self.handoff()
         self.assertIn(str(self.record / "manifest.json"), text)
         self.assertNotIn(str(self.record / "checkout"), text)
-        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(self.journal()["state"], "resuming")
         self.assertTrue(rr.due(self.cfg, only=["fix"]))
         self.assertFalse(self.run_recovery())
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
@@ -1991,8 +1993,7 @@ class Fixture(unittest.TestCase):
         ):
             saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
         self.assertFalse((archived / ".lake").exists())
-        self.assertTrue((archived / "A.lean").is_file())
-        self.assertEqual(saved._complete(self.record), self.manifest)
+        self.assertFalse(self.record.exists())  # completed source is deleted, not retained as history
 
     def test_reintegration_wait_keeps_working_dependency_cache(self):
         self.rewritten_checkpoint(conflicting=True)
@@ -2347,8 +2348,8 @@ class Fixture(unittest.TestCase):
         ):
             saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
         rr.reconcile_handoff(self.cfg, self.record, self.journal())
-        self.assertEqual(self.journal()["handoff"]["state"], "published")
-        self.assertEqual(self.journal()["handoff"]["published_head"], published)
+        saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
+        self.assertFalse(self.record.exists())  # the published handoff has no remaining task
         self.assertEqual(git(self.remote, "rev-parse", "main"), published)
 
     def test_retained_checkout_uncertain_intent_is_not_erased_by_clean_replacement(self):
@@ -2578,7 +2579,7 @@ fi
             self.assertEqual(self.journal()["attempts"], count)
             self.assertNotIn("publication", self.journal())
             self.retry_now()
-        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(self.journal()["state"], "eligible")
         self.assertIn("server policy rejected", self.journal()["reason"]["detail"])
         self.assertEqual(self.values.get("fix-10-head", 0), 0)
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
@@ -2866,7 +2867,7 @@ fi
                 self.assertFalse(self.run_recovery())
                 self.retry_now()
         self.assertEqual(self.journal()["infrastructure_failures"], 3)
-        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(self.journal()["state"], "eligible")
         self.assertNotIn("publication", self.journal())
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
