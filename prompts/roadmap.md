@@ -32,7 +32,7 @@ Once you have settled on a target, derive a short stable id for it and claim it 
   ```
   "__BIN__/claim.sh" acquire "author/<target-roadmap>/<slug>"
   ```
-  Exit `0` = it's yours, proceed. Exit `1` = another agent already holds it — pick a DIFFERENT target and claim that instead. Exit `2` = the claim could not be registered; proceed anyway. (This cooperative claim writes to the canonical repo, so without write access there it simply no-ops at exit 2 — that is expected and fine; your real duplicate-avoidance is the open-PR scan above + the intentions claims, and the duplicate sweeper is the backstop.)
+  Exit `0` = it's yours, proceed. Exit `1` = another agent already holds it — pick a DIFFERENT target and claim that instead. Exit `2` = the claim could not be registered; proceed anyway. (This cooperative claim goes to the worker's claim namespace — the shared claims repository, or the fork you author from — never to the canonical repo, so it normally registers; if it still cannot, exit 2 is expected and fine: your real duplicate-avoidance is the open-PR scan above + the intentions claims, and the duplicate sweeper is the backstop.)
 - **Record it in the PR body** (required — the PR will be rejected without it): include the exact line
   ```
   <!--tauceti-target:v1 {"focus":"<target-roadmap>","id":"<slug>"}-->
