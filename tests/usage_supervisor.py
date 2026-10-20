@@ -325,6 +325,16 @@ class SupervisorTests(unittest.TestCase):
             tick(self.budget)
         self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
 
+    def test_missing_sidecar_does_not_bypass_live_guards_in_budget_entrypoints(self):
+        self.launch()
+        self.response()
+        self.journal.flush(closed=True)
+        lifecycle_path(self.root, self.id).unlink()
+        self.assertIsNone(self.budget.recover_usage(self.id, allow_live_owner=True))
+        with self.assertRaisesRegex(BudgetError, "live native"):
+            self.budget.settle_receipt(dict(id=self.id, totals={"provider": "3"}, outcome="exit:0"))
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+
     def test_lost_sidecar_before_first_recovery_charges_usage_instead_of_zero(self):
         native = self.launch()
         self.response()
@@ -423,6 +433,16 @@ class SupervisorTests(unittest.TestCase):
             self.bridge / "inbox" / (self.id + ".terminal"),
             dict(id=self.id, native=native, kind="successful-exit", returncode=0),
         )
+        durable(
+            self.bridge / "inbox" / (self.id + ".receipt"), dict(id=self.id, totals={"provider": "3"}, outcome="exit:0")
+        )
+        tick(self.budget)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 3)
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_late_vm_authoritative_receipt_survives_missing_terminal_file(self):
+        self.remote_launch()
+        self.response()
         durable(
             self.bridge / "inbox" / (self.id + ".receipt"), dict(id=self.id, totals={"provider": "3"}, outcome="exit:0")
         )

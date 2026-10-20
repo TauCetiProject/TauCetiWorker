@@ -669,7 +669,7 @@ class Budget:
             if not session:
                 raise BudgetError("receipt has no recorded admission")
             from .usage_lifecycle import alive
-            from .usage_supervisor import external_exit_proved, read_lifecycle
+            from .usage_supervisor import external_exit_proved, invocation_lifecycle
 
             if receipt.get("outcome") == "launch-failed" and totals and all(money(v) == 0 for v in totals.values()):
                 from .usage_accounting import session_usage
@@ -678,7 +678,7 @@ class Budget:
                 if money(session.get("cost", "0")) > 0 or (journal and journal["messages"]):
                     raise BudgetError("no-inference receipt contradicts durable usage; reserve retained")
 
-            lifecycle = read_lifecycle(self.directory, receipt["id"])
+            lifecycle = invocation_lifecycle(self.directory, session)
             if (
                 totals is not None
                 and lifecycle
@@ -878,14 +878,14 @@ class Budget:
         A late native receipt reverses the estimated prefix before settlement.
         """
         from .budget_usage import evidence
-        from .usage_supervisor import invocation_alive, read_lifecycle
+        from .usage_supervisor import invocation_alive, invocation_lifecycle
 
         def live(session):
             # Legacy finish may bypass its bridge owner; a registered native
             # invocation must always be stopped, even during bridge cleanup.
             return (
                 invocation_alive(self.directory, session)
-                if read_lifecycle(self.directory, invocation)
+                if invocation_lifecycle(self.directory, session)
                 else (not allow_live_owner and bridge_owner_alive(session.get("owner")))
             )
 

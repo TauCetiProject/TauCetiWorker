@@ -35,8 +35,26 @@ def read_lifecycle(directory, invocation):
         return None
 
 
+def invocation_lifecycle(directory, session):
+    value = read_lifecycle(directory, session["id"]) or session.get("lifecycle")
+    if value and value["phase"] == "admitted":
+        try:
+            permit = safe_message(Path(value["bridge"]) / "outbox" / (value["id"] + ".permit"))
+            if permit.get("id") != value["id"]:
+                raise ValueError("native permit invocation mismatch")
+            value = {
+                **value,
+                "phase": "permitted",
+                "native": permit.get("native", {"unsupported": True}),
+                "gate": permit["gate"],
+            }
+        except FileNotFoundError:
+            pass
+    return value
+
+
 def invocation_alive(directory, session, *, legacy_owner=True):
-    value = read_lifecycle(directory, session["id"])
+    value = invocation_lifecycle(directory, session)
     if value is None:
         return legacy_owner and bridge_owner_alive(session.get("owner"))
     if value.get("external"):
@@ -58,6 +76,21 @@ def external_exit_proved(value):
                 return True
         except FileNotFoundError:
             pass
+    try:
+        receipt = safe_message(bridge / "inbox" / (invocation + ".receipt"))
+        totals = receipt.get("totals")
+        if (
+            receipt.get("id") == invocation
+            and receipt.get("outcome") == "exit:0"
+            and not receipt.get("provisional")
+            and isinstance(totals, dict)
+            and totals
+        ):
+            from .budget import money
+
+            return all(isinstance(k, str) and isinstance(v, str) and money(v) >= 0 for k, v in totals.items())
+    except FileNotFoundError:
+        pass
     return False
 
 
