@@ -290,3 +290,17 @@ class GitHubUnavailable(NoProgress):
     def __init__(self, message: str, *, retry_at: float | None = None):
         super().__init__(message)
         self.retry_at = retry_at
+
+
+class SharedStateUnavailable(GitHubUnavailable):
+    """A shared-state dependency cannot establish current evidence; wait for it, never treat it as no work.
+
+    `failure` is github_state.last_failure(): dependency, reason, sanitized detail, retry time and the
+    provenance of any retained complete response. It never contains credentials.
+    """
+
+    def __init__(self, message: str, failure: dict):
+        super().__init__(message, retry_at=failure.get("retry_at"))
+        self.failure = failure
+        self.dependency = failure.get("dependency", "github-state")
+        self.reason = failure.get("reason", "transport")
