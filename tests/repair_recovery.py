@@ -331,6 +331,7 @@ class Fixture(unittest.TestCase):
         with patch("tauceti_worker.github_outbox.pending_for", return_value=True):
             self.assertFalse(self.run_recovery())
             self.assertFalse(self.run_recovery())
+        self.retry_now()
         self.assertTrue(self.run_recovery())
         self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
 
@@ -375,6 +376,7 @@ class Fixture(unittest.TestCase):
         with patch.object(rr, "conversation_identity", return_value="credential-1"):
             self.assertEqual(rr.valid_conversation(value, self.profile, "alice"), "session-12345")
             self.assertIsNone(rr.valid_conversation(value, self.profile, "bob"))
+            self.assertIsNone(rr.valid_conversation(value, self.profile, "alice", scope=dict(pr=11)))
             wrong = copy.deepcopy(value)
             wrong["profile"]["model"] = "other"
             self.assertIsNone(rr.valid_conversation(wrong, self.profile, "alice"))
@@ -469,6 +471,31 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "corrupt-checkpoint")
         self.assertFalse((self.record / "checkout").exists())
+
+
+class RealVerifierIntegration(unittest.TestCase):
+    def test_real_receipt_reuse_and_final_input_check(self):
+        from verification import Receipts
+
+        case = Receipts()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        (case.root / "TauCeti/A.lean").write_text("retained verified repair\n")
+        cfg = SimpleNamespace(state=case.state, logdir=case.home / "logs")
+        w = SimpleNamespace(cfg=cfg, rc=SimpleNamespace(deadline=__import__("time").time() + 60))
+        backend = rr.WorkerBackend(w, SimpleNamespace())
+        facts = dict(labels=[], ref="repair", head=case.base, repository="alice/repo")
+        manifest = dict(id="real-receipt", authorization={})
+        with patch("tauceti_worker.agents.warm_host_build_caches") as warm:
+            first = backend.verify(case.root, manifest, facts)
+            self.assertEqual(first["status"], "success", first.get("error"))
+            second = backend.verify(case.root, manifest, facts)
+            self.assertEqual(second["status"], "success", second.get("error"))
+            self.assertTrue(all("reused_from" in p for p in second["phases"].values()))
+            warm.assert_called()
+            publication = backend.prepare(case.root, manifest, facts, second)
+        self.assertEqual(publication["oid"], git(case.root, "rev-parse", "HEAD"))
+        self.assertTrue(Path(publication["receipt"]).is_file())
 
 
 if __name__ == "__main__":

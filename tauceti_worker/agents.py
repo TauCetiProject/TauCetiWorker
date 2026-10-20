@@ -812,6 +812,7 @@ def run_agent_host(
     resume=None,
     session_path=None,
     session_actor=None,
+    session_scope=None,
 ) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
@@ -857,6 +858,7 @@ def run_agent_host(
                 profile=asdict(profile),
                 actor=session_actor,
                 identity=conversation_identity(profile.provider),
+                scope=session_scope,
                 session=resume,
             ),
         )

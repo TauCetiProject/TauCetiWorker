@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 from . import work_recovery as saved
 from .config import log
+from .constants import BASE_BRANCH
 from .runtime_status import atomic_json, read_json, report_runtime
 
 STATES = {"retained", "eligible", "resuming", "verified", "publication-pending", "published", "obsolete", "blocked"}
@@ -141,7 +142,7 @@ class Recovery:
             )
             return False
         operator = read_json(self.record / "operator.json")
-        if j.get("retry_at", 0) > time.time() and not j.get("publication") and j.get("operator", {}) == operator:
+        if j.get("retry_at", 0) > time.time() and j.get("operator", {}) == operator:
             return False
         charged = False
         try:
@@ -158,7 +159,9 @@ class Recovery:
                     )
                     return True
                 if outcome == "ambiguous":
-                    raise Wait("publication-uncertain", "Remote publication or GitHub outbox cannot yet be reconciled")
+                    raise RuntimeError(
+                        "Remote publication is confirmed but GitHub outbox reconciliation remains uncertain"
+                    )
             b.policy(m, facts)
             external = fingerprint(
                 dict(checkpoint=m["fingerprint"], facts=facts, operator=read_json(self.record / "operator.json"))
@@ -236,7 +239,7 @@ class Recovery:
             )
             return False
         except Exception as error:
-            attempts = j.get("attempts", 0) + int(not charged)
+            attempts = min(3, j.get("attempts", 0) + int(not charged))
             failure = dict(
                 code="invocation-failed",
                 detail=f"{type(error).__name__}: {error}",
@@ -266,6 +269,17 @@ class WorkerBackend:
     def __init__(self, w, opts):
         self.w, self.opts = w, opts
         self.owned = False
+        self.previous_environment = {
+            key: os.environ.get(key)
+            for key in (
+                "TAUCETI_PUSH_REF",
+                "TAUCETI_PUSH_EXPECT",
+                "TAUCETI_PUSH_REMOTE",
+                "TAUCETI_CLAIM_SH",
+                "TAUCETI_CLAIM_KEY",
+                "TAUCETI_CLAIM_REPO",
+            )
+        }
 
     def facts(self, m):
         from .github_transport import read_context
@@ -326,10 +340,10 @@ class WorkerBackend:
                 "Current PR is draft or has a protected hold label",
                 "Wait for the PR author/operator to remove the hold",
             )
-        if facts["base"] != "main":
+        if facts["base"] != BASE_BRANCH:
             raise Block(
                 "base-policy",
-                "PR no longer targets canonical main",
+                f"PR no longer targets canonical {BASE_BRANCH}",
                 "Restore original base authorization before recovery",
             )
         auth = m.get("authorization") or {}
@@ -401,10 +415,17 @@ class WorkerBackend:
             raise Wait("claim-unavailable", "An exact branch claim is required; claim busy or acquisition failed")
 
     def release(self):
-        if self.owned:
-            self.w.claims.stop_heartbeat()
-            self.w.claims.release()
-            self.owned = False
+        try:
+            if self.owned:
+                self.w.claims.stop_heartbeat()
+                self.w.claims.release()
+                self.owned = False
+        finally:
+            for key, value in self.previous_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def claim_lost(self):
         return self.w.claims.lost.is_set() or not self.owned
@@ -438,7 +459,11 @@ class WorkerBackend:
         )
         saved._git(temp, "remote", "set-url", "origin", url)
         saved._git(
-            temp, "fetch", "origin", f"pull/{m['pr']}/head:refs/remotes/recovery/pr", "main:refs/remotes/origin/main"
+            temp,
+            "fetch",
+            "origin",
+            f"pull/{m['pr']}/head:refs/remotes/recovery/pr",
+            f"{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}",
         )
         saved.restore(record, temp)
         if checkout.exists():
@@ -484,8 +509,10 @@ class WorkerBackend:
     def verification_environment(self, checkout):
         if not any((checkout / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
             return {}
-        from .constants import TAUCETI_CACHE_ARTIFACT_URL, TAUCETI_CACHE_REVISION_URL, TAUCETI_CACHE_SERVICE
+        from .agents import TAUCETI_CACHE_ARTIFACT_URL, TAUCETI_CACHE_REVISION_URL, TAUCETI_CACHE_SERVICE
 
+        if not TAUCETI_CACHE_SERVICE:
+            return {}
         config = checkout.parent / "verification-lake.toml"
         if not config.exists():
             saved._write(
@@ -513,11 +540,12 @@ class WorkerBackend:
         with environment(**self.verification_environment(checkout)):
             # Restore ordinary dependency/artifact prerequisites before fingerprinting;
             # an empty isolated clone must not compile missing Mathlib from scratch.
-            warm_host_build_caches(checkout, dict(os.environ), self.w.cfg.logdir)
+            if any((checkout / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+                warm_host_build_caches(checkout, dict(os.environ), self.w.cfg.logdir)
             result = Verification(
                 checkout,
                 self.w.cfg.state,
-                base=saved._rev(checkout, "origin/main"),
+                base=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
                 policy=policy,
                 deadline=self.w.rc.deadline,
             ).run()
@@ -538,6 +566,12 @@ class WorkerBackend:
                 "continuation-permissions",
                 "Original or current round requires sandboxed execution",
                 "Resume with the original sandbox workflow; host recovery may only publish mechanically",
+            )
+        if auth.get("billing", "subscription") != ("api" if api_mode() else "subscription"):
+            raise Block(
+                "billing-policy",
+                "Current billing mode differs from the original round authorization",
+                "Use the original billing mode or explicitly reauthorize this checkpoint",
             )
         raw = auth.get("profile")
         if not raw:
@@ -604,7 +638,8 @@ class WorkerBackend:
                 "Resolve its existing retry policy before another model invocation",
             )
         session = read_json(record / "continuation-session.json") or m.get("conversation")
-        resume = valid_conversation(session, profile, auth.get("actor"))
+        scope = dict(repository=m["repository"], pr=m["pr"], source_round=m.get("source_round"))
+        resume = valid_conversation(session, profile, auth.get("actor"), scope=scope)
         prompt = (
             f"Recover only checkpoint {record.name} for {m['repository']} PR #{m['pr']}. "
             f"Reason: {why}. Original expected head: {m.get('expected_remote_head')}; current head: {facts['head']}. "
@@ -619,7 +654,7 @@ class WorkerBackend:
         with environment(
             TAUCETI_RECOVERY_CONTINUATION="1",
             TAUCETI_GITHUB_PR=m["pr"],
-            TAUCETI_VERIFY_BASE=saved._rev(checkout, "origin/main"),
+            TAUCETI_VERIFY_BASE=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
         ):
             try:
                 with api_context(
@@ -650,6 +685,7 @@ class WorkerBackend:
                         resume=resume,
                         session_path=record / "continuation-session.json",
                         session_actor=auth.get("actor"),
+                        session_scope=scope,
                     )
                     if api and api.blocked_reason:
                         for key in keys:
@@ -685,13 +721,13 @@ class WorkerBackend:
         verifier = Verification(
             checkout,
             self.w.cfg.state,
-            base=saved._rev(checkout, "origin/main"),
+            base=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
             policy=scope_policy(
                 facts["labels"], facts["ref"], bump=m.get("authorization", {}).get("automatic_bump", False)
             ),
             deadline=self.w.rc.deadline,
         )
-        verifier.base = saved._rev(checkout, "origin/main")
+        verifier.base = saved._rev(checkout, f"origin/{BASE_BRANCH}")
         with environment(**self.verification_environment(checkout)):
             if digest(verifier.inputs()) != receipt.get("fingerprint"):
                 raise RuntimeError("Exact verification inputs changed before publication")
@@ -773,11 +809,12 @@ class WorkerBackend:
         return "unpublished"
 
 
-def valid_conversation(value, profile, actor):
+def valid_conversation(value, profile, actor, *, scope=None):
     if not isinstance(value, dict):
         return None
     if (
         not value.get("identity")
+        or (scope is not None and value.get("scope") != scope)
         or value.get("profile") != asdict(profile)
         or value.get("actor") != actor
         or value.get("identity") != conversation_identity(profile.provider)
@@ -792,10 +829,22 @@ def conversation_identity(provider):
     from .quota import claude_dir, codex_dir
 
     root = codex_dir(Path.home()) if provider == "codex" else claude_dir(Path.home())
-    path = root / ("auth.json" if provider == "codex" else ".credentials.json")
+    mode = "api" if provider == "claude" and os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else "subscription"
+    if mode == "api":
+        selected = os.environ.get("TAUCETI_ANTHROPIC_KEY_FILE")
+        if not selected:
+            return None
+        path = Path(selected)
+    else:
+        path = root / ("auth.json" if provider == "codex" else ".credentials.json")
     try:
         return fingerprint(
-            dict(provider=provider, home=str(root), credential=hashlib.sha256(path.read_bytes()).hexdigest())
+            dict(
+                provider=provider,
+                billing=mode,
+                home=str(root),
+                credential=hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
         )
     except OSError:
         return None

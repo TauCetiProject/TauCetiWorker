@@ -1675,6 +1675,11 @@ def _do_fixlike(
             )
             return 1
         co = w.cfg.checkout
+        from .activity import current_round_id
+
+        conversation_round = current_round_id()
+        conversation_path = w.cfg.state / "provider-conversations" / f"{conversation_round or time.time_ns()}.json"
+        conversation_scope = dict(repository=TAUCETI, pr=pr, source_round=conversation_round)
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
         chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
@@ -1715,13 +1720,14 @@ def _do_fixlike(
                     foreign=bool(foreign),
                     automatic_bump=getattr(p, "automatic_bump", False),
                     profile=asdict(_effective_authoring_profile(opts)),
+                    billing="api" if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else "subscription",
                     account=getattr(opts, "account", None),
                     sandbox_host=getattr(opts, "sandbox_host", True),
                     charged=list(charged),
                     budget=getattr(c, "budget", 0) or 3,
                     roadmap=getattr(sv, "roadmap_only", None),
                 ),
-                conversation_path=str(w.cfg.state / "provider-conversation.json"),
+                conversation_path=str(conversation_path),
             )
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
         try:
@@ -1731,8 +1737,9 @@ def _do_fixlike(
                 _effective_authoring_profile(opts),
                 w.cfg.logdir,
                 cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
-                session_path=w.cfg.state / "provider-conversation.json",
+                session_path=conversation_path,
                 session_actor=getattr(sv, "me_login", ""),
+                session_scope=conversation_scope,
             )
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
