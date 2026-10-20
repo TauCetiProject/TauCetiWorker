@@ -29,8 +29,8 @@ from pathlib import Path
 
 from .config import Die
 from .constants import LEAN_ROOT
-from .containment import Boundary
 from .paths import HERE
+from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
@@ -278,23 +278,21 @@ class Verification:
         self.receipt["commands"].append(entry)
         self.save()
         self.progress(f"{phase}: start {json.dumps(argv)} (log {log})")
-        boundary = Boundary(f"verify-{phase}", env=env)
-        entry["containment"] = dict(mode=boundary.mode, strong=boundary.strong, reason=boundary.reason)
         process = None
+        command_stack = contextlib.ExitStack()
         stdout_path = log.with_suffix(".stdout")
         offset = 0
         try:
             with log.open("wb") as output, stdout_path.open("wb") as captured:
-                process = subprocess.Popen(
-                    boundary.argv(argv),
-                    cwd=self.root,
-                    env=env,
-                    stdout=captured if capture else output,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    pass_fds=boundary.pass_fds,
+                process = command_stack.enter_context(
+                    owned_process(
+                        argv,
+                        cwd=self.root,
+                        env=env,
+                        stdout=captured if capture else output,
+                        stderr=subprocess.STDOUT,
+                    )
                 )
-                boundary.launched()
                 while process.poll() is None:
                     if not capture:
                         with log.open("rb") as progress:
@@ -310,16 +308,10 @@ class Verification:
                 entry["exit"] = process.returncode
         finally:
             try:
-                if process is not None and process.poll() is None:
-                    boundary.abort()
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                command_stack.close()
+                if process is not None:
+                    entry["cleanup"] = "process-group-best-effort"
                     entry["exit"] = process.returncode
-                entry["cleanup"] = boundary.finish(
-                    process.returncode if process is not None else None,
-                    pgid=process.pid if process is not None else None,
-                )
             finally:
                 entry["ended_at"] = time.time()
                 self.save()

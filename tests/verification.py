@@ -15,6 +15,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from process_cleanup import running
+
 from tauceti_worker.verification import (
     Verification,
     atomic,
@@ -125,7 +127,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_ACTIVITY_DIR=str(self.home / "activity"),
             TAUCETI_FLEET_EVENTS=str(self.home / "worker-events.jsonl"),
             TAUCETI_VERIFY_HELPER="1",
-            TAUCETI_PROCESS_CONTAINMENT="legacy",
+            TAUCETI_PROCESS_CONTAINMENT="invalid-old-policy",
             TAUCETI_VERIFY_STATE=str(self.state),
             TAUCETI_VERIFY_CACHE_DIR=str(self.home / "cache"),
             TAUCETI_VERIFY_BASE=self.base,
@@ -274,8 +276,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             owned_tool = int((self.root / ".lake/tool.pid").read_text())
             p.kill()
             p.communicate(timeout=10)
-            # This fixture uses process-group fallback; SIGKILL cannot run Python cleanup.
-            os.kill(owned_tool, signal.SIGKILL)
+            limit = time.monotonic() + 5
+            while running(owned_tool) and time.monotonic() < limit:
+                time.sleep(0.02)
+            self.assertFalse(running(owned_tool), "verification tool survived its owner")
             receipt = json.loads(next(self.state.glob("verification/*/receipt.json")).read_text())
             self.assertEqual(receipt["status"], "incomplete")
             self.assertEqual(len(list((self.state / "verification-pending").glob("*.json"))), 1)
@@ -378,21 +382,18 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.verify(stage="shim-expiry", base=base)
         self.assertNotIn("--only-new", json.loads((self.root / ".lake/shim-args").read_text()))
 
-    def test_strong_containment_when_available(self):
-        from tauceti_worker.containment import capability
-
-        with patch.dict(os.environ, TAUCETI_PROCESS_CONTAINMENT="auto"):
-            if not capability().strong:
-                self.skipTest("rootless namespace unavailable")
-            result = self.verify(stage="build")
+    def test_old_cleanup_markers_do_not_block_verification(self):
+        markers = self.home / "activity/containment-unconfirmed"
+        markers.mkdir(parents=True)
+        (markers / "malformed.json").write_text("{broken")
+        (markers / "stale.json").write_text('{"pid_namespace": 42, "boundary": "old"}')
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "quiescence.json").write_text("not json")
+        result = self.verify(stage="build")
         self.assertEqual(result["status"], "success", result.get("error"))
-        self.assertTrue(all(c["containment"]["strong"] for c in result["commands"]))
-
-    def test_refused_containment_leaves_json_incomplete(self):
-        p = self.spawn(TAUCETI_PROCESS_CONTAINMENT="invalid")
-        output, _ = p.communicate(timeout=10)
-        self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(json.loads(output)["status"], "incomplete")
+        self.assertTrue(all("containment" not in command for command in result["commands"]))
+        self.assertEqual((markers / "malformed.json").read_text(), "{broken")
+        self.assertEqual((self.state / "quiescence.json").read_text(), "not json")
 
     def test_explicit_lint_modules_are_bound_inputs(self):
         modules = write(self.home, "lint-modules.txt", "TauCeti.B\n")

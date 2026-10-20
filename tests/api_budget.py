@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -830,14 +831,15 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
 
     def test_native_exec_gate_inside_real_pid_namespace(self):
-        from tauceti_worker.containment import command, probe
-
-        supported, reason = probe()
-        if not supported:
-            self.skipTest(reason)
+        # A copied shim may run in another PID namespace (a sandbox the operator chose); its PIDs
+        # are namespace-local and must never be mistaken for host PIDs.
+        namespace = ["bwrap", "--die-with-parent", "--unshare-pid", "--bind", "/", "/"]
+        namespace += ["--dev-bind", "/dev", "/dev", "--proc", "/proc", "--"]
+        if not shutil.which("bwrap") or subprocess.run([*namespace, "true"], capture_output=True).returncode:
+            self.skipTest("rootless bwrap PID namespace unavailable")
         with ClaudeAPIContext("worker1", "fix") as context:
             result = subprocess.run(
-                command()
+                namespace
                 + [str(context.bin / "claude"), "-p", "fixture", "--model", "opus", "--output-format", "stream-json"],
                 capture_output=True,
                 text=True,

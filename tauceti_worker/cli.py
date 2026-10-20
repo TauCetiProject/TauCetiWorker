@@ -1542,10 +1542,8 @@ def cmd_host_doctor(args) -> int:
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
-    from . import containment, shared_mathlib
+    from . import shared_mathlib
 
-    contained, contained_note = containment.doctor_row()
-    rows.append(("containment", contained, contained_note))
     shared_ok, shared_note = shared_mathlib.capability()
     rows.append(("shared Mathlib", shared_ok, shared_note + "; TAUCETI_SHARED_MATHLIB_BUILDS=auto|off|required"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))

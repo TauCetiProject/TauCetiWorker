@@ -7,6 +7,33 @@ unfinished merge/rebase, the worker first writes a recovery record. The same
 guard protects the writable roadmap clone used by progress reports, which runs
 on the host even for sandboxed workers.
 
+## Containment removal (#364)
+
+Host agents, verification and retained repair use ordinary owned process groups with TERM/KILL
+cleanup and existing timeouts. Deliberately detached descendants may survive that best-effort
+cleanup. The removed round containment policy, global uncertainty markers and `quiescence.json`
+are ignored automatically, even when stale or malformed. Leave historical files and optional
+receipt fields in place: no marker deletion, confirmation, manual resume or transcript inspection
+is needed to retire them. Source records, recovery journals, publication outboxes, paid counters
+and usage history keep their existing formats and integrity checks.
+
+Uncertain destructive-cleanup candidates remain saved or moved aside while unrelated work
+continues. No new history scan, GitHub poller, namespace watchdog or cleanup-proof gate is added.
+Explicit Bubble sandboxes, claims, budget/fleet admission, verifier continuations and installation
+publication locks retain their own existing controls. Shared Mathlib rollout remains off.
+
+[Issue #364](https://github.com/TauCetiProject/TauCetiWorker/issues/364) establishes the baseline for
+reduced #338/PR #354 (fast preservation lookup and bounded cleanup), #311/PR #357 (storage
+reclamation and rotation), and #310/PR #361 (autonomous recovery). Those changes rebase onto this
+removal and target the upstream default branch, without namespace/proof requirements or historical
+cwd rebinding. #335/#337 are not planned; PR #352 is closed unmerged. PR #362 is independent.
+
+Local fixture evidence covers stale/malformed markers, unavailable PID namespaces, fresh recovery
+checkouts, crash boundaries, original allowances, cancellation, timeouts and accounting supervision.
+Implementation and fixture results do not establish deployment or naturally observed recovery.
+The existing rollout owner alone deploys at idle boundaries. This change authorizes no production
+round termination, capacity/grant increase, synthetic paid work or additional observer.
+
 ## Record format
 
 Records live at `state/<worker>/recovery/<round-id>/`, named for the round that
@@ -123,8 +150,9 @@ are refreshed as throwaway snapshots; nothing written there can be published.
 At a new host round boundary, the worker preserves the previous checkout and
 runs a bounded recovery phase before choosing unrelated work or selecting a
 model. Loop drivers can start a recovery-only child while model funding/quota
-is unavailable. Fleet capacity admission still applies. Recovery requires strong
-PID containment and no unconfirmed cleanup. It never restarts a live session.
+is unavailable. Fleet capacity admission still applies. Recovery uses an independent real checkout
+and skips a checkout with observed local users (Linux `/proc`; unavailable on other hosts). Rootless PID namespaces, global cleanup markers
+and quiescence proofs are not prerequisites.
 
 The immutable `tauceti-work-recovery/v1` manifest and payloads remain intact.
 New PR repair owners also record the original GitHub actor, PR author, destination
@@ -174,20 +202,19 @@ integration that needs source reasoning. Unfinished native merge/rebase operatio
 whose metadata v1 did not retain are blocked until their parents/metadata are
 explicitly reconstructed; they never become an accidental single-parent replay. It receives a narrow checkpoint-only
 prompt and the original profile/permissions, plus fresh subscription admission that honors pacing even when a normal loop child
-received an internal quota override, or fresh API budget admission. A matching durable provider conversation is preferred;
+received an internal quota override, or fresh API budget admission. A matching durable provider conversation created in this actual recovery checkout is preferred;
 a missing or mismatched stable account identity/profile or absent local session
 artifact starts a narrow new conversation. OAuth refresh preserves account
 identity when its stable account ID is bound to the credential document; separate
 cached CLI profiles do not establish that binding, so unknown accounts use a
-narrow new conversation. During a resume, the original cwd is bound to the isolated checkout in
-the same containing namespace so historical absolute paths cannot edit the live
-worker checkout. The GitHub proxy, safe-push helper and pre-push hook reject
+narrow new conversation. Conversations from historical working directories also start narrowly
+in the fresh checkout, without binding or modifying the historical path. The GitHub proxy, safe-push helper and pre-push hook reject
 continuation publication; its origin is fetch-only and GitHub token environment
 variables are removed. The supervisor verifies the resulting source before
 publication and checks committed blob bytes, paths and executable bits against
 the verified inventory. Recovery commits disable hooks. Changed
 source is retained using the same checkpoint format, including new files left by
-an interrupted continuation once containment confirms quiescence. Content repair allowances
+an interrupted continuation once no local checkout users are observed. Content repair allowances
 remain separate from infrastructure retries; known failures before model launch
 refund content allowances. Publication includes only tracked changes and declared
 untracked source covered by the verifier. Ignored drafts outside that inventory,

@@ -45,6 +45,19 @@ class ActivityTests(unittest.TestCase):
         with patch.object(a.time, "time", return_value=self.now - age):
             a.emit("round_finished", key=rid, round_id=rid, round_type=kind, outcome=outcome)
 
+    def test_upgrade_preserves_usage_history_and_ignores_old_containment_projection(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("CREATE TABLE containment(boundary TEXT PRIMARY KEY, cleanup TEXT)")
+            db.execute("INSERT INTO containment VALUES ('historical', 'namespace-unconfirmed')")
+            db.execute("INSERT INTO conversation_costs VALUES ('paid', 'worker', 'machine', 1, 2, '17.25')")
+        a.emit("containment_result", boundary="old", cleanup="namespace-unconfirmed")
+        with contextlib.closing(a._connect()) as db, db:
+            a._consume(db, [])
+            self.assertEqual(
+                tuple(db.execute("SELECT * FROM containment").fetchone()), ("historical", "namespace-unconfirmed")
+            )
+            self.assertEqual(db.execute("SELECT cost FROM conversation_costs WHERE id='paid'").fetchone()[0], "17.25")
+
     def test_table_aligns_all_rows_and_lists_zero_count_work_types(self):
         self.finish(10, kind="fix")
         a.prepare(now=self.now)

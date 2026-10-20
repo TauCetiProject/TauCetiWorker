@@ -88,14 +88,6 @@ class RoundContext:
                 fn()
             except Exception as e:
                 log(f"cleanup step failed: {e}")
-        if self.activity is not None:
-            # Every boundary this round launched has finished by now; say whether all were empty.
-            try:
-                from .containment import write_quiescence
-
-                write_quiescence(self.cfg.state, self.activity.id)
-            except Exception as e:
-                log(f"cleanup step failed: {e}")
         if self._fd is not None:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
@@ -215,7 +207,7 @@ class Claims:
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
         # Set when the heartbeat reports the lease lost; branch work passes it to the agent as its
-        # cancellation event, so a lost claim tears the agent's containment boundary down.
+        # cancellation event, so a lost claim cancels the owned agent process group.
         self.lost = threading.Event()
         self._stopped = threading.Event()
 
@@ -370,9 +362,8 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         # Unlike kill_round_group (which signals while the leader PID is still live), p.wait() has already
         # reaped the leader here, so the group is held open only by stragglers. The lone wrong-kill window
         # — the freed leader PID being reused AND the reuser making itself a group leader before this line
-        # — is microseconds wide and needs a deliberate setsid; we accept it. This sweep is the legacy
-        # fallback: on a host with PID-namespace containment (containment.py) every agent and tool, in
-        # --loop and one-shot rounds alike, already died with its namespace, setsid'd ones included.
+        # — is microseconds wide and needs a deliberate setsid; we accept it. Host agents and
+        # supervised tools also sweep their own groups, including in one-shot rounds.
         reap_round_group(pgid)
         if accounting:
             try:

@@ -327,8 +327,7 @@ New invocations also record their exact admission ticket, invocation ID, bridge,
 shim and native process birth identities in `budget/lifecycles/`. The admission
 ledger event includes the initial lifecycle identity, so a bridge crash before
 writing its sidecar is recoverable. A detached host supervisor owns the sidecars
-and recovery, outside both the round process group and the agent containment
-boundary. It starts at API worker/context startup and is checked again at loop
+and recovery, outside both the round process group and any agent sandbox. It starts at API worker/context startup and is checked again at loop
 round boundaries. Restarting it replays the local evidence automatically; it does
 not poll providers or GitHub. Recovery progress is persisted, and a separate
 heartbeat remains responsive during ledger recovery. Admission checks restart a

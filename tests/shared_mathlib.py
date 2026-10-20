@@ -16,7 +16,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import containment
 from tauceti_worker import shared_mathlib as s
 from tauceti_worker.runtime_status import atomic_json
 
@@ -83,27 +82,18 @@ class SharedTests(unittest.TestCase):
         self.library = self.root / "toolchain/lib/lean"
         self.library.mkdir(parents=True)
         (self.library / "Init.olean").write_text("fixture ABI")
-        real_run, real_contained = subprocess.run, containment.run
+        real_run = subprocess.run
 
-        def fake_lake(command):
+        def run(command, *args, **kwargs):
             if command == ["lake", "env", "lean", "--version"]:
                 return subprocess.CompletedProcess(command, 0, "Lean fixture ABI\n", "")
             if command == ["lake", "env", "lean", "--print-prefix"]:
                 return subprocess.CompletedProcess(command, 0, str(self.library.parents[1]) + "\n", "")
-            return None
+            return real_run(command, *args, **kwargs)
 
-        def run(command, *args, **kwargs):
-            return fake_lake(command) or real_run(command, *args, **kwargs)
-
-        def contained(command, *args, **kwargs):
-            return fake_lake(command) or real_contained(command, *args, **kwargs)
-
-        for patcher in (
-            patch.object(s.subprocess, "run", side_effect=run),
-            patch.object(containment, "run", side_effect=contained),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = patch.object(s, "run_process", side_effect=run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.downloads = 0
         disk = patch.object(
             s.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100_000_000, 20_000_000, 80_000_000)
@@ -111,9 +101,12 @@ class SharedTests(unittest.TestCase):
         disk.start()
         self.addCleanup(disk.stop)
 
-    def extract(self, command, cwd, env, output, timeout, *, prefix=()):
+    def extract(self, command, cwd, env, output, timeout):
         self.downloads += 1
-        self.assertEqual(command, ["lake", "exe", "cache", "get"])
+        self.assertEqual(command[-4:], ["lake", "exe", "cache", "get"])
+        self.assertIn("--ro-bind", command)
+        self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", env)
+        self.assertNotIn("--unshare-pid", command)
         self.assertNotEqual(cwd, self.cwd)
         self.assertFalse((cwd / ".lake/packages/mathlib/.lake/build/poison").exists())
         build = cwd / ".lake/packages/mathlib/.lake/build/lib/lean"
@@ -123,6 +116,19 @@ class SharedTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(b"verified artifact")
         return 0
+
+    def test_old_round_containment_policy_and_status_are_ignored(self):
+        self.env["TAUCETI_PROCESS_CONTAINMENT"] = "invalid-old-policy"
+        status = self.pool / "status"
+        status.mkdir(parents=True)
+        s.atomic_json(status / "live.json", dict(supervisor=s.process_identity(os.getpid()), containment_mode="legacy"))
+        (status / "broken.json").write_text("{broken")
+        self.assertEqual(s.mode(self.env), "auto")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with patch.object(s, "capability", side_effect=AssertionError("private round probed namespaces")):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertEqual((status / "broken.json").read_text(), "{broken")
 
     def test_signature_includes_revisions_config_toolchain_and_abi(self):
         key, spec = s.signature(self.cwd, self.env)
@@ -415,43 +421,6 @@ class SharedTests(unittest.TestCase):
         with self.assertRaisesRegex(s.Unavailable, "hardlink alias"):
             s.inventory(build)
 
-    def test_private_namespace_cannot_write_pool_or_policy(self):
-        self.require_overlay()
-        self.pool.mkdir()
-        artifact = self.pool / "artifact"
-        artifact.write_text("immutable")
-        atomic_json(self.pool / "policy.json", dict(mode="off"))
-        code = "from pathlib import Path; import sys\nfor name in ('artifact','policy.json','new-file'):\n try: (Path(sys.argv[1])/name).write_text('poison')\n except OSError: pass\n else: raise AssertionError('writable pool')"
-        result = containment.run(
-            [sys.executable, "-c", code, str(self.pool)], env=self.env, label="private-fixture", capture_output=True
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(artifact.read_text(), "immutable")
-
-    def test_publisher_namespace_only_writes_its_fresh_staging_project(self):
-        self.require_overlay()
-        from tauceti_worker import agents
-
-        self.pool.mkdir()
-        key, spec = s.signature(self.cwd, self.env)
-
-        def extract(command, cwd, env, output, timeout, *, prefix):
-            self.extract(command, cwd, env, output, timeout)
-            code = "from pathlib import Path; import sys; p=Path(sys.argv[1]); (p/'staging-write').write_text('ok')\ntry: Path(sys.argv[2]).write_text('poison')\nexcept OSError: pass\nelse: raise AssertionError('writable policy')"
-            return agents._cache_fetch(
-                [sys.executable, "-c", code, str(cwd), str(self.pool / "policy.json")],
-                cwd,
-                env,
-                output,
-                timeout,
-                prefix=prefix,
-            )
-
-        with s.key_lock(self.pool, key):
-            entry, _ = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", extract)
-        self.assertTrue(s.ready_entry(entry, key, spec))
-        self.assertFalse((self.pool / "policy.json").exists())
-
     def test_missing_corrupt_policy_and_independent_safety_latch(self):
         self.env.pop("TAUCETI_SHARED_MATHLIB_BUILDS")
         self.assertEqual(s.mode(self.env), "off")
@@ -527,20 +496,6 @@ class SharedTests(unittest.TestCase):
             self.assertEqual((self.pool / "safety-stop.json").exists(), "safety-stop.json" not in failed_names)
             self.assertEqual((self.pool / "policy.json").exists(), "policy.json" not in failed_names)
 
-    def test_unconfirmed_publisher_does_not_pass_exclusive_lease_to_downloader(self):
-        self.require_overlay()
-
-        def extract(command, cwd, env, output, timeout, *, prefix):
-            self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", env)
-            raise containment.ContainmentUnconfirmed("fixture publisher namespace unconfirmed")
-
-        with self.assertRaisesRegex(containment.ContainmentUnconfirmed, "fixture publisher"):
-            with s.view(self.cwd, self.env, self.root / "logs", extract):
-                self.fail("inference started after unconfirmed publisher")
-        self.assertEqual(s.mode(self.env), "off")
-        self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", self.env)
-        self.assertEqual(s.summary(self.env)["blocked"], 1)
-
     def test_busy_exclusive_lease_has_bounded_auto_fallback(self):
         self.require_overlay()
         key, _ = s.signature(self.cwd, self.env)
@@ -549,32 +504,6 @@ class SharedTests(unittest.TestCase):
                 self.assertEqual(prefix, [])
         self.assertIn("lock wait timed out", " ".join(s.summary(self.env)["reasons"]))
         self.assertEqual(self.downloads, 0)
-
-    def test_failed_boundary_argument_setup_records_not_started(self):
-        self.require_overlay()
-        from tauceti_worker import activity
-
-        with patch.object(activity, "current_round_id", return_value="setup-fixture"):
-            boundary = containment.Boundary("setup-fixture", env=self.env)
-            with patch.object(containment.os, "pipe", side_effect=OSError("fixture EMFILE")):
-                with self.assertRaisesRegex(OSError, "EMFILE"):
-                    boundary.argv(["true"])
-            self.assertTrue(containment.confirmed_empty("setup-fixture"))
-            self.assertFalse(containment.cleanup_unconfirmed("setup-fixture"))
-        containment._boundaries.pop("setup-fixture", None)
-
-    def test_live_weaker_worker_blocks_new_shared_round(self):
-        self.require_overlay()
-        s.report(self.pool, self.env, mode="private")
-        path = next((self.pool / "status").glob("*.json"))
-        row = json.loads(path.read_text())
-        row["containment_mode"] = "process-group"
-        atomic_json(path, row)
-        self.assertEqual(s.mode(self.env), "off")
-        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
-        with self.assertRaisesRegex(s.Unavailable, "weaker containment"):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract):
-                self.fail("required mode started without isolation")
 
     def test_required_missing_mathlib_reports_blocked_before_inference(self):
         shutil.rmtree(self.mathlib)
@@ -654,14 +583,7 @@ class SharedTests(unittest.TestCase):
         self.assertFalse(receipts[-1]["cleanup_success"])
 
     def test_auto_fallback_and_required_fail_before_body(self):
-        with (
-            patch.object(s, "capability", return_value=(False, "enable user namespaces")),
-            patch.object(
-                containment,
-                "capability",
-                return_value=SimpleNamespace(strong=True, mode=containment.NAMESPACE, reason="fixture"),
-            ),
-        ):
+        with patch.object(s, "capability", return_value=(False, "enable user namespaces")):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
                 self.assertEqual(prefix, [])
             self.assertIn("enable user namespaces", s.summary(self.env)["reasons"])
@@ -857,62 +779,39 @@ class SharedTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
     def test_killed_cache_parent_terminates_detached_downloader_group(self):
-        # A contained downloader's own pid is namespace-local; identify it by a unique argv token.
-        for policy in ("legacy", "auto"):
-            with self.subTest(policy=policy):
-                if policy == "auto" and not containment.probe()[0]:
-                    continue  # auto falls back to the legacy sweep, which a setsid escapes by design
-                token = f"tauceti-downloader-{os.getpid()}-{policy}"
-                ready = self.root / f"downloader-{policy}.ready"
-                # Only a namespace can catch a downloader that escapes its session.
-                childcode = 'import os,time,sys; sys.argv[3] == "auto" and os.setsid(); open(sys.argv[1],"w").write("up"); time.sleep(100)'
-                parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1],sys.argv[4],sys.argv[5]],Path.cwd(),dict(os.environ),f,100)'
-                parent = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-c",
-                        parentcode,
-                        str(ready),
-                        str(self.root / "cache.log"),
-                        childcode,
-                        token,
-                        policy,
-                    ],
-                    env={**os.environ, "TAUCETI_PROCESS_CONTAINMENT": policy},
-                )
-
-                def tagged(token=token):
-                    found = []
-                    for entry in Path("/proc").iterdir():
-                        if entry.name.isdigit():
-                            try:
-                                args = (entry / "cmdline").read_bytes().split(b"\0")
-                                state = (entry / "stat").read_text().rsplit(")", 1)[1].split()[0]
-                            except OSError:
-                                continue
-                            if token.encode() in args and state != "Z":
-                                found.append(int(entry.name))
-                    return found
-
+        pidfile = self.root / "downloader.pid"
+        childcode = 'import os,time,sys; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(100)'
+        parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1]],Path.cwd(),dict(os.environ),f,100)'
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parentcode, str(pidfile), str(self.root / "cache.log"), childcode]
+        )
+        pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(pidfile.exists())
+            pid = int(pidfile.read_text())
+            parent.kill()
+            parent.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
                 try:
-                    deadline = time.monotonic() + 10
-                    while not ready.exists() and time.monotonic() < deadline:
-                        time.sleep(0.02)
-                    self.assertTrue(ready.exists())
-                    self.assertTrue(tagged())
-                    parent.kill()
-                    parent.wait(timeout=5)
-                    deadline = time.monotonic() + 5
-                    while tagged() and time.monotonic() < deadline:
-                        time.sleep(0.02)
-                    self.assertFalse(tagged(), "detached cache downloader survived its killed parent")
-                finally:
-                    if parent.poll() is None:
-                        parent.kill()
-                        parent.wait()
-                    for pid in tagged():
-                        with contextlib.suppress(ProcessLookupError):
-                            os.kill(pid, 9)
+                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                except FileNotFoundError:
+                    break
+                if state == "Z":
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("detached cache downloader survived its killed parent")
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait()
+            if pid:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, 9)
 
     def test_gc_reclaims_killed_builder_staging_and_skips_live_builder(self):
         key = "a" * 64
@@ -946,7 +845,7 @@ class SharedTests(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
 
-    def test_pid_namespace_proc_matches_process_and_toolchain_lookup(self):
+    def test_view_proc_matches_process_and_toolchain_lookup(self):
         self.require_overlay()
         lower, upper, work = (self.root / name for name in ("lower", "upper", "work"))
         for path in (lower, upper, work):
@@ -958,6 +857,22 @@ class SharedTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_view_keeps_the_host_pid_namespace(self):
+        # Agents' own tooling hands PIDs to services outside the view (a Codex shell asking the
+        # systemd user manager for a scope, for example). A private PID namespace breaks that.
+        self.require_overlay()
+        lower, upper, work = (self.root / name for name in ("lower", "upper", "work"))
+        for path in (lower, upper, work):
+            path.mkdir()
+        self.assertNotIn("--unshare-pid", s.overlay_command(lower, upper, work, upper, lower))
+        result = subprocess.run(
+            s.overlay_command(lower, upper, work, upper, lower) + ["readlink", "/proc/self/ns/pid"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), os.readlink("/proc/self/ns/pid"))
 
     def test_preparation_telemetry_does_not_claim_readiness_before_warmers_pass(self):
         self.require_overlay()

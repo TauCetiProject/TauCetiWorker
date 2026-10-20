@@ -121,7 +121,7 @@ class Fixture(unittest.TestCase):
         claims.begin_branch_work = acquire
         claims.stop_heartbeat = lambda: None
         claims.release = lambda: setattr(claims, "held", None)
-        self.values = {}
+        self.values = {"historical-paid": 17}
         counters = SimpleNamespace(read=lambda k: self.values.get(k, 0), write=lambda k, v: self.values.update({k: v}))
         self.w = SimpleNamespace(
             cfg=self.cfg,
@@ -134,13 +134,17 @@ class Fixture(unittest.TestCase):
         self.opts = SimpleNamespace(
             only=[], prs=(), sandbox_host=True, agent="claude", account=None, ignore_quota=False, dry_run=False
         )
+        legacy = self.root / "activity/containment-unconfirmed"
+        legacy.mkdir(parents=True)
+        (legacy / "malformed.json").write_text("{broken")
+        (legacy / "stale.json").write_text('{"boundary": "old", "pid_namespace": 42}')
+        (self.cfg.state / "quiescence.json").write_text("not json")
         self.patches = [
+            patch.dict(os.environ, TAUCETI_ACTIVITY_DIR=str(legacy.parent), TAUCETI_PROCESS_CONTAINMENT="required"),
             patch.dict(os.environ, {"TAUCETI_CLAIM_KEY": "", "TAUCETI_AUTO_RECOVERY": "on"}),
             patch.object(rr, "repository_url", lambda repo: str(self.remote)),
             patch("tauceti_worker.github.me", return_value="alice"),
             patch("tauceti_worker.github.can_push", return_value=True),
-            patch("tauceti_worker.containment.strong", return_value=True),
-            patch("tauceti_worker.containment.unconfirmed", return_value=[]),
             patch("tauceti_worker.config.roadmap_only", return_value="any"),
             patch("tauceti_worker.config.roadmap_skip", return_value=[]),
             patch("tauceti_worker.github_outbox.drain", return_value=[]),
@@ -189,6 +193,7 @@ class Fixture(unittest.TestCase):
 
     def assert_retained(self):
         self.assertEqual(saved._complete(self.record), self.manifest)
+        self.assertEqual(self.values["historical-paid"], 17)
         co = self.record / "checkout"
         if co.exists():
             self.assertEqual((co / "A.lean").read_text(), "retained repair\n")
@@ -398,6 +403,45 @@ class Fixture(unittest.TestCase):
             self.assertFalse(rr.recover(self.w, self.opts))
         self.assertEqual(self.journal()["state"], "obsolete")
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+
+    def test_old_markers_and_wait_resume_without_losing_source_or_paid_counts(self):
+        markers = self.root / "activity/containment-unconfirmed"
+        markers.mkdir(parents=True, exist_ok=True)
+        (markers / "malformed.json").write_text("{broken")
+        (markers / "stale.json").write_text('{"boundary": "old", "pid_namespace": 42}')
+        (self.cfg.state / "quiescence.json").write_text("not json")
+        self.values["historical-paid"] = 17
+        rr.write(
+            self.record,
+            {},
+            "eligible",
+            attempts=0,
+            retry_at=0,
+            reason=rr.reason(rr.Wait("containment-unavailable", "old global wait")),
+            selection=rr.selection([], (), True, "claude"),
+        )
+        with patch.dict(
+            os.environ, TAUCETI_ACTIVITY_DIR=str(markers.parent), TAUCETI_PROCESS_CONTAINMENT="invalid-old-policy"
+        ):
+            self.assertTrue(rr.due(self.cfg, only=[], agent="claude"))
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(self.values["historical-paid"], 17)
+        self.assertEqual(self.journal()["state"], "published")
+        self.assertEqual((markers / "malformed.json").read_text(), "{broken")
+        self.assert_retained()
+
+    def test_live_recovery_checkout_is_skipped_without_touching_source(self):
+        journal = {}
+        checkout = self.backend.restore(self.record, self.manifest, journal)
+        lock = checkout / ".git/index.lock"
+        lock.write_text("still owned")
+        journal["content_started"] = "interrupted"
+        with patch.object(saved, "live_users", return_value=["123 (fixture)"]):
+            with self.assertRaises(rr.Wait) as error:
+                self.backend.restore(self.record, self.manifest, journal)
+        self.assertEqual(error.exception.code, "continuation-cleanup")
+        self.assertEqual(lock.read_text(), "still owned")
+        self.assert_retained()
 
     def test_mechanical_zero_paid_and_duplicate(self):
         self.assertTrue(self.run_recovery())
@@ -747,7 +791,6 @@ class Fixture(unittest.TestCase):
             logdir=self.cfg.logdir,
             label="fixture",
             provider="claude",
-            contain=False,
             session_path=path,
         )
         self.assertEqual(rc, 0)
@@ -906,7 +949,7 @@ class Fixture(unittest.TestCase):
         summary = saved.summary(self.cfg.state.parent, workers={"w"})
         self.assertIn("next action: restore dependency", summary["reasons"][0])
 
-    def test_valid_original_conversation_resumes_in_original_cwd_alias(self):
+    def test_historical_conversation_uses_fresh_checkout(self):
         FakeVerification.failures = 1
         recovery = rr.Recovery(self.record, self.backend)
         recovery.manifest["conversation"] = dict(
@@ -924,8 +967,9 @@ class Fixture(unittest.TestCase):
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
             self.assertTrue(recovery.run())
-        self.assertEqual(model.call_args.kwargs["resume"], "session-12345")
-        self.assertEqual(model.call_args.kwargs["original_cwd"], self.co)
+        self.assertIsNone(model.call_args.kwargs["resume"])
+        self.assertNotIn("original_cwd", model.call_args.kwargs)
+        self.assertEqual(model.call_args.args[0], self.record / "checkout")
 
     def test_continuation_raw_git_push_is_denied_but_supervisor_can_publish(self):
         actual = self.backend.verify
@@ -1096,29 +1140,6 @@ class ConversationIsolation(unittest.TestCase):
                 self.assertIsNone(rr.conversation_identity("claude"))
                 rr.atomic_json(root / ".credentials.json", dict(claudeAiOauth=dict(accessToken="new-account-token")))
                 self.assertIsNone(rr.conversation_identity("claude"))
-
-    def test_original_absolute_cwd_maps_to_isolated_source(self):
-        from tauceti_worker import agents, containment
-
-        if not containment.capability().strong:
-            self.skipTest("rootless PID namespace unavailable")
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            original, isolated = root / "original", root / "isolated"
-            original.mkdir()
-            isolated.mkdir()
-            (original / "source").write_text("live")
-            (isolated / "source").write_text("retained")
-            profile = agents.AuthoringProfile("claude", "fixture", "high", "fixture", "fixture")
-            script = f"from pathlib import Path; Path({str(original / 'source')!r}).write_text('repaired')"
-            with patch.object(
-                agents, "host_agent_argv", return_value=([sys.executable, "-c", script], os.environ.copy())
-            ):
-                self.assertEqual(
-                    agents.run_agent_host(isolated, "fixture", profile, root / "logs", original_cwd=original), 0
-                )
-            self.assertEqual((original / "source").read_text(), "live")
-            self.assertEqual((isolated / "source").read_text(), "repaired")
 
 
 class RealVerifierIntegration(unittest.TestCase):
