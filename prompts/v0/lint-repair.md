@@ -41,7 +41,8 @@ If `test -s` fails, or a name is auto-generated (for example an `inst...` instan
 
 ## Verify before pushing (ALL of these MUST pass; they are what the `build` check runs)
 __LOCAL_VERIFICATION__
-The `lint-repair` policy keeps the axiom and duplicate-declaration audit whole-library. After the
+The `lint-repair` policy requires full axiom and duplicate-declaration checks in CI; local checks
+still read only changed modules' own declarations. After the
 repair, run the final verification once:
 ```
 lake exe cache get   # only if not yet run this session
@@ -56,7 +57,8 @@ lake build --iofail
 lake exe module-system
 bash scripts/lint-style.sh
 ```
-then the scope recipe, the audit (it also checks duplicate declarations globally), the flagged-module
+then the scope recipe, the cheap changed-file axiom check (global duplicates and transitive axioms
+are checked in CI), the flagged-module
 append above, and the scoped environment lint. The scoped `lint-env.sh` must print `LINT-ENV: PASS`.
 If a step fails, fix it and rerun only the steps whose inputs your fix changed. Never push red.
 

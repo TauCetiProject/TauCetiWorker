@@ -484,14 +484,19 @@ def local_verification(policy: str, bubble: bool = False) -> str:
     if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
         raise Die(f"unknown local verification scope policy {policy!r}")
     if os.environ.get("TAUCETI_VERIFY_HELPER", "0") != "1":
-        return fill_prompt(HERE / "prompts" / "local-verification.md", SCOPE_POLICY=policy)
+        python = "/usr/bin/python3" if bubble else sys.executable
+        return fill_prompt(
+            HERE / "prompts" / "local-verification.md",
+            SCOPE_POLICY=policy,
+            LOCAL_AXIOMS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-axioms"',
+        )
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
     return (
         "### Local verification\n"
         f"Run `{helper}` synchronously after the last edit or integration. "
         f"The worker's local actual-source scope policy is `{policy}`. "
-        "The helper runs the full `lake build --iofail`, scoped axiom/duplicate audit, "
+        "The helper runs the full `lake build --iofail`, fast changed-file axiom checks, "
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
@@ -502,7 +507,9 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
         "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
         "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
-        "phase results and receipt path. These are local checks, not full CI.\n"
+        "phase results and receipt path. Axiom checks read only changed modules' own compiled declarations; "
+        "transitive axiom and global duplicate checks run in CI. No local whole-library audit fallback. "
+        "These are local checks, not full CI.\n"
         f"```bash\n{helper}\n```\n"
     )
 
@@ -2101,6 +2108,12 @@ def run_in_bubble(
         os.chmod(rounddir / f, 0o755)
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
+    # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
+    for name in ("tauceti-local-axioms", "LocalAxioms.lean"):
+        shutil.copy(HERE / "scripts" / name, rounddir / name)
+    # Container-produced executables must never enter the host's checker cache.
+    local_axioms_cache = cfg.state / "bubble-local-axioms"
+    local_axioms_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     if helper_on:
         from .verification import cache_root
 
@@ -2128,7 +2141,12 @@ def run_in_bubble(
 
     _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
 
-    mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    mount_flags = [
+        "--mount",
+        f"{rounddir}:/opt/round:ro",
+        "--mount",
+        f"{local_axioms_cache}:/opt/local-axioms-cache:rw",
+    ]
     if helper_on:
         mount_flags += [
             "--mount",
@@ -2197,9 +2215,9 @@ def run_in_bubble(
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
-    tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH"
+    tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
     if api_bridge and _uses_claude_credentials(cred_model):
-        tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH"
+        tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     for var in (

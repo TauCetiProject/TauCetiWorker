@@ -78,6 +78,7 @@ RUN_STDLIB=(
   isolate_home_paths.py
   kiro.py
   local_verification_scope.py
+  local_axioms.py
   verification.py
   verification_audit.py
   ledger_blocking.py

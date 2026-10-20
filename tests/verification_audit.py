@@ -321,7 +321,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             v.atomic(path, old)
             self.assertEqual(self.verify(stage="build")["status"], "success")
             self.assertEqual(len(v.read_json(path)["sha256"]), 64)
-            self.assertEqual(v.read_json(path)["files"], 1)
+        self.assertEqual(v.read_json(path)["files"], 2)  # Lean and the local checker's native compiler.
 
     def test_unavailable_identity_cache_falls_back_to_complete_validation(self):
         manifest = self.home / "installations.json"

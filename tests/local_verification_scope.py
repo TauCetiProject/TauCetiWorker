@@ -7,12 +7,12 @@ against small Git fixtures standing in for a TauCeti checkout. It must:
   1. include committed, staged, unstaged and untracked changes, measured from the merge base with the
      canonical main's remote-tracking ref (never fetched);
   2. list only existing, representable changed modules, in an absolute file;
-  3. choose the full audit for a deleted module (including the old end of a rename), a pin, lakefile
+  3. report full CI requirements for a deleted module (including the old end of a rename), a pin, lakefile
      or toolchain change (also when only in the working tree), a Lean file outside the module
      inventory (root, Unicode, newline), and any broad worker policy;
-  4. report `unknown` (full audit, no local lint) when the base or file list cannot be determined;
+  4. report `unknown` (no full local fallback) when the base or file list cannot be determined;
   5. accept an honestly empty documentation-only scope;
-  6. drive `lake exe axioms` with AXIOMS_ONLY_MODULES exactly when scoped;
+  6. drive only the cheap changed-file checker, never the whole-library audit;
   7. appear, with the foreground/exit-status rules, in every rendered authoring/repair prompt.
 
 The worker passes the policy from surveyed labels/branch; `scope_policy` is checked here too.
@@ -297,9 +297,16 @@ def main():
         stub = bin_dir / "lake"
         stub.write_text(f'#!/bin/sh\necho "lake $* AXIOMS=${{AXIOMS_ONLY_MODULES-unset}}" >> {log}\n')
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        local_stub = bin_dir / "local-checker"
+        local_stub.write_text(
+            "import os, sys\nfrom pathlib import Path\n"
+            f"Path({str(log)!r}).write_text('local-checker ' + ' '.join(sys.argv[1:]) + "
+            "' AXIOMS=' + os.environ.get('AXIOMS_ONLY_MODULES', 'unset'))\n"
+        )
         # An inherited scope must never narrow a full audit.
         env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", AXIOMS_ONLY_MODULES="/stale/list")
         _, audit, lint = blocks("ordinary")
+        audit = audit.replace(str(tc.paths.HERE / "scripts/tauceti-local-axioms"), str(local_stub))
 
         def audit_call(repo):
             log.write_text("")
@@ -311,21 +318,31 @@ def main():
         rc, call = audit_call(r)
         listed = r / ".lake" / "tauceti-scope" / "modules.txt"
         check(
-            "scoped audit passes an absolute module list", rc == 0 and call == f"lake exe axioms AXIOMS={listed}", call
+            "scoped audit passes an absolute module list",
+            rc == 0 and "local-checker --modules" in call and str(listed) in call and "exe axioms" not in call,
+            call,
         )
         check("module list path is absolute", listed.is_absolute())
         r = Path(root) / "docs"
         scope(r)
         rc, call = audit_call(r)
-        check("empty scope still runs the scoped auditor (global duplicates)", call.endswith("/modules.txt"), call)
+        check(
+            "empty scope uses the cheap local checker",
+            "local-checker --modules" in call and "exe axioms" not in call,
+            call,
+        )
         r = Path(root) / "deleted"
         scope(r)
         rc, call = audit_call(r)
-        check("full scope clears an inherited scope", rc == 0 and call == "lake exe axioms AXIOMS=", call)
+        check(
+            "full CI scope still uses changed-file diagnostics",
+            rc == 0 and "local-checker --modules" in call and call.endswith("AXIOMS="),
+            call,
+        )
         r = Path(root) / "no-main"
         scope(r)
         rc, call = audit_call(r)
-        check("unknown scope runs the unscoped audit", rc == 0 and call == "lake exe axioms AXIOMS=", call)
+        check("unknown scope fails without any full-library fallback", rc != 0 and call == "", call)
         lint_run = subprocess.run(["bash", "-c", lint], cwd=r, env=env, capture_output=True, text=True)
         check("unknown scope skips the local lint", "CI runs the environment lint" in lint_run.stdout)
         r = fixture(root, "never-scoped")
