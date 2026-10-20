@@ -23,6 +23,99 @@ from tauceti_worker.verification_jobs import resume_pending
 
 class Recovery(Receipts):
     # Reuse the private Git/fake-verifier fixture; load_tests collects only these audit cases.
+    def test_symlinked_worker_state_resumes_existing_and_new_snapshots(self):
+        alias = self.home / "runtime-state"
+        alias.symlink_to(self.state, target_is_directory=True)
+        for isolated in (True, False):
+            with self.subTest(isolated=isolated):
+                result = self.verify(stage="build", deadline=time.time() - 1)
+                path = Path(result["continuation_job"])
+                job = v.read_json(path)
+                candidate = self.state / "verification-candidates" / job["id"]
+                job.update(
+                    next_at=0,
+                    isolated=isolated,
+                    root=str(alias / "verification-candidates" / job["id"] if isolated else self.root),
+                )
+                v.atomic(path, job)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertTrue(resume_pending(SimpleNamespace(state=alias), seconds=10))
+                complete = v.read_json(self.state / "verification-jobs" / path.name)
+                self.assertEqual(complete["status"], "success", complete.get("error"))
+                self.assertEqual(Path(complete["root"]), candidate.resolve())
+                self.assertIn("build --iofail", (candidate / ".lake/calls").read_text())
+
+    def test_owned_helper_resolves_candidate_alias_without_accepting_another_workspace(self):
+        import fcntl
+
+        result = self.verify(stage="build", deadline=time.time() - 1)
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        candidate = Path(job["root"])
+        alias = self.home / "runtime-state"
+        alias.symlink_to(self.state, target_is_directory=True)
+        candidate_alias = alias / "verification-candidates" / job["id"]
+        lease = self.state / "verification-jobs" / f"{job['id']}.lock"
+        lease.parent.mkdir(exist_ok=True)
+        with lease.open("a+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            env = dict(
+                self.env,
+                TAUCETI_VERIFY_STATE=str(alias),
+                TAUCETI_VERIFY_JOB_FD=str(owner.fileno()),
+            )
+            inherited = [owner.fileno()]
+
+            def invoke():
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO / "scripts/tauceti-verify"),
+                        "--base",
+                        job["base"],
+                        "--stage",
+                        "build",
+                        "--resume-job",
+                        str(path),
+                        "--json",
+                    ],
+                    cwd=candidate_alias,
+                    env=env,
+                    pass_fds=tuple(inherited),
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+
+            cycle = self.home / "cycle"
+            cycle.symlink_to(cycle)
+            for wrong_root in (str(self.root), ".", None, str(cycle)):
+                job["root"] = wrong_root
+                v.atomic(path, job)
+                rejected = invoke()
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(json.loads(rejected.stdout)["status"], "incomplete")
+                self.assertFalse((candidate / ".lake/calls").exists())
+            job["root"] = str(candidate_alias)
+            v.atomic(path, job)
+            with (self.home / "wrong-lease").open("a+") as wrong:
+                env["TAUCETI_VERIFY_JOB_FD"] = str(wrong.fileno())
+                inherited.append(wrong.fileno())
+                # The real lease remains open, but the helper must validate the supplied fd.
+                rejected = invoke()
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(json.loads(rejected.stdout)["status"], "incomplete")
+                self.assertIn("requires its supervisor's job lease", json.loads(rejected.stdout)["error"])
+                self.assertFalse((candidate / ".lake/calls").exists())
+                inherited.pop()
+            env["TAUCETI_VERIFY_JOB_FD"] = str(owner.fileno())
+            completed = invoke()
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        receipt = json.loads(completed.stdout)
+        self.assertEqual(receipt["status"], "success")
+        self.assertEqual(receipt["root"], str(candidate.resolve()))
+        self.assertIn("build --iofail", (candidate / ".lake/calls").read_text())
+
     def test_repeated_deadlines_resume_without_model_or_remote_reads(self):
         with patch.dict(os.environ, FIXTURE_MODE="sleep", FIXTURE_SLEEP="60"):
             result = self.verify(stage="build", deadline=time.time() + 1)

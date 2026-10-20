@@ -374,6 +374,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                     job["attempts"] += 1
                     root = Path(job["root"])
                     try:
+                        root = root.resolve()
                         if (
                             job.get("isolated")
                             and root.resolve() != (state / "verification-candidates" / identifier).resolve()
@@ -382,7 +383,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         if digest(inventory(root, job["base"])) != job["source_digest"]:
                             raise ValueError("candidate source changed; preserved job requires reconciliation")
                         if not job.get("isolated"):
-                            target = state / "verification-candidates" / job["id"]
+                            target = (state / "verification-candidates" / job["id"]).resolve()
                             target.parent.mkdir(parents=True, exist_ok=True)
                             if target.exists():
                                 shutil.rmtree(target)  # previous interrupted snapshot, never the source
@@ -390,7 +391,8 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             if digest(inventory(target, job["base"])) != job["source_digest"]:
                                 raise ValueError("candidate changed during continuation snapshot")
                             root = target
-                            job.update(root=str(root), isolated=True)
+                            job["isolated"] = True
+                        job["root"] = str(root)
                         atomic(path, job)
                         report_runtime(
                             "verifying",
@@ -478,7 +480,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                 path.unlink(missing_ok=True)
                             else:
                                 atomic(path, current)
-                    except (Incomplete, OSError, ValueError, subprocess.CalledProcessError) as error:
+                    except (Incomplete, OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
                         job.update(error=str(error), status="incomplete")
                         atomic(state / "verification-jobs" / path.name, job)
                         path.unlink(missing_ok=True)

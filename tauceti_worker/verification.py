@@ -756,7 +756,7 @@ def command(args):
         os.environ.get("TAUCETI_VERIFY_STATE") or HERE / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
     )
     try:
-        root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
+        root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip()).resolve()
         deadline = float(os.environ["TAUCETI_ROUND_DEADLINE"]) if os.environ.get("TAUCETI_ROUND_DEADLINE") else None
         if deadline is not None and not math.isfinite(deadline):
             raise ValueError("round deadline must be finite")
@@ -767,7 +767,9 @@ def command(args):
             if (
                 job.get("schema") != "tauceti-verification-job/v1"
                 or job_path != state.resolve() / "verification-pending" / f"{job.get('id')}.json"
-                or job.get("root") != str(root)
+                or not isinstance(job.get("root"), str)
+                or not Path(job["root"]).is_absolute()
+                or Path(job["root"]).resolve() != root
             ):
                 raise ValueError("invalid mechanical verification job")
             descriptor = int(os.environ.get("TAUCETI_VERIFY_JOB_FD", "-1"))
@@ -776,6 +778,9 @@ def command(args):
             if (owned.st_dev, owned.st_ino) != (lease.st_dev, lease.st_ino):
                 raise ValueError("mechanical helper requires its supervisor's job lease")
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # A runtime's state symlink and Git's physical cwd name the same candidate.
+            # Persist the actual execution path; different workspaces remain distinct inputs.
+            job["root"] = str(root)
         verification = Verification(
             root,
             state,
@@ -788,7 +793,7 @@ def command(args):
             job=job,
         )
         result = verification.run()
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         result = dict(schema=SCHEMA, status="incomplete", error=str(error))
     if args.json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))

@@ -110,9 +110,13 @@ or provenance changes. Deadline/signal jobs remain eligible without an expiry th
 candidate. Terminal jobs move from `verification-pending/` into `verification-jobs/`.
 
 Recovery builds only in an independent candidate, never resets the original source and never pushes,
-creates a PR or bypasses accounting/publication guards. Receipts bind the actual replay environment;
-a different toolchain/configuration invalidates prior evidence. Bubble recovery needs the host's
-normal verification tools for the pinned project; unavailable tools leave typed incomplete evidence
+creates a PR or bypasses accounting/publication guards.
+Jobs store canonical candidate paths. The helper resolves runtime state/workspace symlinks before
+checking that its working directory matches the job and validating the inherited job lease. Receipts
+remain bound to that physical workspace, including when a runtime alias changes after deployment.
+Receipts bind the actual replay environment; a different toolchain/configuration invalidates prior
+evidence. Bubble recovery needs the host's normal verification tools for the pinned project; unavailable
+tools leave typed incomplete evidence
 and a dormant job that wakes on local tool availability changes. Publication/reconciliation of a recovered candidate remains #310's separate concern. This
 verification continuation does not require #310. Claude Bash timeout variables cover the remaining
 round; Codex prompts instruct the agent to wait on its returned execution session. SIGINT, SIGTERM
