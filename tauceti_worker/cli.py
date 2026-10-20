@@ -173,6 +173,7 @@ def add_github_account_flag(p: argparse.ArgumentParser) -> None:
 
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--recovery-only", action="store_true", help=argparse.SUPPRESS)
     from .config import positive_integer
 
     p.add_argument(
@@ -1373,6 +1374,40 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             log(f"[test] holding the lock and sleeping {slp}s")
             time.sleep(int(slp))
             return 0
+
+        # Source recovery precedes provider selection/admission and unrelated work. A
+        # mechanically valid repair can publish even when all model budgets are closed.
+        if not dry and "security-audit" not in only:
+            from .quota import mirror_creds
+            from .repair_recovery import recover
+            from .work_recovery import guard
+
+            mirror_creds(cfg)
+            if (cfg.checkout / ".git").exists():
+                guard(cfg, cfg.checkout)  # Preserve the last round before selecting recovery.
+            recovery_gh = GitHub()
+            recovery_worker = Worker(
+                cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
+            )
+            recovery_opts = RoundOpts(
+                only=only,
+                agent=agent,
+                work_model="auto",
+                sandbox_host=not getattr(args, "bubble", False),
+                dry_run=False,
+                prs=prs,
+                account=getattr(args, "account", None),
+                ignore_quota=ignore_quota,
+                authoring_profile=(
+                    resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
+                    if agent != "auto" and (author_model or author_effort)
+                    else None
+                ),
+            )
+            if recover(recovery_worker, recovery_opts):
+                return 0
+            if getattr(args, "recovery_only", False):
+                return 0
 
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,

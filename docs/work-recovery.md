@@ -117,3 +117,79 @@ The guard covers the authoring checkout and the progress roadmap clone, where
 work is committed and published. Reference mirrors (`fetch_ref`,
 `fetch_git_source`, shared repository attachments) have pushing disabled and
 are refreshed as throwaway snapshots; nothing written there can be published.
+
+## Automatic repair recovery
+
+At a new host round boundary, the worker preserves the previous checkout and
+runs a bounded recovery phase before choosing unrelated work or selecting a
+model. Loop drivers can start a recovery-only child while model funding/quota
+is unavailable. Fleet capacity admission still applies. Recovery requires strong
+PID containment and no unconfirmed cleanup. It never restarts a live session.
+
+The immutable `tauceti-work-recovery/v1` manifest and payloads remain intact.
+New PR repair owners also record the original GitHub actor, PR author, destination
+repository/ref, roadmap, exact provider profile, account restriction, sandbox
+permission, and repair allowance keys. Provider session IDs come from structured
+provider events and are bound to that identity/profile, never extracted from a
+final transcript.
+
+Each record has a separate, private `recovery.json` consumer journal:
+
+| State | Durable meaning |
+|---|---|
+| retained | Saved source is available; no invocation started |
+| eligible | Current policy permits a retry, or a structured dependency wait remains |
+| resuming | A claimed invocation owns the isolated checkout |
+| verified | An exact-input verifier succeeded; its receipt is retained |
+| publication-pending | A particular commit, expected head, destination and receipt are durable before push |
+| published | Actual remote Git state contains the intended commit and the GitHub outbox is reconciled |
+| obsolete | The PR closed/merged, or the exact saved source is already the remote tree; source stays archived |
+| blocked | A structured failure names the condition and next action; unrelated work can continue |
+
+The worker restores binary patches, staged/unstaged boundaries, untracked bytes,
+and symlinks into an independent clone below the record, without resetting the
+normal checkout. An interrupted restoration is retained separately. Verification
+runs synchronously through the installed `tauceti verify` implementation; exact
+receipts may be reused by its normal input/phase matching. The complete input
+fingerprint is checked again before committing. Publication requires the current
+writer's head as an ancestor, fresh PR policy, a real claim, and `git-safe-push`'s
+expected-head CAS. No recovery comment or new PR is synthesized from agent prose.
+Existing GitHub publication intents use the durable outbox's reconciliation.
+A crash after push reconciles the actual branch and commit ancestry before any
+replay, including after the invocation limit.
+
+A model runs only for failed source verification, unfinished source integration,
+or a moved head that needs integration. It receives a narrow checkpoint-only
+prompt and the original profile/permissions, plus fresh subscription admission
+or API budget admission. A matching durable provider conversation is preferred;
+a missing or mismatched identity/profile starts a narrow new conversation.
+Continuation cannot publish through the worker's GitHub proxy or safe-push
+helper; the supervisor verifies the resulting source before publication. Changed
+source is retained using the same checkpoint format. Content repair allowances
+remain separate from infrastructure retries. Full verification is required;
+recovery does not introduce a new source-only push-red route.
+
+One invocation and at most eight record inspections are allowed per phase, with
+a cursor to avoid starvation. Infrastructure failures retry after 60, 300 and
+1800 seconds; three failed invocations for unchanged checkpoint/external facts
+block further invocations. Claim, verification-capacity, policy and admission
+waits do not consume those attempts. Changed PR facts re-enable eligibility.
+An operator can place `{"retry_epoch": 1}` in a record's `operator.json` after
+repairing infrastructure; changing the epoch re-enables the bounded retries.
+`content_allowance` can explicitly authorize another narrow continuation without
+resetting the original workflow's repair counters. Legacy records lacking durable
+publication authorization, sandbox-required rounds without a supported isolated
+sandbox recovery backend, unsupported destinations, new-PR authoring without a
+structured PR target, and exact one-launch foreign canaries retain a structured
+blocked disposition rather than gaining inferred permission. A trusted operator
+may supply the original structured `authorization` in `operator.json`.
+
+`tauceti recovery --json` and prepared local activity expose the consumer's durable
+state/reason; status does not read GitHub. For the historical PR16035 case, see
+[evidence/issue-310-pr16035-disposition.json](evidence/issue-310-pr16035-disposition.json).
+The production disposition is also retained under the main worker state tree's
+`recovery-dispositions/pr-16035.json`; its search scope is explicitly local.
+
+Set `TAUCETI_AUTO_RECOVERY=off` to stop starting recovery invocations. An invocation
+already owning work finishes; its checkout, checkpoint, receipt and outbox are
+preserved. This switch does not disable the K0 source-preservation guard.

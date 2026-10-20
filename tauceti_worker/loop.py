@@ -128,7 +128,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # Verification owns an isolated candidate and a separate job lease. Its queue wait
             # must not block model selection, and host CI reservations still precede launch.
             resume_pending(cfg, background=True)
-            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
+            from .repair_recovery import due
+
+            recovery_only = "security-audit" not in only and due(cfg)
+            if not recovery_only and api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
                     reason = admission_pause(snapshot, worker=cfg.wid)
@@ -160,7 +163,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # while a window of it is reset-but-unopened: the round is authorized to spend ONE small
             # request to open it, but only once it has found work (see work_units.dispatch).
             pending_init = False
-            if unpaced:
+            if recovery_only:
+                model = agent  # The child attempts recovery before any model selection.
+            elif unpaced:
                 model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
                 # --ignore-quota overrides PACING (the soft over-pace throttle), not AVAILABILITY. We
@@ -261,8 +266,17 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # flag omitted here would turn every round of a `--loop --pr` into a free-running one.
             if prs:
                 tail += ["--pr", ",".join(str(n) for n in prs)]
-            if model:
+            if recovery_only:
+                tail += ["--recovery-only", "--agent", agent]
+            elif model:
                 tail += ["--agent", model, "--ignore-quota"]  # loop already paced; child must not re-pace
+            if recovery_only:
+                if getattr(args, "author_model", None):
+                    tail += ["--author-model", args.author_model]
+                if getattr(args, "author_effort", None):
+                    tail += ["--author-effort", args.author_effort]
+                if ignore_quota:
+                    tail.append("--ignore-quota")
             if pending_init:
                 # Authorization travels with the round, not with the pacer: the child asks for it only
                 # after it has surveyed and picked a work unit, so a round that finds nothing to do never
@@ -270,7 +284,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 tail.append("--claude-bootstrap")
             # Audit-capable workers use a fixed Luna/Haiku inspection profile and reject
             # authoring overrides. Their maintenance fallback resolves its normal defaults.
-            if model and "security-audit" not in only:
+            if model and not recovery_only and "security-audit" not in only:
                 profile = resolve_authoring_profile(
                     model,
                     cli_model=getattr(args, "author_model", None),

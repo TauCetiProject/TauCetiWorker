@@ -1702,7 +1702,27 @@ def _do_fixlike(
             # The remote head is published by definition; a later recovery record names it as the
             # expected head and bundles only commits made on top of it.
             mark_published(co, f"pr/{pr}", checked)
-            note_owner(w.cfg, expected_head=checked)
+            from dataclasses import asdict
+
+            note_owner(
+                w.cfg,
+                expected_head=checked,
+                authorization=dict(
+                    actor=getattr(sv, "me_login", ""),
+                    author=getattr(p, "author", ""),
+                    repository=f"{p.head_owner}/{p.head_repo}",
+                    ref=p.head_ref,
+                    foreign=bool(foreign),
+                    automatic_bump=getattr(p, "automatic_bump", False),
+                    profile=asdict(_effective_authoring_profile(opts)),
+                    account=getattr(opts, "account", None),
+                    sandbox_host=getattr(opts, "sandbox_host", True),
+                    charged=list(charged),
+                    budget=getattr(c, "budget", 0) or 3,
+                    roadmap=getattr(sv, "roadmap_only", None),
+                ),
+                conversation_path=str(w.cfg.state / "provider-conversation.json"),
+            )
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
         try:
             rc = run_agent_host(
@@ -1711,6 +1731,8 @@ def _do_fixlike(
                 _effective_authoring_profile(opts),
                 w.cfg.logdir,
                 cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
+                session_path=w.cfg.state / "provider-conversation.json",
+                session_actor=getattr(sv, "me_login", ""),
             )
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
@@ -1718,6 +1740,14 @@ def _do_fixlike(
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             raise
+        finally:
+            # Agent containment is empty before run_agent_host returns or raises.
+            # Capture the final source now, so a quota-blocked loop can recover it
+            # without needing another paid round to reach checkout preparation.
+            from .work_recovery import guard
+
+            if (co / ".git").exists():
+                guard(w.cfg, co)
     if capacity_wait():
         from .config import VerificationUnavailable
 

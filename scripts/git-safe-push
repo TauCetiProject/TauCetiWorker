@@ -22,6 +22,8 @@
 #   TAUCETI_CLAIM_SH     path to claim.sh (default: alongside this script)
 set -uo pipefail
 
+[[ "${TAUCETI_RECOVERY_CONTINUATION:-}" != "1" ]] || { echo "git-safe-push: recovery supervisor must reverify and publish" >&2; exit 1; }
+
 REF="${1:-${TAUCETI_PUSH_REF:-}}"
 EXPECT="${TAUCETI_PUSH_EXPECT:-}"
 REMOTE="${TAUCETI_PUSH_REMOTE:-origin}"

@@ -547,6 +547,8 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
             untracked=[p for p, _ in snap.untracked],
             excluded=[dict(path=p, reason=r) for p, r in snap.excluded],
             files=files,
+            authorization=owner.get("authorization"),
+            conversation=read_json(Path(owner["conversation_path"])) if owner.get("conversation_path") else None,
         )
         _write(tmp / "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
         _fsync_dir(tmp)
@@ -817,9 +819,13 @@ def restore(record: Path, repo: Path) -> None:
             _git(repo, "apply", "--binary", *([option] if option else []), str(record / name))
     with tarfile.open(record / "untracked.tar") as tar:
         for member in tar.getmembers():
-            if member.name.startswith("/") or ".." in Path(member.name).parts:
+            if member.name.startswith("/") or any(p in ("..", ".git") for p in Path(member.name).parts):
                 raise RecordError(f"unsafe archive member {member.name}")
             dest = repo / member.name
+            if any(parent.is_symlink() for parent in dest.parents if parent != repo and repo in parent.parents):
+                raise RecordError(f"archive member traverses a symlink: {member.name}")
+            if not (member.isfile() or member.issym()):
+                raise RecordError(f"unsupported archive member {member.name}")
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.is_symlink() or dest.exists():
                 dest.unlink()
@@ -849,7 +855,12 @@ def records(state_root: Path | None = None, *, workers=None):
                 if record.name.startswith(".tmp-"):
                     yield worker.name, None, None, {"state": "incomplete"}
                     continue
-                yield worker.name, record, _complete(record, digests=False), read_json(record / "status.json")
+                yield (
+                    worker.name,
+                    record,
+                    _complete(record, digests=False),
+                    (read_json(record / "recovery.json") or read_json(record / "status.json")),
+                )
 
 
 def summary(state_root: Path | None = None, *, workers=None) -> dict:
@@ -869,8 +880,10 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
         if state == "retained":
             counts["retained"] += 1
             reasons.add(f"{worker}: {status.get('reason') or 'checkout moved aside'}")
-        elif state == "recovery-blocked":
-            counts["blocked"] += 1  # written only by the earlier blocking guard; superseded on next use
+        elif state in ("recovery-blocked", "blocked"):
+            counts["blocked"] += 1
+            if status.get("reason"):
+                reasons.add(f"{worker}/{record.name}: {status['reason']}")
         elif state == "checkout-reset":
             counts["reset"] += 1
         elif state == "superseded":

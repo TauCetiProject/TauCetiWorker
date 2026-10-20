@@ -135,6 +135,7 @@ RUN_STDLIB=(
   worker_claude_config.py
   worker_manager.py
   work_recovery.py
+  repair_recovery.py
 )
 # special-cased python tests (handled explicitly below)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)

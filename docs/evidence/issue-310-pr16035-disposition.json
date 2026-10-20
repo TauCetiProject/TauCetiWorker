@@ -1,0 +1,49 @@
+{
+  "observed_at": "2026-10-20T03:55:52.822498+00:00",
+  "pr": 16035,
+  "reason": {
+    "code": "pr-closed-no-matching-local-checkpoint",
+    "detail": "PR16035 is closed. No matching PR identity, PR-commit tip, branch name, or source patch was found among the two retained recovery records on this host. No retained-checkout directory was found under the main worker checkouts tree. The former attempt cannot be asserted present. Its PolynomialDomain.lean module is present on canonical main.",
+    "next_action": "Keep all existing source/checkpoints. Do not reopen or replay the closed PR. Any subsequently discovered source requires a fresh relevance and authorization check."
+  },
+  "remote": {
+    "closed_at": "2026-10-20T02:28:32Z",
+    "github_merged_at": null,
+    "head": "c344750968923c9333d63422404882683d2dd40a",
+    "main_source": {
+      "blob": "ae69d080060f2f81677828875e841bb46ec0c0c3",
+      "path": "TauCeti/AlgebraicGeometry/AdicSpace/Spa/Polydisc/PolynomialDomain.lean"
+    },
+    "state": "CLOSED",
+    "title": "[Merged by Bors] - feat: the domain of two coprime polynomials in the closed disc is a finite union of holed discs"
+  },
+  "repository": "TauCetiProject/TauCeti",
+  "schema": "tauceti-work-recovery-disposition/v1",
+  "search": {
+    "records": [
+      {
+        "local_head": "a061077ccf95d1905daecea8539fa6fe7fbffe98",
+        "matching_patches": [],
+        "path": "/home/kim/TauCetiWorker/state/worker2/recovery/6b44c6a5035a456a881b69fa3dc007cf/manifest.json",
+        "pr": null,
+        "pr_commit_tip_matches": []
+      },
+      {
+        "local_head": "d386a66fd992cade2141b7194fcfb1f284127c36",
+        "matching_patches": [],
+        "path": "/home/kim/TauCetiWorker/state/worker3/recovery/e88ad705150b49a8a0824215375cb303/manifest.json",
+        "pr": null,
+        "pr_commit_tip_matches": []
+      }
+    ],
+    "retained_checkouts": [],
+    "root": "/home/kim/TauCetiWorker",
+    "scope": "Main worker state and checkout trees on this host only; no claim about other hosts or historical artifacts"
+  },
+  "sources": [
+    "https://github.com/TauCetiProject/TauCeti/pull/16035",
+    "https://api.github.com/repos/TauCetiProject/TauCeti/pulls/16035",
+    "https://github.com/TauCetiProject/TauCeti/blob/main/TauCeti/AlgebraicGeometry/AdicSpace/Spa/Polydisc/PolynomialDomain.lean"
+  ],
+  "state": "obsolete"
+}
