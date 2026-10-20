@@ -55,6 +55,7 @@ RUN_STDLIB=(
   github_state_reconciliation.py
   github_outbox.py
   global_maintenance.py
+  shared_state_outage.py
   github_pause.py
   host_agent_preflight.py
   host_build_cache.py
@@ -64,6 +65,7 @@ RUN_STDLIB=(
   isolate_home_macos.py
   isolate_home_paths.py
   kiro.py
+  local_verification_scope.py
   ledger_blocking.py
   loop_sigterm.py
   lost_build.py

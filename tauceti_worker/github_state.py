@@ -6,14 +6,20 @@ No installation credentials leave the server. Conditional reads always contact i
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import http.client
 import json
+import math
 import os
+import random
+import re
+import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 from . import github_transport as transport
@@ -22,6 +28,126 @@ from .paths import ensure_ssl_cert_file
 
 class StateQueryError(ValueError):
     pass
+
+
+DEPENDENCY = "github-state"
+# Reasons a caller can act on. Authentication/configuration needs an operator; the rest recover.
+ACTIONABLE = frozenset({"client_auth_configuration"})
+_last_failure: contextvars.ContextVar[dict | None] = contextvars.ContextVar("github_state_failure", default=None)
+
+
+class _Failure(OSError):
+    def __init__(self, reason: str, detail: str = "", *, status: int | None = None, retry_after: float | None = None):
+        super().__init__(reason)
+        self.reason, self.detail, self.status, self.retry_after = reason, detail, status, retry_after
+
+
+def last_failure() -> dict | None:
+    """The structured cause of this context's most recent unavailable read, or None after success."""
+    return _last_failure.get()
+
+
+_SECRET_FIELD = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|bearer|basic|token|access_token|password|secret|api[_-]?key|cookie)\b"
+    r"[\"']?\s*[:=]?\s*(?:(?:bearer|basic|token)\s+)?[\"']?[^\s\"',;}]+"
+)
+# Opaque credential-shaped runs (GitHub tokens, JWTs, base64 blobs); diagnostics never need them.
+_OPAQUE = re.compile(r"[A-Za-z0-9_\-+/=.]{24,}")
+
+
+def _sanitize(text, *secrets) -> str:
+    """Bounded printable diagnostics with credential fields and credential-shaped values removed."""
+    text = str(text or "")
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = _SECRET_FIELD.sub(lambda m: m.group(1) + " [redacted]", text)
+    text = _OPAQUE.sub("[redacted]", text)
+    return re.sub(r"\s+", " ", re.sub(r"[^\x20-\x7e]", " ", text)).strip()[:200]
+
+
+MAX_RETRY_AFTER = 300.0
+
+
+def _retry_after(value) -> float | None:
+    """A server's Retry-After seconds, finite and capped so a bad header cannot park recovery."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER) if math.isfinite(seconds) else None
+
+
+def _classify(error, token) -> _Failure:
+    """Map one attempt's exception to a bounded, credential-free reason."""
+    if isinstance(error, _Failure):
+        return error
+    if isinstance(error, urllib.error.HTTPError):
+        try:
+            body = error.read(512).decode("utf-8", "replace")
+            message = json.loads(body).get("error", body) if body.lstrip().startswith("{") else body
+        except Exception:
+            message = ""
+        finally:
+            error.close()
+        retry_after = _retry_after((error.headers or {}).get("Retry-After"))
+        return _Failure(
+            f"http_{error.code}", _sanitize(message or error.reason, token), status=error.code, retry_after=retry_after
+        )
+    if isinstance(error, urllib.error.URLError):
+        inner = error.reason
+        if isinstance(inner, (TimeoutError, socket.timeout)) or "timed out" in str(inner):
+            return _Failure("timeout", _sanitize(inner, token))
+        return _Failure("connection", _sanitize(inner, token))
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return _Failure("timeout", _sanitize(error, token))
+    if isinstance(error, (ConnectionError, http.client.IncompleteRead, http.client.RemoteDisconnected)):
+        return _Failure("connection", _sanitize(type(error).__name__, token))
+    if isinstance(error, http.client.HTTPException):
+        return _Failure("invalid_response", _sanitize(type(error).__name__, token))
+    if isinstance(error, OSError):
+        return _Failure("connection", _sanitize(error, token))
+    return _Failure("invalid_response", _sanitize(type(error).__name__, token))
+
+
+def _unavailable(repo, operation, reason, detail="", *, status=None, retry_at=None, circuit="closed", cached=None):
+    record = {
+        "dependency": DEPENDENCY,
+        "repository": repo,
+        "operation": operation,
+        "reason": reason,
+        "detail": detail,
+        "status": status,
+        "retry_at": retry_at,
+        "circuit": circuit,
+        "actionable": reason in ACTIONABLE,
+    }
+    if cached:
+        # Provenance of the last complete response; it supports planning, never current-state claims.
+        payload = cached["payload"]
+        record["cached"] = {
+            "revision": payload.get("revision"),
+            "observed_at": payload.get("observed_at"),
+            "verified_at": payload.get("verified_at"),
+            "stored_at": cached.get("stored_at"),
+        }
+    _last_failure.set(record)
+    transport.event(
+        {
+            "kind": "gateway_fallback",
+            "operation": operation,
+            "reason": "circuit_open" if circuit == "open" else reason,
+            **({"cause": reason} if circuit == "open" else {}),
+            **({"status": status} if status else {}),
+            **({"detail": detail} if detail else {}),
+        }
+    )
+    return False, None
+
+
+def _backoff(failures: int) -> float:
+    """Bounded, jittered open interval so machines sharing one service do not probe in lockstep."""
+    return min(300.0, 30.0 * (1 << min(max(failures - 3, 0), 4))) * random.uniform(0.8, 1.2)
 
 
 def _url() -> str | None:
@@ -47,11 +173,75 @@ def _wire(data, operation):
     return data
 
 
+def _cached(path: Path, binding: dict):
+    """The last completely assembled response for exactly this query and client identity."""
+    try:
+        cached = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(cached, dict)
+        or cached.get("query") != binding
+        or not isinstance(cached.get("payload"), dict)
+        or cached["payload"].get("status") != "ok"
+        or "revision" not in cached["payload"]
+        or "cursor" in cached["payload"]
+    ):
+        return None  # Unbound, partial or legacy entries never answer a conditional read.
+    return cached
+
+
+PROBE_LEASE = 15.0
+
+
+def _circuit_update(circuit: Path, change, *args) -> None:
+    """Apply one serialized circuit transition; local storage failure never blocks a read."""
+    try:
+        with transport.locked(circuit.with_suffix(".lock"), timeout=1):
+            try:
+                state = json.loads(circuit.read_text())
+            except (OSError, ValueError):
+                state = {}
+            new = change(state, *args)
+            if new is not state:
+                transport.atomic(circuit, new)
+    except OSError:
+        pass
+
+
+def _renew(state, probe):
+    return {**state, "probe_until": time.time() + PROBE_LEASE} if state.get("probe") == probe else state
+
+
+def _recovered(state, started, probe, key):
+    if state.get("failed_at", 0) > started and (probe is None or state.get("probe") != probe):
+        return state  # A request that began before a newer recorded failure is not evidence of recovery.
+    now = time.time()
+    cooling = {k: v for k, v in state.get("coverage_until", {}).items() if k != key and v > now}
+    return {
+        "failures": 0,
+        "until": 0,
+        **({"coverage_until": cooling, "coverage_reason": state.get("coverage_reason", "")} if cooling else {}),
+    }
+
+
+def _cooldown(state, operation, key, until, reason):
+    if operation != "survey":
+        return state
+    now = time.time()
+    active = {k: v for k, v in state.get("coverage_until", {}).items() if v > now}
+    return {**state, "coverage_until": {**active, key: until}, "coverage_reason": reason}
+
+
 def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=False, _optional=False, **args):
-    """Return (available, data). Failed transport/config/coverage falls back; bad queries raise."""
+    """Return (available, data). Failed transport/config/coverage falls back; bad queries raise.
+
+    An unavailable result records its structured cause for `last_failure()`.
+    """
     if _allow_observed and operation != "workflow_jobs":
         raise StateQueryError("observed coverage is available only for workflow jobs")
     began = time.monotonic()
+    _last_failure.set(None)
     if transport.direct_reads():
         return False, None
     url = _url()
@@ -62,11 +252,21 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
         token = Path(os.environ["TAUCETI_GITHUB_STATE_TOKEN_FILE"]).read_text().strip()
         if not token:
             raise ValueError("empty client token")
-    except (KeyError, OSError, ValueError):
-        transport.event({"kind": "gateway_fallback", "operation": operation, "reason": "client_auth_configuration"})
-        return False, None
+    except (KeyError, OSError, ValueError) as error:
+        detail = "TAUCETI_GITHUB_STATE_TOKEN_FILE is not set" if isinstance(error, KeyError) else type(error).__name__
+        return _unavailable(repo, operation, "client_auth_configuration", detail)
     identity = hashlib.sha256((url + "\0" + token).encode()).hexdigest()
     base = transport.root() / "gateway" / identity
+    binding = {"identity": identity, "repository": repo, "operation": operation, "args": args}
+    if _allow_observed:
+        binding["allow_observed"] = True
+    key = hashlib.sha256(
+        json.dumps([repo, operation, args, bool(_allow_observed)], sort_keys=True).encode()
+    ).hexdigest()
+    cached_path = base / "responses" / (key + ".json")
+    cached = _cached(cached_path, binding)
+    probe = None
+    started = time.time()
     # An unsupported repository/auth scope must not poison healthy TauCeti reads.
     circuit = base / "circuits" / (hashlib.sha256(repo.encode()).hexdigest() + ".json")
     try:
@@ -77,23 +277,36 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 state = {}
             now = time.time()
             if state.get("until", 0) > now or state.get("probe_until", 0) > now:
-                transport.event({"kind": "gateway_fallback", "operation": operation, "reason": "circuit_open"})
-                return False, None
+                # Keep the cause that opened the circuit; "circuit open" alone is not actionable.
+                return _unavailable(
+                    repo,
+                    operation,
+                    state.get("reason", "transport"),
+                    state.get("detail", ""),
+                    status=state.get("status"),
+                    retry_at=max(state.get("until", 0), state.get("probe_until", 0)),
+                    circuit="open",
+                    cached=cached,
+                )
+            if operation == "survey" and state.get("coverage_until", {}).get(key, 0) > now:
+                # The global inventory is backfilling; peers share one cooldown instead of each asking.
+                return _unavailable(
+                    repo,
+                    operation,
+                    "coverage_unavailable",
+                    state.get("coverage_reason", ""),
+                    retry_at=state["coverage_until"][key],
+                    cached=cached,
+                )
             if state.get("failures", 0) >= 3:
-                # Only one process probes recovery; peers use direct access during that probe.
-                transport.atomic(circuit, {**state, "probe_until": now + 6})
+                # Only one process probes recovery; peers wait for that probe's lease, which the
+                # prober renews page by page so a long healthy read never admits a second probe.
+                probe = uuid.uuid4().hex
+                transport.atomic(circuit, {**state, "probe": probe, "probe_until": now + PROBE_LEASE})
     except OSError:
         state = {}
-    key = hashlib.sha256(
-        json.dumps([repo, operation, args, bool(_allow_observed)], sort_keys=True).encode()
-    ).hexdigest()
-    cached_path = base / "responses" / (key + ".json")
-    try:
-        cached = json.loads(cached_path.read_text())
-    except (OSError, ValueError):
-        cached = None
     deadline = time.monotonic() + 5
-    last = "transport"
+    last = _Failure("transport")
     for attempt in range(2):
         rows, cursor, cursors, revision = [], None, set(), None
         unchanged = False
@@ -116,61 +329,62 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                     with urllib.request.urlopen(
                         request, timeout=max(0.1, min(2.4, deadline - time.monotonic()))
                     ) as response:
-                        payload = json.load(response)
+                        try:
+                            payload = json.load(response)
+                        except ValueError:
+                            raise _Failure("invalid_response", "malformed JSON") from None
                         etag = response.headers.get("ETag")
                 except urllib.error.HTTPError as error:
-                    if error.code == 304 and cached:
+                    if error.code == 304 and cached and not cursor:
                         payload = cached["payload"]
                         etag = cached.get("etag")
                         unchanged = True
                     elif error.code == 400:
                         if _optional:
-                            transport.event(
-                                {
-                                    "kind": "gateway_fallback",
-                                    "operation": operation,
-                                    "reason": "unsupported_service_version",
-                                }
+                            return _unavailable(
+                                repo, operation, "incompatible_protocol", "unsupported service version", status=400
                             )
-                            return False, None
                         raise StateQueryError(
                             "state service rejected the query; check the client/service protocol versions"
                         ) from None
                     elif error.code in (401, 403):
-                        last = "client_auth_configuration"
-                        raise OSError(last) from None
+                        raise _Failure(
+                            "client_auth_configuration", _classify(error, token).detail, status=error.code
+                        ) from None
                     else:
-                        raise
+                        raise _classify(error, token) from None
                 if not isinstance(payload, dict):
-                    raise OSError("invalid service response")
+                    raise _Failure("invalid_response", "response is not an object")
                 if (
                     payload.get("version") != 1
                     or payload.get("repository") != repo
                     or payload.get("operation") != operation
                 ):
-                    raise OSError("service protocol mismatch")
+                    raise _Failure("incompatible_protocol", "service protocol mismatch")
                 accepted_observation = (
                     _allow_observed
                     and payload.get("coverage") == "webhook_observed"
                     and payload.get("complete") is False
                 )
                 if payload.get("status") != "ok" or not (payload.get("complete") is True or accepted_observation):
-                    transport.event(
-                        {
-                            "kind": "gateway_fallback",
-                            "operation": operation,
-                            "reason": payload.get("reason", "coverage_unavailable"),
-                        }
+                    # Unknown coverage is never an empty inventory, and a partial page is never cached.
+                    detail = _sanitize(payload.get("reason", ""), token)
+                    if detail == "repository_unavailable":
+                        # The service does not serve this repository to this client: a scope/config fix.
+                        return _unavailable(repo, operation, "client_auth_configuration", detail, cached=cached)
+                    retry_at = time.time() + 30 * random.uniform(0.8, 1.2)
+                    _circuit_update(circuit, _cooldown, operation, key, retry_at, detail)
+                    return _unavailable(
+                        repo, operation, "coverage_unavailable", detail, retry_at=retry_at, cached=cached
                     )
-                    return False, None
                 if revision is not None and revision != payload["revision"]:
-                    raise OSError("mixed service snapshot revisions")
+                    raise _Failure("mixed_revision", "service snapshot changed during pagination")
                 revision = payload["revision"]
                 data = payload["data"]
                 if isinstance(data, list):
                     rows.extend(data)
                 elif cursor:
-                    raise OSError("invalid paginated scalar")
+                    raise _Failure("invalid_response", "invalid paginated scalar")
                 next_cursor = payload.get("cursor")
                 if not next_cursor:
                     result = rows if isinstance(data, list) else data
@@ -180,10 +394,13 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         if unchanged:
                             os.utime(cached_path, None)
                         else:
-                            transport.atomic(cached_path, {"etag": etag, "payload": complete})
-                        transport.atomic(circuit, {"failures": 0, "until": 0})
+                            transport.atomic(
+                                cached_path,
+                                {"etag": etag, "payload": complete, "query": binding, "stored_at": time.time()},
+                            )
                     except OSError:
                         pass  # A healthy mirror remains usable when the local cache is unavailable.
+                    _circuit_update(circuit, _recovered, started, probe, key)
                     transport.event(
                         {
                             "kind": "gateway_read",
@@ -196,16 +413,19 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                             "verified_at": payload.get("verified_at"),
                         }
                     )
+                    _last_failure.set(None)
                     wire = _wire(result, operation)
                     return True, {**complete, "data": wire} if _with_metadata else wire
                 if next_cursor in cursors or time.monotonic() >= deadline:
-                    raise OSError("service pagination failed")
+                    raise _Failure("pagination", "repeated cursor or stalled pagination")
                 if len(cursors) >= 10000:
-                    raise OSError("service pagination exceeded its page bound")
+                    raise _Failure("pagination", "page bound exceeded")
                 # A responsive server with a large, stable snapshot is operable.
                 # Bound each request and stalled interval rather than treating
                 # a healthy multi-page response as an outage after five seconds.
                 deadline = time.monotonic() + 5
+                if probe:
+                    _circuit_update(circuit, _renew, probe)
                 cursors.add(next_cursor)
                 cursor = next_cursor
         except StateQueryError:
@@ -218,21 +438,33 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
             AttributeError,
             http.client.HTTPException,
             urllib.error.URLError,
-        ):
-            if time.monotonic() >= deadline or last == "client_auth_configuration":
+        ) as error:
+            last = _classify(error, token)
+            if time.monotonic() >= deadline or last.reason == "client_auth_configuration":
                 break
-    try:
-        with transport.locked(circuit.with_suffix(".lock"), timeout=1):
-            try:
-                state = json.loads(circuit.read_text())
-            except (OSError, ValueError):
-                state = {}
-            failures = state.get("failures", 0) + 1
-            transport.atomic(circuit, {"failures": failures, "until": time.time() + 30 if failures >= 3 else 0})
-    except OSError:
-        pass
-    transport.event({"kind": "gateway_fallback", "operation": operation, "reason": last})
-    return False, None
+    retry_at = time.time() + max(last.retry_after or 0, 5 * random.uniform(0.8, 1.2))
+
+    def failed(state):
+        nonlocal retry_at
+        failures = state.get("failures", 0) + 1
+        now = time.time()
+        until = now + max(_backoff(failures), last.retry_after or 0) if failures >= 3 else 0
+        retry_at = until or retry_at
+        # A failure from a request that is not the active probe leaves that probe's lease intact.
+        lease = {k: state[k] for k in ("probe", "probe_until") if k in state and state.get("probe") != probe}
+        return {
+            **lease,
+            "failures": failures,
+            "until": until,
+            "reason": last.reason,
+            "detail": last.detail,
+            "status": last.status,
+            "since": state.get("since") or now,
+            "failed_at": now,
+        }
+
+    _circuit_update(circuit, failed)
+    return _unavailable(repo, operation, last.reason, last.detail, status=last.status, retry_at=retry_at, cached=cached)
 
 
 def read_workflow_jobs(repo: str, run_id: int | str, *, allow_observed=False):
@@ -315,6 +547,5 @@ def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None):
         ):
             raise ValueError("invalid survey author counts")
         return True, SurveyRows(rows, counts)
-    except (ValueError, KeyError, TypeError, AttributeError):
-        transport.event({"kind": "gateway_fallback", "operation": "survey", "reason": "survey_contract_mismatch"})
-        return False, None
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        return _unavailable(repo, "survey", "incompatible_protocol", _sanitize(error))

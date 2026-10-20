@@ -54,6 +54,7 @@ from .constants import (
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
+from .github_state import StateQueryError
 from .review_state import Meta, ReviewState
 from .survey_facts import in_scope, roadmap_focuses, target_focuses
 
@@ -338,6 +339,8 @@ class Survey:
     max_open_prs: int = field(default_factory=configured_max_open_prs)
     next_auto_stage: str | None = None
     github_failed: bool = False
+    # Structured shared-state outage (github_state.last_failure()): unknown coverage, not an empty inventory.
+    dependency_wait: dict | None = None
     discovery_gaps: int = 0  # cached histories needed before ruling out global maintenance
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
@@ -648,6 +651,16 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     return due, reason
 
 
+def describe_dependency_wait(failure: dict) -> str:
+    """One bounded line naming a dependency outage's concrete cause."""
+    reason = failure.get("reason", "transport")
+    detail = failure.get("detail")
+    text = f"{failure.get('dependency', 'github-state')}: {reason}" + (f" ({detail})" if detail else "")
+    if failure.get("circuit") == "open":
+        text += "; circuit open"
+    return text
+
+
 def bust_progress_cache(cfg: Config) -> None:
     """Drop the cached `due` verdict so the next survey re-derives it.
 
@@ -811,12 +824,31 @@ def survey(
             else (False, [])
         )
         if cached_only and not available:
+            from .github_state import DEPENDENCY, last_failure
+
             sv.github_failed = True
-            sv.errors.append("global maintenance cache unavailable; waiting for the shared GitHub state service")
+            sv.dependency_wait = last_failure() or {"dependency": DEPENDENCY, "reason": "transport", "detail": ""}
+            sv.errors.append(
+                "global maintenance cache unavailable; waiting for the shared GitHub state service "
+                f"({describe_dependency_wait(sv.dependency_wait)})"
+            )
             return sv
         raw = [row["pr"] for row in compact] if available else gh.open_prs()
         if available and seed:
             seed(compact)
+    except StateQueryError as e:
+        if not cached_only:
+            raise
+        # A malformed service URL is configuration for an operator, not an outage to wait out.
+        sv.github_failed = True
+        sv.dependency_wait = {
+            "dependency": "github-state",
+            "reason": "client_auth_configuration",
+            "detail": str(e)[:200],
+            "actionable": True,
+        }
+        sv.errors.append(f"global maintenance cache unavailable ({describe_dependency_wait(sv.dependency_wait)})")
+        return sv
     except GitHubError as e:
         sv.github_failed = True
         sv.errors.append(str(e))

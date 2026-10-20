@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker.config import NoProgress
+from tauceti_worker.config import NoProgress, SharedStateUnavailable
 from tauceti_worker.github_state import SurveyRows
 from tauceti_worker.review_state import ReviewState
 from tauceti_worker.survey import PRInfo
@@ -231,7 +231,7 @@ class GlobalMaintenance(unittest.TestCase):
         with (
             patch("tauceti_worker.github_state.read_survey", return_value=(False, None)),
             patch.object(work, "roadmap_areas") as areas,
-            self.assertRaisesRegex(NoProgress, "global maintenance cache unavailable"),
+            self.assertRaisesRegex(SharedStateUnavailable, "global maintenance cache unavailable"),
         ):
             run_round(self.w, self.opts)
         areas.assert_not_called()
