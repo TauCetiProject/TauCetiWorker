@@ -206,8 +206,9 @@ def test_full_record(root):
         d_off = wr.guard(other[2], other[1])
     finally:
         del os.environ["TAUCETI_WORK_RECOVERY"]
-    check("rollback: dirty tree moved aside, not reset", d_off.ok and d_off.state == "retained")
-    check("rollback: no record written", not (other[2].state / "recovery").exists())
+    check("rollback: baseline source guard stays active", d_off.ok and d_off.record is not None)
+    check("rollback: new index stays disabled", not (other[2].state / "recovery-index").exists())
+    check("rollback: existing checkout stays in place", (other[1] / "Draft.lean").read_text() == "x\n")
 
 
 def test_commits_only(root):
@@ -237,7 +238,7 @@ def test_commits_only(root):
     )
     check("no pending refs left", git(co, "for-each-ref", "refs/tauceti-pending") == "")
     d2 = wr.guard(cfg, co)
-    check("commits only: not bundled twice", d2.ok and d2.record is None)
+    check("commits only: not bundled twice", d2.ok and d2.record == d.record)
     clone = reconstruct(origin, d.record, root / "commits", "rebuilt")
     check("bundle restores the detached commit", git(clone, "rev-parse", "HEAD").strip() == detached)
     check("bundle restores the branch commits", git(clone, "cat-file", "-t", tip).strip() == "commit")
@@ -297,10 +298,36 @@ def retained_dirs(co):
     return sorted(p for p in parent.iterdir() if p.is_dir()) if parent.is_dir() else []
 
 
+def allow_cleanup(cfg, co):
+    """Fixture-only attribution from an exited local process, never a real worker owner."""
+    owner = json.loads(
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-c",
+                "import json; from tauceti_worker.work_recovery import process_owner; print(json.dumps(process_owner()))",
+            ],
+            cwd=REPO,
+            text=True,
+        )
+    )
+    for tree in retained_dirs(co):
+        sidecar = tree.with_name(tree.name.removesuffix(".deleting") + ".owner.json")
+        value = wr.read_json(sidecar)
+        value.update(process=owner, round_id="fixture-stopped")
+        wr.atomic_json(sidecar, value)
+
+
+def prepared_summary(state_root):
+    wr.housekeep(state_root, seconds=10, entries=50000, bytes=32 * 1024 * 1024)
+    return wr.summary(state_root)
+
+
 def test_move_aside(root):
     """Whatever cannot be saved or reset safely is moved aside whole; nothing ever blocks."""
     origin, co, cfg = fixture(root / "nospace")
     make_dirty(co, root / "nospace" / "nowhere")
+    (co / ".env").unlink()  # credentials are deliberately never eligible for whole-tree deletion
     before = snapshot_tree(co)
     refs = git(co, "for-each-ref")
     real_archive = wr._archive
@@ -328,7 +355,10 @@ def test_move_aside(root):
     # The next preparation saves the retained copy (space is back) and removes it.
     subprocess.run(["git", "clone", "-q", str(origin), str(co)], check=True)
     d = wr.guard(cfg, co)
-    check("retained copy saved and removed", d.ok and not retained_dirs(co))
+    check("foreground leaves retained copy for housekeeping", d.ok and bool(retained_dirs(co)))
+    allow_cleanup(cfg, co)
+    wr.housekeep(cfg.state.parent, seconds=10, entries=50000)
+    check("retained copy saved and removed in background", not retained_dirs(co))
     records = [p for p in (cfg.state / "recovery").iterdir() if p.is_dir()]
     check("retained copy now has a record", len(records) == 1 and (records[0] / "manifest.json").exists())
     clone = reconstruct(origin, records[0], root / "nospace", "rebuilt")
@@ -374,7 +404,7 @@ def test_move_aside(root):
     rec = cfg.state / "recovery"
     rec.mkdir(parents=True, exist_ok=True)
     (rec / ".tmp-crashed-1-abcd").mkdir()
-    s = wr.summary(root / "stuck" / "state")
+    s = prepared_summary(root / "stuck" / "state")
     check("interrupted save counted incomplete", s["incomplete"] == 1 and s["records"] == 0)
 
     # Corrupt manifest and damaged payloads: neither reused nor deleted.
@@ -385,12 +415,12 @@ def test_move_aside(root):
     corrupt.mkdir(parents=True)
     (corrupt / "manifest.json").write_text("{not json")
     d = wr.guard(cfg, co)
-    check("corrupt manifest not reused", d.record is not None and d.record.name == "round-x.2")
+    check("corrupt manifest not reused", d.record is not None and d.record.name.startswith("round-x."))
     check("corrupt manifest retained", (corrupt / "manifest.json").read_text() == "{not json")
     (d.record / "untracked.tar").write_bytes(b"truncated")
     d2 = wr.guard(cfg, co)
     check("damaged record not reused", d2.record not in (None, d.record) and (d.record / "manifest.json").exists())
-    check("summary counts corrupt and damaged", wr.summary(root / "corrupt" / "state")["corrupt"] == 2)
+    check("summary counts corrupt and damaged", prepared_summary(root / "corrupt" / "state")["corrupt"] == 2)
 
 
 def test_broken_git_state(root):
@@ -435,8 +465,9 @@ def test_broken_git_state(root):
     check("eviction fixture ready", (big / ".lake").exists())
     wr.guard(cfg, co)
     check("unsavable retained copy keeps its source", (big / "Source.lean").exists())
-    check("unsavable retained copy loses its caches", not (big / ".lake").exists())
-    check("interrupted removal finished", not doomed.exists())
+    check("unknown owner keeps its caches", (big / ".lake").exists())
+    wr.housekeep(cfg.state.parent, seconds=1)
+    check("unverified deletion marker kept", doomed.exists())
 
 
 def test_live_process(root):
@@ -465,7 +496,10 @@ def test_live_process(root):
         child.kill()
         child.wait()
     d = wr.guard(cfg, co)
-    check("process gone: retained copy removed", d.ok and not retained_dirs(co))
+    check("process gone: foreground still leaves cleanup to background", d.ok and bool(retained_dirs(co)))
+    allow_cleanup(cfg, co)
+    wr.housekeep(cfg.state.parent, seconds=10, entries=50000)
+    check("process gone: retained copy removed by housekeeping", not retained_dirs(co))
 
     _, co2, cfg2 = fixture(root / "live-clean")
     child = subprocess.Popen(["sleep", "60"], cwd=co2)

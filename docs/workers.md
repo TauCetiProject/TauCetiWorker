@@ -234,10 +234,12 @@ is open and never takes that lock itself. Independent verification job leases an
 references protect their caches and source too. An inactive checkout can be removed in full only after source recovery
 succeeds and its remaining Git state can be safely discarded. Failed source
 preservation retains source while recognized build caches can still be reclaimed.
-Each daily pass inspects at most three retained checkouts per worker; a local cursor
-moves past uncertain candidates so they cannot starve others. Stashes, additional
-Git refs (including cloned tags), reflog-only commits and credential-like files
-keep their checkout when the recovery record cannot capture them. This is generated
+The daily collector registers retained checkout roots using metadata only. Ordinary
+activity housekeeping owns their resumable deletion under time, entry and byte
+budgets; uncertain candidates are skipped while unrelated work continues. It
+archives extra commit/reflog tips in existing v1 bundles. Stashes, notes, native
+Git operations and credential-like files keep their original checkout when the
+recovery format cannot capture them. This is generated
 data retention; it does not discard uncaptured Git history to meet an age target.
 Credentials, review outboxes, source recovery, usage journals and budget accounting
 are preserved. Existing installations get one 72-hour grace

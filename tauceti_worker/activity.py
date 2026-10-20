@@ -656,6 +656,10 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 _bors(db, errors)
             from . import shared_mathlib, work_recovery
 
+            try:
+                work_recovery.housekeep()
+            except Exception as error:
+                errors.append(f"Recovery housekeeping deferred ({type(error).__name__}); retryable jobs retained")
             sharing = shared_mathlib.summary()
             value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
             value["all"]["shared_mathlib"] = sharing

@@ -51,8 +51,10 @@ left the source. Each record is private to its worker (mode `0700`/`0600`):
 The worker writes into a `.tmp-*` directory and fsyncs every file and the
 directory. It then renames the directory into place and fsyncs the parent.
 `manifest.json` is written last and lists each payload's size and digest. A
-record is trusted (for reuse, for exempting its commits, or for restore) only
-when every payload matches; a damaged record is reported as corrupt, kept, and
+record is initially trusted only when every payload matches; restore always repeats
+exact digest validation. Warm preparation may reuse that verification receipt while
+the manifest and every payload retain the same device, inode, size, mtime and ctime.
+A damaged record is reported as corrupt, kept, and
 replaced by a fresh copy. An interrupted save leaves at most a `.tmp-*`
 directory, which status reports as incomplete. Nothing in `state/*/recovery`
 is ever deleted automatically.
@@ -74,8 +76,8 @@ stop a worker. Preparation always saves first and then always continues:
 - **Anything unpublished** (commits, edits, untracked or ignored source): saved
   in a durable record. A final inspection then checks that the checkout still
   matches it; a write that landed after the snapshot is saved too. The checkout
-  is then reset in place. Commits are bundled once and marked
-  `refs/tauceti/preserved/<record>/...`.
+  is then reset in place. The same source fingerprint reuses its completed descriptor;
+  `refs/tauceti/preserved/<record>/...` remain available for compatibility.
 - **A process still uses the checkout** (Linux `/proc` cwd/root/open files,
   even when the checkout is clean), saving fails (no space, permissions, the
   archive bound, a git error), the tree keeps changing, or the git state is
@@ -84,16 +86,74 @@ stop a worker. Preparation always saves first and then always continues:
   `<checkout parent>/retained-checkouts/<name>-<time>-<id>`, a same-directory rename that
   needs no free space, and preparation clones a fresh checkout. Any process
   still working in the old one keeps working there.
-- **Retained checkouts clean themselves up**: each later preparation handles up
-  to three of them. A copy nothing uses any more is saved into a record,
-  re-inspected to confirm nothing changed, renamed to `*.deleting` and removed;
-  an interrupted removal is finished later. A copy that cannot be saved keeps
-  its source but has its dependency and build caches evicted, so retained
-  checkouts do not fill the disk with build output.
+- **Retained checkouts clean themselves up in activity housekeeping**. Work-start
+  preparation never walks or removes historical trees. The ordinary activity
+  collector normally uses a shared 250 ms, 4,096-entry, 16 MiB read and 256 MiB
+  removal budget per tick. Low free space raises removal to 1 GiB and 8,192 entries.
+  A source candidate that exhausts its allowance gets persisted backoff (60–1,800
+  seconds) and a capped allowance on a later tick: at most 30 seconds, 262,144
+  entries and 1 GiB of reads. Effective limits are included in prepared timing
+  receipts. Cleanup never holds the worker round lock or reserves worker admission.
+  Destructive traversal persists its depth-first cursor, including partial
+  truncation of uniquely owned large cache files. Directory descriptors are reused
+  within a slice, and changed directories are fsynced once per slice. Metadata enumeration resumes
+  between collector ticks; a collector restart safely restarts the read-only sweep.
+  Filesystem calls themselves are not preemptible.
+- **Ordinary ownership and live references protect each candidate**, including cache
+  eviction and resumed `*.deleting` trees. The recorded owner must have stopped;
+  live users, surviving members of a recorded ordinary round session on the same
+  boot, and visible mounts withhold the candidate. Independently started tool
+  sessions remain covered by the best-effort cwd/open-file checks; this is no
+  guarantee of collecting deliberately detached descendants. Process birth checks do not
+  require PID namespace APIs. Repair-cache cleanup takes the consumer's existing
+  per-record recovery lock and checks its actual-use generation. No cleanup takes
+  the worker round lock. Unknown or unreadable ownership or mount information skips
+  that candidate and leaves a retryable next action while other work continues.
+  Old containment markers and proofs are ignored. Housekeeping neither creates
+  nor maintains them.
+  Traversal never follows symlinks or crosses filesystems. A deletion marker alone
+  never authorizes destruction. Known untracked top-level caches can be reclaimed
+  incrementally; tracked cache-named paths remain source. Before removing source,
+  housekeeping saves a descriptor, re-inspects the source, validates the descriptor
+  exactly, and journals the deletion before rename. Credentials, native Git
+  operation metadata, stash and notes keep the original tree intact. Other reflog-only
+  and extra-ref commit tips are included in the existing v1 bundle before the tree
+  is removed, including amended-away and force-pushed heads. This history inspection
+  happens only in bounded housekeeping; work-start preparation never walks retained
+  Git histories. Extra history is capped at 4,096 tips and descriptor metadata at
+  4 MiB; exceeding either bound parks the candidate before publishing a descriptor.
+  A larger source candidate stays recoverable while its next bounded allowance is
+  scheduled. Candidates beyond the maximum allowance keep their source and
+  retryable disposition. Unarchived metadata parks only that candidate, keeping
+  its last source allowance; subsequent ticks check a fixed set of metadata stamps
+  until they change or the daily retry is due. A missing or indirect `.git` never runs
+  Git discovery against an enclosing repository; Git commands have a checkout-parent
+  ceiling and cache removal requires the expected top-level checkout. No marker removal is needed after failures.
 
 Preparation refuses only when a checkout can be neither saved nor moved aside,
 and the next round simply retries. Nothing in this path asks an operator to do
 anything; `tauceti recovery` only lists what was saved.
+
+## Preservation lookup
+
+`state/<worker>/recovery-index/<source-key>.json` is a disposable, atomically
+replaced, versioned index. Its key includes repository identity and the complete
+source fingerprint; its checksum covers the record identity, canonical manifest contents and verified
+file metadata. A separate entry for the unpublished commit set reuses its verified
+bundle when a clean checkout moves HEAD while retaining the same local branches.
+It also binds the descriptor's original source fingerprint, so replacing a manifest
+invalidates the artifact receipt. A warm lookup reads one entry, its manifest, and at most five file
+metadata stamps. It does not scan other descriptors, hash historical archives, or
+walk retained caches. Source inspection still measures the current candidate.
+
+A missing, interrupted, corrupt or incompatible entry is a cache miss. Preparation
+saves the current source again rather than trusting the entry or rebuilding history
+inline. Background metadata reconciliation can discover existing descriptors, but
+registers them as **unverified**: first reuse must verify every payload and establish
+an unchanged before/after metadata receipt. Changed or missing payload evidence
+likewise requires exact verification or a fresh save. Descriptors, including
+incomplete or damaged ones, are never automatically removed. The preservation
+format remains `tauceti-work-recovery/v1`.
 
 ## Publication
 
@@ -123,20 +183,38 @@ tar -xf <record>/untracked.tar
 
 The activity collector adds local counts to the prepared summaries: records,
 checkouts moved aside, incomplete and corrupt, with reasons. `tauceti activity`
-and `tauceti workers status` show them, and fleet summaries only add host counts.
-Status never reads GitHub.
+and `tauceti workers status` show them, and fleet summaries aggregate host counts.
+Prepared data includes cleanup backlog,
+oldest age and next-action counts, the last preparation's elapsed seconds, Python
+source/payload read/hash bytes and Git output bytes, metadata work units, and the
+last housekeeping tick's elapsed/read/removal work. These counters measure the
+instrumented operations, not kernel-wide I/O. Inventory reconciliation is bounded;
+its record counts publish after a completed sweep, while cleanup receipts publish
+separately. Failed items add a bounded reason/error count while inventory proceeds;
+index publication contention does not freeze prepared counts. Status only reads
+prepared JSON and never reads GitHub or inspects trees.
 
 ## Rollout and rollback
 
 Rollout does not reset existing checkouts. On a worker's first preparation, its
-local-only commits are bundled once and any dirty tree is saved before the
-reset. Records left `recovery-blocked` by the first version of this guard are
-marked `superseded` when their checkout is next prepared.
+clean local-only commits reuse their completed bundle; any dirty tree is saved
+before the reset, with independent payloads for each changed source snapshot.
+Historical `recovery-blocked` dispositions are diagnostic only and never gate later
+work starts.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
-table). Preparation then writes no records and skips inspection. A clean
-checkout is reused as before, but one that `git status` reports dirty is still
-moved aside rather than reset. Existing records are never deleted.
+table). This stops index lookup/publication and background housekeeping, including
+resumed deletions and historical reconciliation. The existing source-saving guard
+stays active: current unpublished source is saved directly in v1 descriptors before
+a reset, without consulting the index. Healthy checkouts and their caches remain
+in place; an unsavable or live candidate is still moved aside intact. With index
+reuse disabled, a clean leftover branch reuses one exactly validated descriptor
+named by this checkout's own preserved refs. Only one candidate bundle is validated;
+no historical payload inventory is hashed. Bundle prerequisites must still be
+published; a rewritten base triggers a fresh self-contained save. Changed dirty source still gets its own
+self-contained descriptor. Rollback does not repeatedly clone or retain pristine
+checkouts and large private caches.
+Existing descriptors, retained trees, deletion journals and indexes remain intact.
 
 ## Scope
 
@@ -253,7 +331,7 @@ and current-head integration under the same publication checks.
 state/reason; status does not read GitHub. The fresh-repair fence is worker-local;
 shared claims and the expected-head CAS coordinate writers across the fleet. For the historical PR16035 case, see
 [evidence/issue-310-pr16035-disposition.json](evidence/issue-310-pr16035-disposition.json).
-Terminal and blocked recovery evict rebuildable caches from its isolated/restoration clones;
+Terminal and blocked recovery queue bounded housekeeping for rebuildable caches in isolated/restoration clones;
 source, Git history, immutable records and outboxes remain archived.
 
 The production disposition is also retained under the main worker state tree's
@@ -262,3 +340,42 @@ The production disposition is also retained under the main worker state tree's
 Set `TAUCETI_AUTO_RECOVERY=off` to stop starting recovery invocations. An invocation
 already owning work finishes; its checkout, checkpoint, receipt and outbox are
 preserved. This switch does not disable the K0 source-preservation guard.
+
+## K3 validation and canary evidence
+
+`tests/recovery_maintenance.py` uses disposable local Git repositories and isolated
+state/activity/cache roots. The growing-history fixture adds 32 MiB of descriptors
+and 32 GiB of sparse retained caches; warm preparation retains identical read, hash
+and metadata counts (44 source hash bytes, 35 metadata work units in the fixture).
+Tests also reconstruct saved source after interrupted descriptor publication and
+recursive deletion, invalidate corrupt indexes and missing/same-size changed
+payloads, resume entry/byte budgets across preparer restarts, preserve unknown/live
+owners and mounts, and keep tracked cache-named source and symlink targets intact.
+Production-default fixtures preserve 21 MiB of source, revalidate a changed large
+payload receipt and reclaim mode-000 overlay directories. Further fixtures show
+that unavailable namespace APIs and stale/malformed containment markers cannot
+block preparation or unrelated cleanup, a live recovery lock protects its cache,
+a new actual-use generation invalidates old cache cleanup, and source, credentials,
+Git operation metadata and accounting survive. Old-tree cleanup runs while a new
+round holds its admission lock.
+
+These are implementation fixtures, not measured production slowdown or recovery.
+No worker deployment or naturally occurring canary sample is recorded here. After
+normal rollout, capture prepared preparation and cleanup timing/backlog receipts
+from naturally occurring rounds. Do not launch paid work or synthetic CI for a
+sample. Issue closure establishes implementation evidence only; capacity and the
+$100/hour replenishment grant remain unchanged.
+
+The integration baseline is [PR #366](https://github.com/TauCetiProject/TauCetiWorker/pull/366),
+implementing [#364](https://github.com/TauCetiProject/TauCetiWorker/issues/364),
+established the containment-free baseline used here. Storage expiry, cache recycling
+and log rotation belong to [PR #357](https://github.com/TauCetiProject/TauCetiWorker/pull/357).
+This change adds no expiry policy, namespace lifecycle or deployment action.
+The retained-checkout roots registered here, `.deleting` trees and
+`recovery-cleanup/jobs` journals have one collector owner: this housekeeping path.
+The storage collector registers retained roots without enumerating or deleting
+those trees; activity housekeeping uses the existing `.recovery-housekeeping.lock`
+and journals. Its `save_for_cleanup` helper inspects only the current candidate
+and uses indexed descriptors, preserving storage expiry/rotation for other roots.
+Pending verification references are checked within housekeeping budgets and
+withhold only their candidate. Neither path restores historical preservation scans.
