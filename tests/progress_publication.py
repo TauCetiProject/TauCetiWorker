@@ -126,6 +126,19 @@ with (
         else:
             raise AssertionError("author change must not publish")
         run.assert_not_called()
+    # Malformed receipt fields never wedge survey selection or delete prose.
+    marker = work / "publication.json"
+    saved = marker.read_text()
+    for malformed in ({"files": original}, {"files": original, "actor": "author", "retry_at": "later"}):
+        marker.write_text(json.dumps(malformed))
+        assert publication.retained(cfg) is None
+        assert progress_due(cfg, worker.counters)[0] is False
+    marker.write_text(saved)
+    plan_bytes = (work / "plan.json").read_bytes()
+    (work / "plan.json").write_text("[]")
+    assert publication.retained(cfg) is None
+    assert progress_due(cfg, worker.counters)[0] is False
+    (work / "plan.json").write_bytes(plan_bytes)
     # Receipt corruption or edited bodies preserve everything for recovery.
     (work / "status-body.md").write_text("changed")
     with patch.object(wu.subprocess, "run") as run:

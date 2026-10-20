@@ -89,11 +89,11 @@ def fork_read(upstream, env):
             return result.stdout
 
         try:
-            return discover(read, upstream)
+            return {**discover(read, upstream), "observed_at": time.time()}
         except (ForkUnknown, OSError, subprocess.SubprocessError, GitHubUnavailable):
             return None
 
-    return tr.shared_read(["publication-fork-v1", upstream.lower()], fetch, ttl=60, identity=tr.scope(env))
+    return tr.shared_read(["publication-fork-v2", upstream.lower()], fetch, ttl=60, identity=tr.scope(env))
 
 
 def prepare(argv, env, cwd=None, input=None):
@@ -415,8 +415,9 @@ def reconcile(value, env):
         # Two complete public-visibility observations, separated by a grace
         # period, authorize at most one replay. Persist the bound across crashes.
         now = time.time()
-        first = value.setdefault("fork_absent_since", now)
-        if now - first < 300 or now - value.get("updated", value.get("created", now)) < 300:
+        observed = evidence["observed_at"]
+        first = value.setdefault("fork_absent_since", observed)
+        if observed - first < 300 or now - value.get("updated", value.get("created", now)) < 300:
             return None
         return False if value.get("fork_retries", 0) < 1 else None
     if args[:2] == ["pr", "close"]:

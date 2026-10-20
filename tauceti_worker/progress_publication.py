@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import time
 
 from . import github_outbox as outbox
@@ -20,7 +21,9 @@ def fingerprints(work):
             raise ValueError("empty prepared report")
         values[name] = hashlib.sha256(body).hexdigest()
     plan = json.loads((work / "plan.json").read_text())
-    if not all(plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "status_path", "progress_path")):
+    if not isinstance(plan, dict) or not all(
+        plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "status_path", "progress_path")
+    ):
         raise ValueError("incomplete prepared plan")
     return values
 
@@ -33,7 +36,16 @@ def retained(cfg):
         hashes = fingerprints(work)
         if receipt.exists():
             value = json.loads(receipt.read_text())
-            return value if value["files"] == hashes else None
+            if (
+                isinstance(value, dict)
+                and isinstance(value.get("actor"), str)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", value["actor"])
+                and isinstance(value.get("retry_at", 0), (int, float))
+                and (value.get("version") is None or isinstance(value["version"], str))
+                and value.get("files") == hashes
+            ):
+                return value
+            return None
         done = work / "publication-done.json"
         if done.exists() and json.loads(done.read_text()).get("files") == hashes:
             return None
@@ -53,7 +65,7 @@ def retained(cfg):
             who = value.get("context", {}).get("actor") or env.get("TAUCETI_GITHUB_ACCOUNT")
             if who:
                 return {"actor": who.lower(), "files": hashes, "legacy": True, "retry_at": 0}
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     return None
 

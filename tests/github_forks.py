@@ -154,6 +154,16 @@ with (
     with patch.object(tr, "execute", return_value=result(page(fork=False))) as read:
         assert outbox.drain(env) == [path.stem] and read.call_count == 1
     value = json.loads(path.read_text())
+    stale = {
+        "actor": "author",
+        "upstream_id": "UPSTREAM",
+        "fork": None,
+        "absent": True,
+        "observed_at": time.time() - 60,
+    }
+    with patch.object(outbox, "fork_read", return_value=stale):
+        check = {**value, "fork_absent_since": time.time() - 301}
+        assert outbox.reconcile(check, env) is None, "cached observations must be separated by the full grace period"
     value.update(fork_absent_since=time.time() - 301, retry_at=0)
     tr.atomic(path, value)
     with patch.object(tr, "execute", return_value=subprocess.CompletedProcess([], 1, "", "lost response")) as write:
