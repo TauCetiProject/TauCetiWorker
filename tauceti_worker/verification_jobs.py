@@ -37,10 +37,17 @@ def copy_file(source, target):
 def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """Copy exact sources/index and warm build caches without editing the agent's index."""
     from .verification import Incomplete
-    from .verification_storage import CopyBudget, CopyLimit, reserve
+    from .verification_storage import CopyBudget, CopyLimit, reserve, settle
 
     try:
-        budget = CopyBudget(reserve(target.parent.parent, target.name))
+        try:
+            amount = reserve(target.parent.parent, target.name, source_only=not include_builds)
+        except Pressure as error:
+            if not include_builds or error.reason != "capacity":
+                raise
+            include_builds = False
+            amount = reserve(target.parent.parent, target.name, source_only=True)
+        budget = CopyBudget(amount, target)
 
         def copy(source, dest):
             budget.charge(Path(source))
@@ -110,6 +117,7 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
+        settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
     except CopyLimit:
         if not include_builds:
             raise
@@ -254,6 +262,11 @@ def finish_job(verification):
             else:
                 verification.receipt.update(error=str(error), incomplete_reason="preservation")
                 resumable = False
+    if storage_wait and not job.get("isolated"):
+        # A live or container-only checkout is not an independent continuation workspace.
+        # Permit a fresh exact-source invocation after reclamation rather than deduplicating
+        # it against a pending job the supervisor cannot safely execute.
+        resumable = False
     if status in {"success", "failed"} or not resumable:
         job["status"] = status
         job["error"] = verification.receipt.get("error")
@@ -261,7 +274,12 @@ def finish_job(verification):
         path.unlink(missing_ok=True)
         if status == "incomplete":
             verification.receipt.update(
-                result_type="incomplete", next_action="repair verification inputs and invoke verify again"
+                result_type="incomplete",
+                next_action=(
+                    "reclaim verification storage and retry verify in this workspace"
+                    if storage_wait
+                    else "repair verification inputs and invoke verify again"
+                ),
             )
     else:
         job.update(

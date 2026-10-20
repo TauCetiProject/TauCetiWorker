@@ -506,6 +506,8 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
         "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
+        "On disk-pressure, preserve edits; a pending result with a continuation job belongs to the supervisor. "
+        "An incomplete result without a continuation needs a later invocation in the preserved workspace; do not spin on unchanged checks. "
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
         "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
         "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
@@ -2266,8 +2268,10 @@ def run_in_bubble(
         for name in (
             "STORAGE_BYTES",
             "CANDIDATE_BYTES",
+            "SOURCE_CANDIDATE_BYTES",
             "CHECKPOINT_BYTES",
             "MIN_FREE_BYTES",
+            "MIN_FREE_PERCENT",
             "COMPLETED_CACHE_SECONDS",
             "IDLE_CACHE_SECONDS",
         ):

@@ -361,6 +361,7 @@ class Verification:
         self.live_lease = None
         self.job = job
         self.storage_monitor = None
+        self.storage_lease = None
         self.installations = Installations(
             self.state,
             digest=digest,
@@ -682,6 +683,20 @@ class Verification:
 
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 previous[sig] = signal.signal(sig, interrupted)
+            if self.root.parent == self.state / "verification-candidates":
+                from .retention import locked
+                from .verification_storage import Monitor, reserve
+
+                # A direct CLI invocation in an older candidate can create a new job ID.
+                # Protect the actual workspace independently of whichever job refers to it.
+                self.storage_lease = locked(self.state / "verification-storage" / f"{self.root.name}.lock")
+                try:
+                    self.storage_lease.__enter__()
+                except BlockingIOError:
+                    self.storage_lease = None
+                    raise Pressure("candidate storage is being reclaimed; retry verification") from None
+                reserve(self.state, self.root.name)
+                self.storage_monitor = Monitor(self.state, self.root.name)
             raw = self.base_arg or os.environ.get("TAUCETI_VERIFY_BASE") or local_main(self.root)
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
@@ -693,7 +708,7 @@ class Verification:
 
             self.job = prepare_job(self, dict(sources=candidate_sources))
             self.receipt["job"] = self.job["id"]
-            if self.job.get("isolated"):
+            if self.job.get("isolated") and self.storage_monitor is None:
                 from .verification_storage import Monitor
 
                 self.storage_monitor = Monitor(self.state, self.job["id"])
@@ -784,6 +799,8 @@ class Verification:
                 self.index_success()
             # Recompute bytes, pins, dependencies, toolchain, environment and verifier after all tools exit.
             self.validate_inputs(inputs, full=True)
+            if self.storage_monitor is not None:
+                self.storage_monitor.finish()
             self.receipt.update(status="success", ended_at=time.time())
             self.index_success()
         except subprocess.CalledProcessError as error:
@@ -794,7 +811,13 @@ class Verification:
                 error=f"command exited {error.returncode}: {error.cmd}",
             )
         except Pressure as error:
-            self.receipt.update(status="incomplete", error=str(error), incomplete_reason="disk-pressure")
+            self.receipt.update(
+                status="incomplete",
+                error=str(error),
+                incomplete_reason="disk-pressure",
+                result_type="incomplete",
+                next_action="reclaim verification storage and retry verify in this workspace",
+            )
         except Incomplete as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason=error.reason)
         except (Die, OSError, ValueError, RuntimeError) as error:
@@ -816,6 +839,8 @@ class Verification:
             self.live_lease.close()
             if self.storage_monitor is not None:
                 self.storage_monitor.close()
+            if self.storage_lease is not None:
+                self.storage_lease.__exit__(None, None, None)
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
             try:
@@ -824,13 +849,15 @@ class Verification:
                 self.progress(f"verification hash cache unavailable: {error}")
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
-            if self.job and self.receipt["status"] == "incomplete":
+            if self.receipt.get("result_type") == "pending":
                 report_runtime(
                     "verification-pending",
                     verification_phase=None,
                     verification_job=self.job["id"],
                     detail="durable verification job retained for mechanical continuation",
                 )
+            elif self.receipt["status"] == "incomplete":
+                report_runtime("verification-incomplete", verification_phase=None, detail=self.receipt.get("error"))
             else:
                 report_runtime("working", verification_phase=None)
         return self.receipt
@@ -877,38 +904,66 @@ class Verification:
 
     def checkpoint_sources(self, inputs):
         """Preserve pre-verification Bubble edits before its disposable container can disappear."""
+        from .retention import locked
+        from .verification_storage import LimitedWriter, release, reserve_checkpoint, settle
+
         key = digest(dict(base=self.base, sources=inputs["sources"]))
         target = self.state / "verification-checkpoints" / key
-        if not (target / "checkpoint.json").exists():
-            from .verification_storage import LimitedWriter, reserve_checkpoint
-
-            limit = reserve_checkpoint(self.state, key)
-            target.mkdir(mode=0o700, parents=True, exist_ok=True)
-            patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
-            names = sorted(untracked(self.root))
-            size = len(patch) + sum((self.root / name).lstat().st_size + 1024 for name in names)
-            if size > limit:
-                raise Pressure("source checkpoint exceeds its reserved byte budget; original source retained")
-            with (target / "source.patch").open("wb") as out:
-                out.write(patch)
-                out.flush()
-                os.fsync(out.fileno())
-            with (target / "untracked.tar").open("wb") as out:
-                with tarfile.open(fileobj=LimitedWriter(out, limit - len(patch)), mode="w") as archive:
-                    for name in names:
-                        archive.add(self.root / name, arcname=name, recursive=False)
-            with (target / "untracked.tar").open("rb") as source:
-                os.fsync(source.fileno())
-            atomic(
-                target / "checkpoint.json",
-                dict(
-                    base=self.base,
-                    root=str(self.root),
-                    patch="source.patch",
-                    untracked="untracked.tar",
-                    created_at=time.time(),
-                ),
-            )
+        try:
+            with locked(self.state / "verification-checkpoint-locks" / f"{key}.lock"):
+                if not (target / "checkpoint.json").exists():
+                    limit = reserve_checkpoint(self.state, key)
+                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    try:
+                        patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
+                        names = sorted(untracked(self.root))
+                        size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
+                        if size > limit:
+                            raise Pressure(
+                                "source checkpoint exceeds its reserved byte budget; original source retained"
+                            )
+                        with (target / "source.patch").open("wb") as out:
+                            out.write(patch)
+                            out.flush()
+                            os.fsync(out.fileno())
+                        with (target / "untracked.tar").open("wb") as out:
+                            with tarfile.open(fileobj=LimitedWriter(out, limit - len(patch)), mode="w") as archive:
+                                for name in names:
+                                    archive.add(self.root / name, arcname=name, recursive=False)
+                            out.flush()
+                            os.fsync(out.fileno())
+                        atomic(
+                            target / "checkpoint.json",
+                            dict(
+                                base=self.base,
+                                root=str(self.root),
+                                source_digest=digest(inputs["sources"]),
+                                patch="source.patch",
+                                untracked="untracked.tar",
+                                created_at=time.time(),
+                                payloads={
+                                    name: file_record(target / name) for name in ("source.patch", "untracked.tar")
+                                },
+                            ),
+                        )
+                    finally:
+                        # A failed write retains any partial source payload, but never books a
+                        # permanent 256 MiB for an empty directory or a tiny completed checkpoint.
+                        size = sum(path.stat().st_size for path in target.iterdir() if path.is_file())
+                        if not size:
+                            for name in ("source.patch", "untracked.tar"):
+                                path = target / name
+                                if path.is_file() and path.stat().st_size == 0:
+                                    path.unlink()
+                            if not any(target.iterdir()):
+                                target.rmdir()
+                                with contextlib.suppress(OSError, Pressure):
+                                    release(self.state, key)
+                        else:
+                            with contextlib.suppress(OSError, Pressure):
+                                settle(self.state, key, size, compact=True)
+        except BlockingIOError:
+            raise Pressure("exact source checkpoint is being preserved; retry verification", reason="busy") from None
         self.receipt["source_checkpoint"] = str(target / "checkpoint.json")
         self.save()
 

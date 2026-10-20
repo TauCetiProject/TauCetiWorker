@@ -120,7 +120,7 @@ if mode == 'sleep':
 if mode == 'storage-growth':
     (p/'build').mkdir(exist_ok=True)
     with (p/'build/oversized').open('wb') as out: out.truncate(int(os.environ['FIXTURE_GROW_BYTES']))
-    time.sleep(5)
+    time.sleep(float(os.environ.get('FIXTURE_SLEEP', '5')))
 if mode == 'barrier':
     barrier = Path(os.environ['FIXTURE_BARRIER'])
     (barrier / ('ready-' + Path(os.environ['TAUCETI_VERIFY_STATE']).name)).touch()

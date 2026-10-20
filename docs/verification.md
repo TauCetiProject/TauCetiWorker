@@ -156,60 +156,77 @@ candidate. Terminal jobs move from `verification-pending/` into `verification-jo
 
 ### Candidate storage and automatic reclamation
 
-Verification storage has a host-local byte reservation ledger, shared across worker HOME overrides
-and runtime versions. Before copying an independent candidate or launching its tools, the helper
-reserves space. Existing sibling workers' candidate directories are discovered without recursive
-inventory walks. Legacy candidates initially consume the entire host allowance until background
-compaction measures their retained source, so an unknown historical size cannot silently admit
-more copies. Bubble helpers mount the same ledger and record the host's canonical state paths.
+Verification uses a cooperative host-local byte reservation ledger, shared across worker HOME
+overrides and runtime versions. Bubble helpers mount the same ledger and record canonical host
+state paths. This is storage admission, not a fixed heavy-work queue or a filesystem quota.
 
-Default settings (positive integers, bytes or seconds as named):
+Default settings (positive integers except the percentage, which permits zero):
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `TAUCETI_VERIFY_STORAGE_BYTES` | 128 GiB | Total reserved candidate/checkpoint storage per user and host |
-| `TAUCETI_VERIFY_CANDIDATE_BYTES` | 32 GiB | Reservation for a candidate that can copy caches or run tools |
-| `TAUCETI_VERIFY_CHECKPOINT_BYTES` | 256 MiB | Bound for one durable source checkpoint |
-| `TAUCETI_VERIFY_MIN_FREE_BYTES` | 20 GiB | Minimum filesystem reserve; at least 10% is always kept |
+| `TAUCETI_VERIFY_CANDIDATE_BYTES` | 32 GiB | Growth allowance before a candidate runs tools or copies warm caches |
+| `TAUCETI_VERIFY_SOURCE_CANDIDATE_BYTES` | 2 GiB | Smaller source-preservation allowance when warm copies cannot fit |
+| `TAUCETI_VERIFY_CHECKPOINT_BYTES` | 256 MiB | Maximum size of one durable source checkpoint |
+| `TAUCETI_VERIFY_MIN_FREE_BYTES` | 20 GiB | Absolute minimum filesystem reserve |
+| `TAUCETI_VERIFY_MIN_FREE_PERCENT` | 10 | Percentage reserve; the larger absolute/percentage reserve applies |
 | `TAUCETI_VERIFY_COMPLETED_CACHE_SECONDS` | 3600 | Completed-job cache grace period |
 | `TAUCETI_VERIFY_IDLE_CACHE_SECONDS` | 86400 | Idle pending-job cache lifetime |
 | `TAUCETI_VERIFY_STORAGE_DIR` | Host-local state directory | Explicit shared accounting root; use private state for tests |
 
-All workers sharing an accounting root should receive the same limits. Reservations count logical
-bytes, including reflinked data: shared extents are not treated as guaranteed free future capacity.
-Warm copies that exceed their reservation retry without `.lake/build` directories. Source copies
-that cannot fit return incomplete; the original source and pending job remain available. Source
-checkpoints count against the same host allowance, and archive writes have an explicit byte bound.
+Workers sharing an accounting root should receive the same limits. Reservations count logical
+bytes, including reflinked data. Completed snapshots and checkpoints immediately reduce their
+reservation to measured size, with a 16 KiB accounting floor; they do not retain a whole 32 GiB or
+256 MiB allowance. Starting candidate tools reserves possible growth again. Free-space admission
+counts only unwritten growth on the target filesystem, rather than counting already-written bytes
+twice. If a warm snapshot cannot fit, preservation retries without generated Lake builds under the
+smaller source allowance. Source copies that cannot fit return incomplete while leaving the original
+workspace intact. Checkpoint archive writes have an explicit byte bound; failures retain partial
+source payloads and release unused reservations.
 
-The ordinary supervisor and activity preparer run one bounded cleanup slice per host every ten
-seconds. A separate cleanup timer is unnecessary. Disk pressure permits early eviction before the
-age threshold. Job and receipt flocks, live process references, mount observations and symlink
-guards protect active candidates. Cleanup removes only untracked build directories in the main
-checkout and its dependency checkouts; tracked files, dependency source edits, Git history, source
-checkpoints, receipts, accounting and publication journals are retained. Recursive removal has a
-durable cursor and byte/entry/time budgets. Process death releases locks and later ticks continue.
-Candidates rotate fairly so an active or large tree cannot starve the others.
+Shallow discovery accounts for historical directories and candidates written by older runtimes.
+Legacy candidates initially book the per-candidate allowance, and background read-only inventories
+replace estimates with measurements even for partial/unknown-owner trees. Unknown ownership never
+permits deleting source. A corrupt disposable ledger is quarantined and rebuilt from local directory
+registrations; receipts and source payloads are not discarded.
 
-After cache removal, a bounded metadata inventory reduces the reservation to retained source/Git
-size, with a 64 MiB accounting floor per candidate. A cache-generation token invalidates receipt
-reuse after output eviction without scanning historical receipts. Small source-only candidates
-remain available for mechanical verification and publication recovery; they never expire merely
-because they are old. If unique source alone fills the allowance, new allocation stays deferred
-until space or the explicit budget changes. No unpublished source is deleted to satisfy a quota.
+The ordinary supervisor, activity preparer and explicit `tauceti cleanup` invoke bounded reclamation.
+At most one collector runs per host, with a ten-second minimum interval; actual cadence depends on
+ordinary activity/round boundaries. A separate timer is unnecessary while those services operate.
+The default slice is 0.25 seconds, 2048 metadata entries and 256 MiB of deletion. Recursive removal
+has a durable cursor. Read-only inventory resumes within a long-lived collector and restarts safely
+after process death. Collection rotates, prioritizes terminal candidates, skips already-compacted
+rows, and never follows symlinks or crosses observed mounts. Job/receipt/workspace flocks and live
+process references protect active work. Missing ownership or mount observations withhold that tree.
 
-Storage deferral returns `status: incomplete`, `incomplete_reason: disk-pressure`, and a pending
-continuation when a job exists. The supervisor retries without a model and without charging a
-verification attempt for failed storage admission. Other inference work remains eligible. Prepared
-activity status includes reserved bytes, the allowance, free bytes, source-only counts and cleanup
-errors; status reads never walk candidates.
+Completed candidates can shed both their own and dependency build outputs. Idle pending candidates
+shed only their own build outputs: dependency builds stay warm to avoid repeated Mathlib rebuilds.
+Disk pressure permits early reclamation. Before removing a build directory the collector checks for
+tracked and untracked non-ignored files, so a source file under `build/` remains protected. Staged
+state, dependency edits, Git history, checkpoints, receipts and publication/accounting journals remain
+intact. A cache-generation token invalidates receipt reuse after output eviction without historical
+receipt scans. Cleanup errors, including ENOSPC, remain retryable and cannot terminate the supervisor.
 
-These are strict admission reservations and monitored write limits, not filesystem-enforced hard
-quotas. Owned candidate tools check free space once per second and incrementally inspect at most
-4096 file metadata entries per check. Detected pressure interrupts the owned tool group, records
-its actual exit and retains a pending job. A large tree takes several observations to measure, and
-a fast writer can overshoot between observations. A filesystem quota/dedicated volume is required
-for a strict kernel-enforced write ceiling. Existing source records outside verification storage
-remain governed by work-recovery policy. This feature does not raise capacity or change V0 dispatch.
+Retained source and protected dependency builds still count against the allowance. No unpublished
+source expires merely because it is old. If these protected bytes exhaust the budget, prepared
+status explicitly reports exhausted storage and the action needed: publication/validated archival or
+an explicit budget adjustment. New storage allocation defers; unrelated inference remains eligible.
+This deliberately does not invent permission to delete unpublished history.
+
+Storage deferral returns `status: incomplete` and `incomplete_reason: disk-pressure`. An isolated
+candidate gets a pending continuation that the supervisor retries without a model or verification
+attempt charge for failed storage admission. Without an independent candidate, the result is terminal
+incomplete with workspace retry guidance, allowing a fresh invocation instead of falsely advertising
+an unusable continuation. Prepared activity status reports reservations, the allowance, free space,
+compaction counts and errors; status reads never traverse candidates.
+
+Running candidate tools sample free space once per second and inspect at most 4096 metadata entries
+per sample. Detected pressure interrupts their owned process group, records real exits and retains
+pending work. A full size check before overall success also catches writers that finish between
+samples. A fast writer can overshoot before detection; kernel-enforced ceilings require filesystem
+quotas or a dedicated volume. The ledger and environment are cooperative controls, including inside
+Bubble. Existing source records outside verification storage retain their work-recovery policy.
+This change does not raise capacity, restart active rounds or change V0 helper dispatch.
 
 Recovery builds only in an independent candidate, never resets the original source and never pushes,
 creates a PR or bypasses accounting/publication guards.

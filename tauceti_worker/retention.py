@@ -418,6 +418,13 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
             )
         except (OSError, ValueError) as error:
             note(report, "errors", f"shared cache cleanup: {error}")
+        from . import verification_storage
+
+        states = [state for cfg in configs for state in (cfg.state, cfg.state / "verification-state")]
+        report["verification_storage"] = (
+            read_json(verification_storage.root() / "status.json") if dry else verification_storage.housekeep(states)
+        )
+
     for cfg in configs:
         try:
             if not safe(cfg.state, cfg.state.parent):
