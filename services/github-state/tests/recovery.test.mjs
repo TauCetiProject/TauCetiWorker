@@ -15,14 +15,15 @@ const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 // R2 double with digest checks, prefix listing and injectable failures.
 function bucket(){
  const objects=new Map(),failures=[];
- const meta=(key,o)=>({key,size:o.bytes.length,customMetadata:o.customMetadata,uploaded:o.uploaded});
+ const meta=(key,o)=>({key,size:o.bytes.length,customMetadata:o.customMetadata,uploaded:o.uploaded,etag:o.etag});
  const check=(op,key)=>{const i=failures.findIndex(f=>f(op,key));if(i>=0){failures.splice(i,1);throw new Error('R2 '+op+' failed');}};
  return {objects,failures,
   async head(key){check('head',key);const o=objects.get(key);return o?meta(key,o):null;},
   async get(key){check('get',key);const o=objects.get(key);return o?{...meta(key,o),text:async()=>o.bytes.toString(),json:async()=>JSON.parse(o.bytes.toString()),arrayBuffer:async()=>new Uint8Array(o.bytes).buffer}:null;},
   async put(key,value,options={}){check('put',key);const bytes=Buffer.from(typeof value==='string'?value:new Uint8Array(value));
    if(options.sha256 && sha(bytes)!==options.sha256) throw new Error('digest mismatch');
-   objects.set(key,{bytes,customMetadata:options.customMetadata || {},uploaded:new Date()});},
+   if(options.onlyIf?.etagMatches && objects.get(key)?.etag!==options.onlyIf.etagMatches) return null;
+   objects.set(key,{bytes,customMetadata:options.customMetadata || {},uploaded:new Date(),etag:sha(bytes)});},
   async delete(keys){for(const key of [].concat(keys)){check('delete',key);objects.delete(key);}},
   async list({prefix='',limit=1000,cursor}={}){const keys=[...objects.keys()].filter(k=>k.startsWith(prefix)).sort(),start=Number(cursor || 0);
    return {objects:keys.slice(start,start+limit).map(k=>meta(k,objects.get(k))),truncated:start+limit<keys.length,cursor:String(start+limit)};},
@@ -133,13 +134,12 @@ test('a persistently failing parked event is held aside without blocking newer e
 });
 
 // Repository harness over node:sqlite with an R2 double.
-function repositoryFixture(env={}){
- const db=new DatabaseSync(':memory:');let alarm=null;
- const ctx={id:{toString:()=>'fixture'},storage:{sql:{exec(sql,...bindings){let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};},get databaseSize(){return 0;}},
+function repositoryFixture(env={},size=0,db=new DatabaseSync(':memory:'),archive=bucket()){
+ let alarm=null;
+ const ctx={blockConcurrencyWhile:fn=>fn(),id:{toString:()=>'fixture'},storage:{sql:{exec(sql,...bindings){let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};},get databaseSize(){return size;}},
   transactionSync(fn){db.exec('SAVEPOINT tx');try{const v=fn();db.exec('RELEASE tx');return v;}catch(e){db.exec('ROLLBACK TO tx');db.exec('RELEASE tx');throw e;}},getAlarm:async()=>alarm,setAlarm:async v=>{alarm=v;}}};
- const archive=bucket();
  const state=new RepositoryState(ctx,{ALLOWED_REPOSITORIES:JSON.stringify([repo]),ARCHIVE:archive,...env});
- state.setMeta('repository',repo);
+ if(!size) state.setMeta('repository',repo);
  return {db,state,archive};
 }
 const queryFixture=(state,q)=>state.fetch(new Request('https://internal/query',{method:'POST',body:JSON.stringify({repository:'org/repo',...q})})).then(r=>r.json());
@@ -197,7 +197,7 @@ test('expiry runs before repair and hydration, survives their failure, and keeps
 test('cold start on a current schema performs no writes',async()=>{
  const {db}=repositoryFixture();
  const writes=[];
- const ctx={id:{toString:()=>'fixture'},storage:{sql:{exec(sql,...bindings){if(/^\s*(INSERT|UPDATE|REPLACE|CREATE|ALTER|DELETE)/i.test(sql))writes.push(sql.slice(0,40));let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};}},transactionSync:fn=>fn()}};
+ const ctx={blockConcurrencyWhile:fn=>fn(),id:{toString:()=>'fixture'},storage:{sql:{exec(sql,...bindings){if(/^\s*(INSERT|UPDATE|REPLACE|CREATE|ALTER|DELETE)/i.test(sql))writes.push(sql.slice(0,40));let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};}},transactionSync:fn=>fn()}};
  const state=new RepositoryState(ctx,{ALLOWED_REPOSITORIES:JSON.stringify([repo])});
  assert.deepEqual(writes,[]);assert.equal(state.schema,'current');
 });
@@ -226,4 +226,67 @@ test('a replayed long-parked event keeps its receipt through maintenance',async(
  await state.ingest({key:'parked/100/bodies/old.json',delivery:'old',event:'ping',repository:'org/repo',received:Date.now()-20*86400000});
  await state.maintenance();
  assert.equal(db.prepare("SELECT COUNT(*) n FROM deliveries WHERE id='old'").get().n,1);
+});
+
+test('a database at the size limit starts read-only: no migration, degraded until a verified probe',async()=>{
+ const {db,archive}=repositoryFixture();
+ db.exec("DELETE FROM meta WHERE key='schema_version'");
+ const full=10*1024**3;
+ const {state}=repositoryFixture({},full,db,archive);
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(state.schema,'legacy');assert.equal(state.degraded.operation,'database_size');
+ assert.equal(db.prepare("SELECT COUNT(*) n FROM meta WHERE key='schema_version'").get().n,0,'no migration write was attempted');
+ // After cleanup the file stays large; a probe-verified state lifts the size rule.
+ await archive.put('control/100/storage.json',JSON.stringify({state:'writable',verified_at:Date.now()}));
+ const {state:recovered}=repositoryFixture({},full,db,archive);
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(recovered.degraded,undefined);assert.equal(recovered.schema,'current');
+ // A recorded failure degrades even a small database.
+ await archive.put('control/100/storage.json',JSON.stringify({state:'full',since:1,source:'queue'}));
+ const {state:marked}=repositoryFixture({},1,db,archive);
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(marked.degraded.operation,'recorded:queue');
+});
+
+test('a storage-full exception from the reset object parks immediately and records the state',async()=>{
+ const h=harness();
+ h.env.REPOSITORIES.get=()=>({fetch:async()=>{throw new Error('Exceeded the maximum database size.');}});
+ const message=await deliver(h.env,'thrown',1);
+ assert.equal(message.acked,true);assert.equal(message.retried,null);
+ assert.ok(durable(h,'thrown'));
+ assert.equal(JSON.parse(h.archive.objects.get('control/100/storage.json').bytes).state,'full');
+ h.env.REPOSITORIES.get=()=>({fetch:async()=>{throw new Error('out of memory: SQLITE_NOMEM');}});
+ assert.deepEqual((await deliver(h.env,'nomem',1)).retried,{delaySeconds:5},'other storage errors retry');
+});
+
+test('a recorded full state stops legacy migration even below the size threshold',async()=>{
+ const {db,archive}=repositoryFixture();
+ db.exec("DELETE FROM meta WHERE key='schema_version'");
+ await archive.put('control/100/storage.json',JSON.stringify({state:'full',since:1,source:'queue'}));
+ const {state}=repositoryFixture({},1,db,archive);
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(state.schema,'legacy');assert.equal(state.degraded.operation,'recorded:queue');
+ assert.equal(db.prepare("SELECT COUNT(*) n FROM meta WHERE key='schema_version'").get().n,0);
+});
+
+test('degraded workflow reads never run the legacy attempt rewrite',async()=>{
+ const {db,state}=repositoryFixture();
+ db.prepare('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?)').run('workflow_runs','77','',JSON.stringify({id:77,run_attempt:2}),'',1,1,0);
+ state.degraded={since:1,reason:'storage_full',operation:'test'};
+ const before=db.prepare('SELECT COUNT(*) n FROM changes').get().n;
+ const result=await queryFixture(state,{operation:'workflow_jobs',args:{id:'77'}});
+ assert.equal(result.status,'unavailable');assert.equal(result.reason,'storage_full');
+ assert.equal(db.prepare("SELECT COUNT(*) n FROM meta WHERE key='workflow_attempt:77'").get().n,0);
+ assert.equal(db.prepare('SELECT COUNT(*) n FROM changes').get().n,before);
+});
+
+test('a failure report older than a verified probe cannot undo recovery',async()=>{
+ const {noteRepositoryFull}=await load('src/ingress.ts');
+ const archive=bucket(),env={ARCHIVE:archive};
+ const started=Date.now()-1000;
+ await archive.put('control/100/storage.json',JSON.stringify({state:'writable',verified_at:Date.now()}));
+ await noteRepositoryFull(env,'100','queue',started);
+ assert.equal(JSON.parse(archive.objects.get('control/100/storage.json').bytes).state,'writable');
+ await noteRepositoryFull(env,'100','queue',Date.now()+1000);
+ assert.equal(JSON.parse(archive.objects.get('control/100/storage.json').bytes).state,'full');
 });

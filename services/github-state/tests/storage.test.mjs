@@ -103,6 +103,8 @@ test('a full repository keeps serving stored reads, parks ingestion, recovers he
   assert.equal(batch.results[0].result.status,'ok');assert.equal(batch.results[1].result.status,'ok');
   const health=await (await stub.fetch('https://internal/health')).json();
   assert.equal(health.storage.mode,'degraded');assert.equal(health.storage.degraded.reason,'storage_full');
+  await wait(100);
+  assert.equal(JSON.parse(await (await (await mf.getR2Bucket('ARCHIVE')).get('control/'+repository.id+'/storage.json')).text()).state,'full','full state recorded outside SQLite');
 
   // Ingestion parks durably instead of spending queue retries.
   const parked=await event(mf,'full-1',comment(501));
@@ -174,6 +176,9 @@ test('a full repository keeps serving stored reads, parks ingestion, recovers he
   assert.equal((await adminPost(mf,'/admin/storage/fault',{mode:'none'})).status,200);
   const writable=await (await adminPost(mf,'/admin/storage/probe',{bytes:4096})).json();
   assert.equal(writable.writable,true);assert.equal(writable.storage.schema,'current');assert.equal(writable.storage.mode,'writable');
+  assert.equal(JSON.parse(await (await (await mf.getR2Bucket('ARCHIVE')).get('control/'+repository.id+'/storage.json')).text()).state,'writable');
+  const large=await (await adminPost(mf,'/admin/storage/probe',{bytes:3*1048576+5})).json();
+  assert.equal(large.writable,true);assert.equal(large.bytes,3*1048576+5);
   const replay=await (await adminPost(mf,'/admin/ingress/replay',{})).json();
   assert.equal(replay.replayed,1);
   const receipts=await (await send(stub,'/storage/deliveries',{ids:['full-1','unknown']})).json();

@@ -5,10 +5,14 @@ import { batchLimit } from './catalog';
 import { Lane, LANES, laneAt, settings } from './reconciliation';
 import { SURVEY_CONTRACT, compactPR, issueFragment, reviewFragment, summarizeFragments, inScope, roadmapFocuses } from './survey';
 import { readPromotionReceipts } from './activity_landings';
-import { controlKey } from './ingress';
+import { controlKey, noteRepositoryFull, storageKey } from './ingress';
 import { Failure, FULL_MESSAGE, AdminError, CLEANUP, PARKABLE, classify, createRecovery, deleteClass, exportPage, faultySql, log, missingSchema, requestId, readManifest, scan, summary, verifyExport } from './storage';
 
 const SCHEMA_VERSION=4;
+// 10 GiB limit less a margin. With no recorded storage state, a database this
+// large is treated as full: no startup write may risk a failed commit, which
+// resets the object and would repeat on every start.
+const FULL_DATABASE=10*1024**3-16*1024**2;
 const CURSOR_UPLOADS=4;
 const cursorKey=(repo:string,id:string,offset:number)=>`cursors/${repo}/${id}/${offset}.json`;
 
@@ -30,19 +34,48 @@ export class RepositoryState extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
     this.sql=env.FAULT_INJECTION==='true'?faultySql(ctx.storage.sql,()=>this.faultFull):ctx.storage.sql;
-    if(env.FAULT_INJECTION==='true') ctx.blockConcurrencyWhile(async()=>{
-      this.faultFull=(await env.ARCHIVE.get(this.faultKey()).then(o=>o?.json<any>()))?.mode==='full';
-      this.startup();
+    if (this.sql.databaseSize>=FULL_DATABASE) this.degraded={since:Date.now(),reason:'storage_full',operation:'database_size'};
+    // A current or fresh schema starts synchronously; migrating an existing
+    // legacy schema waits until the durable storage state is known.
+    if (env.FAULT_INJECTION!=='true') this.startup(true);
+    ctx.blockConcurrencyWhile(async()=>{
+      if (env.FAULT_INJECTION==='true') {
+        this.faultFull=(await env.ARCHIVE.get(this.faultKey()).then(o=>o?.json<any>()))?.mode==='full';
+        if (this.faultFull) this.degraded ||= {since:Date.now(),reason:'storage_full',operation:'fault_injection'};
+      }
+      await this.storageMarker();
+      if (env.FAULT_INJECTION==='true' || this.schema!=='current') this.startup();
     });
-    else this.startup();
+  }
+  // A recorded full state degrades the object; a probe-verified writable state
+  // overrides the size rule after cleanup, since freed pages do not shrink the file.
+  async storageMarker(): Promise<void> {
+    let marker:any;
+    try {
+      const repo=this.meta('repository')?.id;
+      marker=repo?await this.env.ARCHIVE.get(storageKey(repo)).then(o=>o?.json<any>()):undefined;
+    } catch {return;}
+    if (marker?.state==='full') this.degraded={since:Number(marker.since) || Date.now(),reason:'storage_full',operation:'recorded:'+marker.source};
+    else if (marker?.state==='writable' && this.degraded?.operation==='database_size') this.degraded=undefined;
+  }
+  markFull(operation:string): void {
+    const repo=(()=>{try {return this.meta('repository')?.id;} catch {return undefined;}})();
+    if (repo) noteRepositoryFull(this.env,repo,operation,this.degraded?.since ?? Date.now()).catch(()=>{});
   }
   faultKey(): string { return 'faults/'+this.ctx.id.toString()+'.json'; }
   // Existing current schemas start without any write. Migration is one
   // transaction; if it cannot commit, compatible stored data stays readable.
-  startup(): void {
+  startup(defer=false): void {
     let version:unknown;
     try {version=this.meta('schema_version');} catch {version=undefined;}
     if(version===SCHEMA_VERSION) {this.schema='current';return;}
+    if(this.degraded || defer && this.sql.exec<any>("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='meta'").one().n) {
+      // Never attempt a migration that cannot commit; existing data stays readable.
+      let missing:string[];
+      try {missing=missingSchema(this.sql);} catch {missing=['sqlite_master'];}
+      this.schema=missing.length?{error:'schema_unavailable',missing,cause:'storage_full'}:'legacy';
+      return;
+    }
     try {this.ctx.storage.transactionSync(()=>this.migrate());this.schema='current';}
     catch(error) {
       let missing:string[];
@@ -103,7 +136,7 @@ export class RepositoryState extends DurableObject<Env> {
   }
   noteFailure(operation:string,error:unknown): Failure {
     const reason=classify(error);
-    if(reason==='storage_full' && !this.degraded) this.degraded={since:Date.now(),reason,operation};
+    if(reason==='storage_full' && !this.degraded) {this.degraded={since:Date.now(),reason,operation};this.markFull(operation);}
     // At most one structured line per operation and minute; no payloads.
     const now=Date.now();
     if((this.logged.get(operation) || 0)<now-60000) {
@@ -323,6 +356,7 @@ export class RepositoryState extends DurableObject<Env> {
     // Legacy mirrors did not scope membership by attempt. Revalidate once;
     // retain current webhook rows and all historical resource records. This
     // must commit before the legacy membership can be served.
+    if(this.degraded) throw new Error('Exceeded the maximum database size; workflow attempt revalidation needs a write (degraded)');
     this.ctx.storage.transactionSync(()=>{
       this.setMeta('workflow_attempt:'+id,attempt);
       const key=queryKey({operation:'workflow_jobs',args:{id}});
@@ -1011,8 +1045,9 @@ export class RepositoryState extends DurableObject<Env> {
     } finally {
       try {
         const row=this.sql.exec<any>('SELECT MIN(MAX(due,lease_until)) AS due FROM jobs').one();
-        // Degraded mode only expires rows; due repairs must not spin the alarm.
-        if (row.due) await this.setAlarm(Math.max(Date.now()+(this.degraded?60000:100),row.due));
+        // Degraded mode writes nothing, not even the next alarm; the cron tick
+        // keeps expiring rows until a probe restores writes.
+        if (row.due && !this.degraded) await this.setAlarm(Math.max(Date.now()+100,row.due));
       } catch(error) {this.noteFailure('alarm',error);}
     }
   }
@@ -1095,11 +1130,22 @@ export class RepositoryState extends DurableObject<Env> {
         note:'Deleted rows become reusable free pages; the physical database size need not shrink. Prove headroom with /admin/storage/probe.'});
     }
     if (path==='/storage/probe') {
-      const bytes=Number.isSafeInteger(input.bytes) && input.bytes>0?Math.min(input.bytes,1048576):65536,before=this.sql.databaseSize;
+      const bytes=Number.isSafeInteger(input.bytes) && input.bytes>0?Math.min(input.bytes,64*1048576):65536,before=this.sql.databaseSize;
       // Commit a real row, then delete it: proves usable headroom of that size.
-      try {this.ctx.storage.transactionSync(()=>this.sql.exec("INSERT INTO meta VALUES('storage_probe',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",JSON.stringify('x'.repeat(bytes))));}
-      catch(error) {return json({writable:false,bytes,reason:this.noteFailure('probe',error),database_size:this.sql.databaseSize,storage:this.storageState()});}
-      this.sql.exec("DELETE FROM meta WHERE key='storage_probe'");
+      // The size-limit failure arrives at commit, so wait for durability.
+      try {
+        // Rows stay below Cloudflare's per-row limit; together they prove the requested headroom.
+        this.ctx.storage.transactionSync(()=>{
+          for (let offset=0,i=0;offset<bytes;offset+=1048576,i++) this.sql.exec("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",'storage_probe:'+i,JSON.stringify('x'.repeat(Math.min(1048576,bytes-offset))));
+        });
+        await this.ctx.storage.sync();
+      } catch(error) {
+        try {this.sql.exec("DELETE FROM meta WHERE key LIKE 'storage_probe:%'");} catch {}
+        return json({writable:false,bytes,reason:this.noteFailure('probe',error),database_size:this.sql.databaseSize,storage:this.storageState()});
+      }
+      this.sql.exec("DELETE FROM meta WHERE key LIKE 'storage_probe:%'");
+      await this.ctx.storage.sync();
+      await this.env.ARCHIVE.put(storageKey(repo),JSON.stringify({state:'writable',verified_at:Date.now(),bytes,database_size:this.sql.databaseSize}));
       this.degraded=undefined;
       if (this.schema!=='current') this.startup();
       await this.optionalAsync('alarm',()=>this.setAlarm(Date.now()+100));

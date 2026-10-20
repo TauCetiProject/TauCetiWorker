@@ -1,6 +1,6 @@
 import { Env, EventPointer, Query, Repository, authorize, digest, json, repositories, repository, stub, validSignature, validateQuery, parseGitHub } from './protocol';
 import { classify, log, requestId } from './storage';
-import { PARK_AFTER_ATTEMPTS, backlog, backoff, drain, ingressMode, park, reconcile, setIngressMode } from './ingress';
+import { PARK_AFTER_ATTEMPTS, backlog, backoff, drain, ingressMode, noteRepositoryFull, park, reconcile, setIngressMode } from './ingress';
 export { RepositoryState } from './repository';
 export { InstallationScheduler } from './installation';
 
@@ -16,11 +16,19 @@ async function query(req:Request,env:Env,q:Query,request_id:string): Promise<Res
   const repo=repository(env,q.repository);
   if (!await authorize(req,env)) return json({error:'unauthorized'},401);
   if (!repo || !await authorize(req,env,repo.name)) return json({version:1,repository:q.repository,operation:q.operation,status:'unavailable',revision:0,complete:false,reason:'repository_unavailable'});
-  const response=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/query',{method:'POST',headers:{'If-None-Match':req.headers.get('If-None-Match') || '','x-request-id':request_id},body:JSON.stringify({...q,repository:repo.name})});
+  let response:Response;const started=Date.now();
+  try {response=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/query',{method:'POST',headers:{'If-None-Match':req.headers.get('If-None-Match') || '','x-request-id':request_id},body:JSON.stringify({...q,repository:repo.name})});}
+  catch(error) {
+    const reason=classify(error);
+    if (reason==='storage_full') await noteRepositoryFull(env,repo.id,'query',started).catch(()=>{});
+    log('query_failed',{request_id,operation:q.operation,reason});
+    return json({error:'storage_unavailable',reason,request_id},503);
+  }
   if (response.status===304) return response;
   if (response.status!==200) {
     // Keep the established error code; add the precise cause and request ID.
     const detail:any=await response.json().catch(()=>({}));
+    if (detail.error==='storage_full') await noteRepositoryFull(env,repo.id,'query',started).catch(()=>{});
     log('query_failed',{request_id,operation:q.operation,status:response.status,reason:detail.error});
     return json({error:'storage_unavailable',reason:typeof detail.error==='string'?detail.error:'status_'+response.status,request_id},503);
   }
@@ -105,7 +113,15 @@ export default {
         const input:any=req.method==='POST'?await req.json():{repository:url.searchParams.get('repository')};
         const repo=repository(env,input?.repository || '');
         if (!repo) return json({error:'repository_not_allowed'},400);
-        const forward=(path:string,body?:unknown)=>stub(env.REPOSITORIES,repo.id).fetch('https://internal'+path,body===undefined?{headers:{'x-request-id':request_id}}:{method:'POST',headers:{'x-request-id':request_id},body:JSON.stringify(body)});
+        const forward=async(path:string,body?:unknown)=>{
+          const started=Date.now();
+          try {return await stub(env.REPOSITORIES,repo.id).fetch('https://internal'+path,body===undefined?{headers:{'x-request-id':request_id}}:{method:'POST',headers:{'x-request-id':request_id},body:JSON.stringify(body)});}
+          catch(error) {
+            const reason=classify(error);
+            if (reason==='storage_full') await noteRepositoryFull(env,repo.id,'admin',started).catch(()=>{});
+            return json({error:'storage_unavailable',reason,request_id},503);
+          }
+        };
         if (url.pathname==='/admin/storage' && req.method==='GET') return forward('/storage/summary');
         const operation=url.pathname.slice('/admin/storage/'.length);
         if (url.pathname.startsWith('/admin/storage/') && req.method==='POST' && STORAGE_OPERATIONS.has(operation)) return forward('/storage/'+operation,{...input,repository_id:repo.id});
@@ -151,16 +167,18 @@ export default {
     for (const message of batch.messages) {
       const pointer=message.body,repo=repository(env,pointer.repository);
       if (!repo) { message.ack(); continue; }
-      let reason:string;
+      let reason:string,started=Date.now();
       try {
         if (!modes.has(repo.id)) modes.set(repo.id,ingressMode(env,repo));
         if ((await modes.get(repo.id)!).mode==='parked') reason='planned_migration';
         else {
+          started=Date.now();
           const result=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/event',{method:'POST',body:JSON.stringify(pointer)});
           if (result.ok) { message.ack(); continue; }
           const detail:any=await result.json().catch(()=>({}));
           // A full or unavailable repository is parked immediately rather
           // than spending the queue's retry budget.
+          if (detail.error==='storage_full') await noteRepositoryFull(env,repo.id,'queue',started);
           if (detail.parkable) reason=String(detail.error);
           else if (message.attempts>=PARK_AFTER_ATTEMPTS) reason='retry_budget:'+String(detail.error || result.status);
           else {
@@ -169,11 +187,16 @@ export default {
           }
         }
       } catch(error) {
-        if (message.attempts<PARK_AFTER_ATTEMPTS) {
-          log('event_retry',{delivery:pointer.delivery,attempts:message.attempts,reason:classify(error)});
+        // At the size limit the commit fails after the handler returns, so the
+        // failure arrives as an exception from the reset object.
+        const failure=classify(error);
+        if (failure==='storage_full') {
+          await noteRepositoryFull(env,repo.id,'queue',started).catch(()=>{});
+          reason=failure;
+        } else if (message.attempts<PARK_AFTER_ATTEMPTS) {
+          log('event_retry',{delivery:pointer.delivery,attempts:message.attempts,reason:failure});
           message.retry({delaySeconds:backoff(message.attempts)});continue;
-        }
-        reason='retry_budget:'+classify(error);
+        } else reason='retry_budget:'+failure;
       }
       try {
         await park(env,repo,pointer,reason);
@@ -189,7 +212,12 @@ export default {
     for (const repo of repositories(env)) {
       if(repo.name==='TauCetiProject/TauCeti') ctx.waitUntil(stub(env.REPOSITORIES,repo.id).fetch('https://internal/activity-refresh',{method:'POST'}));
       ctx.waitUntil((async()=>{
-        const tick=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/tick',{method:'POST',body:JSON.stringify({repository:repo.name})});
+        let tick:Response;const started=Date.now();
+        try {tick=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/tick',{method:'POST',body:JSON.stringify({repository:repo.name})});}
+        catch(error) {
+          if (classify(error)==='storage_full') await noteRepositoryFull(env,repo.id,'tick',started);
+          throw error;
+        }
         const state:any=await tick.json().catch(()=>({}));
         // The delivery audit spends GitHub quota; skip it while the repository
         // cannot store results or ingestion is deliberately parked.

@@ -1,5 +1,5 @@
 import { Env, EventPointer, Repository, digest, parseGitHub, stub } from './protocol';
-import { log } from './storage';
+import { classify, log } from './storage';
 
 // Parked ingress keeps acknowledged webhooks durable while the repository
 // object cannot apply them (storage full or a planned migration). Pointers and
@@ -12,6 +12,17 @@ const pad = (n: number) => String(Math.max(0, Math.floor(n))).padStart(15, '0');
 export const pointerKey = (repo: string, p: EventPointer, held = false) => `parked/${repo}/${held ? 'held' : 'pointers'}/${pad(p.received)}-${p.delivery}.json`;
 export const bodyKey = (repo: string, delivery: string) => `parked/${repo}/bodies/${delivery}.json`;
 export const controlKey = (repo: string) => `control/${repo}/ingress.json`;
+// Durable storage state. At the size limit Cloudflare rejects the commit after
+// the handler returns and resets the object, so the object cannot record that
+// it is full; whoever observes the failure records it here instead.
+export const storageKey = (repo: string) => `control/${repo}/storage.json`;
+// `started` is when the failing request began: a probe verified after that
+// supersedes the report, and the conditional write rejects a concurrent probe.
+export async function noteRepositoryFull(env: Env, repo: string, source: string, started: number): Promise<void> {
+  const object = await env.ARCHIVE.get(storageKey(repo)), marker: any = object ? await object.json() : null;
+  if (marker?.state === 'full' || marker?.state === 'writable' && Number(marker.verified_at) >= started) return;
+  await env.ARCHIVE.put(storageKey(repo), JSON.stringify({ state: 'full', since: started, source }), object ? { onlyIf: { etagMatches: object.etag } } : undefined);
+}
 export function backoff(attempts: number): number { return Math.min(600, 5 * 2 ** Math.max(0, Math.min(attempts - 1, 8))); }
 
 export async function ingressMode(env: Env, repo: Repository): Promise<{ mode: 'apply' | 'parked'; reason?: string; at?: number }> {
@@ -59,7 +70,15 @@ export async function drain(env: Env, repo: Repository, options: { limit?: numbe
   for (const object of page.objects) {
     const parked = await env.ARCHIVE.get(object.key).then(o => o?.json<Parked>());
     if (!parked) continue;
-    const response = await stub(env.REPOSITORIES, repo.id).fetch('https://internal/event', { method: 'POST', body: JSON.stringify({ key: parked.key, delivery: parked.delivery, event: parked.event, repository: parked.repository, received: parked.received }) });
+    let response: Response;
+    const started = Date.now();
+    try { response = await stub(env.REPOSITORIES, repo.id).fetch('https://internal/event', { method: 'POST', body: JSON.stringify({ key: parked.key, delivery: parked.delivery, event: parked.event, repository: parked.repository, received: parked.received }) }); }
+    catch (error) {
+      const reason = classify(error);
+      if (reason === 'storage_full') await noteRepositoryFull(env, repo.id, 'replay', started);
+      log('parked_replay_failed', { repository: repo.name, delivery: parked.delivery, error: reason });
+      return { replayed, failed, remaining: true, stopped: reason };
+    }
     if (response.ok) {
       // Body first: a missing body with a committed receipt still deduplicates.
       await env.ARCHIVE.delete(parked.key);
