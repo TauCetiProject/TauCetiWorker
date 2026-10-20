@@ -111,9 +111,12 @@ def resolve(owner):
             return None
     if owner.get("unsupported") and sys.platform != "linux":
         return owner
-    if owner.get("boot") != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
-        return None
     namespace = owner.get("namespace")
+    if (
+        namespace == os.readlink("/proc/self/ns/pid")
+        and owner.get("boot") != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    ):
+        return None
     if namespace == os.readlink("/proc/self/ns/pid"):
         candidates = [Path("/proc") / str(int(owner["pid"]))]
     else:
@@ -135,7 +138,7 @@ def resolve(owner):
 
 
 def alive(owner):
-    if not owner or owner.get("unsupported"):
+    if not owner or owner.get("unsupported") or owner.get("remote"):
         return True  # Unknown is never proof of termination.
     try:
         if sys.platform == "darwin":
@@ -156,19 +159,27 @@ def exec_gate(bridge, invocation, command):
     birth = identity()
     durable(bridge / "inbox" / (invocation + ".launch"), dict(id=invocation, native=birth))
     permit = bridge / "outbox" / (invocation + ".permit")
+
+    def no_exec(reason):
+        durable(bridge / "inbox" / (invocation + ".no-exec"), dict(id=invocation, native=birth, reason=reason))
+        return 75
+
     deadline = time.monotonic() + 30
     while not permit.exists():
         if time.monotonic() >= deadline:
-            return 75  # No permit means no inference, even if the bridge died.
+            return no_exec("permit-timeout")
         time.sleep(0.05)
-    permission = json.loads(permit.read_text())
-    if permission.get("id") != invocation or permission.get("gate") != birth:
-        raise ValueError("invalid native launch permit")
+    try:
+        permission = json.loads(permit.read_text())
+        if permission.get("id") != invocation or permission.get("gate") != birth:
+            return no_exec("invalid-permit")
+    except (OSError, ValueError):
+        return no_exec("unreadable-permit")
     try:
         os.execvpe(command[0], command, os.environ)
     except OSError:
-        durable(bridge / "inbox" / (invocation + ".exec-failed"), dict(id=invocation))
-        return 75
+        durable(bridge / "inbox" / (invocation + ".exec-failed"), dict(id=invocation, native=birth))
+        return no_exec("exec-failed")
 
 
 if __name__ == "__main__":

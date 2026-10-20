@@ -330,17 +330,27 @@ writing its sidecar is recoverable. A detached host supervisor owns the sidecars
 and recovery, outside both the round process group and the agent containment
 boundary. It starts at API worker/context startup and is checked again at loop
 round boundaries. Restarting it replays the local evidence automatically; it does
-not poll providers or GitHub. Only registered new invocations participate in this
+not poll providers or GitHub. Recovery progress is persisted, and a separate
+heartbeat remains responsive during ledger recovery. Admission checks restart a
+lost supervisor; source updates retire it at an invocation boundary. Only registered new invocations participate in this
 automatic recovery; historical cleanup remains separate.
 
 Every native launch, including an explicit resume or copied Bubble shim, must
 create a durable usage journal. A native exec gate waits until the supervisor has
 verified the journal and recorded the native process identity, then receives a
-durable permit. Missing or malformed accounting configuration fails before
+durable permit containing a second copy of that native identity. A lost sidecar
+can recover the permitted identity without reclassifying real inference as zero
+spend. Missing or malformed accounting configuration fails before
 inference. Linux identities include the boot ID, start ticks and PID namespace;
 namespace-local PIDs are translated while the gate is alive. macOS identities use
 the boot session and process birth time in microseconds. On other platforms an
 unknown identity cannot authorize automatic stopped-process reconciliation.
+For Bubble across a VM or a host-uninspectable container, the bridge explicitly
+records the remote boot/start/namespace identity without interpreting its PID on
+the host. An exact gate-linked native exit receipt proves termination there;
+bridge death without that receipt records `remote-liveness-unconfirmed` and
+retains the reserve. These receipts and journals remain available for later local
+reconciliation.
 
 Lifecycle evidence distinguishes observed native success, nonzero exit, signal,
 exec failure, bridge death and parent death; the outer loop records round timeout
@@ -349,7 +359,7 @@ assigned a guessed exit status. A stopped process or `inflight=false` never clos
 a journal. Normal journal closure requires a successfully drained native exit, a
 result event and healthy journal writes. Without that proof recovery retains the
 priced prefix and an explicitly uncertain tail reserve. A never-permitted gate
-or recorded exec failure proves no inference and permits exact zero settlement.
+or gate-linked no-exec receipt proves no inference and permits exact zero settlement.
 Late authoritative receipts remain readable and replace estimates with existing
 ledger corrections.
 

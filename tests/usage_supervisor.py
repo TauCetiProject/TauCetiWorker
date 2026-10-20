@@ -325,6 +325,138 @@ class SupervisorTests(unittest.TestCase):
             tick(self.budget)
         self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
 
+    def test_lost_sidecar_before_first_recovery_charges_usage_instead_of_zero(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        lifecycle_path(self.root, self.id).unlink()
+        tick(self.budget)
+        self.assertGreater(Decimal(self.budget.snapshot()["spent"]), 2)
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+        self.assertEqual(self.saved()["status"], "provisional")
+
+    def test_lost_sidecar_after_permit_never_refunds_a_priced_prefix(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        tick(self.budget)
+        before = Decimal(self.budget.snapshot()["spent"])
+        lifecycle_path(self.root, self.id).unlink()
+        tick(self.budget)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), before)
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+        self.assertEqual(self.saved()["status"], "provisional")
+        with self.assertRaisesRegex(BudgetError, "contradicts durable usage"):
+            self.budget.settle_receipt(dict(id=self.id, totals={self.id: "0"}, outcome="launch-failed"))
+
+    def test_no_exec_proof_releases_a_never_used_permit(self):
+        native = self.launch()
+        gate = read_lifecycle(self.root, self.id)["gate"]
+        durable(self.bridge / "inbox" / (self.id + ".no-exec"), dict(id=self.id, native=gate, reason="permit-timeout"))
+        self.stop(native)
+        self.stop(self.shim)
+        tick(self.budget)
+        self.assertEqual(self.saved()["status"], "settled")
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_no_exec_proof_cannot_override_priced_responses(self):
+        native = self.launch()
+        self.response()
+        gate = read_lifecycle(self.root, self.id)["gate"]
+        durable(self.bridge / "inbox" / (self.id + ".no-exec"), dict(id=self.id, native=gate))
+        self.stop(native)
+        self.stop(self.shim)
+        tick(self.budget)
+        self.assertGreater(Decimal(self.budget.snapshot()["spent"]), 2)
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_restart_uses_persisted_recovery_stamp(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        tick(self.budget)
+        with (
+            patch.object(self.budget, "recover_usage") as recover,
+            patch.object(self.budget, "settle_receipt") as settle,
+        ):
+            tick(self.budget, cache={})
+            recover.assert_not_called()
+            settle.assert_not_called()
+
+    def remote_launch(self):
+        self.stop(self.shim)
+        tick(self.budget)
+        self.id = uuid.uuid4().hex
+        birth = dict(pid=20, start="123", boot="vm-boot", namespace="pid:[vm]")
+        with patch("tauceti_worker.usage_supervisor.resolve", return_value=None):
+            value = registration(
+                self.id,
+                uuid.uuid4().hex,
+                self.bridge,
+                birth,
+                enabled=True,
+                owner=self.owner,
+                parent=identity(),
+                allow_remote=True,
+            )
+        self.assertTrue(
+            self.budget.admit(self.id, "fixture", MODEL, "fix", bridge=str(self.bridge), lifecycle=value)["allowed"]
+        )
+        register(self.root, value)
+        self.journal = UsageJournal(self.journal.directory, self.id, model=MODEL)
+        native = {**birth, "pid": 21, "start": "124"}
+        durable(self.bridge / "inbox" / (self.id + ".launch"), dict(id=self.id, native=native))
+        tick(self.budget)
+        self.assertTrue((self.bridge / "outbox" / (self.id + ".permit")).exists())
+        return native
+
+    def test_vm_native_receipt_settles_without_interpreting_vm_pid_on_host(self):
+        native = self.remote_launch()
+        self.response()
+        self.assertTrue(read_lifecycle(self.root, self.id)["external"])
+        with self.assertRaisesRegex(BudgetError, "live native"):
+            self.budget.settle_receipt(dict(id=self.id, totals={"provider": "3"}, outcome="exit:0"))
+        durable(
+            self.bridge / "inbox" / (self.id + ".terminal"),
+            dict(id=self.id, native=native, kind="successful-exit", returncode=0),
+        )
+        durable(
+            self.bridge / "inbox" / (self.id + ".receipt"), dict(id=self.id, totals={"provider": "3"}, outcome="exit:0")
+        )
+        tick(self.budget)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 3)
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_vm_bridge_death_alone_preserves_unknown_liveness_and_reserve(self):
+        self.remote_launch()
+        self.response()
+        value = read_lifecycle(self.root, self.id)
+        value["owner"]["start"] = "dead-bridge"
+        durable(lifecycle_path(self.root, self.id), value)
+        tick(self.budget)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+        self.assertIn("remote-liveness-unconfirmed", {e["kind"] for e in read_lifecycle(self.root, self.id)["events"]})
+
+    def test_round_end_reporting_failure_preserves_round_returncode(self):
+        from types import SimpleNamespace
+
+        from tauceti_worker import round as rounds
+
+        process = SimpleNamespace(pid=os.getpid(), wait=lambda timeout: 7, returncode=7)
+        with (
+            patch("tauceti_worker.claude_api.api_mode", return_value=True),
+            patch("tauceti_worker.usage_supervisor.ensure_supervisor"),
+            patch("tauceti_worker.usage_supervisor.record_round_end", side_effect=OSError("storage unavailable")),
+            patch.object(rounds, "spawn_round", return_value=process),
+            patch.object(rounds, "reap_round_group"),
+            patch.object(rounds, "log"),
+        ):
+            self.assertEqual(rounds.run_round_subprocess([]), 7)
+
     def test_bad_lifecycle_does_not_block_other_recovery(self):
         (self.root / "lifecycles" / ("0" * 32 + ".json")).write_text("bad json")
         self.stop(self.shim)

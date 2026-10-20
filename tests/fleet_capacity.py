@@ -68,6 +68,7 @@ class FleetTests(unittest.TestCase):
             patch.object(context.budget, "snapshot", return_value={}),
             patch("tauceti_worker.claude_api.report_runtime"),
             patch("tauceti_worker.usage_supervisor.register"),
+            patch("tauceti_worker.usage_supervisor.ensure_supervisor"),
         ):
             self.assertTrue(
                 context.handle(dict(action="admit", id="a" * 32, model="test", process=identity()))["allowed"]

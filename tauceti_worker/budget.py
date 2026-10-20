@@ -669,10 +669,23 @@ class Budget:
             if not session:
                 raise BudgetError("receipt has no recorded admission")
             from .usage_lifecycle import alive
-            from .usage_supervisor import read_lifecycle
+            from .usage_supervisor import external_exit_proved, read_lifecycle
+
+            if receipt.get("outcome") == "launch-failed" and totals and all(money(v) == 0 for v in totals.values()):
+                from .usage_accounting import session_usage
+
+                journal = session_usage(self.directory, session)
+                if money(session.get("cost", "0")) > 0 or (journal and journal["messages"]):
+                    raise BudgetError("no-inference receipt contradicts durable usage; reserve retained")
 
             lifecycle = read_lifecycle(self.directory, receipt["id"])
-            if totals is not None and lifecycle and lifecycle.get("native") and alive(lifecycle["native"]):
+            if (
+                totals is not None
+                and lifecycle
+                and lifecycle.get("native")
+                and alive(lifecycle["native"])
+                and not (lifecycle.get("external") and external_exit_proved(lifecycle))
+            ):
                 raise BudgetError("cannot settle a live native invocation; receipt retained for recovery")
             if session["status"] == "settled" and session.get("cost_provenance") not in ESTIMATE_PROVENANCES:
                 return

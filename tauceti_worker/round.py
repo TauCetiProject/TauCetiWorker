@@ -351,7 +351,10 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
 
     accounting = api_mode()
     if accounting:
-        ensure_supervisor(budget_dir())
+        try:
+            ensure_supervisor(budget_dir())
+        except Exception as error:
+            log(f"usage supervisor startup pending: {error}")
     p = spawn_round(argv_tail, timeout=timeout)
     owner = process_identity(p.pid) if accounting else None
     ending = "exit"
@@ -380,10 +383,13 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         # --loop and one-shot rounds alike, already died with its namespace, setsid'd ones included.
         reap_round_group(pgid)
         if accounting:
-            record_round_end(
-                budget_dir(),
-                owner,
-                "signal" if ending == "exit" and p.returncode is not None and p.returncode < 0 else ending,
-                p.returncode,
-            )
-            ensure_supervisor(budget_dir())
+            try:
+                record_round_end(
+                    budget_dir(),
+                    owner,
+                    "signal" if ending == "exit" and p.returncode is not None and p.returncode < 0 else ending,
+                    p.returncode,
+                )
+                ensure_supervisor(budget_dir())
+            except Exception as error:
+                log(f"usage supervisor recovery pending: {error}")

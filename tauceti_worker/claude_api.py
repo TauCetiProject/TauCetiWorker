@@ -236,7 +236,9 @@ class ClaudeAPIContext:
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):
                 raise BudgetError("invalid admission request")
             from .usage_lifecycle import identity
-            from .usage_supervisor import register, registration
+            from .usage_supervisor import ensure_supervisor, register, registration
+
+            ensure_supervisor(self.budget.directory)
 
             invocation = self.admission_ids.setdefault(ticket, uuid.uuid4().hex)
             lifecycle = registration(
@@ -245,6 +247,7 @@ class ClaudeAPIContext:
                 self.directory,
                 request.get("process"),
                 enabled=self.enabled,
+                allow_remote=not self.host,
                 owner=process_identity(),
                 parent=identity(os.getppid()),
                 deadline=float(os.environ["TAUCETI_ROUND_DEADLINE"])

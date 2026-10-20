@@ -793,6 +793,20 @@ with ClaudeAPIContext("crash-fixture", "fix"):
                 os.killpg(driver.pid, signal.SIGKILL)
             driver.wait()
 
+    def test_admission_restarts_a_supervisor_lost_mid_context(self):
+        from tauceti_worker.usage_lifecycle import alive
+
+        with ClaudeAPIContext("worker1", "fix") as context:
+            owner = json.loads((self.root / "budget/usage-supervisor.json").read_text())["owner"]
+            os.kill(owner["pid"], signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while alive(owner) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            result = self.run_claude()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(context.invocations), 1)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
+
     def test_native_exec_gate_inside_real_pid_namespace(self):
         from tauceti_worker.containment import command, probe
 

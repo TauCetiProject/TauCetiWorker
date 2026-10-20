@@ -257,8 +257,12 @@ def main():
             "failed-launch" if exec_failed else "successful-exit" if rc == 0 else "signal" if rc < 0 else "failed-exit"
         )
         try:
-            durable(bridge / "inbox" / (invocation + ".terminal"), dict(id=invocation, kind=kind, returncode=rc))
-        except OSError as error:
+            launch_identity = json.loads((bridge / "inbox" / (invocation + ".launch")).read_text()).get("native")
+            durable(
+                bridge / "inbox" / (invocation + ".terminal"),
+                dict(id=invocation, kind=kind, returncode=rc, native=launch_identity),
+            )
+        except (OSError, ValueError) as error:
             warning(f"tauceti lifecycle terminal evidence pending: {type(error).__name__}")
         if exec_failed:
             outcome = "launch-failed"
