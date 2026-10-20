@@ -683,10 +683,24 @@ def prepare_checkout(
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
     # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
     # the checkout aside and starts again from a fresh clone instead of failing every round.
-    if g("checkout", "-q", "-f", "-B", os.environ.get("TAUCETI_BASE_BRANCH", "main"), "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")):
+    if g(
+        "checkout",
+        "-q",
+        "-f",
+        "-B",
+        os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+        "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+    ):
         if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
             return False
-        if not clone("forced checkout failed") or g("checkout", "-q", "-f", "-B", os.environ.get("TAUCETI_BASE_BRANCH", "main"), "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")):
+        if not clone("forced checkout failed") or g(
+            "checkout",
+            "-q",
+            "-f",
+            "-B",
+            os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+            "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+        ):
             return False
     from .verification_scope import local_main
 
