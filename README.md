@@ -79,7 +79,7 @@ Ctrl-C stops the current round and exits. From a clone you can run `./tauceti`
 instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
 
-Local checks use [exact-input verification receipts and a host heavy-work queue](docs/verification.md).
+Local checks use [concurrent verification with exact-input receipts](docs/verification.md).
 
 ### Multiple GitHub accounts
 

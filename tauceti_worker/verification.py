@@ -1,4 +1,4 @@
-"""Synchronous, exact-input local verification and a rootless host heavy-work queue.
+"""Synchronous, concurrent local verification with exact-input receipts.
 
 Receipts are evidence of commands run against particular bytes, never a proof of correctness.
 A receipt is durable and incomplete before any child starts; SIGKILL cannot turn it into success.
@@ -33,7 +33,6 @@ from .containment import Boundary
 from .paths import HERE
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
-from .verification_queue import admitted
 from .verification_scope import git, local_main, scope, untracked
 
 SCHEMA = "tauceti-verification/v1"
@@ -84,23 +83,16 @@ def machine_key() -> str:
     return digest(platform.node())[:24]
 
 
-def queue_root() -> Path:
-    # Bubble explicitly mounts this same host directory; a private container /tmp is not shared.
+def cache_root() -> Path:
+    # Share immutable installation identities, never admission to verification work.
     root = Path(
-        os.environ.get("TAUCETI_VERIFY_HOST_QUEUE") or f"/tmp/tauceti-verification-{os.getuid()}-{machine_key()}"
+        os.environ.get("TAUCETI_VERIFY_CACHE_DIR") or f"/tmp/tauceti-verification-{os.getuid()}-{machine_key()}"
     )
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
-        raise ValueError(f"unsafe verification queue directory: {root}")
+        raise ValueError(f"unsafe verification cache directory: {root}")
     return root
-
-
-def heavy_slots() -> int:
-    raw = os.environ.get("TAUCETI_VERIFY_HEAVY_SLOTS", "1")
-    if not raw.isascii() or not raw.isdigit() or int(raw) < 1:
-        raise ValueError("TAUCETI_VERIFY_HEAVY_SLOTS must be a positive integer")
-    return int(raw)
 
 
 def files_under(root: Path):
@@ -223,7 +215,6 @@ class Verification:
             phases={},
             commands=[],
             receipt=str(self.path),
-            queue_wait_seconds=0.0,
         )
         self.base = ""
         self.watched = {}
@@ -234,14 +225,8 @@ class Verification:
         self.dependency_names = None
         self.mutated = False
         self.last_watch = 0.0
-        self.wait_lease = None
-        self.interrupted_wait = False
+        self.live_lease = None
         self.job = job
-        self.capacity_path = (
-            self.state / "verification-job-capacity" / f"{job['id']}.json"
-            if job
-            else self.state / "verification-capacity.json"
-        )
         self.installations = Installations(
             self.state,
             digest=digest,
@@ -250,7 +235,7 @@ class Verification:
             files_under=files_under,
             file_record=file_record,
             stamps=stamps,
-            cache_directory=lambda: queue_root() / "installations",
+            cache_directory=lambda: cache_root() / "installations",
         )
 
     def save(self):
@@ -266,7 +251,6 @@ class Verification:
         if not math.isfinite(margin) or margin < 0:
             raise ValueError("TAUCETI_VERIFY_CHECKPOINT_MARGIN must be a nonnegative number of seconds")
         if self.deadline is not None and time.time() >= self.deadline - margin:
-            self.interrupted_wait = bool(self.receipt.get("waiting_for_capacity"))
             raise Incomplete("round deadline checkpoint margin reached; checkpoint now", reason="deadline")
 
     def watch(self):
@@ -286,68 +270,9 @@ class Verification:
         ):
             raise Incomplete("dependency, toolchain or verifier mutated during verification")
 
-    @contextlib.contextmanager
-    def slot(self, phase):
-        started = time.monotonic()
-        waiting = False
-        acquired = False
-        published = 0.0
-
-        def publish():
-            nonlocal waiting, published
-            if not waiting:
-                from .verification_jobs import preserve_candidate
-
-                waiting = True
-                self.progress(f"{phase}: waiting-verification-capacity")
-                self.receipt["waiting_for_capacity"] = True
-                self.capacity(True)
-                self.save()
-                report_runtime("waiting-verification-capacity", verification_receipt=str(self.path))
-                if self.job:
-                    preserve_candidate(self)
-            if time.monotonic() - published >= 15:
-                published = time.monotonic()
-                self.capacity(True)
-                report_runtime("waiting-verification-capacity", verification_receipt=str(self.path))
-
-        try:
-            with admitted(
-                queue_root(),
-                heavy_slots(),
-                watch=self.watch,
-                waiting=publish,
-                priority=self.job.get("priority") if self.job else None,
-            ):
-                acquired = True
-                self.receipt["queue_wait_seconds"] += time.monotonic() - started if waiting else 0
-                self.capacity(False)
-                self.receipt["waiting_for_capacity"] = False
-                report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
-                yield
-        finally:
-            if not acquired and waiting:
-                self.receipt["queue_wait_seconds"] += time.monotonic() - started
-                self.capacity(False, interrupted=True)
-            self.save()
-
-    def capacity(self, waiting, *, interrupted=False):
-        atomic(
-            self.capacity_path,
-            dict(
-                attempt=os.environ.get("TAUCETI_VERIFY_ATTEMPT"),
-                waiting=waiting,
-                interrupted=interrupted,
-                deadline=self.interrupted_wait,
-                receipt=str(self.path),
-                job=f"verification-pending/{self.job['id']}.json" if self.job else None,
-                lease=str((self.directory / "live.lock").relative_to(self.state)),
-                at=time.time(),
-            ),
-        )
-
     def command(self, phase, argv, *, env=None, capture=False):
         self.watch()
+        report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
         log = self.directory / f"{len(self.receipt['commands']):03d}-{phase}.log"
         entry = dict(phase=phase, argv=argv, started_at=time.time(), ended_at=None, exit=None, log=str(log))
         self.receipt["commands"].append(entry)
@@ -592,9 +517,8 @@ class Verification:
     def run(self):
         self.save()
         previous = {}
-        self.wait_lease = (self.directory / "live.lock").open("a+")
-        fcntl.flock(self.wait_lease, fcntl.LOCK_EX)
-        self.capacity(False)
+        self.live_lease = (self.directory / "live.lock").open("a+")
+        fcntl.flock(self.live_lease, fcntl.LOCK_EX)
         cache = read_json(self.state / "verification-hashes.json")
         cache_size = len(cache)
         cache_token = _HASH_CACHE.set(cache)
@@ -605,7 +529,6 @@ class Verification:
 
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 previous[sig] = signal.signal(sig, interrupted)
-            heavy_slots()
             raw = self.base_arg or os.environ.get("TAUCETI_VERIFY_BASE") or local_main(self.root)
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
@@ -684,16 +607,10 @@ class Verification:
                 )
                 self.receipt["phases"][phase] = record
                 self.save()
-                # Shim and source-style checks are cheap. Environment lint/build/audits alone
-                # consume heavy capacity; release it between commands.
                 for argv, env in self.phase_commands(phase, modules):
                     if early_style and phase == "lint" and "scripts/lint-style.sh" in argv:
                         continue
-                    heavy = phase in {"build", "axioms", "module-system"} or (
-                        phase == "lint" and "scripts/lint-env.sh" in argv
-                    )
-                    with self.slot(phase) if heavy else contextlib.nullcontext():
-                        self.command(phase, argv, env=env)
+                    self.command(phase, argv, env=env)
                 self.validate_inputs(inputs)
                 record.update(status="success", ended_at=time.time(), validated_fingerprint=fingerprint)
                 self.index_success()
@@ -736,7 +653,7 @@ class Verification:
             self.save()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
-            self.wait_lease.close()
+            self.live_lease.close()
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
             if len(cache) != cache_size:
@@ -744,13 +661,8 @@ class Verification:
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
             if self.job and self.receipt["status"] == "incomplete":
-                status = (
-                    "waiting-verification-capacity"
-                    if self.receipt.get("waiting_for_capacity")
-                    else "verification-pending"
-                )
                 report_runtime(
-                    status,
+                    "verification-pending",
                     verification_phase=None,
                     verification_job=self.job["id"],
                     detail="durable verification job retained for mechanical continuation",
@@ -885,94 +797,3 @@ def command(args):
         if result.get("error"):
             print(result["error"], file=sys.stderr)
     return 0 if result["status"] == "success" else 1
-
-
-def live_wait(wait: dict, state: Path) -> bool:
-    if not wait.get("waiting") or not wait.get("lease"):
-        return False
-    try:
-        with (state / wait["lease"]).open("r+") as lease:
-            try:
-                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return False
-            except BlockingIOError:
-                return True
-    except OSError:
-        return False
-
-
-def capacity_evidence(wait: dict, state: Path, *, interrupted_round=False) -> bool:
-    return bool(
-        wait.get("deadline")
-        and wait.get("interrupted")
-        or wait.get("interrupted")
-        and isinstance(wait.get("job"), str)
-        and (state / wait["job"]).is_file()
-        or live_wait(wait, state)
-        or interrupted_round
-        and (wait.get("waiting") or wait.get("interrupted"))
-    )
-
-
-def refund_capacity_wait(state: Path, counters, *, interrupted_round=False) -> bool:
-    """Restore captured counters once, only for the current unfinished invocation/round."""
-    attempt = read_json(state / "verification-attempt.json")
-    wait = read_json(state / "verification-capacity.json")
-    if (
-        not attempt
-        or attempt.get("finished")
-        or wait.get("attempt") != attempt.get("id")
-        or not capacity_evidence(wait, state, interrupted_round=interrupted_round)
-    ):
-        return False
-    if not attempt.get("refunded"):
-        for key, value in attempt.get("restore", {}).items():
-            counters.write(key, min(counters.read(key), value))
-        attempt["refunded"] = True
-        atomic(state / "verification-attempt.json", attempt)
-    return True
-
-
-def begin_attempt(w, charged, *, bubble=False):
-    if not charged:
-        return lambda: False
-    state = w.cfg.state / "verification-state" if bubble else w.cfg.state
-    identifier = uuid.uuid4().hex
-    atomic(
-        state / "verification-attempt.json",
-        dict(id=identifier, finished=False, restore={key: max(0, w.counters.read(key) - 1) for key in charged}),
-    )
-    os.environ["TAUCETI_VERIFY_ATTEMPT"] = identifier
-
-    def callback():
-        refunded = refund_capacity_wait(state, w.counters)
-        attempt = read_json(state / "verification-attempt.json")
-        attempt["finished"] = True
-        atomic(state / "verification-attempt.json", attempt)
-        return refunded
-
-    if getattr(w, "rc", None) is not None:
-
-        def cleanup():
-            if getattr(w.rc, "interrupted", False):
-                refund_capacity_wait(state, w.counters, interrupted_round=True)
-
-        w.rc.add_cleanup(cleanup)
-    return callback
-
-
-def waiting_for_capacity(cfg, *, since=None) -> bool:
-    state = getattr(cfg, "state", None)
-    if state is None:
-        return False
-    attempt = os.environ.get("TAUCETI_VERIFY_ATTEMPT")
-    for directory in (state, state / "verification-state"):
-        wait = read_json(directory / "verification-capacity.json")
-        matches = (
-            (wait.get("at", 0) >= since) if since is not None else bool(attempt and wait.get("attempt") == attempt)
-        )
-        if since is not None and wait.get("at", 0) < time.time() - 30:
-            continue
-        if matches and capacity_evidence(wait, directory, interrupted_round=since is not None):
-            return True
-    return False

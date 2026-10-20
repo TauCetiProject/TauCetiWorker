@@ -582,13 +582,13 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
 
     def test_refusal_does_not_mask_typed_pauses_or_launched_tool_failures(self):
-        from tauceti_worker.config import Die, VerificationUnavailable
+        from tauceti_worker.config import Die, GitHubUnavailable
 
         cfg = SimpleNamespace(state=self.root / "worker")
         worker = SimpleNamespace(cfg=cfg, counters=Counters(cfg))
         candidate = SimpleNamespace(pr=7, head="a" * 40)
         for paid in (False, True):
-            for error in (VerificationUnavailable("verification queue"), Die("tool failed")):
+            for error in (GitHubUnavailable("GitHub unavailable"), Die("tool failed")):
                 if not paid and isinstance(error, Die):
                     continue  # A pre-inference parsing exception can represent the refused result.
                 with self.subTest(paid=paid, error=error):
@@ -659,26 +659,6 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 work_units._run_github_stage("fix", launch, worker, None, candidate, None, False)
         self.assertEqual(worker.counters.read("fix-7-aaaaaaaaaaaa"), 0)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
-
-    def test_pending_verification_takes_precedence_over_later_admission_refusal(self):
-        from tauceti_worker.config import VerificationUnavailable
-
-        cfg = SimpleNamespace(state=self.root / "worker")
-        worker = SimpleNamespace(cfg=cfg, counters=Counters(cfg))
-        candidate = SimpleNamespace(pr=7, head="a" * 40)
-        for stage in ("roadmap", "overlap-fix"):
-            with self.subTest(stage=stage):
-                self.budget.configure(set_grant=100)
-                with ClaudeAPIContext("worker1", stage):
-
-                    def launch(*_):
-                        self.assertEqual(self.run_claude().returncode, 0)
-                        self.budget.configure(set_grant=0)
-                        return self.run_claude().returncode
-
-                    with patch("tauceti_worker.verification.waiting_for_capacity", return_value=True):
-                        with self.assertRaises(VerificationUnavailable):
-                            work_units._run_github_stage(stage, launch, worker, None, candidate, None, False)
 
     def test_policy_expiry_or_malformed_policy_between_bridge_and_launch(self):
         policy = self.root / "admission.json"

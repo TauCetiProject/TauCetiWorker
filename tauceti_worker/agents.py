@@ -491,14 +491,13 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "### Local verification\n"
         f"Run `{helper}` synchronously after the last edit or integration. "
         f"The worker's local actual-source scope policy is `{policy}`. "
-        "The helper owns the heavy-work queue, full `lake build --iofail`, scoped axiom/duplicate audit, "
+        "The helper runs the full `lake build --iofail`, scoped axiom/duplicate audit, "
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
         "Use a tool timeout covering the remaining round; Claude Bash timeouts are set by the worker. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
-        "A waiting-verification-capacity message means stay in this foreground call; the claim heartbeat continues. "
         "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
         "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
@@ -2103,7 +2102,7 @@ def run_in_bubble(
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
     if helper_on:
-        from .verification import queue_root
+        from .verification import cache_root
 
         package = rounddir / "tauceti_worker"
         shutil.copytree(
@@ -2115,7 +2114,9 @@ def run_in_bubble(
         (rounddir / "tauceti-verify").chmod(0o755)
         verify_state = cfg.state / "verification-state"
         verify_state.mkdir(parents=True, exist_ok=True)
-        host_queue = queue_root()
+        host_cache = None
+        with contextlib.suppress(OSError, ValueError):
+            host_cache = cache_root()
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -2132,9 +2133,9 @@ def run_in_bubble(
         mount_flags += [
             "--mount",
             f"{verify_state}:/opt/verification-state:rw",
-            "--mount",
-            f"{host_queue}:/opt/verification-queue:rw",
         ]
+        if host_cache is not None:
+            mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
     api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
     api_boundary = None
     if api_bridge and _uses_claude_credentials(cred_model):
@@ -2202,7 +2203,6 @@ def run_in_bubble(
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     for var in (
-        "TAUCETI_VERIFY_ATTEMPT",
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
         "TAUCETI_PUSH_REMOTE",
@@ -2215,9 +2215,10 @@ def run_in_bubble(
     if helper_on:
         for key, value in {
             "TAUCETI_VERIFY_STATE": "/opt/verification-state",
-            "TAUCETI_VERIFY_HOST_QUEUE": "/opt/verification-queue",
+            "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
+            if host_cache is not None
+            else "/tmp/verification-cache",
             "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
-            "TAUCETI_VERIFY_HEAVY_SLOTS": os.environ.get("TAUCETI_VERIFY_HEAVY_SLOTS", "1"),
             "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
             "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
             "TAUCETI_VERIFY_PYTHON": "/usr/bin/python3",

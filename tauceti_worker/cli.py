@@ -53,7 +53,6 @@ from .config import (
     GitHubUnavailable,
     NoProgress,
     ProgressPreparationUnavailable,
-    VerificationUnavailable,
     acquire_slot,
     auto_assign_wid,
     is_git_url,
@@ -71,7 +70,6 @@ from .constants import (
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
-    EX_VERIFICATION_WAIT,
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -1754,9 +1752,6 @@ def cli_main() -> int:
             failure_log=None,
         )
         return EX_DOCUMENTATION_WAIT
-    except VerificationUnavailable as e:
-        report_runtime("waiting-verification-capacity", detail=str(e))
-        return EX_VERIFICATION_WAIT
     except AdmissionUnavailable as e:
         log(str(e))
         report_runtime(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact receipts, failure propagation and host queue with local Git/fake Lean fixtures only."""
+"""Exact receipts, failure propagation and concurrent execution with local Git/fake Lean fixtures only."""
 
 import contextlib
 import io
@@ -12,18 +12,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker.verification import (
     Verification,
     atomic,
-    begin_attempt,
-    heavy_slots,
     inventory,
-    queue_root,
-    refund_capacity_wait,
 )
 from tauceti_worker.verification_scope import local_main, scope
 
@@ -84,6 +79,13 @@ if mode == 'mutation':
 if mode == 'sleep':
     (p/'tool.pid').write_text(str(os.getpid()))
     time.sleep(float(os.environ.get('FIXTURE_SLEEP', '1.5')))
+if mode == 'barrier':
+    barrier = Path(os.environ['FIXTURE_BARRIER'])
+    (barrier / ('ready-' + Path(os.environ['TAUCETI_VERIFY_STATE']).name)).touch()
+    deadline = time.monotonic() + 40
+    while not (barrier / 'release').exists():
+        if time.monotonic() > deadline: sys.exit(98)
+        time.sleep(0.02)
 if os.environ.get('AUDIT_PHASES_FILE'):
     Path(os.environ['AUDIT_PHASES_FILE']).write_text('audit-import\\t1\\naudit-duplicates\\t2\\naudit-axioms\\t3\\n')
 print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True)
@@ -102,8 +104,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_VERIFY_HELPER="1",
             TAUCETI_PROCESS_CONTAINMENT="legacy",
             TAUCETI_VERIFY_STATE=str(self.state),
-            TAUCETI_VERIFY_HOST_QUEUE=str(self.home / "queue"),
-            TAUCETI_VERIFY_HEAVY_SLOTS="1",
+            TAUCETI_VERIFY_CACHE_DIR=str(self.home / "cache"),
             TAUCETI_VERIFY_BASE=self.base,
             TAUCETI_VERIFY_CHECKPOINT_MARGIN="0",
         )
@@ -119,10 +120,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
     def calls(self):
         return (self.root / ".lake/calls").read_text().splitlines()
 
-    def spawn(self, **updates):
+    def spawn(self, *, root=None, **updates):
         return subprocess.Popen(
             [sys.executable, str(REPO / "scripts/tauceti-verify"), "--stage", "build", "--json"],
-            cwd=self.root,
+            cwd=root or self.root,
             env={**self.env, **updates},
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -199,28 +200,30 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertIn("TauCeti.New", scope(self.root, self.base, "ordinary")["modules"])
         self.assertEqual(local_main(self.root), self.base)
 
-    def test_queue_contention_deadline_and_owner_death(self):
-        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="10")
-        self.addCleanup(lambda: p.poll() is None and p.kill())
-        self.wait_calls(p)
-        # Another worker has its own durable state, but shares the actual host queue.
-        q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"), TAUCETI_ROUND_DEADLINE=str(time.time() + 3))
-        out, _ = q.communicate(timeout=10)
-        result = json.loads(out)
-        self.assertNotEqual(q.returncode, 0)
-        self.assertTrue(result["waiting_for_capacity"])
-        self.assertIn("deadline", result["error"])
-        self.assertEqual(len(self.calls()), 1)
-        p.kill()
-        p.communicate(timeout=10)
-        owned_tool = int((self.root / ".lake/tool.pid").read_text())
-        os.kill(owned_tool, signal.SIGKILL)
-        receipt = json.loads(next(self.state.glob("verification/*/receipt.json")).read_text())
-        self.assertEqual(receipt["status"], "incomplete")
-        # An owner killed without Python cleanup releases its flock immediately.
-        q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker3"), TAUCETI_ROUND_DEADLINE=str(time.time() + 3))
-        out, _ = q.communicate(timeout=10)
-        self.assertEqual(q.returncode, 0, out)
+    def test_owner_death_leaves_incomplete_receipt_and_recoverable_job(self):
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60")
+        try:
+            self.wait_calls(p)
+            limit = time.monotonic() + 10
+            while not (self.root / ".lake/tool.pid").exists():
+                self.assertIsNone(p.poll())
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(0.02)
+            owned_tool = int((self.root / ".lake/tool.pid").read_text())
+            p.kill()
+            p.communicate(timeout=10)
+            # This fixture uses process-group fallback; SIGKILL cannot run Python cleanup.
+            os.kill(owned_tool, signal.SIGKILL)
+            receipt = json.loads(next(self.state.glob("verification/*/receipt.json")).read_text())
+            self.assertEqual(receipt["status"], "incomplete")
+            self.assertEqual(len(list((self.state / "verification-pending").glob("*.json"))), 1)
+            q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"))
+            out, _ = q.communicate(timeout=10)
+            self.assertEqual(q.returncode, 0, out)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.communicate(timeout=10)
 
     def test_deadline_interrupts_child_and_sigterm(self):
         p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="10", TAUCETI_ROUND_DEADLINE=str(time.time() + 2))
@@ -245,32 +248,54 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         result = self.verify(stage="build")
         self.assertNotIn("reused_from", result["phases"]["build"])
 
-    def test_durable_capacity_refund_is_idempotent(self):
-        values = {"fix-1": 3}
-        counters = SimpleNamespace(read=lambda key: values[key], write=lambda key, value: values.update({key: value}))
-        worker = SimpleNamespace(cfg=SimpleNamespace(state=self.state), counters=counters)
-        callback = begin_attempt(worker, ("fix-1",))
-        atomic(
-            self.state / "verification-capacity.json",
-            dict(attempt=os.environ["TAUCETI_VERIFY_ATTEMPT"], waiting=False, interrupted=True, deadline=True),
-        )
-        self.assertTrue(callback())
-        self.assertEqual(values["fix-1"], 2)
-        self.assertFalse(refund_capacity_wait(self.state, counters))
-        self.assertEqual(values["fix-1"], 2)
+    def test_twenty_independent_verifiers_enter_build_together_despite_old_slot(self):
+        import fcntl
+        import shutil
 
-    def test_two_workers_run_serially(self):
-        first = self.spawn(FIXTURE_MODE="sleep")
-        self.wait_calls(first)
-        started = time.monotonic()
-        second = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"), FIXTURE_MODE="sleep")
-        out1, _ = first.communicate(timeout=10)
-        out2, _ = second.communicate(timeout=10)
-        self.assertEqual(first.returncode, 0, out1)
-        self.assertEqual(second.returncode, 0, out2)
-        result = json.loads(out2)
-        self.assertGreater(result["queue_wait_seconds"], 0.7)
-        self.assertGreater(time.monotonic() - started, 2.5)
+        barrier = self.home / "barrier"
+        barrier.mkdir()
+        old_queue = self.home / "obsolete-queue"
+        old_queue.mkdir()
+        processes = []
+        with (old_queue / "slot-0.lock").open("a+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            try:
+                for index in range(20):
+                    root = self.home / f"source-{index}"
+                    shutil.copytree(self.root, root)
+                    state = self.home / f"worker-{index}"
+                    # Old deployment variables and stale waits cannot throttle new verification.
+                    atomic(state / "verification-capacity.json", dict(waiting=True, interrupted=True))
+                    processes.append(
+                        self.spawn(
+                            root=root,
+                            TAUCETI_VERIFY_STATE=str(state),
+                            TAUCETI_VERIFY_HOST_QUEUE=str(old_queue),
+                            TAUCETI_VERIFY_HEAVY_SLOTS="1",
+                            FIXTURE_MODE="barrier",
+                            FIXTURE_BARRIER=str(barrier),
+                        )
+                    )
+                limit = time.monotonic() + 30
+                while len(list(barrier.glob("ready-*"))) != len(processes):
+                    self.assertTrue(all(p.poll() is None for p in processes))
+                    self.assertLess(time.monotonic(), limit, "independent builds were serialized")
+                    time.sleep(0.02)
+                (barrier / "release").touch()
+                for p in processes:
+                    out, _ = p.communicate(timeout=20)
+                    self.assertEqual(p.returncode, 0, out)
+                    result = json.loads(out)
+                    self.assertEqual(result["status"], "success")
+                    self.assertNotIn("queue_wait_seconds", result)
+                    self.assertNotIn("waiting_for_capacity", result)
+                self.assertFalse(list(old_queue.glob("wait-*")))
+            finally:
+                (barrier / "release").touch()
+                for p in processes:
+                    if p.poll() is None:
+                        p.kill()
+                    p.communicate(timeout=10)
 
     def test_shim_ratchet_and_one_json_result(self):
         write(self.root, "TauCeti/mathlib-shims.json", "{}")
@@ -306,29 +331,6 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         output, _ = p.communicate(timeout=10)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(json.loads(output)["status"], "incomplete")
-
-    def test_stale_wait_does_not_refund_normal_completion(self):
-        values = {"fix-1": 3}
-        counters = SimpleNamespace(read=lambda key: values[key], write=lambda key, value: values.update({key: value}))
-        worker = SimpleNamespace(cfg=SimpleNamespace(state=self.state), counters=counters)
-        callback = begin_attempt(worker, ("fix-1",))
-        lease = self.state / "dead.lock"
-        lease.touch()
-        atomic(
-            self.state / "verification-capacity.json",
-            dict(attempt=os.environ["TAUCETI_VERIFY_ATTEMPT"], waiting=True, lease="dead.lock", at=time.time()),
-        )
-        self.assertFalse(callback())
-        self.assertEqual(values["fix-1"], 3)
-        self.assertFalse(refund_capacity_wait(self.state, counters, interrupted_round=True))
-
-    def test_new_reused_invocation_clears_old_wait(self):
-        first = self.verify(stage="build")
-        self.assertEqual(first["status"], "success", first.get("error"))
-        atomic(self.state / "verification-capacity.json", dict(waiting=True, interrupted=True, deadline=True))
-        second = self.verify(stage="build")
-        self.assertIn("reused_from", second["phases"]["build"])
-        self.assertFalse(json.loads((self.state / "verification-capacity.json").read_text())["waiting"])
 
     def test_explicit_lint_modules_are_bound_inputs(self):
         modules = write(self.home, "lint-modules.txt", "TauCeti.B\n")
@@ -392,59 +394,9 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertGreater(int(env["BASH_MAX_TIMEOUT_MS"]), 1000000)
         self.assertIn(sys.executable, local_verification("ordinary"))
 
-    def test_queued_unmanaged_round_is_detected_from_local_journal(self):
-        from tauceti_worker.verification import waiting_for_capacity
-
-        marker = self.state / "verification-capacity.json"
-        atomic(marker, dict(waiting=True, at=time.time(), lease="dead.lock"))
-        self.assertTrue(waiting_for_capacity(SimpleNamespace(state=self.state), since=time.time() - 1))
-        self.assertFalse(waiting_for_capacity(SimpleNamespace(state=self.state), since=time.time() + 1))
-
-    def test_loop_capacity_wait_skips_api_budget_and_no_work_backoff(self):
-        from tauceti_worker import loop
-        from tauceti_worker.constants import EX_VERIFICATION_WAIT
-
-        for code in (124, EX_VERIFICATION_WAIT):
-
-            def round_result(_, code=code):
-                atomic(
-                    self.state / "verification-state/verification-capacity.json",
-                    dict(waiting=True, at=time.time(), lease="dead.lock"),
-                )
-                return code
-
-            with (
-                patch.object(loop, "fleet_admission_reason", return_value=None),
-                patch.object(loop, "api_mode", return_value=False),
-                patch.object(loop, "choose_model", return_value=("claude", {})),
-                patch.object(loop, "github_budget", return_value={}),
-                patch.object(loop, "run_round_subprocess", side_effect=round_result),
-                patch.object(loop, "Budget") as budget,
-                patch.object(loop, "report_runtime") as status,
-                patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt) as sleep,
-            ):
-                loop.cmd_loop(
-                    SimpleNamespace(bubble=True),
-                    SimpleNamespace(wid="fixture", state=self.state),
-                    only=["fix"],
-                    agent="claude",
-                )
-            budget.assert_not_called()
-            sleep.assert_called_once_with(5)
-            self.assertIn(
-                "waiting-verification-capacity", [call.args[0] for call in status.call_args_list if call.args]
-            )
-
-    def test_cli_capacity_exit_and_installed_wrapper_permission(self):
+    def test_installed_wrapper_permission(self):
         from tauceti_worker import cli
-        from tauceti_worker.config import VerificationUnavailable
-        from tauceti_worker.constants import EX_VERIFICATION_WAIT
 
-        with (
-            patch.object(cli, "main", side_effect=VerificationUnavailable("fixture wait")),
-            patch.object(cli, "report_runtime"),
-        ):
-            self.assertEqual(cli.cli_main(), EX_VERIFICATION_WAIT)
         package = self.home / "installed"
         wrapper = write(package, "scripts/tauceti-verify", "fixture")
         wrapper.chmod(0o644)
@@ -480,13 +432,13 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("checker is missing", result["error"])
 
-    def test_slot_configuration(self):
-        self.assertEqual(heavy_slots(), 1)
-        self.assertIn("queue", str(queue_root()))
-        for bad in ("0", "-1", "two", "1.5"):
-            os.environ["TAUCETI_VERIFY_HEAVY_SLOTS"] = bad
-            with self.assertRaises(ValueError):
-                heavy_slots()
+    def test_obsolete_slot_settings_do_not_restrict_or_reject_verification(self):
+        for value in ("1", "0", "invalid"):
+            with patch.dict(os.environ, TAUCETI_VERIFY_HEAVY_SLOTS=value):
+                result = self.verify(stage="build", reuse=False)
+            self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertFalse((self.state / "verification-capacity.json").exists())
+        self.assertFalse((self.state / "verification-attempt.json").exists())
 
 
 if __name__ == "__main__":

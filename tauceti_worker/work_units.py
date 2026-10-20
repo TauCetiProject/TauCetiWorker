@@ -981,12 +981,6 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
 
     try:
         rc = fn(w, sv, c, opts, bubble)
-        from .verification import waiting_for_capacity
-
-        if stage in FILE_CHANGE_STAGES | {"overlap-fix"} and waiting_for_capacity(getattr(w, "cfg", None)):
-            from .config import VerificationUnavailable
-
-            raise VerificationUnavailable("waiting-verification-capacity: verification remains recoverable")
         check_result(rc)
     except AdmissionUnavailable:
         refund_admission()
@@ -1662,9 +1656,6 @@ def _do_fixlike(
         # blocks a restart on preparation failure; a typed pre-inference refusal
         # restores this launch allowance without removing existing checkpoints.
         w.counters.record_foreign_repair_launch(pr, head, scope.evidence_base, foreign)
-    from .verification import begin_attempt
-
-    capacity_wait = begin_attempt(w, charged, bubble=bubble)
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
@@ -1784,12 +1775,6 @@ def _do_fixlike(
                     ),
                 )
                 guard(w.cfg, co)
-    if capacity_wait():
-        from .config import VerificationUnavailable
-
-        raise VerificationUnavailable(
-            "waiting-verification-capacity: unfinished verification retained; PR attempt refunded"
-        )
     if rc == 0:
         w.rs.bust(pr)
     elif not foreign:

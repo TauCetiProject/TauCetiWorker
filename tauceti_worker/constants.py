@@ -151,7 +151,6 @@ INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a 
 EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without failed-round backoff
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
 EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outside the round timeout
-EX_VERIFICATION_WAIT = 78  # heavy verification capacity, outside no-work and API admission
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)

@@ -154,7 +154,7 @@ def prepare_job(verification, inputs):
 
 
 def preserve_candidate(verification, *, disposable_only=False):
-    """Preserve before publishing a queued job; reused phases need no candidate copy."""
+    """Preserve an interrupted or disposable candidate; reused phases need no candidate copy."""
     from .verification import atomic, digest, inventory
 
     job = verification.job
@@ -212,7 +212,7 @@ def finish_job(verification):
     status = verification.receipt["status"]
     path = verification.state / "verification-pending" / f"{job['id']}.json"
     waiting_tools = verification.receipt.get("incomplete_reason") in {"tool-missing", "toolchain"}
-    resumable = verification.receipt.get("incomplete_reason") in {"deadline", "signal", "capacity"} or waiting_tools
+    resumable = verification.receipt.get("incomplete_reason") in {"deadline", "signal"} or waiting_tools
     if resumable and not job.get("isolated"):
         try:
             preserve_candidate(verification)
@@ -371,10 +371,6 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         except BlockingIOError:
                             continue
-                    from .survey import Counters
-                    from .verification import refund_capacity_wait
-
-                    refund_capacity_wait(state, Counters(cfg), interrupted_round=True)
                     job["attempts"] += 1
                     root = Path(job["root"])
                     try:
@@ -431,7 +427,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             result_path = state / "verification-jobs" / f"{job['id']}-{job['attempts']}.result.json"
                             log_path = result_path.with_suffix(".log")
                             # Independent candidate and job lease permit inference to continue
-                            # while this helper owns/waits for its heavy slot.
+                            # while this helper verifies its independent candidate.
                             env["TAUCETI_RUNTIME_STATUS"] = str(result_path.with_suffix(".runtime.json"))
                             with result_path.open("w") as output, log_path.open("w") as log:
                                 process = subprocess.Popen(
