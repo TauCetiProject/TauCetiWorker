@@ -681,20 +681,50 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
         self.tick()
         self.assertTrue((tree / ".git" / "MERGE_HEAD").exists())
 
-    def test_tag_and_reflog_only_source_keep_git_history(self):
+    def test_tag_and_reflog_only_source_are_bundled_before_tree_removal(self):
         self.dirty()
         git(self.co, "add", "Draft.lean")
         git(self.co, "commit", "-qm", "unpublished tagged source")
         lost = git(self.co, "rev-parse", "HEAD").strip()
         git(self.co, "tag", "local-tag")
         git(self.co, "reset", "--hard", "HEAD~1")
+        expected = snapshot_tree(self.co)
         tree = self.retained()
         self.tick()
-        self.assertTrue((tree / ".git").is_dir())
-        git(tree, "tag", "-d", "local-tag")
+        self.assertFalse(tree.exists())
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+        clone = reconstruct(self.origin, saved, self.root, "history-restored")
+        self.assertIn("exact saved source", git(clone, "show", f"{lost}:Draft.lean"))
+        self.assertIn(f"history/{lost}", wr._read_manifest(saved)["bundle_refs"])
+
+    def test_force_pushed_remote_and_amended_source_history_reconstruct(self):
+        seed = self.root / "seed"
+        git(seed, "checkout", "-qb", "pr")
+        (seed / "A.lean").write_text("old published source")
+        git(seed, "commit", "-qam", "old PR")
+        remote_old = git(seed, "rev-parse", "HEAD").strip()
+        git(seed, "push", str(self.origin), "pr")
+        git(self.co, "fetch", "origin")
+        git(seed, "reset", "--hard", "main")
+        (seed / "A.lean").write_text("replacement published source")
+        git(seed, "commit", "-qam", "rewritten PR")
+        git(seed, "push", "--force", str(self.origin), "pr")
+        git(self.co, "fetch", "origin")
+        (self.co / "A.lean").write_text("amended-away local source")
+        git(self.co, "commit", "-qam", "local original")
+        local_old = git(self.co, "rev-parse", "HEAD").strip()
+        (self.co / "A.lean").write_text("current local source")
+        git(self.co, "commit", "-qam", "amend", "--amend")
+        expected = self.dirty()
+        tree = self.retained()
         self.tick()
-        self.assertTrue(tree.exists())
-        self.assertIn("exact saved source", git(tree, "show", f"{lost}:Draft.lean"))
+        self.assertFalse(tree.exists())
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+        clone = reconstruct(self.origin, saved, self.root, "orphan-history-restored")
+        self.assertEqual(git(clone, "show", f"{remote_old}:A.lean"), "old published source")
+        self.assertEqual(git(clone, "show", f"{local_old}:A.lean"), "amended-away local source")
 
     def test_upstream_release_tags_do_not_park_recoverable_tree(self):
         git(self.root / "seed", "tag", "-am", "release", "v1-fixture")
@@ -1056,7 +1086,9 @@ with patch('os.readlink', side_effect=OSError('PID namespaces unavailable')):
         (self.co / ".git").mkdir()  # a killed clone can leave an invalid directory
         tree = self.retained()
         refs = git(self.root, "for-each-ref")
-        self.tick()
+        with patch.object(maintenance, "_safe", side_effect=AssertionError("invalid Git ran process scan")):
+            self.tick()
+            self.tick()
         self.assertTrue((tree / "Draft.lean").exists())
         self.assertEqual(git(self.root, "for-each-ref"), refs)
         self.assertFalse((self.cfg.state / "recovery").exists())
@@ -1064,6 +1096,48 @@ with patch('os.readlink', side_effect=OSError('PID namespaces unavailable')):
             wr._git(tree, "rev-parse", "--show-toplevel")
         wr._update_refs(tree, ["update refs/tauceti/test HEAD"], check=False)
         self.assertEqual(git(self.root, "for-each-ref"), refs)
+
+    def test_rollback_clean_leftover_branch_reuses_one_verified_bundle(self):
+        git(self.co, "checkout", "-qb", "unfinished")
+        (self.co / "A.lean").write_text("local-only source")
+        git(self.co, "commit", "-qam", "unfinished")
+        head = git(self.co, "rev-parse", "HEAD").strip()
+        with (
+            patch.dict(os.environ, TAUCETI_WORK_RECOVERY="off"),
+            patch.object(index, "lookup", side_effect=AssertionError("rollback index reliance")),
+            patch.object(index, "remember", side_effect=AssertionError("rollback index publication")),
+        ):
+            saved = wr.guard(self.cfg, self.co).record
+            git(self.co, "checkout", "-qB", "main", "origin/main")
+            for _ in range(4):
+                self.assertEqual(wr.guard(self.cfg, self.co).record, saved)
+            self.assertEqual(len(list((self.cfg.state / "recovery").glob("*/commits.bundle"))), 1)
+            (saved / "commits.bundle").write_bytes(b"corrupt")
+            replacement = wr.guard(self.cfg, self.co).record
+            self.assertNotEqual(saved, replacement)
+            for _ in range(4):
+                self.assertEqual(wr.guard(self.cfg, self.co).record, replacement)
+            self.assertEqual(len(list((self.cfg.state / "recovery").glob("*/commits.bundle"))), 2)
+        clone = reconstruct(self.origin, replacement, self.root, "rollback-history")
+        self.assertEqual(git(clone, "show", f"{head}:A.lean"), "local-only source")
+
+    def test_recycled_session_leader_does_not_protect_old_tree(self):
+        self.dirty()
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd="/",
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(lambda: proc.wait(timeout=3))
+        self.addCleanup(proc.terminate)
+        tree = self.retained()
+        birth = dict(pid=proc.pid, session=proc.pid, start="0", boot=wr.process_owner()["boot"])
+        wr.atomic_json(tree.with_name(tree.name + ".owner.json"), dict(process=birth))
+        self.tick()
+        self.assertFalse(tree.exists())
+        self.assertIsNone(proc.poll())  # unrelated replacement session remains healthy
 
     def test_prepared_summary_and_rollback_do_no_payload_analysis(self):
         self.dirty()

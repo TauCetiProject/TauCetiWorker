@@ -352,7 +352,7 @@ def _untracked(repo: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]
     return keep, excluded
 
 
-def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
+def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = False) -> Snapshot:
     """Read-only inspection. Raises RecordError when the checkout cannot be read reliably.
     `preserved` names the complete records whose preserved refs may exempt commits from re-recording."""
     head = _rev(repo, "HEAD")
@@ -371,6 +371,26 @@ def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
             tips[name] = oid
             operations.append(name)
     operations += [d for d in ("rebase-merge", "rebase-apply") if (gitdir / d).exists()]
+    if history:
+        # Archive only history outside the source tips already covered by ordinary v1 records.
+        # Deduplicate by oid so our own preservation-ref writes cannot change the snapshot.
+        extra = set(
+            _git(
+                repo,
+                "rev-list",
+                "--all",
+                "--reflog",
+                "--not",
+                "--remotes",
+                f"--glob={PUBLISHED}",
+                *sorted(set(tips.values())),
+                text=True,
+            ).split()
+        )
+        if extra:
+            heads = set(_git(repo, "rev-list", "--no-walk", "--all", "--reflog", text=True).split())
+            for oid in extra & heads:
+                tips[f"history/{oid}"] = oid
     base = _rev(repo, "refs/remotes/origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")) or _rev(
         repo, "refs/remotes/origin/HEAD"
     )
@@ -1040,6 +1060,53 @@ def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
         return Decision(False, f"could not preserve source: {error}", record)
 
 
+def _rollback_commits(cfg, repo, snap, repository):
+    """Index-free fallback: validate one bundle named by this checkout's own preserved refs.
+
+    Only current Git-ref metadata is enumerated, never historic descriptor directories/trees.
+    A corrupt/missing candidate causes a fresh save; no other historical payload is hashed.
+    """
+    unpublished = set(snap.unpublished)
+    required = {oid for oid in snap.tips.values() if oid in unpublished}
+    if not required:
+        return None
+    groups = {}
+    prefix = PRESERVED + "/"
+    for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)", PRESERVED, text=True).splitlines():
+        oid, _, ref = line.partition(" ")
+        if not ref.startswith(prefix):
+            continue
+        record_id, separator, _ = ref[len(prefix) :].partition("/")
+        if separator and record_id and not record_id.startswith("."):
+            groups.setdefault(record_id, set()).add(oid)
+    selected, newest = None, -1
+    for record_id, oids in groups.items():
+        if not required <= oids:
+            continue
+        record = cfg.state / "recovery" / record_id
+        try:
+            _charge(entries=1)
+            modified = record.stat().st_mtime_ns
+            if modified > newest:
+                selected, newest = record, modified
+        except OSError:
+            continue
+    if selected is None:
+        return None
+    try:
+        manifest = _complete(selected)
+        if manifest is None or manifest.get("repository") != repository or not manifest["bundle_refs"]:
+            return None
+        _sync_record(selected)
+        heads = {
+            line.split()[0]
+            for line in _git(repo, "bundle", "list-heads", str(selected / "commits.bundle"), text=True).splitlines()
+        }
+        return selected if required <= heads else None
+    except (OSError, RecordError, ValueError, TypeError):
+        return None
+
+
 def _guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
     """Save anything unpublished in `repo`, then let preparation continue. Never waits for a human.
 
@@ -1071,8 +1138,12 @@ def _guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI
                 )
             return Decision(True, state="clean")
         committed = None
-        if indexed and snap.unpublished and not snap.dirty:
-            committed = _indexed_record(cfg.state, repository, _commit_key(snap), source=False)
+        if snap.unpublished and not snap.dirty:
+            committed = (
+                _indexed_record(cfg.state, repository, _commit_key(snap), source=False)
+                if indexed
+                else _rollback_commits(cfg, repo, snap, repository)
+            )
         if committed is not None:
             record = committed  # still run the ordinary live-user and final-source rechecks below
         elif snap.needs_record:

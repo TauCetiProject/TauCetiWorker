@@ -165,10 +165,19 @@ def _safe(state, tree, owner):
         return "await-owner"
     session = birth.get("session")
     if session is not None:
+        if not isinstance(session, int) or session <= 0:
+            return "await-owner"
         try:
             if birth["boot"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
                 session = None
-        except OSError:
+            else:
+                try:
+                    fields = Path(f"/proc/{session}/stat").read_text().rsplit(")", 1)[1].split()
+                    if int(fields[3]) == session and fields[19] != birth["start"]:
+                        session = None  # a new session reused the old leader's PID
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+        except (OSError, ValueError, IndexError):
             return "await-owner"
     if tree.is_symlink() or wr.live_users(tree, session=session):
         return "await-live-users"
@@ -391,7 +400,7 @@ def _promote(job, work):
     return True
 
 
-def _unarchived_state(tree, snap, record):
+def _unarchived_state(tree, snap):
     """v1 captures branch source, but not credentials, native operations or extra Git history."""
     from . import work_recovery as wr
 
@@ -401,22 +410,8 @@ def _unarchived_state(tree, snap, record):
         return True
     if wr._git(tree, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/notes").strip():
         return True
-    # Do not treat historical preserved refs as evidence here: their descriptors have not
-    # been validated for this candidate. Leave reflog-only source in the original Git tree.
-    return bool(
-        wr._git(
-            tree,
-            "rev-list",
-            "--reflog",
-            "--all",
-            "--not",
-            "--branches",
-            "--remotes",
-            f"--glob={wr.PUBLISHED}",
-            f"--glob={wr.PRESERVED}/{record.name}",
-            *([snap.head] if snap.head else []),
-        ).strip()
-    )
+    # The history-aware snapshot includes extra ref/reflog tips in this descriptor's v1 bundle.
+    return False
 
 
 def _park_signature(tree, sidecar):
@@ -491,12 +486,20 @@ def _cleanup(state, tree, root, work, observation=None):
             return
         if job.pop("parked", None) is not None:
             job["retry_at"] = 0  # a metadata change can retry immediately at its last successful allowance
-        # Git must never discover an enclosing repository for a failed/incomplete clone.
-        if (job["phase"] == "save" or not tree.name.endswith(".deleting")) and (
-            not (tree / ".git").is_dir() or (tree / ".git").is_symlink()
-        ):
-            _park(job, tree, sidecar)
-            return
+        # Reject failed/incomplete repositories before any process or mount traversal.
+        if job["phase"] == "save" or not tree.name.endswith(".deleting"):
+            valid = (tree / ".git").is_dir() and not (tree / ".git").is_symlink()
+            if valid:
+                try:
+                    top = wr._git(tree, "rev-parse", "--show-toplevel", text=True).strip()
+                    valid = os.path.realpath(top) == os.path.realpath(tree)
+                except wr.BudgetExhausted:
+                    raise
+                except (OSError, wr.RecordError, subprocess.SubprocessError):
+                    valid = False
+            if not valid:
+                _park(job, tree, sidecar)
+                return
         reason = _safe(state, tree, owner)
         if reason:
             job["next_action"] = reason
@@ -511,7 +514,7 @@ def _cleanup(state, tree, root, work, observation=None):
                 job["next_action"] = "resume-cache-removal"
                 return
             saving_source = True
-            snap = wr.inspect(tree)
+            snap = wr.inspect(tree, history=True)
             record = wr._record(
                 cfg,
                 tree,
@@ -520,10 +523,10 @@ def _cleanup(state, tree, root, work, observation=None):
                 owner.get("repository", root["repository"]),
                 owner=owner,
             )
-            if _unarchived_state(tree, snap, record):
+            if _unarchived_state(tree, snap):
                 _park(job, tree, sidecar)
                 return  # v1 records do not preserve credentials or native operation metadata
-            if _safe(state, tree, owner) or wr.inspect(tree).fingerprint != snap.fingerprint:
+            if _safe(state, tree, owner) or wr.inspect(tree, history=True).fingerprint != snap.fingerprint:
                 job["next_action"] = "retry-changing-source"
                 return
             manifest = wr._complete(record)
@@ -563,11 +566,11 @@ def _cleanup(state, tree, root, work, observation=None):
             # Compare again because a late source change invalidates the deletion receipt.
             validating_source = not just_saved
             if not just_saved:
-                snap = wr.inspect(tree)
+                snap = wr.inspect(tree, history=True)
                 if snap.fingerprint != manifest["fingerprint"]:
                     job.update(phase="save", next_action="preserve-changed-source", stack=[""])
                     return
-                if _unarchived_state(tree, snap, record):
+                if _unarchived_state(tree, snap):
                     _park(job, tree, sidecar)
                     return
         saving_source = validating_source = False

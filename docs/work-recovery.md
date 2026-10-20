@@ -116,8 +116,11 @@ stop a worker. Preparation always saves first and then always continues:
   incrementally; tracked cache-named paths remain source. Before removing source,
   housekeeping saves a descriptor, re-inspects the source, validates the descriptor
   exactly, and journals the deletion before rename. Credentials, native Git
-  operation metadata, unpublished extra refs and reflog-only history that v1 cannot reconstruct
-  keep the original tree intact.
+  operation metadata, stash and notes keep the original tree intact. Other reflog-only
+  and extra-ref commit tips are included in the existing v1 bundle before the tree
+  is removed, including amended-away and force-pushed heads. This history inspection
+  happens only in bounded housekeeping; work-start preparation never walks retained
+  Git histories.
   A larger source candidate stays recoverable while its next bounded allowance is
   scheduled. Candidates beyond the maximum allowance keep their source and
   retryable disposition. Unarchived metadata parks only that candidate, keeping
@@ -204,8 +207,11 @@ resumed deletions and historical reconciliation. The existing source-saving guar
 stays active: current unpublished source is saved directly in v1 descriptors before
 a reset, without consulting the index. Healthy checkouts and their caches remain
 in place; an unsavable or live candidate is still moved aside intact. With index
-reuse disabled, repeated saves may duplicate source payloads, but rollback does
-not repeatedly clone or retain pristine checkouts and large private caches.
+reuse disabled, a clean leftover branch reuses one exactly validated descriptor
+named by this checkout's own preserved refs. Only one candidate bundle is validated;
+no historical payload inventory is hashed. Changed dirty source still gets its own
+self-contained descriptor. Rollback does not repeatedly clone or retain pristine
+checkouts and large private caches.
 Existing descriptors, retained trees, deletion journals and indexes remain intact.
 
 ## Scope
