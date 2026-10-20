@@ -119,16 +119,15 @@ def link_into(src: Path, dst: Path, skip=None) -> tuple[int, int]:
 def mathlib_pool(host_home: Path, env: dict[str, str] | None = None) -> Path:
     """Where the machine keeps its shared `.ltar`s.
 
-    Follows the same order Mathlib's own cache tool uses, so the pool is the directory the operator's
-    interactive `lake exe cache get` already fills: an explicit `MATHLIB_CACHE_DIR`, else
-    `XDG_CACHE_HOME/mathlib`, else `~/.cache/mathlib` under the LOGIN user's home rather than the
-    per-worker one."""
+    Explicit overrides remain external/operator-owned. The default lives inside TauCeti's
+    owned build-cache pool so its collector can reclaim it without touching interactive caches.
+    """
     env = os.environ if env is None else env
     explicit = env.get("TAUCETI_MATHLIB_POOL") or env.get("MATHLIB_CACHE_DIR")
     if explicit:
         return Path(explicit)
-    xdg = env.get("XDG_CACHE_HOME")
-    return Path(xdg) / "mathlib" if xdg else host_home / ".cache" / "mathlib"
+    managed = Path(env.get("TAUCETI_BUILD_CACHE_ROOT") or host_home / ".cache/tauceti/builds")
+    return managed / "mathlib"
 
 
 def elan_pool(host_home: Path, env: dict[str, str] | None = None) -> Path:

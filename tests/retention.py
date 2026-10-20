@@ -41,11 +41,15 @@ class Retention(unittest.TestCase):
             quota_cache=self.state / "cache",
         )
         self.clock = 1_000_000.0
+        actual = shutil.disk_usage(self.root)
+        balanced = shutil._ntuple_diskusage(actual.total, actual.total // 2, actual.total // 2)
         for item in (
+            patch.object(retention.shutil, "disk_usage", return_value=balanced),
             patch.dict(
                 os.environ,
                 {
                     "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
+                    "TAUCETI_BUILD_CACHE_ROOT": str(self.root / "build-cache"),
                     "TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool"),
                     "TAUCETI_WORKERS_STATE_DIR": str(self.root / "managed"),
                 },
@@ -108,6 +112,40 @@ class Retention(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertIn(b"unfinished", (records[0][1] / "unstaged.patch").read_bytes())
         self.assertFalse(result["errors"])
+
+    def test_pressure_request_recycles_each_old_generation_once(self):
+        build = self.cache()
+        private = self.cfg.state / "home/.cache/lake/payload"
+        private.parent.mkdir(parents=True)
+        private.write_text("old artifact")
+        retention.recycle(self.cfg, now=self.clock)
+        atomic_json(
+            activity.root() / "cache-pressure.json",
+            dict(requested_at=self.clock + 10, until=self.clock + 200, workers=[self.cfg.wid]),
+        )
+        retention.recycle(self.cfg, now=self.clock + 20)
+        self.assertFalse(private.exists())
+        self.assertTrue(build.exists())  # Pressure does not make the current build cold.
+        private.parent.mkdir(parents=True)
+        private.write_text("new artifact")
+        retention.recycle(self.cfg, now=self.clock + 30)
+        self.assertTrue(private.exists())
+
+    def test_critical_space_reclaims_idle_private_cache_before_admission(self):
+        cache = self.cache()
+        self.cfg.state.mkdir(parents=True, exist_ok=True)
+        usage = shutil._ntuple_diskusage(1000, 960, 40)
+        with (
+            patch.object(retention.shutil, "disk_usage", return_value=usage),
+            patch("tauceti_worker.retention.request_cleanup"),
+        ):
+            with self.assertRaises(config.AdmissionUnavailable):
+                with round_.RoundContext(self.cfg):
+                    self.fail("critical storage must defer new work")
+        self.assertFalse(cache.exists())
+        # Deferral released the round lock, and does not need an activity/paid round.
+        with retention.locked(self.cfg.state / "round.lock"):
+            pass
 
     def test_short_rounds_do_not_renew_generation(self):
         cache = self.cache()
@@ -816,7 +854,7 @@ class Retention(unittest.TestCase):
         ):
             retention.install_timer()
         directory = self.root / "xdg/systemd/user"
-        self.assertIn("OnCalendar=daily", (directory / "tauceti-cleanup.timer").read_text())
+        self.assertIn("OnCalendar=hourly", (directory / "tauceti-cleanup.timer").read_text())
         self.assertIn("Persistent=true", (directory / "tauceti-cleanup.timer").read_text())
         self.assertIn("IOSchedulingClass=idle", (directory / "tauceti-cleanup.service").read_text())
         self.assertIn("TAUCETI_ACTIVITY_DIR=", (directory / "tauceti-cleanup.service").read_text())

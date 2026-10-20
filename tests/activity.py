@@ -63,6 +63,16 @@ class ActivityTests(unittest.TestCase):
             )
             self.assertEqual(db.execute("SELECT cost FROM conversation_costs WHERE id='paid'").fetchone()[0], "17.25")
 
+    def test_host_cache_metrics_are_in_prepared_group_status(self):
+        from tauceti_worker import expanded_cache
+
+        a.atomic_json(a.root() / "cleanup.json", dict(at=1, managed_bytes=1024, protected_bytes=512))
+        a.emit("round_started", worker="one", group="host-one", round_id="round-one")
+        with patch.object(expanded_cache, "summary", return_value=dict(workers=1, hits=10, expanded=2, seconds=3)):
+            value = a.prepare()
+        self.assertEqual(value["groups"]["host-one"]["storage_cleanup"]["managed_bytes"], 1024)
+        self.assertEqual(a.cached(group="host-one")["summary"]["expanded_cache"]["hits"], 10)
+
     def test_table_aligns_all_rows_and_lists_zero_count_work_types(self):
         self.finish(10, kind="fix")
         a.prepare(now=self.now)

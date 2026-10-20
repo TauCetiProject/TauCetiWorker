@@ -530,8 +530,13 @@ def sync_mathlib_pool(cfg: Config) -> None:
     if private.resolve() == pool.resolve():
         return  # operator pointed this worker straight at the pool; nothing to exchange
     try:
+        from .cache_storage import initialize
+        from .expanded_cache import root
+
+        if pool == root() / "mathlib":
+            initialize(root())
         promoted, hydrated = build_caches.sync_pool(private, pool)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         log(f"mathlib cache pool: skipped ({e})")
         return
     if promoted or hydrated:
@@ -1283,7 +1288,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.pop("TAUCETI_PR_CACHE_MISS", None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
-        from . import shared_mathlib
+        from . import expanded_cache, shared_mathlib
 
         try:
             with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
@@ -1291,7 +1296,28 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
                 try:
                     try:
-                        warm_host_build_caches(cwd, env, logdir)
+                        with expanded_cache.preparation(
+                            cwd,
+                            env,
+                            refetch=lambda warm: _cache_fetch(
+                                [
+                                    *prefix,
+                                    "lake",
+                                    "cache",
+                                    "get",
+                                    "--service",
+                                    TAUCETI_CACHE_SERVICE,
+                                    "--repo",
+                                    TAUCETI,
+                                    f"--max-revs={lake_cache_max_revs(warm)}",
+                                ],
+                                cwd,
+                                warm,
+                                subprocess.DEVNULL,
+                                30,
+                            ),
+                        ) as warm_env:
+                            warm_host_build_caches(cwd, warm_env, logdir)
                     except Exception as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
@@ -1443,6 +1469,44 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
 
     if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
         return
+    # Mathlib itself knows which compressed archives the selected dependency tree
+    # needs. Prune stale private links daily so pool GC can actually release them;
+    # otherwise the old promote/hydrate-all exchange resurrects dead archives forever.
+    from . import expanded_cache
+    from .runtime_status import read_json
+
+    mathlib_private = Path(env.get("MATHLIB_CACHE_DIR", "/nonexistent"))
+    home = Path(env.get("HOME", "/nonexistent"))
+    mathlib_pool = expanded_cache.root(env) / "mathlib"
+    marker = mathlib_private.parent / "mathlib-cleanup.json"
+    if (
+        env.get("TAUCETI_SHARED_ARTIFACTS", "1") != "0"
+        and mathlib_private.is_relative_to(home)
+        and mathlib_private != home
+        and (mathlib_pool.parent / "owner.json").is_file()
+        and time.time() - read_json(marker).get("at", 0) > 86400
+        and deadline - time.monotonic() > 60
+    ):
+        try:
+            # Failed housekeeping retries in an hour, never on every paid round.
+            expanded_cache.atomic_json(marker, dict(at=time.time() - 23 * 3600))
+            with logf.open("ab") as output:
+                rc = _cache_fetch(
+                    [*prefix, "lake", "exe", "cache", "clean"],
+                    cwd,
+                    env,
+                    output,
+                    max(1, min(30, deadline - time.monotonic())),
+                )
+            if rc == 0:
+                build_caches.link_into(mathlib_private, mathlib_pool)
+                for path in mathlib_private.glob("*.ltar"):
+                    pooled = mathlib_pool / path.name
+                    if pooled.is_file() and not pooled.is_symlink():
+                        os.utime(pooled, None)  # Current-tree reuse, not download age.
+                expanded_cache.atomic_json(marker, dict(at=time.time()))
+        except Exception as error:
+            log(f"Mathlib archive housekeeping deferred: {error}")
     if env.get("LAKE_ARTIFACT_CACHE", "1").lower() in _LAKE_FALSE:
         log("host build caches: TauCeti artifact caching explicitly disabled by LAKE_ARTIFACT_CACHE")
         return

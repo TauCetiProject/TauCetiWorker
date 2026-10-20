@@ -109,6 +109,22 @@ def display(value, default_kinds=()):
             f"{cleanup.get('errors_count', len(cleanup.get('errors', [])))} errors; "
             f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB free"
         )
+        if "managed_bytes" in cleanup:
+            age = max(0, int(time.time() - cleanup.get("at", time.time())))
+            print(
+                f"  Managed caches: {cleanup['managed_bytes'] / 2**30:.1f} GiB; "
+                f"{cleanup.get('protected_bytes', 0) / 2**30:.1f} GiB held by live workers; "
+                f"{cleanup.get('reclaimed_bytes', 0) / 2**30:.1f} GiB space recovered; checked {age}s ago"
+            )
+            if cleanup.get("pressure"):
+                print("  Disk cleanup requested; live work and saved source remain protected")
+    if expanded := s.get("expanded_cache"):
+        if expanded.get("workers"):
+            print(
+                f"Expanded artifacts (latest preparation per worker): {expanded.get('hits', 0)} reused; "
+                f"{expanded.get('expanded', 0)} expanded; {expanded.get('seconds', 0):.1f}s preparation"
+            )
+
     since = s.get("history_since")
     print("Activity since: " + (datetime.fromtimestamp(since, UTC).isoformat(timespec="seconds") if since else "none"))
     kinds = list(dict.fromkeys(s.get("round_types", default_kinds)))
@@ -376,6 +392,29 @@ def combine(values):
                 row = s["rounds"][w].setdefault(kind, dict(finished=0, failed=0, unknown=0))
                 for key in row:
                     row[key] += counts.get(key, 0)
+    cleanup = [v["storage_cleanup"] for v in known if v.get("storage_cleanup")]
+    if cleanup:
+        s["storage_cleanup"] = dict(
+            at=min(row.get("at", 0) for row in cleanup),
+            **{
+                key: sum(row.get(key, 0) for row in cleanup)
+                for key in (
+                    "managed_bytes",
+                    "protected_bytes",
+                    "reclaimed_bytes",
+                    "free_bytes",
+                    "removed_count",
+                    "protected_count",
+                    "errors_count",
+                )
+            },
+            pressure=any(row.get("pressure", False) for row in cleanup),
+        )
+    expanded = [v["expanded_cache"] for v in known if v.get("expanded_cache")]
+    if expanded:
+        s["expanded_cache"] = {
+            key: sum(row.get(key, 0) for row in expanded) for key in ("workers", "hits", "expanded", "seconds")
+        }
     for w in WINDOWS:
         for key in ("authored", "landed", "reviews", "fixes"):
             s["pr_windows"][w][key] = sum(v["pr_windows"][w].get(key, 0) for v in known)

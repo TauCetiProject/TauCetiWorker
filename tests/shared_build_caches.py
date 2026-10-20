@@ -98,12 +98,13 @@ def main():
         # The pool follows the same order Mathlib's own tool uses, so it is the directory the
         # operator's interactive `cache get` already fills.
         check(
-            "pool honours XDG_CACHE_HOME",
-            build_caches.mathlib_pool(LOGIN_HOME, {"XDG_CACHE_HOME": "/xdg"}) == Path("/xdg/mathlib"),
+            "default pool is owned by TauCeti, outside the operator cache",
+            build_caches.mathlib_pool(LOGIN_HOME, {"XDG_CACHE_HOME": "/xdg"})
+            == LOGIN_HOME / ".cache/tauceti/builds/mathlib",
         )
         check(
             "pool falls back to the login home",
-            build_caches.mathlib_pool(LOGIN_HOME, {}) == LOGIN_HOME / ".cache" / "mathlib",
+            build_caches.mathlib_pool(LOGIN_HOME, {}) == LOGIN_HOME / ".cache/tauceti/builds/mathlib",
         )
         check(
             "an explicit pool override wins",
