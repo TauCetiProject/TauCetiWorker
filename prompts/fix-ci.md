@@ -16,7 +16,9 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   The other stage names are `build`, `axioms`, `module-system` and `lint`. The helper checks
   the merge-base shim registry with `--fail-on-available`, `--base-manifest` and `--base-root`,
   using `--only-new` for source-only PRs. It never fetches. If lint flags unchanged declarations,
-  inspect their defining sources and current main before choosing a repair. Policy: `__SCOPE_POLICY__`.
+  inspect their defining sources and current main before choosing a repair. To reproduce them, write
+  their dotted module names to an absolute list outside the checkout and pass `--lint-modules /absolute/list`
+  to both the diagnostic lint phase and the final all-stage helper call. Policy: `__SCOPE_POLICY__`.
 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.

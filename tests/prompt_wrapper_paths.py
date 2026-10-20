@@ -23,10 +23,12 @@ This harness pins the four properties that keep that true:
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import os
 import re
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -122,6 +124,19 @@ def main():
             all(ln.startswith(f'"{subs.get("BIN")}/') for ln in invocations),
         )
     check("every bundled prompt has a call site", {p.name for p in PROMPTS.glob("*.md")} == set(CALL_SITES))
+
+    # Rollback selects the unchanged standalone V0 templates, while retaining literal substitutions.
+    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="0"):
+        for name in ("roadmap.md", "fix.md", "fix-ci.md", "rebase.md", "bump.md", "lint-repair.md", "overlap-fix.md"):
+            substitutions = dict(CALL_SITES[name])
+            substitutions["LOCAL_VERIFICATION"] = tc.agents.local_verification(
+                substitutions.get("SCOPE_POLICY", "ordinary")
+            )
+            text = fill_prompt(PROMPTS / name, **substitutions)
+            check(
+                f"{name}: V0 rollback restores scope recipe",
+                "<<'TAUCETI_SCOPE'" in text and "/tauceti-verify" not in text,
+            )
 
     # 4) Shim expiry is an autonomous repair input, not a notification-only dead end. Both workers
     # reproduce and verify the gate, and both know the registry is part of the source-only fix.

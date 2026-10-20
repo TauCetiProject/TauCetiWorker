@@ -81,7 +81,9 @@ mode = os.environ.get('FIXTURE_MODE', '')
 if mode == 'fail': sys.exit(23)
 if mode == 'mutation':
     source = Path('TauCeti/A.lean'); before = source.read_text(); source.write_text('changed'); source.write_text(before)
-if mode == 'sleep': time.sleep(1.5)
+if mode == 'sleep':
+    (p/'tool.pid').write_text(str(os.getpid()))
+    time.sleep(float(os.environ.get('FIXTURE_SLEEP', '1.5')))
 if os.environ.get('AUDIT_PHASES_FILE'):
     Path(os.environ['AUDIT_PHASES_FILE']).write_text('audit-import\\t1\\naudit-duplicates\\t2\\naudit-axioms\\t3\\n')
 print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True)
@@ -100,6 +102,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_VERIFY_HOST_QUEUE=str(self.home / "queue"),
             TAUCETI_VERIFY_HEAVY_SLOTS="1",
             TAUCETI_VERIFY_BASE=self.base,
+            TAUCETI_VERIFY_CHECKPOINT_MARGIN="0",
         )
         self.environ = patch.dict(os.environ, self.env, clear=True)
         self.environ.start()
@@ -194,11 +197,11 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(local_main(self.root), self.base)
 
     def test_queue_contention_deadline_and_owner_death(self):
-        p = self.spawn(FIXTURE_MODE="sleep")
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="10")
         self.addCleanup(lambda: p.poll() is None and p.kill())
         self.wait_calls(p)
         # Another worker has its own durable state, but shares the actual host queue.
-        q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"), TAUCETI_ROUND_DEADLINE=str(time.time() + 0.4))
+        q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"), TAUCETI_ROUND_DEADLINE=str(time.time() + 3))
         out, _ = q.communicate(timeout=10)
         result = json.loads(out)
         self.assertNotEqual(q.returncode, 0)
@@ -207,6 +210,8 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(len(self.calls()), 1)
         p.kill()
         p.communicate(timeout=10)
+        owned_tool = int((self.root / ".lake/tool.pid").read_text())
+        os.kill(owned_tool, signal.SIGKILL)
         receipt = json.loads(next(self.state.glob("verification/*/receipt.json")).read_text())
         self.assertEqual(receipt["status"], "incomplete")
         # An owner killed without Python cleanup releases its flock immediately.
@@ -215,7 +220,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(q.returncode, 0, out)
 
     def test_deadline_interrupts_child_and_sigterm(self):
-        p = self.spawn(FIXTURE_MODE="sleep", TAUCETI_ROUND_DEADLINE=str(time.time() + 0.4))
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="10", TAUCETI_ROUND_DEADLINE=str(time.time() + 2))
         out, _ = p.communicate(timeout=10)
         result = json.loads(out)
         self.assertEqual(result["status"], "incomplete")
@@ -243,11 +248,12 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         worker = SimpleNamespace(cfg=SimpleNamespace(state=self.state), counters=counters)
         callback = begin_attempt(worker, ("fix-1",))
         atomic(
-            self.state / "verification-capacity.json", dict(attempt=os.environ["TAUCETI_VERIFY_ATTEMPT"], waiting=True)
+            self.state / "verification-capacity.json",
+            dict(attempt=os.environ["TAUCETI_VERIFY_ATTEMPT"], waiting=False, interrupted=True, deadline=True),
         )
         self.assertTrue(callback())
         self.assertEqual(values["fix-1"], 2)
-        self.assertTrue(refund_capacity_wait(self.state, counters))
+        self.assertFalse(refund_capacity_wait(self.state, counters))
         self.assertEqual(values["fix-1"], 2)
 
     def test_two_workers_run_serially(self):
@@ -297,6 +303,178 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         output, _ = p.communicate(timeout=10)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(json.loads(output)["status"], "incomplete")
+
+    def test_stale_wait_does_not_refund_normal_completion(self):
+        values = {"fix-1": 3}
+        counters = SimpleNamespace(read=lambda key: values[key], write=lambda key, value: values.update({key: value}))
+        worker = SimpleNamespace(cfg=SimpleNamespace(state=self.state), counters=counters)
+        callback = begin_attempt(worker, ("fix-1",))
+        lease = self.state / "dead.lock"
+        lease.touch()
+        atomic(
+            self.state / "verification-capacity.json",
+            dict(attempt=os.environ["TAUCETI_VERIFY_ATTEMPT"], waiting=True, lease="dead.lock", at=time.time()),
+        )
+        self.assertFalse(callback())
+        self.assertEqual(values["fix-1"], 3)
+        self.assertFalse(refund_capacity_wait(self.state, counters, interrupted_round=True))
+
+    def test_new_reused_invocation_clears_old_wait(self):
+        first = self.verify(stage="build")
+        self.assertEqual(first["status"], "success", first.get("error"))
+        atomic(self.state / "verification-capacity.json", dict(waiting=True, interrupted=True, deadline=True))
+        second = self.verify(stage="build")
+        self.assertIn("reused_from", second["phases"]["build"])
+        self.assertFalse(json.loads((self.state / "verification-capacity.json").read_text())["waiting"])
+
+    def test_explicit_lint_modules_are_bound_inputs(self):
+        modules = write(self.home, "lint-modules.txt", "TauCeti.B\n")
+        write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
+        result = self.verify(stage="lint", lint_modules=modules)
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertIn("TauCeti.B", Path(result["commands"][3]["log"]).read_text())
+        modules.write_text("TauCeti.A\n")
+        result = self.verify(stage="lint", lint_modules=modules)
+        self.assertNotIn("reused_from", result["phases"]["lint"])
+
+    def test_bubble_checkpoint_survives_incomplete_verification(self):
+        write(self.root, "TauCeti/A.lean", "candidate edit\n")
+        write(self.root, "TauCeti/Untracked.lean", "untracked edit\n")
+        with patch.dict(os.environ, TAUCETI_VERIFY_BUBBLE="1", TAUCETI_VERIFY_CHECKPOINT_MARGIN="10"):
+            result = self.verify(stage="build", deadline=time.time() + 1)
+        self.assertEqual(result["status"], "incomplete")
+        checkpoint = Path(result["source_checkpoint"])
+        self.assertTrue(checkpoint.is_file())
+        self.assertIn("candidate edit", checkpoint.with_name("source.patch").read_text())
+        import tarfile
+
+        with tarfile.open(checkpoint.with_name("untracked.tar")) as archive:
+            self.assertEqual(archive.extractfile("TauCeti/Untracked.lean").read(), b"untracked edit\n")
+
+    def test_content_cache_rechecks_changed_ctime(self):
+        self.verify(stage="build")
+        before = json.loads((self.state / "verification-hashes.json").read_text())
+        write(self.root, "TauCeti/A.lean", "changed input\n")
+        result = self.verify(stage="build")
+        after = json.loads((self.state / "verification-hashes.json").read_text())
+        self.assertGreater(len(after), len(before))
+        self.assertNotIn("reused_from", result["phases"]["build"])
+        self.assertIn("path", result["inputs"])
+
+    def test_bubble_wrapper_layout_in_python_safe_path_mode(self):
+        import shutil
+
+        layout = self.home / "round"
+        layout.mkdir()
+        shutil.copy(REPO / "scripts/tauceti-verify", layout / "tauceti-verify")
+        shutil.copytree(
+            REPO / "tauceti_worker", layout / "tauceti_worker", ignore=shutil.ignore_patterns("__pycache__")
+        )
+        result = subprocess.run(
+            [sys.executable, "-P", str(layout / "tauceti-verify"), "--help"],
+            cwd=self.home,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--lint-modules", result.stdout)
+
+    def test_host_wrapper_uses_worker_python_and_long_timeout(self):
+        from tauceti_worker.agents import host_agent_argv, local_verification
+
+        with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() + 1800)):
+            _, env = host_agent_argv("fixture prompt", "claude")
+        self.assertEqual(env["TAUCETI_VERIFY_PYTHON"], sys.executable)
+        self.assertGreater(int(env["BASH_MAX_TIMEOUT_MS"]), 1000000)
+        self.assertIn(sys.executable, local_verification("ordinary"))
+
+    def test_queued_unmanaged_round_is_detected_from_local_journal(self):
+        from tauceti_worker.verification import waiting_for_capacity
+
+        marker = self.state / "verification-capacity.json"
+        atomic(marker, dict(waiting=True, at=time.time(), lease="dead.lock"))
+        self.assertTrue(waiting_for_capacity(SimpleNamespace(state=self.state), since=time.time() - 1))
+        self.assertFalse(waiting_for_capacity(SimpleNamespace(state=self.state), since=time.time() + 1))
+
+    def test_loop_capacity_wait_skips_api_budget_and_no_work_backoff(self):
+        from tauceti_worker import loop
+        from tauceti_worker.constants import EX_VERIFICATION_WAIT
+
+        for code in (124, EX_VERIFICATION_WAIT):
+
+            def round_result(_, code=code):
+                atomic(
+                    self.state / "verification-state/verification-capacity.json",
+                    dict(waiting=True, at=time.time(), lease="dead.lock"),
+                )
+                return code
+
+            with (
+                patch.object(loop, "fleet_admission_reason", return_value=None),
+                patch.object(loop, "api_mode", return_value=False),
+                patch.object(loop, "choose_model", return_value=("claude", {})),
+                patch.object(loop, "github_budget", return_value={}),
+                patch.object(loop, "run_round_subprocess", side_effect=round_result),
+                patch.object(loop, "Budget") as budget,
+                patch.object(loop, "report_runtime") as status,
+                patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt) as sleep,
+            ):
+                loop.cmd_loop(
+                    SimpleNamespace(bubble=True),
+                    SimpleNamespace(wid="fixture", state=self.state),
+                    only=["fix"],
+                    agent="claude",
+                )
+            budget.assert_not_called()
+            sleep.assert_called_once_with(5)
+            self.assertIn(
+                "waiting-verification-capacity", [call.args[0] for call in status.call_args_list if call.args]
+            )
+
+    def test_cli_capacity_exit_and_installed_wrapper_permission(self):
+        from tauceti_worker import cli
+        from tauceti_worker.config import VerificationUnavailable
+        from tauceti_worker.constants import EX_VERIFICATION_WAIT
+
+        with (
+            patch.object(cli, "main", side_effect=VerificationUnavailable("fixture wait")),
+            patch.object(cli, "report_runtime"),
+        ):
+            self.assertEqual(cli.cli_main(), EX_VERIFICATION_WAIT)
+        package = self.home / "installed"
+        wrapper = write(package, "scripts/tauceti-verify", "fixture")
+        wrapper.chmod(0o644)
+        with patch.object(cli, "HERE", package):
+            cli._ensure_scripts_executable()
+        self.assertTrue(os.access(wrapper, os.X_OK))
+
+    def test_deleted_renamed_and_untracked_sources_invalidate_reuse(self):
+        self.assertEqual(self.verify(stage="build")["status"], "success")
+        (self.root / "TauCeti/A.lean").unlink()
+        for change in (
+            lambda: None,
+            lambda: (self.root / "TauCeti/B.lean").rename(self.root / "TauCeti/Renamed.lean"),
+            lambda: write(self.root, "TauCeti/New.lean", "new"),
+            lambda: write(self.root, "TauCeti/Ignored.lean", "ignored"),
+        ):
+            change()
+            result = self.verify(stage="build")
+            self.assertEqual(result["status"], "success", result.get("error"))
+            self.assertNotIn("reused_from", result["phases"]["build"])
+
+    def test_unknown_scope_and_missing_checker_fail_closed(self):
+        write(self.root, ".git/shallow", self.base + "\n")
+        build = self.verify(stage="build")
+        self.assertEqual(build["status"], "success", build.get("error"))
+        self.assertEqual(build["scope"]["mode"], "unknown")
+        result = self.verify(stage="all")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("reused_from", result["phases"]["build"])
+        (self.root / ".git/shallow").unlink()
+        write(self.root, "TauCeti/mathlib-shims.json", "{}")
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("checker is missing", result["error"])
 
     def test_slot_configuration(self):
         self.assertEqual(heavy_slots(), 1)

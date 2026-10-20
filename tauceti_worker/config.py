@@ -280,6 +280,10 @@ class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
 
 
+class VerificationUnavailable(NoProgress):
+    """Heavy verification capacity wait; separate from inference/API admission."""
+
+
 class AdmissionUnavailable(NoProgress):
     """Local API admission needs a bounded recheck, without no-progress backoff."""
 

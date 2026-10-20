@@ -2,12 +2,19 @@
 """Absolute installed/source wrapper; independent of shell startup PATH changes."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 # In a source checkout scripts/ sits beside the package; in a wheel it sits inside it.
-location = Path(__file__).resolve().parent.parent
+script_dir = Path(__file__).resolve().parent
+location = script_dir.parent
+if (script_dir / "tauceti_worker").is_dir():
+    location = script_dir  # Bubble's /opt/round layout, including Python safe-path mode.
 sys.path.insert(0, str(location.parent if location.name == "tauceti_worker" else location))
+python = os.environ.get("TAUCETI_VERIFY_PYTHON")
+if python and Path(python).resolve() != Path(sys.executable).resolve():
+    os.execv(python, [python, str(Path(__file__).resolve()), *sys.argv[1:]])
 from tauceti_worker.verification import add_parser, command  # noqa: E402
 
 parser = argparse.ArgumentParser(prog=str(Path(__file__).resolve()))

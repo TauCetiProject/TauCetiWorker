@@ -1121,10 +1121,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             raise admission_failure(api.blocked_reason)
     from .verification import waiting_for_capacity
 
-    if waiting_for_capacity(w.cfg):
-        from .config import AdmissionUnavailable
+    if stage in FILE_CHANGE_STAGES | {"overlap-fix"} and waiting_for_capacity(w.cfg):
+        from .config import VerificationUnavailable
 
-        raise AdmissionUnavailable("waiting-verification-capacity: verification remains recoverable")
+        raise VerificationUnavailable("waiting-verification-capacity: verification remains recoverable")
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
@@ -1653,9 +1653,9 @@ def _do_fixlike(
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             raise
     if capacity_wait():
-        from .config import AdmissionUnavailable
+        from .config import VerificationUnavailable
 
-        raise AdmissionUnavailable(
+        raise VerificationUnavailable(
             "waiting-verification-capacity: unfinished verification retained; PR attempt refunded"
         )
     if rc == 0:

@@ -14,6 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -210,6 +211,20 @@ try:
         rc = tc.run_in_bubble(w, tc.TAUCETI, "PROMPT", opts)
     work_argv = out.getvalue()
     check("work echo succeeds", rc == 0)
+    check("work shares the actual host verification queue", "/opt/verification-queue:rw" in work_argv)
+    check("work preliminary build uses the queue", "tauceti-verify" in work_argv and "--stage build" in work_argv)
+    check("work configures long foreground tool timeouts", "BASH_MAX_TIMEOUT_MS=" in work_argv)
+    with (
+        patch.dict(os.environ, TAUCETI_VERIFY_HELPER="0"),
+        patch("tauceti_worker.verification.queue_root", side_effect=AssertionError("rollback must not use queue")),
+    ):
+        legacy = io.StringIO()
+        with contextlib.redirect_stdout(legacy):
+            check("V0 still launches with unavailable queue", tc.run_in_bubble(w, tc.TAUCETI, "PROMPT", opts) == 0)
+        check(
+            "V0 does not require helper or base resolution",
+            "TAUCETI_VERIFY_BASE=" not in legacy.getvalue() and "/opt/verification-queue" not in legacy.getvalue(),
+        )
     cache_grant = (
         f"--lake-cache-service {tc.TAUCETI_CACHE_SERVICE} "
         f"{tc.TAUCETI_CACHE_ARTIFACT_URL} {tc.TAUCETI_CACHE_REVISION_URL}"
@@ -224,6 +239,7 @@ try:
         rc = tc.run_in_bubble(w, tc.TAUCETI, "", opts, inner_cmd="true", cred_model="claude")
     review_argv = out.getvalue()
     check("review/probe echo succeeds", rc == 0)
+    check("review/probe has no verification queue dependency", "/opt/verification-queue" not in review_argv)
     check("review/probe does not add a cache capability", "--lake-cache-service" not in review_argv)
     check("review/probe command is not wrapped in a build", "lake exe cache get" not in review_argv)
 finally:

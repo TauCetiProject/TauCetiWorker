@@ -479,7 +479,8 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         raise Die(f"unknown local verification scope policy {policy!r}")
     if os.environ.get("TAUCETI_VERIFY_HELPER", "1") == "0":
         return fill_prompt(HERE / "prompts" / "local-verification.md", SCOPE_POLICY=policy)
-    helper = f'"{wrapper_bin(bubble)}/tauceti-verify"'
+    python = "/usr/bin/python3" if bubble else sys.executable
+    helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
     return (
         "### Local verification\n"
         f"Run `{helper}` synchronously after the last edit or integration. "
@@ -488,6 +489,9 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
+        "Use a tool timeout covering the remaining round; Claude Bash timeouts are set by the worker. "
+        "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
+        "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
         "A waiting-verification-capacity message means stay in this foreground call; the claim heartbeat continues. "
         "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
@@ -690,6 +694,11 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    env["TAUCETI_VERIFY_PYTHON"] = sys.executable
+    remaining_ms = str(
+        max(1000, int((float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200) - time.time()) * 1000))
+    )
+    env.update(BASH_DEFAULT_TIMEOUT_MS=remaining_ms, BASH_MAX_TIMEOUT_MS=remaining_ms)
     profile = _authoring_profile(profile)
     if profile.provider == "codex":
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
@@ -754,7 +763,7 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
 
         with contextlib.suppress(ValueError, subprocess.CalledProcessError):
             env["TAUCETI_VERIFY_BASE"] = local_main(cwd)
-    env.setdefault("TAUCETI_VERIFY_STATE", str(logdir.parent / "state" / env.get("TAUCETI_WORKER_ID", "local")))
+    env.setdefault("TAUCETI_VERIFY_STATE", str(HERE / "state" / env.get("TAUCETI_WORKER_ID", "local")))
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
@@ -1767,7 +1776,7 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     )
 
 
-def bubble_work_cmd(inner: str) -> str:
+def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     """Trusted bootstrap run before the work agent inside Bubble.
 
     Bubble's noninteractive `--command` mode deliberately does not run a hook-generated build, so do
@@ -1785,6 +1794,7 @@ def bubble_work_cmd(inner: str) -> str:
     library from source, every round, for as long as the endpoint stayed down.
     """
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
+    preliminary = '"/opt/round/tauceti-verify" --stage build' if verify_helper else "timeout 1800 lake build"
     return (
         "set -e; "
         "lake exe cache get || lake exe cache get; "
@@ -1806,7 +1816,7 @@ def bubble_work_cmd(inner: str) -> str:
         "fi; "
         "fi; "
         'rm -f "$tc_log"; '
-        "if ! timeout 1800 lake build; then "
+        f"if ! {preliminary}; then "
         "echo 'warning: pre-agent lake build failed or timed out; the agent starts from a red tree' >&2; "
         "fi; "
         f"exec {inner}"
@@ -1900,6 +1910,7 @@ def run_in_bubble(
     # replace it in this subprocess env with a private, transient Keychain handoff below; the process-wide
     # value and any operator-owned credential file remain untouched.
     env = ensure_bubble_home(cfg)
+    helper_on = inner_cmd is None and os.environ.get("TAUCETI_VERIFY_HELPER", "1") != "0"
     rounddir = cfg.state / "bubble-round"
 
     shutil.rmtree(rounddir, ignore_errors=True)
@@ -1910,17 +1921,20 @@ def run_in_bubble(
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
-    from .verification import queue_root
+    if helper_on:
+        from .verification import queue_root
 
-    package = rounddir / "tauceti_worker"
-    shutil.copytree(Path(__file__).parent, package, ignore=shutil.ignore_patterns("__pycache__", "scripts", "prompts"))
-    shutil.copytree(HERE / "scripts", package / "scripts")
-    shutil.copytree(HERE / "prompts", package / "prompts")
-    shutil.copy(HERE / "scripts" / "tauceti-verify", rounddir / "tauceti-verify")
-    (rounddir / "tauceti-verify").chmod(0o755)
-    verify_state = cfg.state / "verification-state"
-    verify_state.mkdir(parents=True, exist_ok=True)
-    host_queue = queue_root()
+        package = rounddir / "tauceti_worker"
+        shutil.copytree(
+            Path(__file__).parent, package, ignore=shutil.ignore_patterns("__pycache__", "scripts", "prompts")
+        )
+        shutil.copytree(HERE / "scripts", package / "scripts")
+        shutil.copytree(HERE / "prompts", package / "prompts")
+        shutil.copy(HERE / "scripts" / "tauceti-verify", rounddir / "tauceti-verify")
+        (rounddir / "tauceti-verify").chmod(0o755)
+        verify_state = cfg.state / "verification-state"
+        verify_state.mkdir(parents=True, exist_ok=True)
+        host_queue = queue_root()
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -1932,14 +1946,14 @@ def run_in_bubble(
 
     _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
 
-    mount_flags = [
-        "--mount",
-        f"{rounddir}:/opt/round:ro",
-        "--mount",
-        f"{verify_state}:/opt/verification-state:rw",
-        "--mount",
-        f"{host_queue}:/opt/verification-queue:rw",
-    ]
+    mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    if helper_on:
+        mount_flags += [
+            "--mount",
+            f"{verify_state}:/opt/verification-state:rw",
+            "--mount",
+            f"{host_queue}:/opt/verification-queue:rw",
+        ]
     api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
     if api_bridge and _uses_claude_credentials(cred_model):
         from .claude_api_client import atomic
@@ -2003,26 +2017,36 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
-    for key, value in {
-        "TAUCETI_VERIFY_STATE": "/opt/verification-state",
-        "TAUCETI_VERIFY_HOST_QUEUE": "/opt/verification-queue",
-        "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
-        "TAUCETI_VERIFY_HEAVY_SLOTS": os.environ.get("TAUCETI_VERIFY_HEAVY_SLOTS", "1"),
-        "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
-        "TAUCETI_PROCESS_CONTAINMENT": "legacy",  # Bubble owns the outer process boundary.
-    }.items():
-        tcenv += f" {key}={shlex.quote(value)}"
+    if helper_on:
+        for key, value in {
+            "TAUCETI_VERIFY_STATE": "/opt/verification-state",
+            "TAUCETI_VERIFY_HOST_QUEUE": "/opt/verification-queue",
+            "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
+            "TAUCETI_VERIFY_HEAVY_SLOTS": os.environ.get("TAUCETI_VERIFY_HEAVY_SLOTS", "1"),
+            "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
+            "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
+            "TAUCETI_VERIFY_PYTHON": "/usr/bin/python3",
+            "TAUCETI_VERIFY_BUBBLE": "1",
+            "BASH_DEFAULT_TIMEOUT_MS": str(
+                max(1000, int((getattr(getattr(w, "rc", None), "deadline", time.time() + 7200) - time.time()) * 1000))
+            ),
+            "BASH_MAX_TIMEOUT_MS": str(
+                max(1000, int((getattr(getattr(w, "rc", None), "deadline", time.time() + 7200) - time.time()) * 1000))
+            ),
+            "TAUCETI_PROCESS_CONTAINMENT": "legacy",  # Bubble owns the outer process boundary.
+        }.items():
+            tcenv += f" {key}={shlex.quote(value)}"
     command_inner = inner_cmd if inner_cmd is not None else agent_inner_cmd(profile)
     if inner_cmd is None:
-        command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
-    if inner_cmd is None:
+        command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner, verify_helper=helper_on))}"
+    if helper_on:
         # Resolve the canonical local main once after Bubble has checked out the target.
         setup = (
             'export TAUCETI_VERIFY_BASE="$(PYTHONPATH=/opt/round python3 -c '
             + shlex.quote(
                 "from pathlib import Path; from tauceti_worker.verification_scope import local_main; print(local_main(Path.cwd()))"
             )
-            + ')"; test -n "$TAUCETI_VERIFY_BASE" || exit 1; '
+            + ')"; '
             + tcenv
             + " "
             + command_inner

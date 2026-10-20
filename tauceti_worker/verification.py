@@ -7,17 +7,20 @@ A receipt is durable and incomplete before any child starts; SIGKILL cannot turn
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import fcntl
 import hashlib
 import json
 import math
 import os
 import platform
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -30,7 +33,8 @@ from .runtime_status import read_json, report_runtime
 from .verification_scope import git, local_main, scope, untracked
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 1
+POLICY_VERSION = 2
+_HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
 
 
@@ -126,8 +130,27 @@ def file_record(path: Path) -> dict:
 
 
 def hash_file(path: Path) -> str:
+    before = path.stat()
+    identity = (
+        str(path.absolute()),
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    key = digest(identity)
+    cache = _HASH_CACHE.get()
+    if cache is not None and isinstance(cache.get(key), str) and len(cache[key]) == 64:
+        return cache[key]
     with path.open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
+        result = hashlib.file_digest(source, "sha256").hexdigest()
+    after = path.stat()
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != identity[1:]:
+        raise Incomplete(f"input changed while fingerprinting: {path}")
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def source_names(root: Path, base: str) -> set[str]:
@@ -162,10 +185,20 @@ def stamps(paths) -> dict:
 
 class Verification:
     def __init__(
-        self, root: Path, state: Path, *, base=None, stage="all", reuse=True, policy="ordinary", deadline=None
+        self,
+        root: Path,
+        state: Path,
+        *,
+        base=None,
+        stage="all",
+        reuse=True,
+        policy="ordinary",
+        deadline=None,
+        lint_modules=None,
     ):
         self.root, self.state = root.resolve(), state.resolve()
         self.base_arg, self.policy = base, policy
+        self.lint_modules = lint_modules
         self.requested = list(STAGES) if stage == "all" else [stage]
         self.reuse, self.deadline = reuse, deadline
         self.id = uuid.uuid4().hex
@@ -186,10 +219,13 @@ class Verification:
         )
         self.base = ""
         self.watched = {}
+        self.static_stamps = {}
         self.watch_names = set()
         self.dependency_names = None
         self.mutated = False
         self.last_watch = 0.0
+        self.wait_lease = None
+        self.interrupted_wait = False
 
     def save(self):
         atomic(self.path, self.receipt)
@@ -198,21 +234,30 @@ class Verification:
         print(message, file=sys.stderr, flush=True)
 
     def check_deadline(self):
-        if self.deadline is not None and time.time() >= self.deadline:
-            raise Incomplete("round deadline interrupted verification")
+        margin = float(os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"))
+        if not math.isfinite(margin) or margin < 0:
+            raise ValueError("TAUCETI_VERIFY_CHECKPOINT_MARGIN must be a nonnegative number of seconds")
+        if self.deadline is not None and time.time() >= self.deadline - margin:
+            self.interrupted_wait = bool(self.receipt.get("waiting_for_capacity"))
+            raise Incomplete("round deadline checkpoint margin reached; checkpoint now")
 
     def watch(self):
         self.check_deadline()
-        if self.watched and time.monotonic() - self.last_watch >= 0.25:
+        if self.watched and time.monotonic() - self.last_watch >= 2:
             self.last_watch = time.monotonic()
-            if (
-                stamps(self.watched) != self.watched
-                or source_names(self.root, self.base) != self.watch_names
-                or self.dependency_names is not None
-                and {str(p) for p in files_under(self.root / ".lake/packages")} != self.dependency_names
-            ):
+            if stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names:
                 self.mutated = True
                 raise Incomplete("verification inputs mutated during execution")
+
+    def final_watch(self):
+        self.last_watch = 0
+        self.watch()
+        if (
+            stamps(self.static_stamps) != self.static_stamps
+            or self.dependency_names is not None
+            and {str(p) for p in files_under(self.root / ".lake/packages")} != self.dependency_names
+        ):
+            raise Incomplete("dependency, toolchain or verifier mutated during verification")
 
     @contextlib.contextmanager
     def slot(self, phase):
@@ -221,6 +266,8 @@ class Verification:
         started = time.monotonic()
         waiting = False
         handle = None
+        published = 0.0
+        acquired_wait = None
         try:
             while handle is None:
                 self.watch()
@@ -238,30 +285,39 @@ class Verification:
                 if handle is None:
                     if not waiting:
                         self.progress(f"{phase}: waiting-verification-capacity")
-                        self.capacity(True)
                         self.receipt["waiting_for_capacity"] = True
                         self.save()
                         waiting = True
-                    # Keep the supervisor's existing candidate/claim heartbeat running; no new GitHub reads.
-                    report_runtime("waiting-verification-capacity", verification_receipt=str(self.path))
-                    time.sleep(0.1)
-            self.receipt["queue_wait_seconds"] += time.monotonic() - started
+                    if time.monotonic() - published >= 15:
+                        published = time.monotonic()
+                        self.capacity(True)
+                        report_runtime("waiting-verification-capacity", verification_receipt=str(self.path))
+                    time.sleep(min(1, max(0.01, (self.deadline or time.time() + 1) - time.time())))
+            acquired_wait = time.monotonic() - started
             self.capacity(False)
             self.receipt["waiting_for_capacity"] = False
-            self.save()
             report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
             yield
         finally:
+            self.receipt["queue_wait_seconds"] += (
+                (acquired_wait if acquired_wait is not None else time.monotonic() - started) if waiting else 0
+            )
             if handle is not None:
-                os.close(handle)  # close-on-exec: neither tools nor orphaned children keep the slot
+                os.close(handle)
+            elif waiting:
+                self.capacity(False, interrupted=True)
+            self.save()
 
-    def capacity(self, waiting):
+    def capacity(self, waiting, *, interrupted=False):
         atomic(
             self.state / "verification-capacity.json",
             dict(
                 attempt=os.environ.get("TAUCETI_VERIFY_ATTEMPT"),
                 waiting=waiting,
+                interrupted=interrupted,
+                deadline=self.interrupted_wait,
                 receipt=str(self.path),
+                lease=str((self.directory / "live.lock").relative_to(self.state)),
                 at=time.time(),
             ),
         )
@@ -276,14 +332,15 @@ class Verification:
         boundary = Boundary(f"verify-{phase}")
         entry["containment"] = dict(mode=boundary.mode, strong=boundary.strong, reason=boundary.reason)
         process = None
+        stdout_path = log.with_suffix(".stdout")
         offset = 0
         try:
-            with log.open("wb") as output:
+            with log.open("wb") as output, stdout_path.open("wb") as captured:
                 process = subprocess.Popen(
                     boundary.argv(argv),
                     cwd=self.root,
                     env=env,
-                    stdout=output,
+                    stdout=captured if capture else output,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     pass_fds=boundary.pass_fds,
@@ -298,7 +355,7 @@ class Verification:
                             if data:
                                 print(data.decode(errors="replace"), file=sys.stderr, end="", flush=True)
                     self.watch()
-                    if capture and time.time() - entry["started_at"] > 30:
+                    if capture and time.time() - entry["started_at"] > 300:
                         raise Incomplete(f"{phase}: toolchain probe timed out")
                     time.sleep(0.05)
                 entry["exit"] = process.returncode
@@ -318,6 +375,9 @@ class Verification:
                 entry["ended_at"] = time.time()
                 self.save()
         text = log.read_text(errors="replace")
+        captured_text = stdout_path.read_text(errors="replace")
+        if capture:
+            entry["stdout_log"] = str(stdout_path)
         # Keep the original audit progress/timing lines verbatim in the receipt and full log.
         entry["audit_timings"] = [
             line
@@ -334,7 +394,7 @@ class Verification:
         self.progress(f"{phase}: exit {entry['exit']}")
         if entry["exit"]:
             raise subprocess.CalledProcessError(entry["exit"], argv, output=text)
-        return text.strip()
+        return (captured_text if capture else text).strip()
 
     def inputs(self):
         self.check_deadline()
@@ -344,6 +404,10 @@ class Verification:
             if executable is None:
                 raise ValueError(f"verification tool missing: {name}")
             toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
+        for name in ("cc", "c++", "clang", "ar", "ld"):
+            selected = shlex.split(os.environ.get(name.upper(), name))
+            if selected and (executable := shutil.which(selected[0])):
+                toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
         for command in (
             ["lake", "--version"],
             ["lake", "env", "lean", "--version"],
@@ -358,15 +422,32 @@ class Verification:
         dependencies = {str(p.relative_to(deps)): file_record(p) for p in files_under(deps)}
         config = os.environ.get("LAKE_CONFIG")
         # Hash environment values to avoid recording credentials. Volatile orchestration values do not build inputs.
-        volatile = {"TAUCETI_ROUND_DEADLINE", "TAUCETI_RUNTIME_STATUS", "_", "SHLVL"}
         environment = {
-            k: digest(v) for k, v in os.environ.items() if not k.startswith("TAUCETI_VERIFY_") and k not in volatile
+            k: digest(v)
+            for k, v in os.environ.items()
+            if k.startswith(("LEAN", "LAKE", "ELAN", "MATHLIB", "NIX_"))
+            or k
+            in {
+                "PATH",
+                "HOME",
+                "CC",
+                "CXX",
+                "AR",
+                "LD",
+                "CFLAGS",
+                "CXXFLAGS",
+                "LDFLAGS",
+                "LD_LIBRARY_PATH",
+                "PYTHONPATH",
+                "PYTHONSAFEPATH",
+            }
         }
         verifier = {str(p.name): hash_file(p) for p in Path(__file__).parent.glob("*.py")}
         verifier["wrapper"] = hash_file(HERE / "scripts" / "tauceti-verify")
         sources = inventory(self.root, self.base)
         return dict(
             sources=sources,
+            root=str(self.root),
             dependencies=dependencies,
             base=self.base,
             scope=scope(self.root, self.base, self.policy),
@@ -375,7 +456,8 @@ class Verification:
             toolchain=toolchain,
             verifier=verifier,
             policy_version=POLICY_VERSION,
-            python=sys.version,
+            python=dict(version=sys.version, executable=file_record(Path(sys.executable))),
+            lint_modules=file_record(Path(self.lint_modules)) if self.lint_modules else None,
         )
 
     def phase_commands(self, phase, modules):
@@ -396,14 +478,33 @@ class Verification:
             if selected["mode"] == "unknown":
                 raise Incomplete("lint: changed modules unknown; CI owns the full environment lint")
             commands = []
-            if selected["modules"]:
-                env["LINT_ONLY_MODULES"] = str(modules)
+            lint_list = self.directory / "lint-modules.txt"
+            lint_modules = set(selected["modules"])
+            if self.lint_modules:
+                for module in Path(self.lint_modules).read_text().splitlines():
+                    module = module.strip()
+                    if not module:
+                        continue
+                    path = module.replace(".", "/") + ".lean"
+                    from .verification_scope import MODULE
+
+                    if not MODULE.fullmatch(path) or not (self.root / path).is_file():
+                        raise Incomplete(f"invalid explicit lint module: {module}")
+                    lint_modules.add(module)
+            lint_list.write_text("".join(f"{m}\n" for m in sorted(lint_modules)))
+            if lint_modules:
+                env["LINT_ONLY_MODULES"] = str(lint_list)
                 commands.append((["bash", "-o", "pipefail", "scripts/lint-env.sh"], env))
             commands.append((["bash", "-o", "pipefail", "scripts/lint-style.sh"], env))
             return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
             if not script.exists():
+                checker_in_base = git(
+                    self.root, "ls-tree", "--name-only", self.base, "--", "scripts/check-expired-mathlib-shims.py"
+                )
+                if (self.root / "TauCeti/mathlib-shims.json").exists() or checker_in_base:
+                    raise Incomplete("shim-expiry: required checker is missing")
                 return []  # Supported older TauCeti revisions have no shim registry/checker.
             merge = selected["merge_base"]
             if not merge:
@@ -440,33 +541,55 @@ class Verification:
     def run(self):
         self.save()
         previous = {}
+        self.wait_lease = (self.directory / "live.lock").open("a+")
+        fcntl.flock(self.wait_lease, fcntl.LOCK_EX)
+        self.capacity(False)
+        cache = read_json(self.state / "verification-hashes.json")
+        cache_size = len(cache)
+        cache_token = _HASH_CACHE.set(cache)
         try:
 
             def interrupted(signum, _):
                 raise Incomplete(f"verification interrupted by signal {signum}")
 
-            for sig in (signal.SIGINT, signal.SIGTERM):
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 previous[sig] = signal.signal(sig, interrupted)
             heavy_slots()
-            self.check_deadline()
             raw = self.base_arg or os.environ.get("TAUCETI_VERIFY_BASE") or local_main(self.root)
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
             self.progress(f"scope: {self.receipt['scope']['mode']}: {self.receipt['scope']['reason']}")
+            if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
+                self.checkpoint_sources(dict(sources=inventory(self.root, self.base)))
+            self.check_deadline()
             self.watch_names = source_names(self.root, self.base)
             dep_paths = list(files_under(self.root / ".lake/packages"))
-            self.watched = stamps([self.root / p for p in self.watch_names] + dep_paths)
+            self.watched = stamps([self.root / p for p in self.watch_names])
+            self.static_stamps = stamps(dep_paths)
             inputs = self.inputs()
             self.watch()
             extra = list(Path(__file__).parent.glob("*.py")) + [HERE / "scripts/tauceti-verify"]
             prefix = Path(inputs["toolchain"]["lake env lean --print-prefix"])
             extra += list(files_under(prefix))
+            extra += [
+                Path(entry["path"])
+                for entry in inputs["toolchain"].values()
+                if isinstance(entry, dict) and "path" in entry
+            ]
+            extra.append(Path(sys.executable))
             self.dependency_names = {str(p) for p in files_under(self.root / ".lake/packages")}
             if os.environ.get("LAKE_CONFIG"):
                 extra.append(Path(os.environ["LAKE_CONFIG"]))
-            self.watched.update(stamps(extra))
+            if self.lint_modules:
+                extra.append(Path(self.lint_modules))
+            self.static_stamps.update(stamps(extra))
             fingerprint = digest(inputs)
-            self.receipt.update(inputs=inputs, fingerprint=fingerprint)
+            input_file = self.state / "verification-inputs" / f"{fingerprint}.json"
+            if not input_file.exists():
+                atomic(input_file, inputs)
+            self.receipt.update(inputs=dict(path=str(input_file), sha256=fingerprint), fingerprint=fingerprint)
+            if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
+                self.checkpoint_sources(inputs)
 
             modules = self.directory / "modules.txt"
             modules.write_text("".join(f"{m}\n" for m in self.receipt["scope"]["modules"]))
@@ -490,13 +613,12 @@ class Verification:
                 record.update(status="success", ended_at=time.time())
                 self.save()
             # Recompute bytes, pins, dependencies, toolchain, environment and verifier after all tools exit.
-            self.last_watch = 0
-            self.watch()
+            self.final_watch()
             if self.mutated or digest(self.inputs()) != fingerprint:
                 raise Incomplete("verification inputs changed during execution")
-            self.last_watch = 0
-            self.watch()
+            self.final_watch()
             self.receipt["status"] = "success"
+            self.index_success()
         except subprocess.CalledProcessError as error:
             self.receipt.update(status="failed", error=f"command exited {error.returncode}: {error.cmd}")
         except (Incomplete, Die, OSError, ValueError, RuntimeError) as error:
@@ -521,31 +643,88 @@ class Verification:
             self.save()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+            self.wait_lease.close()
+            _HASH_CACHE.reset(cache_token)
+            # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
+            if len(cache) != cache_size:
+                atomic(self.state / "verification-hashes.json", dict(list(cache.items())[-200000:]))
+            shutil.rmtree(self.directory / "base", ignore_errors=True)
+            (self.directory / "base.tar").unlink(missing_ok=True)
+            report_runtime("working", verification_phase=None)
         return self.receipt
 
+    def index_success(self):
+        index = self.state / "verification-index" / f"{self.receipt['fingerprint']}.json"
+        index.parent.mkdir(parents=True, exist_ok=True)
+        with index.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            entries = read_json(index)
+            for phase, result in self.receipt["phases"].items():
+                if "reused_from" not in result:
+                    entries[phase] = str(self.path)
+            # Publish the receipt before its index; interrupted publication never grants evidence.
+            self.save()
+            atomic(index, entries)
+
     def find_reuse(self, fingerprint, phase):
-        for path in sorted((self.state / "verification").glob("*/receipt.json")):
-            if path == self.path:
-                continue
-            try:
-                old = json.loads(path.read_text())
-                evidence = old.get("phases", {}).get(phase, {})
-                # Only a fully input-stable run can contribute evidence, including stage-only runs.
-                if (
-                    old.get("schema") == SCHEMA
-                    and old.get("status") == "success"
-                    and old.get("fingerprint") == fingerprint
-                    and evidence.get("status") == "success"
-                ):
-                    return path
-            except (OSError, ValueError, TypeError, AttributeError):
-                continue
+        entry = read_json(self.state / "verification-index" / f"{fingerprint}.json").get(phase)
+        if not isinstance(entry, str):
+            return None
+        path = Path(entry)
+        old = read_json(path)
+        phases = old.get("phases")
+        inputs = old.get("inputs")
+        if not isinstance(phases, dict) or not isinstance(inputs, dict) or not isinstance(inputs.get("path"), str):
+            return None
+        evidence = phases.get(phase)
+        if not isinstance(evidence, dict):
+            return None
+        if (
+            old.get("schema") == SCHEMA
+            and old.get("status") == "success"
+            and old.get("fingerprint") == fingerprint
+            and evidence.get("status") == "success"
+            and Path(old.get("inputs", {}).get("path", "")).is_file()
+        ):
+            return path
         return None
+
+    def checkpoint_sources(self, inputs):
+        """Preserve pre-verification Bubble edits before its disposable container can disappear."""
+        key = digest(dict(base=self.base, sources=inputs["sources"]))
+        target = self.state / "verification-checkpoints" / key
+        if not (target / "checkpoint.json").exists():
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
+            with (target / "source.patch").open("wb") as out:
+                out.write(patch)
+                out.flush()
+                os.fsync(out.fileno())
+            with tarfile.open(target / "untracked.tar", "w") as archive:
+                for name in sorted(untracked(self.root)):
+                    archive.add(self.root / name, arcname=name, recursive=False)
+            with (target / "untracked.tar").open("rb") as source:
+                os.fsync(source.fileno())
+            atomic(
+                target / "checkpoint.json",
+                dict(
+                    base=self.base,
+                    root=str(self.root),
+                    patch="source.patch",
+                    untracked="untracked.tar",
+                    created_at=time.time(),
+                ),
+            )
+        self.receipt["source_checkpoint"] = str(target / "checkpoint.json")
+        self.save()
 
 
 def add_parser(sub):
     parser = sub.add_parser("verify", help="synchronously verify exact local inputs; never query GitHub")
     parser.add_argument("--stage", choices=(*STAGES, "all"), default="all")
+    parser.add_argument(
+        "--lint-modules", type=Path, help="additional existing TauCeti modules to lint; list outside the checkout"
+    )
     parser.add_argument("--base", help="resolved canonical-main commit; defaults to the round's pinned SHA")
     parser.add_argument(
         "--json", action="store_true", help="emit exactly one JSON result on stdout; progress on stderr"
@@ -570,6 +749,7 @@ def command(args):
             reuse=not args.no_reuse,
             policy=os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
             deadline=deadline,
+            lint_modules=getattr(args, "lint_modules", None),
         )
         result = verification.run()
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
@@ -583,15 +763,40 @@ def command(args):
     return 0 if result["status"] == "success" else 1
 
 
-def refund_capacity_wait(state: Path, counters) -> bool:
-    """Idempotent refund of an attempt interrupted while queued, also after supervisor SIGKILL.
+def live_wait(wait: dict, state: Path) -> bool:
+    if not wait.get("waiting") or not wait.get("lease"):
+        return False
+    try:
+        with (state / wait["lease"]).open("r+") as lease:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return False
+            except BlockingIOError:
+                return True
+    except OSError:
+        return False
 
-    Runs under the existing per-worker round lock. It restores captured counter values rather
-    than decrementing twice if a crash occurs between a counter write and journal completion.
-    """
+
+def capacity_evidence(wait: dict, state: Path, *, interrupted_round=False) -> bool:
+    return bool(
+        wait.get("deadline")
+        and wait.get("interrupted")
+        or live_wait(wait, state)
+        or interrupted_round
+        and (wait.get("waiting") or wait.get("interrupted"))
+    )
+
+
+def refund_capacity_wait(state: Path, counters, *, interrupted_round=False) -> bool:
+    """Restore captured counters once, only for the current unfinished invocation/round."""
     attempt = read_json(state / "verification-attempt.json")
     wait = read_json(state / "verification-capacity.json")
-    if not attempt or wait.get("attempt") != attempt.get("id") or not wait.get("waiting"):
+    if (
+        not attempt
+        or attempt.get("finished")
+        or wait.get("attempt") != attempt.get("id")
+        or not capacity_evidence(wait, state, interrupted_round=interrupted_round)
+    ):
         return False
     if not attempt.get("refunded"):
         for key, value in attempt.get("restore", {}).items():
@@ -605,29 +810,42 @@ def begin_attempt(w, charged, *, bubble=False):
     if not charged:
         return lambda: False
     state = w.cfg.state / "verification-state" if bubble else w.cfg.state
-    refund_capacity_wait(state, w.counters)
     identifier = uuid.uuid4().hex
     atomic(
         state / "verification-attempt.json",
-        dict(id=identifier, restore={key: max(0, w.counters.read(key) - 1) for key in charged}),
+        dict(id=identifier, finished=False, restore={key: max(0, w.counters.read(key) - 1) for key in charged}),
     )
     os.environ["TAUCETI_VERIFY_ATTEMPT"] = identifier
 
     def callback():
-        return refund_capacity_wait(state, w.counters)
+        refunded = refund_capacity_wait(state, w.counters)
+        attempt = read_json(state / "verification-attempt.json")
+        attempt["finished"] = True
+        atomic(state / "verification-attempt.json", attempt)
+        return refunded
 
     if getattr(w, "rc", None) is not None:
-        w.rc.add_cleanup(callback)
+
+        def cleanup():
+            if getattr(w.rc, "interrupted", False):
+                refund_capacity_wait(state, w.counters, interrupted_round=True)
+
+        w.rc.add_cleanup(cleanup)
     return callback
 
 
-def waiting_for_capacity(cfg) -> bool:
+def waiting_for_capacity(cfg, *, since=None) -> bool:
     state = getattr(cfg, "state", None)
     if state is None:
         return False
     attempt = os.environ.get("TAUCETI_VERIFY_ATTEMPT")
     for directory in (state, state / "verification-state"):
         wait = read_json(directory / "verification-capacity.json")
-        if attempt and wait.get("attempt") == attempt and wait.get("waiting"):
+        matches = (
+            (wait.get("at", 0) >= since) if since is not None else bool(attempt and wait.get("attempt") == attempt)
+        )
+        if since is not None and wait.get("at", 0) < time.time() - 30:
+            continue
+        if matches and capacity_evidence(wait, directory, interrupted_round=since is not None):
             return True
     return False

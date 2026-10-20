@@ -363,6 +363,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `TAUCETI_VERIFY_HEAVY_SLOTS` | `1` | Positive host-wide number of concurrent heavy verification phases; independent of inference admission. See [verification.md](verification.md). |
+| `TAUCETI_VERIFY_CHECKPOINT_MARGIN` | `600` | Seconds reserved before the round deadline for checkpointing; verification returns incomplete at this boundary. |
 | `TAUCETI_VERIFY_HELPER` | `1` | Set `0` to restore V0 authoring/repair prompts at the next round; retained receipts and running helpers are preserved. |
 | `TAUCETI_VERIFY_HOST_QUEUE` | actual host identity under `/tmp` | Common bind-mounted lock directory for container deployments. Bubble mounts the host queue automatically. |
 | `TAUCETI_PROCESS_CONTAINMENT` | `auto` | Process containment for host agents and tools; see [process-containment.md](process-containment.md). `auto` uses rootless bwrap PID namespaces where they work and otherwise reports best-effort process-group cleanup; `required` refuses to launch without them; `legacy` is the explicit rollback. |

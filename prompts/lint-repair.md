@@ -17,7 +17,9 @@ Repair existing declarations only: restate, re-annotate, or (if redundant) remov
 
 The PR body, comments and failing CI log list the violations to repair. Find each declaration's
 defining module, inspect the source, and fix the underlying issue. The helper lints changed modules
-and performs a full axiom audit under this branch's policy. Whole-library environment lint stays
+and performs a full axiom audit under this branch's policy. For a declaration flagged in an unchanged module, write its dotted module name to an absolute
+list outside this checkout, then run `"__BIN__/tauceti-verify" --stage lint --lint-modules /absolute/list`.
+Use that same list on the final all-stage call. Whole-library environment lint stays
 in CI; a local success does not assert that every unchanged module passed it.
 
 - For a failing check's CI logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.

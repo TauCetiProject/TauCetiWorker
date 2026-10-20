@@ -41,6 +41,7 @@ class RoundContext:
         self._fd: int | None = None
         self._cleanups: list = []
         self._done = False
+        self.interrupted = False
         self.activity = None
         self.record_activity = record_activity
 
@@ -69,8 +70,8 @@ class RoundContext:
         from .verification import refund_capacity_wait
 
         counters = Counters(self.cfg)
-        refund_capacity_wait(self.cfg.state, counters)
-        refund_capacity_wait(self.cfg.state / "verification-state", counters)
+        refund_capacity_wait(self.cfg.state, counters, interrupted_round=True)
+        refund_capacity_wait(self.cfg.state / "verification-state", counters, interrupted_round=True)
         # Register first: LIFO cleanup records resources after claim/build teardown.
         try:
             from .resources import RoundResources
@@ -112,6 +113,7 @@ class RoundContext:
             self._fd = None
 
     def __exit__(self, *exc) -> bool:
+        self.interrupted = exc[0] in (SystemExit, KeyboardInterrupt)
         if self.activity:
             self.activity.finish(exc[1])
         self._cleanup()
