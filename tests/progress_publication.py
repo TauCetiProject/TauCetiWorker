@@ -280,6 +280,8 @@ with (
             raise AssertionError("storage failure must request a retry")
     assert set((state / "progress/retained").iterdir()) == before
     assert publication.retained(cfg)["files"] == value["files"]
+    assert publication.retained(cfg)["retry_at"] > time.time() + 290
+    assert progress_due(cfg, worker.counters)[0] is False
     assert publication.parked_window(cfg, pages) in before
     incomplete = state / "progress/retained/incomplete"
     incomplete.mkdir()

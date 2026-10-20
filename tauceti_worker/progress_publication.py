@@ -1,5 +1,6 @@
 """Private receipts for prepared reports; resume publication before paying for prose."""
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -210,8 +211,13 @@ def park(cfg, value, reason):
     except OSError as exc:
         from .config import ProgressPreparationUnavailable
 
+        retry_at = time.time() + 300
+        # A large bundle copy can fail while a small receipt update still succeeds. Keep the
+        # publication authority and defer ordinary selection instead of retrying every loop.
+        with contextlib.suppress(OSError):
+            tr.atomic(work / "publication.json", {**value, "retry_at": retry_at})
         raise ProgressPreparationUnavailable(
-            f"waiting-progress-storage: could not retain prepared report: {exc}", retry_at=time.time() + 300
+            f"waiting-progress-storage: could not retain prepared report: {exc}", retry_at=retry_at
         ) from exc
     complete(cfg, record)
     return saved
