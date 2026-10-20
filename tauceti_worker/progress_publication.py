@@ -13,6 +13,7 @@ from . import github_transport as tr
 from .constants import PROGRESS_REF, ROADMAP
 
 MAX_ATTEMPTS = 6
+MAX_WAIT_AGE = 7 * 86400
 
 FILES = ("plan.json", "status-body.md", "section-body.md")
 
@@ -45,6 +46,9 @@ def retained(cfg):
                 and isinstance(value.get("actor"), str)
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", value["actor"])
                 and isinstance(value.get("retry_at", 0), (int, float))
+                and isinstance(value.get("started", 0), (int, float))
+                and isinstance(value.get("waits", 0), int)
+                and value.get("waits", 0) >= 0
                 and isinstance(value.get("attempts", 0), int)
                 and value.get("attempts", 0) >= 0
                 and (value.get("version") is None or isinstance(value["version"], str))
@@ -101,7 +105,9 @@ def legacy_branch_matches(cfg, plan):
             return False
         headers = re.findall(r"<!--\s*tauceti-progress:v1\s*(\{.*?\})\s*-->", result.stdout, re.S)
         header = json.loads(headers[-1])
-        return all(header.get(k) == plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "prs"))
+        return all(header.get(k) == plan.get(k) for k in ("roadmap", "from_sha", "to_sha")) and header["prs"] == sorted(
+            set(plan["prs"])
+        )
     except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, IndexError):
         return False
 
@@ -146,12 +152,30 @@ def save(cfg, actor, version):
 def defer(cfg, value):
     value = {
         **value,
+        "started": value.get("started") or time.time(),
         "version": value.get("version") or PROGRESS_REF,
         "attempts": value.get("attempts", 0) + 1,
         "retry_at": time.time() + 300,
     }
     tr.atomic(cfg.state / "progress/work/publication.json", value)
     return value
+
+
+def temporary_wait(cfg, value):
+    """Infrastructure waits never spend a report attempt or paid error budget."""
+    waits = value.get("waits", 0) + 1
+    delay = (300, 900, 3600, 14400)[min(waits - 1, 3)]
+    value = {
+        **value,
+        "attempts": max(0, value.get("attempts", 1) - 1),
+        "waits": waits,
+        "started": value.get("started") or time.time(),
+        "retry_at": time.time() + delay,
+    }
+    if time.time() - value["started"] >= MAX_WAIT_AGE:
+        return park(cfg, value, "publication unavailable for seven days; artifacts retained for recovery")
+    tr.atomic(cfg.state / "progress/work/publication.json", value)
+    return None
 
 
 def complete(cfg, value):

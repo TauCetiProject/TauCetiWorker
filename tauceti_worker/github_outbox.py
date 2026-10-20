@@ -299,6 +299,7 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
         isinstance(e, dict) and (e.get("type") or e.get("extensions", {}).get("code")) in terminal_types for e in errors
     )
     if terminal and not quota:
+        result.github_permanent_failure = True
         archive(
             path,
             value,
@@ -306,12 +307,14 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
             error_types=[e.get("type") or e.get("extensions", {}).get("code") for e in errors],
         )
         return
-    if records and all(400 <= r.get("status", 0) < 500 for r in records) and not quota:
-        archive(path, value, "GitHub rejected the publication", http_statuses=[r["status"] for r in records])
-        return
     writes = [
         r for r in records if r.get("method") not in ("GET", "HEAD", "OPTIONS") and r.get("graphql_operation") != "read"
     ]
+    rejected_records = writes or records
+    if rejected_records and all(400 <= r.get("status", 0) < 500 for r in rejected_records) and not quota:
+        result.github_permanent_failure = True
+        archive(path, value, "GitHub rejected the publication", http_statuses=[r["status"] for r in records])
+        return
     logical_quota_rejection = rejected_logically and all(
         isinstance(e, dict) and (e.get("type") or e.get("extensions", {}).get("code")) in ("RATE_LIMIT", "RATE_LIMITED")
         for e in errors
@@ -425,13 +428,7 @@ def reconcile(value, env):
     if args[:2] == ["pr", "close"]:
         context = value.get("context", {})
         expected, who = context.get("expected_head"), context.get("actor")
-        if (
-            not repo
-            or not number
-            or not isinstance(expected, str)
-            or not re.fullmatch(r"[a-f0-9]{40}", expected)
-            or not who
-        ):
+        if not repo or not number:
             return None
         with tr.read_context(fresh=True, direct=True):
             result = tr.execute(["gh", "api", f"repos/{repo}/pulls/{number}"], env=replay)
@@ -441,6 +438,8 @@ def reconcile(value, env):
             live = json.loads(result.stdout)
             if live.get("state") == "closed":
                 return True
+            if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{40}", expected) or not who:
+                return None  # A compound close/comment may have applied only its comment.
             holds = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
             if (
                 live.get("head", {}).get("sha") != expected

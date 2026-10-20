@@ -24,6 +24,11 @@ import json,os,sys
 with open(os.environ["TAUCETI_TEST_GH_CALLS"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")
 if os.environ.get("TAUCETI_TEST_GH_FAIL"):
     print("connection reset",file=sys.stderr);sys.exit(1)
+if os.environ.get("TAUCETI_TEST_GH_DENY"):
+    for line in ["* Request at fixture", "* Request to https://api.github.com/repos/org/repo/issues/99/comments",
+                 "> POST /repos/org/repo/issues/99/comments HTTP/1.1", "< HTTP/2.0 422", "* Request took 1ms"]:
+        print(line,file=sys.stderr)
+    print("validation failed",file=sys.stderr);sys.exit(1)
 print("{}")
 """)
     native.chmod(0o700)
@@ -57,6 +62,13 @@ print("{}")
     with patch.dict(os.environ, env):
         block = tr.blocking_event_since(started)
         assert block and block["resource"] == "publication" and block["reset"] > started + 55
+    # A definitive rejection crosses the shell boundary distinctly from a temporary wait.
+    denial_args = ["api", "repos/org/repo/issues/99/comments", "--method", "POST", "-f", "body=invalid"]
+    denied = subprocess.run(
+        command + denial_args, env={**env, "TAUCETI_TEST_GH_DENY": "1"}, cwd=work, capture_output=True, text=True
+    )
+    assert denied.returncode == 78, denied.stderr
+    assert list((work / "shared/outbox").glob("*/*/*.failed")), "rejection evidence must remain retained"
 
 with (
     tempfile.TemporaryDirectory() as tmp,
@@ -322,6 +334,28 @@ for live, expected in (
         assert outbox.reconcile(value, {}) == expected, (live, expected)
 with patch.object(tr, "execute", return_value=subprocess.CompletedProcess([], 1, "", "timeout")):
     assert outbox.reconcile(value, {}) is None
-with patch.object(tr, "execute") as request:
-    assert outbox.reconcile({**value, "context": {}}, {}) is None
-    request.assert_not_called()
+for state, expected in (("open", None), ("closed", True)):
+    with patch.object(
+        tr, "execute", return_value=subprocess.CompletedProcess([], 0, json.dumps({"state": state}), "")
+    ) as request:
+        assert outbox.reconcile({**value, "context": {}}, {}) is expected
+        assert request.call_count == 1
+
+# Successful lookup reads do not hide a definitive rejection, while partial writes stay ambiguous.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "rejection-fixture"}),
+):
+    for accepted in (False, True):
+        argv = ["gh", "pr", "comment", "7", "--repo", "org/repo", "--body", "retained"]
+        path = outbox.prepare(argv, dict(os.environ), tmp)
+        failure = subprocess.CompletedProcess(argv, 1, "", "validation failed")
+        records = [{"method": "GET", "status": 200}, {"method": "POST", "status": 422}]
+        if accepted:
+            records.insert(1, {"method": "POST", "status": 201})
+        outbox.finish(path, failure, records)
+        if accepted:
+            assert path.exists() and json.loads(path.read_text())["status"] == "ambiguous"
+        else:
+            assert not path.exists() and path.with_suffix(".failed").exists()
+            assert failure.github_permanent_failure is True

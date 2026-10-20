@@ -1857,7 +1857,7 @@ def _do_progress_inner(w, opts) -> int | None:
         # A prepared local branch is an immutable publication artifact. Fetch
         # the live cursor, while leaving its branch and working tree intact.
         if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
-            raise Die(f"refreshing retained progress base in {roadmap_dir} failed")
+            return _defer_progress_publication(w, retained, f"temporary fetch failure in {roadmap_dir}")
     elif (roadmap_dir / ".git").is_dir():
         # `apply` commits and pushes here; a leftover from an interrupted apply is saved, not discarded.
         decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
@@ -1876,6 +1876,8 @@ def _do_progress_inner(w, opts) -> int | None:
     else:
         roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
         if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
+            if retained:
+                return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
             raise Die(f"cloning {ROADMAP} failed")
     if not note_owner(w.cfg, "progress-roadmap", work="progress"):
         raise Die(f"could not record the round that owns {roadmap_dir}")
@@ -1992,6 +1994,18 @@ def _do_progress_inner(w, opts) -> int | None:
     return _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt)
 
 
+def _defer_progress_publication(w, receipt, reason):
+    from . import progress_publication as publication
+
+    saved = publication.temporary_wait(w.cfg, receipt)
+    if saved:
+        w.counters.write(PROGRESS_ERROR_KEY, 0)
+        log(f"progress: {reason}; automatic wait expired, recovery bundle saved at {saved}")
+    else:
+        log(f"progress: {reason}; retaining report and selecting unrelated work")
+    return None
+
+
 def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
     # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
     #    resumable, so a retry after an interrupted run converges rather than duplicating.
@@ -2000,20 +2014,26 @@ def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
     plan_file = work / "plan.json"
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
-    proc = run_tool(
-        "apply",
-        "--plan",
-        str(plan_file),
-        "--status-body",
-        str(status_body),
-        "--section-body",
-        str(section_body),
-        "--roadmap-dir",
-        str(roadmap_dir),
-        "--version",
-        receipt.get("version") or PROGRESS_REF,
-        capture=True,
-    )
+    try:
+        proc = run_tool(
+            "apply",
+            "--plan",
+            str(plan_file),
+            "--status-body",
+            str(status_body),
+            "--section-body",
+            str(section_body),
+            "--roadmap-dir",
+            str(roadmap_dir),
+            "--version",
+            receipt.get("version") or PROGRESS_REF,
+            capture=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _defer_progress_publication(w, receipt, f"publication temporarily unavailable ({exc})")
+    if proc.returncode == 77:
+        return _defer_progress_publication(w, receipt, "publication waiting for GitHub reconciliation")
+
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     # A failure logs its own tail and saves the whole output, so it must be handled BEFORE the
     # excerpt below — otherwise the same text lands in the log twice, once uselessly clipped.

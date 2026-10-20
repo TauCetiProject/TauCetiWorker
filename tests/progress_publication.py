@@ -53,7 +53,7 @@ with (
         "to_sha": "b" * 40,
         "status_path": "Area/STATUS.md",
         "progress_path": "Area/PROGRESS.md",
-        "prs": [1, 2],
+        "prs": [3, 1, 2],
     }
     (work / "plan.json").write_text(json.dumps(plan))
     (work / "status-body.md").write_text("Prepared status prose\n")
@@ -62,7 +62,9 @@ with (
     branch = "progress/aaaaaaa-bbbbbbb/Area"
     git("checkout", "-qb", branch)
     (roadmap / "Area").mkdir()
-    (roadmap / plan["progress_path"]).write_text("<!--tauceti-progress:v1 " + json.dumps(plan) + "-->\nSaved report")
+    # This fixture is produced by Progress files.render_section with newest-first [3, 1, 2].
+    fixture = Path(__file__).parent / "fixtures/progress-retained-section.md"
+    (roadmap / plan["progress_path"]).write_text(fixture.read_text())
     git("add", ".")
     git("commit", "-qm", "prepared report")
     # Upgrade from a legacy retained fork, already reconciled before the survey.
@@ -149,6 +151,27 @@ with (
         os.environ.pop("TAUCETI_GITHUB_ACCOUNT", None)
         with patch("tauceti_worker.github_outbox.actor", return_value="another"):
             assert progress_due(cfg, worker.counters)[0] is False
+    # Infrastructure waits outlast quota resets without spending report attempts.
+    for count in range(1, 8):
+        receipt = publication.defer(cfg, publication.retained(cfg))
+        assert (
+            wu._apply_prepared_progress(
+                worker, lambda *a, **kw: subprocess.CompletedProcess([], 77, "", "quota wait"), roadmap, work, receipt
+            )
+            is None
+        )
+        pending = publication.retained(cfg)
+        assert pending["attempts"] == 0 and pending["waits"] == count
+        assert publication.fingerprints(work) == original
+    assert pending["retry_at"] >= time.time() + 14390
+    assert (
+        wu._apply_prepared_progress(
+            worker, lambda *a, **kw: subprocess.CompletedProcess([], 0, "published", ""), roadmap, work, pending
+        )
+        == 0
+    )
+    assert publication.retained(cfg) is None
+    publication.save(cfg, "author", PROGRESS_REF)
     # Exhausted recovery parks all artifacts and releases future rounds.
     receipt = publication.retained(cfg)
     atomic(work / "publication.json", {**receipt, "attempts": publication.MAX_ATTEMPTS - 1})
@@ -170,6 +193,15 @@ with (
     assert (
         wu._apply_prepared_progress(
             worker, lambda *a, **kw: subprocess.CompletedProcess([], 78, "stale", ""), roadmap, work, receipt
+        )
+        is None
+    )
+    assert not (work / "publication.json").exists()
+    receipt = publication.save(cfg, "author", PROGRESS_REF)
+    aged = {**receipt, "started": time.time() - publication.MAX_WAIT_AGE - 1, "attempts": 1}
+    assert (
+        wu._apply_prepared_progress(
+            worker, lambda *a, **kw: subprocess.CompletedProcess([], 77, "", "outage"), roadmap, work, aged
         )
         is None
     )
