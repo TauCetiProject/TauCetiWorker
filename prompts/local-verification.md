@@ -44,8 +44,9 @@ finish() {
 }
 main=""
 shopt -s nocasematch
+# Raw config, not `git remote get-url`: sandboxes rewrite github.com through a proxy with insteadOf.
 for remote in $(git remote); do
-  [[ "$(git remote get-url "$remote" 2>/dev/null)" =~ \
+  [[ "$(git config --get "remote.$remote.url")" =~ \
      ^(https://([^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)TauCetiProject/TauCeti(\.git)?/?$ ]] \
     || continue
   main="$(git rev-parse --verify --quiet "refs/remotes/$remote/main^{commit}")" && break
