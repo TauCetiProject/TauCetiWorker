@@ -19,6 +19,7 @@ from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
     EX_ADMISSION_WAIT,
+    EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
     EX_VERIFICATION_WAIT,
@@ -306,6 +307,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             rc = run_round_subprocess(tail)
             if rc in (124, 137, 143) and waiting_for_capacity(cfg, since=round_started):
                 rc = EX_VERIFICATION_WAIT
+            if rc == EX_DOCUMENTATION_WAIT:
+                streak = 0
+                paused = runtime_snapshot()
+                report_runtime(
+                    paused.get("state") or "waiting-documentation",
+                    detail=paused.get("detail") or "progress preparation deferred; selecting other work",
+                    next_action_at=paused.get("next_action_at"),
+                )
+                time.sleep(5)
+                continue
             if rc == EX_VERIFICATION_WAIT:
                 streak = 0
                 report_runtime(

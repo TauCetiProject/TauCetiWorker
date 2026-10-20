@@ -59,6 +59,8 @@ def retained(cfg):
         done = work / "publication-done.json"
         if done.exists() and json.loads(done.read_text()).get("files") == hashes:
             return None
+        if (work / "writing.json").exists():
+            return None  # fresh-writer attempts never acquire legacy publication authority
         # Old versions wrote prose then failed creating the fork. Do not adopt
         # arbitrary leftover model files without the matching publication evidence.
         env = dict(os.environ)
@@ -87,6 +89,11 @@ def retained(cfg):
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     return None
+
+
+def begin_writing(cfg):
+    """Fence legacy adoption before changing any canonical inputs or output bodies."""
+    tr.atomic(cfg.state / "progress/work/writing.json", {"version": 1})
 
 
 def legacy_branch_matches(cfg, plan):

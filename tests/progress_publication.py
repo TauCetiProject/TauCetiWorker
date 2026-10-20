@@ -85,6 +85,12 @@ with (
     # A malformed unrelated intent cannot hide valid recovery evidence.
     atomic(directory() / "broken.json", ["invalid"])
     assert publication.retained(cfg)["legacy"]
+    # A fresh writer attempt must not acquire authority from this old fork intent and branch,
+    # including after a failure between installing the two new bodies or saving the receipt.
+    publication.begin_writing(cfg)
+    assert publication.retained(cfg) is None
+    (work / "writing.json").unlink()
+    assert publication.retained(cfg)["legacy"]
     writes, calls = [], []
     worker = SimpleNamespace(
         cfg=cfg,
@@ -145,8 +151,11 @@ with (
         model.assert_not_called()
     assert publication.retained(cfg) is None
     assert publication.fingerprints(work) == original and intent.exists()
-    # A changed author cannot publish the same saved report.
+    # A strong receipt remains authoritative even while the fresh-writing fence persists.
     publication.save(cfg, "author", PROGRESS_REF)
+    publication.begin_writing(cfg)
+    assert publication.retained(cfg)["files"] == original
+    # A changed author cannot publish the same saved report.
     with patch.object(wu, "me", return_value="another"), patch.object(wu.subprocess, "run") as run:
         assert wu._do_progress_inner(worker, None) is None
         run.assert_not_called()

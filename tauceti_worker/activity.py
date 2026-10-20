@@ -129,8 +129,10 @@ class Round:
             with contextlib.suppress(Exception):
                 if blocking_event_since(self.started_at):
                     code = 77
-        if code in (76, 77) or type(exc).__name__ in (
+        if code in (76, 77, 79) or type(exc).__name__ in (
             "AdmissionUnavailable",
+            "DocumentationUnavailable",
+            "ProgressPreparationUnavailable",
             "GitHubUnavailable",
             "SharedStateUnavailable",
         ):
