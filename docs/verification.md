@@ -148,9 +148,10 @@ boundaries; phase checkpoints use existing input metadata and exact source/confi
 Job/index leases suppress duplicate exact-candidate jobs. Permanent scope/configuration/ownership
 errors become terminal incomplete results with retained artifacts, so they cannot starve inference.
 Missing tools remain dormant without repeated verifier launches until local toolchain availability,
-provenance or the installed verifier changes. Toolchain probes retain separate stdout/stderr logs;
-Lake package warnings before Lean's final prefix line do not make an installed toolchain unavailable.
-An invalid final prefix still leaves verification incomplete. Deadline/signal jobs remain eligible without an expiry that discards their
+provenance or any installed verifier component changes. Toolchain probes retain separate stdout/stderr
+logs. Their final version/prefix lines bind the inputs; changing Lake package diagnostics are retained
+in logs and do not invalidate successful checks. A prefix must name an absolute installed directory
+containing `bin/lean`. Invalid final output still leaves verification incomplete. Deadline/signal jobs remain eligible without an expiry that discards their
 candidate. Terminal jobs move from `verification-pending/` into `verification-jobs/`.
 
 Recovery builds only in an independent candidate, never resets the original source and never pushes,

@@ -194,14 +194,12 @@ def tool_readiness(job):
     from .verification import digest, stamps
 
     paths = [path for name in ("lake", "lean", "bash", "python3", "git", "tar") if (path := shutil.which(name))]
-    paths += [
-        str(Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))) / "toolchains"),
-        str(Path(__file__)),
-        str(Path(__file__).with_name("verification.py")),
-        str(HERE / "scripts/tauceti-verify"),
-    ]
+    paths += [str(p) for p in Path(__file__).parent.glob("*.py")]
+    paths += [str(HERE / "scripts" / name) for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")]
+    paths.append(str(Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))) / "toolchains"))
     if job.get("toolchain_wait_path"):
-        paths.append(job["toolchain_wait_path"])
+        prefix = Path(job["toolchain_wait_path"])
+        paths += [str(prefix), str(prefix / "bin" / "lean")]
     return digest(dict(path=os.environ.get("PATH"), elan=os.environ.get("ELAN_HOME"), stamps=stamps(paths)))
 
 

@@ -527,18 +527,18 @@ class Verification:
             selected = shlex.split(os.environ.get(name.upper(), name))
             if selected and (executable := shutil.which(selected[0])):
                 toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
+        # Lake can print package diagnostics before the actual version/prefix.
+        # Keep raw output in the command logs, but bind only the final result:
+        # diagnostics are not inputs, and may change after a successful build.
         for command in (
             ["lake", "--version"],
             ["lake", "env", "lean", "--version"],
             ["lake", "env", "lean", "--print-prefix"],
         ):
-            toolchain[" ".join(command)] = self.command("toolchain", command, capture=True)
-        # Lake may emit package diagnostics on stdout before Lean's result. Keep
-        # the complete probe output in the fingerprint/log; Lean prints its
-        # prefix last. Never search earlier diagnostics for a usable path.
-        lines = toolchain["lake env lean --print-prefix"].splitlines()
-        prefix = Path(lines[-1] if lines else "")
-        if not prefix.is_absolute() or not prefix.is_dir():
+            lines = self.command("toolchain", command, capture=True).splitlines()
+            toolchain[" ".join(command)] = lines[-1] if lines else ""
+        prefix = Path(toolchain["lake env lean --print-prefix"])
+        if not prefix.is_absolute() or not prefix.is_dir() or not (prefix / "bin" / "lean").is_file():
             if prefix.is_absolute() and self.job:
                 self.job["toolchain_wait_path"] = str(prefix)
             raise Incomplete("Lean did not report an absolute installed toolchain prefix", reason="tool-missing")

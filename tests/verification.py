@@ -90,14 +90,21 @@ Path(sys.argv[sys.argv.index('-o') + 1]).chmod(0o755)
 import os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
-if args == ['--version'] or '--version' in args:
-    print('fixture Lean/Lake version 1'); sys.exit(0)
-if '--print-prefix' in args:
-    if os.environ.get('FIXTURE_PROBE_WARNING'):
+if '--version' in args or '--print-prefix' in args:
+    warning = os.environ.get('FIXTURE_PROBE_WARNING')
+    if os.environ.get('FIXTURE_PROBE_WARNING_ONCE'):
+        marker = Path('.lake/probe-warning-' + '-'.join(args))
+        warning = not marker.exists()
+        marker.parent.mkdir(exist_ok=True)
+        marker.touch()
+    if warning:
         print('warning: batteries: repository has local changes:')
         print('  ' + str(Path.cwd() / '.lake/packages/batteries'))
         print('stderr package diagnostic', file=sys.stderr)
-    print({str(self.prefix)!r})
+if args == ['--version'] or '--version' in args:
+    print('fixture Lean/Lake version 1'); sys.exit(0)
+if '--print-prefix' in args:
+    print(os.environ.get('FIXTURE_PROBE_PREFIX', {str(self.prefix)!r}))
     if os.environ.get('FIXTURE_PROBE_TRAILER'): print('not a toolchain prefix')
     sys.exit(0)
 p = Path('.lake'); p.mkdir(exist_ok=True)
@@ -181,8 +188,28 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertIn("warning: batteries", stdout)
         self.assertEqual(stdout.splitlines()[-1], str(self.prefix))
         inputs = json.loads(Path(result["inputs"]["path"]).read_text())
-        self.assertEqual(inputs["toolchain"]["lake env lean --print-prefix"], stdout.strip())
+        self.assertEqual(inputs["toolchain"]["lake env lean --print-prefix"], str(self.prefix))
         self.assertEqual(self.verify(stage="build")["phases"]["build"]["reused_from"], result["receipt"])
+
+    def test_changing_probe_diagnostics_do_not_change_inputs(self):
+        os.environ["FIXTURE_PROBE_WARNING_ONCE"] = "1"
+        first = self.verify(stage="build")
+        self.assertEqual(first["status"], "success", first.get("error"))
+        probes = [c for c in first["commands"] if c["argv"][-1] == "--print-prefix"]
+        self.assertIn("warning:", Path(probes[0]["stdout_log"]).read_text())
+        self.assertNotIn("warning:", Path(probes[-1]["stdout_log"]).read_text())
+        again = self.verify(stage="build")
+        self.assertEqual(again["phases"]["build"]["reused_from"], first["receipt"])
+        self.assertEqual(again["fingerprint"], first["fingerprint"])
+
+    def test_unrelated_absolute_directory_is_not_an_installed_prefix(self):
+        unrelated = self.home / "unrelated-prefix"
+        unrelated.mkdir()
+        os.environ["FIXTURE_PROBE_PREFIX"] = str(unrelated)
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertFalse((self.root / ".lake/calls").exists())
 
     def test_prefix_probe_rejects_trailing_nonpath_output(self):
         os.environ["FIXTURE_PROBE_TRAILER"] = "1"
