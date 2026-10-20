@@ -359,3 +359,16 @@ with (
         else:
             assert not path.exists() and path.with_suffix(".failed").exists()
             assert failure.github_permanent_failure is True
+
+# A wholly rejected 401 can recover after credential refresh without parking paid prose.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "auth-fixture"}),
+):
+    argv = ["gh", "api", "-X", "POST", "repos/org/repo/issues/7/comments", "-f", "body=retained"]
+    path = outbox.prepare(argv, dict(os.environ), tmp)
+    rejected = subprocess.CompletedProcess(argv, 1, "", "Bad credentials")
+    outbox.finish(path, rejected, [{"method": "GET", "status": 200}, {"method": "POST", "status": 401}])
+    value = json.loads(path.read_text())
+    assert value["status"] == "rejected" and value["retry_at"] >= time.time() + 295
+    assert not getattr(rejected, "github_permanent_failure", False)

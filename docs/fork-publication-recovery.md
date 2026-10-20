@@ -13,3 +13,20 @@ Rollback preserves the outbox, `.complete` fork evidence, `progress/work/publica
 Standalone Progress journals uncertain mutations privately. Under Worker, the installed proxy owns the sole mutation journal; local quota waits do not consume mutation replay allowances. Authoritative pre-request or quota rejections refund the Worker fork replay allowance. A compound close-plus-comment is never replayed merely because the PR remains open: the comment may already have been posted.
 
 The proxy reports a definitive mutation rejection as exit 78, retaining its `.failed` evidence; Progress passes that result to Worker for immediate report parking. Already-closed PRs acknowledge retained close intents even when no expected head was recorded. Open compound close/comment intents still require head and actor evidence before any replay. Saved report windows compare PR sets independently of the planner and renderer ordering.
+
+To resume a parked bundle after repairing the cause, use the original account at an idle boundary with exclusive access to this worker's roadmap checkout. The following uses the current fixed executable pin and the saved version label; it preserves the bundle and lets `apply` reconcile the branch and PR before writing:
+
+```bash
+task_report_bundle=/absolute/path/to/state/worker/progress/retained/bundle-id
+task_report_checkout=/absolute/path/to/state/worker/progress/roadmap
+test "$(gh api user --jq .login)" = "$(jq -r .actor "$task_report_bundle/publication.json")" || exit 1
+task_progress_ref=$(python -c 'from tauceti_worker.constants import PROGRESS_REF; print(PROGRESS_REF)')
+uvx --from "git+https://github.com/TauCetiProject/TauCetiProgress@$task_progress_ref" tauceti-progress apply \
+  --plan "$task_report_bundle/plan.json" \
+  --status-body "$task_report_bundle/status-body.md" \
+  --section-body "$task_report_bundle/section-body.md" \
+  --roadmap-dir "$task_report_checkout" \
+  --version "$(jq -r .version "$task_report_bundle/publication.json")"
+```
+
+Exit 75 acknowledges an already published/in-flight window. Exit 77 preserves a temporary wait; exit 78 preserves a stale or unusable report for inspection. Never remove the bundle or force a mutation retry to make this command proceed.

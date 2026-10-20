@@ -164,6 +164,28 @@ with (
         assert pending["attempts"] == 0 and pending["waits"] == count
         assert publication.fingerprints(work) == original
     assert pending["retry_at"] >= time.time() + 14390
+    # The full stage also refunds Git fetch/clone waits after many temporary attempts.
+    for operation in ("fetch", "clone"):
+
+        def unavailable(args, operation=operation, **kwargs):
+            assert args[:1] == ["git"] and operation in args
+            return subprocess.CompletedProcess(args, 1, "", "network unavailable")
+
+        original_git = roadmap / ".git"
+        backup_git = roadmap / ".saved-git"
+        if operation == "clone":
+            original_git.rename(backup_git)
+        try:
+            with (
+                patch.object(wu, "me", return_value="author"),
+                patch.object(wu.subprocess, "run", side_effect=unavailable),
+            ):
+                assert wu._do_progress_inner(worker, None) is None
+        finally:
+            if operation == "clone":
+                backup_git.rename(original_git)
+        assert publication.retained(cfg)["attempts"] == 0
+        assert publication.fingerprints(work) == original
     assert (
         wu._apply_prepared_progress(
             worker, lambda *a, **kw: subprocess.CompletedProcess([], 0, "published", ""), roadmap, work, pending

@@ -311,7 +311,13 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
         r for r in records if r.get("method") not in ("GET", "HEAD", "OPTIONS") and r.get("graphql_operation") != "read"
     ]
     rejected_records = writes or records
-    if rejected_records and all(400 <= r.get("status", 0) < 500 for r in rejected_records) and not quota:
+    auth_rejected = bool(rejected_records) and all(r.get("status") == 401 for r in rejected_records)
+    if (
+        rejected_records
+        and all(400 <= r.get("status", 0) < 500 for r in rejected_records)
+        and not quota
+        and not auth_rejected
+    ):
         result.github_permanent_failure = True
         archive(path, value, "GitHub rejected the publication", http_statuses=[r["status"] for r in records])
         return
@@ -320,11 +326,16 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
         for e in errors
     )
     definitive = (
-        before_request or logical_quota_rejection or (writes and all(r.get("status") in (403, 429) for r in writes))
+        before_request
+        or auth_rejected
+        or logical_quota_rejection
+        or (writes and all(r.get("status") in (403, 429) for r in writes))
     )
     if definitive and value["argv"][:2] == ["repo", "fork"] and value.get("fork_retries", 0):
         value["fork_retries"] -= 1  # Rejection before effects does not spend the ambiguous replay.
     value["status"] = "rejected" if definitive else "ambiguous"
+    if auth_rejected:
+        value["retry_at"] = time.time() + 300
     value["updated"] = time.time()
     tr.atomic(path, value)
     tr.event({"kind": "publication_deferred", "status": value["status"], "intent": path.stem})
