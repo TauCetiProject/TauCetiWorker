@@ -815,7 +815,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
     add_github_account_flag(doctor)
-    doctor.add_argument("--extras", action="store_true")
+    extras = doctor.add_mutually_exclusive_group()
+    extras.add_argument(
+        "--no-extras", dest="extras", action="store_false", help="Report only core project setup checks"
+    )
+    extras.add_argument("--extras", dest="extras", action="store_true", help=argparse.SUPPRESS)
+    doctor.set_defaults(extras=True)
     doctor.add_argument("--online", action="store_true")
     doctor.add_argument("--workflow")
     doctor.add_argument("--field", action="append", default=[])
@@ -1511,7 +1516,9 @@ def cmd_doctor(args) -> int:
         from tauceti_tools.cli import main as project_doctor
 
         flags = ["doctor", "--conf", os.environ.get("TAUCETI_CONF_SOURCE", os.environ["TAUCETI_CONF"])]
-        for flag in ("extras", "online", "apply", "json"):
+        if not args.extras:
+            flags.append("--no-extras")
+        for flag in ("online", "apply", "json"):
             if getattr(args, flag, False):
                 flags.append("--" + flag)
         for flag in ("workflow", "check", "fix"):
