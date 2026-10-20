@@ -358,6 +358,28 @@ class Namespace(Base):
         # Once its own namespace is observed gone, the marker retires.
         self.assertTrue(wait_for(lambda: not containment.unconfirmed(), 5))
 
+    def test_zombie_init_awaiting_a_slow_subreaper_counts_as_empty(self):
+        # The orphaned init is reparented to a subreaper that has not reaped it yet; its namespace
+        # link survives, but the kernel only lets init exit once every member is gone.
+        code = (
+            "import ctypes,os,subprocess,sys,time; sys.path.insert(0, sys.argv[1]); "
+            "from tauceti_worker import containment; ctypes.CDLL(None).prctl(36, 1, 0, 0, 0); "
+            "b = containment.Boundary('zombie'); "
+            "p = subprocess.Popen(b.argv(['sleep', '30']), pass_fds=b.pass_fds); b.launched(); "
+            "p.kill(); p.wait(); time.sleep(0.3); "
+            "pid = b.identity['child-pid']; "
+            "assert open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()[0] == 'Z'; "
+            "print(b.finish(p.returncode)); os.waitpid(pid, 0)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(Path(__file__).resolve().parent.parent)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split()[-1], "namespace-empty")
+
     def test_namespace_init_is_killed_if_it_outlives_its_command(self):
         boundary = containment.Boundary("stuck")
         argv = boundary.argv([sys.executable, "-c", "import time; time.sleep(60)", self.token])

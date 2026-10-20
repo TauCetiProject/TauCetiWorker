@@ -153,10 +153,16 @@ def _namespace_state(pid: int, namespace: int) -> bool | None:
     The namespace's init keeps this link until every other member is dead and reaped, so the link
     names the boundary, not just a pid that the kernel might have reused."""
     try:
-        return os.readlink(f"/proc/{pid}/ns/pid") == f"pid:[{namespace}]"
+        if os.readlink(f"/proc/{pid}/ns/pid") != f"pid:[{namespace}]":
+            return False
+        # A zombie keeps the link until its parent reaps it, and an orphaned init may wait on a slow
+        # subreaper. The kernel lets init exit only after every other member is gone, so a dead
+        # init means an empty namespace.
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        return state not in {"Z", "X"}
     except (FileNotFoundError, ProcessLookupError):
         return False
-    except OSError:
+    except (OSError, IndexError):
         return None
 
 
