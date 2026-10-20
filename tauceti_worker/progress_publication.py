@@ -18,6 +18,32 @@ MAX_WAIT_AGE = 7 * 86400
 FILES = ("plan.json", "status-body.md", "section-body.md")
 
 
+def facts_bundle(plan_file, *, verify=False):
+    """Locate only the hash-named sibling emitted by Progress, never an arbitrary path.
+
+    Publication receipts bind the plan and prose. Applying already prepared prose does not
+    need this auxiliary input; losing it must not invalidate or regenerate paid output.
+    """
+    plan = json.loads(plan_file.read_text())
+    pin = plan.get("documentation") if isinstance(plan, dict) else None
+    if not isinstance(pin, dict) or pin.get("mode") != "pages":
+        return None
+    digest = pin.get("facts_sha256")
+    name = pin.get("bundle_file")
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or name != f"plan.json.facts-{digest}.json.gz"
+    ):
+        raise ValueError("invalid pinned facts bundle sibling")
+    bundle = plan_file.parent / name
+    if bundle.is_symlink():
+        raise ValueError("pinned facts bundle must not be a symlink")
+    if verify and hashlib.sha256(bundle.read_bytes()).hexdigest() != digest:
+        raise ValueError("pinned facts bundle hash mismatch")
+    return bundle
+
+
 def fingerprints(work):
     values = {}
     for name in FILES:
@@ -124,7 +150,13 @@ def park(cfg, value, reason):
     work = cfg.state / "progress/work"
     saved = cfg.state / "progress/retained" / uuid.uuid4().hex
     saved.mkdir(parents=True, mode=0o700)
-    for name in (*FILES, "facts.json", "progress-prompt.md"):
+    names = [*FILES, "facts.json", "progress-prompt.md"]
+    try:
+        if bundle := facts_bundle(work / "plan.json"):
+            names.append(bundle.name)
+    except (OSError, ValueError):
+        pass  # retain core publication artifacts even when auxiliary metadata is damaged
+    for name in names:
         source = work / name
         if source.is_file():
             with open(saved / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:

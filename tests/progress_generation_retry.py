@@ -2,6 +2,7 @@
 """Deployment churn retries mechanical stages, preserving the window and paid-stage state."""
 
 import contextlib
+import hashlib
 import json
 import os
 import subprocess
@@ -109,6 +110,86 @@ class GenerationRetryTests(unittest.TestCase):
         self.assertEqual(self.calls, ["plan", "facts"])
         self.assert_uncharged()
 
+    def pages_fixture(self):
+        bundle = b"exact compressed generation bytes"
+        digest = hashlib.sha256(bundle).hexdigest()
+        pin = {
+            "mode": "pages",
+            "schema_version": 1,
+            "source_commit": NEW,
+            "generation": f"pages/{NEW}/{digest}",
+            "facts_sha256": digest,
+            "bundle_file": f"plan.json.facts-{digest}.json.gz",
+            "coverage": ["Area.lean"],
+            "docs_base": "https://example.invalid/docs",
+        }
+        return bundle, pin
+
+    def test_typed_infrastructure_and_recovery_are_uncharged(self):
+        for code in (77, 78):
+            self.calls.clear()
+            with self.assertRaises(DocumentationUnavailable):
+                self.drive_inner(failures=3, code=code)
+            self.assertEqual(self.calls, ["plan", "facts"] * (1 if code == 77 else 3))
+            self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
+            self.assert_uncharged()
+        self.calls.clear()
+        self.assertEqual(self.drive_inner(failures=1, code=78), 0)
+        self.assertEqual(self.calls, ["plan", "facts"] * 2 + ["prompt", "writer"])
+
+    def test_same_source_different_facts_pin_requires_replan(self):
+        _, pin = self.pages_fixture()
+        with patch.dict(PLAN, documentation=pin):
+            with self.assertRaises(DocumentationUnavailable):
+                wu._prepare_progress(self.worker, self.run_tool, self.roadmap, self.work)
+        self.assertEqual(self.calls, ["plan", "facts"] * 3)
+        self.assert_uncharged()
+
+    def test_pages_bundle_is_promoted_and_archived_with_plan(self):
+        bundle, pin = self.pages_fixture()
+        original_run = self.run_tool
+
+        def bundled(stage, *args, **kwargs):
+            result = original_run(stage, *args, **kwargs)
+            if stage == "plan":
+                target = Path(args[args.index("--out") + 1]).parent / pin["bundle_file"]
+                target.write_bytes(bundle)
+            return result
+
+        self.run_tool = bundled
+        old_bytes = b"previous generation"
+        old_hash = hashlib.sha256(old_bytes).hexdigest()
+        old_pin = {**pin, "facts_sha256": old_hash, "bundle_file": f"plan.json.facts-{old_hash}.json.gz"}
+        (self.work / "plan.json").write_text(json.dumps({**PLAN, "documentation": old_pin}))
+        (self.work / old_pin["bundle_file"]).write_bytes(old_bytes)
+        with patch.dict(PLAN, documentation=pin), patch.dict(FACTS, documentation=pin):
+            self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual((self.work / pin["bundle_file"]).read_bytes(), bundle)
+        saved = list((self.root / "progress/mechanical").glob("attempt-*/previous"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual((saved[0] / old_pin["bundle_file"]).read_bytes(), old_bytes)
+        self.assertEqual(json.loads((saved[0] / "plan.json").read_text())["documentation"], old_pin)
+
+    def test_missing_or_corrupt_bundle_never_launches_writer(self):
+        bundle, pin = self.pages_fixture()
+        original_run = self.run_tool
+        for corrupt in (False, True):
+
+            def bundled(stage, *args, corrupt=corrupt, **kwargs):
+                result = original_run(stage, *args, **kwargs)
+                if corrupt and stage == "plan":
+                    target = Path(args[args.index("--out") + 1]).parent / pin["bundle_file"]
+                    target.write_bytes(bundle + b"corruption")
+                return result
+
+            self.run_tool = bundled
+            with patch.dict(PLAN, documentation=pin), patch.dict(FACTS, documentation=pin):
+                with self.assertRaises(DocumentationUnavailable):
+                    self.drive_inner()
+            self.assertNotIn("writer", self.calls)
+            self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
+            self.assert_uncharged()
+
     def test_invalid_plan_missing_extant_module_and_fetch_failure_do_not_retry(self):
         for failed_stage, detail in (
             ("plan", "cursor is not an ancestor"),
@@ -164,6 +245,7 @@ class GenerationRetryTests(unittest.TestCase):
             if stage == timeout_stage:
                 raise subprocess.TimeoutExpired(args, 1800, output=b"partial stdout", stderr=b"partial stderr")
             if stage in ("plan", "facts"):
+                self.assertEqual(kwargs["env"]["TAUCETI_FACTS_CACHE"], str(self.root / "progress/facts-cache"))
                 if stage == fail_stage and remaining:
                     remaining -= 1
                     self.calls.append(stage)
@@ -220,6 +302,8 @@ class GenerationRetryTests(unittest.TestCase):
     def test_writer_never_launched_on_mechanical_failure(self):
         for failures, stage, code, error in (
             (3, "facts", 76, DocumentationUnavailable),
+            (1, "facts", 77, DocumentationUnavailable),
+            (3, "facts", 78, DocumentationUnavailable),
             (1, "plan", 1, Die),
             (1, "facts", 1, Die),
         ):

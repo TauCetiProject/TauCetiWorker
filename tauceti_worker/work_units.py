@@ -2087,9 +2087,11 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                     return None
                 if proc.returncode:
                     reason = _progress_tool_failed(w, stage, proc)
-                    if _progress_generation_changed(stage, proc):
-                        log(f"progress: documentation changed on mechanical attempt {attempt + 1}/3; replanning")
+                    if _progress_generation_changed(stage, proc) or proc.returncode == 78:
+                        log(f"progress: documentation requires replanning on mechanical attempt {attempt + 1}/3")
                         break
+                    if proc.returncode == 77:
+                        _progress_documentation_wait(w, reason)
                     _progress_mechanical_failed(w, reason)
                 if stage == "plan":
                     try:
@@ -2116,13 +2118,21 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                         raise ValueError("facts must contain full docs_sha and to_sha commit IDs")
                 except (OSError, ValueError, AttributeError) as exc:
                     _progress_mechanical_failed(w, f"progress: invalid facts artifact: {exc}")
-                if facts["docs_sha"] != plan["to_sha"] or facts["to_sha"] != plan["to_sha"]:
+                if (
+                    facts["docs_sha"] != plan["to_sha"]
+                    or facts["to_sha"] != plan["to_sha"]
+                    or facts.get("documentation") != plan.get("documentation")
+                ):
                     reason = (
                         f"successful facts name docs={facts['docs_sha']} to={facts['to_sha']}, "
-                        f"expected={plan['to_sha']}; replanning"
+                        f"expected={plan['to_sha']} or documentation pin differs; replanning"
                     )
                     log(f"progress: {reason}")
                 else:
+                    try:
+                        publication.facts_bundle(plan_file, verify=True)
+                    except (OSError, ValueError) as exc:
+                        _progress_documentation_wait(w, f"pinned facts bundle unavailable: {exc}")
                     return plan_file, facts_file
     # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
     # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
@@ -2138,6 +2148,11 @@ def _install_progress_body(source, target):
             out.flush()
             os.fsync(out.fileno())
         os.replace(name, target)
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -2235,7 +2250,12 @@ def _do_progress_inner(w, opts) -> int | None:
                 text=True,
                 errors="replace",
                 timeout=max(1, min(1800, remaining)),
-                env={**os.environ, "TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else None,
+                env={
+                    **os.environ,
+                    "TAUCETI_FACTS_CACHE": os.environ.get("TAUCETI_FACTS_CACHE")
+                    or str(w.cfg.state / "progress/facts-cache"),
+                    **({"TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else {}),
+                },
             )
         except (OSError, subprocess.SubprocessError) as exc:
 
@@ -2283,15 +2303,24 @@ def _do_progress_inner(w, opts) -> int | None:
         # factual inputs changed. Receipted publication above never reaches this path.
         previous = new_plan.parent.parent / "previous"
         previous.mkdir()
-        for artifact in (plan_file, facts_file, prompt_file, status_body, section_body):
+        artifacts = [plan_file, facts_file, prompt_file, status_body, section_body]
+        try:
+            if bundle := publication.facts_bundle(plan_file):
+                artifacts.append(bundle)
+        except (OSError, ValueError):
+            pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
+        for artifact in artifacts:
             if artifact.exists():
                 shutil.copyfile(artifact, previous / artifact.name)
         if not any(previous.iterdir()):
             previous.rmdir()
         for body in (status_body, section_body):
             body.unlink(missing_ok=True)
-    shutil.copyfile(new_plan, plan_file)
-    shutil.copyfile(new_facts, facts_file)
+    # Install the retained immutable bytes durably before the plan that refers to them.
+    if bundle := publication.facts_bundle(new_plan, verify=True):
+        _install_progress_body(bundle, work / bundle.name)
+    _install_progress_body(new_plan, plan_file)
+    _install_progress_body(new_facts, facts_file)
     w.counters.write("progress-docs-retry-at", 0)
     w.counters.write("progress-docs-waits", 0)
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
