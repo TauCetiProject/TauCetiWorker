@@ -77,7 +77,7 @@ bounded. Receipts and logs remain retained; there is no automatic deletion of in
 After an immutable identity validates, inventory-only hashes for it are omitted from the persisted
 `verification-hashes-v2.json` cache. Individually fingerprinted executable hashes remain cached even
 inside that installation. Directory paths are stored once; mutable input records remain bounded at
-200,000. Directory/key recency survives serialization and keeps actively used hashes ahead of cold history.
+200,000. Persisted directory recency and priority for currently used keys keep active hashes ahead of cold history.
 Cache saves merge only touched keys under a bounded one-second per-state lock; an unavailable cache
 cannot change the verification result or skip runtime cleanup.
 Migration imports matching V1 stat-keyed hashes without rereading their payloads until each workspace
@@ -147,8 +147,11 @@ margin arrives at command completion. Complete input/tool-version preparation ru
 boundaries; phase checkpoints use existing input metadata and exact source/configuration checks.
 Job/index leases suppress duplicate exact-candidate jobs. Permanent scope/configuration/ownership
 errors become terminal incomplete results with retained artifacts, so they cannot starve inference.
-Missing tools remain dormant without repeated verifier launches until local toolchain availability
-or provenance changes. Deadline/signal jobs remain eligible without an expiry that discards their
+Missing tools remain dormant without repeated verifier launches until local toolchain availability,
+provenance or any installed verifier component changes. Toolchain probes retain separate stdout/stderr
+logs. Their final version/prefix lines bind the inputs; changing Lake package diagnostics are retained
+in logs and do not invalidate successful checks. A prefix must name an absolute installed directory
+containing `bin/lean`. Invalid final output still leaves verification incomplete. Deadline/signal jobs remain eligible without an expiry that discards their
 candidate. Terminal jobs move from `verification-pending/` into `verification-jobs/`.
 
 Recovery builds only in an independent candidate, never resets the original source and never pushes,

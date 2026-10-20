@@ -759,6 +759,110 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             reused = v.Verification(Path(complete["root"]), self.state, base=complete["base"], stage="build").run()
         self.assertIn("reused_from", reused["phases"]["build"])
 
+    def test_probe_fix_wakes_dormant_job_and_finishes_without_a_model(self):
+        with patch.dict(os.environ, FIXTURE_PROBE_TRAILER="1"):
+            result = self.verify(stage="build")
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        self.assertEqual(job["status"], "blocked-tools")
+        job["next_at"] = 0
+        v.atomic(path, job)
+        self.assertFalse(resume_pending(SimpleNamespace(state=self.state)))
+        original = v.stamps
+
+        def upgraded(paths):
+            metadata = original(paths)
+            verifier = str(Path(v.__file__))
+            if verifier in metadata:
+                metadata[verifier] = ["upgraded-verifier-stamp"]
+            return metadata
+
+        # Model a newly installed verifier without editing the running repository.
+        with patch.object(v, "stamps", side_effect=upgraded):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        complete = v.read_json(self.state / "verification-jobs" / path.name)
+        self.assertEqual(complete["status"], "success")
+        self.assertEqual(complete["attempts"], 1)
+        self.assertTrue((Path(complete["root"]) / ".lake/calls").exists())
+        self.assertFalse((self.root / ".lake/calls").exists())
+
+    def test_installation_and_driver_updates_wake_tools_then_return_to_dormancy(self):
+        from tauceti_worker.verification_jobs import tool_readiness
+
+        os.environ["FIXTURE_PROBE_TRAILER"] = "1"
+        result = self.verify(stage="build")
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        job["next_at"] = 0
+        v.atomic(path, job)
+        self.assertFalse(resume_pending(SimpleNamespace(state=self.state)))
+        original = v.stamps
+
+        def changed(component):
+            def upgraded(paths):
+                metadata = original(paths)
+                if str(component) in metadata:
+                    metadata[str(component)] = ["installed-component-updated"]
+                return metadata
+
+            return upgraded
+
+        installation = Path(v.__file__).with_name("verification_installations.py")
+        with patch.object(v, "stamps", side_effect=changed(installation)):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        waiting = v.read_json(path)
+        self.assertEqual(waiting["status"], "blocked-tools")
+        self.assertEqual(waiting["attempts"], 1)
+        self.assertEqual(waiting["tool_readiness"], tool_readiness(waiting))
+        waiting["next_at"] = 0
+        v.atomic(path, waiting)
+        self.assertFalse(resume_pending(SimpleNamespace(state=self.state)))
+        del os.environ["FIXTURE_PROBE_TRAILER"]
+        with patch.object(v, "stamps", side_effect=changed(v.HERE / "scripts/LocalAxioms.lean")):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        complete = v.read_json(self.state / "verification-jobs" / path.name)
+        self.assertEqual(complete["status"], "success")
+        self.assertEqual(complete["attempts"], 2)
+        self.assertFalse((self.root / ".lake/calls").exists())
+
+    def test_installing_lean_in_existing_prefix_wakes_dormant_verification(self):
+        prefix = self.home / "late-installation"
+        (prefix / "bin").mkdir(parents=True)
+        os.environ["FIXTURE_PROBE_PREFIX"] = str(prefix)
+        result = self.verify(stage="build")
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        self.assertEqual(job["status"], "blocked-tools")
+        self.assertEqual(job["toolchain_wait_path"], str(prefix))
+        job["next_at"] = 0
+        v.atomic(path, job)
+        self.assertFalse(resume_pending(SimpleNamespace(state=self.state)))
+        before = prefix.stat().st_mtime_ns
+        write(prefix, "bin/lean", (self.prefix / "bin/lean").read_text()).chmod(0o755)
+        self.assertEqual(prefix.stat().st_mtime_ns, before)
+        self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        complete = v.read_json(self.state / "verification-jobs" / path.name)
+        self.assertEqual(complete["status"], "success")
+        self.assertEqual(complete["attempts"], 1)
+
+    def test_registration_update_wakes_dormant_verification(self):
+        manifest = self.home / "publisher.json"
+        v.atomic(manifest, {})
+        os.environ["TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS"] = str(manifest)
+        os.environ["FIXTURE_PROBE_TRAILER"] = "1"
+        result = self.verify(stage="build")
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        job["next_at"] = 0
+        v.atomic(path, job)
+        del os.environ["FIXTURE_PROBE_TRAILER"]
+        self.assertFalse(resume_pending(SimpleNamespace(state=self.state)))
+        v.atomic(manifest, {str(self.prefix): "publisher-updated"})
+        self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        complete = v.read_json(self.state / "verification-jobs" / path.name)
+        self.assertEqual(complete["status"], "success")
+        self.assertEqual(complete["attempts"], 1)
+
     def test_external_source_symlink_preservation_fails_incomplete_without_source_loss(self):
         outside = write(self.home, "external.lean", "external source")
         (self.root / "TauCeti/Linked.lean").symlink_to(outside)
