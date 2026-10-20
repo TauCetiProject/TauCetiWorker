@@ -58,6 +58,7 @@ RUN_STDLIB=(
   github_shared_transport.py
   github_state.py
   github_state_rollout.py
+  github_state_migration.py
   github_state_reconciliation.py
   github_outbox.py
   github_forks.py

@@ -1,4 +1,5 @@
 import { Env, EventPointer, Query, Repository, authorize, digest, json, repositories, repository, stub, validSignature, validateQuery, parseGitHub } from './protocol';
+import { readMigration } from './migration';
 import { classify, log, requestId } from './storage';
 import { PARK_AFTER_ATTEMPTS, backlog, backoff, drain, ingressMode, noteRepositoryFull, park, reconcile, setIngressMode, storageState } from './ingress';
 export { RepositoryState } from './repository';
@@ -106,6 +107,12 @@ export default {
         const input:any=await req.json(),repo=repository(env,input.repository);
         if (!repo) return json({error:'repository_not_allowed'},400);
         return stub(env.REPOSITORIES,repo.id).fetch('https://internal/configure',{method:'POST',body:JSON.stringify({repository:repo.name})});
+      }
+      if (url.pathname==='/admin/migration' && req.method==='POST') {
+        if (!await authorize(req,env,undefined,true)) return json({error:'unauthorized'},401);
+        const input:any=await req.json(),repo=repository(env,input?.repository || '');
+        if(!repo) return json({error:'repository_not_allowed'},400);
+        return stub(env.REPOSITORIES,repo.id).fetch('https://internal/migration',{method:'POST',body:JSON.stringify(input)});
       }
       // Bounded storage diagnostics and recovery. No arbitrary SQL or proxying.
       if (url.pathname==='/admin/storage' || url.pathname.startsWith('/admin/storage/') || url.pathname.startsWith('/admin/ingress')) {
@@ -231,17 +238,30 @@ export default {
       })().catch(error=>log('scheduled_failed',{repository:repo.name,reason:classify(error)})));
       ctx.waitUntil(drain(env,repo).catch(error=>log('parked_replay_failed',{repository:repo.name,reason:classify(error)})));
     }
+    // Retention is conservatively paused for this bucket while a migration
+    // retains its source. Do not expire active cursors, raw input, staging, or
+    // old resource versions underneath an export/observation period.
+    const retentionHeld=async()=>{
+      for(const repo of repositories(env)) {
+        const state=await readMigration(env.ARCHIVE,repo.id);
+        if(state && state.phase!=='abandoned') return true;
+      }
+      return false;
+    };
     // R2 continuation pages are numerous and short-lived; sweep them separately.
     ctx.waitUntil((async()=>{
+      if(await retentionHeld()) return;
       const page=await env.ARCHIVE.list({prefix:'cursors/',limit:500,include:['customMetadata'],cursor:await env.ARCHIVE.get('retention-cursor-cursors').then(o=>o?.text()) || undefined});
       const expired=page.objects.filter(o=>Number(o.customMetadata?.expires)<Date.now()).map(o=>o.key);
-      if (expired.length) await env.ARCHIVE.delete(expired);
+      if (expired.length && !await retentionHeld()) await env.ARCHIVE.delete(expired);
       if (page.truncated) await env.ARCHIVE.put('retention-cursor-cursors',page.cursor); else await env.ARCHIVE.delete('retention-cursor-cursors');
     })().catch(error=>log('cursor_retention_failed',{reason:classify(error)})));
     // Retention is explicit so raw webhook bodies and abandoned staging pages do not accumulate.
     ctx.waitUntil((async()=>{
+      if(await retentionHeld()) return;
       const page=await env.ARCHIVE.list({limit:100,include:['customMetadata'],cursor:await env.ARCHIVE.get('retention-cursor').then(o=>o?.text()) || undefined});
       for (const object of page.objects) {
+        if(await retentionHeld()) return;
         if(Number(object.customMetadata?.expires)<Date.now()) await env.ARCHIVE.delete(object.key);
         else if(object.customMetadata?.kind==='resource' && object.uploaded.getTime()<Date.now()-8*86400000) {
           const repo=repositories(env).find(r=>object.key.startsWith('resources/'+r.id+'/'));

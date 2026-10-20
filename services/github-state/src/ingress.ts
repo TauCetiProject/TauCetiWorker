@@ -1,4 +1,5 @@
 import { Env, EventPointer, Repository, digest, parseGitHub, stub } from './protocol';
+import { readMigration } from './migration';
 import { classify, log } from './storage';
 
 // Parked ingress keeps acknowledged webhooks durable while the repository
@@ -29,6 +30,8 @@ export async function storageState(env: Env, repo: Repository): Promise<any> {
   return env.ARCHIVE.get(storageKey(repo.id)).then(o => o ? o.json() : null);
 }
 export async function ingressMode(env: Env, repo: Repository): Promise<{ mode: 'apply' | 'parked'; reason?: string; at?: number }> {
+  const migration=await readMigration(env.ARCHIVE,repo.id);
+  if(migration && migration.phase!=='abandoned') return {mode:'parked',reason:'migration'};
   const object = await env.ARCHIVE.get(controlKey(repo.id));
   return object ? object.json() : { mode: 'apply' };
 }

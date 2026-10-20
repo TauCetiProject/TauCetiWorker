@@ -351,3 +351,7 @@ references and active SQL references intact. SQLite resource rows are retained;
 long-term database growth still needs a cold-storage policy
 (https://github.com/TauCetiProject/TauCetiWorker/issues/316) before claiming
 sustained operation at the modeled $1,500/hour scale.
+
+The [migration source runbook](../../docs/github-state-migration.md) describes
+S2's test-only, fenced full-table export protocol and its production blockers.
+Source verification does not select PostgreSQL or constitute a release receipt.

@@ -15,7 +15,7 @@
     "name": "tauceti-github-state-test",
     "version_metadata": {"binding":"CF_VERSION"},
     "services": [{"binding":"BORS_ACTIVITY","service":"tauceti-bors"}],
-    "vars": {"REFERENCE_READS": "true", "FAULT_INJECTION": "true"},
+    "vars": {"REFERENCE_READS": "true", "FAULT_INJECTION": "true", "MIGRATION_ENVIRONMENT": "test"},
     "routes": [{"pattern": "github-state-test.taucetiproject.org", "custom_domain": true}],
     "durable_objects": {"bindings": [{"name": "REPOSITORIES", "class_name": "RepositoryState"}, {"name": "INSTALLATIONS", "class_name": "InstallationScheduler"}]},
     "r2_buckets": [{"binding": "ARCHIVE", "bucket_name": "tauceti-github-state-test"}],
