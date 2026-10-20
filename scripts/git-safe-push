@@ -83,9 +83,15 @@ fi
 git update-ref "$ATTEMPT_REF" "$ATTEMPT" || infra_die "cannot retain push attempt"
 if git -c push.followTags=false push --porcelain --force-with-lease="$REF:$EXPECT" "$REMOTE" "$OID:$DEST" >"$PUSH_STATUS"; then
     cat "$PUSH_STATUS"
+    CHANGED=0
+    while IFS=$'\t' read -r flag destination _summary; do
+        if [[ "$destination" == "$OID:$DEST" ]]; then
+            case "$flag" in ' '|+|'*') CHANGED=1 ;; esac
+        fi
+    done <"$PUSH_STATUS"
     # Local publication evidence: checkout preparation treats commits reachable from
     # refs/tauceti/published/* as published, so pushed work is not mistaken for unfinished source.
-    if git update-ref "refs/tauceti/published/scope/$SCOPE/${REF#refs/heads/}" "$OID" 2>/dev/null &&
+    if { [[ "$CHANGED" == 0 ]] || git update-ref "refs/tauceti/published/scope/$SCOPE/${REF#refs/heads/}" "$OID" 2>/dev/null; } &&
        git update-ref "refs/tauceti/published/push/${REF#refs/heads/}" "$OID" 2>/dev/null; then
         git update-ref -d "$PENDING" 2>/dev/null || true
     fi

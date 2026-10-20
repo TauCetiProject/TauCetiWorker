@@ -33,6 +33,7 @@ was published from a transcript; resuming retained work is a separate consumer o
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -795,6 +796,38 @@ def pending_push_ref(marker: dict) -> str:
     return f"refs/tauceti/pending-push/{marker.get('scope') or 'unscoped'}/{branch}"
 
 
+def push_intent(repo, ref):
+    if not ref_object(repo, ref):
+        return {}
+    message = _git(repo, "cat-file", "-p", ref, text=True).split("\n\n", 1)[-1].splitlines()
+    return dict(oid=_rev(repo, ref), expected=message[1] if len(message) > 1 else None)
+
+
+def _handoff_source_receipts(cfg, owner, checkpoint):
+    """A completed save/clean inspection acknowledges the receiving round, never agent text."""
+    for record_name, identity in (owner.get("recovery_handoffs") or [])[:4]:
+        record = Path(record_name)
+        if record.parent != cfg.state / "recovery" or record.is_symlink():
+            raise RecordError("handoff receipt destination is outside this worker's recovery records")
+        with (record / "recovery.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            journal = read_json(record / "recovery.json")
+            handoff = journal.get("handoff") or {}
+            if handoff.get("id") != identity or handoff.get("state") != "offered":
+                continue
+            if handoff.get("source_round") != owner.get("round_id"):
+                raise RecordError("handoff source receipt round mismatch")
+            receipt = dict(round_id=owner.get("round_id"), checkpoint=str(checkpoint) if checkpoint else None)
+            if checkpoint is None and (handoff.get("source_receipt") or {}).get("checkpoint"):
+                continue  # A clean preserved checkout must not erase an earlier durable source pointer.
+            if handoff.get("source_receipt") == receipt:
+                continue
+            journal["handoff"] = {**handoff, "source_receipt": receipt}
+            journal["retry_at"] = 0
+            atomic_json(record / "recovery.json", journal)
+            _fsync_dir(record)
+
+
 def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
     """Write or reuse a complete record for this exact snapshot. Raises RecordError on any failure."""
     from .activity import current_round_id
@@ -804,8 +837,14 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
     marker = owner.get("publication_marker") or {}
     outcome = owner.get("round_outcome")
     if marker.get("ref"):
-        published = _rev(repo, marker["ref"])
-        if published and published != marker.get("before"):
+        branch = marker["ref"].removeprefix("refs/tauceti/published/push/")
+        publication_ref = (
+            f"refs/tauceti/published/scope/{marker['scope']}/{branch}" if marker.get("scope") else marker["ref"]
+        )
+        published = _rev(repo, publication_ref)
+        if published and (
+            marker.get("scope") or (published != marker.get("before") and published != owner.get("expected_head"))
+        ):
             outcome = {**(outcome or {}), "published_head": published}
         pending_ref = pending_push_ref(marker)
         pending = ref_object(repo, pending_ref)
@@ -830,24 +869,19 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
     except OSError as error:
         raise RecordError(f"could not create {root}: {error}") from None
     indexed = os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() != "off"
-    if indexed and (record := _indexed_record(cfg.state, repository, snap.fingerprint, snapshot=snap)):
+    record = _indexed_record(cfg.state, repository, snap.fingerprint, snapshot=snap) if indexed else None
+    pending_publication = (outcome or {}).get("pending_push")
+    if record and pending_publication:
+        previous = read_json(record / "normal-publication.json")
+        if previous and previous != pending_publication:
+            record = None  # Keep both distinct uncertain intents with their original source/authority.
+    if record:
         if (outcome or {}).get("pending_push"):
-            journal = read_json(record / "recovery.json")
-            atomic_json(record / "recovery.json", {**journal, "normal_publication": outcome["pending_push"]})
+            atomic_json(record / "normal-publication.json", outcome["pending_push"])
             _fsync_dir(record)
+        _handoff_source_receipts(cfg, owner, record)
         if snap.unpublished:
             _remember_commits(cfg.state, record, _read_manifest(record), snap)
-        manifest = _read_manifest(record)
-        if manifest.get("source_round"):
-            with contextlib.suppress(OSError, ValueError):
-                recovery_index.remember(
-                    cfg.state,
-                    record,
-                    manifest,
-                    verified=True,
-                    evidence=recovery_index.stamps(record, manifest),
-                    fingerprint=f"round:{manifest['source_round']}",
-                )
         return record
     record_id = base_id
     if (root / record_id).exists():
@@ -932,6 +966,7 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         if isinstance(error, RecordError):
             raise
         raise RecordError(f"could not save recovery record: {error}") from error
+    _handoff_source_receipts(cfg, owner, final)
     # The descriptor is durable before the disposable index is published. Failure/crash here is
     # safe: a later lookup misses and saves again, or housekeeping reconstructs an unverified entry.
     if indexed:
@@ -1264,7 +1299,13 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
     work = Work()
     token = _WORK.set(work)
     try:
+        owner = read_json(owner_path(cfg, label))
         decision = _guard(cfg, repo, label=label, repository=repository)
+        if decision.ok and decision.state == "clean":
+            try:
+                _handoff_source_receipts(cfg, owner, None)
+            except (OSError, RecordError) as error:
+                log(f"handoff source inspection receipt deferred: {error}")
         decision.details["preparation"] = work.report()
         with contextlib.suppress(OSError):
             atomic_json(cfg.state / "recovery-preparation.json", dict(at=time.time(), **work.report()))

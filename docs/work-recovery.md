@@ -47,6 +47,7 @@ left the source. Each record is private to its worker (mode `0700`/`0600`):
 | `unstaged.patch` | binary diff of the worktree against the index |
 | `untracked.tar` | untracked and ignored source with original relative paths, plus the bytes of conflicted and assume-unchanged/skip-worktree paths; symlinks are stored as links and never followed |
 | `status.json` | mutable disposition: `preserved`, `checkout-reset`, `retained` or `superseded` |
+| `normal-publication.json` | optional durable normal-push intent on reused source; separate from the consumer journal so concurrent journal updates cannot erase it |
 
 The worker writes into a `.tmp-*` directory and fsyncs every file and the
 directory. It then renames the directory into place and fsyncs the parent.
@@ -261,6 +262,12 @@ automatic recovery; the next owned round also reconciles interrupted handoffs,
 prefers retained normal progress, and returns unused source to mechanical
 recovery when durable Git intent proves no push was attempted or the attempt
 was rejected. This also permits reintegration after another writer moves the head.
+The normal saver records the actual captured checkpoint, or a completed clean
+inspection, under the existing handoff lock. This durable source outcome survives
+disposable-index loss and non-sequential checkpoint names. An interrupted capture
+retries through ordinary preservation while independent normal work proceeds;
+missing cache entries never prove that no newer source exists. A clean inspection
+cannot erase an earlier positive checkpoint receipt.
 The original evidence stays available alongside a receiving round's partial progress.
 Unpublished edits made after a confirmed push remain evidence for fresh normal
 repair work even when the old round's publication authority has ended. Transferred
@@ -325,7 +332,7 @@ reconciliation is offered only as forensic evidence, leaving the supervisor's
 scheduled reconciliation active. Known local failures before push clear only
 that invocation's never-sent intent.
 Source preservation carries this intent into the recovery record or
-its existing consumer journal when identical source was already saved. A receiving
+the separate publication sidecar when identical source was already saved. A receiving
 round's checkpoint therefore cannot bypass publication reconciliation. Uncertain
 normal publication is confirmed remotely or retained as forensic evidence for
 fresh normal work; it cannot authorize automatic replay of a different commit.
@@ -336,6 +343,9 @@ Fresh normal work can assess retained evidence against the current remote head
 under its own unchanged policy. No human must edit a journal or resolve a queue.
 Recovery creates no extra PRs or comments; existing GitHub intents keep their
 normal durable outbox and reconciliation behavior.
+An up-to-date push of unchanged source is not a new publication outcome and cannot
+consume a retained repair. Exact no-op intents cannot change the remote ref and
+do not block mechanical verification of the unpublished edits.
 
 Each phase runs at most one recovery invocation and inspects at most eight
 source records. Scheduled metadata checks also reevaluate holds and permissions
@@ -367,6 +377,8 @@ machine disposition, not a request for operator action. Source, Git history,
 immutable records and outboxes are preserved; rebuildable caches are queued for bounded housekeeping from terminal and blocked
 checkouts. Recovery integration clones use the same discoverable restoration layout.
 A live or uncertain cleanup candidate is skipped without blocking recovery.
+Eligible recovery retains its working dependency cache across ordinary waits;
+reintegration alone does not enqueue eviction of the live recovery checkout.
 
 `tauceti recovery --json` and prepared activity expose durable state, reason,
 next machine action and retry condition. Status does not read GitHub. The

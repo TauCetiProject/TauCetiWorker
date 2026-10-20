@@ -1814,6 +1814,7 @@ def _do_fixlike(
                 published_after = _rev(co, scoped_push_marker)
                 note_owner(
                     w.cfg,
+                    recovery_handoffs=handoffs,
                     round_outcome=dict(
                         exit_code=agent_rc,
                         published_head=published_after if published_after != scoped_published_before else None,

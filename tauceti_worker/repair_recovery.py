@@ -84,6 +84,15 @@ def uncertain_publication(journal):
     return bool(intent and intent.get("push_started") is not False)
 
 
+def normal_publication(record, manifest, journal):
+    intent = (
+        read_json(record / "normal-publication.json")
+        or journal.get("normal_publication")
+        or (manifest.get("round_outcome") or {}).get("pending_push")
+    )
+    return intent if intent and intent.get("oid") != intent.get("expected") else None
+
+
 def write(record, journal, state, **fields):
     assert state in STATES
     journal.update(
@@ -235,7 +244,7 @@ class Recovery:
         try:
             facts = b.facts(m)
             j["observed_head"] = facts["head"]
-            normal_pending = j.get("normal_publication") or (m.get("round_outcome") or {}).get("pending_push")
+            normal_pending = normal_publication(self.record, m, j)
             if normal_pending:
                 j["forensic_only"] = True
                 if b.reconcile(m, normal_pending, facts) == "published":
@@ -295,7 +304,7 @@ class Recovery:
                     reason=None,
                 )
             b.policy(m, facts)
-            if (m.get("round_outcome") or {}).get("published_head"):
+            if (m.get("round_outcome") or {}).get("published_head") not in (None, m.get("expected_remote_head")):
                 raise Obsolete(
                     "post-publication-leftovers",
                     "The original round already published through git-safe-push; these later edits have no publication authorization",
@@ -748,8 +757,6 @@ class WorkerBackend:
             integrated_head=transaction["target"],
             checkout_ready=True,
         )
-        if archived.exists():
-            self.evict_caches(record)
 
     def reintegrate_delta(
         self, checkout, m, facts, j, expected, *, frozen=None, source_ref=None, force_reasoning=False
@@ -1748,6 +1755,18 @@ def immutable_evidence(record, m, j):
     source = Path(j["source_checkpoint"]) if j.get("source_checkpoint") else record
     if saved._complete(source) is None:
         source = record
+    transferred = (j.get("handoff") or {}).get("checkpoint")
+    successor = read_json(Path(transferred) / "recovery.json") if transferred else {}
+    successor_m = read_json(Path(transferred) / "manifest.json") if transferred else {}
+    successor_uncertain = bool(
+        transferred
+        and (
+            successor.get("forensic_only")
+            or uncertain_publication(successor)
+            or normal_publication(Path(transferred), successor_m, successor)
+            or successor.get("state") == "published"
+        )
+    )
     return dict(
         record_id=record.name,
         manifest=str(source / "manifest.json"),
@@ -1759,13 +1778,16 @@ def immutable_evidence(record, m, j):
         delta_patch=(j.get("delta_integration") or {}).get("patch"),
         reason=j.get("reason"),
         pending_publication=j.get("publication")
+        or read_json(record / "normal-publication.json")
         or j.get("normal_publication")
         or (m.get("round_outcome") or {}).get("pending_push"),
         confirmed_publication=j.get("normal_publication_confirmed")
         or (m.get("round_outcome") or {}).get("published_head"),
         possibly_published_then_removed=j.get("forensic_only", False)
         or (j.get("reason") or {}).get("code") == "publication-head-moved"
-        or uncertain_publication(j),
+        or uncertain_publication(j)
+        or bool(normal_publication(record, m, j) and not j.get("normal_publication_confirmed"))
+        or successor_uncertain,
     )
 
 
@@ -1871,21 +1893,21 @@ def reconcile_handoff(cfg, record, j):
         )
         return
     original = read_json(record / "manifest.json")
+    receipt = h.get("source_receipt")
+    receipt_checked = bool(receipt and receipt.get("round_id") == h.get("source_round"))
+    receipt_checkpoint = Path(receipt["checkpoint"]) if receipt_checked and receipt.get("checkpoint") else None
     if h.get("source_round"):
-        from . import recovery_index
-
         # Round-named preservation records permit bounded point lookups; never
         # rescan the worker's entire history for each unfinished handoff.
         base = saved._safe_id(str(h["source_round"]))
         candidates = [cfg.state / "recovery" / (base if n == 1 else f"{base}.{n}") for n in range(1, MAX_INSPECT + 1)]
-        indexed = recovery_index.lookup(cfg.state, original["repository"], f"round:{h['source_round']}")
-        indexed_record = cfg.state / "recovery" / indexed["record"] if indexed else None
-        candidates = ([indexed_record] if indexed_record else []) + list(reversed(candidates))
-        for other in dict.fromkeys(candidates[:MAX_INSPECT]):
+        candidates = ([receipt_checkpoint] if receipt_checkpoint else []) + candidates
+        for other in list(dict.fromkeys(candidates))[:MAX_INSPECT]:
             m = read_json(other / "manifest.json")
             if (
                 other != record
-                and m.get("source_round") == h["source_round"]
+                and (other == receipt_checkpoint or m.get("source_round") == h["source_round"])
+                and other.parent == cfg.state / "recovery"
                 and m.get("repository") == original.get("repository")
                 and m.get("pr") == original.get("pr")
             ):
@@ -1895,6 +1917,10 @@ def reconcile_handoff(cfg, record, j):
                         j,
                         "obsolete",
                         handoff={**h, "state": "transferred", "checkpoint": str(other)},
+                        forensic_only=bool(
+                            normal_publication(other, m, read_json(other / "recovery.json"))
+                            or uncertain_publication(read_json(other / "recovery.json"))
+                        ),
                         reason=reason(
                             Obsolete(
                                 "source-handoff-checkpoint",
@@ -1903,6 +1929,8 @@ def reconcile_handoff(cfg, record, j):
                         ),
                     )
                     return
+    if receipt_checkpoint and receipt_checkpoint != record:
+        receipt_checked = False  # An invalid/missing positive pointer never proves absence.
     attempt = None
     attempted_commit = None
     if h.get("attempt_marker") and (checkout / ".git").exists():
@@ -1912,9 +1940,43 @@ def reconcile_handoff(cfg, record, j):
         pending = saved.ref_object(
             checkout, h.get("pending_marker") or saved.pending_push_ref(dict(ref=h["push_marker"]))
         )
-        if (attempt == h.get("attempt_before") and pending == h.get("pending_before")) or (
-            attempt and rejected == attempt and not pending
+        last_intent = saved.push_intent(checkout, h["attempt_marker"])
+        if (
+            (attempt == h.get("attempt_before") and pending == h.get("pending_before"))
+            or (attempt and rejected == attempt and not pending)
+            or (last_intent and last_intent["oid"] == last_intent["expected"])
         ):
+            if h.get("source_receipt_required") and h.get("accepted") and not receipt_checked:
+                waits = h.get("source_waits", 0) + 1
+                delay = RETRIES[waits - 1] if waits <= 3 else min(21600, RETRIES[-1] * 2 ** min(waits - 3, 4))
+                write(
+                    record,
+                    j,
+                    "obsolete",
+                    handoff={**h, "source_waits": waits},
+                    retry_at=time.time() + delay,
+                    reason=dict(
+                        code="source-handoff-source-pending",
+                        next_action="retry-source-preservation-receipt",
+                        detail="The receiving round has not durably acknowledged its captured source; preserve ownership",
+                    ),
+                )
+                return
+            if not h.get("source_receipt_required") and not receipt_checked:
+                write(
+                    record,
+                    j,
+                    "obsolete",
+                    handoff={**h, "state": "forensic"},
+                    forensic_only=True,
+                    reason=reason(
+                        Obsolete(
+                            "publication-uncertain",
+                            "Legacy handoff lacks a durable source outcome; retain evidence without replay",
+                        )
+                    ),
+                )
+                return
             write(record, j, "eligible", handoff={**h, "state": "returned"}, retry_at=0, reason=None)
             return
         attempted_commit = saved._rev(checkout, h["attempt_marker"])
@@ -2003,14 +2065,16 @@ def handoff_context(
                     reconcile_handoff(cfg, record, j)
                     h = j.get("handoff") or {}
                     if h.get("state") == "offered":
-                        raise Wait(
-                            "source-handoff-reconciliation", "Previous normal publication is awaiting reconciliation"
-                        )
+                        evidence.append(immutable_evidence(record, m, j))
+                        if len(evidence) >= 4:
+                            break
+                        continue  # Independent normal work proceeds while source preservation retries.
                     if h.get("state") == "published":
                         continue
                 if (
                     j.get("forensic_only")
                     or uncertain_publication(j)
+                    or (normal_publication(record, m, j) and not j.get("normal_publication_confirmed"))
                     or (j.get("reason") or {}).get("code")
                     in {
                         "publication-head-moved",
@@ -2052,6 +2116,8 @@ def handoff_context(
                     attempt_before=saved.ref_object(checkout, attempt_marker),
                     pending_marker=pending_marker,
                     pending_before=saved.ref_object(checkout, pending_marker),
+                    source_receipt_required=True,
+                    accepted=False,
                 )
                 # An uncertain wire intent remains forensic evidence, not a repair recipe.
                 uncertain = (
@@ -2073,6 +2139,10 @@ def handoff_context(
                     ),
                 )
                 handoffs.append((str(record), identity))
+                if not saved.note_owner(cfg, recovery_handoffs=handoffs):
+                    raise Wait("source-handoff-owner", "Source preservation could not retain the receiving ownership")
+                h["accepted"] = True
+                write(record, j, "obsolete", handoff=h)
                 item = immutable_evidence(record, m, j)
                 item["possibly_published_then_removed"] = uncertain
                 evidence.append(item)
@@ -2095,6 +2165,21 @@ def recover(w, opts):
     root = w.cfg.state / "recovery"
     if not root.is_dir():
         return False
+    owner = read_json(saved.owner_path(w.cfg))
+    for record_name, identity in (owner.get("recovery_handoffs") or [])[:4]:
+        candidate = Path(record_name)
+        if candidate.parent != root:
+            continue
+        handoff = read_json(candidate / "recovery.json").get("handoff") or {}
+        if (
+            handoff.get("id") == identity
+            and handoff.get("state") == "offered"
+            and handoff.get("source_receipt_required")
+            and not handoff.get("source_receipt")
+            and (w.cfg.checkout / ".git").exists()
+        ):
+            saved.guard(w.cfg, w.cfg.checkout, repository=w.gh.repo)
+            break
     candidates = record_directories(root)
     cursor_path = root / "cursor.json"
     cursor_state = read_json(cursor_path)
