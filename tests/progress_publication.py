@@ -284,7 +284,10 @@ with (
             wu._do_progress_inner(worker, None)
         except NoProgress:
             pass
+        else:
+            raise AssertionError("lost auxiliary bundle must still reach apply")
         model.assert_not_called()
+    assert json.loads((work / "publication-done.json").read_text())["files"] == value["files"]
     for unsafe in ("../outside.json.gz", "/outside.json.gz", "status-body.md"):
         pages["documentation"]["bundle_file"] = unsafe
         (work / "plan.json").write_text(json.dumps(pages))

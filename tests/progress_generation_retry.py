@@ -130,12 +130,47 @@ class GenerationRetryTests(unittest.TestCase):
             self.calls.clear()
             with self.assertRaises(DocumentationUnavailable):
                 self.drive_inner(failures=3, code=code)
-            self.assertEqual(self.calls, ["plan", "facts"] * (1 if code == 77 else 3))
+            self.assertEqual(self.calls, ["plan", "facts"] + (["plan"] if code == 78 else []))
             self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
             self.assert_uncharged()
         self.calls.clear()
-        self.assertEqual(self.drive_inner(failures=1, code=78), 0)
-        self.assertEqual(self.calls, ["plan", "facts"] * 2 + ["prompt", "writer"])
+        self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual(self.calls, ["plan", "facts", "prompt", "writer"])
+
+    def test_plan_infrastructure_and_invalid_plan_wait_then_recover(self):
+        for code in (77, 78):
+            self.calls.clear()
+            self.values["progress-attempt-ts"] = 123
+            with self.assertRaises(DocumentationUnavailable):
+                self.drive_inner(failures=1, fail_stage="plan", code=code)
+            self.assertEqual(self.calls, ["plan"])
+            self.assert_uncharged()
+            self.calls.clear()
+            self.assertEqual(self.drive_inner(), 0)
+            self.assertEqual(self.calls, ["plan", "facts", "prompt", "writer"])
+
+    def test_repeated_invalid_identity_backs_off_then_ordinary_round_recovers(self):
+        for _ in range(7):
+            self.calls.clear()
+            with self.assertRaises(DocumentationUnavailable) as raised:
+                self.drive_inner(failures=3, code=78)
+            self.assertIn("same invalid facts identity", str(raised.exception))
+            self.assertEqual(self.calls, ["plan", "facts", "plan"])
+            self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
+            self.assert_uncharged()
+        self.assertGreater(self.values["progress-docs-retry-at"], time.time() + 28000)
+        with patch("tauceti_worker.survey.subprocess.run") as tool:
+            self.assertFalse(progress_due(self.cfg, self.worker.counters)[0])
+            tool.assert_not_called()
+        with (
+            patch("tauceti_worker.survey.time.time", return_value=self.values["progress-docs-retry-at"] + 1),
+            patch("tauceti_worker.survey.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "due", "")),
+        ):
+            self.assertTrue(progress_due(self.cfg, self.worker.counters)[0])
+        self.calls.clear()
+        self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual(self.calls, ["plan", "facts", "prompt", "writer"])
+        self.assertEqual(self.values["progress-docs-waits"], 0)
 
     def test_same_source_different_facts_pin_requires_replan(self):
         _, pin = self.pages_fixture()
@@ -189,6 +224,20 @@ class GenerationRetryTests(unittest.TestCase):
             self.assertNotIn("writer", self.calls)
             self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
             self.assert_uncharged()
+        self.run_tool = original_run
+
+        def restored(stage, *args, **kwargs):
+            result = original_run(stage, *args, **kwargs)
+            if stage == "plan":
+                (Path(args[args.index("--out") + 1]).parent / pin["bundle_file"]).write_bytes(bundle)
+            return result
+
+        self.run_tool = restored
+        self.calls.clear()
+        with patch.dict(PLAN, documentation=pin), patch.dict(FACTS, documentation=pin):
+            self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual(self.calls, ["plan", "facts", "prompt", "writer"])
+        self.assertEqual((self.work / pin["bundle_file"]).read_bytes(), bundle)
 
     def test_invalid_plan_missing_extant_module_and_fetch_failure_do_not_retry(self):
         for failed_stage, detail in (
