@@ -19,15 +19,18 @@ addressed by a pidfd taken at launch, and nothing else. On timeout or interrupti
 kills the namespace before draining its output. It never searches the host for processes.
 If emptiness cannot be confirmed, the round fails rather than reusing the checkout. A
 marker under the activity directory then pauses automatic recovery until that namespace
-is observed gone. Losing a branch claim cancels the agent working on that branch, which
+is observed gone. `tauceti doctor` lists such markers. One with no reported namespace
+(bwrap killed before it reported one) cannot retire by itself: remove it once nothing
+from that round is running. Losing a branch claim cancels the agent working on that branch, which
 tears its namespace down.
 
 One window remains: bubblewrap arms `--die-with-parent` in the namespace's init a few
 milliseconds after creating it. The supervisor waits out that setup before treating the
 launch as complete, and kills the init itself if interrupted meanwhile. A supervisor that
-is SIGKILLed inside those milliseconds can still orphan the namespace. Filesystem, network, credentials
-and provider sandboxes behave as before: the whole filesystem and `/dev` are bound
-unchanged. As inside any unprivileged user namespace, setuid programs such as `sudo` do
+is SIGKILLed inside those milliseconds can still orphan the namespace.
+
+Filesystem, network, credentials and provider sandboxes behave as before: the whole
+filesystem and `/dev` are bound unchanged. As inside any unprivileged user namespace, setuid programs such as `sudo` do
 not gain privileges.
 
 At the end of its cleanup, each round writes a diagnostic `state/<worker>/quiescence.json`.

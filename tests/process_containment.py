@@ -456,6 +456,20 @@ class Legacy(Base):
                 with shared_mathlib.view(checkout, env, self.tmp / "logs", None):
                     pass
 
+    def test_doctor_surfaces_markers_that_can_never_retire_by_themselves(self):
+        # A boundary killed before bwrap reported its namespace leaves a marker with no identity.
+        markers = self.tmp / "activity" / "containment-unconfirmed"
+        markers.mkdir(parents=True)
+        (markers / "lost.json").write_text(json.dumps({"label": "cache-fetch", "child_pid": None}))
+        [entry] = containment.unconfirmed()
+        self.assertEqual((entry["label"], entry["marker"]), ("cache-fetch", str(markers / "lost.json")))
+        ok, note = containment.doctor_row()
+        self.assertFalse(ok)
+        self.assertIn("never confirmed empty (cache-fetch)", note)
+        self.assertIn(str(markers), note)
+        (markers / "lost.json").unlink()
+        self.assertEqual(containment.unconfirmed(), [])
+
     def test_invalid_policy_is_refused(self):
         with patch.dict(os.environ, {containment.POLICY_ENV: "sometimes"}), self.assertRaises(Die):
             containment.capability()
