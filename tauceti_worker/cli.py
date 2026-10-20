@@ -807,6 +807,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
     add_github_account_flag(doctor)
+    doctor.add_argument("--extras", action="store_true")
+    doctor.add_argument("--online", action="store_true")
+    doctor.add_argument("--workflow")
+    doctor.add_argument("--field", action="append", default=[])
+    doctor.add_argument("--check")
+    doctor.add_argument("--fix")
+    doctor.add_argument("--apply", action="store_true")
+    doctor.add_argument("--json", action="store_true")
 
     add_workers_parser(sub)
     add_budget_parser(sub)
@@ -859,7 +867,10 @@ def resolve_pace(cmd: str | None, args) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    from tauceti_tools.project import conf_argument
+
+    selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
+    args = parser.parse_args(remaining)
     cmd = args.cmd
     if cmd == "verify":
         from .verification import command
@@ -1438,6 +1449,23 @@ def _have(tool: str) -> bool:
 
 
 def cmd_doctor(args) -> int:
+    if os.environ.get("TAUCETI_CONF"):
+        from tauceti_tools.cli import main as project_doctor
+
+        flags = ["doctor", "--conf", os.environ.get("TAUCETI_CONF_SOURCE", os.environ["TAUCETI_CONF"])]
+        for flag in ("extras", "online", "apply", "json"):
+            if getattr(args, flag, False):
+                flags.append("--" + flag)
+        for flag in ("workflow", "check", "fix"):
+            if getattr(args, flag, None):
+                flags.extend(["--" + flag, getattr(args, flag)])
+        for field in args.field:
+            flags.extend(["--field", field])
+        return project_doctor(flags)
+    return cmd_host_doctor(args)
+
+
+def cmd_host_doctor(args) -> int:
     """Report what the environment can do. The review engine is fetched on demand; a stable Bubble
     install is required only for real ``--bubble`` rounds."""
     cfg = Config.resolve(getattr(args, "worker_id", None))
@@ -1593,7 +1621,12 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # Work-agent bubble rounds warm both Mathlib's cache and TauCeti's public Lake artifact cache before
     # launching the model. Require Bubble's host-global download proxy rather than exposing the cache's
     # public R2 domain directly to the container.
-    if uses_fork and not opts.dry_run and not bubble_supports_lake_cache_service():
+    if (
+        uses_fork
+        and not opts.dry_run
+        and os.environ.get("TAUCETI_CACHE_SERVICE", "tauceti-public")
+        and not bubble_supports_lake_cache_service()
+    ):
         raise Die(
             "preflight: this bubble is too old for TauCeti's Lake artifact cache — it has no "
             "`--lake-cache-service`. Install or update Bubble from kim-em/bubble, then re-run "

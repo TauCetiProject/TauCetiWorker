@@ -30,7 +30,7 @@ assume the same utilization and are not a recommended fleet size.
 
 The machine-readable evidence, including endpoint and per-worker breakdowns,
 is retained at `~/.local/state/tauceti/science-ramp/github-state-capacity.json`.
-Regenerate it with `python3 scripts/github-state-capacity.py --hours 4`.
+Regenerate it with `uv run python scripts/github-state-capacity.py --hours 4`.
 Regular four-hour reports now distinguish worker-account traffic from the
 production App's repository-wide read usage and show its sample time. App
 usage amortized over worker count is not causal per-worker attribution.

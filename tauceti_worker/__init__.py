@@ -13,8 +13,19 @@ single-module API, every submodule's top-level name is flattened into the packag
 the submodules themselves stay importable (e.g. `tauceti_worker.github`) so a test can monkeypatch
 a function on the module that actually looks it up.
 """
+# ruff: noqa: E402
 
 from __future__ import annotations
+
+from tauceti_tools.project import bootstrap as _bootstrap_project
+
+try:
+    _bootstrap_project()
+except (ValueError, OSError) as _configuration_error:
+    import sys
+
+    print(f"tauceti: {_configuration_error}", file=sys.stderr)
+    raise SystemExit(2) from None
 
 # stdlib re-exports for the historical single-module surface (a few tests read tc.json, tc.time, …).
 import json  # noqa: F401

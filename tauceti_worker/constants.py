@@ -7,19 +7,22 @@ import hashlib
 import os
 import re
 
-TAUCETI = "TauCetiProject/TauCeti"
+TAUCETI = os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti")
+BASE_BRANCH = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+LEAN_ROOT = os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti")
+ROADMAP_DIR = os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")
 
 TAUCETI_OWNER = TAUCETI.split("/", 1)[0]  # base-repo owner: a bot PR is first-party iff its head lives here
 
-ROADMAP = "TauCetiProject/TauCetiRoadmap"
+ROADMAP = os.environ.get("TAUCETI_ROADMAP_REPO", "TauCetiProject/TauCetiRoadmap")
 
-REVIEW = "TauCetiProject/TauCetiReview"
+REVIEW = os.environ.get("TAUCETI_REVIEW_REPO", "TauCetiProject/TauCetiReview")
 
 # The shared cooperative-claim namespace: a repository that holds nothing but `refs/tauceti-claims/*`
 # leases, so operators can coordinate without anyone holding write access to canonical. Push access is
 # granted automatically to the author of any merged TauCeti PR (canonical's `claims-access` workflow);
 # until then a worker claims in its own fork instead. See github.claims_repo.
-CLAIMS = "TauCetiProject/tauceti-claims"
+CLAIMS = os.environ.get("TAUCETI_CLAIMS_REPO", "TauCetiProject/tauceti-claims")
 
 
 # Per-PR budgets (a PR can never churn forever).
@@ -106,7 +109,9 @@ MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 
 MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across heads
 
-BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
+BUMP_HEAD_PREFIX = (
+    "bump-mathlib/" if TAUCETI == "TauCetiProject/TauCeti" else "bump-dependencies/"
+)  # branch prefix the review bot opens its mathlib-bump PRs on
 MAX_LINT_REPAIR_ATTEMPTS = 3  # per-head: stop trying to green a red lint-repair head
 MAX_LINT_REPAIR_PR_ATTEMPTS = 6  # per-PR lifetime backstop for lint repair across heads
 # Branch prefix of the repair PR TauCeti's daily full lint (.github/workflows/lint-full.yml) opens

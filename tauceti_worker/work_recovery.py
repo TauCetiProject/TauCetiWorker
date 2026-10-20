@@ -231,7 +231,9 @@ def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
             tips[name] = oid
             operations.append(name)
     operations += [d for d in ("rebase-merge", "rebase-apply") if (gitdir / d).exists()]
-    base = _rev(repo, "refs/remotes/origin/main") or _rev(repo, "refs/remotes/origin/HEAD")
+    base = _rev(repo, "refs/remotes/origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")) or _rev(
+        repo, "refs/remotes/origin/HEAD"
+    )
 
     def outside(*exclusions: str) -> list[str]:
         if not tips:

@@ -1121,6 +1121,14 @@ def survey(
     #    other kind this is not about a PR of ours, so it carries a single pr=0 candidate whose reason
     #    is the cadence verdict. Deep only: the check costs an API call, and the shallow survey exists
     #    to be cheap. progress_due never raises.
+    from tauceti_tools.project import active
+
+    project = active()
+    if project:
+        if not project.feature("progress"):
+            enabled.discard("progress")
+        if not any(u.get("overlap") for u in project.raw.get("upstreams", [])):
+            enabled -= {"overlap-scan", "overlap-fix"}
     if deep and "progress" in enabled:
         due, reason = progress_due(cfg, counters)
         c = Candidate(0, "", reason or "progress report")
