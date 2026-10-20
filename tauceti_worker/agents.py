@@ -506,6 +506,8 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
         "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
+        "On disk-pressure, preserve edits; a pending result with a continuation job belongs to the supervisor. "
+        "An incomplete result without a continuation needs a later invocation in the preserved workspace; do not spin on unchanged checks. "
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
         "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
         "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
@@ -2123,6 +2125,7 @@ def run_in_bubble(
     local_axioms_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     if helper_on:
         from .verification import cache_root
+        from .verification_storage import root as storage_root
 
         package = rounddir / "tauceti_worker"
         shutil.copytree(
@@ -2134,6 +2137,8 @@ def run_in_bubble(
         (rounddir / "tauceti-verify").chmod(0o755)
         verify_state = cfg.state / "verification-state"
         verify_state.mkdir(parents=True, exist_ok=True)
+        verify_storage = storage_root().resolve()
+        verify_storage.mkdir(parents=True, exist_ok=True, mode=0o700)
         host_cache = None
         with contextlib.suppress(OSError, ValueError):
             host_cache = cache_root()
@@ -2158,6 +2163,8 @@ def run_in_bubble(
         mount_flags += [
             "--mount",
             f"{verify_state}:/opt/verification-state:rw",
+            "--mount",
+            f"{verify_storage}:{verify_storage}:rw",
         ]
         if host_cache is not None:
             mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
@@ -2240,6 +2247,8 @@ def run_in_bubble(
     if helper_on:
         for key, value in {
             "TAUCETI_VERIFY_STATE": "/opt/verification-state",
+            "TAUCETI_VERIFY_HOST_STATE": str(verify_state.resolve()),
+            "TAUCETI_VERIFY_STORAGE_DIR": str(verify_storage),
             "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
             if host_cache is not None
             else "/tmp/verification-cache",
@@ -2256,6 +2265,20 @@ def run_in_bubble(
             ),
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
+        for name in (
+            "STORAGE_BYTES",
+            "CANDIDATE_BYTES",
+            "SOURCE_CANDIDATE_BYTES",
+            "CHECKPOINT_BYTES",
+            "CHECKPOINT_POOL_BYTES",
+            "MIN_FREE_BYTES",
+            "MIN_FREE_PERCENT",
+            "OWNERSHIP_SECONDS",
+            "COMPLETED_CACHE_SECONDS",
+            "IDLE_CACHE_SECONDS",
+        ):
+            if value := os.environ.get("TAUCETI_VERIFY_" + name):
+                tcenv += f" TAUCETI_VERIFY_{name}={shlex.quote(value)}"
     if snapshot:
         tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
         from tauceti_tools.project import active

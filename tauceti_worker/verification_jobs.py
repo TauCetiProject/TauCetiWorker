@@ -20,6 +20,7 @@ from pathlib import Path
 from .paths import HERE
 from .runtime_status import read_json, report_runtime
 from .verification_scope import git
+from .verification_storage import Pressure
 
 
 def copy_file(source, target):
@@ -33,11 +34,57 @@ def copy_file(source, target):
         return shutil.copy2(source, target)
 
 
-def snapshot(root, target, names, *, immutable_packages=None):
+def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
+    """A failed copy is disposable until the caller durably publishes isolated ownership."""
+    from .shared_mathlib import remove_tree
+    from .verification import atomic, digest
+    from .verification_storage import candidate, release
+
+    state = target.parent.parent
+    expected = candidate(state, target.name)
+    if target.parent.resolve() != expected.parent or target.exists() or target.is_symlink():
+        raise ValueError("snapshot needs a new owned candidate path")
+    marker = state / "verification-copy-incomplete" / f"{target.name}.json"
+    atomic(marker, dict(version=1, source=str(root), source_digest=digest(names)))
+    try:
+        return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
+    except BaseException:
+        # Nothing in this directory has become an authoritative workspace. Owner death leaves
+        # the same durable construction marker for bounded ordinary collection.
+        with contextlib.suppress(OSError):
+            remove_tree(target)
+        if not target.exists():
+            with contextlib.suppress(OSError, Pressure):
+                release(state, target.name)
+                marker.unlink(missing_ok=True)
+        raise
+
+
+def commit_copy(state, identifier):
+    (state / "verification-copy-incomplete" / f"{identifier}.json").unlink(missing_ok=True)
+
+
+def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """Copy exact sources/index and warm build caches without editing the agent's index."""
     from .verification import Incomplete
+    from .verification_storage import CopyBudget, CopyLimit, reserve, settle
 
     try:
+        reduced_for_capacity = False
+        try:
+            amount = reserve(target.parent.parent, target.name)
+        except Pressure as error:
+            if not include_builds or error.reason != "capacity":
+                raise
+            include_builds = False
+            reduced_for_capacity = True
+            amount = reserve(target.parent.parent, target.name, source_only=True)
+        budget = CopyBudget(amount, target)
+
+        def copy(source, dest):
+            budget.charge(Path(source))
+            return copy_file(source, dest)
+
         index = git(root, "rev-parse", "--git-path", "index").decode().strip()
         index = Path(index) if Path(index).is_absolute() else root / index
         with tempfile.TemporaryDirectory(prefix="verification-index-") as temporary:
@@ -53,6 +100,14 @@ def snapshot(root, target, names, *, immutable_packages=None):
                 .stdout.decode()
                 .strip()
             )
+        # Git's clone writes outside copytree's callback; charge the source object inventory
+        # before launching it. Never rely on reflink/hardlink savings for admission.
+        gitdir = Path(git(root, "rev-parse", "--git-common-dir").decode().strip())
+        gitdir = gitdir if gitdir.is_absolute() else root / gitdir
+        for directory, dirs, files in os.walk(gitdir, followlinks=False):
+            dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
+            for name in files:
+                budget.charge(Path(directory) / name)
         subprocess.run(
             ["git", "clone", "--local", "--no-hardlinks", "--dissociate", "--no-checkout", str(root), str(target)],
             check=True,
@@ -70,6 +125,7 @@ def snapshot(root, target, names, *, immutable_packages=None):
                     f"candidate source symlink needs explicit recovery ownership: {name}", reason="preservation"
                 )
             dest.parent.mkdir(parents=True, exist_ok=True)
+            budget.charge(source)
             shutil.copy2(source, dest, follow_symlinks=False)
         lake = root / ".lake"
         if lake.exists():
@@ -80,16 +136,30 @@ def snapshot(root, target, names, *, immutable_packages=None):
                     name
                     for name in entries
                     if name in {"__pycache__", "tauceti-scope"}
+                    or not include_builds
+                    and name in {"build", "build-before-sharing"}
+                    and Path(directory).name == ".lake"
                     or immutable_packages is not None
                     and Path(directory) == lake
                     and name == "packages"
                     or target.is_relative_to(Path(directory) / name)
                 ]
 
-            shutil.copytree(lake, target / ".lake", symlinks=False, copy_function=copy_file, ignore=ignore)
+            shutil.copytree(lake, target / ".lake", symlinks=False, copy_function=copy, ignore=ignore)
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
+        settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
+    except CopyLimit as error:
+        if not include_builds:
+            if reduced_for_capacity:
+                raise Pressure("source preservation needs more temporarily available candidate capacity") from error
+            raise
+        if target.exists():
+            from .shared_mathlib import remove_tree
+
+            remove_tree(target)  # incomplete snapshot; original source is still intact
+        _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=False)
     except (OSError, subprocess.CalledProcessError) as error:
         raise Incomplete(f"candidate preservation incomplete: {error}", reason="preservation") from error
 
@@ -188,6 +258,7 @@ def preserve_candidate(verification, *, disposable_only=False):
         raise ValueError("preserved candidate inventory differs")
     job.update(root=str(target), isolated=True)
     atomic(verification.state / "verification-pending" / f"{job['id']}.json", job)
+    commit_copy(verification.state, job["id"])
 
 
 def tool_readiness(job):
@@ -202,7 +273,25 @@ def tool_readiness(job):
     if job.get("toolchain_wait_path"):
         prefix = Path(job["toolchain_wait_path"])
         paths += [str(prefix), str(prefix / "bin" / "lean")]
-    return digest(dict(path=os.environ.get("PATH"), elan=os.environ.get("ELAN_HOME"), stamps=stamps(paths)))
+    return digest(
+        dict(
+            path=os.environ.get("PATH"),
+            elan=os.environ.get("ELAN_HOME"),
+            stamps=stamps(paths),
+            storage={
+                name: os.environ.get("TAUCETI_VERIFY_" + name)
+                for name in (
+                    "CANDIDATE_BYTES",
+                    "SOURCE_CANDIDATE_BYTES",
+                    "CHECKPOINT_BYTES",
+                    "STORAGE_BYTES",
+                    "CHECKPOINT_POOL_BYTES",
+                    "MIN_FREE_BYTES",
+                    "MIN_FREE_PERCENT",
+                )
+            },
+        )
+    )
 
 
 def finish_job(verification):
@@ -213,14 +302,31 @@ def finish_job(verification):
     status = verification.receipt["status"]
     path = verification.state / "verification-pending" / f"{job['id']}.json"
     waiting_tools = verification.receipt.get("incomplete_reason") in {"tool-missing", "toolchain"}
-    resumable = verification.receipt.get("incomplete_reason") in {"deadline", "signal"} or waiting_tools
-    if resumable and not job.get("isolated"):
+    storage_wait = verification.receipt.get("incomplete_reason") == "disk-pressure"
+    storage_limit = verification.receipt.get("incomplete_reason") == "storage-limit"
+    resumable = (
+        verification.receipt.get("incomplete_reason") in {"deadline", "signal", "disk-pressure", "storage-limit"}
+        or waiting_tools
+    )
+    if resumable and not job.get("isolated") and not storage_wait and not storage_limit:
         try:
             preserve_candidate(verification)
-        except (Incomplete, OSError, ValueError) as error:
+        except (Incomplete, OSError, ValueError, Pressure) as error:
             # Preservation errors retain source/checkpoint artifacts and never become tool failures.
-            verification.receipt.update(error=str(error), incomplete_reason="preservation")
-            resumable = False
+            if isinstance(error, Pressure):
+                storage_limit = error.reason == "limit"
+                storage_wait = not storage_limit
+                verification.receipt.update(
+                    error=str(error), incomplete_reason="storage-limit" if storage_limit else "disk-pressure"
+                )
+            else:
+                verification.receipt.update(error=str(error), incomplete_reason="preservation")
+                resumable = False
+    if (storage_wait or storage_limit) and not job.get("isolated"):
+        # A live or container-only checkout is not an independent continuation workspace.
+        # Permit a fresh exact-source invocation after reclamation rather than deduplicating
+        # it against a pending job the supervisor cannot safely execute.
+        resumable = False
     if status in {"success", "failed"} or not resumable:
         job["status"] = status
         job["error"] = verification.receipt.get("error")
@@ -228,20 +334,32 @@ def finish_job(verification):
         path.unlink(missing_ok=True)
         if status == "incomplete":
             verification.receipt.update(
-                result_type="incomplete", next_action="repair verification inputs and invoke verify again"
+                result_type="incomplete",
+                next_action=(
+                    "reclaim verification storage and retry verify in this workspace"
+                    if storage_wait
+                    else "adjust verification storage limits or inputs, then invoke verify again"
+                    if storage_limit
+                    else "repair verification inputs and invoke verify again"
+                ),
             )
     else:
         job.update(
-            status="blocked-tools" if waiting_tools else "pending", next_at=time.time() + (60 if waiting_tools else 5)
+            status="blocked-storage-limit" if storage_limit else "blocked-tools" if waiting_tools else "pending",
+            next_at=time.time() + (60 if waiting_tools or storage_wait or storage_limit else 5),
         )
-        if waiting_tools:
+        if waiting_tools or storage_limit:
             job["tool_readiness"] = tool_readiness(job)
         atomic(path, job)
         verification.receipt.update(
             result_type="pending",
             continuation_job=str(path),
             next_action=(
-                "supervisor: resume when local toolchain availability changes"
+                "supervisor: resume after verification storage limits or verifier inputs change"
+                if storage_limit
+                else "supervisor: reclaim idle build caches, then resume verification without a model"
+                if storage_wait
+                else "supervisor: resume when local toolchain availability changes"
                 if waiting_tools
                 else "supervisor: resume verification without a model"
             ),
@@ -299,6 +417,14 @@ def resume_pending(cfg, *, seconds=7200, background=False):
 
     if getattr(cfg, "state", None) is None:
         return False
+    from .verification_storage import Limit, Pressure, housekeep, reserve, validate_settings
+
+    housekeep((cfg.state, cfg.state / "verification-state"))
+    try:
+        validate_settings()
+    except Pressure as error:
+        report_runtime("verification-pending", detail=str(error))
+        return False
     reap_continuations(cfg)
     if os.environ.get("TAUCETI_VERIFY_CONTINUATION", "1") != "1":
         return False
@@ -341,7 +467,9 @@ def resume_pending(cfg, *, seconds=7200, background=False):
             continue
         if job.get("next_at", 0) > time.time():
             continue
-        if job.get("status") == "blocked-tools" and job.get("tool_readiness") == tool_readiness(job):
+        if job.get("status") in {"blocked-tools", "blocked-storage-limit"} and job.get(
+            "tool_readiness"
+        ) == tool_readiness(job):
             continue
         # Bubble writes paths in its mounted namespace. Rebase only that known state
         # prefix; ordinary host paths are already absolute.
@@ -372,7 +500,6 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         except BlockingIOError:
                             continue
-                    job["attempts"] += 1
                     root = Path(job["root"])
                     try:
                         root = root.resolve()
@@ -398,6 +525,10 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             root = target
                             job["isolated"] = True
                         job["root"] = str(root)
+                        atomic(path, job)
+                        commit_copy(state, identifier)
+                        reserve(state, identifier)
+                        job["attempts"] += 1
                         atomic(path, job)
                         report_runtime(
                             "verifying",
@@ -485,6 +616,25 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                 path.unlink(missing_ok=True)
                             else:
                                 atomic(path, current)
+                    except Limit as error:
+                        job.update(
+                            error=str(error),
+                            status="blocked-storage-limit",
+                            next_at=time.time() + 60,
+                            tool_readiness=tool_readiness(job),
+                        )
+                        if job.get("isolated"):
+                            atomic(path, job)
+                        else:
+                            job["status"] = "incomplete"
+                            atomic(state / "verification-jobs" / path.name, job)
+                            path.unlink(missing_ok=True)
+                        return False
+                    except Pressure as error:
+                        job.update(error=str(error), status="pending", next_at=time.time() + 60)
+                        atomic(path, job)
+                        report_runtime("verification-pending", detail=str(error), verification_job=job["id"])
+                        return False
                     except (Incomplete, OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
                         job.update(error=str(error), status="incomplete")
                         atomic(state / "verification-jobs" / path.name, job)

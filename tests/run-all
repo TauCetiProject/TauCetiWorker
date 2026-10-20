@@ -25,6 +25,8 @@ TAUCETI_SHARED_MATHLIB_ROOT="$TAUCETI_ACTIVITY_DIR/mathlib-builds"
 TAUCETI_BUILD_CACHE_ROOT="$TAUCETI_ACTIVITY_DIR/builds"
 export TAUCETI_BUILD_CACHE_ROOT
 export TAUCETI_ACTIVITY_DIR TAUCETI_FLEET_EVENTS TAUCETI_SHARED_MATHLIB_ROOT
+TAUCETI_VERIFY_STORAGE_DIR="$TAUCETI_ACTIVITY_DIR/verification-storage"
+export TAUCETI_VERIFY_STORAGE_DIR
 trap 'rm -rf "$TAUCETI_ACTIVITY_DIR"' EXIT
 
 # stdlib-only python tests, run with the uv-provided interpreter
@@ -85,6 +87,7 @@ RUN_STDLIB=(
   local_axioms.py
   verification.py
   verification_audit.py
+  verification_storage.py
   ledger_blocking.py
   loop_sigterm.py
   mirror_creds.py
