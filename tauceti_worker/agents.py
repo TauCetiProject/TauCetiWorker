@@ -438,12 +438,18 @@ def fill_prompt(path: Path, **subs) -> str:
     RENDERED text would let a claim containing any `__WORD__` abort the round — turning a mechanism
     documented as cooperative and fail-open into a way to stop a roadmap worker."""
     path = Path(path)
+    if (
+        path.parent == HERE / "prompts"
+        and os.environ.get("TAUCETI_VERIFY_HELPER", "1") == "0"
+        and (path.parent / "v0" / path.name).is_file()
+    ):
+        path = path.parent / "v0" / path.name
     text = path.read_text()
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
     # to a scratch file), and its placeholder set is that repo's business, not ours.
-    if path.parent == HERE / "prompts":
+    if path.parent in (HERE / "prompts", HERE / "prompts/v0"):
         missing = sorted({m.group(0) for m in _PLACEHOLDER_RE.finditer(text)} - {f"__{k}__" for k in subs})
         if missing:
             raise Die(f"{path.name}: unfilled prompt placeholder(s) {', '.join(missing)}")
@@ -467,11 +473,29 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
     return "ordinary"
 
 
-def local_verification(policy: str) -> str:
+def local_verification(policy: str, bubble: bool = False) -> str:
     """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
     if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
         raise Die(f"unknown local verification scope policy {policy!r}")
-    return fill_prompt(HERE / "prompts" / "local-verification.md", SCOPE_POLICY=policy)
+    if os.environ.get("TAUCETI_VERIFY_HELPER", "1") == "0":
+        return fill_prompt(HERE / "prompts" / "local-verification.md", SCOPE_POLICY=policy)
+    helper = f'"{wrapper_bin(bubble)}/tauceti-verify"'
+    return (
+        "### Local verification\n"
+        f"Run `{helper}` synchronously after the last edit or integration. "
+        f"The worker's local actual-source scope policy is `{policy}`. "
+        "The helper owns the heavy-work queue, full `lake build --iofail`, scoped axiom/duplicate audit, "
+        "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
+        "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
+        "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
+        "A waiting-verification-capacity message means stay in this foreground call; the claim heartbeat continues. "
+        "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
+        "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
+        "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
+        "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
+        "phase results and receipt path. These are local checks, not full CI.\n"
+        f"```bash\n{helper}\n```\n"
+    )
 
 
 def sync_mathlib_pool(cfg: Config) -> None:
@@ -612,6 +636,12 @@ def prepare_checkout(
             return False
         if not clone("forced checkout failed") or g("checkout", "-q", "-f", "-B", "main", "origin/main"):
             return False
+    from .verification_scope import local_main
+
+    os.environ.pop("TAUCETI_VERIFY_BASE", None)
+    with contextlib.suppress(ValueError, subprocess.CalledProcessError):
+        os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
+    os.environ["TAUCETI_VERIFY_STATE"] = str(cfg.state.resolve())
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
@@ -719,6 +749,12 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
             "and fetch again before building; if that cannot be done, report the cache miss and stop."
         )
     argv, env = host_agent_argv(prompt, profile)
+    if not env.get("TAUCETI_VERIFY_BASE") and (cwd / ".git").exists():
+        from .verification_scope import local_main
+
+        with contextlib.suppress(ValueError, subprocess.CalledProcessError):
+            env["TAUCETI_VERIFY_BASE"] = local_main(cwd)
+    env.setdefault("TAUCETI_VERIFY_STATE", str(logdir.parent / "state" / env.get("TAUCETI_WORKER_ID", "local")))
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
@@ -1874,6 +1910,17 @@ def run_in_bubble(
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
+    from .verification import queue_root
+
+    package = rounddir / "tauceti_worker"
+    shutil.copytree(Path(__file__).parent, package, ignore=shutil.ignore_patterns("__pycache__", "scripts", "prompts"))
+    shutil.copytree(HERE / "scripts", package / "scripts")
+    shutil.copytree(HERE / "prompts", package / "prompts")
+    shutil.copy(HERE / "scripts" / "tauceti-verify", rounddir / "tauceti-verify")
+    (rounddir / "tauceti-verify").chmod(0o755)
+    verify_state = cfg.state / "verification-state"
+    verify_state.mkdir(parents=True, exist_ok=True)
+    host_queue = queue_root()
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -1885,7 +1932,14 @@ def run_in_bubble(
 
     _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
 
-    mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    mount_flags = [
+        "--mount",
+        f"{rounddir}:/opt/round:ro",
+        "--mount",
+        f"{verify_state}:/opt/verification-state:rw",
+        "--mount",
+        f"{host_queue}:/opt/verification-queue:rw",
+    ]
     api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
     if api_bridge and _uses_claude_credentials(cred_model):
         from .claude_api_client import atomic
@@ -1939,6 +1993,7 @@ def run_in_bubble(
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     for var in (
+        "TAUCETI_VERIFY_ATTEMPT",
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
         "TAUCETI_PUSH_REMOTE",
@@ -1948,10 +2003,33 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
+    for key, value in {
+        "TAUCETI_VERIFY_STATE": "/opt/verification-state",
+        "TAUCETI_VERIFY_HOST_QUEUE": "/opt/verification-queue",
+        "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
+        "TAUCETI_VERIFY_HEAVY_SLOTS": os.environ.get("TAUCETI_VERIFY_HEAVY_SLOTS", "1"),
+        "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
+        "TAUCETI_PROCESS_CONTAINMENT": "legacy",  # Bubble owns the outer process boundary.
+    }.items():
+        tcenv += f" {key}={shlex.quote(value)}"
     command_inner = inner_cmd if inner_cmd is not None else agent_inner_cmd(profile)
     if inner_cmd is None:
         command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
-    command = f"{tcenv} {command_inner}"
+    if inner_cmd is None:
+        # Resolve the canonical local main once after Bubble has checked out the target.
+        setup = (
+            'export TAUCETI_VERIFY_BASE="$(PYTHONPATH=/opt/round python3 -c '
+            + shlex.quote(
+                "from pathlib import Path; from tauceti_worker.verification_scope import local_main; print(local_main(Path.cwd()))"
+            )
+            + ')"; test -n "$TAUCETI_VERIFY_BASE" || exit 1; '
+            + tcenv
+            + " "
+            + command_inner
+        )
+        command = "bash -c " + shlex.quote(setup)
+    else:
+        command = f"{tcenv} {command_inner}"
 
     # Only work-agent rounds compile TauCeti. Bubble turns the two immutable public endpoints into
     # capability-scoped routes through its host-global download cache; the upstream host is not exposed

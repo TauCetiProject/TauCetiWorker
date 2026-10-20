@@ -125,30 +125,17 @@ def main():
 
     # 4) Shim expiry is an autonomous repair input, not a notification-only dead end. Both workers
     # reproduce and verify the gate, and both know the registry is part of the source-only fix.
-    shim_command = "python3 scripts/check-expired-mathlib-shims.py"
     for name in ("bump.md", "fix-ci.md"):
         prompt = (PROMPTS / name).read_text()
-        # One shim block per prompt: diagnosis and final verification both point at it.
-        check(f"{name}: reproduces and verifies shim expiry", prompt.count(shim_command) == 1)
-        check(f"{name}: uses strict shim expiry mode", prompt.count("--fail-on-available") == 1)
-        check(f"{name}: validates the base registry ratchet", prompt.count("--base-manifest") == 1)
-        check(f"{name}: refreshes the base ref", prompt.count("git fetch -q origin main") == 1)
+        check(f"{name}: reproduces shim expiry with helper", '"__BIN__/tauceti-verify" --stage shim-expiry' in prompt)
+        check(
+            f"{name}: describes strict shim ratchet",
+            "--fail-on-available" in prompt and "--base-manifest" in prompt and "--base-root" in prompt,
+        )
+        check(f"{name}: no verification fetch", "git fetch -q origin main" not in prompt)
         check(f"{name}: migrates the AI-owned registry", "TauCeti/mathlib-shims.json" in prompt)
         check(f"{name}: forbids weakening exact targets", "never make the check green" in prompt)
-    check(
-        "fix-ci.md: source PRs probe only changed obligations",
-        (PROMPTS / "fix-ci.md").read_text().count("--only-new") == 1,
-    )
-    for name in ("bump.md", "fix-ci.md"):
-        prompt = (PROMPTS / name).read_text()
-        check(
-            f"{name}: shim baseline is the PR merge base",
-            prompt.count('git show "$base_ref":TauCeti/mathlib-shims.json') == 1,
-        )
-        check(
-            f"{name}: shim ratchet reads merge-base sources",
-            prompt.count('--base-root "$base_root"') == 1,
-        )
+    check("fix-ci.md: source PRs probe only changed obligations", "--only-new" in (PROMPTS / "fix-ci.md").read_text())
 
     # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
     # copied from other contributors' intention issues, which is untrusted and documented as

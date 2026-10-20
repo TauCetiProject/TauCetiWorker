@@ -1119,6 +1119,12 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
         if rc != 0 and api is not None and api.blocked_reason:
             raise admission_failure(api.blocked_reason)
+    from .verification import waiting_for_capacity
+
+    if waiting_for_capacity(w.cfg):
+        from .config import AdmissionUnavailable
+
+        raise AdmissionUnavailable("waiting-verification-capacity: verification remains recoverable")
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
@@ -1484,13 +1490,14 @@ def _do_fixlike(
     policy = scope_policy(
         getattr(p, "labels", ()), p.head_ref, bump=label == "bump" or getattr(p, "automatic_bump", False)
     )
+    os.environ["TAUCETI_VERIFY_POLICY"] = policy
     prompt = fill_prompt(
         HERE / "prompts" / prompt_file,
         PR=pr,
         AGENT=opts.agent_name,
         BIN=wrapper_bin(bubble),
         SCOPE_POLICY=policy,
-        LOCAL_VERIFICATION=local_verification(policy),
+        LOCAL_VERIFICATION=local_verification(policy, bubble),
     )
     if label == "rebase":
         evidence = w.gh.rebase_request_body(pr, head)
@@ -1583,6 +1590,9 @@ def _do_fixlike(
         # Existing counter storage supplies fsync + atomic replace. The receipt
         # also blocks a restart if preparation fails/refunds before a paid agent.
         w.counters.record_foreign_repair_launch(pr, head, scope.evidence_base, foreign)
+    from .verification import begin_attempt
+
+    capacity_wait = begin_attempt(w, charged, bubble=bubble)
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
@@ -1617,6 +1627,8 @@ def _do_fixlike(
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None
+        if foreign:
+            os.environ["TAUCETI_VERIFY_BASE"] = foreign
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         if rev.returncode == 0:
             from .work_recovery import mark_published, note_owner
@@ -1640,6 +1652,12 @@ def _do_fixlike(
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             raise
+    if capacity_wait():
+        from .config import AdmissionUnavailable
+
+        raise AdmissionUnavailable(
+            "waiting-verification-capacity: unfinished verification retained; PR attempt refunded"
+        )
     if rc == 0:
         w.rs.bust(pr)
     elif not foreign:
@@ -2115,6 +2133,7 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:
+    os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
     skip = roadmap_skip()
     if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
@@ -2200,7 +2219,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                     else "/opt/review/rubrics (read every .md file in it)"
                 ),
                 SOURCE_GUIDANCE=source_guidance,
-                LOCAL_VERIFICATION=local_verification("ordinary"),
+                LOCAL_VERIFICATION=local_verification("ordinary", bubble),
                 BIN=wrapper_bin(bubble=True),
             ),
             opts,
@@ -2223,7 +2242,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
-        LOCAL_VERIFICATION=local_verification("ordinary"),
+        LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )
     return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)

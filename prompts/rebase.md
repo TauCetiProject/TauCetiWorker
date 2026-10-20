@@ -32,12 +32,9 @@ Merging upstream workflow or pin changes as part of bringing in `main` is expect
 
 ## Verify before pushing (all MUST pass, after the merge/rebase)
 __LOCAL_VERIFICATION__
-Use the request's evidence to reproduce the diagnosis with the specific failing step, not a rerun of
-every check. After the merge/rebase and any repair, run the final verification once: `lake exe cache
-get` (if you have not run it this session, or the merge changed the pins), `lake build --iofail`, then the
-scope recipe and the scoped audit above. The recipe's base is the canonical main you integrated, so
-it covers this PR's changed modules and everything importing them. Iterate until green. Never push
-red: a botched conflict resolution that builds red is worse than the conflict.
+Use the request's evidence to reproduce the diagnosis with the helper's specific failing
+stage. After integration and repairs, run its default all stages. The round's resolved canonical-main
+SHA stays pinned even if remote refs advance. Check its receipt and scope before pushing; never push red.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. When a repair is needed, do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

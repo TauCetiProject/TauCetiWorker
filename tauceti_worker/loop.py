@@ -296,6 +296,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 wait_cached=None,
             )
             rc = run_round_subprocess(tail)
+            if rc in (124, 137, 143) and runtime_snapshot().get("state") == "waiting-verification-capacity":
+                rc = EX_ADMISSION_WAIT
 
             if rc == EX_ADMISSION_WAIT:
                 if reason := fleet_admission_reason(cfg.wid):

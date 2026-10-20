@@ -6,16 +6,12 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 
 ## Reproduce and adapt
 Read the failing CI log first and reproduce the stage that failed, not every check. The usual
-failure is the build: run `lake exe cache get` once, then `lake build`. If the log shows the
-expired-shim check failing, run it:
+failure is the build: use the helper's `--stage build`. If the expired-shim check failed:
 ```
-git fetch -q origin main
-shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"
-base_ref="$(git merge-base origin/main HEAD)"
-if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); fi
-if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
-rm -f "$base_shims"; rm -rf "$base_root"
+"__BIN__/tauceti-verify" --stage shim-expiry
 ```
+The helper uses `--fail-on-available`, checks the merge-base registry with `--base-manifest`
+and `--base-root`, and probes all obligations after a pin change. It never fetches.
 - Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
 - The shim-expiry command may be the only failing check even when `lake build` succeeds. Its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
 - For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
@@ -51,9 +47,8 @@ push the completed repairs and let full CI verify them. Do not spend the session
 
 ## Final verification when time permits
 __LOCAL_VERIFICATION__
-A pin bump changes what every module depends on, so its audit stays whole-library: the recipe
-prints `full: ...` for this branch. Once the migration is complete, run the shim-expiry command
-above, `lake build --iofail`, then the scope recipe and the audit, once each.
+A pin bump changes every module's dependencies, so the helper prints `scope: full: ...`.
+Once the migration is complete, run its default all stages and inspect the receipt.
 
 Full CI runs these checks even when a partial repair cannot run the full library yet.
 

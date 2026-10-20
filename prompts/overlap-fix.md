@@ -25,8 +25,7 @@ Keep one coherent topic per PR. For each removed public declaration explain
 whether Mathlib supplies it, a representation change replaces it, or surviving
 Tau Ceti API preserves it. A green build is insufficient to justify removing
 unused additional mathematics. Use existing cache services rather than
-rebuilding Mathlib from source. Before publishing, verify once: `lake build --iofail`,
-then the scope recipe, the scoped audit and the scoped environment lint below.
+rebuilding Mathlib from source. Before publishing, run the absolute verification helper below with its default all stages.
 
 __LOCAL_VERIFICATION__
 

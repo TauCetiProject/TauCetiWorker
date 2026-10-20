@@ -565,6 +565,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_github_account_flag(p)
     sub = p.add_subparsers(dest="cmd")
+    from .verification import add_parser as add_verification_parser
+
+    add_verification_parser(sub)
     activity = sub.add_parser("activity", help="read prepared local activity; never query GitHub")
     activity.add_argument("action", nargs="?", choices=("show", "refresh", "install-timer"), default="show")
     scope = activity.add_mutually_exclusive_group()
@@ -856,6 +859,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cmd = args.cmd
+    if cmd == "verify":
+        from .verification import command
+
+        return command(args)
     if cmd == "activity":
         from .activity import command
 
