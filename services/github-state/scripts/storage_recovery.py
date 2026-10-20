@@ -62,6 +62,7 @@ def status(environment):
 def export(environment, tables, limit, recovery_id=None):
     # An existing recovery continues from its manifest; a new one records a bookmark.
     recovery = {"id": recovery_id} if recovery_id else call(environment, "/admin/storage/recovery", {})
+    print(json.dumps({"recovery": recovery["id"], "bookmark": recovery.get("bookmark")}), file=sys.stderr, flush=True)
     for table in tables:
         while not (
             page := call(
