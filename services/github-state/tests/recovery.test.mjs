@@ -102,14 +102,14 @@ test('replay removes pointers only after the receipt commits; crashes repeat har
  const h=harness();h.state.full=true;
  for(const d of ['r1','r2','r3']) await deliver(h.env,d);
  h.state.full=false;
- // Crash after application, before cleanup: the next replay deduplicates.
+ // Crash after application, before cleanup (r1), and between body and
+ // pointer removal (r2): both leave receipt-backed pointers that deduplicate.
  h.archive.failures.push((op,key)=>op==='delete' && key.includes('/bodies/r1'));
+ h.archive.failures.push((op,key)=>op==='delete' && key.includes('/pointers/') && key.endsWith('-r2.json'));
  const {drain}=await load('src/ingress.ts');
  await assert.rejects(drain(h.env,repo));
  assert.equal(h.state.applied.get('r1'),1);assert.equal(parked(h.archive,'r1').length,1);
- // A crash between body and pointer removal leaves a receipt-backed pointer.
- h.archive.failures.push((op,key)=>op==='delete' && key.includes('/pointers/') && key.endsWith('-r2.json'));
- await assert.rejects(drain(h.env,repo));
+ assert.equal(h.state.applied.get('r2'),1);assert.equal(parked(h.archive,'r2').length,1);
  const result=await drain(h.env,repo);
  assert.equal(result.replayed,2);
  for(const d of ['r1','r2','r3']) {assert.equal(h.state.applied.get(d),1,d+' applied once');assert.equal(parked(h.archive,d).length,0);}
@@ -276,6 +276,7 @@ test('a recorded full state stops legacy migration even below the size threshold
 test('degraded workflow reads never run the legacy attempt rewrite',async()=>{
  const {db,state}=repositoryFixture();
  db.prepare('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?)').run('workflow_runs','77','',JSON.stringify({id:77,run_attempt:2}),'',1,1,0);
+ state.setMeta('last_webhook',Date.now());
  state.degraded={since:1,reason:'storage_full',operation:'test'};
  const before=db.prepare('SELECT COUNT(*) n FROM changes').get().n;
  const result=await queryFixture(state,{operation:'workflow_jobs',args:{id:'77'}});
@@ -311,4 +312,18 @@ test('a batch parks its messages concurrently',async()=>{
  assert.ok(messages.every(m=>m.acked));
  assert.ok(Date.now()-began<20*2*50,'not one message at a time');
  for(let i=0;i<20;i++) assert.ok(durable(h,'c'+i));
+});
+
+test('a degraded mirror that stopped changing is reported unavailable, not served stale',async()=>{
+ const {state}=repositoryFixture();
+ const q={operation:'open_prs'};
+ state.setMeta('last_webhook',Date.now()-60000);
+ state.degraded={since:Date.now(),reason:'storage_full',operation:'test'};
+ assert.notEqual((await queryFixture(state,q)).reason,'mirror_frozen','recently changed data is still served');
+ state.setMeta('last_webhook',Date.now()-11*60000);
+ const frozen=await queryFixture(state,q);
+ assert.equal(frozen.status,'unavailable');assert.equal(frozen.reason,'mirror_frozen');assert.ok(frozen.frozen_since>0);
+ assert.equal(Object.hasOwn(frozen,'data'),false);
+ state.degraded=undefined;
+ assert.notEqual((await queryFixture(state,q)).reason,'mirror_frozen','a quiet but writable mirror is current');
 });

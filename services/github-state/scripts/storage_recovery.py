@@ -59,8 +59,9 @@ def status(environment):
     }
 
 
-def export(environment, tables, limit):
-    recovery = call(environment, "/admin/storage/recovery", {})
+def export(environment, tables, limit, recovery_id=None):
+    # An existing recovery continues from its manifest; a new one records a bookmark.
+    recovery = {"id": recovery_id} if recovery_id else call(environment, "/admin/storage/recovery", {})
     for table in tables:
         while not (
             page := call(
@@ -142,6 +143,7 @@ def main():
     exporting = commands.add_parser("export")
     exporting.add_argument("--table", action="append", required=True)
     exporting.add_argument("--limit", type=int, default=1000)
+    exporting.add_argument("--recovery", help="continue an existing recovery manifest")
     cleaning = commands.add_parser("cleanup")
     cleaning.add_argument("--class", dest="cleanup_class", required=True)
     cleaning.add_argument("--recovery")
@@ -168,7 +170,7 @@ def main():
     elif args.command == "scan":
         result = call(env, "/admin/storage/scan", {"table": args.table, "after": args.after, "limit": args.limit})
     elif args.command == "export":
-        result = export(env, args.table, args.limit)
+        result = export(env, args.table, args.limit, args.recovery)
     elif args.command == "cleanup":
         result = cleanup(env, args.cleanup_class, args.recovery, args.limit, args.batches)
     elif args.command == "probe":

@@ -229,7 +229,13 @@ export default {
         if (!tick.ok || state.degraded || (await ingressMode(env,repo)).mode==='parked') {log('delivery_audit_skipped',{repository:repo.name,degraded:Boolean(state.degraded),status:tick.status});return;}
         await stub(env.INSTALLATIONS,repo.installation).fetch('https://internal/audit',{method:'POST',body:JSON.stringify(repo)});
       })().catch(error=>log('scheduled_failed',{repository:repo.name,reason:classify(error)})));
-      ctx.waitUntil(drain(env,repo).catch(error=>log('parked_replay_failed',{repository:repo.name,reason:classify(error)})));
+      // Drain for most of the cron minute while replay is making progress.
+      ctx.waitUntil((async()=>{
+        for (const began=Date.now();Date.now()-began<20000;) {
+          const pass=await drain(env,repo,{limit:100});
+          if (pass.stopped || !pass.remaining || !pass.replayed) break;
+        }
+      })().catch(error=>log('parked_replay_failed',{repository:repo.name,reason:classify(error)})));
     }
     // R2 continuation pages are numerous and short-lived; sweep them separately.
     ctx.waitUntil((async()=>{

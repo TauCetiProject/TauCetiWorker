@@ -123,7 +123,8 @@ export async function exportPage(bucket: R2Bucket, sql: SqlStorage, repo: string
   const manifest = await readManifest(bucket, repo, input.recovery), name = table(sql, input.table);
   const state = manifest.tables[name] ||= { started: Date.now(), upper: sql.exec<any>('SELECT COALESCE(MAX(rowid),0) n FROM ' + quote(name)).one().n, after: 0, rows: 0, pages: [], complete: false, verified: false, verified_pages: 0 };
   if (state.complete) return { table: name, ...state, pages: state.pages.length };
-  const cols = columns(sql, name), limit = bounded(input.limit, 1000, 5000);
+  // The 1 MB logical byte bound limits each page; the row bound only caps tiny rows.
+  const cols = columns(sql, name), limit = bounded(input.limit, 1000, 50000);
   const size = cols.map(c => 'COALESCE(length(CAST(' + quote(c) + ' AS BLOB)),0)').join('+');
   const candidates = sql.exec<any>('SELECT rowid id,' + size + ' bytes FROM ' + quote(name) + ' WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?', state.after, state.upper, limit).toArray();
   if (!candidates.length) state.complete = true;
@@ -163,8 +164,9 @@ export async function verifyExport(bucket: R2Bucket, repo: string, input: any): 
 // retention policy; the others require a verified export covering the rows.
 // PR histories, resources, membership/coverage, tombstones, jobs, and
 // delivery receipts are never cleanup classes.
-export const CLEANUP: Record<string, { table: string; where: string; bound: (now: number, input: any) => number; recovery: boolean }> = {
-  expired_cursors: { table: 'cursors', where: 'expires<?', bound: now => now, recovery: false },
+export const CLEANUP: Record<string, { table: string; where: string; bound: (now: number, input: any) => number; recovery: boolean; max?: number }> = {
+  // Legacy cursor rows hold up to 1.5 MB each; keep their batches small.
+  expired_cursors: { table: 'cursors', where: 'expires<?', bound: now => now, recovery: false, max: 200 },
   expired_repair_metrics: { table: 'repair_metrics', where: 'at<?', bound: now => now - 7 * 86400000, recovery: false },
   expired_changes: { table: 'changes', where: 'at<?', bound: now => now - 7 * 86400000, recovery: false },
   expired_retired_objects: { table: 'retired_objects', where: 'at<?', bound: now => now - 30 * 86400000, recovery: false },
@@ -176,7 +178,7 @@ export const CLEANUP: Record<string, { table: string; where: string; bound: (now
 // A verified export covers rows with rowid <= upper that were last written
 // before it started. Rowids can be reused, so both bounds are required.
 export function deleteClass(sql: SqlStorage, name: string, exported: { upper: number; started: number } | null, input: any, now = Date.now(), measure = true): { rows: number; logical_bytes: number | null } {
-  const rule = CLEANUP[name], limit = bounded(input.limit, 100, 500);
+  const rule = CLEANUP[name], limit = bounded(input.limit, 100, rule.max ?? 5000);
   // Measuring reads every deleted payload; routine expiry skips that cost.
   const size = measure ? columns(sql, rule.table).map(c => 'COALESCE(length(CAST(' + quote(c) + ' AS BLOB)),0)').join('+') : '0';
   const bound = exported === null ? rule.bound(now, input) : Math.min(rule.bound(now, input), exported.started);

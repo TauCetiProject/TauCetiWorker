@@ -13,6 +13,10 @@ const SCHEMA_VERSION=4;
 // large is treated as full: no startup write may risk a failed commit, which
 // resets the object and would repeat on every start.
 const FULL_DATABASE=10*1024**3-16*1024**2;
+// Clients do not judge data age. While the store cannot apply changes, a
+// mirror that has not changed for this long is reported unavailable so
+// clients use their direct GitHub fallback instead of acting on frozen state.
+const FROZEN_AFTER=10*60000;
 const CURSOR_UPLOADS=4;
 const cursorKey=(repo:string,id:string,offset:number)=>`cursors/${repo}/${id}/${offset}.json`;
 
@@ -1103,8 +1107,14 @@ export class RepositoryState extends DurableObject<Env> {
     if(Number.isSafeInteger(p.additions) && p.additions!==totalAdded || Number.isSafeInteger(p.deletions) && p.deletions!==totalDeleted) return remember(null);
     return remember({added,deleted,head_sha:p.headRefOid});
   }
+  // The last time the mirror changed: an applied webhook or a stored repair.
+  frozenSince(): number | null {
+    if (!this.degraded) return null;
+    const changed=Math.max(this.meta('last_webhook') || 0,this.meta('last_repair') || 0);
+    return Date.now()-changed>FROZEN_AFTER?changed:null;
+  }
   storageState(): any {
-    return {mode:this.degraded?'degraded':'writable',degraded:this.degraded ?? null,schema:this.schema,database_size:this.sql.databaseSize,fault_injection:this.env.FAULT_INJECTION==='true'?{full:this.faultFull}:undefined};
+    return {mode:this.degraded?'degraded':'writable',degraded:this.degraded ?? null,frozen_since:this.frozenSince(),schema:this.schema,database_size:this.sql.databaseSize,fault_injection:this.env.FAULT_INJECTION==='true'?{full:this.faultFull}:undefined};
   }
   async storage(path:string,req:Request): Promise<Response> {
     const input:any=req.method==='POST'?await req.json():{};
@@ -1216,6 +1226,8 @@ export class RepositoryState extends DurableObject<Env> {
       if (path==='/query') {
         const q=await req.json() as Query;
         validateQuery(q);
+        const changed=this.frozenSince();
+        if (changed!==null) return json({...this.unavailable(q,'mirror_frozen'),frozen_since:changed},200,{'X-TauCeti-Storage':'degraded'});
         if(q.operation==='workflow_jobs') {
           try {this.runAttempt(String(q.args?.id));}
           catch(error) {return json(this.unavailable(q,this.noteFailure('workflow_attempt',error)));}
