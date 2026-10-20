@@ -305,10 +305,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 rc = EX_VERIFICATION_WAIT
             if rc == EX_DOCUMENTATION_WAIT:
                 streak = 0
+                paused = runtime_snapshot()
                 report_runtime(
-                    "waiting-documentation",
-                    detail="documentation replanning deferred; selecting other work",
-                    next_action_at=time.time() + 5,
+                    paused.get("state") or "waiting-documentation",
+                    detail=paused.get("detail") or "progress preparation deferred; selecting other work",
+                    next_action_at=paused.get("next_action_at"),
                 )
                 time.sleep(5)
                 continue

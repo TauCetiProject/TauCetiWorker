@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import cli, loop, work_recovery
 from tauceti_worker import progress_publication as publication
 from tauceti_worker import work_units as wu
-from tauceti_worker.config import Die, DocumentationUnavailable
+from tauceti_worker.config import Die, DocumentationUnavailable, ProgressPreparationUnavailable
 from tauceti_worker.constants import EX_DOCUMENTATION_WAIT, EX_NOPROGRESS, PROGRESS_ERROR_KEY
 from tauceti_worker.survey import progress_due
 
@@ -148,7 +148,9 @@ class GenerationRetryTests(unittest.TestCase):
             )
             self.assert_uncharged()
 
-    def drive_inner(self, failures=0, fail_stage="facts", code=76, timeout_stage=None, write_bodies=True):
+    def drive_inner(
+        self, failures=0, fail_stage="facts", code=76, timeout_stage=None, write_bodies=True, checkout_ok=True
+    ):
         remaining = failures
         options = SimpleNamespace(agent_name="fixture", work_model="fixture")
 
@@ -194,7 +196,7 @@ class GenerationRetryTests(unittest.TestCase):
                 (publication, "defer", {}),
                 (work_recovery, "guard", SimpleNamespace(ok=True)),
                 (work_recovery, "note_owner", None),
-                (wu, "prepare_checkout", True),
+                (wu, "prepare_checkout", checkout_ok),
                 (wu, "_apply_prepared_progress", 0),
             ):
                 stack.enter_context(patch.object(obj, attr, return_value=value))
@@ -326,12 +328,18 @@ class GenerationRetryTests(unittest.TestCase):
         with self.assertRaisesRegex(Die, "agent did not write"):
             self.drive_inner(write_bodies=False)
         self.assertEqual((self.work / "status-body.md").read_text(), "retained body")
+        self.assertTrue((self.work / "writing.json").exists())
+        with patch("tauceti_worker.progress_publication.outbox.intent_paths") as legacy:
+            self.assertIsNone(publication.retained(self.cfg))
+            legacy.assert_not_called()
 
     def test_legacy_retry_requires_distinct_facts_builds(self):
         proc = subprocess.CompletedProcess([], 1, "", LEGACY)
         self.assertFalse(wu._progress_generation_changed("plan", proc))
         self.assertTrue(wu._progress_generation_changed("facts", proc))
         proc.stderr = LEGACY.replace(NEW[:7], OLD[:7])
+        self.assertFalse(wu._progress_generation_changed("facts", proc))
+        proc.stderr = LEGACY.replace(NEW[:7], OLD)
         self.assertFalse(wu._progress_generation_changed("facts", proc))
 
     def test_documentation_wait_is_not_a_failed_activity_round(self):
@@ -345,14 +353,43 @@ class GenerationRetryTests(unittest.TestCase):
 
     def test_stage_timeout_fits_the_remaining_round_budget(self):
         with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() - 1)}):
-            with self.assertRaises(DocumentationUnavailable):
+            with self.assertRaises(ProgressPreparationUnavailable):
                 self.drive_inner()
         self.assertNotIn("plan", self.calls)
         self.assert_uncharged()
-        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 25)}):
+        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 600)}):
             self.assertEqual(self.drive_inner(), 0)
         self.assertTrue(self.timeouts)
-        self.assertTrue(all(timeout <= 10 for timeout in self.timeouts))
+        self.assertTrue(all(timeout <= 585 for timeout in self.timeouts))
+
+    def test_checkout_failure_preserves_cadence_and_defers_mechanical_work(self):
+        with self.assertRaisesRegex(Die, "checkout failed"):
+            self.drive_inner(checkout_ok=False)
+        self.assert_uncharged()
+        self.assertNotIn("writer", self.calls)
+        self.assertGreater(self.values["progress-mechanical-retry-at"], time.time() + 28000)
+        with patch("tauceti_worker.survey.subprocess.run") as tool:
+            self.assertFalse(progress_due(self.cfg, self.worker.counters)[0])
+            tool.assert_not_called()
+
+    def test_deadline_cut_timeout_is_an_uncharged_non_churn_wait(self):
+        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 600)}):
+            with self.assertRaises(ProgressPreparationUnavailable) as raised:
+                self.drive_inner(timeout_stage="facts")
+        self.assertEqual(raised.exception.state, "waiting-progress-preparation")
+        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
+        self.assertEqual(self.values.get("progress-docs-waits", 0), 0)
+        self.assertNotIn("writer", self.calls)
+        self.assert_uncharged()
+        self.assertIn("partial stdout", next(self.cfg.logdir.glob("progress-facts-*.log")).read_text())
+
+    def test_insufficient_writer_budget_waits_before_spending_cadence(self):
+        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 120)}):
+            with self.assertRaises(ProgressPreparationUnavailable):
+                self.drive_inner()
+        self.assertIn("prompt", self.calls)
+        self.assertNotIn("writer", self.calls)
+        self.assert_uncharged()
 
     def test_mechanical_traces_are_bounded_and_prepared_archives_survive(self):
         archive = self.root / "progress/mechanical/attempt-prepared/previous"

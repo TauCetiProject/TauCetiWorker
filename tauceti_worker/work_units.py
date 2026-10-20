@@ -1884,7 +1884,7 @@ def _progress_generation_changed(stage, proc):
         r"was built from ([0-9a-f]{7,40}), not ([0-9a-f]{7,40}); the site is redeploying",
     ):
         if match := re.search(pattern, detail):
-            if match[1] != match[2]:
+            if not (match[1].startswith(match[2]) or match[2].startswith(match[1])):
                 return True
     return False
 
@@ -1908,9 +1908,20 @@ def _progress_documentation_wait(w, reason):
     delay = (60, 300, 900, 1800)[min(waits - 1, 3)]
     retry_at = int(time.time()) + delay
     w.counters.write("progress-docs-waits", waits)
+    w.counters.write("progress-mechanical-retry-at", 0)
     w.counters.write("progress-docs-retry-at", retry_at)
     bust_progress_cache(w.cfg)
     raise DocumentationUnavailable(f"waiting-documentation: {reason}", retry_at=retry_at)
+
+
+def _progress_deadline_wait(w):
+    from .config import ProgressPreparationUnavailable
+
+    _progress_mechanical_delay(w, 60)
+    raise ProgressPreparationUnavailable(
+        "waiting-progress-preparation: insufficient round time; artifacts retained for the next ordinary round",
+        retry_at=w.counters.read("progress-mechanical-retry-at"),
+    )
 
 
 def _prepare_progress(w, run_tool, roadmap_dir, work):
@@ -1921,13 +1932,13 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
     archive.mkdir(parents=True, exist_ok=True)
     # Keep recent traces and every archive containing prepared prose. Full stage diagnostics are
     # retained independently beside the round logs. Never prune publication receipts or bodies.
-    traces = sorted(
-        (p for p in archive.glob("attempt-*") if not (p / "previous").exists()),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for old in traces[19:]:
-        shutil.rmtree(old)
+    traces = []
+    for path in archive.glob("attempt-*"):
+        with contextlib.suppress(OSError):
+            if not (path / "previous").exists():
+                traces.append((path.stat().st_mtime, path))
+    for _, old in sorted(traces, reverse=True)[19:]:
+        shutil.rmtree(old, ignore_errors=True)
     attempts = Path(tempfile.mkdtemp(prefix="attempt-", dir=archive))
     reason = ""
     for attempt in range(3):
@@ -1955,6 +1966,8 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                 proc = run_tool(stage, *args, capture=True, docs_cache=cache)
                 if stage == "plan" and proc.returncode == EX_NOPROGRESS:
                     log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
+                    w.counters.write("progress-docs-waits", 0)
+                    w.counters.write("progress-docs-retry-at", 0)
                     _progress_mechanical_delay(w)
                     return None
                 if proc.returncode:
@@ -1974,13 +1987,18 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                         _progress_mechanical_failed(w, f"progress: invalid plan artifact: {exc}")
                     if saved := publication.parked_window(w.cfg, plan):
                         log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
-                        _progress_mechanical_delay(w)
+                        w.counters.write("progress-docs-waits", 0)
+                        w.counters.write("progress-docs-retry-at", 0)
+                        _progress_mechanical_delay(w, PROGRESS_ATTEMPT_GAP)
                         return None
             else:
                 try:
                     facts = json.loads(facts_file.read_text())
-                    if not all(isinstance(facts.get(k), str) and facts[k] for k in ("docs_sha", "to_sha")):
-                        raise ValueError("facts must contain docs_sha and to_sha")
+                    if not all(
+                        isinstance(facts.get(k), str) and re.fullmatch(r"[0-9a-f]{40}", facts[k])
+                        for k in ("docs_sha", "to_sha")
+                    ):
+                        raise ValueError("facts must contain full docs_sha and to_sha commit IDs")
                 except (OSError, ValueError, AttributeError) as exc:
                     _progress_mechanical_failed(w, f"progress: invalid facts artifact: {exc}")
                 if facts["docs_sha"] != plan["to_sha"] or facts["to_sha"] != plan["to_sha"]:
@@ -1994,6 +2012,19 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
     # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
     # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
     _progress_documentation_wait(w, f"generation kept changing after 3 attempts; {reason}")
+
+
+def _install_progress_body(source, target):
+    """Install a complete body; the writing fence blocks legacy adoption between the two installs."""
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(source.read_bytes())
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, target)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def _do_progress_inner(w, opts) -> int | None:
@@ -2014,9 +2045,12 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.write(PROGRESS_ERROR_KEY, 0)
             return None
         retained = publication.defer(w.cfg, retained)
-    # Mechanical replanning does not spend a prose/cadence attempt. Consume the survey verdict
-    # now so any infrastructure wait is visible before its next due check.
-    bust_progress_cache(w.cfg)
+    # Reserve separate mechanical spacing before checkout and every fallible preparation step.
+    # Churn, deadline and not-due paths replace this reservation with their own retry delays.
+    if not retained:
+        _progress_mechanical_delay(w, PROGRESS_ATTEMPT_GAP)
+    else:
+        bust_progress_cache(w.cfg)
 
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
@@ -2076,8 +2110,8 @@ def _do_progress_inner(w, opts) -> int | None:
         # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
         # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
         remaining = deadline - time.time() - 15
-        if remaining <= 0 and args[0] in ("plan", "facts"):
-            _progress_documentation_wait(w, "mechanical preparation reached its round deadline; artifacts retained")
+        if remaining < 30 and args[0] in ("plan", "facts", "prompt"):
+            _progress_deadline_wait(w)
         log(f"  $ tauceti-progress {args[0]} …")
         try:
             proc = subprocess.run(
@@ -2102,6 +2136,8 @@ def _do_progress_inner(w, opts) -> int | None:
             _progress_tool_output(w, args[0], proc)
             if args[0] == "apply":
                 raise  # publication transport waits keep their existing recovery path
+            if isinstance(exc, subprocess.TimeoutExpired) and remaining < 1800:
+                _progress_deadline_wait(w)
         _progress_tool_output(w, args[0], proc)
         return proc
 
@@ -2114,6 +2150,7 @@ def _do_progress_inner(w, opts) -> int | None:
         return None
     new_plan, new_facts = prepared
     plan = json.loads(new_plan.read_text())
+    publication.begin_writing(w.cfg)
 
     def identity(p, f):
         value = json.loads(p.read_text())
@@ -2142,7 +2179,6 @@ def _do_progress_inner(w, opts) -> int | None:
     shutil.copyfile(new_facts, facts_file)
     w.counters.write("progress-docs-retry-at", 0)
     w.counters.write("progress-docs-waits", 0)
-    w.counters.write("progress-mechanical-retry-at", 0)
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
     # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
@@ -2169,6 +2205,9 @@ def _do_progress_inner(w, opts) -> int | None:
         SECTION_OUT=str(section_out),
         AGENT=opts.agent_name,
     )
+    if deadline - time.time() < 300:
+        _progress_deadline_wait(w)
+    w.counters.write("progress-mechanical-retry-at", 0)
     w.counters.write("progress-attempt-ts", int(time.time()))
     rc = run_agent_host(writing, prompt, opts.work_model, w.cfg.logdir)
     if rc != 0:
@@ -2185,9 +2224,10 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.incr(PROGRESS_ERROR_KEY)
             raise Die(f"the agent did not write {f.name}")
 
-    shutil.copyfile(status_out, status_body)
-    shutil.copyfile(section_out, section_body)
+    _install_progress_body(status_out, status_body)
+    _install_progress_body(section_out, section_body)
     receipt = publication.save(w.cfg, me(), PROGRESS_REF)
+    shutil.rmtree(writing, ignore_errors=True)  # the receipted canonical bodies now retain the paid output
     receipt = publication.defer(w.cfg, receipt)
     return _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt)
 

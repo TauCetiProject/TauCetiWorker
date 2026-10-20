@@ -297,12 +297,20 @@ class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
 
 
-class DocumentationUnavailable(NoProgress):
-    """Documentation deployment churn; replan without spending a report attempt."""
+class ProgressPreparationUnavailable(NoProgress):
+    """Mechanical progress preparation needs time or infrastructure, without a paid attempt."""
+
+    state = "waiting-progress-preparation"
 
     def __init__(self, message, *, retry_at=None):
         super().__init__(message)
         self.retry_at = retry_at
+
+
+class DocumentationUnavailable(ProgressPreparationUnavailable):
+    """Documentation deployment churn; replan without spending a report attempt."""
+
+    state = "waiting-documentation"
 
 
 class VerificationUnavailable(NoProgress):

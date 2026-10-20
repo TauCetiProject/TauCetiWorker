@@ -132,6 +132,7 @@ class Round:
         if code in (76, 77, 79) or type(exc).__name__ in (
             "AdmissionUnavailable",
             "DocumentationUnavailable",
+            "ProgressPreparationUnavailable",
             "GitHubUnavailable",
             "SharedStateUnavailable",
         ):

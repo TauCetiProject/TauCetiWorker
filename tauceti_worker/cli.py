@@ -50,9 +50,9 @@ from .config import (
     AdmissionUnavailable,
     Config,
     Die,
-    DocumentationUnavailable,
     GitHubUnavailable,
     NoProgress,
+    ProgressPreparationUnavailable,
     VerificationUnavailable,
     acquire_slot,
     auto_assign_wid,
@@ -1694,10 +1694,10 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
-    except DocumentationUnavailable as e:
+    except ProgressPreparationUnavailable as e:
         log(str(e))
         report_runtime(
-            "waiting-documentation",
+            e.state,
             detail=str(e),
             next_action_at=e.retry_at,
             failure_reason=None,

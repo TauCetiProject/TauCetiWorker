@@ -449,7 +449,8 @@ then 5, 15 and at most 30 minutes on repeated churn, without
 advancing the report attempt timestamp, spending PR repair allowances, or escalating failure backoff.
 The scheduler can select other work during this cooldown. Other plan/facts/prompt errors remain specific
 failures with a separate mechanical retry delay preserving the existing eight-hour error spacing.
-A not-due recheck or parked window suppresses planning for the ordinary due-cache TTL. The published cursor changes only through normal
+A not-due recheck suppresses planning for the ordinary due-cache TTL; a parked window uses the
+existing eight-hour attempt spacing. The published cursor changes only through normal
 report publication, so the next ordinary replan covers the same unadvanced history.
 
 Every completed plan, facts, prompt and apply command keeps labelled stdout/stderr in private
@@ -458,5 +459,8 @@ Every completed plan, facts, prompt and apply command keeps labelled stdout/stde
 Recent mechanical traces are bounded to 20 directories; archives containing prepared inputs or prose are retained.
 When a new coherent plan/facts identity changes, previous inputs and prose are archived there before
 prose is invalidated. Each writer uses fresh output paths under `state/progress/writing/`; existing prose
-cannot satisfy a new writer launch. Mechanical tool timeouts fit the remaining round deadline. Prepared publication receipts resume apply with their existing prose and version.
+cannot satisfy a new writer launch. Mechanical tool timeouts fit the remaining round deadline. Deadline exhaustion reports
+`waiting-progress-preparation` without increasing the churn or error counters, and no paid writer
+starts with less than five minutes remaining. A durable writing marker prevents older fork intents
+from adopting retained bodies from an unsuccessful fresh writer attempt. Prepared publication receipts resume apply with their existing prose and version.
 Rolling back the tool pin preserves these artifacts and the published cursor.
