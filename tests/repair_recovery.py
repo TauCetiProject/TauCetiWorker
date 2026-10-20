@@ -850,15 +850,15 @@ class Fixture(unittest.TestCase):
         rr.atomic_json(self.record / "operator.json", dict(retry_epoch=1))
         self.assertTrue(rr.due(self.cfg))
 
-    def test_one_invocation_even_when_claim_wait_preserves_attempt(self):
+    def test_one_invocation_even_when_cleanup_wait_refunds_attempt(self):
         other = self.record.parent / "second"
         other.mkdir()
         for path in self.record.iterdir():
             if path.is_file():
                 (other / path.name).write_bytes(path.read_bytes())
-        with patch.object(rr.WorkerBackend, "acquire", side_effect=rr.Wait("claim", "busy")) as acquire:
+        with patch.object(rr.WorkerBackend, "restore", side_effect=rr.Wait("continuation-cleanup", "busy")) as restore:
             self.assertFalse(rr.recover(self.w, self.opts))
-        self.assertEqual(acquire.call_count, 1)
+        self.assertEqual(restore.call_count, 1)
 
     def test_unfinished_native_git_operation_is_durably_blocked(self):
         (self.co / ".git/MERGE_HEAD").write_text(self.base + "\n")
