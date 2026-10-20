@@ -489,6 +489,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             f"{stage}={len(sv.kind(stage).actionable)}" for stage in round_stages(opts) if want(opts.only, stage)
         )
         log(f"Global PR work: {counts}; {sv.discovery_gaps} PR(s) need cached history")
+        if sv.discovery_gaps:
+            log(
+                "Partial cached history; selecting work without waiting: "
+                + ", ".join(f"https://github.com/{w.gh.repo}/pull/{pr}" for pr in sv.discovery_gap_prs)
+            )
 
     # Spread concurrent workers across different branch-writing work: shuffle each non-review stage so
     # workers starting together don't all pick the lowest-numbered PR and spend a branch-claim round-trip
@@ -522,6 +527,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             except Die as exc:
                 log(f"  review: {exc}; reviewer affinity disabled for this round")
         ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
+        if sv.roadmap_backpressure and deferred:
+            log("  review: authoring paused; previous-reviewer preference will not leave workers idle")
+            ordered.extend(deferred)
+            deferred = []
         sv.reviewable.actionable = ordered
         if deferred:
             waits = [REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at) for c in deferred if c.ready_at is not None]
@@ -572,11 +581,6 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
-        if sv.discovery_gaps:
-            raise NoProgress(
-                f"global maintenance: {sv.discovery_gaps} PR(s) need cached history — "
-                "not assuming the backlog is empty or starting new authoring"
-            )
         if sv.roadmap_backpressure:
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
@@ -867,6 +871,12 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
         paused |= {"keep", "do-not-close"}
     if {str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused:
         return False
+    if getattr(c, "partial_history", False):
+        # The agent/engine can inspect this selected PR. Unknown comment coverage
+        # must not turn into another pre-launch dependency wait. Ordinary branch
+        # claims and the review engine's per-head coordination remain authoritative.
+        log(f"  {stage} #{c.pr}: investigating with partial cached history")
+        return True
     meta = w.rs.gh_meta(c.pr, force=True)
     if meta.provenance in ("stale", "fetch_failed"):
         log(f"  {stage} #{c.pr}: could not re-read review state before launching — leaving it for a later round")
@@ -1256,8 +1266,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             log(f"  review #{pr}: contest claim (👀) failed to post — a peer may double-review")
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:
-        nrnd = w.rs.review_rounds(pr, w.counters)
-        log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
+        if getattr(c, "partial_history", False):
+            log(f"  review @ {head[:12]}, reviewers={reviewers}; engine will discover missing history")
+        else:
+            nrnd = w.rs.review_rounds(pr, w.counters)
+            log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
     try:
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts)
