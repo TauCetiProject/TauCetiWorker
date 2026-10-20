@@ -13,11 +13,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import activity, cli, github_outbox, loop, work_units
+from tauceti_worker import activity, agents, cli, github_outbox, loop, work_units
 from tauceti_worker.claude_api import ClaudeAPIContext
 from tauceti_worker.config import AdmissionUnavailable
 from tauceti_worker.constants import EX_ADMISSION_WAIT
-from tauceti_worker.fleet_capacity import admission_reason
+from tauceti_worker.fleet_capacity import admission_reason, admission_unit, check_launch_admission
 from tauceti_worker.fleet_events import emit, mutation
 from tauceti_worker.round import Claims, RoundContext
 from tauceti_worker.survey import Counters
@@ -207,6 +207,85 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(len(states), 3)
         self.assertTrue(all(call.kwargs["detail"] == "CI priority" for call in states))
         self.assertFalse(any(call.args and call.args[0] == "backoff" for call in status.call_args_list))
+
+    def test_non_api_launch_race_and_admitted_continuation(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, TAUCETI_ACTIVITY_DIR=tmp):
+            with (
+                admission_unit("w"),
+                patch("tauceti_worker.fleet_capacity.admission_reason", return_value="CI priority"),
+            ):
+                with patch.object(agents.subprocess, "Popen") as spawn:
+                    with self.assertRaises(AdmissionUnavailable):
+                        agents.run_agent_proc(
+                            [sys.executable, "-c", "pass"],
+                            env=dict(os.environ),
+                            logdir=Path(tmp),
+                            label="fixture",
+                            provider="codex",
+                        )
+                    spawn.assert_not_called()
+                with patch.object(agents.containment, "run") as spawn:
+                    with self.assertRaises(AdmissionUnavailable):
+                        agents.run_to_logfile(["engine"], Path(tmp) / "review.log", "review #7")
+                    spawn.assert_not_called()
+            with (
+                admission_unit("w"),
+                patch("tauceti_worker.fleet_capacity.admission_reason", return_value=None) as policy,
+            ):
+                check_launch_admission()
+                policy.return_value = "CI priority"
+                check_launch_admission()
+                self.assertEqual(policy.call_count, 1)
+            # The following selected unit must recheck; admission cannot leak across rounds.
+            with (
+                admission_unit("w"),
+                patch("tauceti_worker.fleet_capacity.admission_reason", return_value="CI priority"),
+            ):
+                with self.assertRaises(AdmissionUnavailable):
+                    check_launch_admission()
+
+    def test_dispatch_refuses_capacity_before_stage_or_claim(self):
+        cfg = SimpleNamespace(wid="w")
+        worker = SimpleNamespace(cfg=cfg)
+        candidate = SimpleNamespace(pr=0, head="", reason="")
+        opts = work_units.RoundOpts(
+            only=["roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False
+        )
+        with (
+            patch.dict(os.environ, TAUCETI_FLEET_ADMISSION_FILE="fixture"),
+            patch.object(work_units.shutil, "which", return_value="claude"),
+            patch.object(work_units, "_check_stage_read_quota"),
+            patch.object(work_units, "_still_actionable", return_value=True),
+            patch("tauceti_worker.fleet_capacity.admission_reason", return_value="CI priority"),
+            patch.object(work_units, "do_roadmap") as stage,
+        ):
+            with self.assertRaisesRegex(AdmissionUnavailable, "CI priority"):
+                work_units.dispatch("roadmap", worker, None, candidate, opts)
+            stage.assert_not_called()
+
+    def test_admission_wait_preserves_failure_streak_and_ignores_stale_running_detail(self):
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            if len(waits) == 3:
+                raise KeyboardInterrupt
+
+        with (
+            patch.object(loop, "api_mode", return_value=True),
+            patch.dict(os.environ, TAUCETI_USE_BUDGET="0"),
+            patch.object(loop, "fleet_admission_reason", return_value=None),
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop, "run_round_subprocess", side_effect=[1, EX_ADMISSION_WAIT, 1]),
+            patch.object(loop.Budget, "refresh_waiter"),
+            patch.object(loop, "runtime_snapshot", return_value=dict(state="running", detail="provider=claude")),
+            patch.object(loop, "report_runtime") as status,
+            patch.object(loop.time, "sleep", side_effect=sleep),
+        ):
+            loop.cmd_loop(SimpleNamespace(), SimpleNamespace(wid="w"), only=[], agent="claude")
+        self.assertEqual(waits, [loop.BACKOFF_BASE * 2, 5, loop.BACKOFF_BASE * 4])
+        wait = next(call for call in status.call_args_list if call.args and call.args[0] == "waiting-budget")
+        self.assertEqual(wait.kwargs["detail"], "rechecking local API admission")
 
     def test_assistance_uses_mutated_target_and_reconciled_create_has_origin(self):
         with patch("tauceti_worker.fleet_events.emit") as record:

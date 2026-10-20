@@ -21,10 +21,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tauceti_worker import agents, loop, work_units
-from tauceti_worker.budget import Budget, BudgetError, process_identity
+from tauceti_worker.budget import Budget, BudgetError, admission_pause, process_identity
 from tauceti_worker.claude_api import ClaudeAPIContext, configure_api
 from tauceti_worker.cli import build_parser
 from tauceti_worker.config import AdmissionUnavailable
+from tauceti_worker.constants import PROGRESS_ERROR_KEY
 from tauceti_worker.survey import Counters
 from tauceti_worker.worker_manager import WorkersError, WorkerSpec
 
@@ -42,6 +43,37 @@ class BudgetTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_model_preflight_checks_cooldown_calibration_and_queue_without_launch(self):
+        self.budget.configure(grant=100)
+        self.budget.cooldown("opus", 60)
+        self.assertEqual(
+            admission_pause(self.budget.snapshot(worker="w", model="opus"), worker="w", model="opus", now=self.now),
+            "API throughput cooldown",
+        )
+        self.now += 61
+        self.assertTrue(self.budget.admit("calibration", "first", "opus", "fix")["allowed"])
+        self.assertEqual(
+            admission_pause(self.budget.snapshot(worker="w", model="opus"), worker="w", model="opus", now=self.now),
+            "waiting for calibration session cost",
+        )
+        self.budget.settle("calibration", 10)
+        self.budget.configure(set_grant=0)
+        self.assertFalse(self.budget.admit("wait", "first", "opus", "fix")["allowed"])
+        self.budget.configure(set_grant=100)
+        self.assertEqual(
+            admission_pause(self.budget.snapshot(worker="w", model="opus"), worker="w", model="opus", now=self.now),
+            "waiting behind another worker",
+        )
+        self.assertIsNone(
+            admission_pause(
+                self.budget.snapshot(worker="first", model="opus"), worker="first", model="opus", now=self.now
+            )
+        )
+        self.now += 121
+        self.assertIsNone(
+            admission_pause(self.budget.snapshot(worker="w", model="opus"), worker="w", model="opus", now=self.now)
+        )
 
     def test_grants_set_rate_and_readonly_projection(self):
         self.budget.configure(grant="100", rate="20")
@@ -446,7 +478,7 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             ("lint-repair", ("lint-repair-7-aaaaaaaaaaaa", "lint-repair-pr-7")),
             ("rebase", ("rebase-pr-7",)),
             ("review", ("review-err-7",)),
-            ("progress", ("progress-err", "progress-attempt-ts")),
+            ("progress", (PROGRESS_ERROR_KEY, "progress-attempt-ts")),
             ("roadmap", ()),
             ("overlap-scan", ()),
             ("overlap-fix", ()),
@@ -527,6 +559,55 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 work_units._run_github_stage("fix", launch, worker, None, candidate, None, False)
         self.assertEqual(worker.counters.read("fix-7-aaaaaaaaaaaa"), 1)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
+
+    def test_refusal_does_not_mask_typed_pauses_or_launched_tool_failures(self):
+        from tauceti_worker.config import Die, VerificationUnavailable
+
+        cfg = SimpleNamespace(state=self.root / "worker")
+        worker = SimpleNamespace(cfg=cfg, counters=Counters(cfg))
+        candidate = SimpleNamespace(pr=7, head="a" * 40)
+        for paid in (False, True):
+            for error in (VerificationUnavailable("verification queue"), Die("tool failed")):
+                if not paid and isinstance(error, Die):
+                    continue  # A pre-inference parsing exception can represent the refused result.
+                with self.subTest(paid=paid, error=error):
+                    self.budget.configure(set_grant=100)
+                    with ClaudeAPIContext("worker1", "fix"):
+
+                        def launch(*_, paid=paid, error=error):
+                            if paid:
+                                self.assertEqual(self.run_claude().returncode, 0)
+                            self.budget.configure(set_grant=0)
+                            self.assertEqual(self.run_claude().returncode, 75)
+                            raise error
+
+                        with self.assertRaises(type(error)) as caught:
+                            work_units._run_github_stage("fix", launch, worker, None, candidate, None, False)
+                        self.assertIs(caught.exception, error)
+
+    def test_bridge_preflight_cooldown_stops_before_setup(self):
+        self.budget.cooldown("opus", 60)
+        context = ClaudeAPIContext("worker1", "fix", model="opus")
+        with self.assertRaisesRegex(AdmissionUnavailable, "throughput cooldown"):
+            with context:
+                self.fail("cooling model reached stage launch")
+        self.assertFalse(context.directory.exists())
+
+    def test_secondary_engine_cannot_report_success_for_entirely_refused_work(self):
+        cfg = SimpleNamespace(state=self.root / "worker")
+        worker = SimpleNamespace(cfg=cfg, counters=Counters(cfg))
+        candidate = SimpleNamespace(pr=7, head="a" * 40)
+        with ClaudeAPIContext("worker1", "fix"):
+
+            def launch(*_):
+                worker.counters.incr("fix-7-aaaaaaaaaaaa")
+                self.budget.configure(set_grant=0)
+                self.assertEqual(self.run_claude().returncode, 75)
+                return 0  # External engine swallowed the refused child's exit.
+
+            with self.assertRaises(AdmissionUnavailable):
+                work_units._run_github_stage("fix", launch, worker, None, candidate, None, False)
+        self.assertEqual(worker.counters.read("fix-7-aaaaaaaaaaaa"), 0)
 
     def test_policy_expiry_or_malformed_policy_between_bridge_and_launch(self):
         policy = self.root / "admission.json"
@@ -981,7 +1062,7 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
         ):
             with patch.object(loop.time, "sleep", side_effect=sleep):
                 loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude")
-        self.assertEqual(waits, [5, 5])
+        self.assertEqual(waits, [5, 10])
 
     def test_loop_queue_refresh_failure_is_recoverable(self):
         from tauceti_worker.constants import EX_ADMISSION_WAIT

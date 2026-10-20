@@ -924,7 +924,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     Restore only this stage's attempt counters. Provider costs already settled remain costs, and
     successful work is never rolled back just because a later cleanup request hit a limit.
     """
-    from .claude_api import blocked_failure
+    from .claude_api import blocked_failure, check_result
     from .config import AdmissionUnavailable, GitHubUnavailable
     from .github_transport import blocked_since, blocking_event_since
 
@@ -939,7 +939,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "rebase": (rebase_key,),
         "bump": (f"bump-{pr}-{head}", f"bump-pr-{pr}"),
         "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
-        "progress": ("progress-err",),
+        "progress": (PROGRESS_ERROR_KEY,),
     }.get(stage, ())
     before = {key: w.counters.read(key) for key in keys}
     admission_keys = (*keys, "progress-attempt-ts") if stage == "progress" else keys
@@ -955,12 +955,17 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     def refund_admission():
         # Only a refusal before the unit's first admission can undo an attempt.
         from .claude_api import CURRENT_CONTEXT
+        from .fleet_capacity import unit_admitted
 
-        if CURRENT_CONTEXT is not None and CURRENT_CONTEXT.invocations:
+        if (CURRENT_CONTEXT is not None and CURRENT_CONTEXT.invocations) or unit_admitted():
             return
         for key, value in admission_before.items():
             w.counters.write(key, min(value, w.counters.read(key)))
-        if foreign_receipt is not None and not had_foreign_receipt:
+        if (
+            foreign_receipt is not None
+            and not had_foreign_receipt
+            and (CURRENT_CONTEXT is not None or unit_admitted() is False)
+        ):
             foreign_receipt.unlink(missing_ok=True)
 
     def pause():
@@ -974,8 +979,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
 
     try:
         rc = fn(w, sv, c, opts, bubble)
-        if rc != 0 and (failure := blocked_failure()):
-            raise failure
+        check_result(rc)
     except AdmissionUnavailable:
         refund_admission()
         raise
@@ -983,9 +987,20 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         for key, value in before.items():
             w.counters.write(key, min(value, w.counters.read(key)))
         raise error
+    except NoProgress as error:
+        # Preserve verification, lease/cache, and other independently typed pauses.
+        if type(error) is NoProgress and blocked_since(started):
+            pause()
+        raise
     except Exception:
-        # Secondary engines can raise while interpreting an empty refused result.
-        if isinstance(failure := blocked_failure(), AdmissionUnavailable):
+        # Only pre-inference parsing failures can stand in for a refused result.
+        from .claude_api import CURRENT_CONTEXT
+
+        if (
+            CURRENT_CONTEXT is not None
+            and not CURRENT_CONTEXT.invocations
+            and isinstance(failure := blocked_failure(), AdmissionUnavailable)
+        ):
             refund_admission()
             raise failure from None
         if blocked_since(started):
@@ -1147,6 +1162,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     from .claude_api import admission_failure, api_context, api_mode
 
     with contextlib.ExitStack() as stack:
+        from .fleet_capacity import admission_unit
+
+        stack.enter_context(admission_unit(w.cfg.wid if w is not None and hasattr(w, "cfg") else ""))
         try:
             stack.enter_context(
                 api_context(
@@ -1266,10 +1284,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"review #{pr}",
             )
         log(f"  review #{pr}: engine rc={rc}")
-        from .claude_api import blocked_failure
+        from .claude_api import check_result
 
-        if rc != 0 and (failure := blocked_failure()):
-            raise failure
+        check_result(rc)
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without completing a review" streak up front — BEFORE the publish step, which is
@@ -1634,7 +1651,8 @@ def _do_fixlike(
         if not scope or (scope.pr, scope.head) != (pr, head):
             return decline_foreign_repair()
         # Existing counter storage supplies fsync + atomic replace. The receipt
-        # also blocks a restart if preparation fails/refunds before a paid agent.
+        # blocks a restart on preparation failure; a typed pre-inference refusal
+        # restores this launch allowance without removing existing checkpoints.
         w.counters.record_foreign_repair_launch(pr, head, scope.evidence_base, foreign)
     from .verification import begin_attempt
 

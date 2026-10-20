@@ -998,6 +998,9 @@ def run_agent_proc(
     def run_rendered(destination) -> int:
         if cancel_event is not None and cancel_event.is_set():
             raise NoProgress("shared lease lost before agent launch")
+        from .fleet_capacity import check_launch_admission
+
+        check_launch_admission()
         boundary = containment.Boundary(label, prefix=containment_prefix, contain=contain)
         command = boundary.argv(argv)
         # A separate group permits lease-loss cancellation without signalling
@@ -1135,7 +1138,9 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     streams to the terminal instead. Tails logf to the main log on a non-zero exit so failures aren't
     silent. The caller logs a one-line pointer to logf so the detail is discoverable."""
     from .claude_api import review_environment
+    from .fleet_capacity import check_launch_admission
 
+    check_launch_admission()
     api_env = review_environment()
     if label.startswith("review #"):
         api_env = {**(os.environ if api_env is None else api_env), "TAUCETI_GITHUB_HISTORY_BRIDGE": "1"}
@@ -2237,6 +2242,9 @@ def run_in_bubble(
                 contain=False,  # the agent runs in Bubble's container, not on this host
             )
         else:  # review engine / probe — leave its output inline
+            from .fleet_capacity import check_launch_admission
+
+            check_launch_admission()
             rc = subprocess.run(argv, env=env).returncode
     finally:
         try:

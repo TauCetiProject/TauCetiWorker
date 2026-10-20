@@ -18,12 +18,34 @@ class BudgetError(ValueError):
     pass
 
 
-def admission_pause(snapshot):
-    """Preflight funding and ledger integrity; missing receipts are audit work."""
+def admission_pause(snapshot, *, worker=None, model=None, now=None):
+    """Cheap preflight; invocation admission remains the authoritative atomic check."""
+    now = time.time() if now is None else now
+    waiting = snapshot.get("waiting", [])
+    if model is None and worker is not None:
+        previous = next((item for item in waiting if item["worker"] == worker), None)
+        model = previous.get("model") if previous else None
     if snapshot.get("ledger_repair_required"):
         return "ledger repair requires reconciliation"
+    if model and snapshot.get("cooldowns", {}).get(model, 0) > now:
+        return "API throughput cooldown"
+    if model and model in snapshot.get("calibrating_models", []):
+        return "waiting for calibration session cost"
     if money(snapshot["available"]) <= 0 or money(snapshot["available"]) < money(snapshot["admission_threshold"]):
         return "waiting for funding"
+    if worker is not None and model:
+        first = min(
+            (
+                item
+                for item in waiting
+                if item.get("model") == model
+                and item["reason"] in {"waiting for funding", "waiting behind another worker"}
+            ),
+            key=lambda item: (item["since"], item["ticket"]),
+            default=None,
+        )
+        if first and first["worker"] != worker:
+            return "waiting behind another worker"
     return None
 
 
@@ -365,6 +387,11 @@ class Budget:
             clock_backwards=money(now) < state["watermark"],
             ledger=str(self.ledger),
             cooldowns=state["cooldowns"],
+            calibrating_models=[
+                name
+                for name in {s["model"] for s in active if s["status"] == "active"}
+                if not self.estimate(state, name)[0]
+            ],
         )
 
     def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None):

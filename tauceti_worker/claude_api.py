@@ -31,6 +31,15 @@ def blocked_failure():
     return None
 
 
+def check_result(rc):
+    """Some engines swallow child exits; an entirely refused unit still waited."""
+    from .config import AdmissionUnavailable
+
+    if failure := blocked_failure():
+        if rc != 0 or (isinstance(failure, AdmissionUnavailable) and not CURRENT_CONTEXT.invocations):
+            raise failure
+
+
 def admission_failure(message, *, state=None):
     from .config import AdmissionUnavailable, NoProgress
 
@@ -144,7 +153,7 @@ class ClaudeAPIContext:
             raise admission_failure(reason, state="waiting-capacity")
         if self.enabled:
             snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
-            reason = admission_pause(snapshot)
+            reason = admission_pause(snapshot, worker=self.worker, model=self.model)
             if reason:
                 if reason == "waiting for funding" and self.model:
                     self.budget.wait_for_funding(self.worker, self.model, self.phase)
