@@ -19,6 +19,7 @@ from process_cleanup import running
 
 from tauceti_worker.verification import (
     Verification,
+    _HashCache,
     atomic,
     inventory,
 )
@@ -423,12 +424,18 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
     def test_content_cache_rechecks_changed_ctime(self):
         self.verify(stage="build")
         before = sum(
-            map(len, json.loads((self.state / "verification-hashes-v2.json").read_text())["directories"].values())
+            map(
+                len,
+                _HashCache.directories(json.loads((self.state / "verification-hashes-v2.json").read_text())).values(),
+            )
         )
         write(self.root, "TauCeti/A.lean", "changed input\n")
         result = self.verify(stage="build")
         after = sum(
-            map(len, json.loads((self.state / "verification-hashes-v2.json").read_text())["directories"].values())
+            map(
+                len,
+                _HashCache.directories(json.loads((self.state / "verification-hashes-v2.json").read_text())).values(),
+            )
         )
         self.assertGreater(after, before)
         self.assertNotIn("reused_from", result["phases"]["build"])

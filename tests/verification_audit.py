@@ -24,7 +24,7 @@ from tauceti_worker.verification_jobs import resume_pending
 def hash_cache_entries(payload):
     return {
         key: dict(path=directory, sha256=value)
-        for directory, values in payload["directories"].items()
+        for directory, values in v._HashCache.directories(payload).items()
         for key, value in values.items()
     }
 
@@ -44,10 +44,11 @@ class Recovery(Receipts):
         v.atomic(legacy, {key: value["sha256"] for key, value in entries.items()})
         original_legacy = legacy.read_bytes()
         current.unlink()
+        v._HashCache(self.state, self.root).marker.unlink()
         # A deadline before full preparation must not retire the remaining legacy hashes.
         waiting = self.verify(stage="build", deadline=time.time() - 1)
         self.assertEqual(waiting["status"], "incomplete")
-        self.assertFalse(v.read_json(current)["legacy_imported_roots"])
+        self.assertFalse(v._HashCache(self.state, self.root).imported)
         # This case tests cache migration in the original workspace; recovery ownership
         # and the independent snapshot are exercised separately in the recovery fixtures.
         Path(waiting["continuation_job"]).unlink()
@@ -79,7 +80,7 @@ class Recovery(Receipts):
             )
             self.assertNotIn(self.prefix / "lib/immutable-0", hashed, "retain valid stat-keyed payload hashes")
             compact = real_read(current)
-            self.assertIn(v.digest(str(self.root.resolve())), compact["legacy_imported_roots"])
+            self.assertTrue(v._HashCache(self.state, self.root).imported)
             self.assertLess(len(hash_cache_entries(compact)), 200)
             self.assertFalse(
                 any(Path(e["path"]).is_relative_to(self.prefix) for e in hash_cache_entries(compact).values())
@@ -128,6 +129,7 @@ class Recovery(Receipts):
         legacy = self.state / "verification-hashes.json"
         v.atomic(legacy, {key: value["sha256"] for key, value in entries.items()})
         current.unlink()
+        v._HashCache(self.state, self.root).marker.unlink()
         waiting = self.verify(stage="build", deadline=time.time() - 1)
         pending = Path(waiting["continuation_job"])
         job = v.read_json(pending)
@@ -136,7 +138,7 @@ class Recovery(Receipts):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
         self.assertEqual(v.read_json(self.state / "verification-jobs" / pending.name)["status"], "success")
-        self.assertNotIn(v.digest(str(self.root.resolve())), v.read_json(current)["legacy_imported_roots"])
+        self.assertFalse(v._HashCache(self.state, self.root).imported)
         real_digest = hashlib.file_digest
         hashed = []
 
@@ -162,7 +164,79 @@ class Recovery(Receipts):
         second.save({})
         payload = v.read_json(first.path)
         self.assertEqual(len(hash_cache_entries(payload)), 2)
-        self.assertEqual(set(payload["legacy_imported_roots"]), {first.root, second.root})
+        self.assertTrue(first.marker.is_file())
+        self.assertTrue(second.marker.is_file())
+
+    def test_current_hashes_survive_history_eviction_in_alphabetically_early_directories(self):
+        old = v._HashCache(self.state)
+        for directory in ("aaa-live", "zzz-old", "zzz-older"):
+            for index in range(3):
+                old.put(v.digest([directory, index]), str(self.home / directory / str(index)), "1" * 64)
+        old.save({})
+        current = v._HashCache(self.state)
+        key = v.digest(["aaa-live", 0])
+        self.assertEqual(current.lookup(key, str(self.home / "aaa-live/0")), "1" * 64)
+        fresh = v.digest("new-live-key")
+        current.put(fresh, str(self.home / "aaa-live/fresh"), "2" * 64)
+        with patch.object(v, "HASH_CACHE_LIMIT", 4):
+            current.save({})
+        entries = hash_cache_entries(v.read_json(current.path))
+        self.assertEqual(len(entries), 4)
+        self.assertIn(key, entries)
+        self.assertIn(fresh, entries)
+
+    def test_stale_untouched_inventory_cannot_restore_pruned_records(self):
+        old = v._HashCache(self.state)
+        old.put("a" * 64, str(self.prefix / "lib/obsolete"), "1" * 64)
+        old.save({})
+        stale = v._HashCache(self.state)
+        prune = v._HashCache(self.state)
+        prune.save({self.prefix})
+        stale.put("b" * 64, str(self.root / "fresh"), "2" * 64)
+        stale.save({})
+        entries = hash_cache_entries(v.read_json(stale.path))
+        self.assertNotIn("a" * 64, entries)
+        self.assertIn("b" * 64, entries)
+
+    def test_fresh_candidates_skip_opaque_history_and_do_not_retire_original_migration(self):
+        legacy = self.state / "verification-hashes.json"
+        v.atomic(legacy, {"a" * 64: "1" * 64})
+        real_read = v.read_json
+        with patch.object(v, "read_json", wraps=real_read) as reads:
+            for index in range(2):
+                root = self.home / f"candidate-{index}"
+                cache = v._HashCache(self.state, root, fresh_candidate=True)
+                self.assertIsNone(cache.lookup("b" * 64, str(root / "Source.lean")))
+                cache.put("b" * 64, str(root / "Source.lean"), "2" * 64)
+                cache.finish_import()
+                cache.save({})
+            self.assertFalse(v._HashCache(self.state, self.root).imported)
+        self.assertFalse(any(call.args[0] == legacy for call in reads.call_args_list))
+
+    def test_direct_hashes_survive_other_writers_with_different_executables(self):
+        first, second = v._HashCache(self.state), v._HashCache(self.state)
+        a, b = "a" * 64, "b" * 64
+        first.lookup(a, str(self.prefix / "bin/first"))
+        first.put(a, str(self.prefix / "bin/first"), "1" * 64)
+        first.save({self.prefix})
+        second.lookup(b, str(self.prefix / "bin/second"))
+        second.put(b, str(self.prefix / "bin/second"), "2" * 64)
+        second.save({self.prefix})
+        self.assertEqual(set(hash_cache_entries(v.read_json(first.path))), {a, b})
+
+    def test_hash_cache_lock_wait_is_bounded_and_optional(self):
+        import fcntl
+
+        self.state.mkdir(exist_ok=True)
+        cache = v._HashCache(self.state)
+        with cache.path.with_suffix(".lock").open("a+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            start = time.monotonic()
+            with self.assertRaises(BlockingIOError):
+                cache.save({})
+            self.assertLess(time.monotonic() - start, 2)
+            result = self.verify(stage="build")
+            self.assertEqual(result["status"], "success", result.get("error"))
 
     def test_optional_hash_cache_write_failure_preserves_completed_result_and_status(self):
         with (
@@ -847,7 +921,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             finally:
                 v._HASH_CACHE.reset(token)
             cache.save(installation.validated)
-            self.assertEqual(v.read_json(cache.path)["directories"], {})
+            self.assertEqual(v.read_json(cache.path)["directories"], [])
             original_cache_size = cache.path.stat().st_size
             self.assertEqual(metrics["bytes"], 122880000)
             cold_metrics = dict(metrics)

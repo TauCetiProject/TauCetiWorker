@@ -77,12 +77,16 @@ bounded. Receipts and logs remain retained; there is no automatic deletion of in
 After an immutable identity validates, inventory-only hashes for it are omitted from the persisted
 `verification-hashes-v2.json` cache. Individually fingerprinted executable hashes remain cached even
 inside that installation. Directory paths are stored once; mutable input records remain bounded at
-200,000. Cache saves merge concurrent updates under a short per-state lock and an unavailable cache
+200,000. Directory/key recency survives serialization and keeps actively used hashes ahead of cold history.
+Cache saves merge only touched keys under a bounded one-second per-state lock; an unavailable cache
 cannot change the verification result or skip runtime cleanup.
 Migration imports matching V1 stat-keyed hashes without rereading their payloads until each workspace
 completes preparation. Early deadlines and isolated continuations retain migration eligibility for
-the original workspace. The cache keeps at most 128 completed workspace markers; warm preparation
-in those workspaces reads only V2, including after source changes. The V1 file remains intact for
+the original workspace. Completion markers live separately in `verification-hash-roots/`, with one exact lookup per
+workspace and no history scan. Warm preparation in migrated workspaces reads only V2, including
+after source changes. Fresh isolated candidates skip opaque V1 history with nonmatching paths/inodes.
+Repeated continuations reuse their V2 hashes. A toolchain switch may require one new payload hash
+if its stat key is absent from V2, even when an old V1 file has that key. The V1 file remains intact for
 rollback and may be removed once rollback support is no longer needed. Immutable identity files and
 receipt indexes keep their existing formats.
 The warm bound assumes a matching validated installation identity. A new identity after a reboot,
