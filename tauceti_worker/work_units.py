@@ -41,6 +41,7 @@ from .agents import (
     wrapper_bin,
 )
 from .config import (
+    ClaimCollision,
     Config,
     Die,
     NoProgress,
@@ -540,6 +541,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
+    claim_collision = False
     for stage in round_stages(opts):
         if not want(opts.only, stage):
             continue
@@ -553,13 +555,16 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                 and _branch_claimed_elsewhere(w, c.pr)
             ):
                 log(f"Global PR work: {stage} #{c.pr} claimed by a peer — skipping before fresh PR reads")
+                claim_collision = True
                 declined.append((stage, c.pr))
                 continue
             if global_pick and c.pr:
                 p = next((p for p in sv.open_prs if p.number == c.pr), None)
                 areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
                 log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
+            collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
             rc = dispatch(stage, w, sv, c, opts)
+            claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
             if rc is not None:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
             declined.append((stage, c.pr))
@@ -596,7 +601,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         # at a reason that was never printed.
         for stage, pr in declined:
             log(f"  --pr #{pr}: {stage} candidate was offered but not taken (claimed by a peer, or re-checked stale)")
-        raise NoProgress(
+        error = ClaimCollision if claim_collision else NoProgress
+        raise error(
             f"nothing actionable on the requested PR(s) {', '.join(f'#{n}' for n in opts.prs)} this "
             f"round ({scope}) — see the per-PR reasons above; no unrelated work was done"
         )
@@ -610,7 +616,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     for stage in ("overlap-fix", "overlap-scan"):
         if stage in opts.only and sv.kind(stage).suppressed:
             raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
-    raise NoProgress(f"no eligible work this round under {scope}")
+    error = ClaimCollision if claim_collision else NoProgress
+    raise error(f"no eligible work this round under {scope}")
 
 
 # Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a

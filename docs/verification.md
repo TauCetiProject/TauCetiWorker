@@ -23,7 +23,7 @@ bind evidence to. Unknown lint scope remains incomplete instead of silently esta
 A stage-only build or audit does not claim the skipped requested lint succeeded.
 
 All stages run the whole-library `lake build --iofail`, fast changed-file axiom diagnostics,
-module-system, source style lint, changed-module environment lint, and the shim ratchet.
+module-system, source style lint, changed-module environment/documentation lint, and the shim ratchet.
 A stage-only call runs that stage; it does not assert that prerequisites or other stages passed.
 The shim checker receives merge-base source and registry snapshots, strict `--fail-on-available`,
 and `--only-new` for unchanged pins outside bump policy. Older source revisions without the checker
@@ -31,6 +31,13 @@ record an empty shim phase. CI still owns whole-library environment lint. For fa
 modules, `--lint-modules /absolute/list` adds validated existing dotted TauCeti module names to the
 local lint list; its contents are fingerprinted. Use the same option for final verification. Write this
 list and any extra diagnostic logs outside the checkout; untracked checkout files are inputs.
+
+Local environment lint uses the Worker-owned `LocalLint.lean` checker, compiled once and
+shared across workers with the same toolchain and dependency content. It imports only the
+explicit module list and checks declarations owned by those modules, including documentation
+and `nolint` entries. Imported dependency declarations are excluded. Empty or theorem-only
+documentation scopes are valid. Older PR scripts cannot restore a whole-project documentation
+scan: local verification never invokes their `lint-env.sh`. CI retains its full-library coverage.
 
 Local axiom checks use the bundled `scripts/LocalAxioms.lean`, through the absolute
 `scripts/tauceti-local-axioms --modules FILE` wrapper. They read only the selected modules' own

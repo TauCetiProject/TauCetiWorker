@@ -83,11 +83,16 @@ Path(sys.argv[sys.argv.index('-o') + 1]).chmod(0o755)
         )
         leanc.chmod(0o755)
         self.bin = self.home / "bin"
+        local_lint_checker = (
+            "#!"
+            + sys.executable
+            + "\nimport sys,json\nfrom pathlib import Path\nmods=Path(sys.argv[1]).read_text().splitlines()\nprint(Path(sys.argv[2]).read_text() + ' ' + json.dumps(dict(modules=len(mods),declarations=0,doc_scanned=0,linters=1,nolints=[],findings=[])))\n"
+        )
         fake = write(
             self.bin,
             "lake",
             f"""#!{sys.executable}
-import os, sys, time
+import os, sys, time, subprocess
 from pathlib import Path
 args = sys.argv[1:]
 if '--version' in args or '--print-prefix' in args:
@@ -111,6 +116,15 @@ p = Path('.lake'); p.mkdir(exist_ok=True)
 with (p/'calls').open('a') as f: f.write(' '.join(args)+' AXIOMS='+os.environ.get('AXIOMS_ONLY_MODULES','')+'\\n')
 mode = os.environ.get('FIXTURE_MODE', '')
 if mode == 'fail': sys.exit(23)
+if args == ['build', 'local-lint']:
+    target = p/'build/bin/local-lint'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text({local_lint_checker!r})
+    target.chmod(0o755)
+    sys.exit(0)
+if len(args) > 1 and args[0] == 'env' and Path(args[1]).is_file() and Path(args[1]).name not in ('lean','python3'):
+    sys.exit(subprocess.run(args[1:]).returncode)
+
 if mode == 'bad-axiom-after-build' and args[0] == 'build': (p/'axiom-invalid').touch()
 if mode == 'mutation':
     source = Path('TauCeti/A.lean'); before = source.read_text(); source.write_text('changed'); source.write_text(before)
@@ -147,6 +161,8 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_VERIFY_HELPER="1",
             TAUCETI_PROCESS_CONTAINMENT="invalid-old-policy",
             TAUCETI_VERIFY_STATE=str(self.state),
+            TAUCETI_LOCAL_LINT_CACHE=str(self.home / "local-lint-cache"),
+            TAUCETI_VERIFY_MIN_FREE_PERCENT="0",
             TAUCETI_VERIFY_STORAGE_DIR=str(self.home / "verification-storage"),
             TAUCETI_VERIFY_STORAGE_BYTES=str(512 * 1024**2),
             TAUCETI_VERIFY_CANDIDATE_BYTES=str(64 * 1024**2),
@@ -464,8 +480,9 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
-        lint = next(c for c in result["commands"] if "scripts/lint-env.sh" in c["argv"])
-        self.assertIn("TauCeti.B", Path(lint["log"]).read_text())
+        lint = next(c for c in result["commands"] if "tauceti_worker.local_lint" in c["argv"])
+        self.assertIn("TauCeti.B", Path(lint["argv"][-1]).read_text())
+        self.assertFalse(any("scripts/lint-env.sh" in c["argv"] for c in result["commands"]))
         modules.write_text("TauCeti.A\n")
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertNotIn("reused_from", result["phases"]["lint"])

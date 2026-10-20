@@ -152,6 +152,8 @@ EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without fail
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
 EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outside the round timeout
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
+EX_RECOVERY_IDLE = 80  # Mechanical recovery found no available work; select normal work immediately
+EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 

@@ -233,6 +233,7 @@ class Claims:
         # cancellation event, so a lost claim cancels the owned agent process group.
         self.lost = threading.Event()
         self._stopped = threading.Event()
+        self.collisions = 0
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -247,6 +248,7 @@ class Claims:
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
         rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 1:
+            self.collisions += 1
             log(f"branch #{pr} claimed by another worker — skipping (COOP dedup)")
             return False
         os.environ["TAUCETI_PUSH_REF"] = refname
