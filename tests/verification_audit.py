@@ -23,6 +23,61 @@ from tauceti_worker.verification_jobs import resume_pending
 
 class Recovery(Receipts):
     # Reuse the private Git/fake-verifier fixture; load_tests collects only these audit cases.
+    def test_candidate_symlinks_cannot_redirect_cleanup_or_verification(self):
+        for isolated in (False, True):
+            with self.subTest(isolated=isolated):
+                result = self.verify(stage="build", deadline=time.time() - 1)
+                path = Path(result["continuation_job"])
+                job = v.read_json(path)
+                candidate = self.state / "verification-candidates" / job["id"]
+                sentinel = self.home / ("sentinel-" + job["id"])
+                candidate.rename(sentinel)
+                marker = sentinel / ".lake/keep"
+                marker.parent.mkdir(exist_ok=True)
+                marker.write_text("preserved")
+                candidate.symlink_to(sentinel, target_is_directory=True)
+                job.update(isolated=isolated, next_at=0, root=str(candidate if isolated else self.root))
+                v.atomic(path, job)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+                complete = v.read_json(self.state / "verification-jobs" / path.name)
+                self.assertEqual(complete["status"], "incomplete")
+                self.assertIn("not an owned candidate", complete["error"])
+                self.assertEqual(marker.read_text(), "preserved")
+                self.assertTrue(candidate.is_symlink())
+                self.assertFalse((sentinel / ".lake/calls").exists())
+
+    def test_candidate_parent_symlink_is_not_an_owned_snapshot_directory(self):
+        result = self.verify(stage="build", deadline=time.time() - 1)
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        candidates = self.state / "verification-candidates"
+        foreign = self.home / "foreign-candidates"
+        candidates.rename(foreign)
+        candidates.symlink_to(foreign, target_is_directory=True)
+        job.update(next_at=0, isolated=False, root=str(self.root))
+        v.atomic(path, job)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        complete = v.read_json(self.state / "verification-jobs" / path.name)
+        self.assertEqual(complete["status"], "incomplete")
+        self.assertIn("not an owned candidate", complete["error"])
+        self.assertTrue((foreign / job["id"] / "TauCeti/A.lean").is_file())
+
+    def test_snapshot_cleanup_cannot_remove_its_source(self):
+        result = self.verify(stage="build", deadline=time.time() - 1)
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        candidate = Path(job["root"])
+        job.update(next_at=0, isolated=False)
+        v.atomic(path, job)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        complete = v.read_json(self.state / "verification-jobs" / path.name)
+        self.assertEqual(complete["status"], "incomplete")
+        self.assertIn("overlaps its source", complete["error"])
+        self.assertEqual(v.digest(v.inventory(candidate, job["base"])), job["source_digest"])
+
     def test_symlinked_worker_state_resumes_existing_and_new_snapshots(self):
         alias = self.home / "runtime-state"
         alias.symlink_to(self.state, target_is_directory=True)
