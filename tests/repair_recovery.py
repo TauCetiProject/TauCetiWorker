@@ -291,7 +291,7 @@ class Fixture(unittest.TestCase):
 
         def die(path, target):
             result = original(path, target)
-            if Path(target).name == "source-checkout":
+            if Path(target).name.startswith("restore-delta-source-"):
                 raise Death()
             return result
 
@@ -1879,6 +1879,42 @@ class Fixture(unittest.TestCase):
         self.assertEqual(handoffs, [])
         rr.return_handoffs(handoffs)
         self.assertEqual(self.journal()["state"], "obsolete")
+
+    def test_handoff_finds_nonsequential_receiving_checkpoint_by_round_index(self):
+        with patch("tauceti_worker.activity.current_round_id", return_value="receiving-round"):
+            self.handoff()
+        owner = {**self.owner, "round_id": "receiving-round"}
+        (self.co / "A.lean").write_text("first partial source\n")
+        first = saved._record(self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=owner)
+        (self.co / "A.lean").write_text("latest partial source\n")
+        latest = saved._record(self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=owner)
+        self.assertNotEqual(latest, first)
+        self.assertNotIn(latest.name, [f"receiving-round.{n}" for n in range(2, 9)])
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["checkpoint"], str(latest))
+        self.assertEqual(self.journal()["handoff"]["state"], "transferred")
+
+    def test_reintegration_cache_cleanup_uses_bounded_housekeeping(self):
+        self.rewritten_checkpoint()
+        checkout = self.backend.restore(self.record, self.manifest, {})
+        cache = checkout / ".lake/build/cache"
+        cache.parent.mkdir(parents=True)
+        cache.write_bytes(b"rebuildable")
+        with patch(
+            "tauceti_worker.recovery_maintenance._evict_caches", side_effect=AssertionError("foreground cache walk")
+        ):
+            self.assertTrue(self.run_recovery())
+        archived = Path(self.journal()["delta_integration"]["archived"])
+        self.assertEqual(archived.parent, self.record)
+        self.assertTrue((archived / ".lake").exists())
+        with (
+            patch.object(saved, "owner_stopped", return_value=True),
+            patch.object(saved, "live_users", return_value=[]),
+        ):
+            saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
+        self.assertFalse((archived / ".lake").exists())
+        self.assertTrue((archived / "A.lean").is_file())
+        self.assertEqual(saved._complete(self.record), self.manifest)
 
     def test_gc_cannot_prune_reintegration_lineage_inputs(self):
         self.rewritten_checkpoint(conflicting=True)

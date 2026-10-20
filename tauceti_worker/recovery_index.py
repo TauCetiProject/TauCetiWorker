@@ -89,6 +89,15 @@ def remember(state: Path, record: Path, manifest: dict, *, verified: bool, evide
                     raise
                 time.sleep(0.001)
         _remember(state, record, manifest, verified=verified, evidence=evidence, fingerprint=fingerprint)
+        if fingerprint is None and manifest.get("source_round"):
+            _remember(
+                state,
+                record,
+                manifest,
+                verified=verified,
+                evidence=evidence,
+                fingerprint=f"round:{manifest['source_round']}",
+            )
 
 
 def _remember(state: Path, record: Path, manifest: dict, *, verified: bool, evidence=None, fingerprint=None) -> None:

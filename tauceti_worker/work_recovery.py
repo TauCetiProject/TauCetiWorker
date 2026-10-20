@@ -837,6 +837,17 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
             _fsync_dir(record)
         if snap.unpublished:
             _remember_commits(cfg.state, record, _read_manifest(record), snap)
+        manifest = _read_manifest(record)
+        if manifest.get("source_round"):
+            with contextlib.suppress(OSError, ValueError):
+                recovery_index.remember(
+                    cfg.state,
+                    record,
+                    manifest,
+                    verified=True,
+                    evidence=recovery_index.stamps(record, manifest),
+                    fingerprint=f"round:{manifest['source_round']}",
+                )
         return record
     record_id = base_id
     if (root / record_id).exists():

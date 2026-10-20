@@ -749,7 +749,7 @@ class WorkerBackend:
             checkout_ready=True,
         )
         if archived.exists():
-            saved._evict_caches(archived)
+            self.evict_caches(record)
 
     def reintegrate_delta(
         self, checkout, m, facts, j, expected, *, frozen=None, source_ref=None, force_reasoning=False
@@ -829,10 +829,10 @@ class WorkerBackend:
                 source_checkpoint=(frozen or {}).get("source_checkpoint") or str(checkpoint),
                 object_source=(frozen or {}).get("object_source")
                 or (frozen or {}).get("archived")
-                or str(root / "source-checkout"),
+                or str(self.record / f"restore-delta-source-{root.name}"),
                 previous_source_checkpoint=str(checkpoint),
-                built=str(root / "built"),
-                archived=str(root / "source-checkout"),
+                built=str(self.record / f"restore-delta-built-{root.name}"),
+                archived=str(self.record / f"restore-delta-source-{root.name}"),
                 stage="prepared",
                 has_paid_progress=paid_progress,
                 force_reasoning=force_reasoning,
@@ -853,8 +853,8 @@ class WorkerBackend:
         self.pin_history(checkout, j)
         built = Path(transaction["built"])
         if built.exists():
-            built.rename(root / f"interrupted-{uuid.uuid4().hex}")
-            saved._fsync_dir(root)
+            built.rename(self.record / f"interrupted-restore-delta-{uuid.uuid4().hex}")
+            saved._fsync_dir(self.record)
         patch = Path(transaction["patch"]).read_bytes()
         if hashlib.sha256(patch).hexdigest() != transaction["patch_sha256"]:
             raise RuntimeError("Retained delta payload failed validation")
@@ -1872,11 +1872,16 @@ def reconcile_handoff(cfg, record, j):
         return
     original = read_json(record / "manifest.json")
     if h.get("source_round"):
+        from . import recovery_index
+
         # Round-named preservation records permit bounded point lookups; never
         # rescan the worker's entire history for each unfinished handoff.
         base = saved._safe_id(str(h["source_round"]))
         candidates = [cfg.state / "recovery" / (base if n == 1 else f"{base}.{n}") for n in range(1, MAX_INSPECT + 1)]
-        for other in reversed(candidates):
+        indexed = recovery_index.lookup(cfg.state, original["repository"], f"round:{h['source_round']}")
+        indexed_record = cfg.state / "recovery" / indexed["record"] if indexed else None
+        candidates = ([indexed_record] if indexed_record else []) + list(reversed(candidates))
+        for other in dict.fromkeys(candidates[:MAX_INSPECT]):
             m = read_json(other / "manifest.json")
             if (
                 other != record

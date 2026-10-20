@@ -364,9 +364,9 @@ sandbox recovery and v1 native Git operations whose metadata was not retained
 cannot acquire inferred replay authority. Their exact source remains blocked as
 evidence while fresh normal work continues under current policy. This is a
 machine disposition, not a request for operator action. Source, Git history,
-immutable records and outboxes are preserved; rebuildable caches are evicted
-from terminal and blocked checkouts when the candidate has no observed users.
-An uncertain cache-cleanup candidate is skipped without blocking recovery.
+immutable records and outboxes are preserved; rebuildable caches are queued for bounded housekeeping from terminal and blocked
+checkouts. Recovery integration clones use the same discoverable restoration layout.
+A live or uncertain cleanup candidate is skipped without blocking recovery.
 
 `tauceti recovery --json` and prepared activity expose durable state, reason,
 next machine action and retry condition. Status does not read GitHub. The
