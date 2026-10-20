@@ -36,7 +36,7 @@ def check_result(rc):
     from .config import AdmissionUnavailable
 
     if failure := blocked_failure():
-        if rc != 0 or (isinstance(failure, AdmissionUnavailable) and not CURRENT_CONTEXT.invocations):
+        if rc != 0 or (isinstance(failure, AdmissionUnavailable) and not CURRENT_CONTEXT.launched):
             raise failure
 
 
@@ -123,6 +123,7 @@ class ClaudeAPIContext:
         self.stop = threading.Event()
         self.errors = []
         self.invocations = set()
+        self.launch_failures = set()
         self.admission_ids = {}
         self.models = {}
         self.blocked_reason = None
@@ -131,6 +132,11 @@ class ClaudeAPIContext:
         self.previous_context = os.environ.get("TAUCETI_API_CONTEXT")
         self.previous_cmd = os.environ.get("TAUCETI_CLAUDE_CMD")
         self.parent_context = CURRENT_CONTEXT
+
+    @property
+    def launched(self):
+        # Admissions are conservatively counted until a zero-spend launch failure is confirmed.
+        return bool(self.invocations - self.launch_failures)
 
     def __enter__(self):
         try:
@@ -155,8 +161,8 @@ class ClaudeAPIContext:
             snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
             reason = admission_pause(snapshot, worker=self.worker, model=self.model)
             if reason:
-                if reason == "waiting for funding" and self.model:
-                    self.budget.wait_for_funding(self.worker, self.model, self.phase)
+                if self.model:
+                    self.budget.wait_for_admission(self.worker, self.model, self.phase, reason)
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
                 raise admission_failure(reason, state="waiting-budget")
         self.directory.mkdir(parents=True, mode=0o700)
@@ -215,7 +221,7 @@ class ClaudeAPIContext:
 
             # A context can launch multiple calls or resume a paid session.
             # Once admitted, finish this work unit even if CI takes capacity.
-            if not self.invocations and (reason := fleet_admission_reason(self.worker)):
+            if not self.launched and (reason := fleet_admission_reason(self.worker)):
                 self.blocked_reason = reason
                 self.wait_state = "waiting-capacity"
                 report_runtime(self.wait_state, detail=reason)
@@ -268,6 +274,7 @@ class ClaudeAPIContext:
         if receipt["id"] not in self.invocations:
             raise BudgetError("receipt has no admission in this bridge")
         if receipt["outcome"] == "launch-failed":
+            self.launch_failures.add(receipt["id"])
             self.wait_state = None
             self.blocked_reason = "native Claude launch failed before spending"
         if not self.enabled:

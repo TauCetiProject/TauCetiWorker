@@ -957,7 +957,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         from .claude_api import CURRENT_CONTEXT
         from .fleet_capacity import unit_admitted
 
-        if (CURRENT_CONTEXT is not None and CURRENT_CONTEXT.invocations) or unit_admitted():
+        if (CURRENT_CONTEXT is not None and CURRENT_CONTEXT.launched) or unit_admitted():
             return
         for key, value in admission_before.items():
             w.counters.write(key, min(value, w.counters.read(key)))
@@ -979,6 +979,12 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
 
     try:
         rc = fn(w, sv, c, opts, bubble)
+        from .verification import waiting_for_capacity
+
+        if stage in FILE_CHANGE_STAGES | {"overlap-fix"} and waiting_for_capacity(getattr(w, "cfg", None)):
+            from .config import VerificationUnavailable
+
+            raise VerificationUnavailable("waiting-verification-capacity: verification remains recoverable")
         check_result(rc)
     except AdmissionUnavailable:
         refund_admission()
@@ -998,7 +1004,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
 
         if (
             CURRENT_CONTEXT is not None
-            and not CURRENT_CONTEXT.invocations
+            and not CURRENT_CONTEXT.launched
             and isinstance(failure := blocked_failure(), AdmissionUnavailable)
         ):
             refund_admission()
@@ -1179,12 +1185,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 raise
             raise admission_failure(str(error)) from None
         rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
-    from .verification import waiting_for_capacity
-
-    if stage in FILE_CHANGE_STAGES | {"overlap-fix"} and waiting_for_capacity(w.cfg):
-        from .config import VerificationUnavailable
-
-        raise VerificationUnavailable("waiting-verification-capacity: verification remains recoverable")
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another

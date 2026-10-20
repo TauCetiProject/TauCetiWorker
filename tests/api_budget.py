@@ -75,6 +75,23 @@ class BudgetTests(unittest.TestCase):
             admission_pause(self.budget.snapshot(worker="w", model="opus"), worker="w", model="opus", now=self.now)
         )
 
+    def test_preflight_ignores_orphaned_calibration_bridge_and_admission_recovers_it(self):
+        self.budget.configure(grant=100)
+        bridge = self.directory / "dead-bridge"
+        heartbeat = bridge / "outbox/heartbeat"
+        heartbeat.parent.mkdir(parents=True)
+        heartbeat.touch()
+        os.utime(heartbeat, (self.now, self.now))
+        self.assertTrue(self.budget.admit("calibration", "first", "opus", "fix", bridge=str(bridge))["allowed"])
+        self.budget.wait_for_admission("next", "opus", "fix", "waiting for calibration session cost")
+        snapshot = self.budget.snapshot(worker="next", model="opus")
+        self.assertEqual(admission_pause(snapshot, worker="next", now=self.now), "waiting for calibration session cost")
+        self.now += 31
+        snapshot = self.budget.snapshot(worker="next", model="opus")
+        self.assertIsNone(admission_pause(snapshot, worker="next", now=self.now))
+        self.assertTrue(self.budget.admit("recovered", "next", "opus", "fix")["allowed"])
+        self.assertIn("calibration", self.budget.snapshot()["unresolved"])
+
     def test_grants_set_rate_and_readonly_projection(self):
         self.budget.configure(grant="100", rate="20")
         original = self.budget.ledger.read_bytes()
@@ -592,6 +609,13 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             with context:
                 self.fail("cooling model reached stage launch")
         self.assertFalse(context.directory.exists())
+        snapshot = self.budget.snapshot(worker="worker1")
+        self.assertEqual(admission_pause(snapshot, worker="worker1"), "API throughput cooldown")
+        waiter = snapshot["waiting"][0]
+        with self.assertRaises(AdmissionUnavailable), ClaudeAPIContext("worker1", "fix", model="opus"):
+            self.fail("cooling model reached launch")
+        refreshed = self.budget.snapshot(worker="worker1")["waiting"][0]
+        self.assertEqual((waiter["ticket"], waiter["since"]), (refreshed["ticket"], refreshed["since"]))
 
     def test_secondary_engine_cannot_report_success_for_entirely_refused_work(self):
         cfg = SimpleNamespace(state=self.root / "worker")
@@ -608,6 +632,47 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             with self.assertRaises(AdmissionUnavailable):
                 work_units._run_github_stage("fix", launch, worker, None, candidate, None, False)
         self.assertEqual(worker.counters.read("fix-7-aaaaaaaaaaaa"), 0)
+
+    def test_launch_failure_then_admission_refusal_restores_unspent_attempt(self):
+        cfg = SimpleNamespace(state=self.root / "worker")
+        worker = SimpleNamespace(cfg=cfg, counters=Counters(cfg))
+        candidate = SimpleNamespace(pr=7, head="a" * 40)
+        with ClaudeAPIContext("worker1", "fix") as context:
+
+            def launch(*_):
+                worker.counters.incr("fix-7-aaaaaaaaaaaa")
+                failed = self.run_claude(env={**os.environ, "FAKE_UNLINK_AFTER_AUTH": "1"})
+                self.assertEqual(failed.returncode, 75, failed.stderr)
+                self.assertTrue(context.invocations)
+                self.assertFalse(context.launched)
+                self.budget.configure(set_grant=0)
+                self.assertFalse(context.handle(dict(action="admit", id="c" * 32, model="opus"))["allowed"])
+                return 75
+
+            with self.assertRaises(AdmissionUnavailable):
+                work_units._run_github_stage("fix", launch, worker, None, candidate, None, False)
+        self.assertEqual(worker.counters.read("fix-7-aaaaaaaaaaaa"), 0)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+
+    def test_pending_verification_takes_precedence_over_later_admission_refusal(self):
+        from tauceti_worker.config import VerificationUnavailable
+
+        cfg = SimpleNamespace(state=self.root / "worker")
+        worker = SimpleNamespace(cfg=cfg, counters=Counters(cfg))
+        candidate = SimpleNamespace(pr=7, head="a" * 40)
+        for stage in ("roadmap", "overlap-fix"):
+            with self.subTest(stage=stage):
+                self.budget.configure(set_grant=100)
+                with ClaudeAPIContext("worker1", stage):
+
+                    def launch(*_):
+                        self.assertEqual(self.run_claude().returncode, 0)
+                        self.budget.configure(set_grant=0)
+                        return self.run_claude().returncode
+
+                    with patch("tauceti_worker.verification.waiting_for_capacity", return_value=True):
+                        with self.assertRaises(VerificationUnavailable):
+                            work_units._run_github_stage(stage, launch, worker, None, candidate, None, False)
 
     def test_policy_expiry_or_malformed_policy_between_bridge_and_launch(self):
         policy = self.root / "admission.json"

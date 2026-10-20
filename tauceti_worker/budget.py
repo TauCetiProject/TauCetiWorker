@@ -78,6 +78,18 @@ def bridge_owner_alive(owner):
         return False
 
 
+def orphaned_bridge(session, now):
+    """Use the same liveness evidence for preflight and authoritative admission."""
+    if session["status"] != "active" or not session.get("bridge"):
+        return False
+    heartbeat = Path(session["bridge"]) / "outbox/heartbeat"
+    try:
+        stale = now - heartbeat.stat().st_mtime > 30
+    except FileNotFoundError:
+        stale = True
+    return stale and not bridge_owner_alive(session.get("owner"))
+
+
 def money(value) -> Decimal:
     try:
         number = Decimal(str(value))
@@ -301,6 +313,9 @@ class Budget:
                 self.save_waiting(queue)
 
     def wait_for_funding(self, worker, model, phase):
+        self.wait_for_admission(worker, model, phase, "waiting for funding")
+
+    def wait_for_admission(self, worker, model, phase, reason):
         with self.locked():
             state = self.replay()
             queue = self.waiting_state(state)
@@ -316,7 +331,7 @@ class Budget:
                 ticket=previous.get("ticket", uuid.uuid4().hex),
                 since=previous.get("since", now),
                 seen=now,
-                reason="waiting for funding",
+                reason=reason,
                 estimate=str(estimate),
             )
             self.save_waiting(queue)
@@ -389,7 +404,7 @@ class Budget:
             cooldowns=state["cooldowns"],
             calibrating_models=[
                 name
-                for name in {s["model"] for s in active if s["status"] == "active"}
+                for name in {s["model"] for s in active if s["status"] == "active" and not orphaned_bridge(s, now)}
                 if not self.estimate(state, name)[0]
             ],
         )
@@ -404,15 +419,9 @@ class Budget:
             if resume and not any(resume in s.get("totals", {}) for s in state["sessions"].values()):
                 raise BudgetError("resuming requires a recorded cost baseline for that provider session ID")
             for session in active:
-                if session["status"] == "active" and session.get("bridge"):
-                    heartbeat = Path(session["bridge"]) / "outbox/heartbeat"
-                    try:
-                        orphaned = self.clock() - heartbeat.stat().st_mtime > 30
-                    except FileNotFoundError:
-                        orphaned = True
-                    if orphaned and not bridge_owner_alive(session.get("owner")):
-                        session["status"] = "unresolved"
-                        events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
+                if orphaned_bridge(session, self.clock()):
+                    session["status"] = "unresolved"
+                    events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
             costs, estimate = self.estimate(state, model, phase)
             live = [s for s in active if s["status"] == "active"]
             available = state["balance"] - sum((money(s.get("reserve", s["estimate"])) for s in active), Decimal(0))

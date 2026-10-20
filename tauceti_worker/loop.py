@@ -132,7 +132,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     blocked, reason, snapshot = True, str(error), {}
                 if blocked:
                     wake = snapshot.get("funding_at")
-                    nap = max(1, min(5, (wake - time.time() + 1) if wake else 5))
+                    if reason == "API throughput cooldown":
+                        waiter = next((item for item in snapshot.get("waiting", []) if item["worker"] == cfg.wid), {})
+                        wake = snapshot.get("cooldowns", {}).get(waiter.get("model"))
+                    limit = 60 if reason in ("waiting for funding", "API throughput cooldown") else 5
+                    nap = max(1, min(limit, (wake - time.time() + 1) if wake else limit))
                     report_runtime("waiting-budget", detail=reason, budget=snapshot, next_action_at=time.time() + nap)
                     time.sleep(nap)
                     continue
