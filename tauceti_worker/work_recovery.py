@@ -652,6 +652,12 @@ def live_users(repo: Path) -> list[str]:
     return found
 
 
+MAX_PRUNE_PER_PREPARATION = 3
+# Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks
+# publication bundles in state/<worker>/progress/retained, beside the roadmap clone.
+RETAINED_DIR = "retained-checkouts"
+
+
 def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> Decision:
     """Move the whole checkout aside, unmodified, so preparation can continue on a fresh one.
 
@@ -659,45 +665,87 @@ def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> De
     working there) exactly where it was. The retained copy is saved and removed automatically by a
     later preparation once nothing uses it, so no operator is ever needed."""
     global LAST_REFUSAL
-    parent = repo.parent / "retained"
+    parent = repo.parent / RETAINED_DIR
     dest = parent / f"{repo.name}-{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
     try:
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        owner = read_json(owner_path(cfg, label))
-        if owner:
-            atomic_json(dest.with_name(dest.name + ".owner.json"), owner)
         os.rename(repo, dest)
-        _fsync_dir(parent)
-        _fsync_dir(repo.parent)
     except OSError as error:
         # Neither saved nor movable: leave everything untouched; the next round tries again.
         LAST_REFUSAL = f"{reason}, and moving {repo} aside failed ({error}); the checkout is left intact"
         return Decision(False, LAST_REFUSAL, record, "refused")
+    with contextlib.suppress(OSError):  # durability and attribution are best effort here
+        _fsync_dir(parent)
+        _fsync_dir(repo.parent)
+    owner = read_json(owner_path(cfg, label))
+    if owner:
+        with contextlib.suppress(OSError):
+            atomic_json(dest.with_name(dest.name + ".owner.json"), owner)
     if record is not None:
         _set_status(record, "retained", f"{reason}; checkout moved to {dest}")
     log(f"recovery: {reason}; moved the checkout to {dest} and continuing with a fresh one")
     return Decision(True, reason, record, "retained", dict(retained=str(dest)))
 
 
+def retain(cfg, repo: Path, reason: str, *, label: str = "TauCeti") -> Decision:
+    """Move an unusable checkout (a stale lock, damaged metadata, an interrupted clone) aside whole."""
+    return _retain(cfg, repo, reason, None, label)
+
+
+def _evict_caches(tree: Path) -> None:
+    """Reclaim a retained checkout's dependency and build caches; never its source."""
+    for root, dirs, _ in os.walk(tree, followlinks=False):
+        for name in [d for d in dirs if d in CACHE_DIRS or (root == str(tree) and d in CACHE_TOP)]:
+            path = Path(root) / name
+            if not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+        dirs[:] = [d for d in dirs if d not in CACHE_DIRS and d != ".git"]
+
+
 def _prune_retained(cfg, repo: Path, label: str, repository: str) -> None:
-    """Save and remove retained checkouts that nothing uses any more. Failures keep them for later."""
-    parent = repo.parent / "retained"
+    """Save and remove retained checkouts that nothing uses any more, a few per preparation.
+
+    A copy is removed only after a record of it is durable and a second inspection shows it did not
+    change meanwhile. A copy that cannot be saved keeps its source but loses its caches, so retained
+    checkouts cannot fill the disk with build output. Removal renames to `*.deleting` first, so an
+    interrupted delete is finished later without needing git."""
+    parent = repo.parent / RETAINED_DIR
     if not parent.is_dir():
         return
-    for old in sorted(p for p in parent.glob(f"{repo.name}-*") if p.is_dir()):
+    for doomed in parent.glob("*.deleting"):
+        shutil.rmtree(doomed, ignore_errors=True)
+    budget = MAX_PRUNE_PER_PREPARATION
+    for old in sorted(p for p in parent.glob(f"{repo.name}-*") if p.is_dir() and not p.name.endswith(".deleting")):
+        if budget <= 0:
+            return
+        budget -= 1
         if live_users(old):
             continue
         sidecar = old.with_name(old.name + ".owner.json")
         try:
             snap = inspect(old, _preserved(cfg))
             record = _record(cfg, old, snap, label, repository, owner=read_json(sidecar)) if snap.needs_record else None
+            if live_users(old) or inspect(old, _preserved(cfg)).fingerprint != snap.fingerprint:
+                continue  # something touched it while saving; try again later
+            doomed = old.with_name(old.name + ".deleting")
+            os.rename(old, doomed)
             if record is not None:
                 _set_status(record, "checkout-reset", f"retained checkout {old.name} saved and removed")
-            shutil.rmtree(old)
+            shutil.rmtree(doomed, ignore_errors=True)
             sidecar.unlink(missing_ok=True)
             log(f"recovery: removed retained checkout {old}" + (f"; its source is in {record}" if record else ""))
         except (OSError, subprocess.SubprocessError, RecordError) as error:
-            log(f"recovery: keeping retained checkout {old} for now ({error})")
+            log(f"recovery: keeping retained checkout {old} for now ({error}); evicting its caches")
+            _evict_caches(old)
+
+
+def _dirty_without_inspection(repo: Path) -> bool:
+    """Rollback's only check: does git report anything a reset would discard? Unknown counts as yes."""
+    p = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--ignored=no", "--untracked-files=all"],
+        capture_output=True,
+    )
+    return p.returncode != 0 or bool(p.stdout.strip())
 
 
 def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
@@ -713,7 +761,10 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
     LAST_REFUSAL = ""
     _prune_retained(cfg, repo, label, repository)
     if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
-        return Decision(True, state="disabled")  # rollback: the earlier destructive reuse
+        # Rollback: no inspection or records. A dirty tree is still never reset; it is moved aside.
+        if _dirty_without_inspection(repo):
+            return _retain(cfg, repo, "TAUCETI_WORK_RECOVERY=off and the checkout is dirty", None, label)
+        return Decision(True, state="disabled")
     record = None
     for _ in range(3):
         try:
@@ -721,6 +772,9 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
         except (OSError, subprocess.SubprocessError, RecordError) as error:
             return _retain(cfg, repo, f"could not inspect {repo} ({error})", record, label)
         if snap.published:
+            users = live_users(repo)
+            if users:  # nothing to lose now, but a live writer could still create some
+                return _retain(cfg, repo, "processes still use the checkout: " + ", ".join(users[:8]), None, label)
             _supersede(cfg, repo, None)
             return Decision(True, state="clean")
         if snap.needs_record:

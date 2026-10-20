@@ -583,25 +583,35 @@ def prepare_checkout(
         log(f"cloning {TAUCETI} → {co} ({why})")
         return subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)]).returncode == 0
 
+    if co.exists() and not (co / ".git").is_dir():
+        # An interrupted clone (or anything else without git metadata) would fail every round.
+        if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
+            return False
     if not (co / ".git").is_dir() and not clone("first run"):
         return False
 
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
-    if g("fetch", "-q", "origin"):
-        return False
+    # Before the fetch, so damaged metadata fails inspection and is moved aside rather than failing
+    # every round; a stale view of the remote only makes the guard save more.
     decision = work_recovery.guard(cfg, co)
     if not decision.ok:
         log(f"checkout preparation refused: {decision.reason}")
         return False
     if decision.state == "retained" and not clone("previous checkout moved aside"):
         return False
+    if g("fetch", "-q", "origin"):
+        return False  # usually the network; the next round retries
     # -f discards a prior round's leftover edits (now saved) and lands us on main in one step; a plain
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
-    # branch with only main's content. Bail if even the forced checkout fails.
+    # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
+    # the checkout aside and starts again from a fresh clone instead of failing every round.
     if g("checkout", "-q", "-f", "-B", "main", "origin/main"):
-        return False
+        if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
+            return False
+        if not clone("forced checkout failed") or g("checkout", "-q", "-f", "-B", "main", "origin/main"):
+            return False
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.

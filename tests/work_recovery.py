@@ -203,8 +203,8 @@ def test_full_record(root):
         d_off = wr.guard(other[2], other[1])
     finally:
         del os.environ["TAUCETI_WORK_RECOVERY"]
-    check("rollback: earlier behaviour, no record", d_off.ok and d_off.state == "disabled")
-    check("rollback: no recovery directory", not (other[2].state / "recovery").exists())
+    check("rollback: dirty tree moved aside, not reset", d_off.ok and d_off.state == "retained")
+    check("rollback: no record written", not (other[2].state / "recovery").exists())
 
 
 def test_commits_only(root):
@@ -290,7 +290,7 @@ def test_hidden_source(root):
 
 
 def retained_dirs(co):
-    parent = co.parent / "retained"
+    parent = co.parent / wr.RETAINED_DIR
     return sorted(p for p in parent.iterdir() if p.is_dir()) if parent.is_dir() else []
 
 
@@ -390,6 +390,52 @@ def test_move_aside(root):
     check("summary counts corrupt and damaged", wr.summary(root / "corrupt" / "state")["corrupt"] == 2)
 
 
+def test_broken_git_state(root):
+    """Crash debris never wedges preparation: it is moved aside and a fresh clone used."""
+    origin, co, cfg = fixture(root / "broken")
+    agents = tc.agents
+    saved_sync, saved_url = agents.sync_mathlib_pool, agents.CHECKOUT_URL
+    agents.sync_mathlib_pool = lambda cfg: None
+    agents.CHECKOUT_URL = str(origin)
+    try:
+        (co / ".git" / "index.lock").write_text("")
+        (co / "Draft.lean").write_text("x\n")
+        ok = agents.prepare_checkout(cfg, work="fix")
+        check("stale index.lock: preparation succeeds", ok and not (co / ".git" / "index.lock").exists())
+        check(
+            "stale index.lock: old checkout retained or saved",
+            bool(retained_dirs(co)) or any((cfg.state / "recovery").iterdir()),
+        )
+        subprocess.run(["rm", "-rf", str(co)], check=True)
+        co.mkdir()
+        (co / "partial").write_text("interrupted clone\n")
+        ok = agents.prepare_checkout(cfg, work="fix")
+        check("interrupted clone: preparation succeeds", ok and (co / ".git").is_dir())
+        check(
+            "interrupted clone: debris retained, not deleted", any((d / "partial").exists() for d in retained_dirs(co))
+        )
+    finally:
+        agents.sync_mathlib_pool, agents.CHECKOUT_URL = saved_sync, saved_url
+
+    # A retained copy that cannot be saved keeps its source but loses its caches; a `*.deleting`
+    # leftover from an interrupted removal is finished without git.
+    origin, co, cfg = fixture(root / "evict")
+    parent = co.parent / wr.RETAINED_DIR
+    big = parent / "TauCeti-20260101T000000-aaaaaa"
+    big.mkdir(parents=True)
+    (big / "Source.lean").write_text("unsaved source\n")
+    (big / ".lake").mkdir()
+    (big / ".lake" / "huge.olean").write_bytes(b"x" * 100)
+    doomed = parent / "TauCeti-20250101T000000-bbbbbb.deleting"
+    doomed.mkdir()
+    (doomed / "rest").write_text("half deleted\n")
+    check("eviction fixture ready", (big / ".lake").exists())
+    wr.guard(cfg, co)
+    check("unsavable retained copy keeps its source", (big / "Source.lean").exists())
+    check("unsavable retained copy loses its caches", not (big / ".lake").exists())
+    check("interrupted removal finished", not doomed.exists())
+
+
 def test_live_process(root):
     if not Path("/proc/self").exists():
         print("[SKIP] live-process detection needs /proc")
@@ -417,6 +463,16 @@ def test_live_process(root):
         child.wait()
     d = wr.guard(cfg, co)
     check("process gone: retained copy removed", d.ok and not retained_dirs(co))
+
+    _, co2, cfg2 = fixture(root / "live-clean")
+    child = subprocess.Popen(["sleep", "60"], cwd=co2)
+    try:
+        time.sleep(0.2)
+        d = wr.guard(cfg2, co2)
+    finally:
+        child.kill()
+        child.wait()
+    check("clean but in use: moved aside rather than reset", d.ok and d.state == "retained")
     check(
         "process gone: record reused, not duplicated",
         len([p for p in (cfg.state / "recovery").iterdir() if p.is_dir()]) == 1,
@@ -606,6 +662,7 @@ def main():
             test_hidden_source,
             test_move_aside,
             test_live_process,
+            test_broken_git_state,
             test_late_write,
             test_push_and_owner,
             test_prepare_checkout,

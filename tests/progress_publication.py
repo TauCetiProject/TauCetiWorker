@@ -186,6 +186,10 @@ with (
                 assert wu._do_progress_inner(worker, None) is None
         finally:
             if operation == "clone":
+                # Without .git the directory is moved aside whole before the clone attempt.
+                moved = sorted(d for d in (roadmap.parent / "retained-checkouts").glob("roadmap-*") if d.is_dir())
+                if not roadmap.exists() and moved:
+                    moved[-1].rename(roadmap)
                 backup_git.rename(original_git)
         assert publication.retained(cfg)["attempts"] == 0
         assert publication.fingerprints(work) == original

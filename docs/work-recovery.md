@@ -49,14 +49,20 @@ stop a worker. Preparation always saves first and then always continues:
   matches it; a write that landed after the snapshot is saved too. The checkout
   is then reset in place. Commits are bundled once and marked
   `refs/tauceti/preserved/<record>/...`.
-- **A process still uses the checkout** (Linux `/proc` cwd/root/open files),
-  saving fails (no space, permissions, the archive bound, a git error), or the
-  tree keeps changing: the whole checkout is moved aside unmodified to
-  `<checkout parent>/retained/<name>-<time>-<id>`, a same-directory rename that
+- **A process still uses the checkout** (Linux `/proc` cwd/root/open files,
+  even when the checkout is clean), saving fails (no space, permissions, the
+  archive bound, a git error), the tree keeps changing, or the git state is
+  broken (no `.git` after an interrupted clone, a stale `index.lock`, a failed
+  forced checkout): the whole checkout is moved aside unmodified to
+  `<checkout parent>/retained-checkouts/<name>-<time>-<id>`, a same-directory rename that
   needs no free space, and preparation clones a fresh checkout. Any process
   still working in the old one keeps working there.
-- **Retained checkouts clean themselves up**: each later preparation saves any
-  retained checkout that nothing uses any more into a record, then removes it.
+- **Retained checkouts clean themselves up**: each later preparation handles up
+  to three of them. A copy nothing uses any more is saved into a record,
+  re-inspected to confirm nothing changed, renamed to `*.deleting` and removed;
+  an interrupted removal is finished later. A copy that cannot be saved keeps
+  its source but has its dependency and build caches evicted, so retained
+  checkouts do not fill the disk with build output.
 
 Preparation refuses only when a checkout can be neither saved nor moved aside,
 and the next round simply retries. Nothing in this path asks an operator to do
@@ -101,8 +107,9 @@ reset. Records left `recovery-blocked` by the first version of this guard are
 marked `superseded` when their checkout is next prepared.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
-table). Preparation then resumes the earlier destructive reuse without saving.
-Existing records are never deleted.
+table). Preparation then writes no records and skips inspection. A clean
+checkout is reused as before, but one that `git status` reports dirty is still
+moved aside rather than reset. Existing records are never deleted.
 
 ## Scope
 
