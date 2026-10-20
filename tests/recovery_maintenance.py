@@ -1211,6 +1211,28 @@ with patch('os.readlink', side_effect=OSError('PID namespaces unavailable')):
         saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
         self.restored(saved, expected)
 
+    def test_pending_reference_to_original_path_protects_resumed_deletion(self):
+        self.dirty()
+        tree = self.retained()
+        rename = os.rename
+
+        def crash_after_rename(source, dest):
+            rename(source, dest)
+            if str(dest).endswith(".deleting"):
+                raise Crash()
+
+        with patch.object(maintenance.os, "rename", crash_after_rename), self.assertRaises(Crash):
+            self.tick()
+        doomed = tree.with_name(tree.name + ".deleting")
+        pending = self.cfg.state / "verification-pending" / "fixture.json"
+        wr.atomic_json(pending, dict(root=str(tree)))
+        maintenance._SWEEPS.clear()
+        self.tick()
+        self.assertTrue((doomed / "Draft.lean").exists())
+        pending.unlink()
+        self.tick()
+        self.assertFalse(doomed.exists())
+
     def test_prepared_summary_and_rollback_do_no_payload_analysis(self):
         self.dirty()
         tree = Path(wr.retain(self.cfg, self.co, "fixture").details["retained"])

@@ -160,7 +160,9 @@ def _referenced(state, tree):
     """Honor pending verification references with the same ordinary housekeeping budget."""
     from .work_recovery import _charge
 
-    target = tree.resolve()
+    targets = {tree.resolve()}
+    if tree.name.endswith(".deleting"):
+        targets.add(tree.with_name(tree.name.removesuffix(".deleting")).resolve())
     for source in (state, state / "verification-state"):
         directory = source / "verification-pending"
         if not directory.is_dir():
@@ -179,7 +181,7 @@ def _referenced(state, tree):
                             reference = source / reference.relative_to("/opt/verification-state")
                         if not reference.is_absolute():
                             reference = source / reference
-                        if reference.resolve().is_relative_to(target):
+                        if any(reference.resolve().is_relative_to(target) for target in targets):
                             return True
     return False
 
