@@ -37,6 +37,7 @@ from .verification_scope import git, local_main, scope, untracked
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 4
+HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
@@ -46,6 +47,123 @@ class Incomplete(Exception):
     def __init__(self, message, *, reason="invalid-input"):
         super().__init__(message)
         self.reason = reason
+
+
+class _HashCache:
+    """Directory-grouped mutable hashes, with per-workspace lazy V1 migration."""
+
+    def __init__(self, state, root=None, *, fresh_candidate=False):
+        self.path = state / "verification-hashes-v2.json"
+        payload = read_json(self.path)
+        self.entries = self.directories(payload)
+        self.touched = {}
+        self.marker = state / "verification-hash-roots" / f"{digest(str(root.resolve()))}.json" if root else None
+        self.imported = bool(self.marker and read_json(self.marker).get("schema") == "tauceti-hash-root/v2")
+        self.finished = False
+        self.legacy_path = state / "verification-hashes.json"
+        self.legacy = {} if self.imported or fresh_candidate or root is None else None
+        self.retained = set()
+        self.inventory_depth = 0
+
+    @staticmethod
+    def directories(payload):
+        data = payload.get("directories", [])
+        if payload.get("schema") != "tauceti-verification-hash-cache/v2":
+            return {}
+        if isinstance(data, dict):
+            data = list(data.items())
+        if not isinstance(data, list):
+            return {}
+        return {
+            row[0]: dict(row[1])
+            for row in data
+            if isinstance(row, (list, tuple))
+            and len(row) == 2
+            and isinstance(row[0], str)
+            and Path(row[0]).is_absolute()
+            and isinstance(row[1], dict)
+        }
+
+    def lookup(self, key, path):
+        if not self.inventory_depth:
+            self.retained.add(key)
+        value = self.entries.get(str(Path(path).parent), {}).get(key)
+        if isinstance(value, str) and len(value) == 64:
+            self.put(key, path, value)
+            return value
+        if self.legacy is None:
+            self.legacy = read_json(self.legacy_path)
+        value = self.legacy.get(key)
+        if isinstance(value, str) and len(value) == 64:
+            self.put(key, path, value)
+            return value
+        return None
+
+    def put(self, key, path, value):
+        directory = str(Path(path).parent)
+        self.entries.setdefault(directory, {})[key] = value
+        self.touched.setdefault(directory, {})[key] = value
+
+    def finish_import(self):
+        self.finished = True
+        if self.legacy is None:
+            self.legacy = {}
+
+    def save(self, immutable_roots):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(".lock").open("a+") as lock:
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            disk = read_json(self.path)
+            merged = self.directories(disk)
+            direct = disk.get("direct", {})
+            direct = direct if isinstance(direct, dict) else {}
+            # Merge only used/new keys. A stale snapshot cannot restore pruned inventories.
+            # Move touched directories and keys last, ahead of cold history at the bound.
+            for directory, values in self.touched.items():
+                previous = merged.pop(directory, {})
+                for key, value in values.items():
+                    previous.pop(key, None)
+                    previous[key] = value
+                merged[directory] = previous
+            remaining = HASH_CACHE_LIMIT
+            directories = {}
+            retained_direct = {}
+            for directory, values in reversed(list(merged.items())):
+                compact = any(Path(directory).is_relative_to(root) for root in immutable_roots)
+                pinned = direct.get(directory, [])
+                pinned = set(value for value in pinned if isinstance(value, str)) if isinstance(pinned, list) else set()
+                if compact:
+                    pinned.update(self.retained.intersection(values))
+                kept = {
+                    key: value
+                    for key, value in values.items()
+                    if isinstance(value, str) and len(value) == 64 and (not compact or key in pinned)
+                }
+                kept = dict(list(kept.items())[-remaining:]) if remaining else {}
+                if kept:
+                    directories[directory] = kept
+                    remaining -= len(kept)
+                    pins = sorted(pinned.intersection(kept))
+                    if pins:
+                        retained_direct[directory] = pins
+            payload = dict(
+                schema="tauceti-verification-hash-cache/v2",
+                directories=list(reversed(list(directories.items()))),
+                direct=retained_direct,
+            )
+            if payload != disk:
+                atomic(self.path, payload)
+            if self.finished and self.marker and not self.imported:
+                atomic(self.marker, dict(schema="tauceti-hash-root/v2"))
+                self.imported = True
 
 
 def digest(value) -> str:
@@ -140,16 +258,30 @@ def hash_file(path: Path) -> str:
     )
     key = digest(identity)
     cache = _HASH_CACHE.get()
-    if cache is not None and isinstance(cache.get(key), str) and len(cache[key]) == 64:
-        return cache[key]
+    cached = cache.lookup(key, identity[0]) if isinstance(cache, _HashCache) else cache.get(key) if cache else None
+    if isinstance(cached, str) and len(cached) == 64:
+        return cached
     with path.open("rb") as source:
         result = hashlib.file_digest(source, "sha256").hexdigest()
     after = path.stat()
     if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != identity[1:]:
         raise Incomplete(f"input changed while fingerprinting: {path}")
-    if cache is not None:
+    if isinstance(cache, _HashCache):
+        cache.put(key, identity[0], result)
+    elif cache is not None:
         cache[key] = result
     return result
+
+
+def installation_file_record(path):
+    cache = _HASH_CACHE.get()
+    if not isinstance(cache, _HashCache):
+        return file_record(path)
+    cache.inventory_depth += 1
+    try:
+        return file_record(path)
+    finally:
+        cache.inventory_depth -= 1
 
 
 def source_names(root: Path, base: str) -> set[str]:
@@ -233,7 +365,7 @@ class Verification:
             atomic=atomic,
             read_json=read_json,
             files_under=files_under,
-            file_record=file_record,
+            file_record=installation_file_record,
             stamps=stamps,
             cache_directory=lambda: cache_root() / "installations",
         )
@@ -528,8 +660,11 @@ class Verification:
         previous = {}
         self.live_lease = (self.directory / "live.lock").open("a+")
         fcntl.flock(self.live_lease, fcntl.LOCK_EX)
-        cache = read_json(self.state / "verification-hashes.json")
-        cache_size = len(cache)
+        cache = _HashCache(
+            self.state,
+            self.root,
+            fresh_candidate=bool(self.job and self.job.get("isolated") and self.job.get("attempts") == 1),
+        )
         cache_token = _HASH_CACHE.set(cache)
         try:
 
@@ -559,6 +694,7 @@ class Verification:
             self.watch_names = source_names(self.root, self.base)
             self.watched = stamps([self.root / p for p in self.watch_names])
             inputs = self.inputs()
+            cache.finish_import()
             self.watch()
             extra = list(Path(__file__).parent.glob("*.py")) + [
                 HERE / "scripts" / name for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")
@@ -665,8 +801,10 @@ class Verification:
             self.live_lease.close()
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
-            if len(cache) != cache_size:
-                atomic(self.state / "verification-hashes.json", dict(list(cache.items())[-200000:]))
+            try:
+                cache.save(self.installations.validated)
+            except OSError as error:
+                self.progress(f"verification hash cache unavailable: {error}")
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
             if self.job and self.receipt["status"] == "incomplete":
