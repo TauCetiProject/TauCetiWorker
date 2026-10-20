@@ -451,6 +451,27 @@ def fill_prompt(path: Path, **subs) -> str:
     return _PLACEHOLDER_RE.sub(lambda m: str(subs.get(m.group(0)[2:-2], m.group(0))), text)
 
 
+def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
+    """The local audit scope policy for a PR, from labels and branch the survey already holds.
+
+    Mirrors TauCeti's CI: pin bumps, `full-lint`-labelled PRs and `lint-repair/` branches audit the
+    whole library; everything else may scope to the changed modules. Never fetches labels."""
+    if bump:
+        return "bump"
+    if head_ref.startswith("lint-repair/"):
+        return "lint-repair"
+    if "full-lint" in {label.lower() for label in labels}:
+        return "full-lint"
+    return "ordinary"
+
+
+def local_verification(policy: str) -> str:
+    """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
+    if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
+        raise Die(f"unknown local verification scope policy {policy!r}")
+    return fill_prompt(HERE / "prompts" / "local-verification.md", SCOPE_POLICY=policy)
+
+
 def sync_mathlib_pool(cfg: Config) -> None:
     """Exchange finished `.ltar`s with the machine pool before the agent runs.
 

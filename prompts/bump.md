@@ -5,16 +5,16 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 - For a difficult API migration, preserve completed source repairs and describe the remaining root failure so the next session can continue. Never revert the target or gut the library.
 
 ## Reproduce and adapt
+Read the failing CI log first and reproduce the stage that failed, not every check. The usual
+failure is the build: run `lake exe cache get` once, then `lake build`. If the log shows the
+expired-shim check failing, run it:
 ```
-lake exe cache get
 git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"
 base_ref="$(git merge-base origin/main HEAD)"
 if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"; rm -rf "$base_root"
-lake build
-lake exe axioms
 ```
 - Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
 - The shim-expiry command may be the only failing check even when `lake build` succeeds. Its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
@@ -46,22 +46,14 @@ the foreground; a background build will be abandoned when the session ends. Push
 before ending your turn; no later turn will recover unpushed edits. Full-library compilation and
 all audits remain required for merging; a partial checkpoint must never be described as green.
 
-When the migration is complete, run the full verification commands above if time permits. Otherwise
+When the migration is complete, run the final verification below if time permits. Otherwise
 push the completed repairs and let full CI verify them. Do not spend the session waiting for CI.
 
 ## Final verification when time permits
-
-```
-lake exe cache get
-git fetch -q origin main
-shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"
-base_ref="$(git merge-base origin/main HEAD)"
-if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); fi
-if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
-rm -f "$base_shims"; rm -rf "$base_root"
-lake build
-lake exe axioms
-```
+__LOCAL_VERIFICATION__
+A pin bump changes what every module depends on, so its audit stays whole-library: the recipe
+prints `full: ...` for this branch. Once the migration is complete, run the shim-expiry command
+above, `lake build`, then the scope recipe and the audit, once each.
 
 Full CI runs these checks even when a partial repair cannot run the full library yet.
 
@@ -75,4 +67,4 @@ Full CI runs these checks even when a partial repair cannot run the full library
 - Do NOT open a new PR; do NOT touch files outside `TauCeti/` (and the already-bumped pins).
 
 ## Report
-End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry / `lake build` / `lake exe axioms` results observed, distinguishing partial checkpoints from full verification. Do not claim green unless you saw it.
+End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry, `scope:`, `lake build` and `lake exe axioms` results observed, distinguishing partial checkpoints from complete local verification, and local checks from CI. Do not claim green unless you saw it.
