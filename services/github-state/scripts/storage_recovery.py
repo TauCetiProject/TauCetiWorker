@@ -59,33 +59,10 @@ def status(environment):
     }
 
 
-def export(environment, tables, limit, recovery_id=None, classes=(), page_bytes=None):
-    # An existing recovery continues from its manifest; a new one records a bookmark.
-    recovery = {"id": recovery_id} if recovery_id else call(environment, "/admin/storage/recovery", {})
-    print(json.dumps({"recovery": recovery["id"], "bookmark": recovery.get("bookmark")}), file=sys.stderr, flush=True)
-    # A class export archives only the rows that cleanup class deletes.
-    scopes = [{"table": table} for table in tables] + [{"class": name} for name in classes]
-    for scope in scopes:
-        body = {
-            "recovery": recovery["id"],
-            "limit": limit,
-            **scope,
-            **({"page_bytes": page_bytes} if page_bytes else {}),
-        }
-        while not (page := call(environment, "/admin/storage/export", body))["complete"]:
-            print(json.dumps(page), file=sys.stderr)
-        while not (check := call(environment, "/admin/storage/verify", {"recovery": recovery["id"], **scope}))[
-            "verified"
-        ]:
-            print(json.dumps(check), file=sys.stderr)
-        print(json.dumps(check), file=sys.stderr)
-    return recovery
-
-
-def cleanup(environment, cleanup_class, recovery, limit, batches):
+def cleanup(environment, cleanup_class, limit, batches):
     total = {"class": cleanup_class, "rows": 0, "logical_bytes": 0, "batches": 0}
     for _ in range(batches):
-        body = {"class": cleanup_class, "limit": limit, **({"recovery": recovery} if recovery else {})}
+        body = {"class": cleanup_class, "limit": limit}
         result = call(environment, "/admin/storage/cleanup", body)
         total["rows"] += result["rows"]
         total["logical_bytes"] += result.get("logical_bytes") or 0
@@ -125,7 +102,6 @@ def receipt(environment, probe_bytes):
         "legacy_client_reads": legacy_reads(environment),
         "probe": call(environment, "/admin/storage/probe", {"bytes": probe_bytes}) if probe_bytes else None,
         "ingress": state["ingress"],
-        "legacy_cursors": state["storage"]["legacy_cursors"],
         "note": "Queue and DLQ depth are read from the Cloudflare dashboard or `wrangler queues info`; record them alongside this receipt.",
     }
     EVIDENCE.mkdir(parents=True, exist_ok=True)
@@ -145,22 +121,12 @@ def main():
     retention.add_argument("--mode", choices=["dry_run", "enforce"])
     retention.add_argument("--disable", action="append", default=[])
     retention.add_argument("--pin", action="append", default=[])
-    retention.add_argument("--archive-ci", action="store_true")
     scan = commands.add_parser("scan")
     scan.add_argument("--table", required=True)
     scan.add_argument("--after", type=int, default=0)
     scan.add_argument("--limit", type=int, default=2000)
-    exporting = commands.add_parser("export")
-    exporting.add_argument("--table", action="append", default=[])
-    exporting.add_argument(
-        "--class", dest="classes", action="append", default=[], help="cleanup class, e.g. ci_resources"
-    )
-    exporting.add_argument("--page-bytes", type=int, help="logical bytes per page, up to 8000000")
-    exporting.add_argument("--limit", type=int, default=1000)
-    exporting.add_argument("--recovery", help="continue an existing recovery manifest")
     cleaning = commands.add_parser("cleanup")
     cleaning.add_argument("--class", dest="cleanup_class", required=True)
-    cleaning.add_argument("--recovery")
     cleaning.add_argument("--limit", type=int, default=100)
     cleaning.add_argument("--batches", type=int, default=10)
     probing = commands.add_parser("probe")
@@ -179,25 +145,17 @@ def main():
     receipting.add_argument("--probe-bytes", type=int, default=0)
     args = parser.parse_args()
     env = args.environment
-    if args.command == "retention" and not args.mode and (args.disable or args.pin or args.archive_ci):
+    if args.command == "retention" and not args.mode and (args.disable or args.pin):
         parser.error("retention overrides require --mode")
     if args.command == "status":
         result = status(env)
     elif args.command == "retention":
-        policy = (
-            {"mode": args.mode, "disabled": args.disable, "pinned": args.pin, "archive_ci": args.archive_ci}
-            if args.mode
-            else None
-        )
+        policy = {"mode": args.mode, "disabled": args.disable, "pinned": args.pin} if args.mode else None
         result = call(env, "/admin/storage/retention", {"policy": policy} if policy is not None else {})
     elif args.command == "scan":
         result = call(env, "/admin/storage/scan", {"table": args.table, "after": args.after, "limit": args.limit})
-    elif args.command == "export":
-        if not args.table and not args.classes:
-            parser.error("export needs --table or --class")
-        result = export(env, args.table, args.limit, args.recovery, args.classes, args.page_bytes)
     elif args.command == "cleanup":
-        result = cleanup(env, args.cleanup_class, args.recovery, args.limit, args.batches)
+        result = cleanup(env, args.cleanup_class, args.limit, args.batches)
     elif args.command == "probe":
         result = call(env, "/admin/storage/probe", {"bytes": args.bytes})
     elif args.command == "ingress":

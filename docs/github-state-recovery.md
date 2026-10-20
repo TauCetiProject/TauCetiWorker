@@ -6,7 +6,7 @@ service is built so that this state degrades writes only:
 
 - Startup on a current schema performs no writes. A migration runs in one
   transaction; if it cannot commit, an existing compatible schema stays
-  readable (`schema: "legacy"`). A genuinely missing schema returns
+  readable (`schema: "migration_pending"`). A genuinely missing schema returns
   `schema_unavailable` with the missing tables, never empty data.
 - Complete stored reads do not depend on demand, metrics, refresh scheduling,
   or derived-cache writes. After the first storage-full failure the object
@@ -21,8 +21,7 @@ service is built so that this state degrades writes only:
   fallback instead of acting on frozen state.
 - New continuation pages are written to private R2 (`cursors/<repo>/<id>/<offset>.json`),
   using the existing `id:offset` cursor syntax and the same repository,
-  query, coverage and expiry checks. Legacy SQL cursors remain readable until
-  they expire.
+  query, coverage and expiry checks.
 - Expired cursors, metrics, journal entries and retired-object markers are
   deleted at the start of every alarm (and on the cron tick while degraded),
   before any repair, hydration or snapshot work.
@@ -77,33 +76,23 @@ until set back to `none`.
 S=services/github-state/scripts/storage_recovery.py
 uv run python $S --environment production status        # sizes, cursors, mode, parked backlog
 uv run python $S --environment production scan --table cursors
-uv run python $S --environment production cleanup --class expired_cursors --batches 100
+uv run python $S --environment production cleanup --class expired_changes --batches 100
 uv run python $S --environment production probe --bytes 65536
 ```
 
 1. Confirm the deployed version from `/v1/health` (`state.deployment_id`).
-2. Measure before deleting: `status` lists tables, indexes and the legacy
-   cursor table; `scan` reports per-column and per-index logical bytes for a
+2. Measure before deleting: `status` lists tables and indexes; `scan` reports per-column and per-index logical bytes for a
    keyset range. Cloudflare does not expose `page_count` or
    `freelist_count`; these are reported as `null`.
-3. Clear expired cursors (`expired_cursors`), then the other retention classes
-   (`expired_repair_metrics`, `expired_changes`, `expired_retired_objects`).
-   None of these needs an export: they follow the existing retention policy.
-4. If more space is needed, archive expendable telemetry first:
-   `export --table repair_metrics --table demand` records a recovery manifest
-   with the Durable Object point-in-time bookmark, writes digest-checked
-   keyset pages to `recovery/<repo>/<id>/`, and verifies every page. Then run
-   `cleanup --class repair_metrics --recovery <id>` or `--class stale_demand`.
-   Cleanup refuses unverified exports and deletes only rows covered by the
-   export. Apart from the CI classes below, PR histories, resources,
-   membership and coverage, tombstones, jobs, and delivery receipts are not
-   cleanup classes.
-   GitHub Actions and check-run records are no longer mirrored, and their
-   stored rows (about 90% of the database in October 2026) are removable:
-   `export --class ci_resources --class ci_members --class ci_collections
-   --class ci_meta --limit 1000 --page-bytes 8000000` archives and verifies
-   only those rows, then `cleanup --class <class> --recovery <id>` deletes
-   them, covering exported rowids only.
+3. Clear the retention classes (`expired_repair_metrics`, `expired_changes`,
+   `expired_retired_objects`).
+4. If more space is needed, delete expendable telemetry: `cleanup --class
+   repair_metrics` (older than a day) or `--class stale_demand`. Stored rows
+   of the unmirrored GitHub Actions and check-run records are removed with
+   `ci_resources`, `ci_members`, `ci_collections` and `ci_meta`. There are no
+   R2 archives; deletion is final. PR histories, other resources, membership
+   and coverage, tombstones, jobs, and delivery receipts are not cleanup
+   classes.
 5. Prove headroom with `probe`. It commits, waits for durability, and deletes
    rows totalling the requested size (up to 64 MiB, in 1 MiB rows); success ends degraded mode and lets the migration
    commit. Deleted rows become reusable free pages, so `database_size` need
@@ -115,7 +104,7 @@ uv run python $S --environment production probe --bytes 65536
    under `webhooks/<date>/`, so reconciliation covers them without consuming
    the DLQ.
 7. Record a release receipt: `receipt --probe-bytes 65536` stores the
-   deployment ID, ordinary legacy-client reads through
+   deployment ID, ordinary unmodified client reads through
    `tauceti_worker.github_state`, storage mode, probe result and parked/held
    backlog under `~/.local/state/tauceti/github-state-recovery/`. Add the
    queue and DLQ depth from the Cloudflare dashboard. Public `/healthz` is not
