@@ -74,6 +74,14 @@ all phases. Complete inventories are stored once under `verification-inputs/<dig
 from receipts. A phase index avoids scanning old receipts. Per-file digests are cached by path,
 device, inode, size, mtime and ctime; any metadata change rereads the bytes. The metadata cache is
 bounded. Receipts and logs remain retained; there is no automatic deletion of incomplete evidence.
+After an immutable identity validates, its per-file hashes are omitted from the persisted general
+cache. The path-aware
+`verification-hashes-v2.json` cache keeps mutable input hashes and removes records under validated
+immutable installations, including when an installation becomes registered later. Migration imports
+matching V1 stat-keyed hashes without rereading their payloads until the first complete preparation;
+early deadlines keep migration eligible. Later warm preparation reads only V2, including after source
+changes. The V1 cache remains intact for rollback. Immutable identity files and receipt indexes keep
+their existing formats.
 Temporary shim archives are removed after use. Source metadata sampling every two seconds catches mutations restored to their original bytes; a final full digest
 check rejects changed inputs. Mutable toolchain/dependency metadata is checked at phase boundaries rather
 than repeatedly scanning large installations during tool execution. Environment hashing is limited to build

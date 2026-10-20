@@ -48,6 +48,61 @@ class Incomplete(Exception):
         self.reason = reason
 
 
+class _HashCache:
+    """Keep mutable input hashes; import opaque V1 entries lazily without payload rereads."""
+
+    def __init__(self, state):
+        self.path = state / "verification-hashes-v2.json"
+        self.original = read_json(self.path)
+        entries = self.original.get("entries", {})
+        self.entries = dict(entries) if isinstance(entries, dict) else {}
+        self.imported = (
+            self.original.get("schema") == "tauceti-verification-hash-cache/v2"
+            and self.original.get("legacy_imported") is True
+        )
+        self.legacy_path = state / "verification-hashes.json"
+        self.legacy = {} if self.imported else None
+
+    def get(self, key, path):
+        entry = self.entries.get(key)
+        if isinstance(entry, dict) and entry.get("path") == path:
+            value = entry.get("sha256")
+            if isinstance(value, str) and len(value) == 64:
+                return value
+        if self.legacy is None:
+            self.legacy = read_json(self.legacy_path)
+        value = self.legacy.get(key)
+        if isinstance(value, str) and len(value) == 64:
+            self.put(key, path, value)
+            return value
+        return None
+
+    def put(self, key, path, value):
+        self.entries[key] = dict(path=path, sha256=value)
+
+    def finish_import(self):
+        # Once complete preparation has visited the mutable inputs, future invocations
+        # need no historical opaque cache, including when a candidate source changes.
+        self.imported = True
+        if self.legacy is None:
+            self.legacy = {}
+
+    def save(self, immutable_roots):
+        # A previously unregistered read-only tree can become trusted later. Remove its old
+        # mutable-cache records once; warm cache JSON must not scale with sealed inventory.
+        entries = {
+            key: value
+            for key, value in self.entries.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("path"), str)
+            and not any(Path(value["path"]).is_relative_to(root) for root in immutable_roots)
+        }
+        entries = dict(list(entries.items())[-200000:])
+        payload = dict(schema="tauceti-verification-hash-cache/v2", entries=entries, legacy_imported=self.imported)
+        if payload != self.original:
+            atomic(self.path, payload)
+
+
 def digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
 
@@ -140,14 +195,17 @@ def hash_file(path: Path) -> str:
     )
     key = digest(identity)
     cache = _HASH_CACHE.get()
-    if cache is not None and isinstance(cache.get(key), str) and len(cache[key]) == 64:
-        return cache[key]
+    cached = cache.get(key, identity[0]) if isinstance(cache, _HashCache) else cache.get(key) if cache else None
+    if isinstance(cached, str) and len(cached) == 64:
+        return cached
     with path.open("rb") as source:
         result = hashlib.file_digest(source, "sha256").hexdigest()
     after = path.stat()
     if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != identity[1:]:
         raise Incomplete(f"input changed while fingerprinting: {path}")
-    if cache is not None:
+    if isinstance(cache, _HashCache):
+        cache.put(key, identity[0], result)
+    elif cache is not None:
         cache[key] = result
     return result
 
@@ -528,8 +586,7 @@ class Verification:
         previous = {}
         self.live_lease = (self.directory / "live.lock").open("a+")
         fcntl.flock(self.live_lease, fcntl.LOCK_EX)
-        cache = read_json(self.state / "verification-hashes.json")
-        cache_size = len(cache)
+        cache = _HashCache(self.state)
         cache_token = _HASH_CACHE.set(cache)
         try:
 
@@ -559,6 +616,7 @@ class Verification:
             self.watch_names = source_names(self.root, self.base)
             self.watched = stamps([self.root / p for p in self.watch_names])
             inputs = self.inputs()
+            cache.finish_import()
             self.watch()
             extra = list(Path(__file__).parent.glob("*.py")) + [
                 HERE / "scripts" / name for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")
@@ -665,8 +723,7 @@ class Verification:
             self.live_lease.close()
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
-            if len(cache) != cache_size:
-                atomic(self.state / "verification-hashes.json", dict(list(cache.items())[-200000:]))
+            cache.save(self.installations.validated)
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
             if self.job and self.receipt["status"] == "incomplete":
