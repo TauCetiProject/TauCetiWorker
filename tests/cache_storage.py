@@ -186,6 +186,34 @@ class Storage(unittest.TestCase):
         self.assertGreater(result["managed_bytes"], 0)
         self.assertFalse(self.pool.exists())
 
+    def test_full_checkout_filesystem_defers_even_when_state_filesystem_has_space(self):
+        checkout = self.root / "scratch-checkout"
+        checkout.mkdir()
+        real_stat = Path.stat
+
+        def metadata(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if path == checkout:
+                return SimpleNamespace(st_dev=info.st_dev + 1)
+            return info
+
+        def usage(path):
+            return (
+                shutil._ntuple_diskusage(1000, 960, 40)
+                if path == checkout
+                else shutil._ntuple_diskusage(1000, 500, 500)
+            )
+
+        cfg = SimpleNamespace(state=self.root, checkout=checkout)
+        with (
+            patch.object(Path, "stat", metadata),
+            patch.object(storage.shutil, "disk_usage", side_effect=usage),
+            patch.object(retention, "request_cleanup"),
+        ):
+            with self.assertRaises(config.AdmissionUnavailable) as error:
+                storage.admit(cfg)
+        self.assertEqual(error.exception.state, "waiting-storage")
+
     def test_resume_interrupted_delete_and_preserve_operator_cache(self):
         entry = self.entry(age=4 * 86400)
         pending = entry.with_name(entry.name + ".retention-deleting")
