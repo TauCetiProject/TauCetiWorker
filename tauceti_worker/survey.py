@@ -48,6 +48,7 @@ from .constants import (
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
+from .github_state import StateQueryError
 from .review_state import Meta, ReviewState
 from .survey_facts import in_scope, roadmap_focuses, target_focuses
 
@@ -722,6 +723,19 @@ def survey(
         raw = [row["pr"] for row in compact] if available else gh.open_prs()
         if available and seed:
             seed(compact)
+    except StateQueryError as e:
+        if not cached_only:
+            raise
+        # A malformed service URL is configuration for an operator, not an outage to wait out.
+        sv.github_failed = True
+        sv.dependency_wait = {
+            "dependency": "github-state",
+            "reason": "client_auth_configuration",
+            "detail": str(e)[:200],
+            "actionable": True,
+        }
+        sv.errors.append(f"global maintenance cache unavailable ({describe_dependency_wait(sv.dependency_wait)})")
+        return sv
     except GitHubError as e:
         sv.github_failed = True
         sv.errors.append(str(e))

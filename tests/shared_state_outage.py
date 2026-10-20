@@ -223,6 +223,103 @@ class StateClient(unittest.TestCase):
             self.assertEqual(state.read("org/repo", "issue_comments", number=7), (True, []))
         self.assertEqual(self.circuit(), {"failures": 0, "until": 0})
 
+    def test_sanitizer_removes_credentials_other_than_the_client_token(self):
+        body = (
+            b'{"error":"Authorization: Bearer ghp_FAKEfake0123456789abcdefABCDEF '
+            b'Basic dXNlcjpwYXNzd29yZA== token=abc123 password: hunter2 Exceeded the maximum database size."}'
+        )
+        failure = self.fail_with(fails(503, body))
+        for secret in ("ghp_FAKE", "dXNlcjpw", "abc123", "hunter2"):
+            self.assertNotIn(secret, failure["detail"])
+            self.assertNotIn(secret, (self.root / "requests.jsonl").read_text())
+            self.assertNotIn(secret, json.dumps(self.circuit()))
+        self.assertIn("Exceeded the maximum database size.", failure["detail"])
+
+    def test_retry_after_is_finite_and_capped(self):
+        for value in ("inf", "1e12", "-5", "nan"):
+            with self.subTest(value=value):
+                for _ in range(3):
+                    failure = self.fail_with(fails(429, b"", {"Retry-After": value}))
+                until = self.circuit()["until"]
+                self.assertTrue(time.time() < until <= time.time() + 360, until)
+                self.assertTrue(time.time() < failure["retry_at"] <= time.time() + 360)
+                for circuit in (self.root / "gateway").glob("*/circuits/*.json"):
+                    circuit.unlink()
+
+    def test_unavailable_inventory_shares_a_cooldown(self):
+        unavailable = {
+            **page([]),
+            "operation": "survey",
+            "status": "unavailable",
+            "complete": False,
+            "reason": "backfill",
+        }
+        with patch.object(state.urllib.request, "urlopen", return_value=Response(unavailable)) as fetch:
+            for _ in range(4):
+                self.assertEqual(state.read("org/repo", "survey", roadmap="any"), (False, None))
+                self.assertEqual(state.last_failure()["reason"], "coverage_unavailable")
+        self.assertEqual(fetch.call_count, 1)
+        self.assertGreater(state.last_failure()["retry_at"], time.time() + 20)
+
+    def test_repository_scope_is_operator_actionable(self):
+        unavailable = {**page([]), "status": "unavailable", "complete": False, "reason": "repository_unavailable"}
+        failure = self.fail_with(lambda *_a, **_k: Response(unavailable))
+        self.assertEqual((failure["reason"], failure["actionable"]), ("client_auth_configuration", True))
+
+    def test_failed_refresh_preserves_the_last_complete_response(self):
+        with patch.object(state.urllib.request, "urlopen", return_value=Response(page([{"id": "5"}]))):
+            self.assertTrue(state.read("org/repo", "issue_comments", number=7)[0])
+        (path,) = (self.root / "gateway").glob("*/responses/*.json")
+        before = path.read_text()
+
+        def changed_mid_read(request, **_):
+            if "cursor=" in request.full_url:
+                return Response(page([{"id": "7"}], revision=3), etag='"3"')
+            return Response(page([{"id": "6"}], revision=2, cursor="p1"), etag='"2"')
+
+        self.assertEqual(self.fail_with(changed_mid_read)["reason"], "mixed_revision")
+        self.assertEqual(path.read_text(), before)
+
+    def test_probe_lease_is_renewed_across_a_long_paginated_read(self):
+        for _ in range(3):
+            self.fail_with(fails(503))
+        (path,) = (self.root / "gateway").glob("*/circuits/*.json")
+        path.write_text(json.dumps({**self.circuit(), "until": 0}))
+        peer = []
+
+        def slow_pages(request, **_):
+            if peer:
+                self.fail("a peer probed while the lease holder was still reading")
+            time.sleep(0.3)
+            if "cursor=" not in request.full_url:
+                return Response(page([{"id": "1"}], cursor="p1"))
+            # Past the initial lease, but within the renewed one.
+            peer.append(True)
+            outcome = state.read("org/repo", "issue_comments", number=8)
+            peer.append(state.last_failure())
+            self.assertEqual(outcome, (False, None))
+            return Response(page([{"id": "2"}]))
+
+        with (
+            patch.object(state, "PROBE_LEASE", 0.5),
+            patch.object(state.urllib.request, "urlopen", side_effect=slow_pages),
+        ):
+            self.assertEqual(state.read("org/repo", "issue_comments", number=7), (True, [{"id": 1}, {"id": 2}]))
+        self.assertEqual((peer[1]["circuit"], peer[1]["reason"]), ("open", "http_503"))
+        self.assertEqual(self.circuit(), {"failures": 0, "until": 0})
+
+    def test_stale_success_does_not_erase_a_newer_outage(self):
+        def outage_during_request(*_a, **_k):
+            for _ in range(3):
+                with patch.object(state.urllib.request, "urlopen", side_effect=fails(503)):
+                    state.read("org/repo", "issue_comments", number=8)
+            return Response(page([]))
+
+        with patch.object(state.urllib.request, "urlopen", side_effect=outage_during_request):
+            self.assertTrue(state.read("org/repo", "issue_comments", number=7)[0])
+        self.assertEqual(self.circuit()["failures"], 3)
+        self.assertGreater(self.circuit()["until"], time.time())
+
     def test_backoff_is_bounded_and_jittered(self):
         values = {round(state._backoff(n), 3) for n in range(3, 30) for _ in range(3)}
         self.assertTrue(all(24 <= value <= 360 for value in values))
@@ -330,6 +427,13 @@ class RoundBoundary(unittest.TestCase):
         failure = {"dependency": "github-state", "reason": "client_auth_configuration", "actionable": True}
         with (
             patch("tauceti_worker.github_state.read_survey", side_effect=self.outage(failure)),
+            self.assertRaisesRegex(Die, "operator action required"),
+        ):
+            run_round(self.w, self.opts)
+
+    def test_malformed_service_url_is_operator_actionable(self):
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "http://state.test"}),
             self.assertRaisesRegex(Die, "operator action required"),
         ):
             run_round(self.w, self.opts)
