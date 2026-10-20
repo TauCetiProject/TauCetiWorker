@@ -46,8 +46,9 @@ class CostTests(unittest.TestCase):
         with patch.object(a.time, "time", return_value=self.now - 10 * DAY):
             a.emit("round_started", round_id="initial")
             a.emit("round_finished", round_id="initial", round_type="fix", outcome="completed")
-        a.emit("round_started", round_id="reviewer", worker="reviewer")
-        a.emit("round_finished", round_id="reviewer", worker="reviewer", round_type="review", outcome="completed")
+        with patch.object(a.time, "time", return_value=self.now):
+            a.emit("round_started", round_id="reviewer", worker="reviewer")
+            a.emit("round_finished", round_id="reviewer", worker="reviewer", round_type="review", outcome="completed")
         self.records = []
         self.record(self.now - 10 * DAY, dict(type="grant", delta="1000"))
         self.session("old", 8 * DAY, "author", "10", settled=True)
@@ -92,7 +93,9 @@ class CostTests(unittest.TestCase):
                     ),
                 )
                 db.execute("INSERT INTO pr_loc VALUES (?,?,?,?,?,?)", ("org/repo", n, "head", loc, 0, self.now))
-        a.emit("pr_activity", repository="org/repo", pr=99, activity="review", worker="reviewer")
+        # Setup can take longer than the summary's one-second horizon on a cold CI runner.
+        with patch.object(a.time, "time", return_value=self.now):
+            a.emit("pr_activity", repository="org/repo", pr=99, activity="review", worker="reviewer")
 
     def record(self, at, event):
         self.records.append(dict(version=1, seq=len(self.records) + 1, timestamp=at, events=[event]))

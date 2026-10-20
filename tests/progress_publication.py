@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Retained progress resumes apply with identical bodies/window and original actor."""
 
+import errno
+import hashlib
 import json
 import os
 import subprocess
@@ -14,7 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import progress_publication as publication
 from tauceti_worker import work_units as wu
-from tauceti_worker.config import Die, NoProgress
+from tauceti_worker.config import Die, NoProgress, ProgressPreparationUnavailable
 from tauceti_worker.constants import EX_NOPROGRESS, PROGRESS_REF, ROADMAP
 from tauceti_worker.github_outbox import directory
 from tauceti_worker.github_transport import atomic, register_principal
@@ -258,6 +260,77 @@ with (
     assert publication.retained(cfg) is None
     assert progress_due(cfg, worker.counters)[0] is False
     (work / "plan.json").write_bytes(plan_bytes)
+    # Pages inputs travel with parked reports. Auxiliary loss never invalidates paid prose:
+    # apply uses the receipted plan and bodies and does not need live documentation or facts.
+    bundle = b"retained compressed facts"
+    digest = hashlib.sha256(bundle).hexdigest()
+    name = f"plan.json.facts-{digest}.json.gz"
+    pages = {**plan, "documentation": {"mode": "pages", "facts_sha256": digest, "bundle_file": name}}
+    (work / "plan.json").write_text(json.dumps(pages))
+    (work / name).write_bytes(bundle)
+    assert publication.facts_bundle(work / "plan.json", verify=True).read_bytes() == bundle
+    value = publication.save(cfg, "author", PROGRESS_REF)
+    before = set((state / "progress/retained").iterdir())
+    with patch.object(publication, "retain_facts_bundle", side_effect=OSError(errno.ENOSPC, "disk full")):
+        try:
+            publication.park(cfg, value, "fixture")
+        except ProgressPreparationUnavailable:
+            pass
+        else:
+            raise AssertionError("storage failure must request a retry")
+    assert set((state / "progress/retained").iterdir()) == before
+    assert publication.retained(cfg)["files"] == value["files"]
+    assert publication.retained(cfg)["retry_at"] > time.time() + 290
+    assert progress_due(cfg, worker.counters)[0] is False
+    assert publication.parked_window(cfg, pages) in before
+    incomplete = state / "progress/retained/incomplete"
+    incomplete.mkdir()
+    (incomplete / "plan.json").write_text(json.dumps({**pages, "to_sha": "d" * 40}))
+    assert publication.parked_window(cfg, {**pages, "to_sha": "d" * 40}) is None
+    parked = publication.park(cfg, value, "fixture")
+    assert (parked / name).read_bytes() == bundle
+    assert (parked / name).stat().st_ino == (work / name).stat().st_ino
+    with patch.object(publication.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")):
+        publication.retain_facts_bundle(work / name, parked / "fallback.json.gz")
+    assert (parked / "fallback.json.gz").read_bytes() == bundle
+    assert publication.fingerprints(parked) == value["files"]
+    value = publication.save(cfg, "author", PROGRESS_REF)
+    (work / name).unlink()
+    assert publication.retained(cfg)["files"] == value["files"]
+    with (
+        patch.object(wu, "me", return_value="author"),
+        patch.object(wu.subprocess, "run", side_effect=resumed),
+        patch.object(wu, "run_agent_host") as model,
+    ):
+        try:
+            wu._do_progress_inner(worker, None)
+        except NoProgress:
+            pass
+        else:
+            raise AssertionError("lost auxiliary bundle must still reach apply")
+        model.assert_not_called()
+    assert json.loads((work / "publication-done.json").read_text())["files"] == value["files"]
+    for unsafe in ("../outside.json.gz", "/outside.json.gz", "status-body.md"):
+        pages["documentation"]["bundle_file"] = unsafe
+        (work / "plan.json").write_text(json.dumps(pages))
+        try:
+            publication.facts_bundle(work / "plan.json")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe bundle path accepted")
+    pages["documentation"]["bundle_file"] = name
+    (work / "plan.json").write_text(json.dumps(pages))
+    (work / name).symlink_to(state / "outside")
+    try:
+        publication.facts_bundle(work / "plan.json")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("bundle symlink accepted")
+    (work / name).unlink()
+    (work / "plan.json").write_bytes(plan_bytes)
+    publication.save(cfg, "author", PROGRESS_REF)
     # Receipt corruption or edited bodies preserve everything for recovery.
     (work / "status-body.md").write_text("changed")
     with patch.object(wu.subprocess, "run") as run:

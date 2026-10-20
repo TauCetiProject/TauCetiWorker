@@ -1,12 +1,17 @@
 """Private receipts for prepared reports; resume publication before paying for prose."""
 
+import contextlib
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
 from . import github_outbox as outbox
 from . import github_transport as tr
@@ -16,6 +21,52 @@ MAX_ATTEMPTS = 6
 MAX_WAIT_AGE = 7 * 86400
 
 FILES = ("plan.json", "status-body.md", "section-body.md")
+
+
+def facts_bundle(plan_file, *, verify=False):
+    """Locate only the hash-named sibling emitted by Progress, never an arbitrary path.
+
+    Publication receipts bind the plan and prose. Applying already prepared prose does not
+    need this auxiliary input; losing it must not invalidate or regenerate paid output.
+    """
+    plan = json.loads(plan_file.read_text())
+    pin = plan.get("documentation") if isinstance(plan, dict) else None
+    if not isinstance(pin, dict) or pin.get("mode") != "pages":
+        return None
+    digest = pin.get("facts_sha256")
+    name = pin.get("bundle_file")
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or name != f"plan.json.facts-{digest}.json.gz"
+    ):
+        raise ValueError("invalid pinned facts bundle sibling")
+    bundle = plan_file.parent / name
+    if bundle.is_symlink():
+        raise ValueError("pinned facts bundle must not be a symlink")
+    if verify and hashlib.sha256(bundle.read_bytes()).hexdigest() != digest:
+        raise ValueError("pinned facts bundle hash mismatch")
+    return bundle
+
+
+def retain_facts_bundle(source, target):
+    """Keep immutable history without duplicating its bytes on the same filesystem."""
+    with tempfile.TemporaryDirectory(prefix=".facts-", dir=target.parent) as tmp:
+        candidate = Path(tmp) / "bundle"
+        try:
+            os.link(source, candidate)
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.ENOSYS):
+                raise
+            shutil.copyfile(source, candidate)
+        with candidate.open("rb") as retained:
+            os.fsync(retained.fileno())
+        os.replace(candidate, target)
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def fingerprints(work):
@@ -122,17 +173,52 @@ def legacy_branch_matches(cfg, plan):
 def park(cfg, value, reason):
     """Keep a private recovery bundle before allowing a new report to be planned."""
     work = cfg.state / "progress/work"
-    saved = cfg.state / "progress/retained" / uuid.uuid4().hex
-    saved.mkdir(parents=True, mode=0o700)
-    for name in (*FILES, "facts.json", "progress-prompt.md"):
-        source = work / name
-        if source.is_file():
-            with open(saved / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:
-                target.write(source.read_bytes())
-                target.flush()
-                os.fsync(target.fileno())
-    record = {**value, "status": "parked", "reason": reason, "saved": str(saved)}
-    tr.atomic(saved / "publication.json", record)
+    parent = cfg.state / "progress/retained"
+    saved = parent / uuid.uuid4().hex
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix=".pending-", dir=parent) as tmp:
+            staged = Path(tmp)
+            names = [*FILES, "facts.json", "progress-prompt.md"]
+            try:
+                if bundle := facts_bundle(work / "plan.json"):
+                    names.append(bundle.name)
+            except (OSError, ValueError):
+                pass  # retain core publication artifacts even when auxiliary metadata is damaged
+            for name in names:
+                source = work / name
+                if source.is_file():
+                    if name.startswith("plan.json.facts-"):
+                        retain_facts_bundle(source, staged / name)
+                        continue
+                    with open(staged / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:
+                        target.write(source.read_bytes())
+                        target.flush()
+                        os.fsync(target.fileno())
+            record = {**value, "status": "parked", "reason": reason, "saved": str(saved)}
+            tr.atomic(staged / "publication.json", record)
+            directory = os.open(staged, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            os.replace(staged, saved)
+            directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except OSError as exc:
+        from .config import ProgressPreparationUnavailable
+
+        retry_at = time.time() + 300
+        # A large bundle copy can fail while a small receipt update still succeeds. Keep the
+        # publication authority and defer ordinary selection instead of retrying every loop.
+        with contextlib.suppress(OSError):
+            tr.atomic(work / "publication.json", {**value, "retry_at": retry_at})
+        raise ProgressPreparationUnavailable(
+            f"waiting-progress-storage: could not retain prepared report: {exc}", retry_at=retry_at
+        ) from exc
     complete(cfg, record)
     return saved
 
@@ -141,6 +227,11 @@ def parked_window(cfg, plan):
     """Never pay to regenerate the exact window already saved for inspection."""
     for path in (cfg.state / "progress/retained").glob("*/plan.json"):
         try:
+            if path.parent.name.startswith("."):
+                continue
+            receipt = json.loads((path.parent / "publication.json").read_text())
+            if receipt.get("status") != "parked":
+                continue
             previous = json.loads(path.read_text())
             if all(previous.get(key) == plan.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs")):
                 return path.parent

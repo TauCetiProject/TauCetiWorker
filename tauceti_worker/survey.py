@@ -614,8 +614,12 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
         return True, "prepared progress report ready to resume publication"
     if (cfg.state / "progress/work/publication.json").exists():
         return False, "prepared progress receipt needs recovery; files preserved"
-    if counters.read("progress-docs-retry-at") > time.time():
-        return False, "waiting-documentation: generation changed; mechanical replanning will retry shortly"
+    if (retry_at := counters.read("progress-docs-retry-at")) > time.time():
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(retry_at))
+        return (
+            False,
+            f"waiting-documentation: mechanical preparation will retry after {when}; stage diagnostics retained",
+        )
     if counters.read("progress-mechanical-retry-at") > time.time():
         return False, "progress mechanical work is cooling down; prose cadence remains unspent"
     cache = cfg.state / "cache" / "progress-due.json"

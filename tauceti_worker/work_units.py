@@ -2001,11 +2001,12 @@ def _progress_mechanical_failed(w, reason):
     raise Die(reason)
 
 
-def _progress_documentation_wait(w, reason):
+def _progress_documentation_wait(w, reason, *, recovery=False):
     from .config import DocumentationUnavailable
 
     waits = w.counters.read("progress-docs-waits") + 1
-    delay = (60, 300, 900, 1800)[min(waits - 1, 3)]
+    delays = (300, 900, 3600, 14400, PROGRESS_ATTEMPT_GAP) if recovery else (60, 300, 900, 1800)
+    delay = delays[min(waits - 1, len(delays) - 1)]
     retry_at = int(time.time()) + delay
     w.counters.write("progress-docs-waits", waits)
     w.counters.write("progress-mechanical-retry-at", 0)
@@ -2041,10 +2042,17 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
         shutil.rmtree(old, ignore_errors=True)
     attempts = Path(tempfile.mkdtemp(prefix="attempt-", dir=archive))
     reason = ""
+    invalid_plan = None
+    recovery = False
+
+    def plan_identity(value):
+        return {key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")}
+
     for attempt in range(3):
         output = attempts / str(attempt + 1)
         output.mkdir()
         plan_file, facts_file = output / "plan.json", output / "facts.json"
+        plan = {}
         # Shared within an attempt, isolated from all other attempts and the global disk cache.
         with tempfile.TemporaryDirectory(prefix="docs-", dir=output) as cache:
             for stage, args in (
@@ -2072,9 +2080,16 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                     return None
                 if proc.returncode:
                     reason = _progress_tool_failed(w, stage, proc)
-                    if _progress_generation_changed(stage, proc):
-                        log(f"progress: documentation changed on mechanical attempt {attempt + 1}/3; replanning")
+                    if proc.returncode == 78:
+                        recovery = True
+                        if stage == "plan":
+                            _progress_documentation_wait(w, reason, recovery=True)
+                        invalid_plan = plan_identity(plan)
+                    if _progress_generation_changed(stage, proc) or proc.returncode == 78:
+                        log(f"progress: documentation requires replanning on mechanical attempt {attempt + 1}/3")
                         break
+                    if proc.returncode == 77:
+                        _progress_documentation_wait(w, reason)
                     _progress_mechanical_failed(w, reason)
                 if stage == "plan":
                     try:
@@ -2085,6 +2100,10 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                             raise ValueError("plan is missing its roadmap/window/PR identity")
                     except (OSError, ValueError) as exc:
                         _progress_mechanical_failed(w, f"progress: invalid plan artifact: {exc}")
+                    if invalid_plan == plan_identity(plan):
+                        _progress_documentation_wait(
+                            w, f"replanning selected the same invalid facts identity; {reason}", recovery=True
+                        )
                     if saved := publication.parked_window(w.cfg, plan):
                         log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
                         w.counters.write("progress-docs-waits", 0)
@@ -2101,17 +2120,25 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                         raise ValueError("facts must contain full docs_sha and to_sha commit IDs")
                 except (OSError, ValueError, AttributeError) as exc:
                     _progress_mechanical_failed(w, f"progress: invalid facts artifact: {exc}")
-                if facts["docs_sha"] != plan["to_sha"] or facts["to_sha"] != plan["to_sha"]:
+                if (
+                    facts["docs_sha"] != plan["to_sha"]
+                    or facts["to_sha"] != plan["to_sha"]
+                    or facts.get("documentation") != plan.get("documentation")
+                ):
                     reason = (
                         f"successful facts name docs={facts['docs_sha']} to={facts['to_sha']}, "
-                        f"expected={plan['to_sha']}; replanning"
+                        f"expected={plan['to_sha']} or documentation pin differs; replanning"
                     )
                     log(f"progress: {reason}")
                 else:
+                    try:
+                        publication.facts_bundle(plan_file, verify=True)
+                    except (OSError, ValueError) as exc:
+                        _progress_documentation_wait(w, f"pinned facts bundle unavailable: {exc}", recovery=True)
                     return plan_file, facts_file
     # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
     # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
-    _progress_documentation_wait(w, f"generation kept changing after 3 attempts; {reason}")
+    _progress_documentation_wait(w, f"generation kept changing after 3 attempts; {reason}", recovery=recovery)
 
 
 def _install_progress_body(source, target):
@@ -2123,6 +2150,11 @@ def _install_progress_body(source, target):
             out.flush()
             os.fsync(out.fileno())
         os.replace(name, target)
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -2220,7 +2252,12 @@ def _do_progress_inner(w, opts) -> int | None:
                 text=True,
                 errors="replace",
                 timeout=max(1, min(1800, remaining)),
-                env={**os.environ, "TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else None,
+                env={
+                    **os.environ,
+                    "TAUCETI_FACTS_CACHE": os.environ.get("TAUCETI_FACTS_CACHE")
+                    or str(w.cfg.state / "progress/facts-cache"),
+                    **({"TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else {}),
+                },
             )
         except (OSError, subprocess.SubprocessError) as exc:
 
@@ -2263,20 +2300,35 @@ def _do_progress_inner(w, opts) -> int | None:
         same = identity(plan_file, facts_file) == identity(new_plan, new_facts)
     except (OSError, ValueError):
         same = False
-    if not same:
-        # Preserve old artifacts for diagnosis/rollback, and invalidate prose only when its
-        # factual inputs changed. Receipted publication above never reaches this path.
-        previous = new_plan.parent.parent / "previous"
-        previous.mkdir()
-        for artifact in (plan_file, facts_file, prompt_file, status_body, section_body):
-            if artifact.exists():
-                shutil.copyfile(artifact, previous / artifact.name)
-        if not any(previous.iterdir()):
-            previous.rmdir()
-        for body in (status_body, section_body):
-            body.unlink(missing_ok=True)
-    shutil.copyfile(new_plan, plan_file)
-    shutil.copyfile(new_facts, facts_file)
+    try:
+        if not same:
+            # Preserve old artifacts for diagnosis/rollback, and invalidate prose only when its
+            # factual inputs changed. Receipted publication above never reaches this path.
+            previous = new_plan.parent.parent / "previous"
+            previous.mkdir()
+            artifacts = [plan_file, facts_file, prompt_file, status_body, section_body]
+            try:
+                if bundle := publication.facts_bundle(plan_file):
+                    artifacts.append(bundle)
+            except (OSError, ValueError):
+                pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
+            for artifact in artifacts:
+                if artifact.exists():
+                    if artifact.name.startswith("plan.json.facts-"):
+                        publication.retain_facts_bundle(artifact, previous / artifact.name)
+                    else:
+                        shutil.copyfile(artifact, previous / artifact.name)
+            if not any(previous.iterdir()):
+                previous.rmdir()
+            for body in (status_body, section_body):
+                body.unlink(missing_ok=True)
+        # Install immutable bytes before the plan that refers to them.
+        if bundle := publication.facts_bundle(new_plan, verify=True):
+            publication.retain_facts_bundle(bundle, work / bundle.name)
+        _install_progress_body(new_plan, plan_file)
+        _install_progress_body(new_facts, facts_file)
+    except (OSError, ValueError) as exc:
+        _progress_documentation_wait(w, f"could not retain pinned progress inputs: {exc}", recovery=True)
     w.counters.write("progress-docs-retry-at", 0)
     w.counters.write("progress-docs-waits", 0)
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
