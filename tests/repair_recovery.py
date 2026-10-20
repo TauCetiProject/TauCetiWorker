@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Recovery protocol faults with real private Git clones/CAS pushes and fake paid/verifier boundaries."""
 
-import copy
 import os
 import subprocess
 import sys
@@ -17,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import repair_recovery as rr
 from tauceti_worker import work_recovery as saved
 from tauceti_worker.agents import AuthoringProfile
+from tauceti_worker.agents import run_agent_host as run_real_agent_host
 from tauceti_worker.runtime_status import read_json
 from tauceti_worker.verification import digest, inventory
 
@@ -145,6 +145,7 @@ class Fixture(unittest.TestCase):
             patch.object(rr, "repository_url", lambda repo: str(self.remote)),
             patch("tauceti_worker.github.me", return_value="alice"),
             patch("tauceti_worker.github.can_push", return_value=True),
+            patch("tauceti_worker.github_state.read", side_effect=lambda *a, **kw: (True, self.raw_facts())),
             patch("tauceti_worker.config.roadmap_only", return_value="any"),
             patch("tauceti_worker.config.roadmap_skip", return_value=[]),
             patch("tauceti_worker.github_outbox.drain", return_value=[]),
@@ -178,6 +179,7 @@ class Fixture(unittest.TestCase):
             labels=[dict(name=label) for label in f["labels"]],
             isDraft=f["draft"],
             baseRefName=f["base"],
+            body="",
         )
 
     def run_recovery(self):
@@ -204,7 +206,7 @@ class Fixture(unittest.TestCase):
         (checkout / "A.lean").write_text("retained repair\n-- repaired\n")
         return 0
 
-    def test_rewritten_head_does_not_resurrect_removed_history(self):
+    def rewritten_checkpoint(self, *, conflicting=False):
         git(self.co, "reset", "--hard", self.base)
         (self.co / "Dropped.lean").write_text("intentionally removed\n")
         git(self.co, "add", "Dropped.lean")
@@ -212,13 +214,113 @@ class Fixture(unittest.TestCase):
         old_head = git(self.co, "rev-parse", "HEAD")
         self.owner["expected_head"] = old_head
         (self.co / "A.lean").write_text("retained delta\n")
+        older = self.record
         self.save_updated_checkpoint()
-        self.advance_writer()
-        self.assertFalse(self.run_recovery())
-        self.assertEqual(self.journal()["reason"]["code"], "head-rewritten")
-        self.assertEqual(FakeVerification.calls, 0)
+        rr.write(
+            older,
+            {},
+            "obsolete",
+            reason=rr.reason(
+                rr.Obsolete("source-replaced", "A newer checkpoint from the same round retains the current source")
+            ),
+        )
+        self.advance_writer(conflicting=conflicting)
+        return old_head
+
+    def test_rewritten_head_does_not_resurrect_removed_history(self):
+        old_head = self.rewritten_checkpoint()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(FakeVerification.calls, 1)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta")
         self.assertNotIn("Dropped.lean", git(self.remote, "ls-tree", "--name-only", "main"))
+        self.assertNotIn(old_head, git(self.remote, "rev-list", "main").split())
         self.assertEqual(saved._complete(self.record), self.manifest)
+        transaction = self.journal()["delta_integration"]
+        self.assertEqual(transaction["stage"], "applied")
+        self.assertEqual(git(Path(transaction["archived"]), "show", "HEAD:A.lean"), "retained delta")
+
+    def test_rewritten_conflict_resolves_under_original_admission(self):
+        old_head = self.rewritten_checkpoint(conflicting=True)
+
+        def resolve(checkout, prompt, *args, **kwargs):
+            self.assertIn("never merge the old expected/source ancestry", prompt)
+            (checkout / "A.lean").write_text("retained delta plus other writer\n")
+            git(checkout, "add", "A.lean")
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=resolve) as model,
+        ):
+            self.assertTrue(self.run_recovery())
+        model.assert_called_once()
+        self.assertEqual(self.journal()["content_attempts"], 1)
+        self.assertEqual(self.journal()["attempts"], 1)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta plus other writer")
+        self.assertNotIn(old_head, git(self.remote, "rev-list", "main").split())
+
+    def test_delta_handoff_crashes_resume_without_model_or_source_loss(self):
+        for stage in ("prepared", "ready", "applied"):
+            with self.subTest(stage=stage):
+                case = Fixture()
+                case.setUp()
+                try:
+                    case.rewritten_checkpoint()
+                    original = rr.write
+
+                    def die(record, journal, state, original=original, stage=stage, **fields):
+                        original(record, journal, state, **fields)
+                        if (fields.get("delta_integration") or {}).get("stage") == stage:
+                            raise Death()
+
+                    with patch.object(rr, "write", side_effect=die):
+                        with self.assertRaises(Death):
+                            case.run_recovery()
+                    case.assertEqual(saved._complete(case.record), case.manifest)
+                    case.assertTrue(case.run_recovery())
+                    case.assertEqual(git(case.remote, "show", "main:A.lean"), "retained delta")
+                    case.assertNotIn("Dropped.lean", git(case.remote, "ls-tree", "--name-only", "main"))
+                    case.assertEqual(git(case.remote, "rev-list", "--count", "main"), "3")
+                finally:
+                    case.doCleanups()
+
+    def test_delta_handoff_death_between_renames_resumes(self):
+        self.rewritten_checkpoint()
+        original = Path.rename
+
+        def die(path, target):
+            result = original(path, target)
+            if Path(target).name == "source-checkout":
+                raise Death()
+            return result
+
+        with patch.object(Path, "rename", die):
+            with self.assertRaises(Death):
+                self.run_recovery()
+        self.assertFalse((self.record / "checkout").exists())
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta")
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_interrupted_resolved_delta_verifies_without_another_model(self):
+        self.rewritten_checkpoint(conflicting=True)
+
+        def resolve_and_die(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("both writers\n")
+            git(checkout, "add", "A.lean")
+            raise Death()
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=resolve_and_die),
+        ):
+            with self.assertRaises(Death):
+                self.run_recovery()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 1)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "both writers")
 
     def test_successful_round_leftovers_are_archived(self):
         self.owner["round_outcome"] = dict(published_head=self.base, exit_code=0)
@@ -381,8 +483,6 @@ class Fixture(unittest.TestCase):
             reason=rr.reason(rr.Block("content-allowance", "spent")),
         )
         self.advance_writer()
-        self.assertFalse(rr.recover(self.w, self.opts))
-        self.assertEqual(self.journal()["state"], "eligible")
         self.assertTrue(rr.recover(self.w, self.opts))
         self.assertEqual(self.journal()["state"], "published")
 
@@ -396,9 +496,9 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["state"], "published")
 
     def test_blocked_checkpoint_observes_closed_pr_without_hashing_payload(self):
-        rr.write(self.record, {}, "blocked", reason=rr.reason(rr.Block("content-allowance", "spent")))
+        rr.write(self.record, {}, "blocked", reason=rr.reason(rr.Block("original-authorization-missing", "legacy")))
         self.current["state"] = "CLOSED"
-        self.assertTrue(rr.due(self.cfg))
+        self.assertFalse(rr.due(self.cfg))
         with patch.object(saved, "_complete", side_effect=AssertionError("metadata probe rehashed source")):
             self.assertFalse(rr.recover(self.w, self.opts))
         self.assertEqual(self.journal()["state"], "obsolete")
@@ -442,6 +542,193 @@ class Fixture(unittest.TestCase):
         self.assertEqual(error.exception.code, "continuation-cleanup")
         self.assertEqual(lock.read_text(), "still owned")
         self.assert_retained()
+
+    def test_original_content_allowance_supports_multiple_autonomous_repairs(self):
+        # One paid launch was already charged by the original round; two remain.
+        self.values["fix-10-head"] = 1
+        attempts = []
+
+        def repair(checkout, *args, **kwargs):
+            attempts.append(1)
+            (checkout / "A.lean").write_text(f"repair version {len(attempts)}\n")
+            return 0
+
+        FakeVerification.failures = 2
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
+        ):
+            self.assertFalse(self.run_recovery())
+            self.assertEqual(self.journal()["reason"]["code"], "source-verification-failed")
+            self.assertEqual(self.journal()["attempts"], 0)
+            self.retry_now()
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.values["fix-10-head"], 3)
+        self.assertEqual(self.journal()["content_attempts"], 2)
+        self.assertFalse((self.record / "operator.json").exists())
+
+    def test_exhausted_content_does_not_require_a_human_or_grant_more_budget(self):
+        self.values["fix-10-head"] = 3
+        FakeVerification.failures = 1
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(self.journal()["reason"]["next_action"], "continue-normal-selection")
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+        self.assertEqual(self.values["fix-10-head"], 3)
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_blocked_and_waiting_records_never_reserve_the_pr(self):
+        for state, code in (
+            ("blocked", "original-authorization-missing"),
+            ("blocked", "incomplete-git-operation"),
+            ("blocked", "recovery-exhausted"),
+            ("blocked", "content-allowance"),
+            ("eligible", "budget-refused"),
+            ("eligible", "work-policy"),
+        ):
+            rr.write(self.record, {}, state, reason=rr.reason(rr.Block(code, "unavailable")))
+            self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+            self.assertIn(str(self.record), rr.retained_context(self.cfg, "upstream/repo", 10))
+        self.assertEqual(saved._complete(self.record), self.manifest)
+        self.assertFalse((self.record / "operator.json").exists())
+
+    def test_rollback_does_not_leave_a_recovery_reservation(self):
+        self.assertTrue(rr.pending_for(self.cfg, "upstream/repo", 10))
+        with patch.dict(os.environ, TAUCETI_AUTO_RECOVERY="off"):
+            self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_old_operator_dependent_block_is_migrated_automatically(self):
+        self.rewritten_checkpoint()
+        for older in (self.cfg.state / "recovery").iterdir():
+            if older.is_dir() and older != self.record:
+                rr.write(older, {}, "obsolete")
+        rr.atomic_json(
+            self.record / "recovery.json",
+            dict(state="blocked", attempts=0, reason=dict(code="head-rewritten"), retry_at=10**12),
+        )
+        self.assertTrue(rr.due(self.cfg))
+        self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["protocol"], rr.PROTOCOL)
+        self.assertFalse((self.record / "operator.json").exists())
+
+    def test_budget_reopens_and_recovery_finishes_without_operator_action(self):
+        FakeVerification.failures = 1
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("no funding")):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
+        self.assertTrue(rr.pending_for(self.cfg, "upstream/repo", 10))
+        with patch.object(rr.time, "time", return_value=self.journal()["reservation_until"] + 1):
+            self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+        self.retry_now()
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
+        ):
+            self.assertTrue(self.run_recovery())
+        model.assert_called_once()
+        self.assertEqual(FakeVerification.calls, 2)
+        self.assertFalse((self.record / "operator.json").exists())
+
+    def test_migration_preserves_exhausted_infrastructure_budget(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            for _ in range(3):
+                self.run_recovery()
+                self.retry_now()
+        journal = self.journal()
+        journal.pop("protocol")
+        rr.atomic_json(self.record / "recovery.json", journal)
+        with patch.object(self.backend, "verify", side_effect=AssertionError("Migration reset failures")) as verify:
+            self.assertFalse(self.run_recovery())
+        verify.assert_not_called()
+        self.assertEqual(self.journal()["attempts"], 3)
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+
+    def test_old_one_continuation_block_uses_remaining_original_budget(self):
+        self.values["fix-10-head"] = 1
+        FakeVerification.failures = 2
+        calls = []
+
+        def repair(checkout, *args, **kwargs):
+            calls.append(1)
+            (checkout / "A.lean").write_text(f"repair {len(calls)}\n")
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
+        ):
+            self.assertFalse(self.run_recovery())
+            journal = self.journal()
+            journal.pop("protocol")
+            journal.update(state="blocked", reason=dict(code="content-allowance"), retry_at=10**12)
+            rr.atomic_json(self.record / "recovery.json", journal)
+            self.assertTrue(rr.recover(self.w, self.opts))
+        # Mechanical reevaluation now succeeds; migration need not buy another repair.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.values["fix-10-head"], 2)
+        self.assertEqual(self.journal()["state"], "published")
+        self.assertFalse((self.record / "operator.json").exists())
+
+    def test_blocked_record_allows_fresh_dispatch_under_normal_quota_checks(self):
+        from tauceti_worker import work_units
+
+        class QuotaReached(Exception):
+            pass
+
+        rr.write(
+            self.record, {}, "blocked", reason=rr.reason(rr.Block("incomplete-git-operation", "unsupported metadata"))
+        )
+        candidate = SimpleNamespace(pr=10)
+        options = SimpleNamespace(dry_run=False, sandbox_host=True)
+        with patch.object(work_units, "_check_stage_read_quota", side_effect=QuotaReached()) as quota:
+            with self.assertRaises(QuotaReached):
+                work_units.dispatch("fix", self.w, None, candidate, options)
+        quota.assert_called_once_with("fix")
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_continuation_cannot_import_removed_lineage(self):
+        old_head = self.rewritten_checkpoint(conflicting=True)
+        writer_head = self.current["head"]
+
+        def import_history(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("resolved delta\n")
+            git(checkout, "add", "A.lean")
+            identity = ("-c", "user.name=fixture", "-c", "user.email=fixture@example.com")
+            git(checkout, *identity, "commit", "-qm", "resolve")
+            git(checkout, *identity, "merge", "-s", "ours", "--no-edit", old_head)
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=import_history),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "removed-history-reintroduced")
+        self.assertEqual(self.journal()["reason"]["next_action"], "retry-with-original-content-allowance")
+        self.assertTrue(self.journal()["rebuild_delta"])
+        self.assertEqual(git(self.remote, "rev-parse", "main"), writer_head)
+
+    def test_unreadable_recovery_metadata_does_not_disable_normal_work(self):
+        original = Path.iterdir
+
+        def unavailable(path):
+            if path == self.cfg.state / "recovery":
+                raise PermissionError("fixture metadata unavailable")
+            return original(path)
+
+        with patch.object(Path, "iterdir", unavailable):
+            self.assertFalse(rr.due(self.cfg))
+            self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+            self.assertEqual(rr.retained_context(self.cfg, "upstream/repo", 10), "")
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(saved._complete(self.record), self.manifest)
 
     def test_mechanical_zero_paid_and_duplicate(self):
         self.assertTrue(self.run_recovery())
@@ -508,12 +795,12 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["state"], "obsolete")
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
-    def test_uncertain_push_with_new_writer_is_blocked_before_replay(self):
+    def test_uncertain_push_with_new_writer_is_archived_without_replay(self):
         actual = rr.write
 
         def die_after_intent(record, journal, state, **fields):
             actual(record, journal, state, **fields)
-            if state == "publication-pending":
+            if (fields.get("publication") or {}).get("push_started"):
                 raise Death()
 
         with patch.object(rr, "write", side_effect=die_after_intent):
@@ -523,11 +810,13 @@ class Fixture(unittest.TestCase):
         writer = self.current["head"]
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "publication-head-moved")
-        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+        self.assertIn("publication-head-moved", rr.retained_context(self.cfg, "upstream/repo", 10))
         self.assertEqual(git(self.remote, "rev-parse", "main"), writer)
         self.assertEqual(FakeVerification.calls, 1)
 
-    def test_three_failures_block_and_operator_rearms(self):
+    def test_three_failures_release_pr_and_changed_head_rearms(self):
         with patch.object(self.backend, "verify", side_effect=RuntimeError("disk full")):
             for n in range(1, 4):
                 self.assertFalse(self.run_recovery())
@@ -535,7 +824,9 @@ class Fixture(unittest.TestCase):
                 self.retry_now()
             self.assertEqual(self.journal()["state"], "blocked")
             self.assertFalse(self.run_recovery())
-        rr.atomic_json(self.record / "operator.json", dict(retry_epoch=1))
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+        self.advance_writer()
+        self.retry_now()  # simulate the bounded external-fact probe becoming due
         self.assertTrue(self.run_recovery())
         self.assert_retained()
 
@@ -710,19 +1001,17 @@ class Fixture(unittest.TestCase):
         self.assert_retained()
 
     def test_identity_profile_mismatch_new_narrow_conversation(self):
-        value = dict(profile=asdict(self.profile), actor="alice", identity="credential-1", session="session-12345")
-        with patch.object(rr, "conversation_identity", return_value="credential-1"):
-            self.assertEqual(rr.valid_conversation(value, self.profile, "alice"), "session-12345")
-            self.assertIsNone(rr.valid_conversation(value, self.profile, "bob"))
-            self.assertIsNone(rr.valid_conversation(value, self.profile, "alice", scope=dict(pr=11)))
-            wrong = copy.deepcopy(value)
-            wrong["profile"]["model"] = "other"
-            self.assertIsNone(rr.valid_conversation(wrong, self.profile, "alice"))
-        with patch.object(rr, "conversation_identity", return_value="credential-2"):
-            self.assertIsNone(rr.valid_conversation(value, self.profile, "alice"))
-        value["identity"] = None
-        with patch.object(rr, "conversation_identity", return_value=None):
-            self.assertIsNone(rr.valid_conversation(value, self.profile, "alice"))
+        FakeVerification.failures = 1
+        recovery = rr.Recovery(self.record, self.backend)
+        recovery.manifest["conversation"] = dict(actor="other", identity="old-account", profile={"model": "other"})
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
+        ):
+            self.assertTrue(recovery.run())
+        self.assertNotIn("resume", model.call_args.kwargs)
+        self.assertEqual(self.journal()["conversation_mode"], "narrow-new")
 
     def test_rollback_preserves_everything(self):
         with (
@@ -890,8 +1179,8 @@ class Fixture(unittest.TestCase):
             args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None)
             self.assertEqual(loop.cmd_loop(args, self.cfg, only=["fix"], agent="claude"), 130)
         self.assertNotIn("--recovery-only", tails[0])
-        rr.atomic_json(self.record / "operator.json", dict(retry_epoch=1))
-        self.assertTrue(rr.due(self.cfg))
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+        self.assertFalse(rr.due(self.cfg))
 
     def test_one_invocation_even_when_cleanup_wait_refunds_attempt(self):
         other = self.record.parent / "second"
@@ -950,9 +1239,9 @@ class Fixture(unittest.TestCase):
         )
         saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
         summary = saved.summary(self.cfg.state.parent, workers={"w"})
-        self.assertIn("next action: restore dependency", summary["reasons"][0])
+        self.assertIn("next action: continue-normal-selection", summary["reasons"][0])
 
-    def test_historical_conversation_uses_fresh_checkout(self):
+    def test_valid_original_conversation_uses_fresh_checkout_without_rebinding(self):
         FakeVerification.failures = 1
         recovery = rr.Recovery(self.record, self.backend)
         recovery.manifest["conversation"] = dict(
@@ -964,15 +1253,16 @@ class Fixture(unittest.TestCase):
         )
         with (
             patch.object(rr, "conversation_identity", return_value="account-a"),
-            patch.object(rr, "session_available", return_value=True),
             patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
             self.assertTrue(recovery.run())
-        self.assertIsNone(model.call_args.kwargs["resume"])
+        self.assertNotIn("resume", model.call_args.kwargs)
         self.assertNotIn("original_cwd", model.call_args.kwargs)
         self.assertEqual(model.call_args.args[0], self.record / "checkout")
+        self.assertEqual(self.journal()["conversation_mode"], "narrow-new")
+        self.assertEqual((self.co / "A.lean").read_text(), "retained repair\n")
 
     def test_continuation_raw_git_push_is_denied_but_supervisor_can_publish(self):
         actual = self.backend.verify
@@ -1103,6 +1393,561 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "corrupt-checkpoint")
         self.assertFalse((self.record / "checkout").exists())
+
+    def test_legacy_containment_wait_migrates_without_namespaces_or_counter_reset(self):
+        for name, payload in (("uncertain.json", "malformed"), ("proof.json", '{"strong":false}')):
+            path = self.cfg.state / "containment" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload)
+        self.values["fix-10-head"] = 2
+        rr.atomic_json(
+            self.record / "recovery.json",
+            dict(
+                protocol=2,
+                state="eligible",
+                attempts=1,
+                content_attempts=2,
+                reason=dict(code="containment-unavailable"),
+                retry_at=10**12,
+            ),
+        )
+        self.assertTrue(rr.due(self.cfg, only=["fix"]))
+        with patch.dict(sys.modules, {"tauceti_worker.containment": None}):
+            self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.values["fix-10-head"], 2)
+        self.assertEqual(self.journal()["content_attempts"], 2)
+        self.assertEqual(self.journal()["attempts"], 1)
+        self.assert_retained()
+
+    def test_terminal_legacy_selection_changes_never_schedule_recovery(self):
+        for state in ("published", "obsolete"):
+            rr.atomic_json(
+                self.record / "recovery.json",
+                dict(state=state, selection=dict(only=[], prs=[], sandbox_host=True, agent="auto")),
+            )
+            self.assertFalse(rr.due(self.cfg, only=["fix"], prs=(10,), agent="claude"))
+
+    def test_selection_change_failure_persists_new_policy_and_backoff(self):
+        rr.write(self.record, {}, "eligible", selection=rr.selection(["review"], (), True, "claude"))
+        self.opts.only = ["fix"]
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["selection"]["only"], ["fix"])
+        self.assertFalse(rr.due(self.cfg, only=["fix"], agent="claude"))
+        with patch.object(self.backend, "restore", side_effect=AssertionError("bypassed backoff")):
+            self.assertFalse(self.run_recovery())
+
+    def test_known_unsent_intent_is_reintegrated_after_head_move(self):
+        with patch.object(self.backend, "publish", side_effect=rr.Wait("claim-or-head-changed", "pre-push")):
+            self.assertFalse(self.run_recovery())
+        self.assertNotIn("publication", self.journal())
+        self.assertEqual(self.journal()["publication_history"][-1]["disposition"], "not-sent")
+        self.advance_writer()
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:Other.lean"), "other writer")
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained repair")
+
+    def test_crash_before_push_started_does_not_archive_known_unsent_delta(self):
+        actual = rr.write
+
+        def die(record, journal, state, **fields):
+            actual(record, journal, state, **fields)
+            if state == "publication-pending":
+                raise Death()
+
+        with patch.object(rr, "write", side_effect=die), self.assertRaises(Death):
+            self.run_recovery()
+        self.advance_writer()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(self.journal()["state"], "published")
+
+    def move_writer_again(self, *, rewrite=False):
+        other = self.root / "other"
+        if rewrite:
+            git(other, "reset", "--hard", self.base)
+        (other / "Next.lean").write_text("next writer\n")
+        git(other, "add", "-A")
+        git(other, "-c", "user.name=other", "-c", "user.email=other@example.com", "commit", "-qm", "next")
+        git(other, "push", "-q", "--force", "origin", "HEAD:main")
+        self.current["head"] = git(self.remote, "rev-parse", "main")
+
+    def test_unresolved_rewritten_delta_retargets_after_forward_head_move(self):
+        old = self.rewritten_checkpoint(conflicting=True)
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        self.move_writer_again()
+        target = self.current["head"]
+        self.retry_now()
+
+        def resolve(checkout, *args, **kwargs):
+            self.assertEqual(git(checkout, "rev-parse", "HEAD"), target)
+            (checkout / "A.lean").write_text("both writers\n")
+            git(checkout, "add", "A.lean")
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=resolve) as model,
+        ):
+            self.assertTrue(self.run_recovery())
+        model.assert_called_once()
+        self.assertNotIn(old, git(self.remote, "rev-list", "main").split())
+        self.assertEqual(git(self.remote, "show", "main:Next.lean"), "next writer")
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_second_rewrite_reuses_frozen_delta_without_paid_work(self):
+        self.rewritten_checkpoint(conflicting=True)
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        patch_bytes = Path(self.journal()["delta_integration"]["patch"]).read_bytes()
+        self.move_writer_again(rewrite=True)
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(Path(self.journal()["delta_integration"]["patch"]).read_bytes(), patch_bytes)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta")
+        self.assertNotIn("Dropped.lean", git(self.remote, "ls-tree", "--name-only", "main"))
+
+    def test_pending_owned_merge_retargets_after_head_move(self):
+        self.advance_writer(conflicting=True)
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        self.move_writer_again()
+        self.retry_now()
+
+        def resolve(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("both writers\n")
+            git(checkout, "add", "A.lean")
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
+        ):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:Next.lean"), "next writer")
+
+    def test_missing_derived_checkout_restores_immutable_source(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            self.assertFalse(self.run_recovery())
+        (self.record / "checkout").rename(self.record / "lost-checkout")
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+        self.assert_retained()
+
+    def handoff(self):
+        return rr.handoff_context(
+            self.cfg,
+            "upstream/repo",
+            10,
+            head=self.current["head"],
+            actor="alice",
+            checkout=self.co,
+            push_marker="refs/tauceti/published/push/main",
+            published_before=None,
+        )
+
+    def test_normal_handoff_retires_recovery_before_exposing_immutable_source(self):
+        text, handoffs = self.handoff()
+        self.assertIn(str(self.record / "manifest.json"), text)
+        self.assertNotIn(str(self.record / "checkout"), text)
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertTrue(rr.due(self.cfg, only=["fix"]))
+        self.assertFalse(self.run_recovery())
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+        rr.complete_handoffs(self.cfg, handoffs, self.base)
+        self.assertEqual(rr.retained_context(self.cfg, "upstream/repo", 10), "")
+        self.assertEqual(self.journal()["handoff"]["published_head"], self.base)
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_unlaunched_handoff_remains_available_to_normal_work(self):
+        self.handoff()
+        context, handoffs = self.handoff()
+        self.assertIn(str(self.record), context)
+        self.assertEqual(len(handoffs), 1)
+        self.assertEqual(self.journal()["handoff"]["state"], "offered")
+        self.assertFalse(self.run_recovery())
+
+    def test_normal_push_survives_death_before_handoff_acknowledgement(self):
+        self.handoff()
+        git(self.co, "update-ref", "refs/tauceti/published/push/main", self.base)
+        context, handoffs = self.handoff()
+        self.assertEqual((context, handoffs), ("", []))
+        self.assertEqual(self.journal()["reason"]["code"], "source-handoff-published")
+        self.assertFalse(self.run_recovery())
+
+    def test_handoff_preserves_latest_partial_source(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            self.assertFalse(self.run_recovery())
+        (self.record / "checkout/A.lean").write_text("latest partial\n")
+        context, _ = self.handoff()
+        snapshot = Path(self.journal()["source_checkpoint"])
+        self.assertIn(str(snapshot / "manifest.json"), context)
+        clone = self.root / "reconstruction"
+        subprocess.run(["git", "clone", "-q", str(self.remote), str(clone)], check=True)
+        saved.restore(snapshot, clone)
+        self.assertEqual((clone / "A.lean").read_text(), "latest partial\n")
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_content_limit_schedules_mechanical_recheck_without_more_paid_work(self):
+        self.values["fix-10-head"] = 3
+        FakeVerification.failures = 1
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "content-allowance")
+        self.assertFalse(rr.due(self.cfg, only=["fix"]))
+        with patch.object(rr.time, "time", return_value=self.journal()["retry_at"] + 1):
+            self.assertTrue(rr.due(self.cfg, only=["fix"]))
+            self.test_loop_recovery_precedes_model_budget()
+            self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(FakeVerification.calls, 2)
+        self.assertEqual(self.values["fix-10-head"], 3)
+
+    def test_infrastructure_backoff_eventually_rechecks_automatically(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            for _ in range(3):
+                self.assertFalse(self.run_recovery())
+                self.retry_now()
+        due = self.journal()["mechanical_recheck_at"]
+        with patch.object(rr.time, "time", return_value=due + 1):
+            self.assertTrue(rr.due(self.cfg, only=["fix"]))
+            self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["infrastructure_failures"], 3)
+        self.assertEqual(self.journal()["state"], "published")
+
+    def test_handoff_excludes_foreign_and_automatic_bump_source(self):
+        for restriction in ("foreign", "automatic_bump"):
+            self.owner["authorization"][restriction] = True
+            (self.co / "A.lean").write_text(f"{restriction} source\n")
+            self.save_updated_checkpoint()
+            self.assertNotIn(self.record, [p for p, _, _ in rr.evidence_records(self.cfg, "upstream/repo", 10)])
+            self.owner["authorization"].pop(restriction)
+
+    def test_reintegration_patch_ignores_external_diff_configuration(self):
+        self.rewritten_checkpoint()
+        actual = self.backend.reintegrate_delta
+
+        def configure(checkout, *args, **kwargs):
+            git(checkout, "config", "diff.noprefix", "true")
+            git(checkout, "config", "color.diff", "always")
+            git(checkout, "config", "diff.external", "false")
+            return actual(checkout, *args, **kwargs)
+
+        with patch.object(self.backend, "reintegrate_delta", side_effect=configure):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta")
+
+    def test_rejected_removed_lineage_is_automatically_replanned(self):
+        old = self.rewritten_checkpoint(conflicting=True)
+
+        def import_history(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("resolved delta\n")
+            git(checkout, "add", "A.lean")
+            identity = ("-c", "user.name=fixture", "-c", "user.email=fixture@example.com")
+            git(checkout, *identity, "commit", "-qm", "resolve")
+            git(checkout, *identity, "merge", "-s", "ours", "--no-edit", old)
+            return 0
+
+        def repair(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("safe retained repair\n")
+            git(checkout, "add", "A.lean")
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=import_history),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.retry_now()
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
+        ):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 2)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "safe retained repair")
+        self.assertNotIn(old, git(self.remote, "rev-list", "main").split())
+
+    def test_blocked_metadata_recheck_never_falls_back_to_direct_github(self):
+        rr.write(self.record, {}, "blocked", reason=rr.reason(rr.Block("original-authorization-missing", "legacy")))
+        with (
+            patch("tauceti_worker.github_state.read", return_value=(False, None)),
+            patch.object(self.w.gh, "pr_view", side_effect=AssertionError("New GitHub polling")),
+        ):
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertIn("no direct GitHub probe", self.journal()["probe_error"])
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+
+    def test_later_rewrite_cannot_reintroduce_an_earlier_target_lineage(self):
+        self.rewritten_checkpoint(conflicting=True)
+        earlier_target = self.current["head"]
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        self.move_writer_again(rewrite=True)
+        other = self.root / "other"
+        (other / "A.lean").write_text("second rewritten writer\n")
+        git(other, "add", "A.lean")
+        identity = ("-c", "user.name=fixture", "-c", "user.email=fixture@example.com")
+        git(other, *identity, "commit", "-qm", "second writer")
+        git(other, "push", "-q", "origin", "HEAD:main")
+        self.current["head"] = git(self.remote, "rev-parse", "main")
+        target = self.current["head"]
+        self.retry_now()
+
+        def import_old_target(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("resolved delta\n")
+            git(checkout, "add", "A.lean")
+            git(checkout, *identity, "commit", "-qm", "resolve")
+            git(checkout, *identity, "merge", "-s", "ours", "--no-edit", earlier_target)
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=import_old_target),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "removed-history-reintroduced")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), target)
+
+    def test_missing_rewritten_checkout_restores_retained_history(self):
+        self.rewritten_checkpoint(conflicting=True)
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        self.move_writer_again(rewrite=True)
+        self.retry_now()
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            self.assertFalse(self.run_recovery())
+        (self.record / "checkout").rename(self.record / "lost-checkout")
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta")
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_push_helper_exec_failure_is_known_unsent(self):
+        actual = subprocess.run
+
+        def unavailable(argv, *args, **kwargs):
+            if argv[0].endswith("git-safe-push"):
+                raise FileNotFoundError("helper unavailable")
+            return actual(argv, *args, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=unavailable):
+            self.assertFalse(self.run_recovery())
+        self.assertNotIn("publication", self.journal())
+        self.assertEqual(self.journal()["publication_history"][-1]["disposition"], "not-sent")
+        self.advance_writer()
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained repair")
+
+    def test_real_remote_lease_rejection_retains_unsent_repair(self):
+        actual = subprocess.run
+        raced = False
+
+        def race(argv, *args, **kwargs):
+            nonlocal raced
+            if argv[0].endswith("git-safe-push") and not raced:
+                raced = True
+                self.advance_writer()
+            return actual(argv, *args, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=race):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "push-rejected")
+        self.assertNotIn("publication", self.journal())
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained repair")
+        self.assertEqual(git(self.remote, "show", "main:Other.lean"), "other writer")
+
+    def test_rewrite_during_owned_merge_uses_original_delta(self):
+        old = self.rewritten_checkpoint(conflicting=True)
+        other = self.root / "other"
+        git(other, "fetch", str(self.co), old)
+        git(other, "reset", "--hard", old)
+        (other / "A.lean").write_text("conflicting forward writer\n")
+        (other / "RemovedWriter.lean").write_text("drop this on rewrite\n")
+        git(other, "add", "-A")
+        git(other, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", "forward")
+        git(other, "push", "-q", "--force", "origin", "HEAD:main")
+        self.current["head"] = git(self.remote, "rev-parse", "main")
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        self.assertTrue(self.journal()["pending_merge_head"])
+        self.move_writer_again(rewrite=True)
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+        paths = git(self.remote, "ls-tree", "--name-only", "main")
+        self.assertNotIn("Dropped.lean", paths)
+        self.assertNotIn("RemovedWriter.lean", paths)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta")
+
+    def test_zero_exit_with_conflicts_can_retarget_and_resolve(self):
+        self.rewritten_checkpoint(conflicting=True)
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", return_value=0),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertTrue(self.journal()["delta_integration"]["requires_reasoning"])
+        self.assertEqual(self.journal()["reason"]["code"], "recovery-source-unresolved")
+        self.move_writer_again()
+        self.retry_now()
+
+        def resolve(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("both writers\n")
+            git(checkout, "add", "A.lean")
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
+        ):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 2)
+
+    def test_prepared_delta_crash_then_head_move_keeps_frozen_source(self):
+        self.rewritten_checkpoint(conflicting=True)
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        self.move_writer_again(rewrite=True)
+        self.retry_now()
+        actual = rr.write
+
+        def die(record, journal, state, **fields):
+            actual(record, journal, state, **fields)
+            if (fields.get("delta_integration") or {}).get("stage") == "prepared":
+                raise Death()
+
+        with patch.object(rr, "write", side_effect=die), self.assertRaises(Death):
+            self.run_recovery()
+        other = self.root / "other"
+        (other / "Last.lean").write_text("last writer\n")
+        git(other, "add", "Last.lean")
+        git(other, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", "last")
+        git(other, "push", "-q", "origin", "HEAD:main")
+        self.current["head"] = git(self.remote, "rev-parse", "main")
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained delta")
+
+    def test_unused_normal_handoff_returns_to_zero_paid_mechanical_recovery(self):
+        _, handoffs = self.handoff()
+        self.assertTrue(rr.due(self.cfg))
+        self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["handoff"]["state"], "returned")
+        self.assertEqual(self.journal()["state"], "published")
+        self.assertEqual(self.values.get("fix-10-head", 0), 0)
+        # A stale acknowledgement cannot consume a newer handoff.
+        rr.complete_handoffs(self.cfg, [(handoffs[0][0], "stale")], self.base)
+        self.assertEqual(self.journal()["state"], "published")
+
+    def test_known_refused_normal_launch_restores_recovery_even_after_head_moves(self):
+        _, handoffs = self.handoff()
+        self.advance_writer()
+        rr.return_handoffs(handoffs)
+        self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "published")
+
+    def test_normal_partial_checkpoint_takes_recovery_ownership(self):
+        with patch("tauceti_worker.activity.current_round_id", return_value="receiving-round"):
+            self.handoff()
+        (self.co / "A.lean").write_text("normal partial source\n")
+        owner = {**self.owner, "round_id": "receiving-round"}
+        latest = saved._record(self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=owner)
+        self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertFalse(rr.recover(self.w, self.opts))  # Reconcile the older lease on the next bounded phase.
+        self.assertEqual(self.journal()["reason"]["code"], "source-handoff-checkpoint")
+        self.assertEqual(read_json(latest / "recovery.json")["state"], "published")
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "normal partial source")
+
+    def test_gc_cannot_prune_reintegration_lineage_inputs(self):
+        self.rewritten_checkpoint(conflicting=True)
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding")):
+            self.assertFalse(self.run_recovery())
+        tx = self.journal()["delta_integration"]
+        for path in (self.record / "checkout", Path(tx["archived"])):
+            git(path, "reflog", "expire", "--expire=now", "--all")
+            git(path, "gc", "--prune=now")
+            for name in ("expected", "source", "target"):
+                self.assertEqual(git(path, "rev-parse", f"refs/tauceti/recovery/{tx['id']}/{name}"), tx[name])
+        self.move_writer_again(rewrite=True)
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+
+    def test_claim_refusal_before_push_is_known_unsent(self):
+        claim = self.root / "claim-refused.sh"
+        claim.write_text("#!/bin/sh\nexit 1\n")
+        claim.chmod(0o700)
+        with patch.dict(os.environ, TAUCETI_CLAIM_KEY="branch/10", TAUCETI_CLAIM_SH=str(claim)):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "push-rejected")
+        self.assertNotIn("publication", self.journal())
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+
+    def test_cached_failure_is_mechanically_rechecked_without_funding(self):
+        FakeVerification.failures = 1
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("funding closed")):
+            self.assertFalse(self.run_recovery())
+            with patch.object(rr.time, "time", return_value=self.journal()["failed_recheck_at"] + 1):
+                self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(FakeVerification.calls, 2)
+        self.assertEqual(self.values.get("fix-10-head", 0), 0)
+
+    def test_repeated_unchanged_infrastructure_failure_backs_off_to_hours(self):
+        now = rr.time.time()
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            for _ in range(9):
+                with patch.object(rr.time, "time", return_value=now):
+                    self.assertFalse(self.run_recovery())
+                delay = self.journal()["retry_at"] - now
+                now = self.journal()["retry_at"] + 1
+        self.assertGreaterEqual(delay, 7200)
+        self.assertEqual(self.journal()["infrastructure_streak"], 9)
+        self.assertEqual(self.journal()["infrastructure_failures"], 9)
+        self.assertEqual(self.values.get("fix-10-head", 0), 0)
+
+    def test_forensic_handoff_cannot_return_to_automatic_publication(self):
+        rr.write(self.record, {}, "obsolete", reason=rr.reason(rr.Obsolete("publication-head-moved", "uncertain")))
+        _, handoffs = self.handoff()
+        rr.return_handoffs(handoffs)
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(self.journal()["handoff"]["state"], "forensic")
+        self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+
+    def test_fresh_continuation_runner_needs_no_pid_namespaces(self):
+        import contextlib
+
+        FakeVerification.failures = 1
+        script = "from pathlib import Path; Path('A.lean').write_text('fresh fixture repair\\n')"
+        with (
+            patch.dict(sys.modules, {"tauceti_worker.containment": None}),
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch.object(rr, "conversation_identity", return_value="fixture-account"),
+            patch(
+                "tauceti_worker.agents.host_agent_argv",
+                side_effect=lambda *a: ([sys.executable, "-c", script], os.environ.copy()),
+            ),
+            patch("tauceti_worker.agents.host_build_cache_context", side_effect=lambda *a: contextlib.nullcontext([])),
+            patch("tauceti_worker.fleet_capacity.check_launch_admission") as admission,
+            patch("tauceti_worker.agents.run_agent_host", side_effect=run_real_agent_host),
+        ):
+            self.assertTrue(self.run_recovery())
+        admission.assert_called_once()
+        self.assertEqual(self.journal()["conversation_mode"], "narrow-new")
+        self.assertEqual(self.values["fix-10-head"], 1)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "fresh fixture repair")
+        self.assertEqual((self.co / "A.lean").read_text(), "retained repair\n")
 
 
 class ConversationIsolation(unittest.TestCase):
