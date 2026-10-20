@@ -232,6 +232,15 @@ def main():
         for policy in ("full-lint", "lint-repair", "bump"):
             expect(f"{policy} policy", r, "full", ["TauCeti.A"], f"{policy} policy", policy=policy)
 
+        # Bubble sandboxes route https://github.com/ through a local proxy with url.insteadOf, and add
+        # an untracked SSH-form `github` remote; the canonical origin must still be recognised.
+        r = fixture(root, "insteadof")
+        git(r, "remote", "add", "github", "git@github.com:TauCetiProject/TauCeti.git")
+        write(r, "TauCeti/A.lean", "changed\n")
+        proxied = Path(root) / "proxy.gitconfig"
+        proxied.write_text('[url "http://127.0.0.1:7777/git/"]\n\tinsteadOf = https://github.com/\n')
+        expect("sandbox insteadOf proxy", r, "scoped", ["TauCeti.A"], config=str(proxied))
+
         r = fixture(root, "ssh-remote", remote="git@github.com:TauCetiProject/TauCeti.git")
         write(r, "TauCeti/A.lean", "changed\n")
         expect("ssh canonical remote", r, "scoped", ["TauCeti.A"])
