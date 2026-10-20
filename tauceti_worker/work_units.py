@@ -2020,14 +2020,29 @@ def _do_progress_inner(w, opts) -> int | None:
         # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
         # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
         log(f"  $ tauceti-progress {args[0]} …")
-        proc = subprocess.run(
-            progress_argv(w.cfg.state, *args),
-            capture_output=capture,
-            text=True,
-            errors="replace",
-            timeout=1800,
-            env={**os.environ, "TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else None,
-        )
+        try:
+            proc = subprocess.run(
+                progress_argv(w.cfg.state, *args),
+                capture_output=capture,
+                text=True,
+                errors="replace",
+                timeout=1800,
+                env={**os.environ, "TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else None,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+
+            def decoded(value):
+                return value.decode("utf-8", "replace") if isinstance(value, bytes) else value or ""
+
+            proc = subprocess.CompletedProcess(
+                args,
+                1,
+                decoded(getattr(exc, "stdout", None)),
+                decoded(getattr(exc, "stderr", None)) + f"\n{type(exc).__name__}: {exc}",
+            )
+            _progress_tool_output(w, args[0], proc)
+            if args[0] == "apply":
+                raise  # publication transport waits keep their existing recovery path
         _progress_tool_output(w, args[0], proc)
         return proc
 

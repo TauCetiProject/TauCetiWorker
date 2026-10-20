@@ -147,7 +147,7 @@ class GenerationRetryTests(unittest.TestCase):
             )
             self.assert_uncharged()
 
-    def drive_inner(self, failures=0, fail_stage="facts", code=76):
+    def drive_inner(self, failures=0, fail_stage="facts", code=76, timeout_stage=None):
         remaining = failures
         options = SimpleNamespace(agent_name="fixture", work_model="fixture")
 
@@ -156,6 +156,8 @@ class GenerationRetryTests(unittest.TestCase):
             if args[0] == "git":
                 return subprocess.CompletedProcess(args, 0, "", "")
             stage = args[1]
+            if stage == timeout_stage:
+                raise subprocess.TimeoutExpired(args, 1800, output=b"partial stdout", stderr=b"partial stderr")
             if stage in ("plan", "facts"):
                 if stage == fail_stage and remaining:
                     remaining -= 1
@@ -229,6 +231,18 @@ class GenerationRetryTests(unittest.TestCase):
             self.assertEqual(bool(archives), not same)
             if archives:
                 self.assertEqual(archives[-1].read_text(), "prior prose")
+
+    def test_tool_timeout_keeps_stage_and_both_partial_streams(self):
+        with self.assertRaises(Die) as raised:
+            self.drive_inner(timeout_stage="facts")
+        self.assertIn("facts", str(raised.exception))
+        self.assertIn("TimeoutExpired", str(raised.exception))
+        self.assertNotIn("writer", self.calls)
+        saved = list(self.cfg.logdir.glob("progress-facts-*.log"))
+        self.assertEqual(len(saved), 1)
+        self.assertIn("partial stdout", saved[0].read_text())
+        self.assertIn("partial stderr", saved[0].read_text())
+        self.assert_uncharged()
 
     def test_cli_and_loop_keep_documentation_wait_out_of_failure_backoff(self):
         with (
