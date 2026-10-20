@@ -95,8 +95,15 @@ uv run python $S --environment production probe --bytes 65536
    keyset pages to `recovery/<repo>/<id>/`, and verifies every page. Then run
    `cleanup --class repair_metrics --recovery <id>` or `--class stale_demand`.
    Cleanup refuses unverified exports and deletes only rows covered by the
-   export. PR histories, resources, membership and coverage, tombstones,
-   jobs, and delivery receipts are not cleanup classes.
+   export. Apart from the CI classes below, PR histories, resources,
+   membership and coverage, tombstones, jobs, and delivery receipts are not
+   cleanup classes.
+   GitHub Actions and check-run records are no longer mirrored, and their
+   stored rows (about 90% of the database in October 2026) are removable:
+   `export --class ci_resources --class ci_members --class ci_collections
+   --class ci_meta --limit 1000 --page-bytes 8000000` archives and verifies
+   only those rows, then `cleanup --class <class> --recovery <id>` deletes
+   them, covering exported rowids only.
 5. Prove headroom with `probe`. It commits, waits for durability, and deletes
    rows totalling the requested size (up to 64 MiB, in 1 MiB rows); success ends degraded mode and lets the migration
    commit. Deleted rows become reusable free pages, so `database_size` need
