@@ -7,7 +7,7 @@ name = "tauceti"
 version = "0.1.0"
 description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
-dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@5d8bd99dabfbf0730e301825f378bbb0b93db25b", "rich>=13", "textual>=8,<9"]
+dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@4c54de2c219ff88229741c02faba876b8fa2b094", "rich>=13", "textual>=8,<9"]
 
 [project.scripts]
 tauceti = "tauceti_worker.cli:cli_main"
