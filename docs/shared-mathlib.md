@@ -33,7 +33,9 @@ clones at those revisions, downloads using `lake exe cache get`, and verifies
 Mathlib `.olean` and `.ilean` outputs before syncing the immutable tree and publishing it atomically. It never publishes
 an agent's mutable build directory. A per-key lock serializes builders.
 
-Each agent runs inside rootless bubblewrap mount and PID namespaces. The published pool
+Each agent runs inside rootless bubblewrap mount and PID namespaces; this view is the
+same boundary as [process containment](process-containment.md), not a second one nested
+around it. The published pool
 is read-only there. OverlayFS combines the shared Mathlib lower with that worker's
 persistent private upper; in-place writes copy up. The entire coding process and
 its tools see this view. Networking, credentials and the existing cancellation

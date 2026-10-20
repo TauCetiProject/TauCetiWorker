@@ -1627,7 +1627,13 @@ def _do_fixlike(
             note_owner(w.cfg, expected_head=checked)
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
         try:
-            rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+            rc = run_agent_host(
+                co,
+                prompt,
+                _effective_authoring_profile(opts),
+                w.cfg.logdir,
+                cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
+            )
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.

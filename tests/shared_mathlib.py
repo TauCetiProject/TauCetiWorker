@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tauceti_worker import containment
 from tauceti_worker import shared_mathlib as s
 from tauceti_worker.runtime_status import atomic_json
 
@@ -81,18 +82,27 @@ class SharedTests(unittest.TestCase):
         self.library = self.root / "toolchain/lib/lean"
         self.library.mkdir(parents=True)
         (self.library / "Init.olean").write_text("fixture ABI")
-        real_run = subprocess.run
+        real_run, real_contained = subprocess.run, containment.run
 
-        def run(command, *args, **kwargs):
+        def fake_lake(command):
             if command == ["lake", "env", "lean", "--version"]:
                 return subprocess.CompletedProcess(command, 0, "Lean fixture ABI\n", "")
             if command == ["lake", "env", "lean", "--print-prefix"]:
                 return subprocess.CompletedProcess(command, 0, str(self.library.parents[1]) + "\n", "")
-            return real_run(command, *args, **kwargs)
+            return None
 
-        patcher = patch.object(s.subprocess, "run", side_effect=run)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        def run(command, *args, **kwargs):
+            return fake_lake(command) or real_run(command, *args, **kwargs)
+
+        def contained(command, *args, **kwargs):
+            return fake_lake(command) or real_contained(command, *args, **kwargs)
+
+        for patcher in (
+            patch.object(s.subprocess, "run", side_effect=run),
+            patch.object(containment, "run", side_effect=contained),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.downloads = 0
         disk = patch.object(
             s.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100_000_000, 20_000_000, 80_000_000)
@@ -377,39 +387,62 @@ class SharedTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
     def test_killed_cache_parent_terminates_detached_downloader_group(self):
-        pidfile = self.root / "downloader.pid"
-        childcode = 'import os,time,sys; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(100)'
-        parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1]],Path.cwd(),dict(os.environ),f,100)'
-        parent = subprocess.Popen(
-            [sys.executable, "-c", parentcode, str(pidfile), str(self.root / "cache.log"), childcode]
-        )
-        pid = None
-        try:
-            deadline = time.monotonic() + 5
-            while not pidfile.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(pidfile.exists())
-            pid = int(pidfile.read_text())
-            parent.kill()
-            parent.wait(timeout=5)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+        # A contained downloader's own pid is namespace-local; identify it by a unique argv token.
+        for policy in ("legacy", "auto"):
+            with self.subTest(policy=policy):
+                if policy == "auto" and not containment.probe()[0]:
+                    continue  # auto falls back to the legacy sweep, which a setsid escapes by design
+                token = f"tauceti-downloader-{os.getpid()}-{policy}"
+                ready = self.root / f"downloader-{policy}.ready"
+                # Only a namespace can catch a downloader that escapes its session.
+                childcode = 'import os,time,sys; sys.argv[3] == "auto" and os.setsid(); open(sys.argv[1],"w").write("up"); time.sleep(100)'
+                parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1],sys.argv[4],sys.argv[5]],Path.cwd(),dict(os.environ),f,100)'
+                parent = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        parentcode,
+                        str(ready),
+                        str(self.root / "cache.log"),
+                        childcode,
+                        token,
+                        policy,
+                    ],
+                    env={**os.environ, "TAUCETI_PROCESS_CONTAINMENT": policy},
+                )
+
+                def tagged(token=token):
+                    found = []
+                    for entry in Path("/proc").iterdir():
+                        if entry.name.isdigit():
+                            try:
+                                args = (entry / "cmdline").read_bytes().split(b"\0")
+                                state = (entry / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                            except OSError:
+                                continue
+                            if token.encode() in args and state != "Z":
+                                found.append(int(entry.name))
+                    return found
+
                 try:
-                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-                except FileNotFoundError:
-                    break
-                if state == "Z":
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail("detached cache downloader survived its killed parent")
-        finally:
-            if parent.poll() is None:
-                parent.kill()
-                parent.wait()
-            if pid:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, 9)
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    self.assertTrue(tagged())
+                    parent.kill()
+                    parent.wait(timeout=5)
+                    deadline = time.monotonic() + 5
+                    while tagged() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertFalse(tagged(), "detached cache downloader survived its killed parent")
+                finally:
+                    if parent.poll() is None:
+                        parent.kill()
+                        parent.wait()
+                    for pid in tagged():
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, 9)
 
     def test_gc_reclaims_killed_builder_staging_and_skips_live_builder(self):
         key = "a" * 64

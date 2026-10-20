@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from .config import Config, Die, log
@@ -83,6 +84,14 @@ class RoundContext:
         for fn in reversed(self._cleanups):  # LIFO: stop heartbeat, pop bubble, release claim
             try:
                 fn()
+            except Exception as e:
+                log(f"cleanup step failed: {e}")
+        if self.activity is not None:
+            # Every boundary this round launched has finished by now; say whether all were empty.
+            try:
+                from .containment import write_quiescence
+
+                write_quiescence(self.cfg.state, self.activity.id)
             except Exception as e:
                 log(f"cleanup step failed: {e}")
         if self._fd is not None:
@@ -202,6 +211,10 @@ class Claims:
         self.held: tuple[str, str] | None = None
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
+        # Set when the heartbeat reports the lease lost; branch work passes it to the agent as its
+        # cancellation event, so a lost claim tears the agent's containment boundary down.
+        self.lost = threading.Event()
+        self._stopped = threading.Event()
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -255,8 +268,19 @@ class Claims:
         os.close(rfd)  # parent keeps only the write end; its closure (or death) is the EOF signal
         self._hb_wfd = wfd
         self.ctx.add_cleanup(self.stop_heartbeat)
+        # Each heartbeat has its own lost/stopped state, so one claim's loss never cancels the next.
+        self.lost = lost = threading.Event()
+        self._stopped = stopped = threading.Event()
+
+        def watch(hb=self._hb):
+            if hb.wait(None) == HEARTBEAT_LOST and not stopped.is_set():
+                log(f"claim {key}: lease lost; cancelling the branch work that depends on it")
+                lost.set()
+
+        threading.Thread(target=watch, daemon=True).start()
 
     def stop_heartbeat(self) -> None:
+        self._stopped.set()
         if self._hb_wfd is not None:
             try:
                 os.close(self._hb_wfd)  # EOF → the heartbeat child exits on its own
@@ -282,6 +306,9 @@ class Claims:
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
 
 
+HEARTBEAT_LOST = 3
+
+
 def cmd_heartbeat(args) -> int:
     """Internal: renew a claim lease every CLAIM_HEARTBEAT_S until the parent dies (pipe EOF) or the
     lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext)."""
@@ -301,7 +328,7 @@ def cmd_heartbeat(args) -> int:
         else:
             time.sleep(CLAIM_HEARTBEAT_S)
         if subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode != 0:
-            return 0  # lease lost → stop renewing so it can expire
+            return HEARTBEAT_LOST  # stop renewing so it can expire, and tell the round
 
 
 def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:
@@ -326,7 +353,7 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         # Unlike kill_round_group (which signals while the leader PID is still live), p.wait() has already
         # reaped the leader here, so the group is held open only by stragglers. The lone wrong-kill window
         # — the freed leader PID being reused AND the reuser making itself a group leader before this line
-        # — is microseconds wide and needs a deliberate setsid; we accept it. (One-shot `tauceti work`
-        # runs the round in-process, not through here, so it is not swept; only the unbounded --loop leak
-        # is operationally damaging, so that scope gap is acceptable.)
+        # — is microseconds wide and needs a deliberate setsid; we accept it. This sweep is the legacy
+        # fallback: on a host with PID-namespace containment (containment.py) every agent and tool, in
+        # --loop and one-shot rounds alike, already died with its namespace, setsid'd ones included.
         reap_round_group(pgid)

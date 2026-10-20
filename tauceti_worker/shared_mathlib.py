@@ -53,18 +53,10 @@ def mode(env):
 
 
 def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
-    return [
-        "bwrap",
-        "--die-with-parent",
-        "--unshare-pid",
-        "--bind",
-        "/",
-        "/",
-        "--dev-bind",
-        "/dev",
-        "/dev",
-        "--proc",
-        "/proc",
+    """The shared view is mounted in the round's one containment namespace, not a nested one."""
+    from .containment import command
+
+    return command(
         "--ro-bind",
         str(pool),
         str(pool),
@@ -75,8 +67,7 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
         str(upper),
         str(work),
         str(target),
-        "--",
-    ]
+    )
 
 
 def capability(directory=None):
@@ -162,8 +153,17 @@ def signature(cwd, env):
     # Loading Lake synchronizes pinned dependency checkouts without compiling
     # Mathlib. Do this before deciding the key, so a manifest bump can hit a
     # shared snapshot on its first round instead of downloading privately first.
-    lean = subprocess.run(
-        ["lake", "env", "lean", "--version"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30
+    from .containment import run
+
+    # Loading Lake configuration can run repository code, so it is contained like any other tool.
+    lean = run(
+        ["lake", "env", "lean", "--version"],
+        label="lake-env",
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if lean.returncode:
         raise Unavailable("Lean toolchain is unavailable; run lake env lean --version")
@@ -186,8 +186,14 @@ def signature(cwd, env):
     if "mathlib" not in dependencies:
         raise Unavailable("manifest has no pinned Mathlib dependency")
     toolchain = (cwd / "lean-toolchain").read_text().strip()
-    prefix = subprocess.run(
-        ["lake", "env", "lean", "--print-prefix"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30
+    prefix = run(
+        ["lake", "env", "lean", "--print-prefix"],
+        label="lake-env",
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     library = Path(prefix.stdout.strip()) / "lib/lean"
     if prefix.returncode or not (library / "Init.olean").is_file():
@@ -474,6 +480,11 @@ def view(cwd, env, logdir, fetch):
     prefix, backup, backup_created, backup_sparse = [], None, False, False
     with contextlib.ExitStack() as stack:
         try:
+            from . import containment
+
+            if containment.policy() == "legacy":
+                # The view is itself a PID namespace; the rollback must not keep using one.
+                raise Unavailable(f"{containment.POLICY_ENV}=legacy disables the namespace-based shared view")
             pool.mkdir(parents=True, exist_ok=True, mode=0o700)
             ok, reason = capability(pool)
             if not ok:

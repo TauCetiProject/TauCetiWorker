@@ -68,7 +68,7 @@ def run(sequence, *, repeat=False, explicit=False):
         )
         calls = []
         outcomes = list(sequence)
-        saved_run = tc.agents.subprocess.run
+        saved_run = tc.agents.containment.run
         saved_key = os.environ.get("OPENAI_API_KEY")
         os.environ["OPENAI_API_KEY"] = "must-not-reach-subscription-probe"
 
@@ -76,7 +76,7 @@ def run(sequence, *, repeat=False, explicit=False):
             calls.append((argv, kwargs))
             return outcomes.pop(0)
 
-        tc.agents.subprocess.run = fake_run
+        tc.agents.containment.run = fake_run
         try:
             try:
                 selected = tc.resolve_codex_model_access(cfg, profile)
@@ -88,7 +88,7 @@ def run(sequence, *, repeat=False, explicit=False):
             else:
                 selected_again = None
         finally:
-            tc.agents.subprocess.run = saved_run
+            tc.agents.containment.run = saved_run
             if saved_key is None:
                 os.environ.pop("OPENAI_API_KEY", None)
             else:

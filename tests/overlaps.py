@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Shared-state races, coverage validation, retry publication and phase integration."""
 
+import contextlib
 import json
 import os
 import signal
@@ -647,51 +648,63 @@ class InterfaceTests(unittest.TestCase):
                 self.assertEqual(rc, status)
 
     def test_killed_worker_cannot_leave_detached_agent_or_tools_running(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ready = Path(tmp) / "ready.json"
-            child = (
-                "import json,os,subprocess,sys,time; "
-                "tool=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-                f"open({str(ready)!r},'w').write(json.dumps([os.getpid(),tool.pid])); "
-                "time.sleep(30)"
-            )
-            worker = (
-                "import os,threading; from pathlib import Path; "
-                "from tauceti_worker.agents import run_agent_proc; "
-                f"run_agent_proc({[sys.executable, '-c', child]!r}, env=dict(os.environ), "
-                f"logdir=Path({tmp!r}), label='bound', provider='test', cancel_event=threading.Event())"
-            )
-            proc = subprocess.Popen(
-                [sys.executable, "-c", worker], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            pgid = None
-            try:
-                deadline = time.monotonic() + 5
-                while not ready.exists() and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                self.assertTrue(ready.exists(), "agent never started")
-                pids = json.loads(ready.read_text())
-                pgid = os.getpgid(pids[0])
-                proc.kill()  # SIGKILL bypasses worker finally/atexit handlers.
-                proc.wait(timeout=3)
+        # Inside a PID namespace the agent's own pids are not host pids, so find the processes by a
+        # unique argv token instead, and only ever signal what carries it.
+        for policy in ("legacy", "auto"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as tmp:
+                token = f"tauceti-overlap-test-{os.getpid()}-{policy}"
+                ready = Path(tmp) / "ready"
+                child = (
+                    "import os,subprocess,sys,time; "
+                    "tool=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)',sys.argv[1]]); "
+                    f"open({str(ready)!r},'w').write('up'); "
+                    "time.sleep(30)"
+                )
+                worker = (
+                    "import os,threading; from pathlib import Path; "
+                    "from tauceti_worker.agents import run_agent_proc; "
+                    f"run_agent_proc({[sys.executable, '-c', child, token]!r}, env=dict(os.environ), "
+                    f"logdir=Path({tmp!r}), label='bound', provider='test', cancel_event=threading.Event())"
+                )
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", worker],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env={**os.environ, "TAUCETI_PROCESS_CONTAINMENT": policy},
+                )
 
-                def running(pid):
-                    status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
-                    return bool(status.stdout.strip()) and not status.stdout.strip().startswith("Z")
+                def tagged(token=token):
+                    found = []
+                    for entry in Path("/proc").iterdir():
+                        if entry.name.isdigit():
+                            try:
+                                args = (entry / "cmdline").read_bytes().split(b"\0")
+                                state = (entry / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                            except OSError:
+                                continue
+                            if token.encode() in args and state != "Z":
+                                found.append(int(entry.name))
+                    return found
 
-                deadline = time.monotonic() + 4
-                while any(running(pid) for pid in pids) and time.monotonic() < deadline:
-                    time.sleep(0.03)
-                self.assertFalse(any(running(pid) for pid in pids), "detached agent/tool survived worker death")
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-                proc.wait(timeout=3)
-                if pgid is not None:
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists(), "agent never started")
+                    self.assertGreaterEqual(len(tagged()), 2)
+                    proc.kill()  # SIGKILL bypasses worker finally/atexit handlers.
+                    proc.wait(timeout=3)
+                    deadline = time.monotonic() + 4
+                    while tagged() and time.monotonic() < deadline:
+                        time.sleep(0.03)
+                    self.assertFalse(tagged(), "detached agent/tool survived worker death")
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait(timeout=3)
+                    for pid in tagged():
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGKILL)
 
     def test_scan_loop_runs_with_rest_budget_when_graphql_is_exhausted(self):
         from tauceti_worker import loop

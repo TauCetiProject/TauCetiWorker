@@ -362,6 +362,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `TAUCETI_PROCESS_CONTAINMENT` | `auto` | Process containment for host agents and tools; see [process-containment.md](process-containment.md). `auto` uses rootless bwrap PID namespaces where they work and otherwise reports best-effort process-group cleanup; `required` refuses to launch without them; `legacy` is the explicit rollback. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, shared by every worker: an install takes a lock and lands by rename. |
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
