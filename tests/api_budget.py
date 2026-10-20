@@ -283,8 +283,10 @@ class BudgetTests(unittest.TestCase):
         (inbox / (invocation + ".receipt")).write_text(
             json.dumps({"id": invocation, "totals": {"provider": "5"}, "outcome": "completed"})
         )
-        self.assertEqual(self.budget.recover("recover pending receipt without a fresh heartbeat")["unresolved"], [])
-        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 5)
+        self.assertEqual(
+            self.budget.recover("recover pending receipt without a fresh heartbeat")["unresolved"], [invocation]
+        )
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
         self.assertTrue(key.exists())
 
     def test_resumption_baseline_and_fair_waiting(self):

@@ -328,19 +328,64 @@ responses on resumed invocations are not charged twice. Decimal token pricing
 honours cache-write TTLs. Unknown models, missing counters, unpriced server-tool/priority-tier usage and
 requests still in flight remain incomplete rather than becoming zero-cost completed work.
 
-`tauceti budget --recover --dry-run --json` previews stopped-owner recovery without
-changing the ledger or deleting bridge keys. Apply with `--recover --note '…'`.
-Recovery tries native receipts first, then directly linked usage journals. Legacy
-transcripts are considered only when a saved receipt names the exact provider
-session and exactly one file belongs to that worker; time-overlap guesses are
-never used. A recovered transcript keeps an incomplete-request reservation. Complete
-saved usage can settle as a marked, correctable token-price estimate. Incomplete
-usage charges the known estimate once and retains a separate conservative
-reservation for uncertainty. Reservations never enter spend reports. Late native
-receipts correct estimates; resumed cumulative totals preserve previously recorded
-baselines and cannot debit the same response twice. Live owners remain protected.
+`tauceti budget --recover --dry-run --json` prepares a content-free manifest under
+`budget/recovery-audits/` without changing the ledger or deleting bridge keys.
+Every invocation has its recorded owner identity, current owner/heartbeat check,
+evidence source, known prefix, existing charge, reservation, proposed estimate,
+final total, spend delta and released reservation recorded. The manifest includes
+ledger sequence/hash, evidence hashes, interval endpoints, comparable IDs/costs/
+durations, median rate and pricing-table hash when available. It contains no
+prompts, response text, credentials or receipt outcome text.
 
-The authoritative ledger stays append-only. Estimated prefix charges use the
-existing correction/unresolved event vocabulary so previous ledger readers retain
-the right financial totals. Native final settlement reverses a prefix before
-recording the full native cost. All cost corrections preserve their audit trail.
+Apply with `tauceti budget --recover --note 'stopped usage policy v1' --json`.
+Application produces a fresh manifest and rechecks process identities immediately
+before its single append-only ledger transaction. Inspect the dry run's identities,
+evidence and totals first. Both a live process identity and a fresh bridge heartbeat
+protect **all** session statuses from modification, including late cumulative
+corrections that would affect a live successor. No grant or worker ceiling changes
+are part of recovery.
+
+Recovery tries authoritative native receipts first, then directly linked durable
+usage journals. Legacy transcripts are considered only when a saved receipt names
+the exact provider session and exactly one file belongs to that worker; worker/time
+overlap never establishes identity. Complete saved usage can settle as a marked,
+correctable token-price estimate. An unclosed journal, an interrupted response,
+or a transcript remains incomplete even if all observed responses are priced,
+the owner has died, or `inflight=false`.
+
+For stopped incomplete usage (including sessions with no journal), policy
+`stopped-usage-v1` uses the median native cost per second of at least three sessions
+of the same model and phase completed in the seven days preceding admission.
+With fewer than three, it uses at least three sessions of that model in the same
+window. Estimates, manually reconciled totals, the invocation itself, negative
+costs, missing/zero/invalid intervals and future endpoints are excluded. The rate
+is multiplied by this invocation's recorded duration and rounded to twelve decimal
+places in USD (half-even). Recorded terminal ledger
+events supply endpoints; if absent, the usage observation time can supply the
+end. Repair time never supplies an endpoint. An unusable duration or insufficient
+comparables uses the **saved prelaunch estimate**, without recalculating admission
+estimates. The resulting total is at least the already charged/known priced prefix.
+It never adds the prefix to the estimated total.
+
+The policy settles this labelled total and releases its residual reservation.
+The manifest reconciles before/after spend exactly to charge deltas and explains
+reservation releases separately: releasing a reservation is neither spending nor
+a refund. Repeat recovery makes no monetary change. A late native receipt replaces
+an estimate through idempotent corrections, including resumed cumulative baselines.
+During ordinary live teardown, `recover_usage` still charges known prefixes and
+retains reservations when evidence is incomplete; only explicit stopped recovery
+applies this policy.
+
+Prepared activity caches distinguish live usage, settled estimates (including
+recovered estimates), and unresolved stopped accounting. Existing spend and dollars
+per LOC measurements remain available. Reservations never enter spend reports;
+`status` still reads prepared local data without GitHub calls or recovery analysis.
+
+The authoritative ledger and retained recovery manifests are append-only evidence.
+Ledger repair transactions name their manifest; a manifest records a plan, and the
+matching ledger transaction establishes application. If a run stops before append,
+rerun dry-run and recovery. Do not truncate evidence or recreate consumed reservations.
+Correct a mistaken total with `tauceti budget --reconcile INVOCATION --cost USD
+--note 'reason and supporting evidence'`; this appends a compensating adjustment.
+Optional provider-admin reconciliation is separate work and does not block stopped
+settlement. Recovery is independent of issue #313.

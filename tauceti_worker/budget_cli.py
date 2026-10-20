@@ -19,7 +19,11 @@ def add_budget_parser(sub):
     parser.add_argument("--note", default="", help="explanation required for reconciliation or ledger repair")
     parser.add_argument("--repair-ledger", action="store_true", help="archive a torn write and audit recovery")
     parser.add_argument("--dry-run", action="store_true", help="preview --recover without changing the ledger")
-    parser.add_argument("--recover", action="store_true", help="recover receipts from stopped accounting bridges")
+    parser.add_argument(
+        "--recover",
+        action="store_true",
+        help="settle stopped usage with audited native evidence or historical estimates",
+    )
 
 
 def cmd_budget(args):
@@ -79,6 +83,9 @@ def cmd_budget(args):
         print("  Clock moved backward; accrual waits for the persisted watermark")
     for action in snapshot.get("recovery_actions", []):
         print("  Recovery: " + json.dumps(action))
+    if snapshot.get("recovery_manifest"):
+        print("  Recovery audit             " + snapshot["recovery_manifest"])
+        print("  Recovery totals            " + json.dumps(snapshot["recovery_totals"]))
     for error in snapshot.get("recovery_errors", []):
         print("  Unresolved recovery: " + error)
     print(f"  Ledger                     {snapshot['ledger']}")

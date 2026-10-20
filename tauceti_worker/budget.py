@@ -13,6 +13,8 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+ESTIMATE_PROVENANCES = {"token-priced", "historical-estimate", "prelaunch-estimate"}
+
 
 class BudgetError(ValueError):
     pass
@@ -134,7 +136,7 @@ class Budget:
                         if kind == "correction":
                             state["spent"] -= money(event["delta"])
                             state["sessions"][event["id"]]["cost"] = event["cost"]
-                            for field in ("cost_provenance", "totals"):
+                            for field in ("cost_provenance", "totals", "recovery_audit"):
                                 if field in event:
                                     state["sessions"][event["id"]][field] = event[field]
                     elif kind == "rate":
@@ -152,6 +154,8 @@ class Budget:
                             outcome=event["outcome"],
                             totals=event.get("totals", {}),
                             cost_provenance=event.get("cost_provenance", "native-reported"),
+                            finished=event.get("finished", rec["timestamp"]),
+                            recovery_audit=event.get("recovery_audit"),
                         )
                         cost = money(event["cost"])
                         state["balance"] -= cost
@@ -161,6 +165,7 @@ class Budget:
                     elif kind == "unresolved":
                         session = state["sessions"][event["id"]]
                         session["status"] = "provisional" if event.get("provisional") else "unresolved"
+                        session.setdefault("finished", rec["timestamp"])
                         if "reserve" in event:
                             session.update(
                                 reserve=event["reserve"],
@@ -585,7 +590,7 @@ class Budget:
             session = state["sessions"].get(receipt["id"])
             if not session:
                 raise BudgetError("receipt has no recorded admission")
-            if session["status"] == "settled" and session.get("cost_provenance") != "token-priced":
+            if session["status"] == "settled" and session.get("cost_provenance") not in ESTIMATE_PROVENANCES:
                 return
             ordered = list(state["sessions"].values())
             position = next(i for i, entry in enumerate(ordered) if entry["id"] == receipt["id"])
@@ -643,14 +648,14 @@ class Budget:
                         (
                             money(p["totals"][provider])
                             for p in priors
-                            if p.get("cost_provenance", "native-reported") != "token-priced"
+                            if p.get("cost_provenance", "native-reported") not in ESTIMATE_PROVENANCES
                         ),
                         default=Decimal(0),
                     )
                     estimates = [
                         p
                         for p in priors
-                        if p.get("cost_provenance") == "token-priced" and money(p["totals"][provider]) > exact
+                        if p.get("cost_provenance") in ESTIMATE_PROVENANCES and money(p["totals"][provider]) > exact
                     ]
                     if money(native) < exact or not estimates or any(set(p["totals"]) != {provider} for p in estimates):
                         break
@@ -672,7 +677,7 @@ class Budget:
                                 delta=str(money(prior["cost"]) - value),
                                 cost=str(value),
                                 totals={provider: str(cursor)},
-                                cost_provenance="token-priced",
+                                cost_provenance=prior["cost_provenance"],
                                 note="estimate constrained by native cumulative total",
                             )
                         )
@@ -704,7 +709,7 @@ class Budget:
                             if set(totals) != set(successor.get("totals", {})):
                                 raise BudgetError("late receipt has mixed cumulative baselines; reconcile explicitly")
                             delta = cost - previous
-                            if successor.get("cost_provenance") == "token-priced":
+                            if successor.get("cost_provenance") in ESTIMATE_PROVENANCES:
                                 rebased = {key: str(money(value) + delta) for key, value in successor["totals"].items()}
                                 events.append(
                                     dict(
@@ -881,61 +886,9 @@ class Budget:
             return result
 
     def recover(self, note, *, dry_run=False):
-        if not dry_run and not note.strip():
-            raise BudgetError("receipt recovery requires --note")
-        from .claude_api import safe_message
+        from .budget_recovery import recover
 
-        with self.locked():
-            sessions = self.replay()["sessions"]
-        errors, actions = [], []
-        for session in sessions.values():
-            if (session["status"] == "settled" and session.get("cost_provenance") != "token-priced") or not session.get(
-                "bridge"
-            ):
-                continue
-            bridge = Path(session["bridge"])
-            if session["status"] == "active" and bridge_owner_alive(session.get("owner")):
-                continue
-            try:
-                if self.clock() - (bridge / "outbox/heartbeat").stat().st_mtime <= 30:
-                    continue
-            except FileNotFoundError:
-                pass
-            invocation = session["id"]
-            try:
-                if (
-                    not isinstance(invocation, str)
-                    or len(invocation) != 32
-                    or any(c not in "0123456789abcdef" for c in invocation)
-                ):
-                    raise BudgetError("invalid receipt invocation ID")
-                receipt = bridge / "inbox" / (invocation + ".receipt")
-                if receipt.exists():
-                    value = safe_message(receipt)
-                    if not isinstance(value, dict) or value.get("id") != invocation:
-                        raise BudgetError("receipt invocation mismatch")
-                    actions.append(
-                        dict(id=invocation, action="recover native receipt", complete=bool(value.get("totals")))
-                    )
-                    if not dry_run:
-                        self.settle_receipt(value, note=note)
-                    if not value.get("totals"):
-                        action = self.recover_usage(invocation, note=note, dry_run=dry_run)
-                        if action:
-                            actions.append(action)
-                else:
-                    action = self.recover_usage(invocation, note=note, dry_run=dry_run)
-                    if action:
-                        actions.append(action)
-                    elif not dry_run:
-                        self.settle(invocation, None, "orphaned without receipt", note=note)
-            except Exception as error:
-                errors.append(f"{invocation}: {error}")
-                if not dry_run:
-                    self.settle(invocation, None, "invalid recovered receipt", note=note)
-            if not dry_run and not bridge_owner_alive(session.get("owner")):
-                (bridge / "key").unlink(missing_ok=True)
-        return dict(self.snapshot(), recovery_errors=errors, recovery_actions=actions, dry_run=dry_run)
+        return recover(self, note, dry_run=dry_run)
 
     def cooldown(self, model, seconds):
         with self.locked():

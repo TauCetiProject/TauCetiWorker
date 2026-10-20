@@ -148,13 +148,22 @@ def display(value, default_kinds=()):
             ("spent_usd", "API cost: completed sessions"),
             (
                 "active_accrued_usd" if costs.get("accounting_version", 1) >= 2 else "pending_usd",
-                "API cost: running/interrupted"
+                "API cost: live usage"
+                if costs.get("accounting_version", 1) >= 3
+                else "API cost: running/interrupted"
                 if costs.get("accounting_version", 1) >= 2
                 else "API cost: active estimates",
             ),
             ("estimated_usd", "API cost: estimated total"),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
+        if costs.get("accounting_version", 1) >= 3:
+            for key, label in (
+                ("settled_estimates_usd", "API cost: settled estimates"),
+                ("recovered_estimates_usd", "API cost: recovered estimates"),
+                ("unresolved_stopped_usd", "API cost: unresolved stopped"),
+            ):
+                cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
         for key, label in (
             ("landed_loc_added", "Authored Lean LOC: landed"),
             ("open_loc_added", "Authored Lean LOC: open"),
@@ -219,6 +228,12 @@ def display(value, default_kinds=()):
         q = costs["quality"]
         print(
             f"Costs: native totals where available; token/interval estimates otherwise; {q.get('incomplete', 0)} conversations have incomplete usage. Reservations excluded."
+        )
+    if spending_rows and costs.get("accounting_version", 1) >= 3:
+        q = costs["accounting"]
+        print(
+            f"Accounting: {q.get('live', 0)} live; {q.get('settled_estimates', 0)} settled estimates "
+            f"({q.get('recovered_estimates', 0)} recovered); {q.get('unresolved_stopped', 0)} unresolved stopped."
         )
     if cost_rows:
         table("Costs / initiated PR output", ("7 days", "All time"), cost_rows)
@@ -322,7 +337,15 @@ def combine(values):
                 "open_prs",
             )
         }
-        for key in ("spent_usd", "active_accrued_usd", "pending_usd", "estimated_usd"):
+        for key in (
+            "spent_usd",
+            "active_accrued_usd",
+            "unresolved_stopped_usd",
+            "settled_estimates_usd",
+            "recovered_estimates_usd",
+            "pending_usd",
+            "estimated_usd",
+        ):
             row[key] = (
                 str(sum((Decimal(r[key]) for r in rows), Decimal(0)))
                 if compatible_costs and all(r.get(key) is not None for r in rows) and len(known) == len(values)
@@ -357,6 +380,10 @@ def combine(values):
     s["costs"]["quality"] = {
         k: sum(v.get("costs", {}).get("quality", {}).get(k, 0) for v in known)
         for k in ("native", "estimated", "incomplete")
+    }
+    s["costs"]["accounting"] = {
+        k: sum(v.get("costs", {}).get("accounting", {}).get(k, 0) for v in known)
+        for k in ("live", "settled_estimates", "recovered_estimates", "unresolved_stopped")
     }
     sharing = [v.get("shared_mathlib", {}) for v in known]
     if any(sharing):
