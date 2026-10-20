@@ -650,7 +650,9 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 self.assertTrue(context.invocations)
                 self.assertFalse(context.launched)
                 self.budget.configure(set_grant=0)
-                self.assertFalse(context.handle(dict(action="admit", id="c" * 32, model="opus"))["allowed"])
+                self.assertFalse(
+                    context.handle(dict(action="admit", id="c" * 32, model="opus", process=identity()))["allowed"]
+                )
                 return 75
 
             with self.assertRaises(AdmissionUnavailable):
