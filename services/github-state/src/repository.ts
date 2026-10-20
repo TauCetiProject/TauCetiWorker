@@ -1130,14 +1130,20 @@ export class RepositoryState extends DurableObject<Env> {
         note:'Deleted rows become reusable free pages; the physical database size need not shrink. Prove headroom with /admin/storage/probe.'});
     }
     if (path==='/storage/probe') {
-      const bytes=Number.isSafeInteger(input.bytes) && input.bytes>0?Math.min(input.bytes,1048576):65536,before=this.sql.databaseSize;
+      const bytes=Number.isSafeInteger(input.bytes) && input.bytes>0?Math.min(input.bytes,64*1048576):65536,before=this.sql.databaseSize;
       // Commit a real row, then delete it: proves usable headroom of that size.
       // The size-limit failure arrives at commit, so wait for durability.
       try {
-        this.ctx.storage.transactionSync(()=>this.sql.exec("INSERT INTO meta VALUES('storage_probe',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",JSON.stringify('x'.repeat(bytes))));
+        // Rows stay below Cloudflare's per-row limit; together they prove the requested headroom.
+        this.ctx.storage.transactionSync(()=>{
+          for (let offset=0,i=0;offset<bytes;offset+=1048576,i++) this.sql.exec("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",'storage_probe:'+i,JSON.stringify('x'.repeat(Math.min(1048576,bytes-offset))));
+        });
         await this.ctx.storage.sync();
-      } catch(error) {return json({writable:false,bytes,reason:this.noteFailure('probe',error),database_size:this.sql.databaseSize,storage:this.storageState()});}
-      this.sql.exec("DELETE FROM meta WHERE key='storage_probe'");
+      } catch(error) {
+        try {this.sql.exec("DELETE FROM meta WHERE key LIKE 'storage_probe:%'");} catch {}
+        return json({writable:false,bytes,reason:this.noteFailure('probe',error),database_size:this.sql.databaseSize,storage:this.storageState()});
+      }
+      this.sql.exec("DELETE FROM meta WHERE key LIKE 'storage_probe:%'");
       await this.ctx.storage.sync();
       await this.env.ARCHIVE.put(storageKey(repo),JSON.stringify({state:'writable',verified_at:Date.now(),bytes,database_size:this.sql.databaseSize}));
       this.degraded=undefined;

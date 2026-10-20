@@ -92,8 +92,8 @@ python3 $S --environment production probe --bytes 65536
    Cleanup refuses unverified exports and deletes only rows covered by the
    export. PR histories, resources, membership and coverage, tombstones,
    jobs, and delivery receipts are not cleanup classes.
-5. Prove headroom with `probe`. It commits and deletes a row of the requested
-   size (up to 1 MiB); success ends degraded mode and lets the migration
+5. Prove headroom with `probe`. It commits, waits for durability, and deletes
+   rows totalling the requested size (up to 64 MiB, in 1 MiB rows); success ends degraded mode and lets the migration
    commit. Deleted rows become reusable free pages, so `database_size` need
    not shrink; report the probe result, not the file size.
 6. Replay parked events (`replay`, or wait for the cron), then reconcile

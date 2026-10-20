@@ -177,6 +177,8 @@ test('a full repository keeps serving stored reads, parks ingestion, recovers he
   const writable=await (await adminPost(mf,'/admin/storage/probe',{bytes:4096})).json();
   assert.equal(writable.writable,true);assert.equal(writable.storage.schema,'current');assert.equal(writable.storage.mode,'writable');
   assert.equal(JSON.parse(await (await (await mf.getR2Bucket('ARCHIVE')).get('control/'+repository.id+'/storage.json')).text()).state,'writable');
+  const large=await (await adminPost(mf,'/admin/storage/probe',{bytes:3*1048576+5})).json();
+  assert.equal(large.writable,true);assert.equal(large.bytes,3*1048576+5);
   const replay=await (await adminPost(mf,'/admin/ingress/replay',{})).json();
   assert.equal(replay.replayed,1);
   const receipts=await (await send(stub,'/storage/deliveries',{ids:['full-1','unknown']})).json();
