@@ -48,4 +48,4 @@ SHA stays pinned even if remote refs advance. Check its receipt and scope before
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: the starting head and integrated main SHA, the exact evidence investigated, which source repairs were needed, and the exact `scope:`, `lake build` and `lake exe axioms` result lines proving your local checks green + axiom-clean, labelled as local (scoped or full) rather than CI. Do not claim green unless you saw it.
+End with a concise summary: the starting head and integrated main SHA, the exact evidence investigated, which source repairs were needed, and the exact `scope:`, `lake build` and `local-axioms:` result lines proving your local checks green + axiom-clean, labelled as local changed-file checks rather than CI. Do not claim green unless you saw it.

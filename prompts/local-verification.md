@@ -1,5 +1,6 @@
 ### How to run local checks
-Other agents share this machine, and a whole-library audit loads every TauCeti and Mathlib module.
+Other agents share this machine. Never run `lake exe axioms` locally: its scope filter still loads
+every TauCeti and Mathlib module. The local checker below reads only changed modules' own artifacts.
 Verify once, at the end, scoped to what you actually changed:
 
 - **Foreground only, real exit statuses.** Run each command in the foreground and wait for it to
@@ -18,15 +19,14 @@ Verify once, at the end, scoped to what you actually changed:
   your last source edit, merge, or commit. It reads only local Git state: do not fetch for it, do not
   query PR labels for it, and never run `scripts/lint-scope.sh` (it makes live GitHub requests). This
   round's scope policy, from the worker's survey of this PR's labels and branch, is
-  `__SCOPE_POLICY__`; any policy other than `ordinary` audits the whole library.
+  `__SCOPE_POLICY__`; this describes CI requirements, never a reason for a whole-library local audit.
 
 The recipe compares your working tree (committed, staged, unstaged and untracked files, deletions,
 and both ends of every rename) with its merge base on the canonical `TauCetiProject/TauCeti` main,
 writes the changed existing modules to an absolute module list, and prints the scope it chose:
-`scoped` (the auditor then also checks every module importing the listed ones, plus global
-duplicate declarations), `full: <reason>` (a pin, lakefile or toolchain change, a deleted module, a
+`scoped` (changed modules), `full: <reason>` (CI needs a full check: a pin, lakefile or toolchain change, a deleted module, a
 Lean file outside the module inventory, or a broad policy), or `unknown: <reason>` (the base or the
-changed files could not be determined: also a full audit, and no local environment lint). An empty
+changed files could not be determined: stop the local audit, and no local environment lint). An empty
 `scoped` list (no Lean change at all) is a valid result; a failure to list files is never empty.
 ```bash
 bash <<'TAUCETI_SCOPE'
@@ -85,12 +85,16 @@ sort -u -o "$out/modules.txt" "$out/modules.txt" || finish "unknown: cannot sort
 finish "scoped against $base"
 TAUCETI_SCOPE
 ```
-Then run the axiom and duplicate-declaration audit in the scope just written:
+Then run the cheap local axiom check, even for broad CI policies. It checks the listed modules'
+own compiled declarations, including private proofs, for new axioms and direct uses of `sorryAx`
+or Lean's native-decision axioms. It does not follow imports or run candidate initializers.
+Full transitive axiom, downstream-importer and global duplicate checks run in CI.
 ```bash
+root="$(git rev-parse --show-toplevel)" && cd "$root" || exit 1
 scope="$(git rev-parse --show-toplevel)/.lake/tauceti-scope"
 case "$(head -n 1 "$scope/mode" 2>/dev/null)" in
-  scoped*) AXIOMS_ONLY_MODULES="$scope/modules.txt" lake exe axioms ;;
-  full*|unknown*) AXIOMS_ONLY_MODULES= lake exe axioms ;;
+  scoped*|full*) AXIOMS_ONLY_MODULES= __LOCAL_AXIOMS__ --modules "$scope/modules.txt" ;;
+  unknown*) echo "local-axioms: changed modules unknown; preserve edits and repair local base/history through checkout preparation. Do not retry unchanged scope or run a full audit." >&2; false ;;
   *) echo "no audit scope: run the scope recipe first" >&2; false ;;
 esac
 ```
@@ -107,5 +111,6 @@ esac
 ```
 Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`; CI owns the whole-library lint.
 
-In your final report, quote the `scope:` line and say plainly that these were local checks (scoped
-or full, as printed). They are not full CI, which still runs every check on the pushed head.
+In your final report, quote the `scope:` and `local-axioms:` lines and label them as local changed-file
+checks. A `full:` scope means full CI is required; it does not claim a full local audit ran.
+These checks are not full CI, which still runs every check on the pushed head.

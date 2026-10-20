@@ -20,7 +20,10 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
     rm -f "$base_shims"; rm -rf "$base_root"
     ```
   - Build: `lake exe cache get` (once per session), then `lake build --iofail`.
-  - Duplicate declarations or axioms: `lake build`, then the scope recipe and scoped audit below.
+  - Duplicate declarations or axioms: diagnose the named declarations and modules from the CI log,
+    repair their source, then build and run the changed-file check below. It does not reproduce
+    global duplicate ownership, transitive dependency or unchanged importer failures. A local pass
+    never dismisses those failures or proves they were transient; do not run a full local audit.
   - Module system: `lake build`, then `lake exe module-system`.
   - Environment lint: `lake build`, the scope recipe, then the scoped lint below. This round's
     policy is `__SCOPE_POLICY__`. Only when it is `full-lint` does CI lint the whole library, so the
@@ -39,7 +42,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
 - If the shim-expiry command fails, its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
-- If the failure is genuinely transient/infra (e.g. cache fetch timeout), the failing stage and shim-expiry command are green locally, and the failed logs contain no actionable migration, do NOT hack the code — push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so in your report.
+- Only if the logs establish a transient infrastructure failure (e.g. cache fetch timeout), with no actionable source/audit violation, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`). A passing local axiom check is never evidence that a CI audit failure was transient.
 - Prefer the smallest correct fix. If a declaration is unsalvageable, it is better to remove it than to leave the PR red — but never gut the PR into vacuity; if nothing useful survives, follow the durable PR outcome rules below rather than pushing an empty shell. Partial overlap does not justify deleting valuable remaining work.
 
 ## Rules of the repo (hard constraints)
@@ -71,4 +74,4 @@ If a step fails, fix it and rerun only the steps whose inputs your fix changed. 
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: what was failing, the root cause, what you changed (or that you only re-triggered transient CI), which CI stage you reproduced, and the exact shim-expiry, `scope:`, `lake build` and `lake exe axioms` result lines proving your local checks green + axiom-clean, labelled as local (scoped or full) rather than full CI. Do not claim green unless you saw it.
+End with a concise summary: what was failing, the root cause, what you changed (or that you only re-triggered transient CI), which CI stage you reproduced, and the exact shim-expiry, `scope:`, `lake build` and `local-axioms:` result lines proving your local checks green + axiom-clean, labelled as local changed-file checks rather than full CI. Do not claim green unless you saw it.

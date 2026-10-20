@@ -1779,7 +1779,7 @@ def cli_main() -> int:
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
     can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "tauceti-verify"):
+    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "tauceti-verify", "tauceti-local-axioms"):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

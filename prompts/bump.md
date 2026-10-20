@@ -62,4 +62,4 @@ Full CI runs these checks even when a partial repair cannot run the full library
 - Do NOT open a new PR; do NOT touch files outside `TauCeti/` (and the already-bumped pins).
 
 ## Report
-End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry, `scope:`, `lake build` and `lake exe axioms` results observed, distinguishing partial checkpoints from complete local verification, and local checks from CI. Do not claim green unless you saw it.
+End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry, `scope:`, `lake build` and `local-axioms:` results observed, distinguishing partial checkpoints from complete local verification, and local checks from CI. Do not claim green unless you saw it.

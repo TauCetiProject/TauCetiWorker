@@ -57,7 +57,28 @@ class Receipts(unittest.TestCase):
         git(self.root, "remote", "add", "origin", "https://github.com/TauCetiProject/TauCeti.git")
         git(self.root, "update-ref", "refs/remotes/origin/main", self.base)
         self.prefix = self.home / "toolchain"
-        write(self.prefix, "bin/lean", "toolchain bytes")
+        lean = write(
+            self.prefix,
+            "bin/lean",
+            f"""#!{sys.executable}
+import sys
+from pathlib import Path
+if sys.argv[1:] == ['--print-prefix']: print({str(self.prefix)!r})
+else: Path('Main.c').write_text('fixture compiler output')
+""",
+        )
+        lean.chmod(0o755)
+        leanc = write(
+            self.prefix,
+            "bin/leanc",
+            f"""#!{sys.executable}
+import sys
+from pathlib import Path
+Path(sys.argv[sys.argv.index('-o') + 1]).write_text({f"#!{sys.executable}"!r} + '\\nimport sys\\nfrom pathlib import Path\\nprint("local-axioms: fixture")\\nsys.exit(1 if Path(".lake/axiom-invalid").exists() else 0)\\n')
+Path(sys.argv[sys.argv.index('-o') + 1]).chmod(0o755)
+""",
+        )
+        leanc.chmod(0o755)
         self.bin = self.home / "bin"
         fake = write(
             self.bin,
@@ -74,6 +95,7 @@ p = Path('.lake'); p.mkdir(exist_ok=True)
 with (p/'calls').open('a') as f: f.write(' '.join(args)+' AXIOMS='+os.environ.get('AXIOMS_ONLY_MODULES','')+'\\n')
 mode = os.environ.get('FIXTURE_MODE', '')
 if mode == 'fail': sys.exit(23)
+if mode == 'bad-axiom-after-build' and args[0] == 'build': (p/'axiom-invalid').touch()
 if mode == 'mutation':
     source = Path('TauCeti/A.lean'); before = source.read_text(); source.write_text('changed'); source.write_text(before)
 if mode == 'sleep':
@@ -92,9 +114,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
 """,
         )
         fake.chmod(0o755)
-        for name in ("lean", "gh"):
+        for name in ("gh",):
             p = write(self.bin, name, "#!/bin/sh\nexit 97\n")
             p.chmod(0o755)
+        (self.bin / "lean").symlink_to(lean)
         self.state = self.home / "state"
         self.env = dict(
             os.environ,
@@ -107,6 +130,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_VERIFY_CACHE_DIR=str(self.home / "cache"),
             TAUCETI_VERIFY_BASE=self.base,
             TAUCETI_VERIFY_CHECKPOINT_MARGIN="0",
+            TAUCETI_LOCAL_AXIOMS_CACHE=str(self.home / "local-axioms-cache"),
         )
         self.environ = patch.dict(os.environ, self.env, clear=True)
         self.environ.start()
@@ -145,10 +169,12 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertIn("reused_from", second["phases"]["build"])
         self.assertEqual(sum(c.startswith("build") for c in self.calls()), 1)
         self.assertTrue(any(e["audit_timings"] for e in second["commands"]))
-        self.assertEqual(second["audit_phase_timings"][0]["phase"], "audit-import")
-        self.assertEqual(second["audit_phase_timings"][0]["seconds"], 1)
+        self.assertEqual(second["audit_phase_timings"], [])  # No imported environment in local checks.
+        audit = next(c for c in second["commands"] if c["phase"] == "axioms")
+        self.assertTrue(audit["argv"][1].endswith("scripts/tauceti-local-axioms"))
         third = self.verify(stage="all")
-        self.assertTrue(all("reused_from" in e for e in third["phases"].values()))
+        for name, phase in third["phases"].items():
+            self.assertEqual("reused_from" in phase, name not in {"axioms", "module-system"})
         fourth = self.verify(stage="build", reuse=False)
         self.assertNotIn("reused_from", fourth["phases"]["build"])
 
@@ -162,6 +188,42 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         result = self.verify(stage="lint")
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["commands"][-1]["exit"], 1)
+
+    def test_local_axioms_never_initialize_lake_or_fall_back_to_full(self):
+        write(self.root, "TauCeti/A.lean", "changed")
+        write(self.root, "lean-toolchain", "changed pin")
+        result = self.verify(stage="axioms", policy="bump")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual(result["scope"]["mode"], "full")  # Full CI requirement, never full local import.
+        audit = next(c for c in result["commands"] if c["phase"] == "axioms")
+        self.assertIn("tauceti-local-axioms", audit["argv"][1])
+        self.assertFalse((self.root / ".lake/calls").exists())  # Not even Lake startup on this path.
+        self.assertNotIn("queue_wait_seconds", result)
+        write(self.root, ".git/shallow", self.base + "\n")
+        result = self.verify(stage="axioms")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("changed modules unknown", result["error"])
+        self.assertFalse(any(c["phase"] == "axioms" for c in result["commands"]))
+
+    def test_stage_only_axiom_success_cannot_hide_new_build_artifacts(self):
+        write(self.root, "TauCeti/A.lean", "custom axiom added after the previous build")
+        os.environ["FIXTURE_MODE"] = "bad-axiom-after-build"
+        initial = self.verify(stage="axioms")
+        self.assertEqual(initial["status"], "success", initial.get("error"))
+        final = self.verify(stage="all")
+        self.assertEqual(final["status"], "failed", final.get("error"))
+        self.assertEqual(final["phases"]["build"]["status"], "success")
+        self.assertNotIn("reused_from", final["phases"]["axioms"])
+        self.assertEqual(final["commands"][-1]["exit"], 1)
+
+    def test_local_checker_compile_failure_is_incomplete_not_a_source_violation(self):
+        write(self.root, "TauCeti/A.lean", "changed")
+        compiler = self.prefix / "bin/leanc"
+        compiler.write_text(compiler.read_text().replace("import sys", "import sys; sys.exit(23)"))
+        result = self.verify(stage="axioms")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertEqual(result["commands"][-1]["exit"], 75)
 
     def test_change_then_restore_during_execution(self):
         os.environ["FIXTURE_MODE"] = "mutation"

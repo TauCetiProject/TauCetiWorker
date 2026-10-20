@@ -17,13 +17,13 @@ The worker pins `TAUCETI_VERIFY_BASE` from the existing canonical-main checkout 
 from local Git refs only. No scope or verification step requests GitHub data or fetches refs.
 The Python scope contract in `verification_scope.py` is tested against #305's V0 recipe: merge-base
 diff, both rename ends, staged/dirty/deleted/untracked sources, ignored sources under TauCeti,
-full audits for broad policy/pins/deletions/unrepresentable modules, and unknown scope on missing
+full CI requirements for broad policy/pins/deletions/unrepresentable modules, and unknown scope on missing
 history. Missing canonical main fails closed with an incomplete receipt: there is no resolved base to
 bind evidence to. Unknown lint scope remains incomplete instead of silently establishing lint evidence.
 A stage-only build or audit does not claim the skipped requested lint succeeded.
 
-All stages run the whole-library `lake build --iofail`, the axiom/duplicates auditor (scoped only
-when safe), module-system, source style lint, changed-module environment lint, and the shim ratchet.
+All stages run the whole-library `lake build --iofail`, fast changed-file axiom diagnostics,
+module-system, source style lint, changed-module environment lint, and the shim ratchet.
 A stage-only call runs that stage; it does not assert that prerequisites or other stages passed.
 The shim checker receives merge-base source and registry snapshots, strict `--fail-on-available`,
 and `--only-new` for unchanged pins outside bump policy. Older source revisions without the checker
@@ -32,10 +32,34 @@ modules, `--lint-modules /absolute/list` adds validated existing dotted TauCeti 
 local lint list; its contents are fingerprinted. Use the same option for final verification. Write this
 list and any extra diagnostic logs outside the checkout; untracked checkout files are inputs.
 
+Local axiom checks use the bundled `scripts/LocalAxioms.lean`, through the absolute
+`scripts/tauceti-local-axioms --modules FILE` wrapper. They read only the selected modules' own
+`.olean`, `.olean.server` and `.olean.private` data, without loading a Lean environment,
+following imports, reading Mathlib artifacts or running candidate initializers. They reject axiom
+declarations and direct references to `sorryAx`, `Lean.ofReduceBool`, `Lean.ofReduceNat` and
+`Lean.trustCompiler`, including private/opaque proof bodies. Missing/unreadable artifacts fail, an
+empty docs/deletion-only list is valid, and unknown scope fails instead of loading the library.
+Even bump/full-lint/deletion scopes check only their listed surviving changed modules locally.
+These are fast diagnostics after a kernel-checked build, not a transitive axiom or global
+declaration-ownership certificate. Those checks, including downstream importers and changed
+dependencies, remain in authoritative CI. `lake exe axioms` is not used locally: its filter only
+narrows traversal after a full environment import. Policy version 4 and the bundled driver/wrapper
+hashes invalidate earlier local verification receipts. The wrapper compiles a small native executable
+once per checker/toolchain identity, under a flock and atomic publication, then executes it directly.
+There is no Lake or Lean interpreter startup on the warm path, no result caching, and no interpreter
+or full-library fallback. Host binaries live in an owned private `~/.cache/tauceti/local-axioms`
+directory in the login user's home (`TAUCETI_LOCAL_AXIOMS_CACHE` overrides it, isolated HOME does not);
+Bubble uses its own persistent per-worker
+cache, never the host's executable cache. Interrupted compilation leaves no published executable and
+retries automatically. Four recent native versions are retained. Empty scopes need no toolchain.
+Local axiom and module-system phases always rerun against the current artifacts, because a successful
+stage-only check before a build cannot certify the outputs of that later build. Compilation/tool
+failures are incomplete verification, distinct from a found axiom violation.
+
 Each invocation atomically writes `state/<worker>/verification/<id>/receipt.json` before launching
 anything and updates it through completion. File and directory fsync precede publication. The receipt
 records requested phases, scope, start/end timestamps, original audit timing lines, tool exits,
-containment capability and full log paths, including the auditor's `AUDIT_PHASES_FILE` timestamps. Reused phases refer to their original receipt.
+containment capability and full log paths. Reused phases refer to their original receipt.
 Receipts and logs are retained on failure or interruption. SIGKILL leaves the last durable receipt
 incomplete, even if a tool appeared to finish. No background completion is assumed.
 

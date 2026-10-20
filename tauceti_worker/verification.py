@@ -36,7 +36,7 @@ from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 3
+POLICY_VERSION = 4
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
@@ -382,7 +382,8 @@ class Verification:
                     and (file_record(Path(config)) if config else None) == inputs["configuration"]
                     and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
                     and POLICY_VERSION == inputs["policy_version"]
-                    and {p.name for p in Path(__file__).parent.glob("*.py")} == set(inputs["verifier"]) - {"wrapper"}
+                    and {p.name for p in Path(__file__).parent.glob("*.py")}
+                    == set(inputs["verifier"]) - {"wrapper", "tauceti-local-axioms", "LocalAxioms.lean"}
                 )
             if self.mutated or not unchanged:
                 raise Incomplete("verification inputs changed during execution")
@@ -421,6 +422,8 @@ class Verification:
         environment = self.environment()
         verifier = {str(p.name): hash_file(p) for p in Path(__file__).parent.glob("*.py")}
         verifier["wrapper"] = hash_file(HERE / "scripts" / "tauceti-verify")
+        for name in ("tauceti-local-axioms", "LocalAxioms.lean"):
+            verifier[name] = hash_file(HERE / "scripts" / name)
         sources = inventory(self.root, self.base)
         return dict(
             sources=sources,
@@ -446,9 +449,23 @@ class Verification:
         if phase == "build":
             return [(["lake", "build", "--iofail"], env)]
         if phase == "axioms":
-            env["AXIOMS_ONLY_MODULES"] = str(modules) if selected["mode"] == "scoped" else ""
-            env["AUDIT_PHASES_FILE"] = str(self.directory / "audit-phases.tsv")
-            return [(["lake", "exe", "axioms"], env)]
+            if selected["mode"] == "unknown":
+                raise Incomplete("axioms: changed modules unknown; refusing a whole-library local fallback")
+            # This is local feedback, not CI certification. Never import the full library,
+            # including for pin bumps/deletions/broad policies (CI owns their global checks).
+            return [
+                (
+                    [
+                        sys.executable,
+                        str(HERE / "scripts/tauceti-local-axioms"),
+                        "--modules",
+                        str(modules),
+                        "--root",
+                        LEAN_ROOT,
+                    ],
+                    env,
+                )
+            ]
         if phase == "module-system":
             return [(["lake", "exe", "module-system"], env)]
         if phase == "lint":
@@ -551,7 +568,9 @@ class Verification:
             self.watched = stamps([self.root / p for p in self.watch_names])
             inputs = self.inputs()
             self.watch()
-            extra = list(Path(__file__).parent.glob("*.py")) + [HERE / "scripts/tauceti-verify"]
+            extra = list(Path(__file__).parent.glob("*.py")) + [
+                HERE / "scripts" / name for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")
+            ]
             extra += [p for root in self.installations.walked for p in files_under(root)]
             extra += [
                 Path(entry["path"])
@@ -610,7 +629,15 @@ class Verification:
                 for argv, env in self.phase_commands(phase, modules):
                     if early_style and phase == "lint" and "scripts/lint-style.sh" in argv:
                         continue
-                    self.command(phase, argv, env=env)
+                    try:
+                        self.command(phase, argv, env=env)
+                    except subprocess.CalledProcessError as error:
+                        if phase == "axioms" and error.returncode in {2, 75}:
+                            raise Incomplete(
+                                "local axiom checker unavailable; see the phase log",
+                                reason="tool-missing" if error.returncode == 75 else "invalid-input",
+                            ) from error
+                        raise
                 self.validate_inputs(inputs)
                 record.update(status="success", ended_at=time.time(), validated_fingerprint=fingerprint)
                 self.index_success()
@@ -631,18 +658,8 @@ class Verification:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason="preparation")
         finally:
             self.receipt["ended_at"] = time.time()
-            timings = []
-            timing_file = self.directory / "audit-phases.tsv"
-            if timing_file.exists():
-                for line in timing_file.read_text(errors="replace").splitlines():
-                    try:
-                        name, timestamp = line.split("\t")
-                        timings.append(dict(phase=name, started_at=float(timestamp)))
-                    except (ValueError, TypeError):
-                        continue
-                for entry, following in zip(timings, timings[1:], strict=False):
-                    entry["seconds"] = following["started_at"] - entry["started_at"]
-            self.receipt["audit_phase_timings"] = timings
+            # Retain the legacy field for readers; local checks no longer import an environment.
+            self.receipt["audit_phase_timings"] = []
             for phase in self.receipt["phases"].values():
                 if phase.get("ended_at") is None:
                     phase.update(ended_at=self.receipt["ended_at"], status=self.receipt["status"])
@@ -685,6 +702,10 @@ class Verification:
             atomic(index, entries)
 
     def find_reuse(self, fingerprint, phase):
+        # These cheap checks inspect build outputs. A source-only fingerprint cannot certify
+        # that a stage-only check saw artifacts produced by a subsequent build.
+        if phase in {"axioms", "module-system"}:
+            return None
         entry = read_json(self.state / "verification-index" / f"{fingerprint}.json").get(phase)
         if not isinstance(entry, str):
             return None
