@@ -2070,16 +2070,12 @@ def run_in_bubble(
         ]
     for m in mounts or []:
         mount_flags += ["--mount", m]
+    import tauceti_tools
+
+    mount_flags += ["--mount", f"{Path(tauceti_tools.__file__).parent}:/opt/tools/tauceti_tools:ro"]
     snapshot = os.environ.get("TAUCETI_CONF_SNAPSHOT")
     if snapshot:
-        import tauceti_tools
-
-        mount_flags += [
-            "--mount",
-            f"{snapshot}:/opt/project.toml:ro",
-            "--mount",
-            f"{Path(tauceti_tools.__file__).parent}:/opt/tools/tauceti_tools:ro",
-        ]
+        mount_flags += ["--mount", f"{snapshot}:/opt/project.toml:ro"]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
     # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch
@@ -2284,8 +2280,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     outbox but NOT push (the bubble can't reach TauCetiData) — do_review drains that outbox to
     TauCetiData host-side afterwards. The only traffic that
     crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
-    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine has no
-    Python deps, so we run the mounted source with the image's python3 — no uvx/uv/PyPI.
+    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine and its shared Tools dependency are mounted as source and run with the image's
+    python3 — no package downloads inside the container.
 
     The store is mounted READ-WRITE from the worker's persistent store_dir (not /tmp): it holds the
     scoreboard/thread comment ids the next round edits in place — an ephemeral store would post a
@@ -2298,15 +2294,19 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     if not eng:
         ref = os.environ.get("TAUCETI_REVIEW_REF")
         if ref:
-            engine_dir.mkdir(parents=True, exist_ok=True)
-            commands = (
-                ["git", "init", "-q", str(engine_dir)],
-                ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
-                ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
-                ["git", "-C", str(engine_dir), "clean", "-fdxq"],
+            engine_dir = cfg.state / "refs" / f"review-engine-{ref}"
+            current = subprocess.run(
+                ["git", "-C", str(engine_dir), "rev-parse", "HEAD"], capture_output=True, text=True
             )
-            if any(subprocess.run(command).returncode for command in commands):
-                raise Die(f"fetch pinned {REVIEW}@{ref} failed")
+            if current.returncode or current.stdout.strip() != ref:
+                engine_dir.mkdir(parents=True, exist_ok=True)
+                commands = (
+                    ["git", "init", "-q", str(engine_dir)],
+                    ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
+                    ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
+                )
+                if any(subprocess.run(command, timeout=120).returncode for command in commands):
+                    raise Die(f"fetch pinned {REVIEW}@{ref} failed")
         elif not fetch_ref(REVIEW, engine_dir):
             raise Die(f"fetch {REVIEW} failed")
     roadmap_dir = cfg.state / "refs" / "roadmap"

@@ -701,3 +701,7 @@ in `workers.toml`. Keep the raw API key out of that file.
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
 for initialization, coordination, and the live calibration results.
+
+Run Python host helpers from this checkout with `uv run python PATH_TO_HELPER` so they
+use the pinned shared Tools dependency. Update any local timer commands to use the same
+invocation before upgrading this checkout.

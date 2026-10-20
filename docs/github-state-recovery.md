@@ -75,10 +75,10 @@ until set back to `none`.
 
 ```sh
 S=services/github-state/scripts/storage_recovery.py
-python3 $S --environment production status        # sizes, cursors, mode, parked backlog
-python3 $S --environment production scan --table cursors
-python3 $S --environment production cleanup --class expired_cursors --batches 100
-python3 $S --environment production probe --bytes 65536
+uv run python $S --environment production status        # sizes, cursors, mode, parked backlog
+uv run python $S --environment production scan --table cursors
+uv run python $S --environment production cleanup --class expired_cursors --batches 100
+uv run python $S --environment production probe --bytes 65536
 ```
 
 1. Confirm the deployed version from `/v1/health` (`state.deployment_id`).

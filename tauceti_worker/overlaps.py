@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .config import Die, NoProgress, log, max_open_prs, positive_integer
 from .constants import CLAIMS, TAUCETI
-from .github import GitHub, can_push, ensure_fork, me, shared_claims_granted
+from .github import GitHub, can_push, claims_repo, ensure_fork, me, shared_claims_granted
 from .overlap_state import Lease, State, environment, git
 from .overlap_support import atomic, locked, read_context, root, shared_read, snapshot
 from .paths import HERE
@@ -537,8 +537,8 @@ def do_fix(w, sv, c, opts, bubble):
             {
                 "TAUCETI_VERIFY_POLICY": "ordinary",
                 "TAUCETI_WORKER_ID": lease.owner,
-                "CLAIM_REPO": CLAIMS,
-                "TAUCETI_CLAIM_REPO": CLAIMS,
+                "CLAIM_REPO": claims_repo(),
+                "TAUCETI_CLAIM_REPO": claims_repo(),
                 "TAUCETI_CLAIM_KEY": lease.key,
                 "TAUCETI_AUTHOR_CLAIM_KEY": lease.key,
                 "TAUCETI_TARGET_MARKER": match.group(0),
