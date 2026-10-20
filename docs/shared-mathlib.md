@@ -168,5 +168,6 @@ failures latch this stop automatically;
 other observed isolation/lease failures require the same operator rollback. An unsupported capability or insufficient space in auto uses
 private preparation; required mode refuses inference with the reason.
 
-See [the #311 validation record](evidence/shared-mathlib-311.json) for current
-local evidence and incomplete natural rollout gates.
+The [historical #311 validation record](evidence/shared-mathlib-311.json) predates
+#364. Its containment deployment gates are retired; it establishes neither
+deployment nor reactivation readiness for this baseline.
