@@ -20,6 +20,8 @@ def admission_reason(worker: str, *, env=None, now=None) -> str | None:
     now = time.time() if now is None else now
     try:
         policy = json.loads(Path(path).read_text())
+        if not isinstance(policy, dict):
+            raise ValueError("invalid policy")
         expires = policy["expires_at"]
         allowed = policy["workers"]
         if (

@@ -106,7 +106,6 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     )
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
-    admission_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -132,7 +131,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     blocked, reason, snapshot = True, str(error), {}
                 if blocked:
                     wake = snapshot.get("funding_at")
-                    nap = max(1, min(60, (wake - time.time() + 1) if wake else 60))
+                    nap = max(1, min(5, (wake - time.time() + 1) if wake else 5))
                     report_runtime("waiting-budget", detail=reason, budget=snapshot, next_action_at=time.time() + nap)
                     time.sleep(nap)
                     continue
@@ -313,21 +312,25 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 continue
 
             if rc == EX_ADMISSION_WAIT:
-                if reason := fleet_admission_reason(cfg.wid):
-                    report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
-                    time.sleep(5)
-                    continue
                 streak = 0
-                admission_streak += 1
-                nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))
+                paused = runtime_snapshot()
+                reason = fleet_admission_reason(cfg.wid)
+                state = "waiting-capacity" if reason else paused.get("state", "waiting-budget")
+                if state not in ("waiting-capacity", "waiting-budget"):
+                    state = "waiting-budget"
                 with contextlib.suppress(BudgetError, OSError):
-                    Budget().refresh_waiter(cfg.wid)
+                    if api_mode():
+                        Budget().refresh_waiter(cfg.wid)
                 report_runtime(
-                    "waiting-budget", detail="rechecking local API admission", next_action_at=time.time() + nap
+                    state,
+                    detail=reason or paused.get("detail") or "rechecking local API admission",
+                    next_action_at=time.time() + 5,
+                    failure_reason=None,
+                    failure_code=None,
+                    failure_log=None,
                 )
-                time.sleep(nap)
+                time.sleep(5)
                 continue
-            admission_streak = 0
 
             if rc == EX_GITHUB_WAIT:
                 streak = 0

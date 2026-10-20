@@ -919,12 +919,13 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
 
 
 def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
-    """Quota failures in any stage are infrastructure pauses, including checkout and publishing.
+    """Preserve attempts across GitHub pauses and pre-inference admission refusals.
 
     Restore only this stage's attempt counters. Provider costs already settled remain costs, and
     successful work is never rolled back just because a later cleanup request hit a limit.
     """
-    from .config import GitHubUnavailable
+    from .claude_api import blocked_failure
+    from .config import AdmissionUnavailable, GitHubUnavailable
     from .github_transport import blocked_since, blocking_event_since
 
     pr, head = c.pr, c.head[:12]
@@ -941,7 +942,26 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "progress": ("progress-err",),
     }.get(stage, ())
     before = {key: w.counters.read(key) for key in keys}
+    admission_keys = (*keys, "progress-attempt-ts") if stage == "progress" else keys
+    admission_before = {key: w.counters.read(key) for key in admission_keys}
+    foreign_receipt = (
+        w.cfg.state / f"rebase-foreign-launch-{pr}.json"
+        if stage == "rebase" and getattr(c, "foreign_repair_base", "")
+        else None
+    )
+    had_foreign_receipt = foreign_receipt is not None and foreign_receipt.exists()
     started = time.time()
+
+    def refund_admission():
+        # Only a refusal before the unit's first admission can undo an attempt.
+        from .claude_api import CURRENT_CONTEXT
+
+        if CURRENT_CONTEXT is not None and CURRENT_CONTEXT.invocations:
+            return
+        for key, value in admission_before.items():
+            w.counters.write(key, min(value, w.counters.read(key)))
+        if foreign_receipt is not None and not had_foreign_receipt:
+            foreign_receipt.unlink(missing_ok=True)
 
     def pause():
         for key, value in before.items():
@@ -954,11 +974,20 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
 
     try:
         rc = fn(w, sv, c, opts, bubble)
+        if rc != 0 and (failure := blocked_failure()):
+            raise failure
+    except AdmissionUnavailable:
+        refund_admission()
+        raise
     except GitHubUnavailable as error:
         for key, value in before.items():
             w.counters.write(key, min(value, w.counters.read(key)))
         raise error
     except Exception:
+        # Secondary engines can raise while interpreting an empty refused result.
+        if isinstance(failure := blocked_failure(), AdmissionUnavailable):
+            refund_admission()
+            raise failure from None
         if blocked_since(started):
             pause()
         raise
@@ -1046,6 +1075,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             return None
     if not _still_actionable(stage, w, sv, c):
         return None
+    from .claude_api import admission_failure
+    from .fleet_capacity import admission_reason
+
+    if os.environ.get("TAUCETI_FLEET_ADMISSION_FILE") and (reason := admission_reason(w.cfg.wid)):
+        raise admission_failure(reason, state="waiting-capacity")
     if needs_codex_probe:
         # Resolve Sol/Luna before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.
@@ -1114,7 +1148,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
     with contextlib.ExitStack() as stack:
         try:
-            api = stack.enter_context(
+            stack.enter_context(
                 api_context(
                     w.cfg.wid if api_mode() else "",
                     stage,
@@ -1127,8 +1161,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 raise
             raise admission_failure(str(error)) from None
         rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
-        if rc != 0 and api is not None and api.blocked_reason:
-            raise admission_failure(api.blocked_reason)
     from .verification import waiting_for_capacity
 
     if stage in FILE_CHANGE_STAGES | {"overlap-fix"} and waiting_for_capacity(w.cfg):
@@ -1234,12 +1266,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"review #{pr}",
             )
         log(f"  review #{pr}: engine rc={rc}")
-        from .claude_api import blocked_reason
+        from .claude_api import blocked_failure
 
-        if rc != 0 and (reason := blocked_reason()):
-            from .claude_api import admission_failure
-
-            raise admission_failure(reason)
+        if rc != 0 and (failure := blocked_failure()):
+            raise failure
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without completing a review" streak up front — BEFORE the publish step, which is
@@ -1400,14 +1430,15 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
     per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
     """
-    from .claude_api import blocked_reason
+    from .claude_api import blocked_failure
+    from .config import AdmissionUnavailable
 
-    if reason := blocked_reason():
-        for key in charged:
-            w.counters.write(key, max(0, w.counters.read(key) - 1))
-        from .claude_api import admission_failure
-
-        raise admission_failure(reason)
+    if failure := blocked_failure():
+        # Typed waits are restored centrally, including secondary launch paths.
+        if not isinstance(failure, AdmissionUnavailable):
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+        raise failure
     reason = take_last_agent_infra_failure()
     if not reason:
         return
@@ -2017,12 +2048,10 @@ def _do_progress_inner(w, opts) -> int | None:
     )
     rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
     if rc != 0:
-        from .claude_api import blocked_reason
+        from .claude_api import blocked_failure
 
-        if reason := blocked_reason():
-            from .claude_api import admission_failure
-
-            raise admission_failure(reason)
+        if failure := blocked_failure():
+            raise failure
         w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(f"the writing agent exited {rc}")
     for f in (status_body, section_body):

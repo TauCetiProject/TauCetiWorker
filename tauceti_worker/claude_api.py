@@ -25,11 +25,17 @@ def blocked_reason():
     return CURRENT_CONTEXT.blocked_reason if CURRENT_CONTEXT is not None else None
 
 
-def admission_failure(message):
+def blocked_failure():
+    if CURRENT_CONTEXT is not None and CURRENT_CONTEXT.blocked_reason:
+        return admission_failure(CURRENT_CONTEXT.blocked_reason, state=CURRENT_CONTEXT.wait_state)
+    return None
+
+
+def admission_failure(message, *, state=None):
     from .config import AdmissionUnavailable, NoProgress
 
     waiting = message.startswith(("waiting", "unresolved", "API throughput", "provider session", "ledger repair"))
-    return AdmissionUnavailable(message) if waiting else NoProgress(message)
+    return AdmissionUnavailable(message, state=state or "waiting-budget") if state or waiting else NoProgress(message)
 
 
 def review_environment():
@@ -111,6 +117,7 @@ class ClaudeAPIContext:
         self.admission_ids = {}
         self.models = {}
         self.blocked_reason = None
+        self.wait_state = None
         self.previous_path = os.environ.get("PATH", "")
         self.previous_context = os.environ.get("TAUCETI_API_CONTEXT")
         self.previous_cmd = os.environ.get("TAUCETI_CLAUDE_CMD")
@@ -134,7 +141,7 @@ class ClaudeAPIContext:
         from .fleet_capacity import admission_reason as fleet_admission_reason
 
         if reason := fleet_admission_reason(self.worker):
-            raise BudgetError(reason)
+            raise admission_failure(reason, state="waiting-capacity")
         if self.enabled:
             snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
             reason = admission_pause(snapshot)
@@ -142,7 +149,7 @@ class ClaudeAPIContext:
                 if reason == "waiting for funding" and self.model:
                     self.budget.wait_for_funding(self.worker, self.model, self.phase)
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
-                raise BudgetError(reason)
+                raise admission_failure(reason, state="waiting-budget")
         self.directory.mkdir(parents=True, mode=0o700)
         self.bin.mkdir(mode=0o700)
         self.inbox.mkdir(mode=0o700)
@@ -191,6 +198,7 @@ class ClaudeAPIContext:
     def handle(self, request):
         action = request["action"]
         if action == "preflight-failed":
+            self.wait_state = None
             self.blocked_reason = "Claude API authentication unavailable"
             return dict(ok=True)
         if action == "admit":
@@ -200,6 +208,8 @@ class ClaudeAPIContext:
             # Once admitted, finish this work unit even if CI takes capacity.
             if not self.invocations and (reason := fleet_admission_reason(self.worker)):
                 self.blocked_reason = reason
+                self.wait_state = "waiting-capacity"
+                report_runtime(self.wait_state, detail=reason)
                 return dict(allowed=False, reason=reason)
             ticket = request["id"]
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):
@@ -221,6 +231,7 @@ class ClaudeAPIContext:
                 self.invocations.add(invocation)
                 self.models[invocation] = request["model"]
                 self.blocked_reason = None
+                self.wait_state = None
                 answer["id"] = invocation
                 report_runtime(
                     "running",
@@ -231,6 +242,7 @@ class ClaudeAPIContext:
                 )
             else:
                 self.blocked_reason = answer["reason"]
+                self.wait_state = "waiting-budget"
                 report_runtime("waiting-budget", detail=answer["reason"], budget=self.budget.snapshot())
             return answer
         if action == "settle":
@@ -247,6 +259,7 @@ class ClaudeAPIContext:
         if receipt["id"] not in self.invocations:
             raise BudgetError("receipt has no admission in this bridge")
         if receipt["outcome"] == "launch-failed":
+            self.wait_state = None
             self.blocked_reason = "native Claude launch failed before spending"
         if not self.enabled:
             return
