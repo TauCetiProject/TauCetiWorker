@@ -348,7 +348,10 @@ are part of recovery.
 Recovery tries authoritative native receipts first, then directly linked durable
 usage journals. Legacy transcripts are considered only when a saved receipt names
 the exact provider session and exactly one file belongs to that worker; worker/time
-overlap never establishes identity. Complete saved usage can settle as a marked,
+overlap never establishes identity. Recorded finish times and later admissions
+resuming that exact provider session bound transcript attribution. Recovery shares
+response IDs across its plan, so a resume cannot charge responses recovered earlier
+in the same transaction. Complete saved usage can settle as a marked,
 correctable token-price estimate. An unclosed journal, an interrupted response,
 or a transcript remains incomplete even if all observed responses are priced,
 the owner has died, or `inflight=false`.

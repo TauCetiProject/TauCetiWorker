@@ -266,6 +266,31 @@ class RecoveryTests(unittest.TestCase):
             self.repair()
         self.assertEqual(self.state(key)["totals"], {provider: "7"})
 
+    def test_linked_transcript_excludes_later_resumed_invocation(self):
+        provider = "12345678-1234-1234-1234-123456789abc"
+        first = self.session(estimate="1", age=2000, duration=None)
+        second = self.session(estimate="1", age=1000, resume=provider)
+        self.receipt(first, totals=None, provisional=True, lower_bound_totals={provider: "1"})
+        self.receipt(second, totals=None, provisional=True, lower_bound_totals={provider: "3"})
+        project = self.root / "transcripts/project"
+        project.mkdir(parents=True)
+        events = [
+            dict(
+                type="assistant",
+                sessionId=provider,
+                timestamp=datetime.fromtimestamp(NOW - age, UTC).isoformat(),
+                message=dict(id=mid, model=MODEL, usage=dict(input_tokens=0, output_tokens=100000)),
+            )
+            for age, mid in ((1500, "old"), (950, "old"), (940, "new"))
+        ]
+        (project / (provider + ".jsonl")).write_text("".join(json.dumps(e) + "\n" for e in events))
+        with patch.dict(os.environ, TAUCETI_USAGE_TRANSCRIPT_ROOTS=str(project.parent)):
+            _, rows = self.repair(True)
+            self.assertEqual(Decimal(rows[first]["known_prefix_usd"]), 2)
+            self.assertEqual(Decimal(rows[second]["known_prefix_usd"]), 2)
+            self.repair()
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 4)
+
     def test_nonterminating_rate_reconciles_and_native_corrections_become_comparables(self):
         for _ in range(3):
             self.session(cost=1, duration=3, age=5000)
@@ -321,6 +346,33 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.state(key)["cost_provenance"], "historical-estimate")
         self.budget.settle_receipt(dict(id=key, totals={"s": "3"}, outcome="exit:0"))
         self.assertEqual(Decimal(self.state(key)["cost"]), 3)
+
+    def test_resumed_replay_deduplicates_transcript_recovered_in_same_transaction(self):
+        first = self.session()
+        journal = self.saved(first)
+        recovered = json.loads(journal.path.read_text())
+        recovered["recovered_from"] = "receipt-linked-native-transcript"
+        journal.path.unlink()
+        journal.log.unlink()
+        second = self.session(resume="s", age=500)
+        resumed = self.saved(second, closed=True)
+        resumed.observe(
+            dict(
+                type="assistant",
+                session_id="s",
+                message=dict(id="new", model=MODEL, usage=dict(input_tokens=0, output_tokens=100000)),
+            )
+        )
+        resumed.flush(closed=True)
+        with patch(
+            "tauceti_worker.budget_usage.linked_transcript",
+            side_effect=lambda directory, session, sessions: recovered if session["id"] == first else None,
+        ):
+            _, rows = self.repair(True)
+            self.assertEqual(Decimal(rows[second]["final_charge_usd"]), 2)
+            self.repair()
+        self.assertEqual(Decimal(self.state(second)["cost"]), 2)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 9)
 
     def test_duplicate_resumed_responses_and_late_cumulative_correction(self):
         first = self.session()

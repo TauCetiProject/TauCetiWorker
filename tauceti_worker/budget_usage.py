@@ -5,10 +5,11 @@ from decimal import Decimal
 from .usage_accounting import session_usage
 
 
-def evidence(directory, session, sessions):
-    value = session_usage(directory, session)
+def evidence(directory, session, sessions, *, checkpoints=None):
+    checkpoints = checkpoints or {}
+    value = checkpoints.get(session["id"]) or session_usage(directory, session)
     if value is None:
-        value = linked_transcript(directory, session)
+        value = linked_transcript(directory, session, sessions)
     if value is None:
         return None
     # A resumed CLI can replay old responses. Charge each provider response once,
@@ -22,7 +23,7 @@ def evidence(directory, session, sessions):
             prior.get("resume") != session["resume"] and session["resume"] not in prior.get("totals", {})
         ):
             continue
-        saved = session_usage(directory, prior)
+        saved = checkpoints.get(prior["id"]) or session_usage(directory, prior)
         if saved:
             seen.update((m["session"], m["message_id"]) for m in saved["messages"].values())
     items = [m for m in value["messages"].values() if (m["session"], m["message_id"]) not in seen]
@@ -36,7 +37,7 @@ def evidence(directory, session, sessions):
     return dict(items=items, cost=known, complete=complete, checkpoint=value)
 
 
-def linked_transcript(directory, session):
+def linked_transcript(directory, session, sessions=None):
     """Legacy fallback only when a receipt names the exact provider session.
 
     Never infer identity from a worker/time overlap. Reject duplicate files, filter
@@ -44,6 +45,7 @@ def linked_transcript(directory, session):
     """
     import hashlib
     import json
+    import math
     import os
     import stat
     import time
@@ -88,6 +90,17 @@ def linked_transcript(directory, session):
         journal.current, journal.waiting, journal.dirty = {}, {"unknown"}, set()
         journal.flush = lambda: None
         for provider in providers:
+            until = time.time()
+            if session.get("finished") is not None:
+                finish = float(session["finished"])
+                if math.isfinite(finish) and session["started"] <= finish <= until:
+                    until = finish
+            resume_before = None
+            # Identity is receipt-linked. A later recorded resume bounds which
+            # invocation owns responses without guessing a provider from time overlap.
+            for later in (sessions or {}).values():
+                if later.get("resume") == provider and later["started"] > session["started"]:
+                    resume_before = min(resume_before, later["started"]) if resume_before else later["started"]
             matches = {
                 p.resolve() for root in roots for p in root.glob("*/" + provider + ".jsonl") if not p.is_symlink()
             }
@@ -110,10 +123,17 @@ def linked_transcript(directory, session):
                         at = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
                     except (ValueError, KeyError, TypeError):
                         return None
-                    if session["started"] <= at <= time.time():
+                    if session["started"] <= at <= until and (resume_before is None or at < resume_before):
                         journal.observe(dict(type="assistant", session_id=provider, message=event.get("message")))
             journal.value["sources"].append(
-                dict(provider=provider, file=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns)
+                dict(
+                    provider=provider,
+                    file=str(path),
+                    size=info.st_size,
+                    mtime_ns=info.st_mtime_ns,
+                    until=until,
+                    resume_before=resume_before,
+                )
             )
         if len(json.dumps(journal.value)) > MAX_CHECKPOINT or not journal.value["messages"]:
             return None

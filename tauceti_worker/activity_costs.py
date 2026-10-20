@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from .activity_summary import hourly_rate
 from .budget import Budget, money
-from .budget_recovery import live_identity
+from .budget_recovery import interval, live_identity
 from .usage_accounting import session_usage, usage_path
 
 COST_WINDOWS = {"total": None, "7d": 7 * 86400}
@@ -142,7 +142,12 @@ def prepare(db, now, scope_for_worker):
                     )
                 )
         elif money(value) > 0:
-            finish = settled_at.get(identity, saved["observed_at"] if saved else now)
+            recorded = interval(session, now)
+            finish = (
+                float(recorded["finish"])
+                if recorded["finish"] is not None
+                else settled_at.get(identity, saved["observed_at"] if saved else now)
+            )
             accruals.append(
                 (
                     identity,

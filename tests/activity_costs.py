@@ -124,6 +124,19 @@ class CostTests(unittest.TestCase):
         a.prepare(now=self.now + 1)
         return a.cached(group="machine")["summary"]
 
+    def test_recovered_estimate_uses_recorded_interval_in_spending_windows(self):
+        self.session("d" * 32, 2 * DAY, "author", "6", settled=True)
+        self.records[-1]["timestamp"] = self.now
+        self.records[-1]["events"][0].update(
+            cost_provenance="historical-estimate",
+            finished=self.now - 2 * DAY + 100,
+            recovery_audit={"policy": "v1"},
+        )
+        self.write_ledger()
+        costs = self.summary()["costs"]
+        self.assertEqual(Decimal(costs["spending"]["24h"]["spent_usd"]), 90)
+        self.assertEqual(Decimal(costs["windows"]["total"]["estimated_usd"]), 106)
+
     def test_prepared_accounting_separates_live_recovered_and_unresolved(self):
         self.session("b" * 32, 30, "author", "5", settled=False)
         self.records[-1]["events"][0]["owner"] = process_identity()

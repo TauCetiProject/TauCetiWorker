@@ -133,6 +133,7 @@ def recover(budget, note, *, dry_run=False):
         identities = {key: live_identity(s, now) for key, s in original.items()}
         projection = Projection(budget, records, now)
         rows, errors, checkpoints = [], [], []
+        usage_evidence = {}
         for key, session in original.items():
             row = dict(
                 id=key,
@@ -180,7 +181,7 @@ def recover(budget, note, *, dry_run=False):
                 state = projection.replay()
                 current = state["sessions"][key]
                 if current["status"] != "settled":
-                    saved = evidence(budget.directory, current, state["sessions"])
+                    saved = evidence(budget.directory, current, state["sessions"], checkpoints=usage_evidence)
                     floor = max(
                         money(current.get("cost", "0")),
                         money(current.get("lower_bound_cost", "0")),
@@ -189,6 +190,7 @@ def recover(budget, note, *, dry_run=False):
                     duration = interval(session, now, saved)
                     if saved:
                         checkpoint = saved["checkpoint"]
+                        usage_evidence[key] = checkpoint
                         row["source"] = checkpoint.get("recovered_from", "usage-journal")
                         row["audit_inputs"].update(
                             usage_sha256=hashlib.sha256(json.dumps(checkpoint, sort_keys=True).encode()).hexdigest(),
