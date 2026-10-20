@@ -445,6 +445,12 @@ def fill_prompt(path: Path, **subs) -> str:
     ):
         path = path.parent / "v0" / path.name
     text = path.read_text()
+    if path.parent in (HERE / "prompts", HERE / "prompts/v0"):
+        from tauceti_tools.project import active
+        from tauceti_tools.templates import render
+
+        if active():
+            text = render(text, active())
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
@@ -677,10 +683,10 @@ def prepare_checkout(
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
     # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
     # the checkout aside and starts again from a fresh clone instead of failing every round.
-    if g("checkout", "-q", "-f", "-B", "main", "origin/main"):
+    if g("checkout", "-q", "-f", "-B", os.environ.get("TAUCETI_BASE_BRANCH", "main"), "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")):
         if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
             return False
-        if not clone("forced checkout failed") or g("checkout", "-q", "-f", "-B", "main", "origin/main"):
+        if not clone("forced checkout failed") or g("checkout", "-q", "-f", "-B", os.environ.get("TAUCETI_BASE_BRANCH", "main"), "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")):
             return False
     from .verification_scope import local_main
 
@@ -785,7 +791,7 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
 def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path, *, cancel_event=None) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
-    if any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+    if TAUCETI_CACHE_SERVICE and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         prompt += (
             "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
             "checkout and current main. The public `tauceti-public` Lake service remains configured "
@@ -1168,10 +1174,10 @@ KIRO_BUBBLE_MIN_VERSION = "0.7.31"
 # `lake cache get` failed and fell through to a from-scratch `lake build` -- silently, because a
 # cache miss is non-fatal here. The custom domain is also what TauCeti's own CI publishes and reads
 # through (the LAKE_CACHE_*_PUBLIC repo variables). Keep the two in step.
-TAUCETI_CACHE_DOMAIN = "cache.taucetiproject.org"
-TAUCETI_CACHE_SERVICE = "tauceti-public"
-TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
-TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
+TAUCETI_CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
+TAUCETI_CACHE_SERVICE = os.environ.get("TAUCETI_CACHE_SERVICE", "tauceti-public")
+TAUCETI_CACHE_ARTIFACT_URL = os.environ.get("TAUCETI_CACHE_ARTIFACT_URL", f"https://{TAUCETI_CACHE_DOMAIN}/artifacts")
+TAUCETI_CACHE_REVISION_URL = os.environ.get("TAUCETI_CACHE_REVISION_URL", f"https://{TAUCETI_CACHE_DOMAIN}/revisions")
 
 
 class BuildCacheUnavailable(NoProgress):
@@ -1196,6 +1202,9 @@ def lake_cache_max_revs(env: dict) -> str:
 @contextlib.contextmanager
 def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     """Keep the public service available through repairs, merges and dependency changes."""
+    if not TAUCETI_CACHE_SERVICE:
+        yield
+        return
     if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         yield
         return
@@ -1379,6 +1388,8 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
     if env.get("LAKE_ARTIFACT_CACHE", "1").lower() in _LAKE_FALSE:
         log("host build caches: TauCeti artifact caching explicitly disabled by LAKE_ARTIFACT_CACHE")
         return
+    if not TAUCETI_CACHE_SERVICE:
+        return
     base = ["lake", "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI]
     result = fetch("TauCeti", [*base, f"--max-revs={max_revs}"])
     if result == "workspace-error":
@@ -1476,6 +1487,8 @@ def tauceti_cache_unreachable_reason() -> str | None:
     import urllib.error
     import urllib.request
 
+    if not TAUCETI_CACHE_REVISION_URL:
+        return None
     url = f"{TAUCETI_CACHE_REVISION_URL}/"
     try:
         with urllib.request.urlopen(url, timeout=30):
@@ -1843,6 +1856,8 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     log to the ordinary case. It printed one `warning: TauCeti Lake cache miss` line and rebuilt the
     library from source, every round, for as long as the endpoint stayed down.
     """
+    if not TAUCETI_CACHE_SERVICE:
+        return f"set -e; lake exe cache get || lake exe cache get; timeout 1800 lake build || true; exec {inner}"
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     preliminary = (
         '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
@@ -2040,6 +2055,16 @@ def run_in_bubble(
         ]
     for m in mounts or []:
         mount_flags += ["--mount", m]
+    snapshot = os.environ.get("TAUCETI_CONF_SNAPSHOT")
+    if snapshot:
+        import tauceti_tools
+
+        mount_flags += [
+            "--mount",
+            f"{snapshot}:/opt/project.toml:ro",
+            "--mount",
+            f"{Path(tauceti_tools.__file__).parent}:/opt/tools/tauceti_tools:ro",
+        ]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
     # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch
@@ -2090,6 +2115,12 @@ def run_in_bubble(
             "TAUCETI_PROCESS_CONTAINMENT": "legacy",  # Bubble owns the outer process boundary.
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
+    if snapshot:
+        tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
+        from tauceti_tools.project import active
+
+        for key, value in active().environment().items():
+            tcenv += f" {key}={shlex.quote(value)}"
     command_inner = inner_cmd if inner_cmd is not None else agent_inner_cmd(profile)
     if inner_cmd is None:
         command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner, verify_helper=helper_on))}"
@@ -2119,7 +2150,7 @@ def run_in_bubble(
             TAUCETI_CACHE_ARTIFACT_URL,
             TAUCETI_CACHE_REVISION_URL,
         ]
-        if inner_cmd is None
+        if inner_cmd is None and TAUCETI_CACHE_SERVICE
         else []
     )
 
@@ -2249,8 +2280,20 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     cfg = w.cfg
     eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
     engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
-    if not eng and not fetch_ref(REVIEW, engine_dir):  # keeps .git (no cross-repo rev fallback)
-        raise Die(f"fetch {REVIEW} failed")
+    if not eng:
+        ref = os.environ.get("TAUCETI_REVIEW_REF")
+        if ref:
+            engine_dir.mkdir(parents=True, exist_ok=True)
+            commands = (
+                ["git", "init", "-q", str(engine_dir)],
+                ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
+                ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
+                ["git", "-C", str(engine_dir), "clean", "-fdxq"],
+            )
+            if any(subprocess.run(command).returncode for command in commands):
+                raise Die(f"fetch pinned {REVIEW}@{ref} failed")
+        elif not fetch_ref(REVIEW, engine_dir):
+            raise Die(f"fetch {REVIEW} failed")
     roadmap_dir = cfg.state / "refs" / "roadmap"
     if not fetch_ref(ROADMAP, roadmap_dir):
         raise Die(f"fetch {ROADMAP} failed")
@@ -2271,7 +2314,7 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     km = _kiro_review_model(reviewers)
     kiro_flag = f" --kiro-model {shlex.quote(km)}" if km else ""
     inner = (
-        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine:/opt/tools python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
         f"--no-mathlib --no-sync --store /opt/review-store --post "
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
@@ -2316,6 +2359,11 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
 
     Linux keeps the in-tree location beside the worker's other state. Either way the path must be a pure
     function of wid (no $HOME), so a loop child recomputes the same one its parent isolated to."""
+    from tauceti_tools.project import active
+
+    project = active()
+    if project and not project.legacy:
+        return project.state_root / "workers" / wid / "home"
     if sys.platform != "darwin":
         return HERE / "state" / wid / "home"
     base = _base

@@ -110,6 +110,16 @@ from .survey import (
 
 def want(only: list[str], task: str) -> bool:
     """Is this work-unit stage enabled? Empty `only` ⇒ everything (do-whatever-is-helpful)."""
+    from tauceti_tools.project import active
+
+    project = active()
+    if project:
+        if task == "progress" and not project.feature("progress"):
+            return False
+        if task.startswith("overlap-") and not any(u.get("overlap") for u in project.raw.get("upstreams", [])):
+            return False
+        if task == "security-audit" and not project.feature("security_audit"):
+            return False
     if task == "security-audit":
         return task in only
     return (not only) or (task in only)
@@ -821,7 +831,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
                 or live.get("headRefOid") != c.head
                 or live.get("state") != "OPEN"
                 or live.get("isDraft")
-                or live.get("baseRefName") != "main"
+                or live.get("baseRefName") != os.environ.get("TAUCETI_BASE_BRANCH", "main")
             ):
                 return False
             labels = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
@@ -1201,7 +1211,8 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 [
                     "uvx",
                     "--from",
-                    f"git+https://github.com/{REVIEW}",
+                    f"git+https://github.com/{REVIEW}"
+                    + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
                     "tauceti-review",
                     str(pr),
                     "--store",
@@ -1316,7 +1327,10 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     # contributor-publishing path without treating archival as operational review state.
     # The maintainer's identity returns push=true, so the sync below runs and a genuine outage still
     # surfaces loudly. A failed/ambiguous check falls through to the sync (preserving the loud-fail).
-    perm = gh_run(["gh", "api", "repos/TauCetiProject/TauCetiData", "--jq", ".permissions.push"])
+    archive_repo = os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData")
+    if not archive_repo:
+        return 0
+    perm = gh_run(["gh", "api", f"repos/{archive_repo}", "--jq", ".permissions.push"])
     if perm.returncode == 0 and perm.stdout.strip() == "false":
         log(
             f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
@@ -1337,7 +1351,8 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
         argv = [
             "uvx",
             "--from",
-            f"git+https://github.com/{REVIEW}",
+            f"git+https://github.com/{REVIEW}"
+            + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
             "tauceti-review",
             str(pr),
             "--sync-only",
@@ -2211,7 +2226,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 AGENT=opts.agent_name,
                 FORK=fork_owner,
                 WORKERID=w.cfg.wid,
-                ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
+                ROADMAP_DIR="/opt/roadmap/" + os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap"),
                 REVIEW_DIR="/opt/review",
                 RUBRICS=(
                     f"/opt/rubrics/{RUBRIC_BUNDLE}"
@@ -2238,7 +2253,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         AGENT=opts.agent_name,
         FORK=fork_owner,
         WORKERID=w.cfg.wid,
-        ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
+        ROADMAP_DIR=str(refs / "roadmap" / os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")),
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,

@@ -1,3 +1,18 @@
+Generic project configuration is provided by [TauCetiTools](https://github.com/TauCetiProject/TauCetiTools).
+This repository remains an example worker harness. Pass the same configuration to work and review commands:
+
+```sh
+./tauceti --conf https://raw.githubusercontent.com/YOUR_ORG/YOUR_PROJECT/main/tauceti.toml doctor
+./tauceti --conf ./tauceti.toml work --worker-id example
+```
+
+See the [architecture and manual setup](https://github.com/TauCetiProject/TauCetiTools/blob/main/docs/project-setup.md)
+for repository ownership, Apps, credentials, workflow installation and optional services.
+A configured project has its own checkouts, review store, activity and snapshots under
+`~/.local/state/tauceti/projects/OWNER__REPOSITORY/`. Starting a new worker reloads its canonical
+configuration; a running process tree keeps its saved snapshot. Worker IDs in a shared manager
+must remain unique. Commands without `--conf` retain Tau Ceti's existing behavior.
+
 # Tau Ceti Worker
 
 Cached round counts and authored/open/landed PR reporting are available with

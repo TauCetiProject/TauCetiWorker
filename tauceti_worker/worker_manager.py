@@ -42,6 +42,7 @@ CONFIG_VERSION = 1
 DEFAULT_INTERVAL = 2.0
 TMUX_SESSION = "tauceti-workers"
 _WORKER_KEYS = {
+    "conf",
     "max_open_prs",
     "github_state_url",
     "github_state_token_file",
@@ -251,6 +252,7 @@ def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
+    conf: str | None = None
     max_open_prs: int = MAX_OPEN_PRS
     github_state_url: str | None = None
     github_state_token_file: str | None = None
@@ -312,6 +314,7 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}].max_open_prs must be an integer")
         spec = WorkerSpec(
             id=wid,
+            conf=_string(raw.get("conf"), f"workers[{index}].conf", optional=True),
             max_open_prs=cutoff,
             github_state_url=_string(raw.get("github_state_url"), f"workers[{index}].github_state_url", optional=True),
             github_state_token_file=_string(
@@ -392,6 +395,7 @@ class WorkerSpec:
             value["respect_claims"] = False
         for name in (
             "github_account",
+            "conf",
             "github_state_url",
             "github_state_token_file",
             "source",
@@ -420,6 +424,8 @@ class WorkerSpec:
 
     def work_argv(self) -> list[str]:
         argv = self_argv("work", "--loop", "--worker-id", self.id)
+        if self.conf:
+            argv += ["--conf", self.conf]
         argv += ["--max-open-prs", str(self.max_open_prs)]
         if self.claude_billing == "api":
             argv += ["--claude-billing", "api"]
@@ -743,6 +749,19 @@ def cmd_managed_runner(args) -> int:
             # rather than replaced. The manager's own variables are assigned last and are reserved, so
             # nothing here can shadow them.
             env = self_env(unselected_github_env({**unselected_github_env(), **dict(spec.env)}))
+            # A new managed worker starts a new configuration lifetime. Its round
+            # children inherit the snapshot created by that worker, not the manager's.
+            env.pop("TAUCETI_CONF_SNAPSHOT", None)
+            env.pop("TAUCETI_CONF_SOURCE", None)
+            if spec.conf:
+                env["TAUCETI_CONF"] = spec.conf
+            else:
+                from tauceti_tools.project import active
+
+                if active():
+                    for key in active().environment():
+                        env.pop(key, None)
+                env.pop("TAUCETI_CONF", None)
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
