@@ -733,12 +733,19 @@ def prepare_checkout(
     os.environ.pop("TAUCETI_VERIFY_BASE", None)
     with contextlib.suppress(ValueError, subprocess.CalledProcessError):
         os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
-    work_recovery.workspace_environment(cfg)
+    try:
+        work_recovery.workspace_environment(cfg)
+    except (OSError, work_recovery.RecordError) as error:
+        work_recovery.report_workspace_failure(cfg, co, error)
+        return False
     # The new generation has not been exposed to an agent yet; build outputs start empty.
     if g("clean", "-fdxq", "-e", ".lake"):
         return False
     # Attribution only: a failure is logged by note_owner and never stops the round.
     work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap, prepared_head=work_recovery._rev(co, "HEAD"))
+    from .runtime_status import report_runtime
+
+    report_runtime(workspace_error=None, workspace_free_bytes=None)
     return True
 
 

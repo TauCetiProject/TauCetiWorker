@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import log
-from .constants import TAUCETI
+from .constants import ROADMAP, TAUCETI
 from .paths import HERE
 from .runtime_status import atomic_json, read_json
 
@@ -706,11 +706,15 @@ def _selection(cfg, label: str) -> dict:
         raise RecordError(f"invalid workspace selector {path}; preserving every generation")
     active = Path(value["active"])
     root = cfg.state.resolve() / "workspace-generations" / _safe_id(label)
+    try:
+        canonical = active.resolve()
+    except (OSError, RuntimeError) as error:
+        raise RecordError(f"cannot resolve workspace generation {active}: {error}") from error
     if (
         active.name != "checkout"
         or active.parent.parent != root
         or re.fullmatch(r"[0-9a-f]{32}", active.parent.name) is None
-        or active.resolve() != active
+        or canonical != active
         or any(old["checkout"] == str(active) for old in value["retained"])
     ):
         raise RecordError(f"invalid or aliased workspace generation: {active}")
@@ -757,6 +761,20 @@ def recover_selection(cfg, *, label: str = "TauCeti") -> Decision:
         legacy = cfg.checkout if label == "TauCeti" else cfg.state / "progress" / "roadmap"
         candidate = value.get("active")
         repo = Path(candidate) if isinstance(candidate, str) and Path(candidate).is_absolute() else legacy
+        if label == "progress-roadmap":
+            from . import progress_publication as publication
+
+            workdirs = set((cfg.state.resolve() / "workspace-generations" / _safe_id(label)).glob("*/work"))
+            legacy_work = cfg.state / "progress" / "work"
+            workdirs.update((legacy_work, repo.parent / "work"))
+            for work in sorted(workdirs):
+                checkout = legacy if work == legacy_work else work.parent / "checkout"
+                pending = publication.retained(cfg, work=work, checkout=checkout)
+                if pending:
+                    publication.park(cfg, pending, "workspace selector recovery", work=work)
+        snapshot = None
+        if not repo.is_symlink() and (repo / ".git").is_dir():
+            snapshot = preserve(cfg, repo, label=label, repository=ROADMAP if label == "progress-roadmap" else TAUCETI)
         old = value.get("retained", [])
         old = old if isinstance(old, list) else []
         retained = [
@@ -770,11 +788,12 @@ def recover_selection(cfg, *, label: str = "TauCeti") -> Decision:
             cfg,
             repo,
             f"invalid workspace selector; evidence at {evidence}",
-            None,
+            snapshot.record if snapshot else None,
             label,
             selection=dict(active=str(repo.absolute()), retained=retained),
         )
-    except OSError as error:
+    except (OSError, RecordError) as error:
+        report_workspace_failure(cfg, path, error)
         return Decision(False, f"could not preserve invalid selector {path}: {error}", state="refused")
 
 
@@ -908,7 +927,7 @@ def _retain(
                     checkout=str(repo.absolute()),
                     reason=reason,
                     retained_at=time.time(),
-                    resolved_checkout=str(repo.resolve()),
+                    resolved_checkout=os.path.realpath(repo),
                     owner=_owner_for(cfg, repo, label),
                 )
             ]

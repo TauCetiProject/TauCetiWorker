@@ -27,6 +27,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -333,6 +334,18 @@ try:
     check_in("names the project config that disqualified it", ".codex/config.toml", problem)
     shutil.rmtree(Cfg.checkout)
     check("project config removed -> verifiable again", q().codex_account_problem("kim@example.com"), None)
+    from tauceti_worker.work_recovery import RecordError
+
+    with patch("tauceti_worker.quota.active_checkout", side_effect=RecordError("invalid workspace selector")):
+        check("invalid selector does not block credential-store admission", q()._codex_credentials_store(), None)
+        check("invalid selector does not block account admission", q().codex_account_problem("kim@example.com"), None)
+        (codex / "config.toml").write_text('cli_auth_credentials_store = "keyring"\n')
+        check_in(
+            "invalid selector still reports real user credential policy",
+            "keyring",
+            q().codex_account_problem("kim@example.com"),
+        )
+        (codex / "config.toml").unlink()
 
     # The PACER inherits the same assumption: it reads auth.json for the token it measures usage with.
     # Under a non-file store a leftover file would have it fetch and cache one account's usage while the

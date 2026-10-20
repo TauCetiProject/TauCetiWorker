@@ -681,11 +681,17 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
     except RecordError:
         return
     if hasattr(cfg, "state"):
+        from .activity import current_round_id
         from .runtime_status import read_json
         from .work_recovery import owner_path
 
         owner = read_json(owner_path(cfg))
-        if owner.get("checkout") == str(checkout) and owner.get("prepared_head"):
+        if (
+            owner.get("checkout") == str(checkout)
+            and owner.get("prepared_head")
+            and owner.get("round_id") is not None
+            and owner.get("round_id") == current_round_id()
+        ):
             pre_head = owner["prepared_head"]
 
     def git(*args) -> str:
@@ -1737,6 +1743,7 @@ def _do_fixlike(
             note_owner(
                 w.cfg,
                 expected_head=checked,
+                prepared_head=checked,
                 authorization=dict(
                     actor=getattr(sv, "me_login", ""),
                     git_author=dict(

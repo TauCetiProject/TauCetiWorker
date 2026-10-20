@@ -121,14 +121,22 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         while True:
             from .verification_jobs import reap_continuations, resume_pending
 
-            reap_continuations(cfg)
+            try:
+                reap_continuations(cfg)
+            except Exception as error:
+                log(f"verification continuation housekeeping deferred: {error}")
+                report_runtime("verification-pending", detail=str(error))
             if reason := fleet_admission_reason(cfg.wid):
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)
                 continue
             # Verification owns an isolated candidate and a separate job lease. Its queue wait
             # must not block model selection, and host CI reservations still precede launch.
-            resume_pending(cfg, background=True)
+            try:
+                resume_pending(cfg, background=True)
+            except Exception as error:
+                log(f"verification continuation deferred: {error}")
+                report_runtime("verification-pending", detail=str(error))
             from .repair_recovery import due
 
             recovery_only = (

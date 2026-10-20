@@ -1396,7 +1396,9 @@ class Quota:
         try:
             checkout = active_checkout(self.cfg) if getattr(self.cfg, "checkout", None) is not None else None
         except RecordError:
-            return "unreadable:checkout-selector"
+            # Preparation will isolate this generation before Codex starts. Broken workspace
+            # selection is not evidence about the user's credential store or account.
+            return None
         if checkout is not None and _safe_exists(Path(checkout) / ".codex" / "config.toml"):
             return "project-layer"
         return None
@@ -1439,11 +1441,15 @@ class Quota:
         # stays on disk, so reading it would confidently certify an account codex is not using. That
         # fails OPEN, which is the one direction this check must never fail.
         store = self._codex_credentials_store()
+        try:
+            checkout = active_checkout(self.cfg)
+        except RecordError:
+            checkout = self.cfg.checkout  # diagnostic text only; preparation repairs selection
         if store is not None:
             return (
                 _para(
                     f"--account {requested} cannot be verified: "
-                    f"{_store_reason(store, codex_dir(self.cfg.home) / 'config.toml', active_checkout(self.cfg))}. "
+                    f"{_store_reason(store, codex_dir(self.cfg.home) / 'config.toml', checkout)}. "
                     f"Any account TauCeti read from {src}/auth.json could be one codex is not using."
                 )
                 + "\n\n"

@@ -167,7 +167,7 @@ class Config:
     home: Path  # the LOGIN home: where per-user credential stores live (macOS Keychain, gh, git)
     data_home: Path  # the worker's own data root: per-worker, and independent of where $HOME points
     state: Path  # HERE/state/<wid>
-    checkout: Path  # host authoring checkout
+    checkout: Path  # legacy checkout location; host consumers resolve work_recovery.active_checkout
     store_dir: Path  # tauceti-review persistent store
     sbcache: Path  # scoreboard meta cache dir
     logdir: Path  # HERE/logs/<wid>

@@ -57,14 +57,35 @@ class Recovery(Receipts):
             # A new child selects another generation. The independent parent still finds and
             # refunds/resumes the retained generation's job, without inheriting its environment.
             self.assertTrue(agents.prepare_checkout(cfg))
+        # Reconstruct the parent's environment: it inherits none of the child's workspace paths.
+        for key in ("LAKE_CACHE_DIR", "MATHLIB_CACHE_DIR", "XDG_CACHE_HOME", "TMPDIR", "TAUCETI_VERIFY_STATE"):
+            os.environ.pop(key, None)
         parent_cfg = SimpleNamespace(state=worker_state)
         self.assertIn(output, work_recovery.verification_states(parent_cfg))
         self.assertTrue(v.waiting_for_capacity(parent_cfg, since=time.time() - 10))
-        job = json.loads(job_path.read_text())
+        for error in (OSError(28, "No space left on device"), work_recovery.RecordError("aliased runtime")):
+            job = json.loads(job_path.read_text())
+            job["next_at"] = 0
+            v.atomic(job_path, job)
+            with patch("tauceti_worker.verification_jobs.private_environment", side_effect=error):
+                self.assertTrue(resume_pending(parent_cfg, seconds=10))
+            self.assertEqual(v.read_json(job_path)["status"], "pending")
+            self.assertGreater(v.read_json(job_path)["next_at"], time.time())
+            self.assertFalse((output / "verification-jobs" / job_path.name).exists())
+        job = v.read_json(job_path)
+        # A late writer plants the previously predictable runtime cache alias. Every resume
+        # attempt now exclusively reserves another runtime path and never reaches this target.
+        trap = self.home / "trap"
+        trap.mkdir()
+        write(trap, "sentinel", "unchanged")
+        planted = Path(job["root"]).parent / (job["id"] + "-runtime")
+        planted.mkdir()
+        (planted / "tmp").symlink_to(trap, target_is_directory=True)
         job["next_at"] = 0
         v.atomic(job_path, job)
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(resume_pending(parent_cfg, seconds=10))
+        self.assertEqual((trap / "sentinel").read_text(), "unchanged")
         self.assertEqual(counters.read("fix-1"), 2)
         complete = v.read_json(output / "verification-jobs" / job_path.name)
         self.assertEqual(v.read_json(Path(complete["receipt"]))["status"], "success")

@@ -560,6 +560,51 @@ def test_archive_integrity(root):
     check("absent exposed path is not reused", previous != wr.active_checkout(cfg) and not previous.exists())
 
 
+def test_progress_selector_recovery(root):
+    from tauceti_worker import progress_publication as publication
+
+    for variant in ("corrupt", "aliased", "relocated"):
+        origin, _, cfg = fixture(root / variant)
+        legacy = cfg.state / "progress" / "roadmap"
+        check(f"{variant}: initial progress selection", wr.retain(cfg, legacy, "first", label="progress-roadmap").ok)
+        checkout = wr.progress_checkout(cfg)
+        subprocess.run(["git", "clone", "-q", str(origin), str(checkout)], check=True)
+        work = wr.progress_work(cfg)
+        work.mkdir()
+        plan = dict(
+            roadmap="Area",
+            from_sha="a" * 40,
+            to_sha="b" * 40,
+            prs=[1],
+            status_path="STATUS.md",
+            progress_path="PROGRESS.md",
+        )
+        (work / "plan.json").write_text(json.dumps(plan))
+        (work / "status-body.md").write_text("already paid status prose")
+        (work / "section-body.md").write_text("already paid section prose")
+        receipt = publication.save(cfg, "author", "version")
+        if variant == "corrupt":
+            wr.selection_path(cfg, "progress-roadmap").write_text("{broken selector")
+        elif variant == "aliased":
+            physical = checkout.with_name("retained-source")
+            checkout.rename(physical)
+            checkout.symlink_to(physical, target_is_directory=True)
+        else:
+            moved = cfg.state.with_name("moved-worker")
+            cfg.state.rename(moved)
+            cfg.state = moved
+        check(f"{variant}: progress selector auto-recovers", wr.recover_selection(cfg, label="progress-roadmap").ok)
+        parked = publication.parked_window(cfg, plan)
+        check(
+            f"{variant}: exact prepared publication parked",
+            parked is not None and publication.fingerprints(parked) == receipt["files"],
+        )
+        check(
+            f"{variant}: fresh selector cannot repay same window",
+            publication.retained(cfg) is None and publication.parked_window(cfg, plan) is not None,
+        )
+
+
 def test_work_paths(root):
     """Host roadmap work and progress preparation save leftovers and carry on."""
     origin, co, cfg = fixture(root / "paths")
@@ -638,6 +683,7 @@ def main():
             test_detached_writers,
             test_selection_failures,
             test_archive_integrity,
+            test_progress_selector_recovery,
             test_work_paths,
         ):
             (root / test.__name__).mkdir()

@@ -34,10 +34,10 @@ def fingerprints(work):
     return values
 
 
-def retained(cfg):
+def retained(cfg, *, work=None, checkout=None):
     """Local-only discovery, including pre-receipt reports tied to a retained fork intent."""
     try:
-        work = progress_work(cfg)
+        work = progress_work(cfg) if work is None else work
     except RecordError:
         return None
     receipt = work / "publication.json"
@@ -77,7 +77,7 @@ def retained(cfg):
                 if (outbox.fork_upstream(value["argv"]) or "").lower() != ROADMAP.lower():
                     continue
                 who = value.get("context", {}).get("actor") or env.get("TAUCETI_GITHUB_ACCOUNT")
-                if who and legacy_branch_matches(cfg, plan):
+                if who and legacy_branch_matches(cfg, plan, checkout=checkout):
                     return {
                         "actor": who.lower(),
                         "files": hashes,
@@ -100,14 +100,20 @@ def begin_writing(cfg):
     tr.atomic(progress_work(cfg) / "writing.json", {"version": 1})
 
 
-def legacy_branch_matches(cfg, plan):
+def legacy_branch_matches(cfg, plan, *, checkout=None):
     """The old proxy recorded Worker cwd, not the roadmap cwd. Bind the saved
     window to its actual local report commit instead of guessing from cwd/mtime.
     """
     try:
         branch = f"progress/{plan['from_sha'][:7]}-{plan['to_sha'][:7]}/{plan['roadmap']}"
         result = subprocess.run(
-            ["git", "-C", str(progress_checkout(cfg)), "show", f"{branch}:{plan['progress_path']}"],
+            [
+                "git",
+                "-C",
+                str(progress_checkout(cfg) if checkout is None else checkout),
+                "show",
+                f"{branch}:{plan['progress_path']}",
+            ],
             capture_output=True,
             text=True,
             timeout=10,
@@ -123,9 +129,9 @@ def legacy_branch_matches(cfg, plan):
         return False
 
 
-def park(cfg, value, reason):
+def park(cfg, value, reason, *, work=None):
     """Keep a private recovery bundle before allowing a new report to be planned."""
-    work = progress_work(cfg)
+    work = progress_work(cfg) if work is None else work
     saved = cfg.state / "progress/retained" / uuid.uuid4().hex
     saved.mkdir(parents=True, mode=0o700)
     for name in (*FILES, "facts.json", "progress-prompt.md"):
@@ -135,9 +141,11 @@ def park(cfg, value, reason):
                 target.write(source.read_bytes())
                 target.flush()
                 os.fsync(target.fileno())
+    if fingerprints(saved) != value["files"]:
+        raise RecordError(f"progress source changed while parking {work}; original retained")
     record = {**value, "status": "parked", "reason": reason, "saved": str(saved)}
     tr.atomic(saved / "publication.json", record)
-    complete(cfg, record)
+    complete(cfg, record, work=work)
     return saved
 
 
@@ -146,6 +154,9 @@ def parked_window(cfg, plan):
     for path in (cfg.state / "progress/retained").glob("*/plan.json"):
         try:
             previous = json.loads(path.read_text())
+            receipt = json.loads((path.parent / "publication.json").read_text())
+            if receipt.get("status") != "parked" or receipt.get("files") != fingerprints(path.parent):
+                continue  # interrupted/changed copy cannot stand in for a durable parked report
             if all(previous.get(key) == plan.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs")):
                 return path.parent
         except (OSError, ValueError, TypeError, AttributeError):
@@ -189,7 +200,7 @@ def temporary_wait(cfg, value):
     return None
 
 
-def complete(cfg, value):
-    work = progress_work(cfg)
+def complete(cfg, value, *, work=None):
+    work = progress_work(cfg) if work is None else work
     tr.atomic(work / "publication-done.json", {**value, "completed": time.time()})
     (work / "publication.json").unlink(missing_ok=True)

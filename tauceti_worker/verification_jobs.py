@@ -20,7 +20,7 @@ from pathlib import Path
 from .paths import HERE
 from .runtime_status import read_json, report_runtime
 from .verification_scope import git
-from .work_recovery import private_environment, verification_states
+from .work_recovery import RecordError, private_environment, verification_states
 
 
 def copy_file(source, target):
@@ -404,14 +404,20 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         )
                         # A fresh installed helper binds receipts to the code actually loaded
                         # after deployment. Its signal handlers cannot swallow supervisor stop.
-                        env = dict(
-                            os.environ,
-                            **(
-                                private_environment(root.parent / (root.name + "-runtime"))
-                                if state.name == "outputs"
-                                else {}
-                            ),
-                        )
+                        try:
+                            private = {}
+                            if state.name == "outputs":
+                                runtime = Path(tempfile.mkdtemp(prefix=f"{identifier}-runtime-", dir=root.parent))
+                                private = private_environment(runtime)
+                            env = dict(os.environ, **private)
+                        except (OSError, RecordError) as error:
+                            # The exact candidate/job is already durable. A full disk, permission
+                            # failure or cache alias is retryable preparation, never terminal loss.
+                            job.update(status="pending", error=str(error), next_at=time.time() + 60)
+                            with contextlib.suppress(OSError):
+                                atomic(path, job)
+                            report_runtime("verification-pending", detail=str(error), verification_job=job["id"])
+                            return True
                         env.update(
                             TAUCETI_VERIFY_STATE=str(state),
                             TAUCETI_VERIFY_POLICY=job["policy"],
@@ -490,7 +496,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                 path.unlink(missing_ok=True)
                             else:
                                 atomic(path, current)
-                    except (Incomplete, OSError, ValueError, subprocess.CalledProcessError) as error:
+                    except (Incomplete, OSError, ValueError, RecordError, subprocess.CalledProcessError) as error:
                         job.update(error=str(error), status="incomplete")
                         atomic(state / "verification-jobs" / path.name, job)
                         path.unlink(missing_ok=True)

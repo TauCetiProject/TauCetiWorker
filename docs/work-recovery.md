@@ -71,7 +71,11 @@ Even an absent path is never reused: it might previously have been exposed.
 There is no checkout rename in this protocol. Preparation saves invalid selectors as
 metadata evidence and atomically selects another generation; it never silently
 falls back to an old writable alias. Read-only consumers degrade until preparation
-repairs the selector.
+repairs the selector. Parseable old Git trees are snapshotted first when possible.
+Progress recovery discovers valid prepared receipts across canonical generations
+and legacy work directories, parks their fingerprinted inputs before switching,
+and preserves the original files. Incomplete parking copies do not suppress new
+work as if they were complete reports.
 
 Lake and Mathlib download caches, `XDG_CACHE_HOME`, temporary files, and host
 verification outputs are private to the generation. Explicit writable cache
@@ -87,7 +91,9 @@ Verification attempts are created after host preparation, in that generation's
 private outputs. Supervisor readers discover both legacy verification state and
 active/retained generation outputs, including pending jobs, capacity waits and
 refund evidence. Pending exact-input jobs continue after generation selection
-without a model. Resumed candidates receive separate writable caches; evidence
+without a model. Each continuation attempt exclusively reserves a fresh writable
+runtime directory; runtime preparation failures remain pending and retryable.
+Resumed candidates receive separate writable caches; evidence
 from an uncertain generation is not shared into a new author's workspace.
 Before saved-repair selection, source collection only snapshots: it does not
 reserve another authoring generation or change the active checkout.

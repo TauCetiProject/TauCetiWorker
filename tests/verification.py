@@ -419,6 +419,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
                 patch.object(loop, "choose_model", return_value=("claude", {})),
                 patch.object(loop, "github_budget", return_value={}),
                 patch.object(loop, "run_round_subprocess", side_effect=round_result),
+                patch(
+                    "tauceti_worker.verification_jobs.resume_pending",
+                    side_effect=ValueError("temporary continuation failure"),
+                ),
                 patch.object(loop, "Budget") as budget,
                 patch.object(loop, "report_runtime") as status,
                 patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt) as sleep,

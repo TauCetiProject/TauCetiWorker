@@ -222,6 +222,11 @@ with (
     assert len(bundles) == 1 and publication.fingerprints(bundles[0]) == original
     assert intent.exists()
     assert publication.parked_window(cfg, plan) == bundles[0]
+    incomplete = state / "progress/retained/incomplete"
+    incomplete.mkdir()
+    (incomplete / "plan.json").write_text(json.dumps({**plan, "to_sha": "c" * 40}))
+    assert publication.parked_window(cfg, {**plan, "to_sha": "c" * 40}) is None
+
     assert publication.parked_window(cfg, {**plan, "to_sha": "c" * 40}) is None
     # Deterministic/stale reports are parked immediately.
     receipt = publication.save(cfg, "author", PROGRESS_REF)
