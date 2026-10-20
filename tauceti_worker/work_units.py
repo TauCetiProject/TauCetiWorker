@@ -1590,9 +1590,13 @@ def _do_fixlike(
             w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
         )  # bubble checks out the PR inside
     else:
-        if not prepare_checkout(w.cfg):
+        if not prepare_checkout(w.cfg, work=label, pr=pr):
+            from .work_recovery import LAST_REFUSAL
+
             log(f"checkout failed for #{pr} — skipping this attempt")
-            report_failure(f"{label} #{pr}: checkout preparation failed", code=1)
+            report_failure(
+                f"{label} #{pr}: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}", code=1
+            )
             return 1
         co = w.cfg.checkout
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
@@ -1614,6 +1618,13 @@ def _do_fixlike(
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
+        if rev.returncode == 0:
+            from .work_recovery import mark_published, note_owner
+
+            # The remote head is published by definition; a later recovery record names it as the
+            # expected head and bundles only commits made on top of it.
+            mark_published(co, f"pr/{pr}", checked)
+            note_owner(w.cfg, expected_head=checked)
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
         try:
             rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
@@ -1824,6 +1835,12 @@ def _do_progress_inner(w, opts) -> int | None:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
     if (roadmap_dir / ".git").is_dir():
+        from .work_recovery import guard
+
+        # `apply` commits and pushes here; a leftover from an interrupted apply is saved, not discarded.
+        decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
+        if not decision.ok:
+            raise Die(f"refreshing {roadmap_dir} refused: {decision.reason}")
         ok = (
             subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode == 0
             and subprocess.run(
@@ -1840,8 +1857,10 @@ def _do_progress_inner(w, opts) -> int | None:
             raise Die(f"cloning {ROADMAP} failed")
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
-    if not prepare_checkout(w.cfg):
-        raise Die("checkout failed")
+    if not prepare_checkout(w.cfg, work="progress"):
+        from .work_recovery import LAST_REFUSAL
+
+        raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
 
     work = w.cfg.state / "progress" / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -2111,8 +2130,10 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             mounts=mounts,
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )
-    if not prepare_checkout(w.cfg):
-        raise Die("checkout failed")
+    if not prepare_checkout(w.cfg, work="roadmap", roadmap=only or None):
+        from .work_recovery import LAST_REFUSAL
+
+        raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
     prompt = fill_prompt(
         HERE / "prompts" / "roadmap.md",
         ONLY=only,

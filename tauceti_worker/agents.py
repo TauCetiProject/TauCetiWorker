@@ -559,8 +559,17 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
         log(f"Lake artifact cache: cleanup completed but could not update toolchain marker ({e})")
 
 
-def prepare_checkout(cfg: Config) -> bool:
-    """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
+def prepare_checkout(
+    cfg: Config, *, work: str | None = None, pr: int | None = None, roadmap: str | None = None
+) -> bool:
+    """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover.
+
+    Leftovers are only dropped once they are saved or proven published: `work_recovery.guard`
+    writes a durable recovery record first and refuses (leaving the checkout intact) when saving
+    fails or when a dirty checkout cannot be shown quiescent. `work`/`pr`/`roadmap` name the round
+    that takes the checkout, so a later record can say which round left the source."""
+    from . import work_recovery
+
     sync_mathlib_pool(cfg)
     co = cfg.checkout
     if not (co / ".git").is_dir():
@@ -574,9 +583,13 @@ def prepare_checkout(cfg: Config) -> bool:
 
     if g("fetch", "-q", "origin"):
         return False
-    # -f discards a prior round's leftover edits and lands us on main in one step; a plain
-    # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on
-    # the old branch with only main's content. Bail if even the forced checkout fails.
+    decision = work_recovery.guard(cfg, co)
+    if not decision.ok:
+        log(f"checkout preparation refused: {decision.reason}")
+        return False
+    # -f discards a prior round's leftover edits (now saved, or proven absent) and lands us on main
+    # in one step; a plain switch/checkout would refuse on a dirty tree (two noisy errors) and could
+    # leave HEAD on the old branch with only main's content. Bail if even the forced checkout fails.
     if g("checkout", "-q", "-f", "-B", "main", "origin/main"):
         return False
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
@@ -584,6 +597,7 @@ def prepare_checkout(cfg: Config) -> bool:
     # before anything can begin writing this worker's private Lake store again.
     clean_lake_cache_after_toolchain_bump(cfg)
     g("clean", "-fdxq", "-e", ".lake")
+    work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
     return True
 
 

@@ -117,6 +117,7 @@ RUN_STDLIB=(
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
+  work_recovery.py
 )
 # special-cased python tests (handled explicitly below)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)

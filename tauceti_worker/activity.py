@@ -652,11 +652,12 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
                 _refresh_prs(db, config, now, errors)
                 _bors(db, errors)
-            from . import shared_mathlib
+            from . import shared_mathlib, work_recovery
 
             sharing = shared_mathlib.summary()
             value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
             value["all"]["shared_mathlib"] = sharing
+            value["all"]["work_recovery"] = work_recovery.summary()
             for column, key in (("worker", "workers"), ("scope", "groups")):
                 ids = db.execute(
                     f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
@@ -667,6 +668,12 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
                         **{"scope" if key == "groups" else "worker": row[0]}
                     )
+                    members = (
+                        {r[0] for r in db.execute("SELECT DISTINCT worker FROM rounds WHERE scope=?", (row[0],))}
+                        if key == "groups"
+                        else {row[0]}
+                    )
+                    value[key][row[0]]["work_recovery"] = work_recovery.summary(workers=members)
                     atomic_json(
                         scope_path(key, row[0]), dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors)
                     )

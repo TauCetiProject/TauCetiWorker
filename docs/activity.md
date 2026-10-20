@@ -81,6 +81,11 @@ measurement counts and costs before estimating and dividing.
 Cost preparation runs in the existing background collector;
 `activity` and `workers status` still only read small JSON summaries.
 
+Local [work recovery](work-recovery.md) counts come from each worker's
+`state/<worker>/recovery` directory: saved, recovery-blocked, incomplete and
+corrupt records, with block reasons. The background collector prepares them.
+Fleet summaries add host counts.
+
 Completed review counts include reviews of other authors' PRs. `PRs assisted`
 counts distinct PRs in the reported scope with completed review/fix/rebase work
 or a branch push, excluding that scope's initiated PRs. Multi-host summaries add
