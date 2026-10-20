@@ -1827,6 +1827,23 @@ def _progress_tool_failed(w, sub: str, proc) -> str:
 
 
 def _do_progress_inner(w, opts) -> int | None:
+    from . import progress_publication as publication
+
+    retained = publication.retained(w.cfg)
+    marker = w.cfg.state / "progress/work/publication.json"
+    if marker.exists() and not retained:
+        log("Prepared progress receipt does not match its files; preserving it for recovery")
+        return None
+    if retained and retained["actor"] != me().lower():
+        log("Prepared progress belongs to another GitHub actor; preserving its bodies and branch")
+        return None
+    if retained:
+        if retained.get("attempts", 0) >= publication.MAX_ATTEMPTS:
+            saved = publication.park(w.cfg, retained, "publication recovery attempt limit reached")
+            log(f"progress: parked prepared report for recovery at {saved}; selecting unrelated work")
+            w.counters.write(PROGRESS_ERROR_KEY, 0)
+            return None
+        retained = publication.defer(w.cfg, retained)
     # Record the ATTEMPT before anything fallible. The cadence check keys on the last *landed* report,
     # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
     # round, for ever.
@@ -1842,7 +1859,12 @@ def _do_progress_inner(w, opts) -> int | None:
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
     from .work_recovery import guard, note_owner
 
-    if (roadmap_dir / ".git").is_dir():
+    if retained and (roadmap_dir / ".git").is_dir():
+        # A prepared local branch is an immutable publication artifact. Fetch
+        # the live cursor, while leaving its branch and working tree intact.
+        if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
+            return _defer_progress_publication(w, retained, f"temporary fetch failure in {roadmap_dir}")
+    elif (roadmap_dir / ".git").is_dir():
         # `apply` commits and pushes here; a leftover from an interrupted apply is saved, not discarded.
         decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
         if not decision.ok:
@@ -1860,12 +1882,14 @@ def _do_progress_inner(w, opts) -> int | None:
     else:
         roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
         if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
+            if retained:
+                return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
             raise Die(f"cloning {ROADMAP} failed")
     if not note_owner(w.cfg, "progress-roadmap", work="progress"):
         raise Die(f"could not record the round that owns {roadmap_dir}")
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
-    if not prepare_checkout(w.cfg, work="progress"):
+    if not retained and not prepare_checkout(w.cfg, work="progress"):
         from .work_recovery import LAST_REFUSAL
 
         raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
@@ -1877,7 +1901,7 @@ def _do_progress_inner(w, opts) -> int | None:
     facts_file = work / "facts.json"
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
-    for stale in (status_body, section_body):
+    for stale in () if retained else (status_body, section_body):
         stale.unlink(missing_ok=True)  # never ship a previous round's prose
 
     def run_tool(*args: str, capture: bool = False):
@@ -1893,6 +1917,10 @@ def _do_progress_inner(w, opts) -> int | None:
             errors="replace",
             timeout=1800,
         )
+
+    if retained:
+        log("progress: resuming prepared report publication with retained prose and window")
+        return _apply_prepared_progress(w, run_tool, roadmap_dir, work, retained)
 
     # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
     #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
@@ -1916,6 +1944,9 @@ def _do_progress_inner(w, opts) -> int | None:
         w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "plan", proc))
     plan = json.loads(plan_file.read_text())
+    if saved := publication.parked_window(w.cfg, plan):
+        log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
+        return None
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
     # 2) Ground truth from git, so the prose can be checked against what really landed.
@@ -1964,29 +1995,65 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.incr(PROGRESS_ERROR_KEY)
             raise Die(f"the agent did not write {f.name}")
 
+    receipt = publication.save(w.cfg, me(), PROGRESS_REF)
+    receipt = publication.defer(w.cfg, receipt)
+    return _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt)
+
+
+def _defer_progress_publication(w, receipt, reason):
+    from . import progress_publication as publication
+
+    saved = publication.temporary_wait(w.cfg, receipt)
+    if saved:
+        w.counters.write(PROGRESS_ERROR_KEY, 0)
+        log(f"progress: {reason}; automatic wait expired, recovery bundle saved at {saved}")
+    else:
+        log(f"progress: {reason}; retaining report and selecting unrelated work")
+    return None
+
+
+def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
     # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
     #    resumable, so a retry after an interrupted run converges rather than duplicating.
-    proc = run_tool(
-        "apply",
-        "--plan",
-        str(plan_file),
-        "--status-body",
-        str(status_body),
-        "--section-body",
-        str(section_body),
-        "--roadmap-dir",
-        str(roadmap_dir),
-        "--version",
-        PROGRESS_REF,
-        capture=True,
-    )
+    from . import progress_publication as publication
+
+    plan_file = work / "plan.json"
+    status_body = work / "status-body.md"
+    section_body = work / "section-body.md"
+    try:
+        proc = run_tool(
+            "apply",
+            "--plan",
+            str(plan_file),
+            "--status-body",
+            str(status_body),
+            "--section-body",
+            str(section_body),
+            "--roadmap-dir",
+            str(roadmap_dir),
+            "--version",
+            receipt.get("version") or PROGRESS_REF,
+            capture=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _defer_progress_publication(w, receipt, f"publication temporarily unavailable ({exc})")
+    if proc.returncode == 77:
+        return _defer_progress_publication(w, receipt, "publication waiting for GitHub reconciliation")
+
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     # A failure logs its own tail and saves the whole output, so it must be handled BEFORE the
     # excerpt below — otherwise the same text lands in the log twice, once uselessly clipped.
     if proc.returncode not in (0, EX_NOPROGRESS):
         w.counters.incr(PROGRESS_ERROR_KEY)
-        raise Die(_progress_tool_failed(w, "apply", proc))
+        reason = _progress_tool_failed(w, "apply", proc)
+        if receipt.get("attempts", 0) >= publication.MAX_ATTEMPTS or proc.returncode == 78:
+            saved = publication.park(w.cfg, receipt, reason)
+            log(f"progress: saved report needs recovery at {saved}; selecting unrelated work")
+            w.counters.write(PROGRESS_ERROR_KEY, 0)
+            return None
+        raise Die(reason)
     log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
+    publication.complete(w.cfg, receipt)
     if proc.returncode == EX_NOPROGRESS:
         bust_progress_cache(w.cfg)
         raise NoProgress("progress: this window is already in flight or already landed")

@@ -949,6 +949,8 @@ if __name__ == "__main__":
         finally:
             if not readonly:
                 invalidate()
+        if getattr(p, "github_permanent_failure", False):
+            p.returncode = 78  # Definitive rejection; the private .failed intent is retained.
         sys.stdout.write(p.stdout or "")
         sys.stderr.write(p.stderr or "")
         sys.exit(p.returncode)

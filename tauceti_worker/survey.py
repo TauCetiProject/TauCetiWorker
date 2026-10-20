@@ -595,6 +595,25 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     so a broken `uvx`, a GitHub hiccup or a bad exit here must read as "not due" and let the round fall
     through to review and fix work. A stage that can throw is a stage that can wedge the worker.
     """
+    from .progress_publication import retained
+
+    prepared = retained(cfg)
+    if prepared:
+        from .github_outbox import actor
+
+        try:
+            selected = actor(dict(os.environ))
+        except Exception:
+            selected = None
+        if not selected:
+            return False, "prepared progress waiting for authenticated actor"
+        if prepared["actor"] != selected:
+            return False, "prepared progress belongs to another GitHub actor"
+        if prepared.get("retry_at", 0) > time.time():
+            return False, "prepared progress publication waiting for reconciliation"
+        return True, "prepared progress report ready to resume publication"
+    if (cfg.state / "progress/work/publication.json").exists():
+        return False, "prepared progress receipt needs recovery; files preserved"
     cache = cfg.state / "cache" / "progress-due.json"
     try:
         if cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:

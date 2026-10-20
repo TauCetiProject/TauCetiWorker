@@ -1,0 +1,32 @@
+# Fork publication recovery
+
+Worker retains fork intents until a complete authenticated read verifies an owned, writable fork with the requested upstream's immutable ID in its ancestry. A fork may have any name. A read error, partial response, missing permission, absence under private visibility, changed identity, truncated ancestry, or conflicting same-name repository preserves the intent. Reads use the shared credential cache and quota transport.
+
+After two complete public absence observations separated by five minutes, the outbox may replay creation once. This limit survives restart. Legacy personal-fork intents require a pinned account matching the authenticated viewer and are migrated with actor/upstream evidence. Replays use `gh repo fork OWNER/REPO --clone=false`, as fixed independently by TauCetiProgress #8. Verified fork receipts remain in `.complete` files. Unknown fork options remain retained for inspection.
+
+Prepared report receipts bind the original account to hashes of the plan and both prose bodies. Publication resumes `apply` with those files and the original tool-version label before planning or model work (the executable uses the current fixed pin). Temporary infrastructure waits (exit 77) refund the report attempt and back off for 5 minutes, 15 minutes, 1 hour, then 4 hours; they decline the progress stage so unrelated work proceeds in the same round. After seven days without recovery, the artifacts are parked for inspection. Legacy reports require same-worker fork intent evidence for the original actor/upstream and a local deterministic report branch whose exact window matches the saved plan. Old proxies recorded Worker cwd, so cwd and prose timestamps are not used as identity evidence. Completed receipt hashes prevent re-adopting a report. Existing deterministic branch and PR checks prevent duplicate publication. Corrupt receipts and account changes preserve files for inspection and allow unrelated PR work. Six non-infrastructure publication failures, or a deterministic stale/invalid-branch result (exit 78), park the plan, bodies, facts and receipt under `progress/retained/` before releasing the active receipt. Local branches and GitHub intents remain intact. Parked bundles can be inspected and applied with the original actor and version label after the cause is repaired; do not regenerate their prose. Exhausted fork intents back off for an hour between discovery reads.
+
+Worker pins Progress `25d4af78dea8067123bc7ef87bb50486d3284753`, which includes R0 and the companion publication fixes. After an idle-boundary upgrade, ordinary rounds reconcile naturally retained intents and resume the saved reports. Inspect private intents using `python -m tauceti_worker.github_outbox list`; do not bulk-delete intents or force retries. No synthetic repository creation is needed. Production deployment/pin refreshes belong to the rollout coordinator for #302; record natural recovery separately from implementation and release receipts.
+
+Rollback preserves the outbox, `.complete` fork evidence, `progress/work/publication*.json`, `progress/retained/`, plan, prose, and local branches. Stop progress selection before rolling back to a version that lacks receipt-aware resume; that older version would delete saved prose on its next new report attempt. Never mark an uncertain write rejected to make rollback replay it.
+
+Standalone Progress journals uncertain mutations privately. Under Worker, the installed proxy owns the sole mutation journal; local quota waits do not consume mutation replay allowances. Authoritative pre-request or quota rejections refund the Worker fork replay allowance. A compound close-plus-comment is never replayed merely because the PR remains open: the comment may already have been posted.
+
+The proxy reports a definitive mutation rejection as exit 78, retaining its `.failed` evidence; Progress passes that result to Worker for immediate report parking. Already-closed PRs acknowledge retained close intents even when no expected head was recorded. Open compound close/comment intents still require head and actor evidence before any replay. Saved report windows compare PR sets independently of the planner and renderer ordering.
+
+To resume a parked bundle after repairing the cause, use the original account at an idle boundary with exclusive access to this worker's roadmap checkout. The following uses the current fixed executable pin and the saved version label; it preserves the bundle and lets `apply` reconcile the branch and PR before writing:
+
+```bash
+task_report_bundle=/absolute/path/to/state/worker/progress/retained/bundle-id
+task_report_checkout=/absolute/path/to/state/worker/progress/roadmap
+test "$(gh api user --jq .login)" = "$(jq -r .actor "$task_report_bundle/publication.json")" || exit 1
+task_progress_ref=$(python -c 'from tauceti_worker.constants import PROGRESS_REF; print(PROGRESS_REF)')
+uvx --from "git+https://github.com/TauCetiProject/TauCetiProgress@$task_progress_ref" tauceti-progress apply \
+  --plan "$task_report_bundle/plan.json" \
+  --status-body "$task_report_bundle/status-body.md" \
+  --section-body "$task_report_bundle/section-body.md" \
+  --roadmap-dir "$task_report_checkout" \
+  --version "$(jq -r .version "$task_report_bundle/publication.json")"
+```
+
+Exit 75 acknowledges an already published/in-flight window. Exit 77 preserves a temporary wait; exit 78 preserves a stale or unusable report for inspection. Never remove the bundle or force a mutation retry to make this command proceed.
