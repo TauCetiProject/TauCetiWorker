@@ -70,16 +70,13 @@ Make only fixes you can justify against a rubric. Do NOT broaden the PR, add spe
 generality, or invent findings to look diligent: scope is itself a rubric, and a sound small PR
 beats a padded one. If nothing needs changing, say so and move on. Then verify, once:
 
-## Verify before pushing (all three MUST pass)
-```
-lake exe cache get
-lake build
-lake exe axioms
-```
-If `lake build` is red, FIX IT or retreat (below). Never push red.
+## Verify before pushing (all MUST pass)
+__LOCAL_VERIFICATION__
+Your final verification, once your source is done: `lake exe cache get` (if you have not run it
+this session), `lake build --iofail`, then the scope recipe and the scoped audit above. If `lake build` is
+red, FIX IT or retreat (below). Never push red.
 
-
-**Do this synchronously, in this one turn.** Run the three commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
+**Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 
 ## If the target won't close
 Never downgrade to a lookalike: a weakened statement, a degenerate special case, or scaffolding carrying the result's name. Retreat one rung at a time:
@@ -101,4 +98,4 @@ You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`)
   Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, includes a standalone `Roadmap: <target-roadmap>` line (using the canonical top-level directory, never `any`), and, after an upstream switch, a standalone `Consumer roadmap: <designated-roadmap>` line plus the explicit dependency edge. It **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 
 ## Report a submitted PR
-After opening a PR, end with a concise summary: the target and target roadmap you chose, the designated milestone it serves, why it was the most effective current step towards that milestone, the file(s) added and line count, the PR number/URL, the rubrics you read, and what your own review of the diff found and changed. You don't need to make claims about `lake build` or `lake exe axioms`; CI will handle that.
+After opening a PR, end with a concise summary: the target and target roadmap you chose, the designated milestone it serves, why it was the most effective current step towards that milestone, the file(s) added and line count, the PR number/URL, the rubrics you read, and what your own review of the diff found and changed. Quote the `scope:` line and state that the build and audit you ran were local checks, not CI; CI verifies the pushed PR.

@@ -40,6 +40,8 @@ WRAPPERS = ("git-safe-push", "gh-safe-pr-create", "claim.sh")
 
 # The keys each call site passes, so a prompt that grows a placeholder without a substitution fails
 # here rather than reaching an agent. Mirrors work_units._do_fixlike / do_roadmap.
+VERIFY = dict(LOCAL_VERIFICATION="(local verification rules)")
+FIXLIKE = dict(PR=123, AGENT="Claude Code", BIN="/bin", SCOPE_POLICY="ordinary", **VERIFY)
 CALL_SITES = {
     "pr-outcome.md": dict(
         PR=123,
@@ -48,12 +50,13 @@ CALL_SITES = {
         BLOCK_AUTHORITY="Block authority is pinned.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
-    "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin"),
-    "fix.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
-    "fix-ci.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
-    "rebase.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
-    "bump.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
-    "lint-repair.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
+    "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),
+    "fix.md": FIXLIKE,
+    "fix-ci.md": FIXLIKE,
+    "rebase.md": FIXLIKE,
+    "bump.md": dict(FIXLIKE, SCOPE_POLICY="bump"),
+    "lint-repair.md": dict(FIXLIKE, SCOPE_POLICY="lint-repair"),
+    "local-verification.md": dict(SCOPE_POLICY="ordinary"),
     "roadmap.md": dict(
         ONLY="CFSGStatement",
         SKIP="none",
@@ -66,8 +69,10 @@ CALL_SITES = {
         RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",
         BIN="/bin",
+        **VERIFY,
     ),
 }
+NO_WRAPPER = {"overlap-scan.md", "pr-outcome.md", "local-verification.md"}
 
 fails = 0
 
@@ -109,12 +114,12 @@ def main():
         invocations = [ln.strip() for ln in out.splitlines() if any(f"/{w}" in ln for w in WRAPPERS)]
         check(
             f"{name}: expected write-wrapper usage",
-            bool(invocations) == (name not in {"overlap-scan.md", "pr-outcome.md"}),
+            bool(invocations) == (name not in NO_WRAPPER),
         )
         # Quoted, so an install directory containing a space stays one word.
         check(
             f"{name}: every wrapper invocation is absolute and quoted",
-            all(ln.startswith(f'"{subs["BIN"]}/') for ln in invocations),
+            all(ln.startswith(f'"{subs.get("BIN")}/') for ln in invocations),
         )
     check("every bundled prompt has a call site", {p.name for p in PROMPTS.glob("*.md")} == set(CALL_SITES))
 
@@ -123,25 +128,26 @@ def main():
     shim_command = "python3 scripts/check-expired-mathlib-shims.py"
     for name in ("bump.md", "fix-ci.md"):
         prompt = (PROMPTS / name).read_text()
-        check(f"{name}: reproduces and verifies shim expiry", prompt.count(shim_command) == 2)
-        check(f"{name}: uses strict shim expiry mode", prompt.count("--fail-on-available") == 2)
-        check(f"{name}: validates the base registry ratchet", prompt.count("--base-manifest") == 2)
-        check(f"{name}: refreshes the base ref", prompt.count("git fetch -q origin main") == 2)
+        # One shim block per prompt: diagnosis and final verification both point at it.
+        check(f"{name}: reproduces and verifies shim expiry", prompt.count(shim_command) == 1)
+        check(f"{name}: uses strict shim expiry mode", prompt.count("--fail-on-available") == 1)
+        check(f"{name}: validates the base registry ratchet", prompt.count("--base-manifest") == 1)
+        check(f"{name}: refreshes the base ref", prompt.count("git fetch -q origin main") == 1)
         check(f"{name}: migrates the AI-owned registry", "TauCeti/mathlib-shims.json" in prompt)
         check(f"{name}: forbids weakening exact targets", "never make the check green" in prompt)
     check(
         "fix-ci.md: source PRs probe only changed obligations",
-        (PROMPTS / "fix-ci.md").read_text().count("--only-new") == 2,
+        (PROMPTS / "fix-ci.md").read_text().count("--only-new") == 1,
     )
     for name in ("bump.md", "fix-ci.md"):
         prompt = (PROMPTS / name).read_text()
         check(
             f"{name}: shim baseline is the PR merge base",
-            prompt.count('git show "$base_ref":TauCeti/mathlib-shims.json') == 2,
+            prompt.count('git show "$base_ref":TauCeti/mathlib-shims.json') == 1,
         )
         check(
             f"{name}: shim ratchet reads merge-base sources",
-            prompt.count('--base-root "$base_root"') == 2,
+            prompt.count('--base-root "$base_root"') == 1,
         )
 
     # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text

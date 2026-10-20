@@ -24,8 +24,11 @@ abstract transport must not make a computable operation noncomputable.
 Keep one coherent topic per PR. For each removed public declaration explain
 whether Mathlib supplies it, a representation change replaces it, or surviving
 Tau Ceti API preserves it. A green build is insufficient to justify removing
-unused additional mathematics. Run appropriate builds, lint and axiom checks.
-Use existing cache services rather than rebuilding Mathlib from source.
+unused additional mathematics. Use existing cache services rather than
+rebuilding Mathlib from source. Before publishing, verify once: `lake build --iofail`,
+then the scope recipe, the scoped audit and the scoped environment lint below.
+
+__LOCAL_VERIFICATION__
 
 Publish using these quoted, absolute wrapper paths:
 "__BIN__/git-safe-push" <branch>

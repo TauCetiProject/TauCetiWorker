@@ -27,6 +27,7 @@ from .agents import (
     fetch_ref,
     fill_prompt,
     host_agent_argv,
+    local_verification,
     prepare_checkout,
     resolve_authoring_profile,
     resolve_codex_model_access,
@@ -34,6 +35,7 @@ from .agents import (
     run_agent_host,
     run_in_bubble,
     run_to_logfile,
+    scope_policy,
     take_last_agent_infra_failure,
     validate_kiro_model_access,
     wrapper_bin,
@@ -1478,7 +1480,18 @@ def _do_fixlike(
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None
-    prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
+    # Labels and branch come from the survey; local scope never fetches them (CI's lint-scope.sh does).
+    policy = scope_policy(
+        getattr(p, "labels", ()), p.head_ref, bump=label == "bump" or getattr(p, "automatic_bump", False)
+    )
+    prompt = fill_prompt(
+        HERE / "prompts" / prompt_file,
+        PR=pr,
+        AGENT=opts.agent_name,
+        BIN=wrapper_bin(bubble),
+        SCOPE_POLICY=policy,
+        LOCAL_VERIFICATION=local_verification(policy),
+    )
     if label == "rebase":
         evidence = w.gh.rebase_request_body(pr, head)
         prompt += (
@@ -2091,6 +2104,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                     else "/opt/review/rubrics (read every .md file in it)"
                 ),
                 SOURCE_GUIDANCE=source_guidance,
+                LOCAL_VERIFICATION=local_verification("ordinary"),
                 BIN=wrapper_bin(bubble=True),
             ),
             opts,
@@ -2111,6 +2125,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
+        LOCAL_VERIFICATION=local_verification("ordinary"),
         BIN=wrapper_bin(),
     )
     return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)

@@ -30,15 +30,16 @@ If the branch already includes current `main`, semantic repair may still be need
 
 Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.
 
-## Verify before pushing (all three MUST pass, after the merge/rebase)
-```
-lake exe cache get
-lake build
-lake exe axioms
-```
-Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict.
+## Verify before pushing (all MUST pass, after the merge/rebase)
+__LOCAL_VERIFICATION__
+Use the request's evidence to reproduce the diagnosis with the specific failing step, not a rerun of
+every check. After the merge/rebase and any repair, run the final verification once: `lake exe cache
+get` (if you have not run it this session, or the merge changed the pins), `lake build --iofail`, then the
+scope recipe and the scoped audit above. The recipe's base is the canonical main you integrated, so
+it covers this PR's changed modules and everything importing them. Iterate until green. Never push
+red: a botched conflict resolution that builds red is worse than the conflict.
 
-**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. When a repair is needed, do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
+**Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. When a repair is needed, do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 - Commit the merge/resolution (if `git merge` left a merge commit, keep its default message; otherwise `<type>: <subject>`, ending the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
@@ -50,4 +51,4 @@ Iterate until green. Never push red — a botched conflict resolution that build
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: the starting head and integrated main SHA, the exact evidence investigated, which source repairs were needed, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: the starting head and integrated main SHA, the exact evidence investigated, which source repairs were needed, and the exact `scope:`, `lake build` and `lake exe axioms` result lines proving your local checks green + axiom-clean, labelled as local (scoped or full) rather than CI. Do not claim green unless you saw it.
