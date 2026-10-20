@@ -3010,7 +3010,7 @@ class RealVerifierIntegration(unittest.TestCase):
         backend = rr.WorkerBackend(w, SimpleNamespace())
         facts = dict(labels=[], ref="repair", head=case.base, repository="alice/repo")
         manifest = dict(id="real-receipt", authorization={})
-        with patch("tauceti_worker.agents.warm_host_build_caches") as warm:
+        with patch("tauceti_worker.agents.prepare_host_build_caches") as warm:
             first = backend.verify(case.root, manifest, facts)
             self.assertEqual(first["status"], "success", first.get("error"))
             second = backend.verify(case.root, manifest, facts)

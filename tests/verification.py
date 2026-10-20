@@ -127,6 +127,10 @@ if len(args) > 1 and args[0] == 'env' and Path(args[1]).is_file() and Path(args[
     sys.exit(subprocess.run(args[1:]).returncode)
 
 if mode == 'bad-axiom-after-build' and args[0] == 'build': (p/'axiom-invalid').touch()
+if mode == 'widget-generated-hash' and args[0] == 'build':
+    (p/'packages/proofwidgets/widget/package-lock.json.hash').write_text('restored Lake digest')
+if mode == 'widget-source-mutation' and args[0] == 'build':
+    (p/'packages/proofwidgets/widget/package-lock.json').write_text('changed source')
 if mode == 'mutation':
     source = Path('TauCeti/A.lean'); before = source.read_text(); source.write_text('changed'); source.write_text(before)
 if mode == 'sleep':
@@ -310,6 +314,23 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
 
     def test_change_then_restore_during_execution(self):
         os.environ["FIXTURE_MODE"] = "mutation"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("mutat", result["error"])
+
+    def test_proofwidgets_generated_digest_does_not_invalidate_success(self):
+        write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json", "source lockfile")
+        os.environ["FIXTURE_MODE"] = "widget-generated-hash"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        # Replacing an existing digest is also an output change, not a source change.
+        write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json.hash", "old digest")
+        result = self.verify(stage="build", reuse=False)
+        self.assertEqual(result["status"], "success", result.get("error"))
+
+    def test_proofwidgets_source_lockfile_mutation_is_still_rejected(self):
+        write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json", "source lockfile")
+        os.environ["FIXTURE_MODE"] = "widget-source-mutation"
         result = self.verify(stage="build")
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("mutat", result["error"])

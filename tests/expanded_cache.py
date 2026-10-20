@@ -1,5 +1,6 @@
 """Native Lake cache restoration and safe publication; real Lean fixtures are tiny and offline."""
 
+import contextlib
 import json
 import os
 import shutil
@@ -23,6 +24,32 @@ class Cache(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.pool = self.root / "pool"
         cache_storage.initialize(self.pool)
+
+    def test_shared_preparation_fetches_before_hydration_finishes(self):
+        from tauceti_worker.agents import prepare_host_build_caches
+
+        events = []
+        env = dict(LAKE_CACHE_DIR=str(self.root / "private"))
+        warm_env = dict(env, LAKE_CACHE_DIR=str(self.root / "downloads"))
+
+        @contextlib.contextmanager
+        def preparation(cwd, environment, *, refetch):
+            self.assertEqual(cwd, self.root)
+            self.assertIs(environment, env)
+            events.append("prepare")
+            yield warm_env
+            events.append("hydrate")
+
+        def warm(cwd, environment, logdir):
+            self.assertIs(environment, warm_env)
+            events.append("fetch")
+
+        with (
+            patch.object(cache, "preparation", preparation),
+            patch("tauceti_worker.agents.warm_host_build_caches", side_effect=warm),
+        ):
+            prepare_host_build_caches(self.root, env, self.root / "logs")
+        self.assertEqual(events, ["prepare", "fetch", "hydrate"])
 
     def test_reject_unsafe_and_incomplete_descriptions(self):
         for data in [{}, {"o": ["../../foreign"], "i": "a" * 16 + ".ilean"}, {"o": ["a" * 16 + ".olean"]}]:

@@ -77,7 +77,10 @@ The digest covers the full Git source inventory and actual bytes (including miss
 untracked and ignored TauCeti sources), base SHA, dependency sources, configuration, environment
 value hashes, installed Lean distribution, executable hashes and versions, Python runtime, and worker
 verifier code/policy. Sensitive environment values are not written. Changes conservatively invalidate
-all phases. Complete inventories are stored once under `verification-inputs/<digest>.json`, referenced
+all phases. ProofWidgets' generated `widget/package.json.hash` and `widget/package-lock.json.hash`
+are excluded from dependency inventories; the JSON source files remain checked. Both normal rounds
+and recovery verification hydrate the shared expanded-artifact cache before verification starts.
+Complete inventories are stored once under `verification-inputs/<digest>.json`, referenced
 from receipts. A phase index avoids scanning old receipts. Per-file digests are cached by path,
 device, inode, size, mtime and ctime; any metadata change rereads the bytes. The metadata cache is
 bounded. Receipts and logs remain retained; there is no automatic deletion of incomplete evidence.

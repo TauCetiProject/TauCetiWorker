@@ -1291,7 +1291,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.pop("TAUCETI_PR_CACHE_MISS", None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
-        from . import expanded_cache, shared_mathlib
+        from . import shared_mathlib
 
         try:
             with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
@@ -1299,28 +1299,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
                 try:
                     try:
-                        with expanded_cache.preparation(
-                            cwd,
-                            env,
-                            refetch=lambda warm: _cache_fetch(
-                                [
-                                    *prefix,
-                                    "lake",
-                                    "cache",
-                                    "get",
-                                    "--service",
-                                    TAUCETI_CACHE_SERVICE,
-                                    "--repo",
-                                    TAUCETI,
-                                    f"--max-revs={lake_cache_max_revs(warm)}",
-                                ],
-                                cwd,
-                                warm,
-                                subprocess.DEVNULL,
-                                30,
-                            ),
-                        ) as warm_env:
-                            warm_host_build_caches(cwd, warm_env, logdir)
+                        prepare_host_build_caches(cwd, env, logdir)
                     except Exception as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
@@ -1334,6 +1313,35 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             raise BuildCacheUnavailable(
                 f"shared Mathlib required: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
+
+
+def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
+    """Fetch and hydrate shared artifacts before either normal work or recovery verification."""
+    from . import expanded_cache
+
+    prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
+    with expanded_cache.preparation(
+        cwd,
+        env,
+        refetch=lambda warm: _cache_fetch(
+            [
+                *prefix,
+                "lake",
+                "cache",
+                "get",
+                "--service",
+                TAUCETI_CACHE_SERVICE,
+                "--repo",
+                TAUCETI,
+                f"--max-revs={lake_cache_max_revs(warm)}",
+            ],
+            cwd,
+            warm,
+            subprocess.DEVNULL,
+            30,
+        ),
+    ) as warm_env:
+        warm_host_build_caches(cwd, warm_env, logdir)
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
