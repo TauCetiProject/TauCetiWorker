@@ -2315,29 +2315,29 @@ def _do_progress_inner(w, opts) -> int | None:
         same = identity(plan_file, facts_file) == identity(new_plan, new_facts)
     except (OSError, ValueError):
         same = False
-    if not same:
-        # Preserve old artifacts for diagnosis/rollback, and invalidate prose only when its
-        # factual inputs changed. Receipted publication above never reaches this path.
-        previous = new_plan.parent.parent / "previous"
-        previous.mkdir()
-        artifacts = [plan_file, facts_file, prompt_file, status_body, section_body]
-        try:
-            if bundle := publication.facts_bundle(plan_file):
-                artifacts.append(bundle)
-        except (OSError, ValueError):
-            pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
-        for artifact in artifacts:
-            if artifact.exists():
-                if artifact.name.startswith("plan.json.facts-"):
-                    publication.retain_facts_bundle(artifact, previous / artifact.name)
-                else:
-                    shutil.copyfile(artifact, previous / artifact.name)
-        if not any(previous.iterdir()):
-            previous.rmdir()
-        for body in (status_body, section_body):
-            body.unlink(missing_ok=True)
-    # Install the retained immutable bytes durably before the plan that refers to them.
     try:
+        if not same:
+            # Preserve old artifacts for diagnosis/rollback, and invalidate prose only when its
+            # factual inputs changed. Receipted publication above never reaches this path.
+            previous = new_plan.parent.parent / "previous"
+            previous.mkdir()
+            artifacts = [plan_file, facts_file, prompt_file, status_body, section_body]
+            try:
+                if bundle := publication.facts_bundle(plan_file):
+                    artifacts.append(bundle)
+            except (OSError, ValueError):
+                pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
+            for artifact in artifacts:
+                if artifact.exists():
+                    if artifact.name.startswith("plan.json.facts-"):
+                        publication.retain_facts_bundle(artifact, previous / artifact.name)
+                    else:
+                        shutil.copyfile(artifact, previous / artifact.name)
+            if not any(previous.iterdir()):
+                previous.rmdir()
+            for body in (status_body, section_body):
+                body.unlink(missing_ok=True)
+        # Install immutable bytes before the plan that refers to them.
         if bundle := publication.facts_bundle(new_plan, verify=True):
             publication.retain_facts_bundle(bundle, work / bundle.name)
         _install_progress_body(new_plan, plan_file)

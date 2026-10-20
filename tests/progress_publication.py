@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Retained progress resumes apply with identical bodies/window and original actor."""
 
+import errno
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import progress_publication as publication
 from tauceti_worker import work_units as wu
-from tauceti_worker.config import Die, NoProgress
+from tauceti_worker.config import Die, NoProgress, ProgressPreparationUnavailable
 from tauceti_worker.constants import EX_NOPROGRESS, PROGRESS_REF, ROADMAP
 from tauceti_worker.github_outbox import directory
 from tauceti_worker.github_transport import atomic, register_principal
@@ -269,10 +270,25 @@ with (
     (work / name).write_bytes(bundle)
     assert publication.facts_bundle(work / "plan.json", verify=True).read_bytes() == bundle
     value = publication.save(cfg, "author", PROGRESS_REF)
+    before = set((state / "progress/retained").iterdir())
+    with patch.object(publication, "retain_facts_bundle", side_effect=OSError(errno.ENOSPC, "disk full")):
+        try:
+            publication.park(cfg, value, "fixture")
+        except ProgressPreparationUnavailable:
+            pass
+        else:
+            raise AssertionError("storage failure must request a retry")
+    assert set((state / "progress/retained").iterdir()) == before
+    assert publication.retained(cfg)["files"] == value["files"]
+    assert publication.parked_window(cfg, pages) in before
+    incomplete = state / "progress/retained/incomplete"
+    incomplete.mkdir()
+    (incomplete / "plan.json").write_text(json.dumps({**pages, "to_sha": "d" * 40}))
+    assert publication.parked_window(cfg, {**pages, "to_sha": "d" * 40}) is None
     parked = publication.park(cfg, value, "fixture")
     assert (parked / name).read_bytes() == bundle
     assert (parked / name).stat().st_ino == (work / name).stat().st_ino
-    with patch.object(publication.os, "link", side_effect=OSError("cross-device")):
+    with patch.object(publication.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")):
         publication.retain_facts_bundle(work / name, parked / "fallback.json.gz")
     assert (parked / "fallback.json.gz").read_bytes() == bundle
     assert publication.fingerprints(parked) == value["files"]

@@ -1,5 +1,6 @@
 """Private receipts for prepared reports; resume publication before paying for prose."""
 
+import errno
 import hashlib
 import json
 import os
@@ -53,7 +54,9 @@ def retain_facts_bundle(source, target):
         candidate = Path(tmp) / "bundle"
         try:
             os.link(source, candidate)
-        except OSError:
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.ENOSYS):
+                raise
             shutil.copyfile(source, candidate)
         with candidate.open("rb") as retained:
             os.fsync(retained.fileno())
@@ -169,26 +172,47 @@ def legacy_branch_matches(cfg, plan):
 def park(cfg, value, reason):
     """Keep a private recovery bundle before allowing a new report to be planned."""
     work = cfg.state / "progress/work"
-    saved = cfg.state / "progress/retained" / uuid.uuid4().hex
-    saved.mkdir(parents=True, mode=0o700)
-    names = [*FILES, "facts.json", "progress-prompt.md"]
+    parent = cfg.state / "progress/retained"
+    saved = parent / uuid.uuid4().hex
     try:
-        if bundle := facts_bundle(work / "plan.json"):
-            names.append(bundle.name)
-    except (OSError, ValueError):
-        pass  # retain core publication artifacts even when auxiliary metadata is damaged
-    for name in names:
-        source = work / name
-        if source.is_file():
-            if name.startswith("plan.json.facts-"):
-                retain_facts_bundle(source, saved / name)
-                continue
-            with open(saved / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:
-                target.write(source.read_bytes())
-                target.flush()
-                os.fsync(target.fileno())
-    record = {**value, "status": "parked", "reason": reason, "saved": str(saved)}
-    tr.atomic(saved / "publication.json", record)
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix=".pending-", dir=parent) as tmp:
+            staged = Path(tmp)
+            names = [*FILES, "facts.json", "progress-prompt.md"]
+            try:
+                if bundle := facts_bundle(work / "plan.json"):
+                    names.append(bundle.name)
+            except (OSError, ValueError):
+                pass  # retain core publication artifacts even when auxiliary metadata is damaged
+            for name in names:
+                source = work / name
+                if source.is_file():
+                    if name.startswith("plan.json.facts-"):
+                        retain_facts_bundle(source, staged / name)
+                        continue
+                    with open(staged / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:
+                        target.write(source.read_bytes())
+                        target.flush()
+                        os.fsync(target.fileno())
+            record = {**value, "status": "parked", "reason": reason, "saved": str(saved)}
+            tr.atomic(staged / "publication.json", record)
+            directory = os.open(staged, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            os.replace(staged, saved)
+            directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except OSError as exc:
+        from .config import ProgressPreparationUnavailable
+
+        raise ProgressPreparationUnavailable(
+            f"waiting-progress-storage: could not retain prepared report: {exc}", retry_at=time.time() + 300
+        ) from exc
     complete(cfg, record)
     return saved
 
@@ -197,6 +221,11 @@ def parked_window(cfg, plan):
     """Never pay to regenerate the exact window already saved for inspection."""
     for path in (cfg.state / "progress/retained").glob("*/plan.json"):
         try:
+            if path.parent.name.startswith("."):
+                continue
+            receipt = json.loads((path.parent / "publication.json").read_text())
+            if receipt.get("status") != "parked":
+                continue
             previous = json.loads(path.read_text())
             if all(previous.get(key) == plan.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs")):
                 return path.parent
