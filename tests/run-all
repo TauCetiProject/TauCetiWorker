@@ -32,6 +32,7 @@ RUN_STDLIB=(
   api_budget.py
   budget_recovery.py
   usage_accounting.py
+  usage_supervisor.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py

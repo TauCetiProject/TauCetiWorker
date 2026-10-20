@@ -102,6 +102,9 @@ def configure_api(args, agent):
     args.anthropic_api_key_file = str(path)
     os.environ["TAUCETI_ANTHROPIC_KEY_FILE"] = str(path)
     os.environ.pop("ANTHROPIC_API_KEY", None)
+    from .usage_supervisor import ensure_supervisor
+
+    ensure_supervisor(directory)
 
 
 def api_mode():
@@ -165,6 +168,9 @@ class ClaudeAPIContext:
                     self.budget.wait_for_admission(self.worker, self.model, self.phase, reason)
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
                 raise admission_failure(reason, state="waiting-budget")
+        from .usage_supervisor import ensure_supervisor
+
+        ensure_supervisor(self.budget.directory)
         self.directory.mkdir(parents=True, mode=0o700)
         self.bin.mkdir(mode=0o700)
         self.inbox.mkdir(mode=0o700)
@@ -189,7 +195,7 @@ class ClaudeAPIContext:
                 raise BudgetError(str(error)) from None
         shim = self.bin / "claude"
         shutil.copy(Path(__file__).with_name("claude_api_client.py"), shim)
-        for name in ("usage_accounting.py", "prices.json"):
+        for name in ("usage_accounting.py", "usage_lifecycle.py", "prices.json"):
             shutil.copy(Path(__file__).with_name(name), self.bin / name)
         usage = self.budget.directory / "usage" / self.directory.name
         usage.mkdir(mode=0o700, exist_ok=True, parents=True)
@@ -229,7 +235,22 @@ class ClaudeAPIContext:
             ticket = request["id"]
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):
                 raise BudgetError("invalid admission request")
+            from .usage_lifecycle import identity
+            from .usage_supervisor import register, registration
+
             invocation = self.admission_ids.setdefault(ticket, uuid.uuid4().hex)
+            lifecycle = registration(
+                invocation,
+                ticket,
+                self.directory,
+                request.get("process"),
+                enabled=self.enabled,
+                owner=process_identity(),
+                parent=identity(os.getppid()),
+                deadline=float(os.environ["TAUCETI_ROUND_DEADLINE"])
+                if os.environ.get("TAUCETI_ROUND_DEADLINE")
+                else None,
+            )
             if self.enabled:
                 answer = self.budget.admit(
                     invocation,
@@ -239,10 +260,12 @@ class ClaudeAPIContext:
                     bridge=str(self.directory),
                     resume=request.get("resume"),
                     owner=process_identity(),
+                    lifecycle=lifecycle,
                 )
             else:
                 answer = dict(allowed=True)
             if answer["allowed"]:
+                register(self.budget.directory, lifecycle)
                 self.invocations.add(invocation)
                 self.models[invocation] = request["model"]
                 self.blocked_reason = None

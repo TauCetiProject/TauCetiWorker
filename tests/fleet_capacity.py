@@ -21,6 +21,7 @@ from tauceti_worker.fleet_capacity import admission_reason, admission_unit, chec
 from tauceti_worker.fleet_events import emit, mutation
 from tauceti_worker.round import Claims, RoundContext
 from tauceti_worker.survey import Counters
+from tauceti_worker.usage_lifecycle import identity
 
 
 class FleetTests(unittest.TestCase):
@@ -66,14 +67,21 @@ class FleetTests(unittest.TestCase):
             patch.object(context.budget, "admit", return_value=dict(allowed=True)) as admit,
             patch.object(context.budget, "snapshot", return_value={}),
             patch("tauceti_worker.claude_api.report_runtime"),
+            patch("tauceti_worker.usage_supervisor.register"),
         ):
-            self.assertTrue(context.handle(dict(action="admit", id="a" * 32, model="test"))["allowed"])
+            self.assertTrue(
+                context.handle(dict(action="admit", id="a" * 32, model="test", process=identity()))["allowed"]
+            )
             capacity.return_value = "CI has capacity priority"
-            self.assertTrue(context.handle(dict(action="admit", id="b" * 32, model="test"))["allowed"])
+            self.assertTrue(
+                context.handle(dict(action="admit", id="b" * 32, model="test", process=identity()))["allowed"]
+            )
             self.assertEqual(capacity.call_count, 1)
             self.assertEqual(admit.call_count, 2)
             admit.return_value = dict(allowed=False, reason="waiting for funding")
-            self.assertFalse(context.handle(dict(action="admit", id="c" * 32, model="test"))["allowed"])
+            self.assertFalse(
+                context.handle(dict(action="admit", id="c" * 32, model="test", process=identity()))["allowed"]
+            )
 
     def test_context_start_refuses_capacity_before_setup(self):
         context = ClaudeAPIContext("worker", "review")

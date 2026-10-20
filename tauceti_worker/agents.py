@@ -2053,7 +2053,7 @@ def run_in_bubble(
         api_bin = rounddir / "api-bin"
         api_bin.mkdir(mode=0o700)
         shutil.copy(Path(__file__).with_name("claude_api_client.py"), api_bin / "claude")
-        for name in ("usage_accounting.py", "prices.json"):
+        for name in ("usage_accounting.py", "usage_lifecycle.py", "prices.json"):
             shutil.copy(Path(__file__).with_name(name), api_bin / name)
         (api_bin / "claude").chmod(0o700)
         keyfile = rounddir / "anthropic.key"
@@ -2062,6 +2062,8 @@ def run_in_bubble(
         w.rc.add_cleanup(lambda: keyfile.unlink(missing_ok=True))
         settings = json.loads((bridge / "bin/config.json").read_text())
         usage_dir = settings.get("usage_dir")
+        if not isinstance(usage_dir, str) or not Path(usage_dir).is_absolute():
+            raise Die("API accounting requires an absolute durable usage_dir")
         settings.update(command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge")
         if usage_dir:
             settings["usage_dir"] = "/opt/api-usage"

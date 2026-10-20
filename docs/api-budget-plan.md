@@ -323,6 +323,44 @@ stdout event or final Claude result. Atomic checkpoints and the preceding valid
 journal prefix survive process termination and torn writes. Bubble mounts only its own round
 usage directory separately from the bridge and never receives the ledger.
 
+New invocations also record their exact admission ticket, invocation ID, bridge,
+shim and native process birth identities in `budget/lifecycles/`. The admission
+ledger event includes the initial lifecycle identity, so a bridge crash before
+writing its sidecar is recoverable. A detached host supervisor owns the sidecars
+and recovery, outside both the round process group and the agent containment
+boundary. It starts at API worker/context startup and is checked again at loop
+round boundaries. Restarting it replays the local evidence automatically; it does
+not poll providers or GitHub. Only registered new invocations participate in this
+automatic recovery; historical cleanup remains separate.
+
+Every native launch, including an explicit resume or copied Bubble shim, must
+create a durable usage journal. A native exec gate waits until the supervisor has
+verified the journal and recorded the native process identity, then receives a
+durable permit. Missing or malformed accounting configuration fails before
+inference. Linux identities include the boot ID, start ticks and PID namespace;
+namespace-local PIDs are translated while the gate is alive. macOS identities use
+the boot session and process birth time in microseconds. On other platforms an
+unknown identity cannot authorize automatic stopped-process reconciliation.
+
+Lifecycle evidence distinguishes observed native success, nonzero exit, signal,
+exec failure, bridge death and parent death; the outer loop records round timeout
+and signal outcomes separately. An unobserved death is recorded as stopped, not
+assigned a guessed exit status. A stopped process or `inflight=false` never closes
+a journal. Normal journal closure requires a successfully drained native exit, a
+result event and healthy journal writes. Without that proof recovery retains the
+priced prefix and an explicitly uncertain tail reserve. A never-permitted gate
+or recorded exec failure proves no inference and permits exact zero settlement.
+Late authoritative receipts remain readable and replace estimates with existing
+ledger corrections.
+
+For rollout, write `record-only` to `budget/usage-recovery-mode` before deployment.
+The supervisor records launches and exits while normal bridge receipts continue
+to settle. Observe naturally selected rounds, then change the file to `auto` to
+enable stopped-invocation recovery (the default when the file is absent). Changes
+are read on each pass and do not restart paid sessions. Rollback can restore
+`record-only`; it must retain lifecycle evidence, permits, receipts,
+journals and reservations; it must not undo committed corrections.
+
 Response counters merge by ID, including partial/repeated events. Replayed
 responses on resumed invocations are not charged twice. Decimal token pricing
 honours cache-write TTLs. Unknown models, missing counters, unpriced server-tool/priority-tier usage and

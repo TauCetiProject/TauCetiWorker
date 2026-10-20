@@ -13,6 +13,13 @@ import uuid
 from decimal import Decimal
 from pathlib import Path
 
+if __package__:
+    from .usage_accounting import UsageJournal
+    from .usage_lifecycle import durable, identity
+else:
+    from usage_accounting import UsageJournal
+    from usage_lifecycle import durable, identity
+
 
 def atomic(path, value):
     tmp = path.with_suffix(".tmp")
@@ -118,7 +125,7 @@ def main():
             resume = args[index + 1]
     previous_reason = None
     while True:
-        admission = request(bridge, "admit", id=invocation, model=model, resume=resume)
+        admission = request(bridge, "admit", id=invocation, model=model, resume=resume, process=identity())
         if admission["allowed"]:
             invocation = admission["id"]
             break
@@ -134,6 +141,7 @@ def main():
     else:
         args += ["--output-format", "stream-json"]
     journal = None
+    journal_healthy = True
     requested_partials = "--include-partial-messages" in args
     if "--verbose" not in args:
         args.append("--verbose")
@@ -162,13 +170,16 @@ def main():
 
     process_exited = False
     try:
-        if config.get("usage_dir"):
-            from usage_accounting import UsageJournal
-
-            journal = UsageJournal(config["usage_dir"], invocation, model=model)
-            if not requested_partials:
-                args.append("--include-partial-messages")
-        proc = subprocess.Popen(real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
+        usage_dir = config.get("usage_dir")
+        if not isinstance(usage_dir, str) or not Path(usage_dir).is_absolute():
+            raise ValueError("API accounting requires an absolute durable usage_dir")
+        journal = UsageJournal(usage_dir, invocation, model=model)
+        if not requested_partials:
+            args.append("--include-partial-messages")
+        gate = [sys.executable, str(Path(__file__).with_name("usage_lifecycle.py")), str(bridge), invocation]
+        proc = subprocess.Popen(
+            gate + real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1
+        )
         outcome = "started"
         assert proc.stdout is not None
         try:
@@ -189,9 +200,10 @@ def main():
                     try:
                         journal.observe(event)
                     except (OSError, ValueError, TypeError, KeyError, ArithmeticError) as error:
+                        journal_healthy = False
                         warning(f"tauceti usage checkpoint pending: {type(error).__name__}")
                 if final is not None and (
-                    event.get("type") == "assistant"
+                    event.get("type") in {"assistant", "stream_event", "user"}
                     or event.get("type") == "system"
                     and event.get("subtype") == "api_retry"
                 ):
@@ -240,6 +252,15 @@ def main():
         rc = proc.wait()
         process_exited = True
         outcome = f"exit:{rc}"
+        kind = "successful-exit" if rc == 0 else "signal" if rc < 0 or rc >= 128 else "failed-exit"
+        try:
+            durable(bridge / "inbox" / (invocation + ".terminal"), dict(id=invocation, kind=kind, returncode=rc))
+        except OSError as error:
+            warning(f"tauceti lifecycle terminal evidence pending: {type(error).__name__}")
+        if (bridge / "inbox" / (invocation + ".exec-failed")).exists():
+            outcome = "launch-failed"
+            totals = {invocation: "0"}
+            unknown_segments.clear()
         try:
             if output_format == "json" and final is not None:
                 print(json.dumps(final))
@@ -260,10 +281,10 @@ def main():
     finally:
         if journal is not None:
             try:
-                journal.flush(closed=process_exited)
+                journal.flush(closed=process_exited and rc == 0 and final is not None and journal_healthy)
             except OSError as error:
                 warning(f"tauceti usage checkpoint pending: {type(error).__name__}")
-        authoritative = outcome == "launch-failed" or process_exited and 0 <= rc < 128
+        authoritative = outcome == "launch-failed" or process_exited and rc == 0
         receipt = dict(
             id=invocation,
             totals=totals if totals and not unknown_segments and authoritative else None,
