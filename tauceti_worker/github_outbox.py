@@ -48,6 +48,12 @@ def semantic_key(payload):
         prefix = args[i].split("=@", 1)[0] + "=@" if "=@" in args[i] else ""
         args[i] = prefix + "<retained-asset:" + index + ">"
     repository = _flag(args, "--repo", "-R")
+    upstream = fork_upstream(args)
+    if upstream:
+        # R0 changes argv but not the remote operation. A corrected command
+        # must find the retained legacy intent before it can send anything.
+        repository = upstream.lower()
+        args = ["repo", "fork", repository, "--clone=false"]
     if not repository:
         repository, _ = target(payload)
     cwd = "repository:" + repository if repository else payload.get("cwd")

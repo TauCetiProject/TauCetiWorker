@@ -124,6 +124,9 @@ with (
     }
     tr.atomic(path, legacy)
     with patch.object(tr, "execute") as read:
+        assert outbox.prepare(argv, env, tmp) == path, "R0 argv correction must find the ambiguous legacy intent"
+        assert outbox.semantic_key(legacy) == outbox.semantic_key({**legacy, "argv": argv[1:]})
+    with patch.object(tr, "execute") as read:
         assert outbox.drain(env) == [] and not path.exists()  # coalesced verified fork
         read.assert_not_called()
     for data in (page(parent="OTHER", collision=True), page(permission="READ"), page(fork=False)):
