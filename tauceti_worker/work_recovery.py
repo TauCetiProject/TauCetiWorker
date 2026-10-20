@@ -100,6 +100,14 @@ class RecordError(Exception):
     """Saving a recovery record failed; the checkout must be left intact."""
 
 
+class HistoryLimit(RecordError):
+    """Source remains intact when history/metadata exceeds the descriptor's bounded format."""
+
+
+MAX_HISTORY_TIPS = 4096
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+
+
 class BudgetExhausted(RecordError):
     """Housekeeping yielded; source and durable cleanup jobs remain retryable."""
 
@@ -389,7 +397,10 @@ def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = F
         )
         if extra:
             heads = set(_git(repo, "rev-list", "--no-walk", "--all", "--reflog", text=True).split())
-            for oid in extra & heads:
+            retained = extra & heads
+            if len(retained) > MAX_HISTORY_TIPS:
+                raise HistoryLimit("retained history exceeds bounded descriptor tip count")
+            for oid in retained:
                 tips[f"history/{oid}"] = oid
     base = _rev(repo, "refs/remotes/origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")) or _rev(
         repo, "refs/remotes/origin/HEAD"
@@ -549,7 +560,7 @@ PAYLOADS = ("staged.patch", "unstaged.patch", "untracked.tar")
 def _read_manifest(record: Path) -> dict | None:
     try:
         size = (record / "manifest.json").stat().st_size
-        if size > 4 * 1024 * 1024:
+        if size > MAX_MANIFEST_BYTES:
             return None
         _charge(entries=1, read=size)
     except OSError:
@@ -866,7 +877,10 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
             round_outcome=outcome,
             conversation=read_json(Path(owner["conversation_path"])) if owner.get("conversation_path") else None,
         )
-        _write(tmp / "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
+        encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+        if len(encoded) > MAX_MANIFEST_BYTES:
+            raise HistoryLimit("preservation metadata exceeds bounded descriptor size")
+        _write(tmp / "manifest.json", encoded)
         _fsync_dir(tmp)
         final = root / record_id
         os.rename(tmp, final)
@@ -1060,6 +1074,27 @@ def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
         return Decision(False, f"could not preserve source: {error}", record)
 
 
+def _bundle_prerequisites(bundle):
+    """Read only the bounded text header, after exact validation of the bundle payload."""
+    prerequisites = []
+    with bundle.open("rb") as handle:
+        while True:
+            line = handle.readline(4097)
+            _charge(read=len(line))
+            if len(line) > 4096 or not line:
+                raise RecordError("invalid bundle header")
+            if line == b"\n":
+                break
+            if line.startswith(b"-"):
+                oid = line[1:].split(b" ", 1)[0].decode("ascii")
+                if not re.fullmatch(r"[0-9a-f]{40,64}", oid):
+                    raise RecordError("invalid bundle prerequisite")
+                prerequisites.append(oid)
+            if handle.tell() > MAX_MANIFEST_BYTES:
+                raise RecordError("oversized bundle header")
+    return prerequisites
+
+
 def _rollback_commits(cfg, repo, snap, repository):
     """Index-free fallback: validate one bundle named by this checkout's own preserved refs.
 
@@ -1097,13 +1132,19 @@ def _rollback_commits(cfg, repo, snap, repository):
         manifest = _complete(selected)
         if manifest is None or manifest.get("repository") != repository or not manifest["bundle_refs"]:
             return None
+        prerequisites = _bundle_prerequisites(selected / "commits.bundle")
+        if (
+            prerequisites
+            and _git(repo, "rev-list", "--no-walk", *prerequisites, "--not", "--remotes", f"--glob={PUBLISHED}").strip()
+        ):
+            return None  # a former published base must now be included in a fresh bundle
         _sync_record(selected)
         heads = {
             line.split()[0]
             for line in _git(repo, "bundle", "list-heads", str(selected / "commits.bundle"), text=True).splitlines()
         }
         return selected if required <= heads else None
-    except (OSError, RecordError, ValueError, TypeError):
+    except (OSError, RecordError, ValueError, TypeError, UnicodeError):
         return None
 
 

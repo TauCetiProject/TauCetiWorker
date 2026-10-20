@@ -120,7 +120,8 @@ stop a worker. Preparation always saves first and then always continues:
   and extra-ref commit tips are included in the existing v1 bundle before the tree
   is removed, including amended-away and force-pushed heads. This history inspection
   happens only in bounded housekeeping; work-start preparation never walks retained
-  Git histories.
+  Git histories. Extra history is capped at 4,096 tips and descriptor metadata at
+  4 MiB; exceeding either bound parks the candidate before publishing a descriptor.
   A larger source candidate stays recoverable while its next bounded allowance is
   scheduled. Candidates beyond the maximum allowance keep their source and
   retryable disposition. Unarchived metadata parks only that candidate, keeping
@@ -209,7 +210,8 @@ a reset, without consulting the index. Healthy checkouts and their caches remain
 in place; an unsavable or live candidate is still moved aside intact. With index
 reuse disabled, a clean leftover branch reuses one exactly validated descriptor
 named by this checkout's own preserved refs. Only one candidate bundle is validated;
-no historical payload inventory is hashed. Changed dirty source still gets its own
+no historical payload inventory is hashed. Bundle prerequisites must still be
+published; a rewritten base triggers a fresh self-contained save. Changed dirty source still gets its own
 self-contained descriptor. Rollback does not repeatedly clone or retain pristine
 checkouts and large private caches.
 Existing descriptors, retained trees, deletion journals and indexes remain intact.

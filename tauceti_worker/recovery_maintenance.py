@@ -595,6 +595,9 @@ def _cleanup(state, tree, root, work, observation=None):
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, wr.RecordError) as error:
         job["next_action"] = "resume-removal" if job["phase"] == "delete" else "retry-preservation"
         job["error"] = str(error)[:300]
+        if isinstance(error, wr.HistoryLimit):
+            _park(job, tree, sidecar)
+            return
         if isinstance(error, wr.BudgetExhausted):
             if work.adaptive and (
                 saving_source or validating_source or (job["phase"] == "save" and not work.removed_bytes)

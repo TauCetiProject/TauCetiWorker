@@ -1121,6 +1121,59 @@ with patch('os.readlink', side_effect=OSError('PID namespaces unavailable')):
         clone = reconstruct(self.origin, replacement, self.root, "rollback-history")
         self.assertEqual(git(clone, "show", f"{head}:A.lean"), "local-only source")
 
+    def test_rollback_rebundles_when_old_prerequisite_is_no_longer_published(self):
+        seed = self.root / "seed"
+        git(seed, "checkout", "-qb", "pr")
+        (seed / "A.lean").write_text("old upstream prerequisite")
+        git(seed, "commit", "-qam", "old base")
+        base = git(seed, "rev-parse", "HEAD").strip()
+        git(seed, "push", str(self.origin), "pr")
+        git(self.co, "fetch", "origin")
+        git(self.co, "checkout", "-qb", "unfinished", "origin/pr")
+        (self.co / "Draft.lean").write_text("unfinished source above base")
+        git(self.co, "add", "Draft.lean")
+        git(self.co, "commit", "-qm", "unfinished")
+        head = git(self.co, "rev-parse", "HEAD").strip()
+        with patch.dict(os.environ, TAUCETI_WORK_RECOVERY="off"):
+            first = wr.guard(self.cfg, self.co).record
+            self.assertIn(base, wr._bundle_prerequisites(first / "commits.bundle"))
+            git(seed, "reset", "--hard", "main")
+            (seed / "A.lean").write_text("replacement remote base")
+            git(seed, "commit", "-qam", "rewritten base")
+            git(seed, "push", "--force", str(self.origin), "pr")
+            git(self.co, "fetch", "origin")
+            second = wr.guard(self.cfg, self.co).record
+            self.assertNotEqual(first, second)
+            self.assertNotIn(base, wr._bundle_prerequisites(second / "commits.bundle"))
+            self.assertEqual(wr.guard(self.cfg, self.co).record, second)
+        clone = reconstruct(self.origin, second, self.root, "prerequisite-restored")
+        self.assertEqual(git(clone, "rev-parse", "HEAD").strip(), head)
+        self.assertEqual(git(clone, "show", f"{base}:A.lean"), "old upstream prerequisite")
+
+    def test_excessive_history_parks_without_publishing_oversized_records(self):
+        self.dirty()
+        git(self.co, "add", "Draft.lean")
+        git(self.co, "commit", "-qm", "orphan history")
+        orphan = git(self.co, "rev-parse", "HEAD").strip()
+        git(self.co, "reset", "--hard", "HEAD~1")
+        tree = self.retained()
+        with patch.object(wr, "MAX_HISTORY_TIPS", 0):
+            self.tick()
+        self.assertTrue(tree.exists())
+        job = maintenance._read_job(maintenance._job_path(self.cfg.state, tree))
+        self.assertIn("history exceeds", job["error"])
+        self.assertTrue(job["parked"])
+        self.assertFalse(list((self.cfg.state / "recovery").glob("*/manifest.json")))
+        with patch.object(wr, "inspect", side_effect=AssertionError("parked oversized history")):
+            self.tick()
+        job["retry_at"] = 0
+        maintenance._write_job(maintenance._job_path(self.cfg.state, tree), job)
+        self.tick()
+        self.assertFalse(tree.exists())
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        clone = reconstruct(self.origin, saved, self.root, "bounded-history")
+        self.assertIn("exact saved source", git(clone, "show", f"{orphan}:Draft.lean"))
+
     def test_recycled_session_leader_does_not_protect_old_tree(self):
         self.dirty()
         proc = subprocess.Popen(
