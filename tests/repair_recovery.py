@@ -2091,6 +2091,9 @@ class Fixture(unittest.TestCase):
         with patch.object(saved, "_record", side_effect=saved.RecordError("fixture source changing")):
             decision = saved.guard(self.cfg, self.co, repository="upstream/repo")
         self.assertEqual(decision.state, "retained")
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "offered")
+        self.assertEqual(self.journal()["reason"]["code"], "source-handoff-source-pending")
         with (
             patch.object(agents, "CHECKOUT_URL", str(self.remote)),
             patch.object(agents, "sync_mathlib_pool"),
@@ -2108,6 +2111,94 @@ class Fixture(unittest.TestCase):
         self.assertTrue(rr.due(self.cfg))
         rr.reconcile_handoff(self.cfg, self.record, self.journal())
         self.assertEqual(self.journal()["handoff"]["state"], "transferred")
+
+    def test_clean_retained_checkout_returns_handoff_without_a_replacement(self):
+        self.handoff()
+        git(self.co, "reset", "--hard", self.base)
+        git(self.co, "clean", "-fd")
+        with patch.object(saved, "live_users", return_value=["fixture late process"]):
+            self.assertEqual(saved.guard(self.cfg, self.co, repository="upstream/repo").state, "retained")
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "offered")
+        with (
+            patch.object(saved, "owner_stopped", return_value=True),
+            patch.object(saved, "live_users", return_value=[]),
+        ):
+            saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
+        self.assertFalse(self.co.exists())
+        self.assertTrue(rr.due(self.cfg))
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "returned")
+        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(FakeVerification.calls, 0)
+
+    def test_covered_commits_from_an_older_round_acknowledge_unused_handoff(self):
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "older already preserved commits")
+        self.assertEqual(saved.guard(self.cfg, self.co, repository="upstream/repo").state, "preserved")
+        self.handoff()
+        for indexed in ("on", "off"):
+            with self.subTest(indexed=indexed), patch.dict(os.environ, TAUCETI_WORK_RECOVERY=indexed):
+                for outcome in (self.record / "source-outcomes").glob("*.json"):
+                    outcome.unlink()
+                with patch.object(
+                    saved, "_record", side_effect=AssertionError("covered commits must reuse their record")
+                ):
+                    self.assertEqual(saved.guard(self.cfg, self.co, repository="upstream/repo").state, "preserved")
+                receipt = saved.source_receipt(self.record, self.journal()["handoff"])
+                self.assertIsNone(receipt["checkpoint"])
+        saved.detach_handoff_owner(self.cfg)
+        self.co.rename(self.root / "removed-clean-checkout")
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "returned")
+
+    def test_current_round_covered_commits_repair_a_missing_positive_outcome(self):
+        self.handoff()
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "receiving progress already saved")
+        with patch.object(saved, "_handoff_source_receipts", side_effect=saved.RecordError("interrupted outcome")):
+            with self.assertRaises(saved.RecordError):
+                saved._record(self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo")
+        with patch.object(saved, "_record", side_effect=AssertionError("covered commits must reuse their record")):
+            self.assertEqual(saved.guard(self.cfg, self.co, repository="upstream/repo").state, "preserved")
+        receipt = saved.source_receipt(self.record, self.journal()["handoff"])
+        self.assertTrue(receipt["checkpoint"])
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "transferred")
+
+    def test_replacement_with_prior_attempt_markers_waits_for_source_outcome(self):
+        self.assertEqual(self.normal_push().returncode, 0)
+        self.handoff()
+        self.assertTrue(self.journal()["handoff"]["attempt_before"])
+        self.co.rename(self.root / "still-unsaved-checkout")
+        git(self.root, "clone", "-q", str(self.remote), str(self.co))
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "offered")
+        self.assertEqual(self.journal()["reason"]["code"], "source-handoff-source-pending")
+
+    def test_older_handoff_without_pending_marker_captures_scoped_uncertainty(self):
+        self.handoff()
+        j = self.journal()
+        del j["handoff"]["pending_marker"]
+        rr.write(self.record, j, j["state"])
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "uncertain normal source")
+        env = {
+            **os.environ,
+            "TAUCETI_PUSH_REF": "main",
+            "TAUCETI_PUSH_EXPECT": self.base,
+            "TAUCETI_PUSH_REMOTE": str(self.root / "missing-remote.git"),
+        }
+        result = subprocess.run(
+            [str(Path(__file__).resolve().parent.parent / "scripts/git-safe-push")],
+            cwd=self.co,
+            env=env,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        saved.guard(self.cfg, self.co, repository="upstream/repo")
+        receipt = saved.source_receipt(self.record, self.journal()["handoff"])
+        self.assertEqual(receipt["pending_publication"]["oid"], git(self.co, "rev-parse", "HEAD"))
 
     def test_receipt_capture_does_not_wait_on_consumer_lock_or_mutate_journal(self):
         self.handoff()

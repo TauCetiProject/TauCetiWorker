@@ -1927,7 +1927,10 @@ def reconcile_handoff(cfg, record, j):
         # rescan the worker's entire history for each unfinished handoff.
         base = saved._safe_id(str(h["source_round"]))
         candidates = [cfg.state / "recovery" / (base if n == 1 else f"{base}.{n}") for n in range(1, MAX_INSPECT + 1)]
-        candidates = ([receipt_checkpoint] if receipt_checkpoint else []) + candidates
+        # A checked outcome is authoritative about what this round captured.
+        # In particular, an explicit clean outcome must not adopt a later empty
+        # housekeeping descriptor merely because it shares the round name.
+        candidates = ([receipt_checkpoint] if receipt_checkpoint else []) if receipt_checked else candidates
         for other in list(dict.fromkeys(candidates))[:MAX_INSPECT]:
             m = read_json(other / "manifest.json")
             if (
@@ -1973,6 +1976,25 @@ def reconcile_handoff(cfg, record, j):
             ),
         )
         return
+    if h.get("source_receipt_required") and h.get("accepted") and not receipt_checked:
+        waits = h.get("source_waits", 0) + 1
+        delay = RETRIES[waits - 1] if waits <= 3 else min(21600, RETRIES[-1] * 2 ** min(waits - 3, 4))
+        write(
+            record,
+            j,
+            "obsolete",
+            handoff={**h, "source_waits": waits},
+            retry_at=time.time() + delay,
+            reason=dict(
+                code="source-handoff-source-pending",
+                next_action="retry-source-preservation-receipt",
+                detail="The receiving round has not durably acknowledged its captured source; preserve ownership",
+            ),
+        )
+        return
+    if receipt_checked and h.get("source_receipt_required") and not (checkout / ".git").exists():
+        write(record, j, "eligible", handoff={**h, "state": "returned"}, retry_at=0, reason=None)
+        return
     attempt = None
     attempted_commit = None
     if h.get("attempt_marker") and (checkout / ".git").exists():
@@ -1992,22 +2014,6 @@ def reconcile_handoff(cfg, record, j):
                 and pending in (None, h.get("pending_before"), attempt)
             )
         ):
-            if h.get("source_receipt_required") and h.get("accepted") and not receipt_checked:
-                waits = h.get("source_waits", 0) + 1
-                delay = RETRIES[waits - 1] if waits <= 3 else min(21600, RETRIES[-1] * 2 ** min(waits - 3, 4))
-                write(
-                    record,
-                    j,
-                    "obsolete",
-                    handoff={**h, "source_waits": waits},
-                    retry_at=time.time() + delay,
-                    reason=dict(
-                        code="source-handoff-source-pending",
-                        next_action="retry-source-preservation-receipt",
-                        detail="The receiving round has not durably acknowledged its captured source; preserve ownership",
-                    ),
-                )
-                return
             if not h.get("source_receipt_required") and not receipt_checked:
                 write(
                     record,

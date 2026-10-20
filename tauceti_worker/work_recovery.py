@@ -791,6 +791,8 @@ def ref_object(repo: Path, ref: str) -> str | None:
 
 
 def pending_push_ref(marker: dict) -> str:
+    if marker["ref"].startswith("refs/tauceti/published/scope/"):
+        return marker["ref"].replace("refs/tauceti/published/scope/", "refs/tauceti/pending-push/", 1)
     branch = marker["ref"].removeprefix("refs/tauceti/published/push/")
     return f"refs/tauceti/pending-push/{marker.get('scope') or 'unscoped'}/{branch}"
 
@@ -851,7 +853,9 @@ def _handoff_source_receipts(cfg, owner, checkpoint, *, checkout=None):
             published = _rev(checkout, handoff["push_marker"])
             if published and published != handoff.get("published_before"):
                 receipt["published_head"] = published
-            pending = push_intent(checkout, handoff["pending_marker"])
+            pending = push_intent(
+                checkout, handoff.get("pending_marker") or pending_push_ref(dict(ref=handoff["push_marker"]))
+            )
             if pending and pending["oid"] != pending["expected"]:
                 receipt["pending_publication"] = pending
         path = record / "source-outcomes" / f"{identity}.{'checkpoint' if checkpoint else 'clean'}.json"
@@ -1343,9 +1347,19 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
     try:
         owner = read_json(owner_path(cfg, label))
         decision = _guard(cfg, repo, label=label, repository=repository)
-        if decision.ok and decision.state == "clean":
+        if decision.ok and decision.state in {"clean", "preserved"} and owner.get("recovery_handoffs"):
             try:
-                _handoff_source_receipts(cfg, owner, None, checkout=repo)
+                # Covered commits may belong to an older PR/round. Only current-round
+                # source is a successor; otherwise this round left no newer source.
+                manifest = _read_manifest(decision.record) if decision.record else {}
+                checkpoint = (
+                    decision.record
+                    if manifest
+                    and manifest.get("source_round") == owner.get("round_id")
+                    and manifest.get("pr") == owner.get("pr")
+                    else None
+                )
+                _handoff_source_receipts(cfg, owner, checkpoint, checkout=repo)
             except (OSError, RecordError) as error:
                 decision = _retain(
                     cfg,

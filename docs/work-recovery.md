@@ -273,7 +273,11 @@ checkout owner sheds the old handoff attribution; retained source keeps its
 original owner record. An interrupted capture
 retries through ordinary preservation while independent normal work proceeds;
 missing cache entries never prove that no newer source exists. A clean inspection
-cannot erase an earlier positive checkpoint receipt.
+cannot erase an earlier positive checkpoint receipt. A checked clean outcome
+returns unused source to recovery even before its replacement checkout exists;
+a missing outcome keeps the handoff retryable without reserving its PR. Reusing
+already-preserved commits also records an outcome, distinguishing a current
+round's saved progress from older branches.
 The original evidence stays available alongside a receiving round's partial progress.
 Unpublished edits made after a confirmed push remain evidence for fresh normal
 repair work even when the old round's publication authority has ended. Transferred

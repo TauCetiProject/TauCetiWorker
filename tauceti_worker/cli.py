@@ -1393,9 +1393,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
 
             try:
                 mirror_creds(cfg)
-                if (cfg.checkout / ".git").exists():
-                    guard(cfg, cfg.checkout)  # Preserve the last round before selecting recovery.
                 recovery_gh = GitHub()
+                if (cfg.checkout / ".git").exists():
+                    guard(cfg, cfg.checkout, repository=recovery_gh.repo)  # Preserve before selecting recovery.
                 recovery_worker = Worker(
                     cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
                 )
