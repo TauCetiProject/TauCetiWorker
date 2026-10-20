@@ -214,7 +214,7 @@ class Claims:
         # Set when the heartbeat reports the lease lost; branch work passes it to the agent as its
         # cancellation event, so a lost claim tears the agent's containment boundary down.
         self.lost = threading.Event()
-        self._stopping = False
+        self._stopped = threading.Event()
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -267,18 +267,20 @@ class Claims:
         self._hb = subprocess.Popen(cmd, pass_fds=[rfd], env=env)
         os.close(rfd)  # parent keeps only the write end; its closure (or death) is the EOF signal
         self._hb_wfd = wfd
-        self._stopping = False
         self.ctx.add_cleanup(self.stop_heartbeat)
+        # Each heartbeat has its own lost/stopped state, so one claim's loss never cancels the next.
+        self.lost = lost = threading.Event()
+        self._stopped = stopped = threading.Event()
 
         def watch(hb=self._hb):
-            if hb.wait(None) == HEARTBEAT_LOST and not self._stopping:
+            if hb.wait(None) == HEARTBEAT_LOST and not stopped.is_set():
                 log(f"claim {key}: lease lost; cancelling the branch work that depends on it")
-                self.lost.set()
+                lost.set()
 
         threading.Thread(target=watch, daemon=True).start()
 
     def stop_heartbeat(self) -> None:
-        self._stopping = True
+        self._stopped.set()
         if self._hb_wfd is not None:
             try:
                 os.close(self._hb_wfd)  # EOF → the heartbeat child exits on its own

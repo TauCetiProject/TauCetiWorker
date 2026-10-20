@@ -258,7 +258,7 @@ def _ingest(db, e):
             "INSERT OR IGNORE INTO containment(boundary,round_id,worker,scope,label,mode,child_pid,pid_namespace,"
             "started) VALUES (?,?,?,?,?,?,?,?,?)",
             (
-                e["boundary"],
+                e.get("boundary", e["id"]),
                 e.get("round_id"),
                 worker,
                 scope,
@@ -279,7 +279,7 @@ def _ingest(db, e):
                     e.get("cleanup"),
                     e.get("child_pid"),
                     e.get("pid_namespace"),
-                    e["boundary"],
+                    e.get("boundary", e["id"]),
                 ),
             )
     elif kind == "ci_result":

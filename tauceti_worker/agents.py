@@ -930,8 +930,9 @@ def run_agent_proc(
         try:
             boundary.launched()
             if cancel_event is not None:
-                monitor = threading.Thread(target=cancel_on_lease_loss, daemon=True)
-                monitor.start()
+                thread = threading.Thread(target=cancel_on_lease_loss, daemon=True)
+                thread.start()
+                monitor = thread
             for line in proc.stdout:
                 rendered = renderer.render_line(line)
                 if rendered:

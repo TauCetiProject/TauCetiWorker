@@ -301,6 +301,11 @@ class Namespace(Base):
         with patch.object(containment, "unconfirmed", return_value=[{"boundary": "b"}]), context:
             pass
         self.assertFalse(json.loads((cfg.state / "quiescence.json").read_text())["empty"])
+        # A boundary that started but never reached its confirmed outcome also withholds it.
+        cfg, context = self.round_context()
+        with context:
+            containment.Boundary("abandoned")
+        self.assertFalse(json.loads((cfg.state / "quiescence.json").read_text())["empty"])
 
     def test_branch_claim_loss_cancels_the_agent(self):
         # The real heartbeat watcher: its child reports the lease lost while the agent is running.
@@ -313,13 +318,19 @@ class Namespace(Base):
         self.assertLess(rc, 0)
         self.assertEqual(tagged(self.token), [])
         claims.stop_heartbeat()
+        # The next claim starts with a fresh cancellation event.
+        keep = [sys.executable, "-c", "import time; time.sleep(30)"]
+        with patch.object(round_, "self_argv", lambda *a: keep), patch.object(round_, "self_env", lambda e: e):
+            claims.start_heartbeat("branch/2", "owner/claims")
+        self.assertFalse(claims.lost.is_set())
+        claims.stop_heartbeat()
 
     def test_stopped_heartbeat_is_not_a_lost_claim(self):
         claims = round_.Claims(SimpleNamespace(), SimpleNamespace(add_cleanup=lambda fn: None))
         lose = [sys.executable, "-c", f"import sys,time; time.sleep(0.5); sys.exit({round_.HEARTBEAT_LOST})"]
         with patch.object(round_, "self_argv", lambda *a: lose), patch.object(round_, "self_env", lambda e: e):
             claims.start_heartbeat("branch/1", "owner/claims")
-        claims._stopping = True  # stop_heartbeat would also terminate it; the race is the point
+        claims._stopped.set()  # stop_heartbeat would also terminate it; the race is the point
         time.sleep(1)
         self.assertFalse(claims.lost.is_set())
         claims.stop_heartbeat()

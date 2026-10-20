@@ -19,6 +19,7 @@ previous best-effort process-group cleanup, and say so: they never report strong
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import platform
 import shutil
@@ -139,6 +140,9 @@ def strong(env=None) -> bool:
     return status(env).strong
 
 
+_HAVE_PIDFD = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+
+
 class ContainmentUnconfirmed(Die):
     """A boundary could not be confirmed empty; its checkout and leases must not be reused yet."""
 
@@ -204,6 +208,11 @@ class Boundary:
         self._started = time.time()
         self._finished = False
         self._launched = False
+        from . import activity
+
+        # Registered before anything runs: a round's proof needs every boundary's outcome.
+        if (round_id := activity.current_round_id()) is not None:
+            _boundaries.setdefault(round_id, {})[self.id] = None
         if not contain:
             self.strong, self.mode, self.reason = False, UNCONTAINED, "runs in a sandbox owned elsewhere"
         elif self.prefix:
@@ -292,12 +301,15 @@ class Boundary:
     def _open_pidfd(self) -> None:
         # Open first, then verify the pid still names our namespace: a pidfd cannot follow pid
         # reuse, so every later signal reaches this init or nobody.
-        if not hasattr(os, "pidfd_open"):
+        global _HAVE_PIDFD
+        if not _HAVE_PIDFD:
             return
         try:
             fd = os.pidfd_open(self.identity["child-pid"])
-        except OSError:
-            return
+        except OSError as error:
+            if error.errno == errno.ENOSYS:
+                _HAVE_PIDFD = False
+            return  # otherwise the init is already gone
         if self._state() is True:
             self._pidfd = fd
         else:
@@ -308,10 +320,13 @@ class Boundary:
 
     def _kill_init(self) -> None:
         """Kill the namespace's own init, which makes the kernel kill every other member."""
+        if self._pidfd is None and self.identity:
+            self._open_pidfd()
         if self._pidfd is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 signal.pidfd_send_signal(self._pidfd, signal.SIGKILL)
-        elif self.identity and self._state() is True:
+        elif self.identity and not _HAVE_PIDFD and self._state() is True:
+            # Kernels before 5.3 have no pidfd: recheck, then signal by pid (a narrow reuse race).
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.kill(self.identity["child-pid"], signal.SIGKILL)
 
@@ -405,7 +420,8 @@ class Boundary:
 
 # Outcomes that prove a namespace boundary left nothing behind.
 PROVEN = {"namespace-empty", "namespace-killed", "not-started"}
-_outcomes: dict[str, list[tuple[str, str]]] = {}
+# round id -> boundary id -> (mode, cleanup), or None while the boundary has no confirmed outcome
+_boundaries: dict[str, dict[str, tuple[str, str] | None]] = {}
 
 
 def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str | None = None) -> None:
@@ -417,7 +433,7 @@ def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str
     if round_id is None:
         return  # recorded only with a round; ad hoc commands have none to attach it to
     if cleanup is not None:
-        _outcomes.setdefault(round_id, []).append((boundary.mode, cleanup))
+        _boundaries.setdefault(round_id, {})[boundary.id] = (boundary.mode, cleanup)
     activity.emit(
         kind,
         key=f"{boundary.id}:{kind}",
@@ -441,9 +457,9 @@ def write_quiescence(state_dir, round_id: str) -> bool:
     A round killed before its cleanup writes nothing, which leaves the checkout's state unknown."""
     from .runtime_status import atomic_json
 
-    outcomes = _outcomes.pop(round_id, [])
+    outcomes = list(_boundaries.pop(round_id, {}).values())
     empty = (
-        strong() and not unconfirmed() and all(mode == NAMESPACE and cleanup in PROVEN for mode, cleanup in outcomes)
+        strong() and not unconfirmed() and all(o is not None and o[0] == NAMESPACE and o[1] in PROVEN for o in outcomes)
     )
     proof = dict(
         round_id=round_id,
@@ -473,8 +489,8 @@ def run(argv, *, label: str, input=None, timeout: float | None = None, env=None,
     rc = None
     try:
         with subprocess.Popen(command_, env=env, pass_fds=(*extra_fds, *boundary.pass_fds), **kwargs) as proc:
-            boundary.launched()
             try:
+                boundary.launched()
                 stdout, stderr = proc.communicate(input, timeout=timeout)
             except subprocess.TimeoutExpired:
                 boundary.abort()
