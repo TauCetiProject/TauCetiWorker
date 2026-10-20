@@ -132,7 +132,16 @@ def status(env=None, *, fresh=False) -> Capability:
 
 def doctor_row(env=None) -> tuple[bool, str]:
     cap = status(env, fresh=True)
-    return cap.strong, f"{cap.mode}: {cap.reason}; {POLICY_ENV}=auto|required|legacy"
+    note = f"{cap.mode}: {cap.reason}; {POLICY_ENV}=auto|required|legacy"
+    if pending := unconfirmed():
+        # These withhold every quiescence proof and pause automatic recovery on this host.
+        labels = ", ".join(sorted({str(entry.get("label", "?")) for entry in pending}))
+        note += (
+            f". {len(pending)} boundary(ies) never confirmed empty ({labels}); automatic recovery is paused. "
+            f"Once nothing from them is running, remove the marker(s) in {_marker_dir()}"
+        )
+        return False, note
+    return cap.strong, note
 
 
 def strong(env=None) -> bool:
@@ -181,9 +190,13 @@ def unconfirmed() -> list[dict]:
     for path in sorted(_marker_dir().glob("*.json")) if _marker_dir().is_dir() else ():
         try:
             entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            entry = {}
+        entry = {**(entry if isinstance(entry, dict) else {}), "marker": str(path)}
+        try:
             gone = _namespace_state(int(entry["child_pid"]), int(entry["pid_namespace"])) is False
-        except (OSError, ValueError, KeyError, TypeError):
-            entry, gone = {"marker": path.name}, False
+        except (KeyError, TypeError, ValueError):
+            gone = False  # no namespace was reported, so nothing here can show it is gone
         if gone:
             path.unlink(missing_ok=True)
         else:

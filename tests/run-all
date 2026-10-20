@@ -17,6 +17,12 @@ cd "$(dirname "$0")/.." || exit 1
 FAIL_FAST=0
 [ "${1:-}" = "--fail-fast" ] && FAIL_FAST=1
 
+# No test may write receipts or containment markers into the operator's real activity store: a
+# stray "unconfirmed" marker there pauses that host's automatic recovery until someone removes it.
+TAUCETI_ACTIVITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-activity-XXXXXX")"
+export TAUCETI_ACTIVITY_DIR
+trap 'rm -rf "$TAUCETI_ACTIVITY_DIR"' EXIT
+
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
   activity.py
