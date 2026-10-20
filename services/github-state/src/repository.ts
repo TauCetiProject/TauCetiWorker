@@ -5,7 +5,7 @@ import { batchLimit } from './catalog';
 import { Lane, LANES, laneAt, settings } from './reconciliation';
 import { SURVEY_CONTRACT, compactPR, issueFragment, reviewFragment, summarizeFragments, inScope, roadmapFocuses } from './survey';
 import { readPromotionReceipts } from './activity_landings';
-import { controlKey, storageKey } from './ingress';
+import { controlKey, noteRepositoryFull, storageKey } from './ingress';
 import { Failure, FULL_MESSAGE, AdminError, CLEANUP, PARKABLE, classify, createRecovery, deleteClass, exportPage, faultySql, log, missingSchema, requestId, readManifest, scan, summary, verifyExport } from './storage';
 
 const SCHEMA_VERSION=4;
@@ -35,14 +35,16 @@ export class RepositoryState extends DurableObject<Env> {
     super(ctx,env);
     this.sql=env.FAULT_INJECTION==='true'?faultySql(ctx.storage.sql,()=>this.faultFull):ctx.storage.sql;
     if (this.sql.databaseSize>=FULL_DATABASE) this.degraded={since:Date.now(),reason:'storage_full',operation:'database_size'};
-    if (env.FAULT_INJECTION!=='true') this.startup();
+    // A current or fresh schema starts synchronously; migrating an existing
+    // legacy schema waits until the durable storage state is known.
+    if (env.FAULT_INJECTION!=='true') this.startup(true);
     ctx.blockConcurrencyWhile(async()=>{
       if (env.FAULT_INJECTION==='true') {
         this.faultFull=(await env.ARCHIVE.get(this.faultKey()).then(o=>o?.json<any>()))?.mode==='full';
         if (this.faultFull) this.degraded ||= {since:Date.now(),reason:'storage_full',operation:'fault_injection'};
       }
       await this.storageMarker();
-      if (env.FAULT_INJECTION==='true') this.startup();
+      if (env.FAULT_INJECTION==='true' || this.schema!=='current') this.startup();
     });
   }
   // A recorded full state degrades the object; a probe-verified writable state
@@ -54,23 +56,20 @@ export class RepositoryState extends DurableObject<Env> {
       marker=repo?await this.env.ARCHIVE.get(storageKey(repo)).then(o=>o?.json<any>()):undefined;
     } catch {return;}
     if (marker?.state==='full') this.degraded={since:Number(marker.since) || Date.now(),reason:'storage_full',operation:'recorded:'+marker.source};
-    else if (marker?.state==='writable' && this.degraded?.operation==='database_size') {
-      this.degraded=undefined;
-      if (this.schema!=='current') this.startup();
-    }
+    else if (marker?.state==='writable' && this.degraded?.operation==='database_size') this.degraded=undefined;
   }
   markFull(operation:string): void {
     const repo=(()=>{try {return this.meta('repository')?.id;} catch {return undefined;}})();
-    if (repo) this.env.ARCHIVE.put(storageKey(repo),JSON.stringify({state:'full',since:this.degraded?.since ?? Date.now(),source:operation})).catch(()=>{});
+    if (repo) noteRepositoryFull(this.env,repo,operation,this.degraded?.since ?? Date.now()).catch(()=>{});
   }
   faultKey(): string { return 'faults/'+this.ctx.id.toString()+'.json'; }
   // Existing current schemas start without any write. Migration is one
   // transaction; if it cannot commit, compatible stored data stays readable.
-  startup(): void {
+  startup(defer=false): void {
     let version:unknown;
     try {version=this.meta('schema_version');} catch {version=undefined;}
     if(version===SCHEMA_VERSION) {this.schema='current';return;}
-    if(this.degraded) {
+    if(this.degraded || defer && this.sql.exec<any>("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='meta'").one().n) {
       // Never attempt a migration that cannot commit; existing data stays readable.
       let missing:string[];
       try {missing=missingSchema(this.sql);} catch {missing=['sqlite_master'];}
@@ -357,6 +356,7 @@ export class RepositoryState extends DurableObject<Env> {
     // Legacy mirrors did not scope membership by attempt. Revalidate once;
     // retain current webhook rows and all historical resource records. This
     // must commit before the legacy membership can be served.
+    if(this.degraded) throw new Error('Exceeded the maximum database size; workflow attempt revalidation needs a write (degraded)');
     this.ctx.storage.transactionSync(()=>{
       this.setMeta('workflow_attempt:'+id,attempt);
       const key=queryKey({operation:'workflow_jobs',args:{id}});

@@ -15,14 +15,15 @@ const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 // R2 double with digest checks, prefix listing and injectable failures.
 function bucket(){
  const objects=new Map(),failures=[];
- const meta=(key,o)=>({key,size:o.bytes.length,customMetadata:o.customMetadata,uploaded:o.uploaded});
+ const meta=(key,o)=>({key,size:o.bytes.length,customMetadata:o.customMetadata,uploaded:o.uploaded,etag:o.etag});
  const check=(op,key)=>{const i=failures.findIndex(f=>f(op,key));if(i>=0){failures.splice(i,1);throw new Error('R2 '+op+' failed');}};
  return {objects,failures,
   async head(key){check('head',key);const o=objects.get(key);return o?meta(key,o):null;},
   async get(key){check('get',key);const o=objects.get(key);return o?{...meta(key,o),text:async()=>o.bytes.toString(),json:async()=>JSON.parse(o.bytes.toString()),arrayBuffer:async()=>new Uint8Array(o.bytes).buffer}:null;},
   async put(key,value,options={}){check('put',key);const bytes=Buffer.from(typeof value==='string'?value:new Uint8Array(value));
    if(options.sha256 && sha(bytes)!==options.sha256) throw new Error('digest mismatch');
-   objects.set(key,{bytes,customMetadata:options.customMetadata || {},uploaded:new Date()});},
+   if(options.onlyIf?.etagMatches && objects.get(key)?.etag!==options.onlyIf.etagMatches) return null;
+   objects.set(key,{bytes,customMetadata:options.customMetadata || {},uploaded:new Date(),etag:sha(bytes)});},
   async delete(keys){for(const key of [].concat(keys)){check('delete',key);objects.delete(key);}},
   async list({prefix='',limit=1000,cursor}={}){const keys=[...objects.keys()].filter(k=>k.startsWith(prefix)).sort(),start=Number(cursor || 0);
    return {objects:keys.slice(start,start+limit).map(k=>meta(k,objects.get(k))),truncated:start+limit<keys.length,cursor:String(start+limit)};},
@@ -256,4 +257,36 @@ test('a storage-full exception from the reset object parks immediately and recor
  assert.equal(JSON.parse(h.archive.objects.get('control/100/storage.json').bytes).state,'full');
  h.env.REPOSITORIES.get=()=>({fetch:async()=>{throw new Error('out of memory: SQLITE_NOMEM');}});
  assert.deepEqual((await deliver(h.env,'nomem',1)).retried,{delaySeconds:5},'other storage errors retry');
+});
+
+test('a recorded full state stops legacy migration even below the size threshold',async()=>{
+ const {db,archive}=repositoryFixture();
+ db.exec("DELETE FROM meta WHERE key='schema_version'");
+ await archive.put('control/100/storage.json',JSON.stringify({state:'full',since:1,source:'queue'}));
+ const {state}=repositoryFixture({},1,db,archive);
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(state.schema,'legacy');assert.equal(state.degraded.operation,'recorded:queue');
+ assert.equal(db.prepare("SELECT COUNT(*) n FROM meta WHERE key='schema_version'").get().n,0);
+});
+
+test('degraded workflow reads never run the legacy attempt rewrite',async()=>{
+ const {db,state}=repositoryFixture();
+ db.prepare('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?)').run('workflow_runs','77','',JSON.stringify({id:77,run_attempt:2}),'',1,1,0);
+ state.degraded={since:1,reason:'storage_full',operation:'test'};
+ const before=db.prepare('SELECT COUNT(*) n FROM changes').get().n;
+ const result=await queryFixture(state,{operation:'workflow_jobs',args:{id:'77'}});
+ assert.equal(result.status,'unavailable');assert.equal(result.reason,'storage_full');
+ assert.equal(db.prepare("SELECT COUNT(*) n FROM meta WHERE key='workflow_attempt:77'").get().n,0);
+ assert.equal(db.prepare('SELECT COUNT(*) n FROM changes').get().n,before);
+});
+
+test('a failure report older than a verified probe cannot undo recovery',async()=>{
+ const {noteRepositoryFull}=await load('src/ingress.ts');
+ const archive=bucket(),env={ARCHIVE:archive};
+ const started=Date.now()-1000;
+ await archive.put('control/100/storage.json',JSON.stringify({state:'writable',verified_at:Date.now()}));
+ await noteRepositoryFull(env,'100','queue',started);
+ assert.equal(JSON.parse(archive.objects.get('control/100/storage.json').bytes).state,'writable');
+ await noteRepositoryFull(env,'100','queue',Date.now()+1000);
+ assert.equal(JSON.parse(archive.objects.get('control/100/storage.json').bytes).state,'full');
 });

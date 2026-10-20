@@ -16,9 +16,12 @@ export const controlKey = (repo: string) => `control/${repo}/ingress.json`;
 // the handler returns and resets the object, so the object cannot record that
 // it is full; whoever observes the failure records it here instead.
 export const storageKey = (repo: string) => `control/${repo}/storage.json`;
-export async function noteRepositoryFull(env: Env, repo: string, source: string): Promise<void> {
-  if ((await env.ARCHIVE.get(storageKey(repo)).then(o => o?.json<any>()))?.state === 'full') return;
-  await env.ARCHIVE.put(storageKey(repo), JSON.stringify({ state: 'full', since: Date.now(), source }));
+// `started` is when the failing request began: a probe verified after that
+// supersedes the report, and the conditional write rejects a concurrent probe.
+export async function noteRepositoryFull(env: Env, repo: string, source: string, started: number): Promise<void> {
+  const object = await env.ARCHIVE.get(storageKey(repo)), marker: any = object ? await object.json() : null;
+  if (marker?.state === 'full' || marker?.state === 'writable' && Number(marker.verified_at) >= started) return;
+  await env.ARCHIVE.put(storageKey(repo), JSON.stringify({ state: 'full', since: started, source }), object ? { onlyIf: { etagMatches: object.etag } } : undefined);
 }
 export function backoff(attempts: number): number { return Math.min(600, 5 * 2 ** Math.max(0, Math.min(attempts - 1, 8))); }
 
@@ -68,10 +71,11 @@ export async function drain(env: Env, repo: Repository, options: { limit?: numbe
     const parked = await env.ARCHIVE.get(object.key).then(o => o?.json<Parked>());
     if (!parked) continue;
     let response: Response;
+    const started = Date.now();
     try { response = await stub(env.REPOSITORIES, repo.id).fetch('https://internal/event', { method: 'POST', body: JSON.stringify({ key: parked.key, delivery: parked.delivery, event: parked.event, repository: parked.repository, received: parked.received }) }); }
     catch (error) {
       const reason = classify(error);
-      if (reason === 'storage_full') await noteRepositoryFull(env, repo.id, 'replay');
+      if (reason === 'storage_full') await noteRepositoryFull(env, repo.id, 'replay', started);
       log('parked_replay_failed', { repository: repo.name, delivery: parked.delivery, error: reason });
       return { replayed, failed, remaining: true, stopped: reason };
     }
