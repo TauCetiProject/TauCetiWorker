@@ -19,7 +19,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
     if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
     rm -f "$base_shims"; rm -rf "$base_root"
     ```
-  - Build: `lake exe cache get` (once per session), then `lake build`.
+  - Build: `lake exe cache get` (once per session), then `lake build --iofail`.
   - Duplicate declarations or axioms: `lake build`, then the scope recipe and scoped audit below.
   - Module system: `lake build`, then `lake exe module-system`.
   - Environment lint: `lake build`, the scope recipe, then the scoped lint below. This round's
@@ -53,7 +53,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Verify before pushing (ALL MUST pass)
 __LOCAL_VERIFICATION__
 After the fix, run the final verification once, covering what the `build` check runs: the
-shim-expiry command above, `lake build`, the scope recipe and scoped audit, `lake exe module-system`,
+shim-expiry command above, `lake build --iofail`, the scope recipe and scoped audit, `lake exe module-system`,
 and the scoped environment lint (with the flagged modules appended under the `full-lint` policy),
 which must print `LINT-ENV: PASS`. A green `lake build` alone is NOT enough: the `build` check also
 fails on a shim-expiry, axiom-audit, module-system or lint-env violation (e.g. a missing docstring).

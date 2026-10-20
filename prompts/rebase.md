@@ -34,7 +34,7 @@ Merging upstream workflow or pin changes as part of bringing in `main` is expect
 __LOCAL_VERIFICATION__
 Use the request's evidence to reproduce the diagnosis with the specific failing step, not a rerun of
 every check. After the merge/rebase and any repair, run the final verification once: `lake exe cache
-get` (if you have not run it this session, or the merge changed the pins), `lake build`, then the
+get` (if you have not run it this session, or the merge changed the pins), `lake build --iofail`, then the
 scope recipe and the scoped audit above. The recipe's base is the canonical main you integrated, so
 it covers this PR's changed modules and everything importing them. Iterate until green. Never push
 red: a botched conflict resolution that builds red is worse than the conflict.

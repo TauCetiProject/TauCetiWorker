@@ -12,7 +12,7 @@ Verify once, at the end, scoped to what you actually changed:
   or `lean-toolchain` changes. Do not rerun a check that already passed unless its inputs (source,
   pins, or the integrated main) changed since. While iterating on a failure, rerun only the failing
   step; `lake build` is incremental, so rerun it after edits. The final verification always uses
-  the plain whole-library `lake build`: a hand-picked module list skips downstream importers that
+  the plain whole-library `lake build --iofail`, as CI does: a hand-picked module list skips downstream importers that
   your change can break, so it never counts as verification.
 - **Scope, not guesswork.** Compute the audit scope with the recipe below, exactly as written, after
   your last source edit, merge, or commit. It reads only local Git state: do not fetch for it, do not
@@ -33,7 +33,7 @@ bash <<'TAUCETI_SCOPE'
 set -uo pipefail
 export LC_ALL=C
 policy='__SCOPE_POLICY__'
-root="$(git rev-parse --show-toplevel)" || exit 1
+root="$(git rev-parse --show-toplevel)" && cd "$root" || exit 1
 out="$root/.lake/tauceti-scope"
 rm -rf "$out" && mkdir -p "$out" && : > "$out/modules.txt" || exit 1
 finish() {
@@ -45,7 +45,8 @@ finish() {
 main=""
 shopt -s nocasematch
 for remote in $(git remote); do
-  [[ "$(git remote get-url "$remote" 2>/dev/null)" =~ github\.com[:/]+TauCetiProject/TauCeti(\.git)?/*$ ]] \
+  [[ "$(git remote get-url "$remote" 2>/dev/null)" =~ \
+     ^(https://([^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)TauCetiProject/TauCeti(\.git)?/?$ ]] \
     || continue
   main="$(git rev-parse --verify --quiet "refs/remotes/$remote/main^{commit}")" && break
 done
@@ -53,9 +54,11 @@ shopt -u nocasematch
 [ -n "$main" ] || finish "unknown: no local canonical TauCetiProject/TauCeti main ref"
 [ "$(git rev-parse --is-shallow-repository)" = false ] || finish "unknown: shallow history"
 base="$(git merge-base "$main" HEAD)" || finish "unknown: no merge base with main $main"
-git -c core.quotePath=false diff --no-ext-diff --no-textconv --no-renames --name-only -z "$base" -- \
+git diff --no-ext-diff --no-textconv --no-renames --no-relative --name-only -z "$base" -- \
   > "$out/changed.nul" || finish "unknown: cannot diff against $base"
-git ls-files -z --others --exclude-standard >> "$out/changed.nul" \
+# Untracked files, including ignored ones under TauCeti/ (Lake builds every source there).
+{ git ls-files -z --others --exclude-standard -- . \
+    && git ls-files -z --others --ignored --exclude-standard -- TauCeti; } >> "$out/changed.nul" \
   || finish "unknown: cannot list untracked files"
 module_re="^TauCeti(/[A-Za-z_][A-Za-z0-9_']*)+\.lean$"
 reason=""
@@ -72,9 +75,9 @@ while IFS= read -r -d '' file; do
     reason="${reason:-deleted module: $file}"
   else
     module="${file%.lean}"
-    printf '%s\n' "${module//\//.}" >> "$out/modules.txt"
+    printf '%s\n' "${module//\//.}" >> "$out/modules.txt" || reason="${reason:-cannot write the module list}"
   fi
-done < "$out/changed.nul"
+done < "$out/changed.nul" || finish "unknown: cannot read the changed-file list"
 sort -u -o "$out/modules.txt" "$out/modules.txt" || finish "unknown: cannot sort the module list"
 [ "$policy" = ordinary ] || reason="${reason:-$policy policy}"
 [ -z "$reason" ] || finish "full: $reason"
@@ -86,7 +89,7 @@ Then run the axiom and duplicate-declaration audit in the scope just written:
 scope="$(git rev-parse --show-toplevel)/.lake/tauceti-scope"
 case "$(head -n 1 "$scope/mode" 2>/dev/null)" in
   scoped*) AXIOMS_ONLY_MODULES="$scope/modules.txt" lake exe axioms ;;
-  full*|unknown*) lake exe axioms ;;
+  full*|unknown*) AXIOMS_ONLY_MODULES= lake exe axioms ;;
   *) echo "no audit scope: run the scope recipe first" >&2; false ;;
 esac
 ```

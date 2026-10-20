@@ -30,7 +30,7 @@ For each finding, judge whether it is actually correct:
 ## Verify before pushing (all MUST pass)
 __LOCAL_VERIFICATION__
 While fixing, use `lake build` (incremental) to check each edit. When every fix is in, run the final
-verification once: `lake exe cache get` (if you have not run it this session), `lake build`, then
+verification once: `lake exe cache get` (if you have not run it this session), `lake build --iofail`, then
 the scope recipe and the scoped audit above. Iterate until green. Never push red. If you changed no
 source (every finding contested), there is nothing new to verify: do not rebuild or re-audit.
 

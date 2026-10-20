@@ -94,23 +94,18 @@ def fixture(root, name, *, remote=CANONICAL, track_main=True):
     return repo
 
 
-def scope(repo, policy="ordinary"):
+def scope(repo, policy="ordinary", cwd=None, config=None):
     recipe = blocks(policy)[0]
-    run = subprocess.run(
-        ["bash", "-c", recipe],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        env=dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1"),
-    )
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=config or "/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    run = subprocess.run(["bash", "-c", recipe], cwd=cwd or repo, capture_output=True, text=True, env=env)
     out = Path(repo) / ".lake" / "tauceti-scope"
     mode = (out / "mode").read_text().strip() if (out / "mode").exists() else f"<none: {run.stderr}>"
     modules = (out / "modules.txt").read_text().split() if (out / "modules.txt").exists() else None
     return run.returncode, mode, modules
 
 
-def expect(name, repo, kind, modules=None, reason="", policy="ordinary"):
-    rc, mode, listed = scope(repo, policy)
+def expect(name, repo, kind, modules=None, reason="", policy="ordinary", **kw):
+    rc, mode, listed = scope(repo, policy, **kw)
     check(f"{name}: recipe exits 0", rc == 0, mode)
     check(f"{name}: mode {kind}", mode.startswith(kind), mode)
     if reason:
@@ -138,6 +133,29 @@ def main():
         r = fixture(root, "untracked")
         write(r, "TauCeti/New/C'.lean")
         expect("untracked new module", r, "scoped", ["TauCeti.New.C'"])
+
+        r = fixture(root, "subdirectory")
+        write(r, "TauCeti/Sub/X.lean")
+        write(r, "TauCeti/Y.lean")
+        write(r, "TauCeti/B.lean", "changed\n")
+        relative = Path(root) / "relative.gitconfig"
+        relative.write_text("[diff]\n\trelative = true\n")
+        expect(
+            "run from a subdirectory with diff.relative",
+            r,
+            "scoped",
+            ["TauCeti.B", "TauCeti.Sub.X", "TauCeti.Y"],
+            cwd=r / "TauCeti" / "Sub",
+            config=str(relative),
+        )
+
+        r = fixture(root, "ignored")
+        write(r, ".gitignore", "/.lake/\nscratch/\n")
+        git(r, "commit", "-qam", "ignore scratch")
+        git(r, "update-ref", "refs/remotes/origin/main", "HEAD")
+        write(r, "TauCeti/scratch/Hidden.lean")
+        write(r, "scratch/notes.lean")
+        expect("ignored untracked module under TauCeti/", r, "scoped", ["TauCeti.scratch.Hidden"])
 
         r = fixture(root, "mixed")
         write(r, "TauCeti/A.lean", "changed\n")
@@ -222,6 +240,15 @@ def main():
         write(r, "TauCeti/A.lean", "changed\n")
         expect("missing canonical main ref", r, "unknown", [], "no local canonical")
 
+        for bad in (
+            "https://notgithub.com/TauCetiProject/TauCeti.git",
+            "/tmp/github.com/TauCetiProject/TauCeti",
+            "https://github.com/TauCetiProject/TauCetiWorker.git",
+        ):
+            r = fixture(root, "lookalike-" + re.sub(r"\W", "_", bad), remote=bad)
+            write(r, "TauCeti/A.lean", "changed\n")
+            expect(f"lookalike remote {bad}", r, "unknown", [], "no local canonical")
+
         r = fixture(root, "fork-only", remote="https://github.com/alice/TauCeti.git")
         write(r, "TauCeti/A.lean", "changed\n")
         expect("only a fork remote", r, "unknown", [], "no local canonical")
@@ -245,7 +272,8 @@ def main():
         stub = bin_dir / "lake"
         stub.write_text(f'#!/bin/sh\necho "lake $* AXIOMS=${{AXIOMS_ONLY_MODULES-unset}}" >> {log}\n')
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+        # An inherited scope must never narrow a full audit.
+        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", AXIOMS_ONLY_MODULES="/stale/list")
         _, audit, lint = blocks("ordinary")
 
         def audit_call(repo):
@@ -268,11 +296,11 @@ def main():
         r = Path(root) / "deleted"
         scope(r)
         rc, call = audit_call(r)
-        check("full scope runs the unscoped audit", rc == 0 and call == "lake exe axioms AXIOMS=unset", call)
+        check("full scope clears an inherited scope", rc == 0 and call == "lake exe axioms AXIOMS=", call)
         r = Path(root) / "no-main"
         scope(r)
         rc, call = audit_call(r)
-        check("unknown scope runs the unscoped audit", rc == 0 and call == "lake exe axioms AXIOMS=unset", call)
+        check("unknown scope runs the unscoped audit", rc == 0 and call == "lake exe axioms AXIOMS=", call)
         lint_run = subprocess.run(["bash", "-c", lint], cwd=r, env=env, capture_output=True, text=True)
         check("unknown scope skips the local lint", "CI runs the environment lint" in lint_run.stdout)
         r = fixture(root, "never-scoped")
@@ -306,6 +334,8 @@ def main():
     sp = tc.agents.scope_policy
     check("ordinary PR", sp(("roadmap/Foo",), "feature") == "ordinary")
     check("full-lint label", sp(("Full-Lint",), "feature") == "full-lint")
+    check("comma-delimited full-lint label, as CI matches it", sp(("foo,full-lint",), "feature") == "full-lint")
+    check("full-lint is not a substring match", sp(("not-full-lint",), "feature") == "ordinary")
     check("lint-repair branch", sp((), "lint-repair/main") == "lint-repair")
     check("bump", sp((), "bump/x", bump=True) == "bump")
     try:

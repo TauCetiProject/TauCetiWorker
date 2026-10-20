@@ -53,7 +53,7 @@ push the completed repairs and let full CI verify them. Do not spend the session
 __LOCAL_VERIFICATION__
 A pin bump changes what every module depends on, so its audit stays whole-library: the recipe
 prints `full: ...` for this branch. Once the migration is complete, run the shim-expiry command
-above, `lake build`, then the scope recipe and the audit, once each.
+above, `lake build --iofail`, then the scope recipe and the audit, once each.
 
 Full CI runs these checks even when a partial repair cannot run the full library yet.
 

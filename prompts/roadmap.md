@@ -73,7 +73,7 @@ beats a padded one. If nothing needs changing, say so and move on. Then verify, 
 ## Verify before pushing (all MUST pass)
 __LOCAL_VERIFICATION__
 Your final verification, once your source is done: `lake exe cache get` (if you have not run it
-this session), `lake build`, then the scope recipe and the scoped audit above. If `lake build` is
+this session), `lake build --iofail`, then the scope recipe and the scoped audit above. If `lake build` is
 red, FIX IT or retreat (below). Never push red.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.

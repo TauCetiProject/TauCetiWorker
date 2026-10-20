@@ -460,7 +460,8 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
         return "bump"
     if head_ref.startswith("lint-repair/"):
         return "lint-repair"
-    if "full-lint" in {label.lower() for label in labels}:
+    # CI's lint_scope_policy.py matches comma-delimited components, so a label like `a,full-lint` counts.
+    if any("full-lint" in label.lower().split(",") for label in labels):
         return "full-lint"
     return "ordinary"
 
