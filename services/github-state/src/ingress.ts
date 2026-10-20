@@ -110,7 +110,8 @@ export async function backlog(env: Env, repo: Repository): Promise<any> {
       const page = await env.ARCHIVE.list({ prefix, cursor, limit: 1000 });
       total += page.objects.length; oldest ||= page.objects[0]?.key;
       cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor && ++pages < 10);
+    // R2 pages can be short; bound by pages, not by an assumed page size.
+    } while (cursor && ++pages < 100);
     const received = oldest ? Number(oldest.slice(prefix.length, prefix.length + 15)) : null;
     return { count: total, truncated: Boolean(cursor), oldest_received: received };
   };

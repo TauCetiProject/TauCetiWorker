@@ -30,7 +30,15 @@ async function github(req,u){
 }
 const client={Authorization:'Bearer client'},admin={Authorization:'Bearer admin'};
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-const get=(mf,operation,args={},headers={})=>mf.dispatchFetch('https://test/v1/query?repository=org/repo&operation='+operation+'&args='+encodeURIComponent(JSON.stringify(args)),{headers:{...client,...headers}});
+// Miniflare occasionally resets its loopback connection under load; retry
+// that transport failure for reads only, never an HTTP result.
+async function dispatch(mf,url,init){
+ for(let attempt=0;;attempt++){
+  try {return await mf.dispatchFetch(url,init);}
+  catch(error){if(attempt>=2 || error.cause?.code!=='ECONNRESET') throw error;await new Promise(resolve=>setTimeout(resolve,200));}
+ }
+}
+const get=(mf,operation,args={},headers={})=>dispatch(mf,'https://test/v1/query?repository=org/repo&operation='+operation+'&args='+encodeURIComponent(JSON.stringify(args)),{headers:{...client,...headers}});
 const adminPost=(mf,path,body)=>mf.dispatchFetch('https://test'+path,{method:'POST',headers:admin,body:JSON.stringify({repository:'org/repo',...body})});
 async function until(read,check,label,ms=30000){
  const deadline=Date.now()+ms;let value;
@@ -45,7 +53,7 @@ async function paginate(mf,operation){
  assert.equal(first.status,'ok');assert.equal(first.complete,true);
  let rows=[...first.data],cursor=first.cursor,pages=1;
  while(cursor){
-  const page=await (await mf.dispatchFetch('https://test/v1/query?repository=org/repo&operation='+operation+'&cursor='+encodeURIComponent(cursor),{headers:client})).json();
+  const page=await (await dispatch(mf,'https://test/v1/query?repository=org/repo&operation='+operation+'&cursor='+encodeURIComponent(cursor),{headers:client})).json();
   assert.equal(page.status,'ok',JSON.stringify(page).slice(0,200));assert.equal(page.revision,first.revision);
   rows.push(...page.data);cursor=page.cursor;pages++;
  }
