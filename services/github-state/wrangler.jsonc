@@ -9,7 +9,7 @@
   "durable_objects": {"bindings": [{"name": "REPOSITORIES", "class_name": "RepositoryState"}, {"name": "INSTALLATIONS", "class_name": "InstallationScheduler"}]},
   "migrations": [{"tag": "v1", "new_sqlite_classes": ["RepositoryState", "InstallationScheduler"]}],
   "r2_buckets": [{"binding": "ARCHIVE", "bucket_name": "tauceti-github-state"}],
-  "queues": {"producers": [{"binding": "EVENTS", "queue": "tauceti-github-state-events"}], "consumers": [{"queue": "tauceti-github-state-events", "max_batch_size": 20, "max_batch_timeout": 1, "max_concurrency": 4, "max_retries": 20, "dead_letter_queue": "tauceti-github-state-events-dlq"}]},
+  "queues": {"producers": [{"binding": "EVENTS", "queue": "tauceti-github-state-events"}], "consumers": [{"queue": "tauceti-github-state-events", "max_batch_size": 100, "max_batch_timeout": 1, "max_concurrency": 16, "max_retries": 20, "dead_letter_queue": "tauceti-github-state-events-dlq"}]},
   "triggers": {"crons": ["* * * * *"]},
   "env": {"test": {
     "name": "tauceti-github-state-test",
@@ -19,6 +19,6 @@
     "routes": [{"pattern": "github-state-test.taucetiproject.org", "custom_domain": true}],
     "durable_objects": {"bindings": [{"name": "REPOSITORIES", "class_name": "RepositoryState"}, {"name": "INSTALLATIONS", "class_name": "InstallationScheduler"}]},
     "r2_buckets": [{"binding": "ARCHIVE", "bucket_name": "tauceti-github-state-test"}],
-    "queues": {"producers": [{"binding": "EVENTS", "queue": "tauceti-github-state-test-events"}], "consumers": [{"queue": "tauceti-github-state-test-events", "max_batch_size": 20, "max_batch_timeout": 1, "max_concurrency": 4, "max_retries": 20, "dead_letter_queue": "tauceti-github-state-test-events-dlq"}]}
+    "queues": {"producers": [{"binding": "EVENTS", "queue": "tauceti-github-state-test-events"}], "consumers": [{"queue": "tauceti-github-state-test-events", "max_batch_size": 100, "max_batch_timeout": 1, "max_concurrency": 16, "max_retries": 20, "dead_letter_queue": "tauceti-github-state-test-events-dlq"}]}
   }}
 }

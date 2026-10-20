@@ -44,9 +44,11 @@ export async function setIngressMode(env: Env, repo: Repository, mode: unknown, 
 // succeed may the caller acknowledge the queue message.
 export async function park(env: Env, repo: Repository, pointer: EventPointer, reason: string): Promise<Parked> {
   const pinned = bodyKey(repo.id, pointer.delivery);
-  let sha256 = (await env.ARCHIVE.head(pinned))?.customMetadata?.sha256;
+  // Re-pinning identical bytes is harmless, so the common path reads the
+  // original once; an already pinned copy matters only once it has expired.
+  const source = await env.ARCHIVE.get(pointer.key);
+  let sha256 = source ? undefined : (await env.ARCHIVE.head(pinned))?.customMetadata?.sha256;
   if (!sha256) {
-    const source = await env.ARCHIVE.get(pointer.key);
     if (!source) throw new Error('event body unavailable');
     const bytes = await source.arrayBuffer();
     sha256 = await digest(bytes);
