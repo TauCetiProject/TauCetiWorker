@@ -25,7 +25,7 @@ def git(root: Path, *args: str) -> bytes:
 def local_main(root: Path) -> str:
     """Resolve only a locally available canonical remote. Never fetch or call GitHub."""
     for remote in git(root, "remote").decode().splitlines():
-        if CANONICAL.fullmatch(git(root, "remote", "get-url", remote).decode().strip()):
+        if CANONICAL.fullmatch(git(root, "config", "--get", f"remote.{remote}.url").decode().strip()):
             try:
                 return git(root, "rev-parse", "--verify", f"refs/remotes/{remote}/main^{{commit}}").decode().strip()
             except subprocess.CalledProcessError:

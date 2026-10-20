@@ -109,11 +109,14 @@ def scope(repo, policy="ordinary", cwd=None, config=None):
 
 def expect(name, repo, kind, modules=None, reason="", policy="ordinary", **kw):
     rc, mode, listed = scope(repo, policy, **kw)
+    from unittest.mock import patch
+
     from tauceti_worker.verification_scope import local_main
     from tauceti_worker.verification_scope import scope as helper_scope
 
     try:
-        actual = helper_scope(Path(repo), local_main(Path(repo)), policy)
+        with patch.dict(os.environ, GIT_CONFIG_GLOBAL=kw.get("config") or "/dev/null", GIT_CONFIG_NOSYSTEM="1"):
+            actual = helper_scope(Path(repo), local_main(Path(repo)), policy)
     except ValueError:
         actual = dict(mode="unknown", modules=[])
     check(
