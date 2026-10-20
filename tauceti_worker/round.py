@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 from .config import Config, Die, log
 from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_TIMEOUT
@@ -36,9 +37,11 @@ class RoundContext:
     def __init__(self, cfg: Config, *, record_activity=True):
         self.cfg = cfg
         self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or (time.time() + ROUND_TIMEOUT))
+        os.environ["TAUCETI_ROUND_DEADLINE"] = str(self.deadline)
         self._fd: int | None = None
         self._cleanups: list = []
         self._done = False
+        self.interrupted = False
         self.activity = None
         self.record_activity = record_activity
 
@@ -55,6 +58,7 @@ class RoundContext:
                 f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
             ) from None
         self._fd = fd
+        os.environ["TAUCETI_VERIFY_ATTEMPT"] = uuid.uuid4().hex
         if self.record_activity:
             from .activity import Round
 
@@ -62,6 +66,12 @@ class RoundContext:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        from .survey import Counters
+        from .verification import refund_capacity_wait
+
+        counters = Counters(self.cfg)
+        refund_capacity_wait(self.cfg.state, counters, interrupted_round=True)
+        refund_capacity_wait(self.cfg.state / "verification-state", counters, interrupted_round=True)
         # Register first: LIFO cleanup records resources after claim/build teardown.
         try:
             from .resources import RoundResources
@@ -103,6 +113,7 @@ class RoundContext:
             self._fd = None
 
     def __exit__(self, *exc) -> bool:
+        self.interrupted = exc[0] in (SystemExit, KeyboardInterrupt)
         if self.activity:
             self.activity.finish(exc[1])
         self._cleanup()

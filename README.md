@@ -52,6 +52,7 @@ uv tool install git+https://github.com/TauCetiProject/TauCetiWorker
 tauceti doctor                     # report the tools and credentials this host can use
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
+tauceti verify --json              # synchronous local verification receipts, from a TauCeti checkout
 tauceti usage --json               # prompt-free Kiro/OpenRouter credit telemetry
 tauceti cost-model                 # agent, CI, cache, and marginal/cumulative LOC-cost estimates
 tauceti work --only review         # one round of a specific kind of work, then exit
@@ -62,6 +63,8 @@ tauceti work --loop                # fully automatic: keep picking the most usef
 Ctrl-C stops the current round and exits. From a clone you can run `./tauceti`
 instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
+
+Local checks use [exact-input verification receipts and a host heavy-work queue](docs/verification.md).
 
 ### Multiple GitHub accounts
 

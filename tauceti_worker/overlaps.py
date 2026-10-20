@@ -531,10 +531,11 @@ def do_fix(w, sv, c, opts, bubble):
             FORK=fork,
             FORK_OWNER=fork.split("/", 1)[0],
             BIN=wrapper_bin(bubble=bubble),
-            LOCAL_VERIFICATION=local_verification("ordinary"),
+            LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         )
         with environment(
             {
+                "TAUCETI_VERIFY_POLICY": "ordinary",
                 "TAUCETI_WORKER_ID": lease.owner,
                 "CLAIM_REPO": CLAIMS,
                 "TAUCETI_CLAIM_REPO": CLAIMS,

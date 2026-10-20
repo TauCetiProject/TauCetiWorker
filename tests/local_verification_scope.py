@@ -43,7 +43,10 @@ def check(name, cond, detail=""):
 
 
 def blocks(policy):
-    text = tc.agents.local_verification(policy)
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="0"):
+        text = tc.agents.local_verification(policy)
     found = re.findall(r"```bash\n(.*?)```", text, re.S)
     assert len(found) == 3, "expected scope, audit and lint blocks"
     return found
@@ -106,6 +109,19 @@ def scope(repo, policy="ordinary", cwd=None, config=None):
 
 def expect(name, repo, kind, modules=None, reason="", policy="ordinary", **kw):
     rc, mode, listed = scope(repo, policy, **kw)
+    from unittest.mock import patch
+
+    from tauceti_worker.verification_scope import local_main
+    from tauceti_worker.verification_scope import scope as helper_scope
+
+    try:
+        with patch.dict(os.environ, GIT_CONFIG_GLOBAL=kw.get("config") or "/dev/null", GIT_CONFIG_NOSYSTEM="1"):
+            actual = helper_scope(Path(repo), local_main(Path(repo)), policy)
+    except ValueError:
+        actual = dict(mode="unknown", modules=[])
+    check(
+        f"{name}: helper matches V0 scope", actual["mode"] == kind and actual["modules"] == (listed or []), str(actual)
+    )
     check(f"{name}: recipe exits 0", rc == 0, mode)
     check(f"{name}: mode {kind}", mode.startswith(kind), mode)
     if reason:
@@ -329,11 +345,11 @@ def main():
         policy = subs.get("SCOPE_POLICY", "ordinary")
         subs["LOCAL_VERIFICATION"] = tc.agents.local_verification(policy)
         text = tc.agents.fill_prompt(tc.paths.HERE / "prompts" / name, **subs)
-        check(f"{name}: embeds the scope recipe", text.count("<<'TAUCETI_SCOPE'") == 1)
-        check(f"{name}: names its policy", f"policy='{policy}'" in text)
+        check(f"{name}: dispatches to the absolute helper", '/tauceti-verify"' in text)
+        check(f"{name}: names its policy", f"policy is `{policy}`" in text)
         check(f"{name}: forbids name-based waits", "`pgrep`" in text and "notify or resume you" in text)
         check(f"{name}: requires pipefail", "set -o pipefail" in text)
-        check(f"{name}: never runs lint-scope.sh", "never run `scripts/lint-scope.sh`" in text)
+        check(f"{name}: avoids GitHub scope reads", "`scripts/lint-scope.sh` alongside the helper" in text)
         check(f"{name}: report separates local checks from CI", "not full CI" in text)
         check(f"{name}: no unscoped whole-suite rerun", "run the WHOLE suite" not in text)
         check(f"{name}: no bare unscoped audit command block", "\nlake exe axioms\n" not in text)

@@ -52,6 +52,7 @@ from .config import (
     Die,
     GitHubUnavailable,
     NoProgress,
+    VerificationUnavailable,
     acquire_slot,
     auto_assign_wid,
     is_git_url,
@@ -68,6 +69,7 @@ from .constants import (
     EX_ADMISSION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
+    EX_VERIFICATION_WAIT,
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -565,6 +567,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_github_account_flag(p)
     sub = p.add_subparsers(dest="cmd")
+    from .verification import add_parser as add_verification_parser
+
+    add_verification_parser(sub)
     activity = sub.add_parser("activity", help="read prepared local activity; never query GitHub")
     activity.add_argument("action", nargs="?", choices=("show", "refresh", "install-timer"), default="show")
     scope = activity.add_mutually_exclusive_group()
@@ -856,6 +861,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cmd = args.cmd
+    if cmd == "verify":
+        from .verification import command
+
+        return command(args)
     if cmd == "activity":
         from .activity import command
 
@@ -1650,6 +1659,9 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
+    except VerificationUnavailable as e:
+        report_runtime("waiting-verification-capacity", detail=str(e))
+        return EX_VERIFICATION_WAIT
     except AdmissionUnavailable as e:
         log(str(e))
         report_failure(str(e), code=EX_ADMISSION_WAIT)
@@ -1671,7 +1683,7 @@ def cli_main() -> int:
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
     can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create"):
+    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "tauceti-verify"):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

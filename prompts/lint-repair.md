@@ -15,15 +15,12 @@ If the merge conflicts, resolve it (conflicts can only be in `TauCeti/`), or fol
 
 Repair existing declarations only: restate, re-annotate, or (if redundant) remove them. Do NOT add new lemmas or definitions: new mathematics needs a roadmap target, which a repair PR does not have. If a violation can only be fixed by adding one, follow the durable blocked-PR procedure below.
 
-The PR body and its comments list the violations the daily lint found, and this PR's CI build lints the whole library, so its failing log is the current list: each violation with the linter's explanation. Work from that list, and from the latest daily-lint comment if it is newer than the last build. Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it. To check your repairs locally, lint the modules you changed plus the modules that define the flagged declarations. The log names each one as `<linter> <declaration>`. After the scope recipe below has written its list, append the modules whose source mentions each declaration's last name component (a few extra modules only cost a little time):
-```
-list="$(git rev-parse --show-toplevel)/.lake/tauceti-scope/modules.txt"
-for name in <the last component of each flagged declaration name>; do
-  grep -rlw --include='*.lean' -- "$name" TauCeti
-done | sed 's/\.lean$//; s|/|.|g' | cat - "$list" | LC_ALL=C sort -u -o "$list"
-test -s "$list" && cat "$list"
-```
-If `test -s` fails, or a name is auto-generated (for example an `inst...` instance) and grep misses its file, add the defining module to that list by hand: the scoped lint silently skips the `#lint` driver when the list names no real module, so an empty list passes without checking anything. Confirm the output line `lint-env: linted N changed module(s)` has N > 0. CI re-runs the full lint when you push. Rerun the recipe only after further source edits, and append the flagged modules again when you do.
+The PR body, comments and failing CI log list the violations to repair. Find each declaration's
+defining module, inspect the source, and fix the underlying issue. The helper lints changed modules
+and performs a full axiom audit under this branch's policy. For a declaration flagged in an unchanged module, write its dotted module name to an absolute
+list outside this checkout, then run `"$TAUCETI_VERIFY_PYTHON" "__BIN__/tauceti-verify" --stage lint --lint-modules /absolute/list`.
+Use that same list on the final all-stage call. Whole-library environment lint stays
+in CI; a local success does not assert that every unchanged module passed it.
 
 - For a failing check's CI logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and everything below passes locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
@@ -41,24 +38,9 @@ If `test -s` fails, or a name is auto-generated (for example an `inst...` instan
 
 ## Verify before pushing (ALL of these MUST pass; they are what the `build` check runs)
 __LOCAL_VERIFICATION__
-The `lint-repair` policy keeps the axiom and duplicate-declaration audit whole-library. After the
-repair, run the final verification once:
-```
-lake exe cache get   # only if not yet run this session
-git fetch -q origin main
-shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"; have_base=0
-base_ref="$(git merge-base origin/main HEAD)"
-if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); have_base=1; fi
-if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
-if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
-rm -f "$base_shims"; rm -rf "$base_root"
-lake build --iofail
-lake exe module-system
-bash scripts/lint-style.sh
-```
-then the scope recipe, the audit (it also checks duplicate declarations globally), the flagged-module
-append above, and the scoped environment lint. The scoped `lint-env.sh` must print `LINT-ENV: PASS`.
-If a step fails, fix it and rerun only the steps whose inputs your fix changed. Never push red.
+Run the helper's default all stages after the final edit. It owns scoped environment lint,
+full build and audits, style lint and the merge-base shim ratchet. Inspect the phase exits and receipt;
+fix failures before pushing.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

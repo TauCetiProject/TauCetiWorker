@@ -21,6 +21,7 @@ from .constants import (
     EX_ADMISSION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
+    EX_VERIFICATION_WAIT,
     GH_MIN_BUDGET,
     INTERROUND,
     OPENROUTER_MODELS,
@@ -295,7 +296,21 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 wait_detail=None,
                 wait_cached=None,
             )
+            from .verification import waiting_for_capacity
+
+            round_started = time.time()
             rc = run_round_subprocess(tail)
+            if rc in (124, 137, 143) and waiting_for_capacity(cfg, since=round_started):
+                rc = EX_VERIFICATION_WAIT
+            if rc == EX_VERIFICATION_WAIT:
+                streak = 0
+                report_runtime(
+                    "waiting-verification-capacity",
+                    detail="verification retained; rechecking host capacity",
+                    next_action_at=time.time() + 5,
+                )
+                time.sleep(5)
+                continue
 
             if rc == EX_ADMISSION_WAIT:
                 if reason := fleet_admission_reason(cfg.wid):
