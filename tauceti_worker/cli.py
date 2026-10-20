@@ -584,6 +584,14 @@ def build_parser() -> argparse.ArgumentParser:
     activity.add_argument("--json", action="store_true")
     activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")
 
+    recovery = sub.add_parser(
+        "recovery", help="list saved unfinished source or confirm a retained checkout is quiescent; local only"
+    )
+    recovery.add_argument("action", nargs="?", choices=("list", "confirm"), default="list")
+    recovery.add_argument("record", nargs="?", help="confirm: the record id under state/<worker>/recovery/")
+    recovery.add_argument("--worker-id", dest="worker_id", default=None)
+    recovery.add_argument("--json", action="store_true")
+
     w = sub.add_parser(
         "work",
         help="do work: one round, or the driver loop with --loop",
@@ -856,6 +864,8 @@ def main(argv: list[str] | None = None) -> int:
         from .activity import command
 
         return command(args)
+    if cmd == "recovery":
+        return cmd_recovery(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size
@@ -1127,6 +1137,47 @@ def cmd_usage(args) -> int:
             elif value.get("account_unavailable_reason"):
                 print(f"  account credits: not queried ({value['account_unavailable_reason']})")
     return 0 if all(v.get("ok") for v in snap.values()) else 1
+
+
+def cmd_recovery(args) -> int:
+    """Local recovery records: never GitHub, never a reset. `confirm` only records an operator's
+    assertion of quiescence for the exact saved source; the next preparation acts on it."""
+    from . import work_recovery
+
+    if args.action == "confirm":
+        if not args.record:
+            raise Die("tauceti recovery confirm needs a record id")
+        try:
+            print(work_recovery.confirm(Config.resolve(args.worker_id), args.record))
+        except work_recovery.RecordError as error:
+            raise Die(str(error)) from None
+        return 0
+    rows = []
+    for worker, record, manifest, status in work_recovery.records():
+        if args.worker_id and worker != args.worker_id:
+            continue
+        rows.append(
+            dict(
+                worker=worker,
+                record=str(record) if record else None,
+                state=status.get("state") or ("corrupt" if record and manifest is None else "unknown"),
+                reason=status.get("reason"),
+                work=(manifest or {}).get("work"),
+                pr=(manifest or {}).get("pr"),
+                local_head=(manifest or {}).get("local_head"),
+            )
+        )
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("No local recovery records.")
+    for row in rows:
+        target = f" #{row['pr']}" if row["pr"] else ""
+        print(f"{row['worker']}: {row['state']} {row['record'] or '(incomplete save)'} {row['work'] or ''}{target}")
+        if row["reason"]:
+            print(f"  {row['reason']}")
+    return 0
 
 
 def cmd_status(args) -> int:

@@ -549,8 +549,10 @@ def do_fix(w, sv, c, opts, bubble):
             if bubble:
                 rc = run_in_bubble(w, TAUCETI, prompt, opts, allow_push=fork, cancel_event=lease.lost)
             else:
-                if not prepare_checkout(w.cfg):
-                    raise Die("overlap-fix: checkout preparation failed")
+                if not prepare_checkout(w.cfg, work="overlap-fix"):
+                    from .work_recovery import LAST_REFUSAL
+
+                    raise Die(f"overlap-fix: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
                 lease.require()
                 rc = run_agent_host(
                     w.cfg.checkout,

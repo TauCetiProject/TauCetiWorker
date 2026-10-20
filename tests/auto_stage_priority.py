@@ -112,7 +112,7 @@ with tempfile.TemporaryDirectory() as tmp:
         cfg=SimpleNamespace(state=Path(tmp), checkout=Path(tmp) / "code"),
         counters=SimpleNamespace(write=lambda name, value: writes.append((name, value))),
     )
-    tc.work_units.prepare_checkout = lambda _cfg: True
+    tc.work_units.prepare_checkout = lambda _cfg, **_: True
     tc.work_units.subprocess.run = fake_run
     try:
         progress_result = tc.work_units._do_progress_inner(progress_worker, None)
@@ -144,7 +144,7 @@ with tempfile.TemporaryDirectory() as tmp:
             return SimpleNamespace(returncode=1, stdout="", stderr="broken plan")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    tc.work_units.prepare_checkout = lambda _cfg: True
+    tc.work_units.prepare_checkout = lambda _cfg, **_: True
     tc.work_units.subprocess.run = failing_plan
     try:
         try:

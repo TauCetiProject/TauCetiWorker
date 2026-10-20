@@ -10,6 +10,7 @@ from decimal import Decimal
 
 WINDOWS = ("3h", "24h", "7d", "total")
 COST_WINDOWS = ("7d", "total")
+RECOVERY_COUNTS = ("records", "blocked", "preserved", "reset", "superseded", "incomplete", "corrupt")
 
 
 def amount(value, *, rate=False):
@@ -239,6 +240,15 @@ def display(value, default_kinds=()):
         )
         for reason in sharing.get("reasons", []):
             print("  " + reason)
+    recovery = s.get("work_recovery")
+    if recovery and any(recovery.get(key) for key in RECOVERY_COUNTS):
+        print()
+        print(
+            f"Local work recovery: {recovery.get('records', 0)} saved, {recovery.get('blocked', 0)} recovery-blocked, "
+            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt"
+        )
+        for reason in recovery.get("reasons", []):
+            print("  " + reason)
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
     print()
@@ -354,6 +364,10 @@ def combine(values):
             for key in ("shared", "private", "preparing", "blocked", "cache_hits", "preparation_seconds")
         }
         s["shared_mathlib"]["reasons"] = sorted({reason for row in sharing for reason in row.get("reasons", [])})
+    recovery = [v.get("work_recovery", {}) for v in known]
+    if any(recovery):
+        s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
+        s["work_recovery"]["reasons"] = sorted({reason for row in recovery for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):
         s["costs"]["funding"] = {

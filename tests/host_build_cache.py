@@ -203,7 +203,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         return real_run(command, **kwargs)
 
-    def prepare(cfg):
+    def prepare(cfg, **_):
         events.append("prepare")
         return True
 
