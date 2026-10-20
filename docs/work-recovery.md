@@ -254,8 +254,10 @@ and current-head integration under the same publication checks.
 state/reason; status does not read GitHub. The fresh-repair fence is worker-local;
 shared claims and the expected-head CAS coordinate writers across the fleet. For the historical PR16035 case, see
 [evidence/issue-310-pr16035-disposition.json](evidence/issue-310-pr16035-disposition.json).
-Terminal and blocked recovery evict rebuildable caches from its isolated/restoration clones;
-source, Git history, immutable records and outboxes remain archived.
+Terminal and blocked recovery retain caches alongside source, Git history, immutable
+records and outboxes until exact lifecycle evidence authorizes destructive cleanup.
+Independent recovery verification uses private cache and output paths below its record;
+it never falls back to the former author's writable caches.
 
 The production disposition is also retained under the main worker state tree's
 `recovery-dispositions/pr-16035.json`; its search scope is explicitly local.

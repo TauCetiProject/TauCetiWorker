@@ -886,6 +886,32 @@ class Fixture(unittest.TestCase):
         self.assertIn("Committed source differs", self.journal()["reason"]["detail"])
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
+    def test_recovery_follows_active_checkout_after_uncertain_source_retention(self):
+        decision = saved.guard(self.cfg, self.co, repository="upstream/repo")
+        self.assertTrue(decision.ok)
+        selected = saved.active_checkout(self.cfg)
+        self.assertNotEqual(selected, self.co)
+        self.assertFalse(selected.exists())  # selection precedes preparation/clone
+        self.assertTrue(self.run_recovery())
+        self.assertFalse(selected.exists())  # recovery has its own independent clone
+        self.assert_retained()
+
+    def test_recovery_verification_uses_private_caches_and_outputs(self):
+        checkout = self.record / "checkout"
+        checkout.mkdir()
+        old_cache = self.root / "author-cache"
+        old_cache.mkdir()
+        with patch.dict(
+            os.environ,
+            {key: str(old_cache) for key in ("LAKE_CACHE_DIR", "MATHLIB_CACHE_DIR", "TMPDIR", "TAUCETI_VERIFY_STATE")},
+        ):
+            env = self.backend.verification_environment(checkout)
+        for key in ("LAKE_CACHE_DIR", "MATHLIB_CACHE_DIR", "TMPDIR", "TAUCETI_VERIFY_STATE"):
+            self.assertTrue(Path(env[key]).is_relative_to(self.record))
+            self.assertNotEqual(Path(env[key]), old_cache)
+        (old_cache / "late.olean").write_bytes(b"late old-owner output")
+        self.assertFalse((Path(env["LAKE_CACHE_DIR"]) / "late.olean").exists())
+
     def test_terminal_recovery_retains_caches_without_exact_lifecycle_evidence(self):
         actual = self.backend.verify
 
