@@ -1871,14 +1871,14 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     log to the ordinary case. It printed one `warning: TauCeti Lake cache miss` line and rebuilt the
     library from source, every round, for as long as the endpoint stayed down.
     """
-    if not TAUCETI_CACHE_SERVICE:
-        return f"set -e; lake exe cache get || lake exe cache get; timeout 1800 lake build || true; exec {inner}"
-    fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     preliminary = (
         '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
         if verify_helper
         else "timeout 1800 lake build"
     )
+    if not TAUCETI_CACHE_SERVICE:
+        return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; exec {inner}"
+    fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     return (
         "set -e; "
         "lake exe cache get || lake exe cache get; "
@@ -2091,9 +2091,9 @@ def run_in_bubble(
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
-    tcenv = "env PATH=/opt/round:$PATH"
+    tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH"
     if api_bridge and _uses_claude_credentials(cred_model):
-        tcenv = "env PATH=/opt/api-bin:/opt/round:$PATH"
+        tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH"
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     for var in (

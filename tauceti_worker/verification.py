@@ -27,6 +27,7 @@ import uuid
 from pathlib import Path
 
 from .config import Die
+from .constants import LEAN_ROOT
 from .containment import Boundary
 from .paths import HERE
 from .runtime_status import read_json, report_runtime
@@ -35,6 +36,7 @@ from .verification_scope import git, local_main, scope, untracked
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 2
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
+LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
 
 
@@ -503,7 +505,7 @@ class Verification:
                 checker_in_base = git(
                     self.root, "ls-tree", "--name-only", self.base, "--", "scripts/check-expired-mathlib-shims.py"
                 )
-                if (self.root / "TauCeti/mathlib-shims.json").exists() or checker_in_base:
+                if (self.root / LEAN_DIR / "mathlib-shims.json").exists() or checker_in_base:
                     raise Incomplete("shim-expiry: required checker is missing")
                 return []  # Supported older TauCeti revisions have no shim registry/checker.
             merge = selected["merge_base"]
@@ -513,14 +515,14 @@ class Verification:
             baseline = self.directory / "base"
             baseline.mkdir(exist_ok=True)
             try:
-                manifest = git(self.root, "show", f"{merge}:TauCeti/mathlib-shims.json")
+                manifest = git(self.root, "show", f"{merge}:{LEAN_DIR}/mathlib-shims.json")
             except subprocess.CalledProcessError:
                 manifest = None
             if manifest is not None:
                 (baseline / "mathlib-shims.json").write_bytes(manifest)
                 # No shell pipeline: both git and tar exits are checked independently.
                 archive = self.directory / "base.tar"
-                archive.write_bytes(git(self.root, "archive", merge, "TauCeti"))
+                archive.write_bytes(git(self.root, "archive", merge, LEAN_DIR))
                 self.command("shim-baseline", ["tar", "-xf", str(archive), "-C", str(baseline)])
                 args += ["--base-manifest", str(baseline / "mathlib-shims.json"), "--base-root", str(baseline)]
                 pins = git(
