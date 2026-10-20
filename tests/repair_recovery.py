@@ -800,6 +800,19 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.values["fix-10-head"], 0)
         self.assertEqual(self.journal()["attempts"], 0)
 
+    def test_fresh_paid_dispatch_cannot_bypass_retained_source_on_same_pr(self):
+        from tauceti_worker import work_units
+
+        self.assertTrue(rr.pending_for(self.cfg, "upstream/repo", 10))
+        candidate = SimpleNamespace(pr=10)
+        options = SimpleNamespace(dry_run=False, sandbox_host=True)
+        with patch.object(
+            work_units, "_check_stage_read_quota", side_effect=AssertionError("Fresh repair bypassed retained source")
+        ):
+            self.assertIsNone(work_units.dispatch("fix", self.w, None, candidate, options))
+        rr.write(self.record, {}, "published")
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+
     def test_damaged_checkpoint_never_runs(self):
         (self.record / "staged.patch").write_text("corrupt")
         self.assertFalse(self.run_recovery())

@@ -1136,6 +1136,22 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True):
     return False
 
 
+def pending_for(cfg, repository, pr):
+    """A fresh paid repair must not bypass a retained checkpoint on the same PR."""
+    state = getattr(cfg, "state", None)
+    if state is None or not (state / "recovery").is_dir():
+        return False
+    for record in (state / "recovery").iterdir():
+        if not record.is_dir() or record.name.startswith("."):
+            continue
+        manifest = read_json(record / "manifest.json")
+        retained_pr = manifest.get("pr") or read_json(record / "operator.json").get("pr")
+        if manifest.get("repository") == repository and retained_pr == pr:
+            if read_json(record / "recovery.json").get("state") not in TERMINAL:
+                return True
+    return False
+
+
 def recover(w, opts):
     """At most one invocation and eight metadata inspections before unrelated selection.
 

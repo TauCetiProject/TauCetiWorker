@@ -1051,6 +1051,12 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if c.pr and w is not None and pending_for(getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
         log(f"  #{c.pr}: retained publication pending; selecting unrelated work")
         return None
+    if c.pr and stage in FILE_CHANGE_STAGES and w is not None:
+        from .repair_recovery import pending_for as retained_repair
+
+        if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
+            log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
+            return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
