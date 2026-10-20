@@ -283,8 +283,10 @@ class BudgetTests(unittest.TestCase):
         (inbox / (invocation + ".receipt")).write_text(
             json.dumps({"id": invocation, "totals": {"provider": "5"}, "outcome": "completed"})
         )
-        self.assertEqual(self.budget.recover("recover pending receipt without a fresh heartbeat")["unresolved"], [])
-        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 5)
+        self.assertEqual(
+            self.budget.recover("recover pending receipt without a fresh heartbeat")["unresolved"], [invocation]
+        )
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
         self.assertTrue(key.exists())
 
     def test_resumption_baseline_and_fair_waiting(self):
@@ -693,6 +695,7 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 receipt = json.loads(next(context.inbox.glob("*.receipt")).read_text())
                 self.assertIsNone(receipt["totals"])
                 self.assertTrue(receipt["provisional"])
+                self.assertNotIn("finished", receipt)
                 self.assertEqual(receipt["lower_bound_totals"], {"completed-model": "12"})
                 self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
             finally:
@@ -717,6 +720,8 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             receipt = json.loads(next(context.inbox.glob("*.receipt")).read_text())
             self.assertTrue(receipt["provisional"])
             self.assertIsNone(receipt["totals"])
+            self.assertIn("finished", receipt)
+            self.assertEqual(self.budget.replay()["sessions"][receipt["id"]]["finished"], receipt["finished"])
         self.assertEqual(len(self.budget.snapshot()["provisional"]), 1)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
 

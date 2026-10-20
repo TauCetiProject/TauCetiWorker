@@ -18,6 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import activity as a
 from tauceti_worker import activity_costs, activity_summary, fleet_events
+from tauceti_worker.budget import process_identity
 from tauceti_worker.usage_accounting import UsageJournal
 
 DAY = 86400
@@ -123,12 +124,60 @@ class CostTests(unittest.TestCase):
         a.prepare(now=self.now + 1)
         return a.cached(group="machine")["summary"]
 
+    def test_recovered_estimate_uses_recorded_interval_in_spending_windows(self):
+        self.session("d" * 32, 2 * DAY, "author", "6", settled=True)
+        self.records[-1]["timestamp"] = self.now
+        self.records[-1]["events"][0].update(
+            cost_provenance="historical-estimate",
+            finished=self.now - 2 * DAY + 100,
+            recovery_audit={"policy": "v1"},
+        )
+        self.write_ledger()
+        costs = self.summary()["costs"]
+        self.assertEqual(Decimal(costs["spending"]["24h"]["spent_usd"]), 90)
+        self.assertEqual(Decimal(costs["windows"]["total"]["estimated_usd"]), 106)
+
+    def test_missing_duration_estimate_is_at_start_not_smeared_to_repair(self):
+        self.session("e" * 32, 2 * DAY, "author", "6", settled=True)
+        self.records[-1]["timestamp"] = self.now
+        self.records[-1]["events"][0].update(
+            cost_provenance="prelaunch-estimate", finished=None, recovery_audit={"policy": "v1"}
+        )
+        self.write_ledger()
+        costs = self.summary()["costs"]
+        self.assertEqual(Decimal(costs["spending"]["24h"]["spent_usd"]), 90)
+        self.assertEqual(Decimal(costs["windows"]["total"]["estimated_usd"]), 106)
+
+    def test_prepared_accounting_separates_live_recovered_and_unresolved(self):
+        self.session("b" * 32, 30, "author", "5", settled=False)
+        self.records[-1]["events"][0]["owner"] = process_identity()
+        self.session("c" * 32, 20, "author", "6", settled=True)
+        self.records[-1]["events"][0].update(cost_provenance="prelaunch-estimate", recovery_audit={"policy": "v1"})
+        self.write_ledger()
+        costs = self.summary()["costs"]
+        self.assertEqual(
+            costs["accounting"], dict(live=1, settled_estimates=1, recovered_estimates=1, unresolved_stopped=1)
+        )
+        row = costs["windows"]["total"]
+        self.assertEqual(Decimal(row["settled_estimates_usd"]), 6)
+        self.assertEqual(Decimal(row["recovered_estimates_usd"]), 6)
+        self.assertEqual(Decimal(row["unresolved_stopped_usd"]), 40)
+        self.assertEqual(Decimal(row["estimated_usd"]), 106)
+        cached = a.cached(group="machine")
+        with (
+            patch.object(a, "_connect", side_effect=AssertionError("SQL in status")),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            a.display(cached)
+        self.assertIn("1 live; 1 settled estimates (1 recovered); 1 unresolved stopped", output.getvalue())
+
     def test_all_fleet_costs_include_reviews_but_only_initiated_output_counts(self):
         s = self.summary()
         rows = s["costs"]["windows"]
         self.assertEqual(set(rows), {"total", "7d"})
         self.assertEqual(Decimal(rows["total"]["spent_usd"]), Decimal(60))
-        self.assertEqual(Decimal(rows["total"]["active_accrued_usd"]), Decimal(40))
+        self.assertEqual(Decimal(rows["total"]["active_accrued_usd"]), 0)
+        self.assertEqual(Decimal(rows["total"]["unresolved_stopped_usd"]), Decimal(40))
         self.assertEqual(Decimal(rows["total"]["weighted_loc"]), Decimal(650))
         self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 650)
         # An old PR landing yesterday does not enter the seven-day initiation cohort.
@@ -298,6 +347,15 @@ class CostTests(unittest.TestCase):
     def test_different_accounting_versions_are_not_silently_pooled(self):
         modern = self.summary()
         legacy = json.loads(json.dumps(modern))
+        version_two = json.loads(json.dumps(modern))
+        version_two["costs"]["accounting_version"] = 2
+        for row in version_two["costs"]["windows"].values():
+            row["active_accrued_usd"] = row.pop("unresolved_stopped_usd")
+        mixed = activity_summary.combine(
+            [dict(available=True, summary=modern), dict(available=True, summary=version_two)]
+        )
+        self.assertEqual(Decimal(mixed["summary"]["costs"]["windows"]["total"]["estimated_usd"]), 200)
+        self.assertEqual(Decimal(mixed["summary"]["costs"]["windows"]["total"]["active_accrued_usd"]), 80)
         legacy["costs"]["accounting_version"] = 1
         for row in legacy["costs"]["windows"].values():
             row["pending_usd"] = row.pop("active_accrued_usd")

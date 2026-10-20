@@ -28,6 +28,7 @@ RUN_STDLIB=(
   activity.py
   activity_costs.py
   api_budget.py
+  budget_recovery.py
   usage_accounting.py
   shared_mathlib.py
   agent_cmds.py

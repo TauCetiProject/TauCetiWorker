@@ -270,6 +270,7 @@ def main():
             provisional=not authoritative,
             lower_bound_totals=dict(totals),
             outcome=outcome,
+            **({"finished": time.time()} if process_exited else {}),
         )
         try:
             atomic(bridge / "inbox" / (invocation + ".receipt"), receipt)
