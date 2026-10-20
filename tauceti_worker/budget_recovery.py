@@ -110,6 +110,10 @@ class Projection(Budget):
         return super().replay(copy.deepcopy(self.projected_records if records is None else records))
 
     def append(self, state, events):
+        for event in events:
+            if event["type"] == "settle" and event.get("cost_provenance") == "native-reported":
+                # Replaying an old receipt now does not make downtime part of its duration.
+                event["finished"] = state["sessions"][event["id"]].get("finished")
         self.events.extend(e for e in events if e["type"] != "accrue")
         self.projected_records.append(json.loads(self.record_bytes(state, events)))
 
@@ -200,7 +204,7 @@ def recover(budget, note, *, dry_run=False):
                         estimate, provenance = floor, "token-priced"
                         audit = dict(policy=POLICY, tier="complete-token-usage", duration=duration, comparable_ids=[])
                     else:
-                        estimate, provenance, audit = historical_estimate(session, original, now, duration)
+                        estimate, provenance, audit = historical_estimate(session, state["sessions"], now, duration)
                     cost = max(floor, estimate)
                     row.update(proposed_estimate_usd=str(estimate), confidence=provenance)
                     row["audit_inputs"].update(audit, floor_usd=str(floor), settled_total_usd=str(cost))

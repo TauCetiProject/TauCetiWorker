@@ -165,7 +165,8 @@ class Budget:
                     elif kind == "unresolved":
                         session = state["sessions"][event["id"]]
                         session["status"] = "provisional" if event.get("provisional") else "unresolved"
-                        session.setdefault("finished", rec["timestamp"])
+                        if "finished" in event:
+                            session["finished"] = event["finished"]
                         if "reserve" in event:
                             session.update(
                                 reserve=event["reserve"],

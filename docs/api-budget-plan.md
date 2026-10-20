@@ -360,9 +360,11 @@ With fewer than three, it uses at least three sessions of that model in the same
 window. Estimates, manually reconciled totals, the invocation itself, negative
 costs, missing/zero/invalid intervals and future endpoints are excluded. The rate
 is multiplied by this invocation's recorded duration and rounded to twelve decimal
-places in USD (half-even). Recorded terminal ledger
-events supply endpoints; if absent, the usage observation time can supply the
-end. Repair time never supplies an endpoint. An unusable duration or insufficient
+places in USD (half-even). Native settlement timestamps or explicitly recorded
+finish times supply endpoints; if absent, a usage observation time can supply the
+invocation's end. Orphan detection and repair time never supply an endpoint.
+Replayed native receipts retain the original recorded endpoint; missing endpoints
+exclude them from rate comparables. An unusable duration or insufficient
 comparables uses the **saved prelaunch estimate**, without recalculating admission
 estimates. The resulting total is at least the already charged/known priced prefix.
 It never adds the prefix to the estimated total.

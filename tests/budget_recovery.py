@@ -75,7 +75,7 @@ class RecoveryTests(unittest.TestCase):
                     )
                 )
             elif duration is not None:
-                events.append(dict(type="unresolved", id=key, outcome="stopped"))
+                events.append(dict(type="unresolved", id=key, outcome="stopped", finished=start + duration))
             if prefix is not None:
                 events.append(
                     dict(
@@ -180,6 +180,39 @@ class RecoveryTests(unittest.TestCase):
             _, rows = self.repair(True)
             self.assertEqual(rows[key]["confidence"], "prelaunch-estimate")
             self.assertEqual(Decimal(rows[key]["final_charge_usd"]), 9)
+
+    def test_orphan_detection_time_is_not_a_recorded_duration(self):
+        for c in (10, 20, 30):
+            self.session(cost=c, age=5000 + c)
+        key = self.session(duration=None, estimate="7")
+        with self.budget.locked():
+            self.budget.append(self.budget.replay(), [dict(type="unresolved", id=key, outcome="orphan detected")])
+        _, rows = self.repair()
+        self.assertEqual(rows[key]["confidence"], "prelaunch-estimate")
+        self.assertEqual(Decimal(rows[key]["final_charge_usd"]), 7)
+        self.assertIsNone(rows[key]["audit_inputs"]["duration"]["seconds"])
+
+    def test_native_receipt_repair_does_not_count_downtime_as_duration(self):
+        key = self.session(duration=None)
+        self.receipt(key, totals={"s": "4"})
+        self.repair()
+        self.assertIsNone(self.state(key)["finished"])
+
+    def test_recovered_native_comparables_available_to_later_invocation(self):
+        good = [self.session(age=5000) for _ in range(3)]
+        for i, key in enumerate(good):
+            self.receipt(key, totals={f"s{i}": "20"})
+        target = self.session(duration=200)
+        _, rows = self.repair()
+        self.assertEqual(rows[target]["confidence"], "historical-estimate")
+        self.assertEqual(rows[target]["audit_inputs"]["comparable_ids"], good)
+        self.assertEqual(Decimal(rows[target]["final_charge_usd"]), 40)
+
+    def test_reservation_is_not_an_estimated_charge(self):
+        key = self.session(estimate="7", reserve="221")
+        _, rows = self.repair()
+        self.assertEqual(Decimal(rows[key]["delta_usd"]), 7)
+        self.assertEqual(Decimal(rows[key]["released_reservation_usd"]), 221)
 
     def test_existing_308_charge_and_221_reservation_are_separate(self):
         charged = self.session(prefix="308", reserve="308")
