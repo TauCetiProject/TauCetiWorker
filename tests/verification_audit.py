@@ -590,7 +590,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
     def test_host_snapshot_retains_external_trusted_immutable_packages(self):
         packages = self.home / "immutable-packages"
         write(packages, "mathlib/Mathlib/A.lean", "dependency")
-        (self.root / ".lake").mkdir()
+        __import__("shutil").rmtree(self.root / ".lake/packages")
         (self.root / ".lake/packages").symlink_to(packages, target_is_directory=True)
         manifest = self.home / "installations.json"
         v.atomic(manifest, {str(packages): "publisher-1"})
