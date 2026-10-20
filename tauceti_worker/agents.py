@@ -1001,7 +1001,7 @@ def run_agent_proc(
         from .fleet_capacity import check_launch_admission
 
         check_launch_admission()
-        boundary = containment.Boundary(label, prefix=containment_prefix, contain=contain)
+        boundary = containment.Boundary(label, prefix=containment_prefix, contain=contain, env=env)
         command = boundary.argv(argv)
         # A separate group permits lease-loss cancellation without signalling
         # the worker's caller. A PID namespace dies with the worker by itself
@@ -1272,7 +1272,7 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
     """
     from .shared_mathlib import lease_fds
 
-    boundary = containment.Boundary("cache-fetch", prefix=prefix)
+    boundary = containment.Boundary("cache-fetch", prefix=prefix, env=env)
     command = boundary.argv(command)
     reader = writer = None
     if not boundary.strong:

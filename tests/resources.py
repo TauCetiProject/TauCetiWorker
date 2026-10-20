@@ -10,9 +10,11 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tauceti_worker import resources
 from tauceti_worker.resources import RoundResources, process_tree
 from tauceti_worker.runtime_status import read_json
 
@@ -53,6 +55,22 @@ with tempfile.TemporaryDirectory() as raw:
     assert last["worker"]["peak_tree_rss_bytes"] >= first["worker"]["peak_tree_rss_bytes"]
     assert len((cfg.logdir / "resources.jsonl").read_text().splitlines()) == 2
     assert last["sampling_error"] is None, last
+    with (
+        patch.object(resources, "read_bytes", side_effect=[4096, 12288]),
+        patch.object(resources, "host_pressure", side_effect=[{"io": {"some": 10}}, {"io": {"some": 35}}]),
+    ):
+        measured = RoundResources(cfg).sample()
+    assert measured["read_bytes"] == 8192, measured
+    assert measured["host_pressure_stall_us"] == {"io": {"some": 25}}, measured
+    assert "co-tenants" in measured["pressure_scope"]
+    with (
+        patch.object(resources, "read_bytes", return_value=None),
+        patch.object(resources, "host_pressure", return_value={}),
+    ):
+        unavailable = RoundResources(cfg).sample()
+    assert unavailable["read_bytes"] is None, unavailable
+    assert unavailable["host_pressure_stall_us"] == {}, unavailable
+
     os.environ.pop("TAUCETI_RUNTIME_STATUS")
 
 print("[OK ] child CPU, sampled tree memory, kernel high water, live status, and durable totals")

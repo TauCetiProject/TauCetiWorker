@@ -78,6 +78,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     env = {
         "PATH": f"{root}:{os.environ['PATH']}",
         "CACHE_TEST_CALLS": str(calls),
+        "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
         "LAKE_CACHE_DIR": str(root / "private-lake-store"),
         "LAKE_ARTIFACT_CACHE": "1",
         "LAKE_RESTORE_ARTIFACTS": "1",
@@ -257,7 +258,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         (root / "interrupt.log").open("ab") as output,
     ):
         try:
-            agents._cache_fetch(["lake"], co, env, output, 10)
+            agents._cache_fetch(["lake"], co, {**env, "TAUCETI_PROCESS_CONTAINMENT": "legacy"}, output, 10)
         except SystemExit as e:
             assert e.code == 143
         else:

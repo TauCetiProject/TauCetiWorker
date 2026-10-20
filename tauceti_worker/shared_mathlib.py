@@ -10,13 +10,17 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import platform
 import pwd
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from .runtime_status import atomic_json, read_json
@@ -26,30 +30,96 @@ class Unavailable(RuntimeError):
     pass
 
 
+class IntegrityFailure(Unavailable):
+    pass
+
+
+LOCK_WAIT_SECONDS = 1500  # fresh extraction can take up to 1200 seconds
+
+
 def root(env=None):
     env = os.environ if env is None else env
     login = Path(pwd.getpwuid(os.getuid()).pw_dir)
     if value := env.get("TAUCETI_SHARED_MATHLIB_ROOT"):
         return (login / value[2:] if value.startswith("~/") else Path(value)).resolve()
-    return login / ".cache/tauceti/mathlib-builds"
+    return (login / ".cache/tauceti/mathlib-builds").resolve()
 
 
 def pin_root(env):
     env.setdefault("TAUCETI_SHARED_MATHLIB_ROOT", str(root(env)))
 
 
-def mode(env):
-    policy = read_json(root(env) / "policy.json")
+def selection(env):
+    pool = root(env)
+    path = pool / "policy.json"
+    policy = read_json(path)
+    if path.exists() and (
+        not policy
+        or policy.get("mode") not in ("off", "auto", "required")
+        or not isinstance(policy.get("expires_at", 0), (int, float))
+        or not math.isfinite(policy.get("expires_at", 0))
+        or policy.get("expiry_mode", "off") not in ("off", "auto", "required")
+        or not isinstance(policy.get("workers", []), list)
+        or any(not isinstance(worker, str) for worker in policy.get("workers", []))
+    ):
+        if env.get("TAUCETI_SHARED_MATHLIB_BUILDS") == "required":
+            raise Unavailable("invalid shared Mathlib policy; repair policy.json before requiring sharing")
+        return "off", "invalid policy.json; repair before enabling sharing"
     expired = policy.get("expires_at", float("inf")) <= time.time()
     value = env.get(
-        "TAUCETI_SHARED_MATHLIB_BUILDS", policy.get("expiry_mode", "off") if expired else policy.get("mode", "auto")
+        "TAUCETI_SHARED_MATHLIB_BUILDS", policy.get("expiry_mode", "off") if expired else policy.get("mode", "off")
     ).lower()
     if value not in {"auto", "off", "required"}:
         raise Unavailable("TAUCETI_SHARED_MATHLIB_BUILDS must be auto, off or required")
     allowed = env.get("TAUCETI_SHARED_MATHLIB_WORKERS", ",".join(policy["workers"]) if "workers" in policy else None)
     if allowed is not None and env.get("TAUCETI_WORKER_ID", "default") not in allowed.split(","):
-        return "off"
-    return value
+        return "off", "worker is not allowlisted for shared Mathlib"
+    stop_path = pool / "safety-stop.json"
+    stop = read_json(stop_path)
+    reason = stop.get("reason") or policy.get("safety_stop")
+    if stop_path.exists() and (not isinstance(reason, str) or not reason):
+        reason = "unreadable safety-stop.json"
+    if reason:
+        if value == "required":
+            raise Unavailable(
+                "shared Mathlib safety stop: "
+                + reason
+                + "; investigate before clearing safety-stop.json and restoring policy"
+            )
+        return "off", "shared Mathlib safety stop: " + reason
+    if value != "off":
+        if value == "required" and env.get("TAUCETI_PROCESS_CONTAINMENT") == "legacy":
+            raise Unavailable("TAUCETI_PROCESS_CONTAINMENT=legacy disables the namespace-based shared view")
+        for path in (pool / "status").glob("*.json"):
+            row = read_json(path)
+            identity = row.get("supervisor")
+            if (
+                isinstance(identity, dict)
+                and isinstance(identity.get("pid"), int)
+                and process_identity(identity["pid"]) == identity
+                and row.get("containment_mode") not in {None, "pid-namespace"}
+            ):
+                if value == "required":
+                    raise Unavailable(
+                        "live worker reports weaker containment; wait for natural cleanup or use private mode"
+                    )
+                return "off", "live worker reports weaker containment; keep sharing off until natural cleanup"
+    reason = "sharing enabled"
+    if value == "off":
+        reason = (
+            "sharing disabled by environment"
+            if "TAUCETI_SHARED_MATHLIB_BUILDS" in env
+            else "shared Mathlib policy expired"
+            if expired
+            else "sharing disabled by policy"
+            if policy
+            else "sharing disabled: no opt-in policy.json"
+        )
+    return value, reason
+
+
+def mode(env):
+    return selection(env)[0]
 
 
 def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
@@ -86,11 +156,24 @@ def capability(directory=None):
             command = overlay_command(lower, upper, work, upper, lower)
             p = subprocess.run(
                 command
-                + ["sh", "-c", 'test "$(cat "$1/probe")" = shared && printf private > "$1/probe"', "sh", str(upper)],
+                + [
+                    "sh",
+                    "-c",
+                    'test "$(cat "$1/probe")" = shared && printf private > "$1/probe" '
+                    '&& ! (printf poison > "$2/probe")',
+                    "sh",
+                    str(upper),
+                    str(lower),
+                ],
                 capture_output=True,
                 timeout=10,
             )
-            if p.returncode or (lower / "probe").read_text() != "shared" or (upper / "probe").read_text() != "private":
+            if (lower / "probe").read_text() != "shared":
+                return (
+                    False,
+                    "isolation failure: overlay probe modified its immutable lower; stop sharing and investigate",
+                )
+            if p.returncode or (upper / "probe").read_text() != "private":
                 return (
                     False,
                     "rootless OverlayFS probe failed: "
@@ -131,7 +214,6 @@ def cache_context(path):
         selected=selected,
         raw_urls={name: url for name, url in raw.items() if url},
         resolved_urls=resolved,
-        tag=git(path, "name-rev", "--tags", "HEAD") if branch == "HEAD" else None,
     )
 
 
@@ -141,7 +223,6 @@ def cache_identity(context):
     return dict(
         branch=context["branch"],
         selected=context["selected"],
-        tag=context["tag"],
         remotes={
             name: hashlib.sha256(url.encode()).hexdigest() if url else None
             for name, url in context["resolved_urls"].items()
@@ -211,8 +292,23 @@ def signature(cwd, env):
         name: (cwd / name).read_text() if (cwd / name).is_file() else None
         for name in ("lake-manifest.json", "lakefile.toml", "lakefile.lean", "lean-toolchain")
     }
+    # Temporary LAKE_CONFIG filenames and private download directories are not
+    # cache selectors. Bind their content/selection settings, without publishing
+    # endpoint credentials in ready.json.
+    selection = {
+        name: hashlib.sha256(value.encode()).hexdigest()
+        for name, value in env.items()
+        if (
+            name.startswith(("LAKE_", "MATHLIB_"))
+            and name not in {"LAKE_CONFIG", "LAKE_CACHE_DIR", "MATHLIB_CACHE_DIR"}
+        )
+        or name in {"ELAN_TOOLCHAIN", "LEAN_SYSROOT", "LEAN_PATH", "LEAN_SRC_PATH"}
+    }
+    lake_config = Path(env["LAKE_CONFIG"]) if env.get("LAKE_CONFIG") else None
+    if lake_config and not lake_config.is_absolute():
+        lake_config = cwd / lake_config
     spec = dict(
-        version=1,
+        version=3,
         artifacts=artifacts,
         mathlib=dependencies["mathlib"],
         dependencies=dependencies,
@@ -221,6 +317,10 @@ def signature(cwd, env):
         mathlib_manifest=(mathlib / "lake-manifest.json").read_text(),
         toolchain=toolchain,
         abi=lean.stdout.strip(),
+        resolved_toolchain=str(library.parent.parent.resolve()),
+        toolchain_init=hashlib.sha256((library / "Init.olean").read_bytes()).hexdigest(),
+        lake_config=hashlib.sha256(lake_config.read_bytes()).hexdigest() if lake_config else None,
+        cache_selection=selection,
         architecture=platform.machine(),
         system=platform.system(),
     )
@@ -229,13 +329,31 @@ def signature(cwd, env):
 
 
 @contextlib.contextmanager
-def key_lock(pool, key, exclusive=True, nonblocking=False):
+def key_lock(pool, key, exclusive=True, nonblocking=False, timeout=None):
     locks = pool / "locks"
     locks.mkdir(parents=True, exist_ok=True)
     with (locks / (key + ".lock")).open("a+") as stream:
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        fcntl.flock(stream, flags | (fcntl.LOCK_NB if nonblocking else 0))
+        lease_lock(stream, flags | (fcntl.LOCK_NB if nonblocking else 0), timeout=timeout)
         yield stream
+
+
+def lease_lock(stream, flags, *, timeout=None):
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while True:
+        try:
+            fcntl.flock(stream, flags | (fcntl.LOCK_NB if deadline is not None else 0))
+            return
+        except BlockingIOError:
+            if deadline is None:
+                raise
+            if time.monotonic() >= deadline:
+                raise Unavailable(
+                    "shared Mathlib lock wait timed out; use private mode and inspect publisher/reader leases"
+                ) from None
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        except OSError as error:
+            raise IntegrityFailure(f"shared Mathlib lease failure: {error}; stop sharing and investigate") from error
 
 
 def remove_tree(path):
@@ -268,6 +386,15 @@ def detach_upper(upper, marker):
     marker.unlink(missing_ok=True)
 
 
+def upper_usage(upper):
+    try:
+        files = [path.lstat() for path in upper.rglob("*")]
+        regular = [info for info in files if stat.S_ISREG(info.st_mode)]
+        return dict(upper_files=len(regular), upper_bytes=sum(info.st_size for info in regular))
+    except OSError:
+        return dict(upper_files=None, upper_bytes=None)
+
+
 def durable_tree(path):
     """Sync immutable data and directories before publishing its ready marker."""
     for here, _, files in os.walk(path, topdown=False):
@@ -289,20 +416,127 @@ def durable_tree(path):
             os.close(fd)
 
 
+def inventory(build):
+    """Fingerprint trusted local files without rereading gigabytes on every hit.
+
+    ctime detects overwrites even if size and mtime are restored. Readers cannot
+    change these files through the read-only pool mount. The host owner remains
+    trusted, as with the existing cache (this is not a hostile-host boundary).
+    Reject links and special files, including symlinked directories.
+    """
+    result = {}
+    device = build.stat().st_dev
+    for here, directories, files in os.walk(build):
+        for path in [Path(here), *(Path(here) / name for name in directories + files)]:
+            info = path.lstat()
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                raise Unavailable(f"unsupported snapshot file {path.relative_to(build)}")
+            if info.st_dev != device or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1):
+                raise Unavailable(f"snapshot file has a mount or hardlink alias: {path.relative_to(build)}")
+            if stat.S_ISREG(info.st_mode):
+                result[str(path.relative_to(build))] = [
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_nlink,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                ]
+    return result
+
+
+def ready_entry(entry, key, spec):
+    """Called with a lease. Preserve a damaged published lower for investigation."""
+    if not entry.exists():
+        return False
+    ready = read_json(entry / "ready.json")
+    try:
+        valid = (
+            ready.get("key") == key
+            and ready.get("spec") == spec
+            and bool(ready.get("inventory"))
+            and (entry / "build").is_dir()
+            and not (entry / "build").is_symlink()
+            and inventory(entry / "build") == ready["inventory"]
+        )
+    except (OSError, Unavailable) as error:
+        raise IntegrityFailure(
+            f"snapshot integrity failure for {key}: {error}; retain lower and use private mode"
+        ) from error
+    if not valid:
+        raise IntegrityFailure(f"snapshot integrity failure for {key}; retain lower and use private mode")
+    return True
+
+
+def stop_sharing(pool, reason):
+    """Stop future rounds; never disturb existing leases or immutable readers."""
+    from .config import log
+
+    recorded = False
+    try:
+        atomic_json(pool / "safety-stop.json", dict(reason=reason, stopped_at=time.time()))
+        recorded = True
+    except OSError as error:
+        log(f"shared Mathlib SAFETY STOP receipt could not be written: {error}")
+    try:
+        with key_lock(pool, "policy", timeout=1):
+            policy = read_json(pool / "policy.json")
+            atomic_json(pool / "policy.json", {**policy, "mode": "off"})
+            recorded = True
+    except (OSError, Unavailable) as error:
+        log(f"shared Mathlib SAFETY STOP policy could not be written: {error}")
+    if recorded:
+        try:
+            fd = os.open(pool, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as error:
+            log(f"shared Mathlib SAFETY STOP directory sync unavailable: {error}")
+    return recorded
+
+
+def discard_entry(pool, entry):
+    """Hide an unlocked entry atomically before deletion can be interrupted."""
+    trash = pool / "trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    retired = trash / (entry.name + "-" + uuid.uuid4().hex)
+    os.replace(entry, retired)
+    for directory in (entry.parent, trash):
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    remove_tree(retired)
+
+
 def collect(pool, *, protect=(), now=None):
+    try:
+        with key_lock(pool, "gc", nonblocking=True):
+            return _collect(pool, protect=protect, now=now)
+    except BlockingIOError:
+        return []
+
+
+def _collect(pool, *, protect=(), now=None):
     """Bounded by snapshot count. Locked readers/builders are never reclaimed."""
     now = time.time() if now is None else now
     entries = pool / "entries"
     entries.mkdir(parents=True, exist_ok=True)
+    for retired in (pool / "trash").glob("*"):
+        with contextlib.suppress(FileNotFoundError):
+            remove_tree(retired)
     # A killed builder cannot run TemporaryDirectory cleanup. Reclaim its
     # staging tree before evicting useful published snapshots for disk pressure.
     for stage in (pool / "staging").glob("*"):
         key = stage.name.split("-", 1)[0]
         if key in protect or len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
             continue
-        if not stage.is_dir() or now - stage.stat().st_mtime < 4 * 3600:
-            continue
         try:
+            if not stage.is_dir() or now - stage.stat().st_mtime < 4 * 3600:
+                continue
             with key_lock(pool, key, nonblocking=True):
                 remove_tree(stage)
         except (BlockingIOError, FileNotFoundError):
@@ -317,7 +551,7 @@ def collect(pool, *, protect=(), now=None):
             continue
         try:
             with key_lock(pool, entry.name, nonblocking=True):
-                shutil.rmtree(entry)
+                discard_entry(pool, entry)
                 removed.append(entry.name)
         except (BlockingIOError, FileNotFoundError):
             pass
@@ -367,7 +601,7 @@ def verify(build, mathlib, artifacts=(".olean", ".ilean")):
 def publish(pool, key, spec, cwd, env, logdir, fetch):
     """Called under exclusive key lock. A failed download never publishes a lower."""
     entry = pool / "entries" / key
-    if read_json(entry / "ready.json").get("key") == key and (entry / "build").is_dir():
+    if ready_entry(entry, key, spec):
         os.utime(entry, None)
         return entry, True
     collect(pool, protect=(key,))
@@ -392,7 +626,18 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         logdir.mkdir(parents=True, exist_ok=True)
         log = logdir / "shared-mathlib-prepare.log"
         with log.open("ab") as output:
-            rc = fetch(["lake", "exe", "cache", "get"], project, env, output, 1200)
+            from .containment import command
+
+            # Every tool sees a read-only pool, including private agents. Only
+            # this fresh trusted project's staging subtree is writable here.
+            rc = fetch(
+                ["lake", "exe", "cache", "get"],
+                project,
+                env,
+                output,
+                1200,
+                prefix=command("--bind", str(project), str(project), env=env),
+            )
         if rc:
             raise Unavailable(f"fresh Mathlib extraction failed (exit {rc}); see {log}")
         mathlib = project / ".lake/packages/mathlib"
@@ -404,15 +649,17 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         ready = stage / "ready"
         ready.mkdir()
         shutil.move(str(build), ready / "build")
+        files = inventory(ready / "build")
         durable_tree(ready / "build")
-        atomic_json(ready / "ready.json", dict(key=key, spec=spec, files_verified=count, published_at=time.time()))
+        atomic_json(
+            ready / "ready.json",
+            dict(key=key, spec=spec, files_verified=count, inventory=files, published_at=time.time()),
+        )
         collect(pool, protect=(key,))
         usage = shutil.disk_usage(pool)
         if usage.free / usage.total < 0.1:
             raise Unavailable("snapshot extraction would leave under 10% disk free; using private builds")
         entry.parent.mkdir(parents=True, exist_ok=True)
-        if entry.exists():
-            shutil.rmtree(entry)  # only incomplete entry; no reader can hold this exclusive lock
         os.replace(ready, entry)
         fd = os.open(entry.parent, os.O_RDONLY)
         try:
@@ -422,13 +669,37 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
     return entry, False
 
 
+def process_identity(pid):
+    try:
+        if platform.system() == "Linux":
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] == "Z":
+                return None
+            return dict(pid=pid, start=fields[19], boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+        os.kill(pid, 0)
+        return dict(pid=pid)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def report(pool, env, **fields):
     worker = env.get("TAUCETI_WORKER_ID", "default")
     identity = hashlib.sha256(worker.encode()).hexdigest()
+    from .activity import current_round_id
+    from .containment import status
+
     try:
         atomic_json(
             pool / "status" / (identity + ".json"),
-            dict(worker=worker, scope=env.get("TAUCETI_FLEET_MACHINE_ID", "local"), observed_at=time.time(), **fields),
+            dict(
+                worker=worker,
+                scope=env.get("TAUCETI_FLEET_MACHINE_ID", "local"),
+                round_id=current_round_id(),
+                supervisor=process_identity(os.getpid()),
+                containment_mode=status(env).mode,
+                observed_at=time.time(),
+                **fields,
+            ),
         )
     except OSError:
         from .config import log
@@ -447,12 +718,32 @@ def summary(env=None, *, scope=None, worker=None):
         and (scope is None or r.get("scope", "local") == scope)
         and (worker is None or r.get("worker") == worker)
     ]
+    for row in rows:
+        supervisor = row.get("supervisor")
+        if row.get("mode") in {"preparing", "shared", "overlay-ready"} and (
+            not isinstance(supervisor, dict)
+            or not isinstance(supervisor.get("pid"), int)
+            or process_identity(supervisor["pid"]) != supervisor
+        ):
+            row.update(mode="idle", reason="shared preparation supervisor exited; namespace leases remain protected")
+        if row.get("mode") in {"shared", "overlay-ready"} and row.get("key"):
+            if not isinstance(row["key"], str) or not re.fullmatch("[0-9a-f]{64}", row["key"]):
+                row.update(mode="blocked", reason="invalid shared Mathlib key in preparation receipt")
+                continue
+            try:
+                with key_lock(pool, row["key"], nonblocking=True):
+                    row.update(mode="idle", reason="shared lease no longer active")
+            except BlockingIOError:
+                pass  # Includes a namespace retaining its lease after supervisor death.
+            except (OSError, Unavailable):
+                row.update(mode="blocked", reason="shared Mathlib lease status unavailable")
     return dict(
         shared=sum(r.get("mode") == "shared" for r in rows),
         private=sum(r.get("mode") == "private" for r in rows),
         cache_hits=sum(r.get("cache_hit", False) for r in rows),
         preparing=sum(r.get("mode") in {"preparing", "overlay-ready"} for r in rows),
         blocked=sum(r.get("mode") == "blocked" for r in rows),
+        idle=sum(r.get("mode") == "idle" for r in rows),
         preparation_seconds=sum(r.get("preparation_seconds", 0) for r in rows),
         reasons=sorted({r["reason"] for r in rows if r.get("reason")}),
     )
@@ -461,8 +752,12 @@ def summary(env=None, *, scope=None, worker=None):
 @contextlib.contextmanager
 def view(cwd, env, logdir, fetch):
     """Yield an argv prefix and keep the lower leased until the whole agent exits."""
-    selected = mode(env)
     pool = root(env)
+    try:
+        selected, selection_reason = selection(env)
+    except Unavailable as error:
+        report(pool, env, mode="blocked", reason=str(error))
+        raise
     started = time.monotonic()
     upper = cwd / ".lake/packages/mathlib/.lake/build"
     marker = upper.parent / "tauceti-shared-mathlib.json"
@@ -472,42 +767,61 @@ def view(cwd, env, logdir, fetch):
         # sharing is enabled again at a later idle boundary.
         detach_upper(upper, marker)
         if selected != "off" and selected == "required":
+            report(pool, env, mode="blocked", reason="Mathlib dependency is not available for sharing")
             raise Unavailable("Mathlib dependency is not available for sharing")
-        if selected == "off":
-            report(pool, env, mode="private", reason="sharing disabled")
+        report(
+            pool,
+            env,
+            mode="private",
+            reason=selection_reason if selected == "off" else "Mathlib dependency is not available for sharing",
+        )
         yield []
         return
     prefix, backup, backup_created, backup_sparse = [], None, False, False
+    safety_stop_recorded = None
     with contextlib.ExitStack() as stack:
         try:
             from . import containment
 
-            if containment.policy() == "legacy":
+            report(pool, env, mode="preparing", reason="checking namespace capability and dependency identity")
+            if containment.policy(env) == "legacy":
                 # The view is itself a PID namespace; the rollback must not keep using one.
                 raise Unavailable(f"{containment.POLICY_ENV}=legacy disables the namespace-based shared view")
+            if not containment.capability(env, fresh=True).strong:
+                raise Unavailable("strong process containment is unavailable; keep sharing off and use private builds")
             pool.mkdir(parents=True, exist_ok=True, mode=0o700)
             ok, reason = capability(pool)
             if not ok:
+                if reason.startswith("isolation failure"):
+                    raise IntegrityFailure(reason)
                 raise Unavailable(reason)
             key, spec = signature(cwd, env)
             report(pool, env, mode="preparing", key=key)
-            lease = stack.enter_context(key_lock(pool, key, exclusive=False))
-            env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = str(lease.fileno())
+            lease = stack.enter_context(key_lock(pool, key, exclusive=False, timeout=LOCK_WAIT_SECONDS))
             entry = pool / "entries" / key
-            hit = read_json(entry / "ready.json").get("key") == key and (entry / "build").is_dir()
+            hit = ready_entry(entry, key, spec)
             if hit:
                 os.utime(entry, None)
             else:
-                # Drop the read lease before competing to build. publish checks
-                # again after locking, so only one builder downloads this key.
-                fcntl.flock(lease, fcntl.LOCK_UN)
-                fcntl.flock(lease, fcntl.LOCK_EX)
-                entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
-                fcntl.flock(lease, fcntl.LOCK_SH)
+                # Serialize publishers separately: a waiting first user must not
+                # wait for the winner's entire paid round to release its lease.
+                lease_lock(lease, fcntl.LOCK_UN)
+                with key_lock(pool, key + "-publisher", timeout=LOCK_WAIT_SECONDS):
+                    lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
+                    hit = ready_entry(entry, key, spec)
+                    if not hit:
+                        lease_lock(lease, fcntl.LOCK_UN)
+                        lease_lock(lease, fcntl.LOCK_EX, timeout=LOCK_WAIT_SECONDS)
+                        entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
+                        lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
             upper.parent.mkdir(parents=True, exist_ok=True)
             ok, reason = capability(upper.parent)
             if not ok:
+                if reason.startswith("isolation failure"):
+                    raise IntegrityFailure(reason)
                 raise Unavailable(reason)
+            # Prior copies and whiteouts must not shadow the lower next round.
+            detach_upper(upper, marker)
             old = read_json(marker)
             backup = upper.with_name("build-before-sharing")
             work = upper.with_name("tauceti-overlay-work")
@@ -525,14 +839,16 @@ def view(cwd, env, logdir, fetch):
             work.mkdir(exist_ok=True)
             candidate = overlay_command(entry / "build", upper, work, upper, pool, lease_fd=lease.fileno())
             probe = subprocess.run(
-                candidate + ["test", "-f", str(upper / "lib/lean/Mathlib.olean")],
+                candidate + ["sh", "-c", 'test -f "$1/lib/lean/Mathlib.olean" || exit 42', "sh", str(upper)],
                 capture_output=True,
                 timeout=15,
                 pass_fds=(lease.fileno(),),
             )
+            if probe.returncode == 42:
+                raise IntegrityFailure("verified lower missing through fresh overlay; stop sharing and investigate")
             if probe.returncode:
-                raise Unavailable("shared Mathlib view failed: " + probe.stderr.decode(errors="replace")[-300:])
-            fcntl.flock(lease, fcntl.LOCK_SH)
+                raise Unavailable("shared Mathlib view unavailable: " + probe.stderr.decode(errors="replace")[-300:])
+            lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
             prefix = candidate
             env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = str(lease.fileno())
             env["TAUCETI_SHARED_MATHLIB_KEY"] = key
@@ -540,7 +856,15 @@ def view(cwd, env, logdir, fetch):
             report(
                 pool, env, mode="overlay-ready", key=key, cache_hit=hit, preparation_seconds=time.monotonic() - started
             )
-        except (Unavailable, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        except (
+            Unavailable,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+            containment.ContainmentUnconfirmed,
+        ) as error:
+            if isinstance(error, (IntegrityFailure, containment.ContainmentUnconfirmed)):
+                safety_stop_recorded = stop_sharing(pool, str(error))
             if backup_created and backup and backup.exists():
                 remove_tree(upper)
                 if backup_sparse:
@@ -553,26 +877,84 @@ def view(cwd, env, logdir, fetch):
             report(
                 pool,
                 env,
-                mode="blocked" if selected == "required" else "private",
+                mode="blocked"
+                if selected == "required" or isinstance(error, containment.ContainmentUnconfirmed)
+                else "private",
                 reason=str(error),
                 preparation_seconds=time.monotonic() - started,
+                safety_stop_recorded=safety_stop_recorded,
             )
             stack.close()
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
+            if isinstance(error, containment.ContainmentUnconfirmed):
+                raise
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []
         # The body is outside the preparation handler: never retry paid work.
+        body_error = None
+        cleanup_error = None
         try:
             yield prefix
+        except BaseException as error:
+            body_error = type(error).__name__
+            if prefix and isinstance(error, containment.ContainmentUnconfirmed):
+                safety_stop_recorded = stop_sharing(
+                    pool, "shared namespace cleanup unconfirmed; preserve active leases and investigate"
+                )
+            raise
         finally:
+            if prefix:
+                if body_error is None and backup and backup.exists():
+                    try:
+                        remove_tree(backup)
+                    except OSError as error:
+                        cleanup_error = str(error)
+                stack.close()
+                from . import activity, containment
+
+                round_id = activity.current_round_id()
+                empty = containment.confirmed_empty(round_id) if round_id is not None else None
+                if containment.cleanup_unconfirmed(round_id):
+                    safety_stop_recorded = stop_sharing(
+                        pool, "shared round namespace cleanup unconfirmed; preserve active leases and investigate"
+                    )
+                record_result(
+                    env,
+                    None,
+                    phase="cleanup",
+                    backup_retained=bool(backup and backup.exists()),
+                    body_error=body_error,
+                    cleanup_error=cleanup_error,
+                    boundaries_confirmed_empty=empty,
+                    cleanup_success=(body_error is None and cleanup_error is None and empty)
+                    if empty is not None
+                    else None,
+                    safety_stop_recorded=safety_stop_recorded,
+                    **upper_usage(upper),
+                )
+                previous = read_json(
+                    pool
+                    / "status"
+                    / (hashlib.sha256(env.get("TAUCETI_WORKER_ID", "default").encode()).hexdigest() + ".json")
+                )
+                if previous.get("mode") != "blocked":
+                    report(
+                        pool,
+                        env,
+                        mode="blocked" if cleanup_error else "idle",
+                        key=env["TAUCETI_SHARED_MATHLIB_KEY"],
+                        reason=cleanup_error
+                        or read_json(pool / "safety-stop.json").get("reason")
+                        or "shared view released; awaiting next natural round",
+                        preparation_seconds=previous.get("preparation_seconds", 0),
+                        cache_hit=previous.get("cache_hit", False),
+                    )
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
-        if prefix and backup and backup.exists():
-            remove_tree(backup)
 
 
 def preparation_status(env, *, error=None):
@@ -597,20 +979,27 @@ def lease_fds(env):
     return (int(value),) if value is not None else ()
 
 
-def record_result(env, code):
+def record_result(env, code, *, phase="invocation", **fields):
     key = env.get("TAUCETI_SHARED_MATHLIB_KEY")
     if not key:
         return
     from .activity import current_round_id
 
+    pool = root(env)
+    previous = read_json(
+        pool / "status" / (hashlib.sha256(env.get("TAUCETI_WORKER_ID", "default").encode()).hexdigest() + ".json")
+    )
     record = dict(
         at=time.time(),
         worker=env.get("TAUCETI_WORKER_ID", "default"),
         round_id=current_round_id(),
         key=key,
         exit_code=code,
+        phase=phase,
+        preparation_seconds=previous.get("preparation_seconds"),
+        cache_hit=previous.get("cache_hit"),
+        **fields,
     )
-    pool = root(env)
     try:
         with (pool / "results.jsonl").open("a") as stream:
             fcntl.flock(stream, fcntl.LOCK_EX)
