@@ -176,11 +176,11 @@ with (
         assert pending["attempts"] == 0 and pending["waits"] == count
         assert publication.fingerprints(work) == original
     assert pending["retry_at"] >= time.time() + 14390
-    # The full stage also refunds Git fetch/clone waits after many temporary attempts.
+    # Fetch waits and damaged retained metadata defer without resetting source or losing prose.
     for operation in ("fetch", "clone"):
 
         def unavailable(args, operation=operation, **kwargs):
-            assert args[:1] == ["git"] and operation in args
+            assert operation == "fetch" and args[:1] == ["git"] and operation in args
             return subprocess.CompletedProcess(args, 1, "", "network unavailable")
 
         original_git = roadmap / ".git"
@@ -195,10 +195,7 @@ with (
                 assert wu._do_progress_inner(worker, None) is None
         finally:
             if operation == "clone":
-                # Without .git the directory is moved aside whole before the clone attempt.
-                moved = sorted(d for d in (roadmap.parent / "retained-checkouts").glob("roadmap-*") if d.is_dir())
-                if not roadmap.exists() and moved:
-                    moved[-1].rename(roadmap)
+                assert (roadmap / "Area" / "PROGRESS.md").exists()
                 backup_git.rename(original_git)
         assert publication.retained(cfg)["attempts"] == 0
         assert publication.fingerprints(work) == original

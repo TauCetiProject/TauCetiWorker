@@ -17,6 +17,7 @@ from .github import GitHub, can_push, ensure_fork, me, shared_claims_granted
 from .overlap_state import Lease, State, environment, git
 from .overlap_support import atomic, locked, read_context, root, shared_read, snapshot
 from .paths import HERE
+from .work_recovery import active_checkout
 
 MATHLIB = "leanprover-community/mathlib4"
 FIRST_PIN = "66748b489336a59ed4b4a4a612615c38de823e9a"
@@ -556,7 +557,7 @@ def do_fix(w, sv, c, opts, bubble):
                     raise Die(f"overlap-fix: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
                 lease.require()
                 rc = run_agent_host(
-                    w.cfg.checkout,
+                    active_checkout(w.cfg),
                     prompt,
                     _effective_authoring_profile(opts),
                     w.cfg.logdir,

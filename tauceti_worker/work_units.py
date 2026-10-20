@@ -103,6 +103,7 @@ from .survey import (
     spread_candidates,
     survey,
 )
+from .work_recovery import active_checkout, progress_checkout, progress_work
 
 # ============================================================================
 # Round — the want-gated cascade over survey(): classify every open PR, then do ONE work unit.
@@ -632,7 +633,7 @@ def _checkout_head(cfg: Config) -> str | None:
     """The checkout's HEAD before a round, or None when there is nothing to compare against."""
     try:
         p = subprocess.run(
-            ["git", "-C", str(cfg.checkout), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30
+            ["git", "-C", str(active_checkout(cfg)), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -649,7 +650,10 @@ def _candidate_checkout_unchanged(cfg: Config, c: Candidate) -> bool:
         return False
     try:
         status = subprocess.run(
-            ["git", "-C", str(cfg.checkout), "status", "--porcelain"], capture_output=True, text=True, timeout=30
+            ["git", "-C", str(active_checkout(cfg)), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -674,7 +678,9 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
 
     def git(*args) -> str:
         try:
-            p = subprocess.run(["git", "-C", str(cfg.checkout), *args], capture_output=True, text=True, timeout=60)
+            p = subprocess.run(
+                ["git", "-C", str(active_checkout(cfg)), *args], capture_output=True, text=True, timeout=60
+            )
         except (OSError, subprocess.SubprocessError):
             return ""
         return p.stdout if p.returncode == 0 else ""
@@ -1680,7 +1686,7 @@ def _do_fixlike(
                 f"{label} #{pr}: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}", code=1
             )
             return 1
-        co = w.cfg.checkout
+        co = active_checkout(w.cfg)
         from .activity import current_round_id
 
         conversation_round = current_round_id()
@@ -2069,14 +2075,17 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                         "--roadmap-dir",
                         str(roadmap_dir),
                         "--code-dir",
-                        str(w.cfg.checkout),
+                        str(active_checkout(w.cfg)),
                         "--min-prs",
                         "25",
                         "--out",
                         str(plan_file),
                     ),
                 ),
-                ("facts", ("--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file))),
+                (
+                    "facts",
+                    ("--plan", str(plan_file), "--code-dir", str(active_checkout(w.cfg)), "--out", str(facts_file)),
+                ),
             ):
                 proc = run_tool(stage, *args, capture=True, docs_cache=cache)
                 if stage == "plan" and proc.returncode == EX_NOPROGRESS:
@@ -2146,7 +2155,7 @@ def _do_progress_inner(w, opts) -> int | None:
     from . import progress_publication as publication
 
     retained = publication.retained(w.cfg)
-    marker = w.cfg.state / "progress/work/publication.json"
+    marker = progress_work(w.cfg) / "publication.json"
     if marker.exists() and not retained:
         log("Prepared progress receipt does not match its files; preserving it for recovery")
         return None
@@ -2169,38 +2178,32 @@ def _do_progress_inner(w, opts) -> int | None:
 
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
-    roadmap_dir = w.cfg.state / "progress" / "roadmap"
+    roadmap_dir = progress_checkout(w.cfg)
     from .work_recovery import guard, note_owner, retain
 
-    if retained and (roadmap_dir / ".git").is_dir():
+    if retained:
+        if not (roadmap_dir / ".git").is_dir():
+            # Keep publication inputs attached to their saved generation. A damaged publication
+            # checkout is handled by saved-work recovery, without switching its work directory.
+            return _defer_progress_publication(w, retained, f"retained roadmap metadata unavailable at {roadmap_dir}")
         # A prepared local branch is an immutable publication artifact. Fetch
         # the live cursor, while leaving its branch and working tree intact.
         if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
             return _defer_progress_publication(w, retained, f"temporary fetch failure in {roadmap_dir}")
     else:
-        if roadmap_dir.exists() and not (roadmap_dir / ".git").is_dir():
-            retain(w.cfg, roadmap_dir, "the roadmap clone has no git metadata", label="progress-roadmap")
-        if (roadmap_dir / ".git").is_dir():
-            # `apply` commits and pushes here; an interrupted apply's leftovers are saved, not discarded.
+        if roadmap_dir.exists():
+            # Source remains at the original absolute path, even when saving fails.
             decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
-            if not decision.ok:
-                raise Die(f"refreshing {roadmap_dir} refused: {decision.reason}")
-        if (roadmap_dir / ".git").is_dir():  # still in place unless the guard moved it aside
-            if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
-                raise Die(f"refreshing {roadmap_dir} failed")  # usually the network; retried next round
-            if subprocess.run(
-                ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
-            ).returncode:
-                # A local failure (a stale lock): move the clone aside and clone afresh below.
-                retain(w.cfg, roadmap_dir, "forced checkout of the roadmap clone failed", label="progress-roadmap")
-            else:
-                subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
-        if not (roadmap_dir / ".git").is_dir():
-            roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
-            if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
-                if retained:
-                    return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
-                raise Die(f"cloning {ROADMAP} failed")
+        else:
+            decision = retain(w.cfg, roadmap_dir, "fresh roadmap generation", label="progress-roadmap")
+        if not decision.ok:
+            raise Die(f"refreshing {roadmap_dir} refused: {decision.reason}")
+        roadmap_dir = progress_checkout(w.cfg)
+        roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
+        if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
+            if retained:
+                return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
+            raise Die(f"cloning {ROADMAP} failed")
     note_owner(w.cfg, "progress-roadmap", work="progress")  # attribution only; never stops the round
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
@@ -2209,7 +2212,7 @@ def _do_progress_inner(w, opts) -> int | None:
 
         raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
 
-    work = w.cfg.state / "progress" / "work"
+    work = progress_work(w.cfg)
     work.mkdir(parents=True, exist_ok=True)
     plan_file = work / "plan.json"
     prompt_file = work / "progress-prompt.md"
@@ -2571,4 +2574,4 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )
-    return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+    return run_agent_host(active_checkout(w.cfg), prompt, _effective_authoring_profile(opts), w.cfg.logdir)

@@ -594,7 +594,9 @@ def build_parser() -> argparse.ArgumentParser:
     activity.add_argument("--json", action="store_true")
     activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")
 
-    recovery = sub.add_parser("recovery", help="list saved unfinished source and moved-aside checkouts; local only")
+    recovery = sub.add_parser(
+        "recovery", help="list saved unfinished source and retained checkout generations; local only"
+    )
     recovery.add_argument("--worker-id", dest="worker_id", default=None)
     recovery.add_argument("--json", action="store_true")
 
@@ -1382,12 +1384,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         if not dry and "security-audit" not in only:
             from .quota import mirror_creds
             from .repair_recovery import recover
-            from .work_recovery import guard
+            from .work_recovery import active_checkout, guard
 
             try:
                 mirror_creds(cfg)
-                if (cfg.checkout / ".git").exists():
-                    guard(cfg, cfg.checkout)  # Preserve the last round before selecting recovery.
+                co = active_checkout(cfg)
+                if (co / ".git").exists():
+                    guard(cfg, co)  # Preserve the last round before selecting recovery.
                 recovery_gh = GitHub()
                 recovery_worker = Worker(
                     cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)

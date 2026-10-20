@@ -886,7 +886,7 @@ class Fixture(unittest.TestCase):
         self.assertIn("Committed source differs", self.journal()["reason"]["detail"])
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
-    def test_terminal_recovery_evicts_only_rebuildable_caches(self):
+    def test_terminal_recovery_retains_caches_without_exact_lifecycle_evidence(self):
         actual = self.backend.verify
 
         def cache(checkout, *args):
@@ -896,7 +896,8 @@ class Fixture(unittest.TestCase):
 
         with patch.object(self.backend, "verify", cache):
             self.assertTrue(self.run_recovery())
-        self.assertFalse((self.record / "checkout/.lake").exists())
+        self.assertTrue((self.record / "checkout/.lake").exists())
+        self.assertFalse((self.record / "cache-evicted.json").exists())
         self.assert_retained()
 
     def test_consumer_status_is_distinct_from_moved_aside_checkout(self):

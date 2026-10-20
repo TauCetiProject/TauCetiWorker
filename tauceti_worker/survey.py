@@ -596,6 +596,7 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     through to review and fix work. A stage that can throw is a stage that can wedge the worker.
     """
     from .progress_publication import retained
+    from .work_recovery import progress_work
 
     prepared = retained(cfg)
     if prepared:
@@ -612,7 +613,7 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
         if prepared.get("retry_at", 0) > time.time():
             return False, "prepared progress publication waiting for reconciliation"
         return True, "prepared progress report ready to resume publication"
-    if (cfg.state / "progress/work/publication.json").exists():
+    if (progress_work(cfg) / "publication.json").exists():
         return False, "prepared progress receipt needs recovery; files preserved"
     if counters.read("progress-docs-retry-at") > time.time():
         return False, "waiting-documentation: generation changed; mechanical replanning will retry shortly"

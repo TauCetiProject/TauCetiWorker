@@ -285,7 +285,7 @@ def display(value, default_kinds=()):
         print()
         print(
             f"Local work recovery: {recovery.get('records', 0)} saved, "
-            f"{recovery.get('retained', 0)} checkouts moved aside, "
+            f"{recovery.get('retained', 0)} retained checkout generations, "
             f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt"
         )
         if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):

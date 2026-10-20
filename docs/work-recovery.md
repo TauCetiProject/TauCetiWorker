@@ -1,7 +1,8 @@
 # Unfinished source recovery
 
-Host checkout preparation force-checks-out `main`, cleans the tree, and later
-replaces PR branches. Before any of that, the worker inspects the checkout. When
+Host checkout preparation selects a new canonical generation, clones `main`, and
+later checks out PR branches there. Before leaving the former tree, the worker
+inspects it. When
 it holds unpublished commits, staged or unstaged edits, untracked source, or an
 unfinished merge/rebase, the worker first writes a recovery record. The same
 guard protects the writable roadmap clone used by progress reports, which runs
@@ -38,35 +39,59 @@ other ignored files are archived. The manifest lists every excluded path with it
 reason, and records conflicted paths deleted from the worktree as `absent`. The untracked archive is
 bounded at 128 MiB and 20,000 files; a larger tree fails the save.
 
-## Preparation never waits for a human
+## Preparation continues in a separate generation
 
-OOMs, SIGKILLs and timeouts are routine, so whatever they leave behind must never
-stop a worker. Preparation always saves first and then always continues:
+A stable inspection, a missing PID, and an empty `/proc` scan cannot prove that a
+detached writer will not return. The current round-level `quiescence.json` is a
+diagnostic, not lifecycle evidence for an exact checkout generation. Until such
+evidence is available, every previously exposed checkout is treated as uncertain,
+including a clean checkout and one with a legacy or missing owner record.
 
-- **Clean and published**: no record and no change from earlier behaviour.
-- **Anything unpublished** (commits, edits, untracked or ignored source): saved
-  in a durable record. A final inspection then checks that the checkout still
-  matches it; a write that landed after the snapshot is saved too. The checkout
-  is then reset in place. Commits are bundled once and marked
-  `refs/tauceti/preserved/<record>/...`.
-- **A process still uses the checkout** (Linux `/proc` cwd/root/open files,
-  even when the checkout is clean), saving fails (no space, permissions, the
-  archive bound, a git error), the tree keeps changing, or the git state is
-  broken (no `.git` after an interrupted clone, a stale `index.lock`, a failed
-  forced checkout): the whole checkout is moved aside unmodified to
-  `<checkout parent>/retained-checkouts/<name>-<time>-<id>`, a same-directory rename that
-  needs no free space, and preparation clones a fresh checkout. Any process
-  still working in the old one keeps working there.
-- **Retained checkouts clean themselves up**: each later preparation handles up
-  to three of them. A copy nothing uses any more is saved into a record,
-  re-inspected to confirm nothing changed, renamed to `*.deleting` and removed;
-  an interrupted removal is finished later. A copy that cannot be saved keeps
-  its source but has its dependency and build caches evicted, so retained
-  checkouts do not fill the disk with build output.
+At preparation, the worker:
 
-Preparation refuses only when a checkout can be neither saved nor moved aside,
-and the next round simply retries. Nothing in this path asks an operator to do
-anything; `tauceti recovery` only lists what was saved.
+1. Saves unpublished commits and source through the existing v1 recovery format
+   when possible. It re-inspects to capture writes observed during the save.
+2. Leaves the former checkout **at its original absolute path**. Both cwd-relative
+   writers and processes reopening that absolute path continue to reach only the
+   retained tree. No replacement or writable symlink is installed there.
+3. Reserves an exclusive random directory under
+   `state/<worker>/workspace-generations/<label>/<generation>/`, fsyncs it and its
+   parent chain, and atomically writes and fsyncs the selector at
+   `state/<worker>/checkout-generations/<label>.json`. The selector records the
+   new canonical `checkout` path and every retained path with its former owner
+   and reason. Owner notes also identify their exact checkout path.
+4. Clones directly into the selected generation. All host authoring, history,
+   progress, and verification preparation resolve that same selector. The old
+   configured checkout remains the legacy input when no selector exists.
+
+Selection precedes cloning. A crash before selection leaves the old pointer;
+a crash after selection leaves an absent or partially cloned generation. The
+next preparation reserves another fresh path, preserving any partial checkout.
+Even an absent path is never reused: it might previously have been exposed.
+There is no checkout rename in this protocol. Invalid selectors fail explicitly
+instead of silently falling back to an old writable alias.
+
+Lake and Mathlib download caches, `XDG_CACHE_HOME`, temporary files, and host
+verification outputs are private to the generation. Explicit writable cache
+path overrides cannot carry across uncertain owners. The mutable Mathlib
+hardlink pool is not imported or promoted during this preparation; independently
+validated immutable Mathlib build views keep their existing sharing contract.
+Progress's writable clone and work outputs use their own generation selector;
+publication receipts and recovery archives retain their existing formats.
+
+Save failures (disk space, permissions, archive bounds, broken Git metadata) do
+not prevent isolation and a fresh clone when those operations can succeed. Actual
+selection, directory, or clone failures are reported and retried by the next
+ordinary round. No manual confirm/resume command is required. Late source bytes
+remain recoverable from the original tree even when they arrived after the last
+archive snapshot.
+
+There is no one-retained-tree cap and no automatic deletion or cache eviction
+based on a fingerprint or missing PID. Legacy `retained-checkouts` trees and
+`*.deleting` leftovers are preserved too. Sound lifecycle evidence for the exact
+generation is required before future destructive cleanup; lifecycle evidence
+and bounded cleanup are separate workstreams. Storage exhaustion remains a real
+failure and is reported without discarding valuable source.
 
 ## Publication
 
@@ -95,21 +120,24 @@ tar -xf <record>/untracked.tar
 ## Status
 
 The activity collector adds local counts to the prepared summaries: records,
-checkouts moved aside, incomplete and corrupt, with reasons. `tauceti activity`
+retained generations, incomplete and corrupt, with reasons. `tauceti activity`
 and `tauceti workers status` show them, and fleet summaries only add host counts.
 Status never reads GitHub.
 
 ## Rollout and rollback
 
-Rollout does not reset existing checkouts. On a worker's first preparation, its
-local-only commits are bundled once and any dirty tree is saved before the
-reset. Records left `recovery-blocked` by the first version of this guard are
-marked `superseded` when their checkout is next prepared.
+Deploy at idle worker boundaries; do not terminate active work. First preparation
+retains the legacy checkout at its existing path and selects a generation.
+Records left `recovery-blocked` by the first guard are marked `superseded` when
+their checkout is next prepared, with their payloads kept.
 
-To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
-table). Preparation then writes no records and skips inspection. A clean
-checkout is reused as before, but one that `git status` reports dirty is still
-moved aside rather than reset. Existing records are never deleted.
+`TAUCETI_WORK_RECOVERY=off` disables archive inspection and recording, while
+retaining generation selection and source isolation. Every retained generation,
+selector, legacy checkout, and recovery record must survive rollback. A binary
+rollback to a version that does not understand selectors must not prepare or
+reset the legacy path; deploy a compatible version at an idle boundary instead.
+Issue closure records implementation evidence only. Deployment and measured
+recovery receipts must be recorded separately.
 
 ## Scope
 

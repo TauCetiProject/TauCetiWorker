@@ -52,6 +52,7 @@ from .review_diagnostics import failure_summary
 from .runtime_status import report_failure
 from .transcript import AgentTranscriptRenderer
 from .usage import UsageError, kiro_data_dir, kiro_process_env, snapshot_kiro_auth_db
+from .work_recovery import active_checkout
 
 # ============================================================================
 
@@ -543,7 +544,7 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
     """
     import hashlib
 
-    toolchain_file = cfg.checkout / "lean-toolchain"
+    toolchain_file = active_checkout(cfg) / "lean-toolchain"
     try:
         contents = toolchain_file.read_bytes()
     except OSError:
@@ -639,50 +640,50 @@ def repair_origin(co: Path) -> bool:
 def prepare_checkout(
     cfg: Config, *, work: str | None = None, pr: int | None = None, roadmap: str | None = None
 ) -> bool:
-    """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover.
+    """Prepare canonical main at a fresh generation, preserving any uncertain former owner's tree.
 
-    Leftovers are only dropped after `work_recovery.guard` saves them in a durable recovery record.
-    If the checkout cannot be reset safely (a process still uses it, or saving fails), the guard
-    moves it aside whole and this clones a fresh one, so preparation never waits for a human.
+    Recovery snapshots source when possible and selects a distinct absolute checkout path. Writable
+    caches and verification outputs are generation-private; no manual resume is required.
     `work`/`pr`/`roadmap` name the round that takes the checkout, so a later record can say which
     round left the source."""
     from . import work_recovery
 
-    sync_mathlib_pool(cfg)
-    co = cfg.checkout
+    co = active_checkout(cfg)
 
     def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
         log(f"cloning {TAUCETI} → {co} ({why})")
         return subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)]).returncode == 0
 
-    if co.exists() and not (co / ".git").is_dir():
-        # An interrupted clone (or anything else without git metadata) would fail every round.
-        if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
+    # Even a missing path may have been exposed to a former owner. Reserve a new generation on
+    # every preparation, including retries after selection/clone failure; never reuse a pathname.
+    decision = (
+        work_recovery.guard(cfg, co)
+        if co.exists() or co.is_symlink()
+        else work_recovery.retain(cfg, co, "fresh generation")
+    )
+    if not decision.ok:
+        log(f"checkout preparation refused: {decision.reason}")
+        return False
+    co = active_checkout(cfg)
+    try:
+        work_recovery.workspace_environment(cfg)
+        if not (co / ".git").is_dir() and not clone("fresh generation"):
             return False
-    if not (co / ".git").is_dir() and not clone("first run"):
+    except (OSError, work_recovery.RecordError) as error:
+        log(f"checkout preparation failed at {co}: {error}")
         return False
 
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
-    # Before the fetch, so damaged metadata fails inspection and is moved aside rather than failing
-    # every round; a stale view of the remote only makes the guard save more.
-    decision = work_recovery.guard(cfg, co)
-    if not decision.ok:
-        log(f"checkout preparation refused: {decision.reason}")
-        return False
-    if decision.state == "retained" and not clone("previous checkout moved aside"):
-        return False
     if not repair_origin(co):
         log("checkout preparation refused: could not restore the canonical origin remote")
         return False
     if g("fetch", "-q", "origin"):
         return False  # usually the network; the next round retries
-    # -f discards a prior round's leftover edits (now saved) and lands us on main in one step; a plain
-    # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
-    # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
-    # the checkout aside and starts again from a fresh clone instead of failing every round.
+    # Only this preparation has used the new clone. A local failure starts another generation;
+    # all old paths remain reserved for their former owners.
     if g(
         "checkout",
         "-q",
@@ -693,6 +694,8 @@ def prepare_checkout(
     ):
         if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
             return False
+        co = active_checkout(cfg)
+        work_recovery.workspace_environment(cfg)
         if not clone("forced checkout failed") or g(
             "checkout",
             "-q",
@@ -707,12 +710,10 @@ def prepare_checkout(
     os.environ.pop("TAUCETI_VERIFY_BASE", None)
     with contextlib.suppress(ValueError, subprocess.CalledProcessError):
         os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
-    os.environ["TAUCETI_VERIFY_STATE"] = str(cfg.state.resolve())
-    # The checkout is quiescent here: the previous agent has exited and the next one has not started.
-    # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
-    # before anything can begin writing this worker's private Lake store again.
-    clean_lake_cache_after_toolchain_bump(cfg)
-    g("clean", "-fdxq", "-e", ".lake")
+    work_recovery.workspace_environment(cfg)
+    # The new generation has not been exposed to an agent yet; build outputs start empty.
+    if g("clean", "-fdxq", "-e", ".lake"):
+        return False
     # Attribution only: a failure is logged by note_owner and never stops the round.
     work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
     return True

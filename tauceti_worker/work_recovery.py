@@ -13,13 +13,11 @@ unpublished is present, writes an atomic, worker-private recovery record:
         untracked.tar    bounded archive of untracked source and conflicted paths; symlinks as links
         status.json      mutable disposition: preserved, checkout-reset, retained, superseded
 
-A reset happens only after the record is durable (every file fsynced, the directory renamed into
-place) and a final inspection shows the checkout still matches it. Preparation never stops for a
-human: OOMs and SIGKILLs are routine, so their leftovers are saved and the checkout is reset. When a
-process still uses the checkout, saving fails, or the tree will not hold still, the whole checkout
-is moved aside unmodified and preparation continues on a fresh clone; a later preparation saves and
-removes the retained copy once nothing uses it. A clean checkout with nothing unpublished needs no
-record at all.
+An inspection is only a snapshot, never proof that a detached writer cannot return. Uncertain
+checkout generations are retained at their original absolute paths, including on rollback. An
+atomic selector routes subsequent work to a distinct canonical generation with private writable
+caches. No retained generation is automatically deleted without lifecycle evidence for that exact
+generation; the current round-level diagnostic receipt does not provide that evidence.
 
 "Published" is decided locally, never from GitHub: a commit is published when it is reachable from a
 remote-tracking ref or from refs/tauceti/published/*, which git-safe-push writes after a successful
@@ -433,8 +431,18 @@ def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
     path = owner_path(cfg, label)
     fields["round_id"] = fields.get("round_id") or current_round_id()
     previous = read_json(path)
-    # A later note from the same round (the PR head it checked out) extends the first one.
-    same = fields["round_id"] is not None and previous.get("round_id") == fields["round_id"]
+    try:
+        legacy = cfg.checkout if label == "TauCeti" else cfg.state / "progress" / "roadmap"
+        checkout = str(active_path(cfg, legacy, label=label).absolute())
+    except (OSError, RecordError) as error:
+        log(f"recovery: could not resolve checkout owner ({error})")
+        return False
+    # A later note extends only the same round's claim on the same exact generation.
+    same = (
+        fields["round_id"] is not None
+        and previous.get("round_id") == fields["round_id"]
+        and previous.get("checkout") == checkout
+    )
     value = previous if same else {}
     value.update({k: v for k, v in fields.items() if v is not None})
     if not same:
@@ -442,9 +450,10 @@ def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
         value["claimed_at"] = time.time()
     value["worker"] = getattr(cfg, "wid", None)
     try:
+        value["checkout"] = checkout
         atomic_json(path, value)
         _fsync_dir(path.parent)
-    except OSError as error:
+    except (OSError, RecordError) as error:
         log(f"recovery: could not record checkout owner ({error})")
         return False
     return True
@@ -460,7 +469,9 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
     from .activity import current_round_id
 
     root = cfg.state / "recovery"
-    owner = owner or read_json(owner_path(cfg, label))
+    owner = owner if owner is not None else read_json(owner_path(cfg, label))
+    if owner.get("checkout") and owner["checkout"] != str(repo.absolute()):
+        owner = {}  # crash before claiming this generation: never inherit another tree's owner
     marker = owner.get("publication_marker") or {}
     outcome = owner.get("round_outcome")
     if marker.get("ref"):
@@ -470,7 +481,7 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
     source_round = owner.get("round_id") or current_round_id() or f"unattributed-{int(time.time())}"
     base_id = _safe_id(str(source_round))
     try:
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _mkdir_durable(root)
         _fsync_dir(root)
         _fsync_dir(root.parent)
         existing = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
@@ -663,153 +674,201 @@ def live_users(repo: Path) -> list[str]:
     return found
 
 
-MAX_PRUNE_PER_PREPARATION = 3
-# Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks
-# publication bundles in state/<worker>/progress/retained, beside the roadmap clone.
-RETAINED_DIR = "retained-checkouts"
+# Selectors extend workspace metadata, not the tauceti-work-recovery/v1 archive format.
+WORKSPACE_SCHEMA = "tauceti-workspace/v1"
+
+
+def selection_path(cfg, label: str = "TauCeti") -> Path:
+    return cfg.state / "checkout-generations" / f"{_safe_id(label)}.json"
+
+
+def _selection(cfg, label: str) -> dict:
+    path = selection_path(cfg, label)
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}  # legacy checkout and owner records remain valid inputs
+    except (OSError, ValueError) as error:
+        raise RecordError(f"cannot read workspace selector {path}: {error}") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != WORKSPACE_SCHEMA
+        or not isinstance(value.get("active"), str)
+        or not Path(value["active"]).is_absolute()
+        or not isinstance(value.get("retained"), list)
+        or any(
+            not isinstance(old, dict)
+            or not isinstance(old.get("checkout"), str)
+            or not isinstance(old.get("reason"), str)
+            for old in value.get("retained", [])
+        )
+    ):
+        raise RecordError(f"invalid workspace selector {path}; preserving every generation")
+    active = Path(value["active"])
+    root = cfg.state.resolve() / "workspace-generations" / _safe_id(label)
+    if (
+        active.name != "checkout"
+        or active.parent.parent != root
+        or re.fullmatch(r"[0-9a-f]{32}", active.parent.name) is None
+        or active.resolve() != active
+        or any(old["checkout"] == str(active) for old in value["retained"])
+    ):
+        raise RecordError(f"invalid or aliased workspace generation: {active}")
+    return value
+
+
+def active_path(cfg, legacy: Path, *, label: str = "TauCeti") -> Path:
+    """Resolve the durable selector; never install a writable alias at a retired path."""
+    value = _selection(cfg, label)
+    return Path(value["active"]) if value else legacy
+
+
+def active_checkout(cfg) -> Path:
+    return active_path(cfg, cfg.checkout) if hasattr(cfg, "state") else cfg.checkout
+
+
+def progress_checkout(cfg) -> Path:
+    return active_path(cfg, cfg.state / "progress" / "roadmap", label="progress-roadmap")
+
+
+def progress_work(cfg) -> Path:
+    if _selection(cfg, "progress-roadmap"):
+        return progress_checkout(cfg).parent / "work"
+    return cfg.state / "progress" / "work"
+
+
+def workspace_environment(cfg) -> None:
+    """Select private mutable caches/outputs before any build or verification subprocess runs.
+
+    Do not import hardlinks from the previous owner's caches or the old mutable .ltar pool.
+    Independently validated immutable Mathlib views retain their existing sharing contract.
+    Explicit cache overrides also belonged to the uncertain owner and cannot be reused here.
+    """
+    value = _selection(cfg, "TauCeti")
+    if not value:
+        return
+    os.environ.update(private_environment(Path(value["active"]).parent))
+
+
+def private_environment(root: Path) -> dict[str, str]:
+    """Writable caches and outputs belonging only to this independent source generation."""
+    result = {}
+    for key, relative in {
+        "LAKE_CACHE_DIR": "cache/lake",
+        "MATHLIB_CACHE_DIR": "cache/mathlib",
+        "XDG_CACHE_HOME": "cache",
+        "TMPDIR": "tmp",
+        "TAUCETI_VERIFY_STATE": "outputs",
+    }.items():
+        directory = root.resolve() / relative
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if directory.resolve() != directory:
+            raise RecordError(f"workspace writable path is aliased: {directory}")
+        result[key] = str(directory)
+    return result
+
+
+def _mkdir_durable(path: Path) -> None:
+    missing = []
+    ancestor = path
+    while not ancestor.exists():
+        missing.append(ancestor)
+        ancestor = ancestor.parent
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for directory in missing:
+        _fsync_dir(directory)
+    _fsync_dir(ancestor)
 
 
 def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> Decision:
-    """Move the whole checkout aside, unmodified, so preparation can continue on a fresh one.
+    """Retain in place and durably select a never-used canonical path before cloning.
 
-    A same-directory rename needs no free space and leaves every byte (and any process still
-    working there) exactly where it was. The retained copy is saved and removed automatically by a
-    later preparation once nothing uses it, so no operator is ever needed."""
+    There is deliberately no rename: both cwd-relative writers and writers reopening the old
+    absolute name must continue reaching only the original tree. Selection happens before clone;
+    a crash leaves either the old selector, an absent checkout, or a partial clone to retain on
+    retry. No failure path resets, removes, or reuses a generation that might have been exposed.
+    Worker slot ownership serializes preparation for this selector.
+    """
     global LAST_REFUSAL
-    parent = repo.parent / RETAINED_DIR
-    dest = parent / f"{repo.name}-{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
     try:
-        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.rename(repo, dest)
-    except OSError as error:
-        # Neither saved nor movable: leave everything untouched; the next round tries again.
-        LAST_REFUSAL = f"{reason}, and moving {repo} aside failed ({error}); the checkout is left intact"
+        value = _selection(cfg, label)
+        if value and Path(value["active"]) != repo.absolute():
+            raise RecordError(f"{repo} is no longer the active generation")
+        root = cfg.state.resolve() / "workspace-generations" / _safe_id(label)
+        _mkdir_durable(root)
+        if root.resolve() != root:
+            raise RecordError(f"workspace generation root is aliased: {root}")
+        generation = root / secrets.token_hex(16)
+        generation.mkdir(mode=0o700)  # exclusive reservation; never reuse an existing name
+        _fsync_dir(generation)
+        _fsync_dir(root)
+        _fsync_dir(root.parent)
+        _fsync_dir(root.parent.parent)
+        retained = value.get("retained", [])
+        if repo.exists() or repo.is_symlink():
+            retained = retained + [
+                dict(
+                    checkout=str(repo.absolute()),
+                    reason=reason,
+                    retained_at=time.time(),
+                    owner=read_json(owner_path(cfg, label)),
+                )
+            ]
+        selector = selection_path(cfg, label)
+        _mkdir_durable(selector.parent)
+        atomic_json(
+            selector,
+            dict(
+                schema=WORKSPACE_SCHEMA,
+                active=str(generation / "checkout"),
+                retained=retained,
+            ),
+        )
+        _fsync_dir(selector.parent)
+        _fsync_dir(selector.parent.parent)
+    except (OSError, RecordError) as error:
+        LAST_REFUSAL = f"{reason}; could not select a fresh workspace ({error}); the checkout is left intact"
         return Decision(False, LAST_REFUSAL, record, "refused")
-    with contextlib.suppress(OSError):  # durability and attribution are best effort here
-        _fsync_dir(parent)
-        _fsync_dir(repo.parent)
-    owner = read_json(owner_path(cfg, label))
-    if owner:
-        with contextlib.suppress(OSError):
-            atomic_json(dest.with_name(dest.name + ".owner.json"), owner)
     if record is not None:
-        _set_status(record, "retained", f"{reason}; checkout moved to {dest}")
-    log(f"recovery: {reason}; moved the checkout to {dest} and continuing with a fresh one")
-    return Decision(True, reason, record, "retained", dict(retained=str(dest)))
+        _set_status(record, "retained", f"{reason}; checkout retained at {repo}")
+    log(f"recovery: {reason}; retaining {repo} and continuing at {generation / 'checkout'}")
+    return Decision(True, reason, record, "retained", dict(retained=str(repo), active=str(generation / "checkout")))
 
 
 def retain(cfg, repo: Path, reason: str, *, label: str = "TauCeti") -> Decision:
-    """Move an unusable checkout (a stale lock, damaged metadata, an interrupted clone) aside whole."""
+    """Isolate an unusable or uncertain generation without moving or deleting any source."""
     return _retain(cfg, repo, reason, None, label)
 
 
-def _evict_caches(tree: Path) -> None:
-    """Reclaim a retained checkout's dependency and build caches; never its source."""
-    for root, dirs, _ in os.walk(tree, followlinks=False):
-        for name in [d for d in dirs if d in CACHE_DIRS or (root == str(tree) and d in CACHE_TOP)]:
-            path = Path(root) / name
-            if not path.is_symlink():
-                shutil.rmtree(path, ignore_errors=True)
-        dirs[:] = [d for d in dirs if d not in CACHE_DIRS and d != ".git"]
-
-
-def _prune_retained(cfg, repo: Path, label: str, repository: str) -> None:
-    """Save and remove retained checkouts that nothing uses any more, a few per preparation.
-
-    A copy is removed only after a record of it is durable and a second inspection shows it did not
-    change meanwhile. A copy that cannot be saved keeps its source but loses its caches, so retained
-    checkouts cannot fill the disk with build output. Removal renames to `*.deleting` first, so an
-    interrupted delete is finished later without needing git."""
-    parent = repo.parent / RETAINED_DIR
-    if not parent.is_dir():
-        return
-    for doomed in parent.glob("*.deleting"):
-        shutil.rmtree(doomed, ignore_errors=True)
-    budget = MAX_PRUNE_PER_PREPARATION
-    for old in sorted(p for p in parent.glob(f"{repo.name}-*") if p.is_dir() and not p.name.endswith(".deleting")):
-        if budget <= 0:
-            return
-        budget -= 1
-        if live_users(old):
-            continue
-        sidecar = old.with_name(old.name + ".owner.json")
-        try:
-            snap = inspect(old, _preserved(cfg))
-            record = _record(cfg, old, snap, label, repository, owner=read_json(sidecar)) if snap.needs_record else None
-            if live_users(old) or inspect(old, _preserved(cfg)).fingerprint != snap.fingerprint:
-                continue  # something touched it while saving; try again later
-            doomed = old.with_name(old.name + ".deleting")
-            os.rename(old, doomed)
-            if record is not None:
-                _set_status(record, "checkout-reset", f"retained checkout {old.name} saved and removed")
-            shutil.rmtree(doomed, ignore_errors=True)
-            sidecar.unlink(missing_ok=True)
-            log(f"recovery: removed retained checkout {old}" + (f"; its source is in {record}" if record else ""))
-        except (OSError, subprocess.SubprocessError, RecordError) as error:
-            log(f"recovery: keeping retained checkout {old} for now ({error}); evicting its caches")
-            _evict_caches(old)
-
-
-def _dirty_without_inspection(repo: Path) -> bool:
-    """Rollback's only check: does git report anything a reset would discard? Unknown counts as yes."""
-    p = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain", "--ignored=no", "--untracked-files=all"],
-        capture_output=True,
-    )
-    return p.returncode != 0 or bool(p.stdout.strip())
-
-
 def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
-    """Save anything unpublished in `repo`, then let preparation continue. Never waits for a human.
+    """Save a best-effort snapshot, retain uncertain ownership, and continue at a fresh path.
 
-    The normal outcome is a durable record followed by a reset in place, including after an OOM or
-    SIGKILL. Every reset is checked against a final inspection, so a write that lands after the
-    snapshot is saved too. When a process still uses the checkout, the save fails, or the checkout
-    will not hold still, the whole checkout is moved aside instead (`state == "retained"`) and the
-    caller creates a fresh one. Refusal is left only for a checkout that can be neither saved nor
-    moved, and the next round simply retries."""
+    Missing legacy owners, absent PIDs, a stable final inspection and the current round-level
+    quiescence diagnostic cannot prove shutdown for this exact generation. Until C1 supplies that
+    lifecycle contract, all previously exposed checkouts take the isolation path. Cleanup belongs
+    to K3: even legacy retained-checkouts and *.deleting debris are preserved here.
+    """
     global LAST_REFUSAL
     LAST_REFUSAL = ""
-    _prune_retained(cfg, repo, label, repository)
     if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
-        # Rollback: no inspection or records. A dirty tree is still never reset; it is moved aside.
-        if _dirty_without_inspection(repo):
-            return _retain(cfg, repo, "TAUCETI_WORK_RECOVERY=off and the checkout is dirty", None, label)
-        return Decision(True, state="disabled")
+        return _retain(cfg, repo, "TAUCETI_WORK_RECOVERY=off; former owner is uncertain", None, label)
     record = None
+    reason = "former owner is not proven quiescent for this generation"
     for _ in range(3):
         try:
             snap = inspect(repo, _preserved(cfg))
-        except (OSError, subprocess.SubprocessError, RecordError) as error:
-            return _retain(cfg, repo, f"could not inspect {repo} ({error})", record, label)
-        if snap.published:
-            users = live_users(repo)
-            if users:  # nothing to lose now, but a live writer could still create some
-                return _retain(cfg, repo, "processes still use the checkout: " + ", ".join(users[:8]), None, label)
-            _supersede(cfg, repo, None)
-            return Decision(True, state="clean")
-        if snap.needs_record:
-            try:
+            if snap.needs_record:
                 record = _record(cfg, repo, snap, label, repository)
-            except RecordError as error:
-                return _retain(cfg, repo, f"could not save its source ({error})", record, label)
             _supersede(cfg, repo, record)
-        users = live_users(repo)
-        if users:
-            return _retain(cfg, repo, "processes still use the checkout: " + ", ".join(users[:8]), record, label)
-        try:
-            again = inspect(repo, _preserved(cfg))
+            users = live_users(repo)
+            if users:
+                reason = "processes still use the checkout: " + ", ".join(users[:8])
+            if inspect(repo, _preserved(cfg)).fingerprint == snap.fingerprint:
+                break
         except (OSError, subprocess.SubprocessError, RecordError) as error:
-            return _retain(cfg, repo, f"could not re-inspect {repo} ({error})", record, label)
-        if again.fingerprint != snap.fingerprint:
-            continue  # a late write: save the newer state before resetting
-        state = "checkout-reset" if snap.dirty else "preserved"
-        if record is not None:
-            _set_status(record, state, "saved before the checkout was reset")
-            what = "unfinished source" if snap.dirty else f"{len(snap.unpublished)} unpublished commit(s)"
-            log(f"recovery: saved {what} in {record}")
-        return Decision(True, record=record, state=state)
-    return _retain(cfg, repo, "the checkout kept changing while it was being saved", record, label)
+            reason = f"could not save or inspect its source ({error})"
+            break
+    return _retain(cfg, repo, reason, record, label)
 
 
 def restore(record: Path, repo: Path) -> None:
@@ -893,6 +952,23 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
     ):
         counts["recovery_" + state.replace("-", "_")] = 0
     reasons = set()
+    retained_paths = set()
+    base = state_root or HERE / "state"
+    with contextlib.suppress(OSError):
+        for worker_dir in base.iterdir():
+            if workers is not None and worker_dir.name not in workers:
+                continue
+            for selector in (worker_dir / "checkout-generations").glob("*.json"):
+                old_entries = read_json(selector).get("retained", [])
+                if not isinstance(old_entries, list):
+                    continue
+                for old in old_entries:
+                    if not isinstance(old, dict) or not isinstance(old.get("checkout"), str):
+                        continue
+                    retained_paths.add(old["checkout"])
+                    reasons.add(
+                        f"{worker_dir.name}: retained {old['checkout']}: {old.get('reason', 'uncertain owner')}"
+                    )
     for worker, record, manifest, status in records(state_root, workers=workers):
         if record is None:
             counts["incomplete"] += 1
@@ -913,7 +989,8 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
                 reasons.add(f"{worker}/{record.name}: {describe_reason(status['reason'])}")
             continue
         if state == "retained":
-            counts["retained"] += 1
+            if manifest.get("checkout") not in retained_paths:
+                counts["retained"] += 1
             reasons.add(f"{worker}: {status.get('reason') or 'checkout moved aside'}")
         elif state in ("recovery-blocked", "blocked"):
             counts["blocked"] += 1
@@ -925,4 +1002,5 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
             counts["superseded"] += 1
         else:
             counts["preserved"] += 1
+    counts["retained"] += len(retained_paths)
     return dict(counts, reasons=sorted(reasons))

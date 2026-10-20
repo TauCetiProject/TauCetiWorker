@@ -26,6 +26,7 @@ from . import oauth as credential_refresh
 from .config import Config, log
 from .constants import AUTHORING_DEFAULTS, CLAUDE_CMD, POLL
 from .github import GitHubError, _parse_retry_after
+from .work_recovery import active_checkout
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
@@ -1439,7 +1440,7 @@ class Quota:
             return (
                 _para(
                     f"--account {requested} cannot be verified: "
-                    f"{_store_reason(store, codex_dir(self.cfg.home) / 'config.toml', self.cfg.checkout)}. "
+                    f"{_store_reason(store, codex_dir(self.cfg.home) / 'config.toml', active_checkout(self.cfg))}. "
                     f"Any account TauCeti read from {src}/auth.json could be one codex is not using."
                 )
                 + "\n\n"

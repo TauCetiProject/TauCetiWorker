@@ -536,7 +536,7 @@ class WorkerBackend:
                 self.snapshot_continuation(checkout, record, m, j)
             return checkout
         temp = record / f"restore-{uuid.uuid4().hex}"
-        source = self.w.cfg.checkout
+        source = saved.active_checkout(self.w.cfg)
         url = repository_url(m["repository"])
         # A private independent clone, never a worktree sharing the active checkout's refs/index.
         subprocess.run(
@@ -609,25 +609,10 @@ class WorkerBackend:
             write(record, j, "resuming", retained_extra=str(dest))
 
     def evict_caches(self, record):
-        from .containment import strong, unconfirmed
-
-        if not strong() or unconfirmed():
-            return
-        marker = record / "cache-evicted.json"
-        if read_json(marker).get("done"):
-            return
-        # Never delete source or Git history on a terminal transition. Build caches
-        # are rebuildable; interrupted restores never ran a model and keep their bytes.
-        for checkout in [record / "checkout", *record.glob("restore-*"), *record.glob("interrupted-restore-*")]:
-            if checkout.is_dir():
-                if saved.live_users(checkout):
-                    return
-                try:
-                    saved._evict_caches(checkout)
-                except OSError as error:
-                    log(f"recovery cache eviction deferred: {error}")
-                    return
-        atomic_json(marker, dict(done=True))
+        # Neither host capability nor an empty /proc scan proves shutdown for this exact
+        # generation. Keep even terminal recovery caches until lifecycle evidence authorizes
+        # K3 cleanup; never turn an uncertain late writer into a source deletion race.
+        return
 
     def commit_source(self, checkout, m):
         snap = saved.inspect(checkout)
@@ -764,12 +749,13 @@ class WorkerBackend:
         return None
 
     def verification_environment(self, checkout):
+        private = saved.private_environment(checkout.parent)
         if not any((checkout / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
-            return {}
+            return private
         from .agents import TAUCETI_CACHE_ARTIFACT_URL, TAUCETI_CACHE_REVISION_URL, TAUCETI_CACHE_SERVICE
 
         if not TAUCETI_CACHE_SERVICE:
-            return {}
+            return private
         config = checkout.parent / "verification-lake.toml"
         if not config.exists():
             saved._write(
@@ -782,6 +768,7 @@ class WorkerBackend:
             )
             saved._fsync_dir(config.parent)
         return dict(
+            private,
             LAKE_CONFIG=str(config),
             LAKE_ARTIFACT_CACHE=os.environ.get("LAKE_ARTIFACT_CACHE", "1"),
             LAKE_RESTORE_ARTIFACTS=os.environ.get("LAKE_RESTORE_ARTIFACTS", "1"),
@@ -805,7 +792,7 @@ class WorkerBackend:
                 self.prepare_source(checkout, self.record, m, self.journal)
             verifier = Verification(
                 checkout,
-                self.w.cfg.state,
+                checkout.parent / "outputs",
                 base=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
                 policy=policy,
                 deadline=self.w.rc.deadline,
@@ -962,6 +949,7 @@ class WorkerBackend:
         with (
             admission_unit(self.w.cfg.wid),
             environment(
+                **saved.private_environment(checkout.parent),
                 TAUCETI_RECOVERY_CONTINUATION="1",
                 TAUCETI_GITHUB_PR=m["pr"],
                 TAUCETI_VERIFY_BASE=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
@@ -1065,7 +1053,7 @@ class WorkerBackend:
 
         verifier = Verification(
             checkout,
-            self.w.cfg.state,
+            checkout.parent / "outputs",
             base=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
             policy=scope_policy(
                 facts["labels"], facts["ref"], bump=m.get("authorization", {}).get("automatic_bump", False)

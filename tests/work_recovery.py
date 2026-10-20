@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
-"""Unfinished source is saved before checkout preparation destroys it, and preparation never stops.
+"""Uncertain generations retain source while fresh work continues at distinct canonical paths.
 
-Pinned here, with local git fixtures only (no GitHub, no agents):
-
-  1. A clean checkout whose commits are all published needs no record and is reset as before.
-  2. Untracked/new files, staged versus unstaged edits, deletions, binary content, symlinks (inside and
-     pointing outside the checkout), and local commits after the expected remote head are saved in a
-     complete tauceti-work-recovery/v1 record before the reset, and a fresh clone reconstructs the
-     exact source bytes.
-  3. Leftovers of an OOM or SIGKILL (no proof of anything) are saved and the checkout reset: nothing
-     waits for a human. A write after the snapshot is saved too.
-  4. Commits-only leftovers are bundled once; commits marked published or pushed are not.
-  5. A conflicted merge, ignored drafts and assume-unchanged edits are saved exactly.
-  6. Save failures (no space, permission, archive bound), a live process using the checkout, and an
-     unstable tree move the whole checkout aside unmodified and preparation continues on a fresh
-     clone; a later preparation saves and removes the retained copy once nothing uses it.
-  7. Interrupted saves, corrupt manifests and damaged payloads are never trusted or deleted.
-  8. Host work (`prepare_checkout`, roadmap) and progress preparation proceed after saving.
+Local git and detached writer fixtures cover v1 reconstruction, unknown legacy ownership,
+late relative/absolute writes after final inspection, private writable caches, repeated uncertain
+rounds, crash-safe selection and partial clones, storage/permission failures, and rollback.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -27,7 +14,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,18 +118,6 @@ def make_dirty(co: Path, outside: Path):
     (co / ".env").write_text("SECRET=1\n")
 
 
-def test_clean_and_published(root):
-    origin, co, cfg = fixture(root / "clean")
-    d = wr.guard(cfg, co)
-    check("clean published checkout: allowed without a record", d.ok and d.record is None and d.state == "clean")
-    check("clean: no recovery directory", not (cfg.state / "recovery").exists())
-    (co / "A.lean").write_text("pushed\n")
-    git(co, "commit", "-qam", "pushed")
-    wr.mark_published(co, "push/feature", git(co, "rev-parse", "HEAD").strip())
-    d = wr.guard(cfg, co)
-    check("commit marked published: no record", d.ok and d.record is None)
-
-
 def test_full_record(root):
     origin, co, cfg = fixture(root / "full")
     outside = root / "outside-secret"
@@ -155,10 +129,10 @@ def test_full_record(root):
     before_head = git(co, "rev-parse", "HEAD").strip()
     staged = git(co, "diff", "--cached", "--binary")
 
-    # Nothing proves the previous round is gone (as after a SIGKILL): save, then allow the reset.
+    # Unknown ownership: save a v1 snapshot, retain the original tree, and select a fresh path.
     d = wr.guard(cfg, co)
     record = cfg.state / "recovery" / "round-1"
-    check("dirty, no proof: allowed after saving", d.ok and d.state == "checkout-reset" and d.record == record)
+    check("dirty, no proof: allowed after saving", d.ok and d.state == "retained" and d.record == record)
     check("guard itself changed nothing in the checkout", snapshot_tree(co) == before_tree)
     manifest = json.loads((record / "manifest.json").read_text())
     check("manifest schema", manifest["schema"] == "tauceti-work-recovery/v1")
@@ -188,7 +162,7 @@ def test_full_record(root):
         members = {m.name: m for m in tar.getmembers()}
     check("outside link archived as a link", members["link-outside"].issym())
     check("outside target content not archived", b"must not be archived" not in (record / "untracked.tar").read_bytes())
-    check("status checkout-reset", json.loads((record / "status.json").read_text())["state"] == "checkout-reset")
+    check("status retained", json.loads((record / "status.json").read_text())["state"] == "retained")
 
     clone = reconstruct(origin, record, root / "full", "rebuilt")
     expected_tree = {k: v for k, v in before_tree.items() if not k.startswith("node_modules")}
@@ -196,8 +170,8 @@ def test_full_record(root):
     check("reconstructed HEAD is the local commit", git(clone, "rev-parse", "HEAD").strip() == before_head)
     check("reconstructed index matches staged state", git(clone, "diff", "--cached", "--binary") == staged)
 
-    d2 = wr.guard(cfg, co)
-    check("repeat: record reused", d2.ok and d2.record == record and len(list((cfg.state / "recovery").iterdir())) == 1)
+    d2 = wr._record(cfg, co, wr.inspect(co, wr._preserved(cfg)), "TauCeti", tc.TAUCETI)
+    check("repeat: record reused", d2 == record and len(list((cfg.state / "recovery").iterdir())) == 1)
 
     os.environ["TAUCETI_WORK_RECOVERY"] = "off"
     try:
@@ -224,7 +198,7 @@ def test_commits_only(root):
     git(co, "commit", "-qam", "detached")
     detached = git(co, "rev-parse", "HEAD").strip()
     d = wr.guard(cfg, co)
-    check("commits only: allowed after saving", d.ok and d.state == "preserved" and d.record is not None)
+    check("commits only: allowed after saving", d.ok and d.state == "retained" and d.record is not None)
     manifest = json.loads((d.record / "manifest.json").read_text())
     check("commits only: roadmap recorded", manifest["work"] == "roadmap" and manifest["roadmap"] == "algebra")
     check(
@@ -236,8 +210,7 @@ def test_commits_only(root):
         git(co, "rev-parse", f"refs/tauceti/preserved/{d.record.name}/refs/heads/roadmap/x").strip() == tip,
     )
     check("no pending refs left", git(co, "for-each-ref", "refs/tauceti-pending") == "")
-    d2 = wr.guard(cfg, co)
-    check("commits only: not bundled twice", d2.ok and d2.record is None)
+    check("commits only: not bundled twice", not wr.inspect(co, wr._preserved(cfg)).needs_record)
     clone = reconstruct(origin, d.record, root / "commits", "rebuilt")
     check("bundle restores the detached commit", git(clone, "rev-parse", "HEAD").strip() == detached)
     check("bundle restores the branch commits", git(clone, "cat-file", "-t", tip).strip() == "commit")
@@ -292,324 +265,266 @@ def test_hidden_source(root):
     check("hidden source reconstructed exactly", snapshot_tree(clone) == before)
 
 
-def retained_dirs(co):
-    parent = co.parent / wr.RETAINED_DIR
-    return sorted(p for p in parent.iterdir() if p.is_dir()) if parent.is_dir() else []
+def test_generations(root):
+    from unittest.mock import patch
 
-
-def test_move_aside(root):
-    """Whatever cannot be saved or reset safely is moved aside whole; nothing ever blocks."""
-    origin, co, cfg = fixture(root / "nospace")
-    make_dirty(co, root / "nospace" / "nowhere")
-    before = snapshot_tree(co)
-    refs = git(co, "for-each-ref")
-    real_archive = wr._archive
-
-    def no_space(*_a, **_k):
-        raise OSError(errno.ENOSPC, "No space left on device")
-
-    wr._archive = no_space
-    try:
-        d = wr.guard(cfg, co)
-    finally:
-        wr._archive = real_archive
-    moved = retained_dirs(co)
-    check("no space: allowed, checkout moved aside", d.ok and d.state == "retained" and len(moved) == 1)
-    check("no space: reason kept", "No space left on device" in d.reason)
-    check("no space: original path free for a fresh clone", not co.exists())
-    check("no space: retained checkout byte-identical", snapshot_tree(moved[0]) == before)
-    check("no space: no refs changed", git(moved[0], "for-each-ref") == refs)
-    check("no space: no partial record left", not any((cfg.state / "recovery").iterdir()))
-    check(
-        "no space: owner kept beside the retained checkout",
-        moved[0].with_name(moved[0].name + ".owner.json").exists() or not wr.owner_path(cfg).exists(),
-    )
-
-    # The next preparation saves the retained copy (space is back) and removes it.
-    subprocess.run(["git", "clone", "-q", str(origin), str(co)], check=True)
-    d = wr.guard(cfg, co)
-    check("retained copy saved and removed", d.ok and not retained_dirs(co))
-    records = [p for p in (cfg.state / "recovery").iterdir() if p.is_dir()]
-    check("retained copy now has a record", len(records) == 1 and (records[0] / "manifest.json").exists())
-    clone = reconstruct(origin, records[0], root / "nospace", "rebuilt")
-    expected = {k: v for k, v in before.items() if not k.startswith("node_modules")}
-    check("retained copy reconstructed exactly", snapshot_tree(clone) == expected)
-
-    # Permission error creating the recovery root, or an oversized tree: moved aside too.
-    origin, co, cfg = fixture(root / "perm")
-    (co / "Draft.lean").write_text("x\n")
+    origin, old, cfg = fixture(root / "generations")
+    (old / "Draft.lean").write_text("original source\n")
+    # Unknown legacy owner; neither a missing PID nor a round diagnostic proves this generation.
     cfg.state.mkdir(parents=True)
-    (cfg.state / "recovery").write_text("not a directory")
-    d = wr.guard(cfg, co)
-    check("unwritable recovery root: moved aside", d.ok and d.state == "retained" and "could not create" in d.reason)
-    origin, co, cfg = fixture(root / "big")
-    (co / "huge.dat").write_bytes(b"x" * 2048)
-    bound = wr.MAX_UNTRACKED_BYTES
-    wr.MAX_UNTRACKED_BYTES = 1024
-    try:
-        d = wr.guard(cfg, co)
-    finally:
-        wr.MAX_UNTRACKED_BYTES = bound
-    check("oversized untracked: moved aside", d.ok and d.state == "retained" and "archive bound" in d.reason)
-    check("oversized untracked: bytes kept", (retained_dirs(co)[0] / "huge.dat").stat().st_size == 2048)
-
-    # Neither saved nor movable: the only refusal, and the checkout is untouched.
-    origin, co, cfg = fixture(root / "stuck")
-    (co / "Draft.lean").write_text("x\n")
-    real_rename, real_archive = wr.os.rename, wr._archive
-    wr._archive = no_space
-
-    def no_rename(*_a):
-        raise OSError(errno.EACCES, "Permission denied")
-
-    wr.os.rename = no_rename
-    try:
-        d = wr.guard(cfg, co)
-    finally:
-        wr.os.rename, wr._archive = real_rename, real_archive
-    check("unsavable and unmovable: refused, retried next round", not d.ok and "left intact" in d.reason)
-    check("unsavable and unmovable: checkout intact", (co / "Draft.lean").read_text() == "x\n")
-
-    # A crash mid-save leaves a .tmp directory: never mistaken for a record, counted as incomplete.
-    rec = cfg.state / "recovery"
-    rec.mkdir(parents=True, exist_ok=True)
-    (rec / ".tmp-crashed-1-abcd").mkdir()
-    s = wr.summary(root / "stuck" / "state")
-    check("interrupted save counted incomplete", s["incomplete"] == 1 and s["records"] == 0)
-
-    # Corrupt manifest and damaged payloads: neither reused nor deleted.
-    origin, co, cfg = fixture(root / "corrupt")
-    wr.note_owner(cfg, round_id="round-x")
-    (co / "Draft.lean").write_text("x\n")
-    corrupt = cfg.state / "recovery" / "round-x"
-    corrupt.mkdir(parents=True)
-    (corrupt / "manifest.json").write_text("{not json")
-    d = wr.guard(cfg, co)
-    check("corrupt manifest not reused", d.record is not None and d.record.name == "round-x.2")
-    check("corrupt manifest retained", (corrupt / "manifest.json").read_text() == "{not json")
-    (d.record / "untracked.tar").write_bytes(b"truncated")
-    d2 = wr.guard(cfg, co)
-    check("damaged record not reused", d2.record not in (None, d.record) and (d.record / "manifest.json").exists())
-    check("summary counts corrupt and damaged", wr.summary(root / "corrupt" / "state")["corrupt"] == 2)
-
-
-def test_broken_git_state(root):
-    """Crash debris never wedges preparation: it is moved aside and a fresh clone used."""
-    origin, co, cfg = fixture(root / "broken")
-    agents = tc.agents
-    saved_sync, saved_url = agents.sync_mathlib_pool, agents.CHECKOUT_URL
-    agents.sync_mathlib_pool = lambda cfg: None
-    agents.CHECKOUT_URL = str(origin)
-    try:
-        (co / ".git" / "index.lock").write_text("")
-        (co / "Draft.lean").write_text("x\n")
-        ok = agents.prepare_checkout(cfg, work="fix")
-        check("stale index.lock: preparation succeeds", ok and not (co / ".git" / "index.lock").exists())
-        check(
-            "stale index.lock: old checkout retained or saved",
-            bool(retained_dirs(co)) or any((cfg.state / "recovery").iterdir()),
-        )
-        subprocess.run(["rm", "-rf", str(co)], check=True)
-        co.mkdir()
-        (co / "partial").write_text("interrupted clone\n")
-        ok = agents.prepare_checkout(cfg, work="fix")
-        check("interrupted clone: preparation succeeds", ok and (co / ".git").is_dir())
-        check(
-            "interrupted clone: debris retained, not deleted", any((d / "partial").exists() for d in retained_dirs(co))
-        )
-    finally:
-        agents.sync_mathlib_pool, agents.CHECKOUT_URL = saved_sync, saved_url
-
-    # A retained copy that cannot be saved keeps its source but loses its caches; a `*.deleting`
-    # leftover from an interrupted removal is finished without git.
-    origin, co, cfg = fixture(root / "evict")
-    parent = co.parent / wr.RETAINED_DIR
-    big = parent / "TauCeti-20260101T000000-aaaaaa"
-    big.mkdir(parents=True)
-    (big / "Source.lean").write_text("unsaved source\n")
-    (big / ".lake").mkdir()
-    (big / ".lake" / "huge.olean").write_bytes(b"x" * 100)
-    doomed = parent / "TauCeti-20250101T000000-bbbbbb.deleting"
-    doomed.mkdir()
-    (doomed / "rest").write_text("half deleted\n")
-    check("eviction fixture ready", (big / ".lake").exists())
-    wr.guard(cfg, co)
-    check("unsavable retained copy keeps its source", (big / "Source.lean").exists())
-    check("unsavable retained copy loses its caches", not (big / ".lake").exists())
-    check("interrupted removal finished", not doomed.exists())
-
-
-def test_live_process(root):
-    if not Path("/proc/self").exists():
-        print("[SKIP] live-process detection needs /proc")
-        return
-    origin, co, cfg = fixture(root / "live")
-    wr.note_owner(cfg, round_id="round-live")
-    (co / "Draft.lean").write_text("unfinished\n")
-    child = subprocess.Popen(["sleep", "60"], cwd=co)
-    try:
-        time.sleep(0.2)
-        d = wr.guard(cfg, co)
-        moved = retained_dirs(co)
-        check(
-            "live process: moved aside, not blocked",
-            d.ok and d.state == "retained" and f"{child.pid} (sleep)" in d.reason,
-        )
-        check("live process: its source saved too", d.record is not None and (moved[0] / "Draft.lean").exists())
-        check(
-            "live process: still working in the retained copy", os.readlink(f"/proc/{child.pid}/cwd") == str(moved[0])
-        )
-        subprocess.run(["git", "clone", "-q", str(origin), str(co)], check=True)
-        check("live process: retained copy kept while in use", wr.guard(cfg, co).ok and retained_dirs(co) == moved)
-    finally:
-        child.kill()
-        child.wait()
-    d = wr.guard(cfg, co)
-    check("process gone: retained copy removed", d.ok and not retained_dirs(co))
-
-    _, co2, cfg2 = fixture(root / "live-clean")
-    child = subprocess.Popen(["sleep", "60"], cwd=co2)
-    try:
-        time.sleep(0.2)
-        d = wr.guard(cfg2, co2)
-    finally:
-        child.kill()
-        child.wait()
-    check("clean but in use: moved aside rather than reset", d.ok and d.state == "retained")
-    check(
-        "process gone: record reused, not duplicated",
-        len([p for p in (cfg.state / "recovery").iterdir() if p.is_dir()]) == 1,
-    )
-
-
-def test_late_write(root):
-    origin, co, cfg = fixture(root / "late")
-    wr.note_owner(cfg, round_id="round-late")
-    (co / "Draft.lean").write_text("early\n")
-    real = wr.live_users
-    calls = []
-
-    def late_writer(path):
-        if path == co and not calls:
-            (co / "Late.lean").write_text("written after the snapshot\n")
-            calls.append(1)
-        return real(path)
-
-    wr.live_users = late_writer
-    try:
-        d = wr.guard(cfg, co)
-    finally:
-        wr.live_users = real
-    manifest = json.loads((d.record / "manifest.json").read_text())
-    check("late write: newer state saved before allowing reset", d.ok and "Late.lean" in manifest["untracked"])
-    check("late write: earlier record retained", len([p for p in (cfg.state / "recovery").iterdir()]) == 2)
-
-
-def test_push_and_owner(root):
-    origin, co, cfg = fixture(root / "push")
-    (co / "A.lean").write_text("pushed\n")
-    git(co, "commit", "-qam", "pushed")
-    pushed = git(co, "rev-parse", "HEAD").strip()
-    env = {**os.environ, "TAUCETI_PUSH_REF": "feature", "TAUCETI_PUSH_REMOTE": str(origin), "TAUCETI_CLAIM_KEY": ""}
-    env.pop("TAUCETI_PUSH_EXPECT", None)
-    rc = subprocess.run([str(REPO / "scripts" / "git-safe-push")], cwd=co, env=env, capture_output=True).returncode
-    check("git-safe-push: pushed", rc == 0 and git(origin, "rev-parse", "feature").strip() == pushed)
-    check(
-        "git-safe-push: published ref is the pushed oid",
-        git(co, "rev-parse", "refs/tauceti/published/push/feature").strip() == pushed,
-    )
-    check("pushed work needs no record", wr.guard(cfg, co).state == "clean")
-
-    saved_sync, saved_atomic = tc.agents.sync_mathlib_pool, wr.atomic_json
-    tc.agents.sync_mathlib_pool = lambda cfg: None
-
-    def fail(*_a, **_k):
-        raise OSError(errno.EACCES, "Permission denied")
-
-    wr.atomic_json = fail
-    try:
-        ok = tc.agents.prepare_checkout(cfg, work="fix", pr=1)
-    finally:
-        tc.agents.sync_mathlib_pool, wr.atomic_json = saved_sync, saved_atomic
-    check("owner write failure never stops preparation", ok is True)
-
-
-def test_prepare_checkout(root):
-    origin, co, cfg = fixture(root / "prep")
-    agents = tc.agents
-    saved_sync, saved_url = agents.sync_mathlib_pool, agents.CHECKOUT_URL
-    agents.sync_mathlib_pool = lambda cfg: None
-    agents.CHECKOUT_URL = str(origin)
-    try:
-        (co / "Draft.lean").write_text("unfinished\n")
-        git(co, "checkout", "-q", "-b", "pr-branch")
-        ok = agents.prepare_checkout(cfg, work="fix", pr=7)
-        check("prepare_checkout: dirty checkout saved and reset", ok and not (co / "Draft.lean").exists())
-        check("prepare_checkout lands on main", git(co, "symbolic-ref", "--short", "HEAD").strip() == "main")
-        records = [p for p in (cfg.state / "recovery").iterdir() if p.is_dir()]
-        check(
-            "prepare_checkout saved the draft",
-            len(records) == 1 and "Draft.lean" in json.loads((records[0] / "manifest.json").read_text())["untracked"],
-        )
-        owner = json.loads(wr.owner_path(cfg).read_text())
-        check("prepare_checkout records the new owner", owner["work"] == "fix" and owner["pr"] == 7)
-        if Path("/proc/self").exists():
-            (co / "Draft2.lean").write_text("x\n")
-            child = subprocess.Popen(["sleep", "60"], cwd=co)
-            try:
-                time.sleep(0.2)
-                ok = agents.prepare_checkout(cfg, work="fix", pr=8)
-                check(
-                    "prepare_checkout: in-use checkout moved aside, fresh clone ready",
-                    ok and (co / ".git").is_dir() and not (co / "Draft2.lean").exists(),
-                )
-                check(
-                    "prepare_checkout: fresh clone on main",
-                    git(co, "symbolic-ref", "--short", "HEAD").strip() == "main",
-                )
-            finally:
-                child.kill()
-                child.wait()
-    finally:
-        agents.sync_mathlib_pool, agents.CHECKOUT_URL = saved_sync, saved_url
-
-
-def test_prepare_checkout_restores_canonical_origin(root):
-    """A clone re-pointed at a stale fork returns to canonical main, keeping the fork remote."""
-    origin, co, cfg = fixture(root / "fork-origin")
-    fork = root / "fork-origin" / "fork.git"
-    subprocess.run(["git", "clone", "-q", "--bare", str(origin), str(fork)], check=True)
-    seed = root / "fork-origin" / "seed"
-    (seed / "C.lean").write_text("theorem c : True := trivial\n")
-    git(seed, "add", "-A")
-    git(seed, "commit", "-qm", "canonical moves on")
-    git(seed, "push", "-q", str(origin), "main")
-    git(co, "remote", "set-url", "origin", str(fork))
-    agents = tc.agents
-    saved_sync, saved_url = agents.sync_mathlib_pool, agents.CHECKOUT_URL
-    agents.sync_mathlib_pool = lambda cfg: None
-    agents.CHECKOUT_URL = str(origin)
-    try:
-        ok = agents.prepare_checkout(cfg, work="fix")
-        check("non-canonical origin: preparation succeeds", ok)
-        check("origin is canonical again", git(co, "config", "--get", "remote.origin.url").strip() == str(origin))
-        check("the fork is kept", git(co, "config", "--get", "remote.previous-origin.url").strip() == str(fork))
-        check("main is canonical main, not the fork's", (co / "C.lean").exists())
-        check(
-            "a canonical origin is left alone",
-            agents.repair_origin(co) and not agents._remote_url(co, "previous-origin-2"),
-        )
-        check(
-            "GitHub URL spellings compare equal",
-            agents._same_repository(
-                "git@github.com:TauCetiProject/TauCeti.git", "https://github.com/TauCetiProject/TauCeti"
+    (cfg.state / "quiescence.json").write_text('{"round_id":"legacy","empty":true}')
+    wr.owner_path(cfg).parent.mkdir()
+    wr.owner_path(cfg).write_text('{"round_id":"legacy","pid":999999999}')
+    previous_paths = [old]
+    previous_caches = []
+    with patch.object(tc.agents, "sync_mathlib_pool", side_effect=AssertionError("unsafe mutable cache pool")):
+        for i in range(4):
+            check(f"uncertain round {i} continues", tc.agents.prepare_checkout(cfg, work="fix", pr=i))
+            active = wr.active_checkout(cfg)
+            check(f"round {i}: canonical distinct path", active == active.resolve() and active not in previous_paths)
+            check(f"round {i}: fresh main", git(active, "branch", "--show-current").strip() == "main")
+            check(f"round {i}: old source preserved", (previous_paths[-1] / "Draft.lean").exists())
+            check(f"round {i}: no old source in candidate", not (active / "Draft.lean").exists())
+            cache = Path(os.environ["LAKE_CACHE_DIR"])
+            check(f"round {i}: private caches", cache not in previous_caches and cache.is_relative_to(active.parent))
+            check(
+                f"round {i}: private verification outputs",
+                Path(os.environ["TAUCETI_VERIFY_STATE"]).is_relative_to(active.parent),
             )
-            and not agents._same_repository(
-                "git@github.com:kim-em/TauCeti.git", "https://github.com/TauCetiProject/TauCeti"
+            (active / "Draft.lean").write_text(f"round {i} unfinished\n")
+            previous_paths.append(active)
+            previous_caches.append(cache)
+    check(
+        "reconstructed configuration resolves same generation",
+        wr.active_checkout(SimpleNamespace(**vars(cfg))) == active,
+    )
+    owner = json.loads(wr.owner_path(cfg).read_text())
+    check("owner binds exact active generation", owner["checkout"] == str(active) and owner["work"] == "fix")
+    retained = json.loads(wr.selection_path(cfg).read_text())["retained"]
+    check("no one-retained-checkout cap", len(retained) == 4 and all(Path(x["checkout"]).exists() for x in retained))
+    check("status reports all retained generations", wr.summary(cfg.state.parent)["retained"] == 4)
+    with patch.dict(os.environ, {"TAUCETI_WORK_RECOVERY": "off"}):
+        check("rollback continues", tc.agents.prepare_checkout(cfg))
+    check("rollback preserves every old generation", all(path.exists() for path in previous_paths))
+
+
+def test_detached_writers(root):
+    from unittest.mock import patch
+
+    origin, old, cfg = fixture(root / "writers")
+    (old / "Draft.lean").write_text("original\n")
+    # Neither fixture writes until preparation has completed its FINAL inspection and cloned.
+    script = (
+        "import pathlib,sys; print('ready',flush=True); sys.stdin.readline(); "
+        "pathlib.Path(sys.argv[1]).write_text('late source\\n'); "
+        "pathlib.Path(sys.argv[2]).write_text('late cache\\n')"
+    )
+    cache = root / "old-cache"
+    cache.mkdir()
+    (old / ".lake").symlink_to(cache, target_is_directory=True)
+    relative = subprocess.Popen(
+        [sys.executable, "-c", script, "Relative.lean", ".lake/relative.olean"],
+        cwd=old,
+        start_new_session=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    absolute = subprocess.Popen(
+        [sys.executable, "-c", script, str(old / "Absolute.lean"), str(cache / "absolute.olean")],
+        cwd="/",
+        start_new_session=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        check(
+            "detached writers ready",
+            relative.stdout.readline().strip() == absolute.stdout.readline().strip() == "ready",
+        )
+        check(
+            "absolute writer holds no checkout reference in proc",
+            not any(x.startswith(str(absolute.pid) + " ") for x in wr.live_users(old)),
+        )
+        with patch.dict(
+            os.environ, {"LAKE_CACHE_DIR": str(cache), "MATHLIB_CACHE_DIR": str(cache), "XDG_CACHE_HOME": str(cache)}
+        ):
+            check("fresh work ready while both writers wait", tc.agents.prepare_checkout(cfg, work="fix"))
+            fresh = wr.active_checkout(cfg)
+            (fresh / "Candidate.lean").write_text("new work\n")
+            for writer in (relative, absolute):
+                writer.stdin.write("go\n")
+                writer.stdin.flush()
+                check("fixture writer finishes naturally", writer.wait(timeout=10) == 0)
+            check("new candidate survives late writes", (fresh / "Candidate.lean").read_text() == "new work\n")
+            check(
+                "neither writer reaches new checkout",
+                not (fresh / "Relative.lean").exists() and not (fresh / "Absolute.lean").exists(),
+            )
+            check(
+                "original and both late sources recoverable",
+                all((old / name).exists() for name in ("Draft.lean", "Relative.lean", "Absolute.lean")),
+            )
+            check("absolute old path still names old tree", old.is_dir() and old != fresh and not old.is_symlink())
+            check(
+                "old cache alias not imported",
+                not (fresh / ".lake").is_symlink() and not list(Path(os.environ["LAKE_CACHE_DIR"]).glob("*.olean")),
+            )
+            check(
+                "old writable cache changes stay in old cache",
+                (cache / "relative.olean").exists() and (cache / "absolute.olean").exists(),
+            )
+        # Snapshotting the late bytes uses the same v1 archive, without authorizing deletion.
+        record = wr._record(cfg, old, wr.inspect(old), "TauCeti", tc.TAUCETI)
+        restored = reconstruct(origin, record, root / "writers", "restored")
+        check(
+            "late bytes reconstruct from v1 record",
+            all(
+                (restored / name).read_bytes() == (old / name).read_bytes()
+                for name in ("Draft.lean", "Relative.lean", "Absolute.lean")
             ),
         )
     finally:
-        agents.sync_mathlib_pool, agents.CHECKOUT_URL = saved_sync, saved_url
+        for writer in (relative, absolute):
+            if writer.poll() is None:
+                writer.stdin.write("go\n")
+                writer.stdin.flush()
+                writer.wait(timeout=10)
+            writer.stdin.close()
+            writer.stdout.close()
+
+
+def test_selection_failures(root):
+    from unittest.mock import patch
+
+    for err in (errno.ENOSPC, errno.EACCES):
+        origin, old, cfg = fixture(root / f"save-{err}")
+        (old / "Draft.lean").write_text("valuable\n")
+        with patch.object(wr, "_archive", side_effect=OSError(err, os.strerror(err))):
+            check(f"save failure {err}: continues fresh", tc.agents.prepare_checkout(cfg))
+        check(f"save failure {err}: original source kept", (old / "Draft.lean").read_text() == "valuable\n")
+        origin, old, cfg = fixture(root / f"select-{err}")
+        (old / "Draft.lean").write_text("valuable\n")
+        real_atomic = wr.atomic_json
+
+        def fail_selection(path, value, cfg=cfg, err=err, real_atomic=real_atomic):
+            if path == wr.selection_path(cfg):
+                raise OSError(err, os.strerror(err))
+            real_atomic(path, value)
+
+        with patch.object(wr, "atomic_json", side_effect=fail_selection):
+            check(
+                f"selector failure {err}: reports actual error",
+                not tc.agents.prepare_checkout(cfg) and os.strerror(err) in wr.LAST_REFUSAL,
+            )
+        check(
+            f"selector failure {err}: original source kept",
+            (old / "Draft.lean").exists() and wr.active_checkout(cfg) == old,
+        )
+        check(f"selector failure {err}: retry succeeds", tc.agents.prepare_checkout(cfg))
+
+    # A clone failure is retried with its partial generation retained, never removed/reused.
+    origin, old, cfg = fixture(root / "clone")
+    real_run = subprocess.run
+
+    def broken_clone(args, **kw):
+        if args[:3] == ["git", "clone", "-q"]:
+            partial = Path(args[-1])
+            partial.mkdir()
+            (partial / "Partial.lean").write_text("partial bytes\n")
+            raise SystemExit("crash during clone")
+        return real_run(args, **kw)
+
+    with patch.object(tc.agents.subprocess, "run", side_effect=broken_clone):
+        try:
+            tc.agents.prepare_checkout(cfg)
+        except SystemExit:
+            pass
+    partial = wr.active_checkout(cfg)
+    check("crash during clone: partial generation selected", (partial / "Partial.lean").exists())
+    check("crash during clone: retry continues", tc.agents.prepare_checkout(cfg))
+    check(
+        "crash during clone: partial source preserved",
+        (partial / "Partial.lean").exists() and wr.active_checkout(cfg) != partial,
+    )
+    # Before selector commit and after selector commit: either pointer is safe to recover.
+    for after in (False, True):
+        origin, old, cfg = fixture(root / f"selection-crash-{after}")
+        (old / "Draft.lean").write_text("source\n")
+        real_atomic = wr.atomic_json
+
+        def crash(path, value, cfg=cfg, after=after, real_atomic=real_atomic):
+            if path == wr.selection_path(cfg):
+                if after:
+                    real_atomic(path, value)
+                raise SystemExit("crash at selector commit")
+            real_atomic(path, value)
+
+        with patch.object(wr, "atomic_json", side_effect=crash):
+            try:
+                tc.agents.prepare_checkout(cfg)
+            except SystemExit:
+                pass
+        check(f"selector crash {after}: old source intact", (old / "Draft.lean").exists())
+        check(f"selector crash {after}: next preparation recovers", tc.agents.prepare_checkout(cfg))
+        check(
+            f"selector crash {after}: legacy path never reused",
+            (old / "Draft.lean").exists() and wr.active_checkout(cfg) != old,
+        )
+    # Malformed selector must never silently fall back to a legacy or retained generation.
+    wr.selection_path(cfg).write_text("{truncated")
+    try:
+        wr.active_checkout(cfg)
+        check("invalid selector refuses legacy fallback", False)
+    except wr.RecordError:
+        check("invalid selector refuses legacy fallback", (old / "Draft.lean").exists())
+    # Legacy cleanup markers are not evidence that a detached owner cannot write later.
+    origin, old, cfg = fixture(root / "legacy-retained")
+    doomed = old.parent / "retained-checkouts" / "TauCeti-old.deleting"
+    doomed.mkdir(parents=True)
+    (doomed / "Draft.lean").write_text("still valuable\n")
+    check("legacy retained preparation continues", tc.agents.prepare_checkout(cfg))
+    check("legacy deleting tree preserved", (doomed / "Draft.lean").exists())
+
+
+def test_archive_integrity(root):
+    from unittest.mock import patch
+
+    origin, old, cfg = fixture(root / "integrity")
+    wr.note_owner(cfg, round_id="round-x")
+    (old / "Draft.lean").write_text("valuable source\n")
+    corrupt = cfg.state / "recovery" / "round-x"
+    corrupt.mkdir(parents=True)
+    (corrupt / "manifest.json").write_text("{broken")
+    decision = wr.guard(cfg, old)
+    check("corrupt record not reused", decision.record.name == "round-x.2")
+    (decision.record / "untracked.tar").write_bytes(b"damaged")
+    replacement = wr._record(cfg, old, wr.inspect(old), "TauCeti", tc.TAUCETI)
+    check("damaged payload not trusted", replacement != decision.record)
+    restored = reconstruct(origin, replacement, root / "integrity", "restored")
+    check(
+        "new archive reconstructs valuable source",
+        (restored / "Draft.lean").read_bytes() == (old / "Draft.lean").read_bytes(),
+    )
+    (cfg.state / "recovery" / ".tmp-crashed-save").mkdir()
+    status = wr.summary(cfg.state.parent)
+    check("corrupt and interrupted archives remain visible", status["corrupt"] == 2 and status["incomplete"] == 1)
+    # A real bound refusal still retains the entire original source tree.
+    origin, old, cfg = fixture(root / "bound")
+    (old / "large.dat").write_bytes(b"x" * 2048)
+    with patch.object(wr, "MAX_UNTRACKED_BYTES", 1024):
+        check("oversized archive continues fresh", tc.agents.prepare_checkout(cfg))
+    check("oversized source retained intact", (old / "large.dat").stat().st_size == 2048)
+    # Preparation must never reuse a generation path just because its checkout disappeared.
+    origin, old, cfg = fixture(root / "absent")
+    check("first preparation succeeds", tc.agents.prepare_checkout(cfg))
+    previous = wr.active_checkout(cfg)
+    import shutil
+
+    shutil.rmtree(previous)
+    check("absent exposed checkout continues fresh", tc.agents.prepare_checkout(cfg))
+    check("absent exposed path is not reused", previous != wr.active_checkout(cfg) and not previous.exists())
 
 
 def test_work_paths(root):
@@ -632,7 +547,10 @@ def test_work_paths(root):
     opts = SimpleNamespace(agent_name="Claude Code", work_model="claude", authoring_profile=None)
     try:
         tc.do_roadmap(w, None, tc.Candidate(0, "", "algebra"), opts, False)
-        check("host roadmap: agent launched after saving", len(launched) == 1 and not (co / "Draft.lean").exists())
+        check(
+            "host roadmap: agent launched after saving",
+            len(launched) == 1 and (co / "Draft.lean").exists() and launched[0][0] == wr.active_checkout(cfg),
+        )
         check("host roadmap: draft saved", any((cfg.state / "recovery").iterdir()))
     finally:
         for k, v in saved.items():
@@ -649,47 +567,30 @@ def test_work_paths(root):
     check("progress clone: section saved", decision.ok and manifest["untracked"] == ["status.md"])
     check("progress clone: repository recorded", manifest["repository"] == "TauCetiProject/TauCetiRoadmap")
 
+    from tauceti_worker import progress_publication as publication
+    from tauceti_worker.survey import progress_due
 
-def test_activity(root):
-    """Prepared activity carries local counts; display and fleet aggregation read only that JSON."""
-    import contextlib
-    import io
-    from unittest.mock import patch
-
-    from tauceti_worker import activity, activity_summary
-
-    origin, co, cfg = fixture(root / "act")
-    wr.note_owner(cfg, round_id="round-a")
-    (co / "Draft.lean").write_text("unfinished\n")
-    real_archive = wr._archive
-    wr._archive = lambda *a, **k: (_ for _ in ()).throw(OSError(errno.ENOSPC, "No space left on device"))
-    try:
-        wr.guard(cfg, co)  # moved aside, no record
-    finally:
-        wr._archive = real_archive
-    subprocess.run(["git", "clone", "-q", str(origin), str(co)], check=True)
-    (co / "Other.lean").write_text("x\n")
-    real_users = wr.live_users
-    wr.live_users = lambda path: ["123 (lake)"] if path == co else []
-    try:
-        wr.guard(cfg, co)  # saved first, then moved aside: a retained record
-    finally:
-        wr.live_users = real_users
-    (cfg.state / "recovery" / ".tmp-x").mkdir()
-    with patch.object(wr, "HERE", root / "act"), patch.object(activity, "_refresh_prs", lambda *a: None):
-        value = activity.prepare()
-    rec = value["all"]["work_recovery"]
-    check("activity: retained and incomplete counted", rec["retained"] >= 1 and rec["incomplete"] == 1)
-    check("activity: reason names the worker", any(r.startswith("w: ") for r in rec["reasons"]))
-    summary = activity.cached()
-    combined = activity_summary.combine([summary, summary])
-    check("fleet aggregate sums host counts", combined["summary"]["work_recovery"]["retained"] == 2 * rec["retained"])
-    with (
-        patch.object(activity, "_connect", side_effect=AssertionError("SQL in status")),
-        contextlib.redirect_stdout(io.StringIO()) as out,
-    ):
-        activity.display(summary)
-    check("display shows moved-aside checkouts", "checkouts moved aside" in out.getvalue())
+    fresh = wr.progress_checkout(cfg)
+    subprocess.run(["git", "clone", "-q", str(origin), str(fresh)], check=True)
+    work = wr.progress_work(cfg)
+    work.mkdir()
+    for name in publication.FILES:
+        (work / name).write_text(
+            json.dumps({k: k for k in ("roadmap", "from_sha", "to_sha", "status_path", "progress_path")})
+            if name.endswith(".json")
+            else "new prose"
+        )
+    publication.save(cfg, "author", "version")
+    check(
+        "progress receipt uses active generation outputs",
+        publication.retained(cfg) is not None and work.parent == fresh.parent,
+    )
+    (work / "section-body.md").write_text("changed without matching receipt")
+    due, reason = progress_due(cfg, SimpleNamespace(read=lambda _: 0))
+    check("survey resolves same generation receipt", not due and "needs recovery" in reason)
+    check(
+        "progress legacy source remains intact", (roadmap / "status.md").read_text() == "unpublished progress section\n"
+    )
 
 
 def main():
@@ -697,19 +598,14 @@ def main():
         root = Path(tmp)
         os.environ["TAUCETI_ACTIVITY_DIR"] = str(root / "activity")
         for test in (
-            test_clean_and_published,
             test_full_record,
             test_commits_only,
             test_hidden_source,
-            test_move_aside,
-            test_live_process,
-            test_broken_git_state,
-            test_late_write,
-            test_push_and_owner,
-            test_prepare_checkout,
-            test_prepare_checkout_restores_canonical_origin,
+            test_generations,
+            test_detached_writers,
+            test_selection_failures,
+            test_archive_integrity,
             test_work_paths,
-            test_activity,
         ):
             (root / test.__name__).mkdir()
             test(root / test.__name__)

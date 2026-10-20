@@ -11,6 +11,7 @@ import uuid
 from . import github_outbox as outbox
 from . import github_transport as tr
 from .constants import PROGRESS_REF, ROADMAP
+from .work_recovery import progress_checkout, progress_work
 
 MAX_ATTEMPTS = 6
 MAX_WAIT_AGE = 7 * 86400
@@ -35,7 +36,7 @@ def fingerprints(work):
 
 def retained(cfg):
     """Local-only discovery, including pre-receipt reports tied to a retained fork intent."""
-    work = cfg.state / "progress/work"
+    work = progress_work(cfg)
     receipt = work / "publication.json"
     try:
         hashes = fingerprints(work)
@@ -93,7 +94,7 @@ def retained(cfg):
 
 def begin_writing(cfg):
     """Fence legacy adoption before changing any canonical inputs or output bodies."""
-    tr.atomic(cfg.state / "progress/work/writing.json", {"version": 1})
+    tr.atomic(progress_work(cfg) / "writing.json", {"version": 1})
 
 
 def legacy_branch_matches(cfg, plan):
@@ -103,7 +104,7 @@ def legacy_branch_matches(cfg, plan):
     try:
         branch = f"progress/{plan['from_sha'][:7]}-{plan['to_sha'][:7]}/{plan['roadmap']}"
         result = subprocess.run(
-            ["git", "-C", str(cfg.state / "progress/roadmap"), "show", f"{branch}:{plan['progress_path']}"],
+            ["git", "-C", str(progress_checkout(cfg)), "show", f"{branch}:{plan['progress_path']}"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -121,7 +122,7 @@ def legacy_branch_matches(cfg, plan):
 
 def park(cfg, value, reason):
     """Keep a private recovery bundle before allowing a new report to be planned."""
-    work = cfg.state / "progress/work"
+    work = progress_work(cfg)
     saved = cfg.state / "progress/retained" / uuid.uuid4().hex
     saved.mkdir(parents=True, mode=0o700)
     for name in (*FILES, "facts.json", "progress-prompt.md"):
@@ -150,7 +151,7 @@ def parked_window(cfg, plan):
 
 
 def save(cfg, actor, version):
-    work = cfg.state / "progress/work"
+    work = progress_work(cfg)
     value = {"actor": actor.lower(), "files": fingerprints(work), "version": version, "retry_at": 0}
     tr.atomic(work / "publication.json", value)
     return value
@@ -164,7 +165,7 @@ def defer(cfg, value):
         "attempts": value.get("attempts", 0) + 1,
         "retry_at": time.time() + 300,
     }
-    tr.atomic(cfg.state / "progress/work/publication.json", value)
+    tr.atomic(progress_work(cfg) / "publication.json", value)
     return value
 
 
@@ -181,11 +182,11 @@ def temporary_wait(cfg, value):
     }
     if time.time() - value["started"] >= MAX_WAIT_AGE:
         return park(cfg, value, "publication unavailable for seven days; artifacts retained for recovery")
-    tr.atomic(cfg.state / "progress/work/publication.json", value)
+    tr.atomic(progress_work(cfg) / "publication.json", value)
     return None
 
 
 def complete(cfg, value):
-    work = cfg.state / "progress/work"
+    work = progress_work(cfg)
     tr.atomic(work / "publication-done.json", {**value, "completed": time.time()})
     (work / "publication.json").unlink(missing_ok=True)
