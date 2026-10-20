@@ -30,6 +30,12 @@ and provider sandboxes behave as before: the whole filesystem and `/dev` are bou
 unchanged. As inside any unprivileged user namespace, setuid programs such as `sudo` do
 not gain privileges.
 
+At the end of its cleanup, each round writes `state/<worker>/quiescence.json` for
+[work recovery](work-recovery.md). It marks the round empty only when this host contains
+every launch and each of the round's boundaries was confirmed empty. Any best-effort,
+Bubble-owned or unconfirmed boundary withholds that proof. A round killed before its
+cleanup writes nothing, so its dirty checkout stays retained as unknown.
+
 Each boundary is recorded with its round as activity receipts: `containment_started` at
 launch, with the label, mode, namespace init pid and PID namespace inode, then
 `containment_result` with the exit status and cleanup result.

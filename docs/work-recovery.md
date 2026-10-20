@@ -69,10 +69,11 @@ tauceti recovery confirm <record> --worker-id <worker>
 
 A confirmation applies only to the exact saved source, compared by fingerprint.
 If the checkout changes after confirmation, the next preparation saves a new
-record and blocks again. A round-containment owner may instead write
-`state/<worker>/quiescence.json` as
-`{"round_id": ..., "empty": true, "boundary": ...}` for the exact round recorded
-in `state/<worker>/checkout-owners/TauCeti.json`.
+record and blocks again. [Process containment](process-containment.md) instead
+writes `state/<worker>/quiescence.json` as
+`{"round_id": ..., "empty": true, "boundary": ...}` when a round's boundaries all
+ended empty. That proof applies only to the exact round recorded in
+`state/<worker>/checkout-owners/TauCeti.json`.
 
 ## Publication
 

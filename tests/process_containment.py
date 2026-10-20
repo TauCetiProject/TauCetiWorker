@@ -266,6 +266,42 @@ class Namespace(Base):
         [event] = self.events()
         self.assertEqual((event["mode"], event["cleanup"]), ("pid-namespace", "namespace-empty"))
 
+    def round_context(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        cfg = SimpleNamespace(state=self.tmp / "state", wid="containment-test", logdir=self.tmp / "logs")
+        return cfg, round_.RoundContext(cfg)
+
+    def test_round_cleanup_proves_quiescence_for_checkout_recovery(self):
+        from tauceti_worker import work_recovery
+
+        cfg, context = self.round_context()
+        with context as ctx:
+            self.assertEqual(self.run_agent(), 0)
+            round_id = ctx.activity.id
+        proof = json.loads((cfg.state / "quiescence.json").read_text())
+        self.assertEqual((proof["round_id"], proof["empty"], proof["boundaries"]), (round_id, True, 1))
+        # The checkout-recovery consumer accepts it for the round that owns the checkout, only.
+        work_recovery.owner_path(cfg).parent.mkdir(parents=True)
+        work_recovery.owner_path(cfg).write_text(json.dumps({"round_id": round_id}))
+        snap = SimpleNamespace(fingerprint="unused")
+        self.assertEqual(work_recovery.quiescence(cfg, self.tmp / "checkout", None, snap, "TauCeti")[0], "quiescent")
+        work_recovery.owner_path(cfg).write_text(json.dumps({"round_id": "another-round"}))
+        self.assertEqual(work_recovery.quiescence(cfg, self.tmp / "checkout", None, snap, "TauCeti")[0], "unknown")
+
+    def test_best_effort_or_unconfirmed_rounds_withhold_the_proof(self):
+        cfg, context = self.round_context()
+        with patch.dict(os.environ, {containment.POLICY_ENV: "legacy"}), context:
+            rc = agents.run_agent_proc(
+                [sys.executable, "-c", "pass"], env=dict(os.environ), logdir=self.tmp, label="agent", provider="test"
+            )
+            self.assertEqual(rc, 0)
+        self.assertFalse(json.loads((cfg.state / "quiescence.json").read_text())["empty"])
+        cfg, context = self.round_context()
+        with patch.object(containment, "unconfirmed", return_value=[{"boundary": "b"}]), context:
+            pass
+        self.assertFalse(json.loads((cfg.state / "quiescence.json").read_text())["empty"])
+
     def test_branch_claim_loss_cancels_the_agent(self):
         # The real heartbeat watcher: its child reports the lease lost while the agent is running.
         claims = round_.Claims(SimpleNamespace(), SimpleNamespace(add_cleanup=lambda fn: None))

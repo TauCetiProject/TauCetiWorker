@@ -403,6 +403,11 @@ class Boundary:
             )
 
 
+# Outcomes that prove a namespace boundary left nothing behind.
+PROVEN = {"namespace-empty", "namespace-killed", "not-started"}
+_outcomes: dict[str, list[tuple[str, str]]] = {}
+
+
 def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str | None = None) -> None:
     from . import activity
 
@@ -411,6 +416,8 @@ def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str
     round_id = activity.current_round_id()
     if round_id is None:
         return  # recorded only with a round; ad hoc commands have none to attach it to
+    if cleanup is not None:
+        _outcomes.setdefault(round_id, []).append((boundary.mode, cleanup))
     activity.emit(
         kind,
         key=f"{boundary.id}:{kind}",
@@ -423,6 +430,34 @@ def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str
         started_at=boundary._started,
         **({} if kind == "containment_started" else {"exit_code": rc, "cleanup": cleanup}),
     )
+
+
+def write_quiescence(state_dir, round_id: str) -> bool:
+    """At the end of a round, tell checkout recovery whether that round left any process behind.
+
+    `state/<worker>/quiescence.json` is the proof work_recovery accepts for the round that owns a
+    dirty checkout. It is empty only when this host contains every launch and each of the round's
+    boundaries was confirmed empty; any best-effort, external or unconfirmed boundary withholds it.
+    A round killed before its cleanup writes nothing, which leaves the checkout's state unknown."""
+    from .runtime_status import atomic_json
+
+    outcomes = _outcomes.pop(round_id, [])
+    empty = (
+        strong() and not unconfirmed() and all(mode == NAMESPACE and cleanup in PROVEN for mode, cleanup in outcomes)
+    )
+    proof = dict(
+        round_id=round_id,
+        empty=empty,
+        boundary=f"{NAMESPACE} x{len(outcomes)}" if empty else None,
+        boundaries=len(outcomes),
+        at=time.time(),
+    )
+    try:
+        atomic_json(Path(state_dir) / "quiescence.json", proof)
+    except OSError as error:
+        log(f"containment: could not record round quiescence ({error}); checkout recovery stays cautious")
+        return False
+    return empty
 
 
 def run(argv, *, label: str, input=None, timeout: float | None = None, env=None, capture_output=False, **kwargs):

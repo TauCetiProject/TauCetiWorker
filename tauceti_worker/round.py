@@ -86,6 +86,14 @@ class RoundContext:
                 fn()
             except Exception as e:
                 log(f"cleanup step failed: {e}")
+        if self.activity is not None:
+            # Every boundary this round launched has finished by now; say whether all were empty.
+            try:
+                from .containment import write_quiescence
+
+                write_quiescence(self.cfg.state, self.activity.id)
+            except Exception as e:
+                log(f"cleanup step failed: {e}")
         if self._fd is not None:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
