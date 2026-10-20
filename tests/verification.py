@@ -97,6 +97,9 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.env = dict(
             os.environ,
             PATH=f"{self.bin}:{os.environ['PATH']}",
+            TAUCETI_ACTIVITY_DIR=str(self.home / "activity"),
+            TAUCETI_FLEET_EVENTS=str(self.home / "worker-events.jsonl"),
+            TAUCETI_VERIFY_HELPER="1",
             TAUCETI_PROCESS_CONTAINMENT="legacy",
             TAUCETI_VERIFY_STATE=str(self.state),
             TAUCETI_VERIFY_HOST_QUEUE=str(self.home / "queue"),
@@ -226,7 +229,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "incomplete")
         self.assertLess(result["commands"][-1]["exit"], 0)
         (self.root / ".lake/calls").unlink()
-        p = self.spawn(FIXTURE_MODE="sleep")
+        p = self.spawn(FIXTURE_MODE="sleep", TAUCETI_VERIFY_STATE=str(self.home / "sigterm-state"))
         self.wait_calls(p)
         p.send_signal(signal.SIGTERM)
         out, _ = p.communicate(timeout=10)
@@ -332,7 +335,8 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
-        self.assertIn("TauCeti.B", Path(result["commands"][3]["log"]).read_text())
+        lint = next(c for c in result["commands"] if "scripts/lint-env.sh" in c["argv"])
+        self.assertIn("TauCeti.B", Path(lint["log"]).read_text())
         modules.write_text("TauCeti.A\n")
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertNotIn("reused_from", result["phases"]["lint"])

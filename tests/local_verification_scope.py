@@ -336,6 +336,8 @@ def main():
         lint_run = subprocess.run(["bash", "-c", lint], cwd=r, env=env, capture_output=True, text=True)
         check("empty scope skips lint-env", "no changed TauCeti module" in lint_run.stdout, lint_run.stdout)
 
+    # The canary helper path is explicitly opted in; V0 remains the dispatch default.
+    os.environ["TAUCETI_VERIFY_HELPER"] = "1"
     # Every authoring/repair prompt, rendered as the worker renders it, carries the same rules.
     sys.path.insert(0, str(HERE))
     from prompt_wrapper_paths import CALL_SITES

@@ -118,10 +118,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            from .verification_jobs import reap_continuations, resume_pending
+
+            reap_continuations(cfg)
             if reason := fleet_admission_reason(cfg.wid):
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)
                 continue
+            # Verification owns an isolated candidate and a separate job lease. Its queue wait
+            # must not block model selection, and host CI reservations still precede launch.
+            resume_pending(cfg, background=True)
             if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
@@ -404,6 +410,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         log("loop interrupted — stopping")
         return 130
     finally:
+        from .verification_jobs import stop_continuations
+
+        stop_continuations(cfg)
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
 
