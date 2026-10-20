@@ -100,6 +100,13 @@ def display(value, default_kinds=()):
     s = value["summary"]
     age = max(0, int(time.time() - s["prepared_at"]))
     print(f"Activity: prepared {age}s ago" + (" (stale)" if age > 180 else ""))
+    if cleanup := s.get("storage_cleanup"):
+        print(
+            f"Storage cleanup: {cleanup.get('removed_count', len(cleanup.get('removed', [])))} paths removed; "
+            f"{cleanup.get('protected_count', len(cleanup.get('protected', [])))} protected; "
+            f"{cleanup.get('errors_count', len(cleanup.get('errors', [])))} errors; "
+            f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB free"
+        )
     since = s.get("history_since")
     print("Activity since: " + (datetime.fromtimestamp(since, UTC).isoformat(timespec="seconds") if since else "none"))
     kinds = list(dict.fromkeys(s.get("round_types", default_kinds)))

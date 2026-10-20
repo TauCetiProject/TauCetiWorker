@@ -64,6 +64,17 @@ class RoundContext:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        if self.record_activity:
+            from .retention import recycle
+
+            try:
+                result = recycle(self.cfg)
+                for error in result["errors"]:
+                    log(f"retention: {error}")
+                if result["removed"]:
+                    log(f"retention: recycled {result.get('removed_count', len(result['removed']))} generated paths")
+            except Exception as error:
+                log(f"retention: cache recycling deferred: {error}")
         # Register first: LIFO cleanup records resources after claim/build teardown.
         try:
             from .resources import RoundResources
@@ -90,6 +101,11 @@ class RoundContext:
                 log(f"cleanup step failed: {e}")
         if self._fd is not None:
             try:
+                if self.record_activity:
+                    try:
+                        os.utime(self._fd, None)  # last use, without another lifecycle record
+                    except OSError as error:
+                        log(f"retention: could not record checkout use: {error}")
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
                 os.close(self._fd)
             except OSError:

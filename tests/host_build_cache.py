@@ -38,6 +38,8 @@ with path.open('a') as f:
 mode = os.environ.get('CACHE_TEST_MODE', '')
 if mode == label + '-retry' and not any(c['label'] == label for c in prior):
  print('error: connection reset'); sys.exit(1)
+if mode == 'disk-full' and not prior:
+ print('error: No space left on device'); sys.exit(1)
 if mode == label + '-fail':
  print('error: artifact transfer failed'); sys.exit(1)
 if mode == 'miss' and label == 'TauCeti':
@@ -135,6 +137,13 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         assert agents.take_last_agent_infra_failure() is None
         assert "artifact transfer failed" in text
     print("[OK] transient fetch retries; persistent or partial download failures block the agent")
+
+    with patch("tauceti_worker.retention.pressure_cleanup") as cleanup:
+        rc, records, _ = run("disk-full")
+        assert rc == 0 and len(launched) == 1
+        cleanup.assert_called_once_with()
+        assert sum(r["label"] == "Mathlib" for r in records) == 2
+    print("[OK] disk pressure cleans once before the existing cache retry")
 
     rc, records, text = run("miss")
     assert rc == 75 and not launched and len(records) == 2

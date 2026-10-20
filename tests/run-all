@@ -122,6 +122,7 @@ RUN_STDLIB=(
   round_file_changes.py
   round_group_sweep.py
   resources.py
+  retention.py
   rubric_bundle.py
   safe_exists.py
   scoreboard_trust.py

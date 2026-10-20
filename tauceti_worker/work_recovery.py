@@ -66,7 +66,10 @@ MAX_UNTRACKED_FILES = 20000
 CACHE_DIRS = frozenset(
     {".lake", "lake-packages", ".cache", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache", ".venv"}
 )
+# Reserved names used by crash-resumable retention deletion contain only generated artifacts.
+CACHE_DIRS |= frozenset(name + ".retention-deleting" for name in CACHE_DIRS)
 CACHE_TOP = frozenset({"build"})  # Lake's legacy top-level build directory
+CACHE_TOP |= frozenset(name + ".retention-deleting" for name in CACHE_TOP)
 CACHE_SUFFIXES = (".olean", ".ilean", ".pyc", ".pyo")
 # Untracked paths that may carry credentials or runtime secrets; recorded by name only.
 SECRET_NAMES = frozenset(
@@ -146,7 +149,7 @@ def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout
         ["git", "-C", str(repo), "-c", "core.quotepath=off", *args],
         capture_output=True,
         timeout=timeout,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"},
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
     )
     if check and p.returncode:
         detail = p.stderr.decode(errors="replace").strip().splitlines()
@@ -460,7 +463,7 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
     from .activity import current_round_id
 
     root = cfg.state / "recovery"
-    owner = owner or read_json(owner_path(cfg, label))
+    owner = read_json(owner_path(cfg, label)) if owner is None else owner
     marker = owner.get("publication_marker") or {}
     outcome = owner.get("round_outcome")
     if marker.get("ref"):
@@ -726,7 +729,11 @@ def _prune_retained(cfg, repo: Path, label: str, repository: str) -> None:
     for doomed in parent.glob("*.deleting"):
         shutil.rmtree(doomed, ignore_errors=True)
     budget = MAX_PRUNE_PER_PREPARATION
-    for old in sorted(p for p in parent.glob(f"{repo.name}-*") if p.is_dir() and not p.name.endswith(".deleting")):
+    for old in sorted(
+        p
+        for p in parent.glob(f"{repo.name}-*")
+        if p.is_dir() and not p.name.endswith((".deleting", ".retention-deleting"))
+    ):
         if budget <= 0:
             return
         budget -= 1
@@ -757,6 +764,46 @@ def _dirty_without_inspection(repo: Path) -> bool:
         capture_output=True,
     )
     return p.returncode != 0 or bool(p.stdout.strip())
+
+
+def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
+    """Save source without moving/resetting a tree; a collector can still evict caches on failure."""
+    record = None
+    try:
+        if not (repo / ".git").is_dir() or (repo / ".git").is_symlink():
+            return Decision(False, "not a standalone Git checkout; retaining source", state="protected")
+        snap = inspect(repo, _preserved(cfg))
+        if len(snap.untracked) > MAX_UNTRACKED_FILES or snap.archive_bytes > MAX_UNTRACKED_BYTES:
+            return Decision(
+                False, "source exceeds the existing recovery archive bounds; retaining checkout", state="protected"
+            )
+        if snap.needs_record and not dry_run:
+            record = _record(cfg, repo, snap, "TauCeti", TAUCETI, owner=owner)
+        if any("credential" in reason for _, reason in snap.excluded):
+            return Decision(False, "credential-like files require retaining the checkout", record, "protected")
+        if _git(
+            repo, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/tags", "refs/notes", text=True
+        ).strip():
+            return Decision(False, "additional Git refs require retaining the checkout", record, "protected")
+        preserved = [f"--glob={PRESERVED}/{record_id}" for record_id in _preserved(cfg)]
+        if _git(
+            repo,
+            "rev-list",
+            "--reflog",
+            "--all",
+            "--not",
+            "--branches",
+            "--remotes",
+            f"--glob={PUBLISHED}",
+            *preserved,
+            text=True,
+        ).strip():
+            return Decision(False, "reflog-only commits require retaining the checkout", record, "protected")
+        if live_users(repo) or inspect(repo, _preserved(cfg)).fingerprint != snap.fingerprint:
+            return Decision(False, "checkout changed or acquired a live user during preservation", record)
+        return Decision(True, record=record, state="preserved")
+    except (OSError, subprocess.SubprocessError, RecordError) as error:
+        return Decision(False, f"could not preserve source: {error}", record)
 
 
 def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:

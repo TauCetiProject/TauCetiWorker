@@ -596,6 +596,11 @@ def build_parser() -> argparse.ArgumentParser:
     recovery.add_argument("--worker-id", dest="worker_id", default=None)
     recovery.add_argument("--json", action="store_true")
 
+    cleanup = sub.add_parser("cleanup", help="expire three-day-old generated worker data; local only")
+    cleanup_mode = cleanup.add_mutually_exclusive_group()
+    cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
+    cleanup_mode.add_argument("--install-timer", action="store_true", help="install daily systemd user cleanup")
+
     w = sub.add_parser(
         "work",
         help="do work: one round, or the driver loop with --loop",
@@ -885,6 +890,10 @@ def main(argv: list[str] | None = None) -> int:
         return command(args)
     if cmd == "recovery":
         return cmd_recovery(args)
+    if cmd == "cleanup":
+        from .retention import cmd_cleanup
+
+        return cmd_cleanup(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size
