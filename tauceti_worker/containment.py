@@ -499,8 +499,8 @@ def write_quiescence(state_dir, round_id: str) -> bool:
     `state/<worker>/quiescence.json` is diagnostic: it is empty only when this host contains every
     launch and each of the round's boundaries was confirmed empty; any best-effort, external or
     unconfirmed boundary withholds it. A round killed before its cleanup writes nothing. Checkout
-    recovery never waits for it: leftovers are saved first, and a checkout still in use is moved
-    aside rather than reset."""
+    recovery never waits for it: leftovers are saved when possible, the uncertain checkout is
+    retained at its original path, and new work uses a distinct canonical generation."""
     from .runtime_status import atomic_json
 
     outcomes = list(_boundaries.pop(round_id, {}).values())

@@ -26,7 +26,7 @@ from . import oauth as credential_refresh
 from .config import Config, log
 from .constants import AUTHORING_DEFAULTS, CLAUDE_CMD, POLL
 from .github import GitHubError, _parse_retry_after
-from .work_recovery import active_checkout
+from .work_recovery import RecordError, active_checkout
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
@@ -1393,7 +1393,10 @@ class Quota:
         # that layer applies to them. Resolving codex's trust rules here would mean reimplementing them,
         # so the presence of such a file is itself disqualifying: it is absent in every ordinary
         # checkout, so this costs nothing until someone actually has one.
-        checkout = getattr(self.cfg, "checkout", None)  # tolerate the lightweight cfg stubs tests build
+        try:
+            checkout = active_checkout(self.cfg) if getattr(self.cfg, "checkout", None) is not None else None
+        except RecordError:
+            return "unreadable:checkout-selector"
         if checkout is not None and _safe_exists(Path(checkout) / ".codex" / "config.toml"):
             return "project-layer"
         return None

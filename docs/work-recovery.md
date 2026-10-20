@@ -68,8 +68,10 @@ Selection precedes cloning. A crash before selection leaves the old pointer;
 a crash after selection leaves an absent or partially cloned generation. The
 next preparation reserves another fresh path, preserving any partial checkout.
 Even an absent path is never reused: it might previously have been exposed.
-There is no checkout rename in this protocol. Invalid selectors fail explicitly
-instead of silently falling back to an old writable alias.
+There is no checkout rename in this protocol. Preparation saves invalid selectors as
+metadata evidence and atomically selects another generation; it never silently
+falls back to an old writable alias. Read-only consumers degrade until preparation
+repairs the selector.
 
 Lake and Mathlib download caches, `XDG_CACHE_HOME`, temporary files, and host
 verification outputs are private to the generation. Explicit writable cache
@@ -77,12 +79,23 @@ path overrides cannot carry across uncertain owners. The mutable Mathlib
 hardlink pool is not imported or promoted during this preparation; independently
 validated immutable Mathlib build views keep their existing sharing contract.
 Progress's writable clone and work outputs use their own generation selector;
-publication receipts and recovery archives retain their existing formats.
+publication receipts and recovery archives retain their existing formats. Damaged
+pending-publication clone metadata parks its fingerprinted work immediately,
+allowing unrelated work and later progress preparation to continue.
+
+Verification attempts are created after host preparation, in that generation's
+private outputs. Supervisor readers discover both legacy verification state and
+active/retained generation outputs, including pending jobs, capacity waits and
+refund evidence. Pending exact-input jobs continue after generation selection
+without a model. Resumed candidates receive separate writable caches; evidence
+from an uncertain generation is not shared into a new author's workspace.
+Before saved-repair selection, source collection only snapshots: it does not
+reserve another authoring generation or change the active checkout.
 
 Save failures (disk space, permissions, archive bounds, broken Git metadata) do
 not prevent isolation and a fresh clone when those operations can succeed. Actual
-selection, directory, or clone failures are reported and retried by the next
-ordinary round. No manual confirm/resume command is required. Late source bytes
+selection, directory, or clone failures report their error and available filesystem
+bytes through runtime status and are retried by the next ordinary round. No manual confirm/resume command is required. Late source bytes
 remain recoverable from the original tree even when they arrived after the last
 archive snapshot.
 

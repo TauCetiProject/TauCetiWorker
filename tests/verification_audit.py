@@ -24,6 +24,53 @@ from tauceti_worker.verification_jobs import resume_pending
 
 class Recovery(Receipts):
     # Reuse the private Git/fake-verifier fixture; load_tests collects only these audit cases.
+    def test_generation_helper_wait_refund_and_parent_continuation(self):
+        from tauceti_worker import agents, work_recovery
+        from tauceti_worker.survey import Counters
+
+        worker_state = self.state
+        cfg = SimpleNamespace(state=worker_state, checkout=self.root, wid="fixture")
+        upstream = self.home / "upstream.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.root), str(upstream)], check=True)
+        subprocess.run(["git", "-C", str(upstream), "update-ref", "refs/heads/main", self.base], check=True)
+        subprocess.run(["git", "-C", str(upstream), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+        with patch.object(agents, "CHECKOUT_URL", str(upstream)):
+            self.assertTrue(agents.prepare_checkout(cfg))
+            self.root = work_recovery.active_checkout(cfg)
+            output = work_recovery.verification_state(cfg)
+            counters = Counters(cfg)
+            counters.write("fix-1", 3)
+            v.begin_attempt(SimpleNamespace(cfg=cfg, counters=counters), ("fix-1",))
+            with (v.queue_root() / "slot-0.lock").open("a+") as owner:
+                fcntl.flock(owner, fcntl.LOCK_EX)
+                process = self.spawn(
+                    TAUCETI_VERIFY_STATE=str(output),
+                    TAUCETI_VERIFY_ATTEMPT=os.environ["TAUCETI_VERIFY_ATTEMPT"],
+                    TAUCETI_ROUND_DEADLINE=str(time.time() + 1),
+                )
+                stdout, stderr = process.communicate(timeout=15)
+                result = json.loads(stdout)
+                self.assertEqual(result.get("result_type"), "pending", stderr)
+            self.assertTrue(v.waiting_for_capacity(cfg, since=time.time() - 10))
+            job_path = Path(result["continuation_job"])
+            self.assertTrue(job_path.is_relative_to(output))
+            # A new child selects another generation. The independent parent still finds and
+            # refunds/resumes the retained generation's job, without inheriting its environment.
+            self.assertTrue(agents.prepare_checkout(cfg))
+        parent_cfg = SimpleNamespace(state=worker_state)
+        self.assertIn(output, work_recovery.verification_states(parent_cfg))
+        self.assertTrue(v.waiting_for_capacity(parent_cfg, since=time.time() - 10))
+        job = json.loads(job_path.read_text())
+        job["next_at"] = 0
+        v.atomic(job_path, job)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(resume_pending(parent_cfg, seconds=10))
+        self.assertEqual(counters.read("fix-1"), 2)
+        complete = v.read_json(output / "verification-jobs" / job_path.name)
+        self.assertEqual(v.read_json(Path(complete["receipt"]))["status"], "success")
+        self.assertFalse(resume_pending(parent_cfg, seconds=10))
+        self.assertEqual(counters.read("fix-1"), 2)
+
     def test_repeated_deadlines_resume_without_model_or_remote_reads(self):
         with (v.queue_root() / "slot-0.lock").open("a+") as owner:
             fcntl.flock(owner, fcntl.LOCK_EX)

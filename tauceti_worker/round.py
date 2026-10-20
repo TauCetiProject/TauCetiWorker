@@ -70,8 +70,10 @@ class RoundContext:
         from .verification import refund_capacity_wait
 
         counters = Counters(self.cfg)
-        refund_capacity_wait(self.cfg.state, counters, interrupted_round=True)
-        refund_capacity_wait(self.cfg.state / "verification-state", counters, interrupted_round=True)
+        from .work_recovery import verification_states
+
+        for directory in verification_states(self.cfg):
+            refund_capacity_wait(directory, counters, interrupted_round=True)
         # Register first: LIFO cleanup records resources after claim/build teardown.
         try:
             from .resources import RoundResources

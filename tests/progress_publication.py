@@ -177,7 +177,7 @@ with (
         assert publication.fingerprints(work) == original
     assert pending["retry_at"] >= time.time() + 14390
     # Fetch waits and damaged retained metadata defer without resetting source or losing prose.
-    for operation in ("fetch", "clone"):
+    for operation in ("fetch",):
 
         def unavailable(args, operation=operation, **kwargs):
             assert operation == "fetch" and args[:1] == ["git"] and operation in args
@@ -255,6 +255,20 @@ with (
     assert publication.retained(cfg) is None
     assert progress_due(cfg, worker.counters)[0] is False
     (work / "plan.json").write_bytes(plan_bytes)
+    # Damaged clone metadata parks immediately without a seven-day local retry loop.
+    original_git = roadmap / ".git"
+    backup_git = roadmap / ".saved-git"
+    original_git.rename(backup_git)
+    try:
+        with patch.object(wu, "me", return_value="author"), patch.object(wu.subprocess, "run") as run:
+            assert wu._do_progress_inner(worker, None) is None
+            run.assert_not_called()
+        assert publication.retained(cfg) is None
+        assert publication.parked_window(cfg, plan) is not None
+        assert publication.fingerprints(work) == original
+    finally:
+        backup_git.rename(original_git)
+    publication.save(cfg, "author", PROGRESS_REF)
     # Receipt corruption or edited bodies preserve everything for recovery.
     (work / "status-body.md").write_text("changed")
     with patch.object(wu.subprocess, "run") as run:

@@ -466,3 +466,9 @@ cannot satisfy a new writer launch. Mechanical tool timeouts fit the remaining r
 starts with less than five minutes remaining. A durable writing marker prevents older fork intents
 from adopting retained bodies from an unsuccessful fresh writer attempt. Prepared publication receipts resume apply with their existing prose and version.
 Rolling back the tool pin preserves these artifacts and the published cursor.
+
+Host authoring preparation isolates uncertain former owners at canonical workspace
+generations. Each new generation overrides writable Lake, Mathlib-download, XDG
+cache and temporary paths with private directories; the mutable Mathlib hardlink
+pool is not exchanged across these generations. Independently validated shared
+Mathlib views retain their sharing contract. See [work recovery](work-recovery.md).

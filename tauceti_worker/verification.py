@@ -35,6 +35,7 @@ from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_queue import admitted
 from .verification_scope import git, local_main, scope, untracked
+from .work_recovery import verification_state, verification_states
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 3
@@ -936,7 +937,7 @@ def refund_capacity_wait(state: Path, counters, *, interrupted_round=False) -> b
 def begin_attempt(w, charged, *, bubble=False):
     if not charged:
         return lambda: False
-    state = w.cfg.state / "verification-state" if bubble else w.cfg.state
+    state = verification_state(w.cfg, bubble=bubble)
     identifier = uuid.uuid4().hex
     atomic(
         state / "verification-attempt.json",
@@ -966,7 +967,7 @@ def waiting_for_capacity(cfg, *, since=None) -> bool:
     if state is None:
         return False
     attempt = os.environ.get("TAUCETI_VERIFY_ATTEMPT")
-    for directory in (state, state / "verification-state"):
+    for directory in verification_states(cfg):
         wait = read_json(directory / "verification-capacity.json")
         matches = (
             (wait.get("at", 0) >= since) if since is not None else bool(attempt and wait.get("attempt") == attempt)

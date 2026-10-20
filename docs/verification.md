@@ -196,3 +196,8 @@ copying cost and host concurrency are still required before broad dispatch.
 No natural production recovery or numerical throughput improvement is asserted by local fixture
 results. Record observed candidate/job/receipt IDs, next automatic action, completed useful work,
 queue waits and immutable preparation cost separately when a canary naturally selects work.
+
+Host authoring uses generation-private verification state. Supervisors discover
+active and retained generation outputs as well as legacy worker state, so queued
+mechanical jobs, capacity waits and refunds survive selection of a fresh checkout.
+See [work recovery](work-recovery.md).

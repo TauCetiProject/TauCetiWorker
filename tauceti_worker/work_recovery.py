@@ -737,6 +737,96 @@ def progress_work(cfg) -> Path:
     return cfg.state / "progress" / "work"
 
 
+def recover_selection(cfg, *, label: str = "TauCeti") -> Decision:
+    """Quarantine corrupt selection evidence, then atomically select without legacy fallback.
+
+    Copy evidence before replacing the pointer. A crash never removes the original selector and
+    exposes the legacy alias as an apparent first run. All source generations remain untouched.
+    """
+    path = selection_path(cfg, label)
+    try:
+        raw = path.read_bytes()
+        evidence = path.with_name(f"{path.stem}.invalid-{secrets.token_hex(8)}")
+        _write(evidence, raw)
+        _fsync_dir(path.parent)
+        try:
+            value = json.loads(raw)
+        except (ValueError, UnicodeError):
+            value = {}
+        value = value if isinstance(value, dict) else {}
+        legacy = cfg.checkout if label == "TauCeti" else cfg.state / "progress" / "roadmap"
+        candidate = value.get("active")
+        repo = Path(candidate) if isinstance(candidate, str) and Path(candidate).is_absolute() else legacy
+        old = value.get("retained", [])
+        old = old if isinstance(old, list) else []
+        retained = [
+            entry
+            for entry in old
+            if isinstance(entry, dict)
+            and isinstance(entry.get("checkout"), str)
+            and isinstance(entry.get("reason"), str)
+        ]
+        return _retain(
+            cfg,
+            repo,
+            f"invalid workspace selector; evidence at {evidence}",
+            None,
+            label,
+            selection=dict(active=str(repo.absolute()), retained=retained),
+        )
+    except OSError as error:
+        return Decision(False, f"could not preserve invalid selector {path}: {error}", state="refused")
+
+
+def report_workspace_failure(cfg, repo: Path, error) -> None:
+    from .runtime_status import report_runtime
+
+    detail = f"workspace preparation failed at {repo}: {error}"
+    available = None
+    with contextlib.suppress(OSError):
+        available = shutil.disk_usage(cfg.state).free
+    report_runtime(
+        "workspace-unavailable",
+        detail=detail,
+        workspace_path=str(repo),
+        workspace_error=str(error),
+        workspace_free_bytes=available,
+    )
+    log(detail + (f" (filesystem free bytes: {available})" if available is not None else ""))
+
+
+def verification_states(cfg) -> list[Path]:
+    """Supervisor discovery of legacy, active and retained private verification namespaces.
+
+    Use selector metadata and immediate record directories only; never walk source/cache trees.
+    A retired generation's queued exact-input work remains discoverable after the next selection.
+    """
+    state = cfg.state
+    locations = [state, state / "verification-state"]
+    for label in ("TauCeti", "progress-roadmap"):
+        value = read_json(selection_path(cfg, label))
+        paths = [value.get("active")]
+        old_entries = value.get("retained", [])
+        if isinstance(old_entries, list):
+            paths += [old.get("checkout") for old in old_entries if isinstance(old, dict)]
+        root = state.resolve() / "workspace-generations" / _safe_id(label)
+        locations.extend(root.glob("*/outputs"))  # also survives invalid-selector recovery/relocation
+        for raw in paths:
+            if isinstance(raw, str):
+                checkout = Path(raw)
+                if checkout.name == "checkout" and checkout.parent.parent == root:
+                    locations.append(checkout.parent / "outputs")
+    locations.extend((state / "recovery").glob("*/outputs"))
+    return list(dict.fromkeys(locations))
+
+
+def verification_state(cfg, *, bubble=False) -> Path:
+    if bubble:
+        return cfg.state / "verification-state"
+    value = _selection(cfg, "TauCeti")
+    return Path(value["active"]).parent / "outputs" if value else cfg.state
+
+
 def workspace_environment(cfg) -> None:
     """Select private mutable caches/outputs before any build or verification subprocess runs.
 
@@ -780,7 +870,14 @@ def _mkdir_durable(path: Path) -> None:
     _fsync_dir(ancestor)
 
 
-def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> Decision:
+def _owner_for(cfg, repo: Path, label: str) -> dict:
+    owner = read_json(owner_path(cfg, label))
+    return owner if not owner.get("checkout") or owner["checkout"] == str(repo.absolute()) else {}
+
+
+def _retain(
+    cfg, repo: Path, reason: str, record: Path | None, label: str, *, selection: dict | None = None
+) -> Decision:
     """Retain in place and durably select a never-used canonical path before cloning.
 
     There is deliberately no rename: both cwd-relative writers and writers reopening the old
@@ -791,7 +888,7 @@ def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> De
     """
     global LAST_REFUSAL
     try:
-        value = _selection(cfg, label)
+        value = _selection(cfg, label) if selection is None else selection
         if value and Path(value["active"]) != repo.absolute():
             raise RecordError(f"{repo} is no longer the active generation")
         root = cfg.state.resolve() / "workspace-generations" / _safe_id(label)
@@ -811,7 +908,8 @@ def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> De
                     checkout=str(repo.absolute()),
                     reason=reason,
                     retained_at=time.time(),
-                    owner=read_json(owner_path(cfg, label)),
+                    resolved_checkout=str(repo.resolve()),
+                    owner=_owner_for(cfg, repo, label),
                 )
             ]
         selector = selection_path(cfg, label)
@@ -828,6 +926,7 @@ def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> De
         _fsync_dir(selector.parent.parent)
     except (OSError, RecordError) as error:
         LAST_REFUSAL = f"{reason}; could not select a fresh workspace ({error}); the checkout is left intact"
+        report_workspace_failure(cfg, repo, error)
         return Decision(False, LAST_REFUSAL, record, "refused")
     if record is not None:
         _set_status(record, "retained", f"{reason}; checkout retained at {repo}")
@@ -852,6 +951,14 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
     LAST_REFUSAL = ""
     if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
         return _retain(cfg, repo, "TAUCETI_WORK_RECOVERY=off; former owner is uncertain", None, label)
+    snapshot = preserve(cfg, repo, label=label, repository=repository)
+    return _retain(cfg, repo, snapshot.reason, snapshot.record, label)
+
+
+def preserve(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
+    """Snapshot-only collection before saved-work recovery; never select, rename or reset source."""
+    if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
+        return Decision(True, "TAUCETI_WORK_RECOVERY=off; former owner is uncertain")
     record = None
     reason = "former owner is not proven quiescent for this generation"
     for _ in range(3):
@@ -868,7 +975,7 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
         except (OSError, subprocess.SubprocessError, RecordError) as error:
             reason = f"could not save or inspect its source ({error})"
             break
-    return _retain(cfg, repo, reason, record, label)
+    return Decision(True, reason, record, "preserved")
 
 
 def restore(record: Path, repo: Path) -> None:
@@ -953,6 +1060,7 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
         counts["recovery_" + state.replace("-", "_")] = 0
     reasons = set()
     retained_paths = set()
+    retained_reasons = {}
     base = state_root or HERE / "state"
     with contextlib.suppress(OSError):
         for worker_dir in base.iterdir():
@@ -966,9 +1074,16 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
                     if not isinstance(old, dict) or not isinstance(old.get("checkout"), str):
                         continue
                     retained_paths.add(old["checkout"])
-                    reasons.add(
-                        f"{worker_dir.name}: retained {old['checkout']}: {old.get('reason', 'uncertain owner')}"
+                    detail = old.get("reason", "uncertain owner")
+                    category = (
+                        "preservation failures"
+                        if "could not save" in detail
+                        else "observed process users"
+                        if "processes still use" in detail
+                        else "uncertain ownership"
                     )
+                    key = (worker_dir.name, category)
+                    retained_reasons[key] = retained_reasons.get(key, 0) + 1
     for worker, record, manifest, status in records(state_root, workers=workers):
         if record is None:
             counts["incomplete"] += 1
@@ -991,7 +1106,8 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
         if state == "retained":
             if manifest.get("checkout") not in retained_paths:
                 counts["retained"] += 1
-            reasons.add(f"{worker}: {status.get('reason') or 'checkout moved aside'}")
+            if manifest.get("checkout") not in retained_paths:
+                reasons.add(f"{worker}: {status.get('reason') or 'checkout retained'}")
         elif state in ("recovery-blocked", "blocked"):
             counts["blocked"] += 1
             if status.get("reason"):
@@ -1003,4 +1119,8 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
         else:
             counts["preserved"] += 1
     counts["retained"] += len(retained_paths)
+    reasons.update(
+        f"{worker}: {count} retained generation(s), {category}"
+        for (worker, category), count in retained_reasons.items()
+    )
     return dict(counts, reasons=sorted(reasons))

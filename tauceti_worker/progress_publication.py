@@ -11,7 +11,7 @@ import uuid
 from . import github_outbox as outbox
 from . import github_transport as tr
 from .constants import PROGRESS_REF, ROADMAP
-from .work_recovery import progress_checkout, progress_work
+from .work_recovery import RecordError, progress_checkout, progress_work
 
 MAX_ATTEMPTS = 6
 MAX_WAIT_AGE = 7 * 86400
@@ -36,7 +36,10 @@ def fingerprints(work):
 
 def retained(cfg):
     """Local-only discovery, including pre-receipt reports tied to a retained fork intent."""
-    work = progress_work(cfg)
+    try:
+        work = progress_work(cfg)
+    except RecordError:
+        return None
     receipt = work / "publication.json"
     try:
         hashes = fingerprints(work)

@@ -20,6 +20,7 @@ from pathlib import Path
 from .paths import HERE
 from .runtime_status import read_json, report_runtime
 from .verification_scope import git
+from .work_recovery import private_environment, verification_states
 
 
 def copy_file(source, target):
@@ -305,7 +306,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
         return False
     jobs = [
         (state, path, read_json(path))
-        for state in (cfg.state, cfg.state / "verification-state")
+        for state in verification_states(cfg)
         for path in (state / "verification-pending").glob("*.json")
     ]
     jobs.sort(key=lambda row: row[2].get("priority") if isinstance(row[2].get("priority"), int) else 0)
@@ -405,6 +406,13 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         # after deployment. Its signal handlers cannot swallow supervisor stop.
                         env = dict(
                             os.environ,
+                            **(
+                                private_environment(root.parent / (root.name + "-runtime"))
+                                if state.name == "outputs"
+                                else {}
+                            ),
+                        )
+                        env.update(
                             TAUCETI_VERIFY_STATE=str(state),
                             TAUCETI_VERIFY_POLICY=job["policy"],
                             TAUCETI_VERIFY_CHECKPOINT_MARGIN="0",

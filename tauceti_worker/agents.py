@@ -648,19 +648,37 @@ def prepare_checkout(
     round left the source."""
     from . import work_recovery
 
-    co = active_checkout(cfg)
+    recovered = False
+    try:
+        co = active_checkout(cfg)
+    except work_recovery.RecordError:
+        decision = work_recovery.recover_selection(cfg)
+        if not decision.ok:
+            log(decision.reason)
+            return False
+        co = active_checkout(cfg)
+        recovered = True
 
     def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
         log(f"cloning {TAUCETI} → {co} ({why})")
-        return subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)]).returncode == 0
+        result = subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)], capture_output=True, text=True)
+        if result.returncode:
+            work_recovery.report_workspace_failure(
+                cfg, co, result.stderr.strip() or f"git clone exited {result.returncode}"
+            )
+        return result.returncode == 0
 
     # Even a missing path may have been exposed to a former owner. Reserve a new generation on
     # every preparation, including retries after selection/clone failure; never reuse a pathname.
     decision = (
-        work_recovery.guard(cfg, co)
-        if co.exists() or co.is_symlink()
-        else work_recovery.retain(cfg, co, "fresh generation")
+        work_recovery.Decision(True)
+        if recovered
+        else (
+            work_recovery.guard(cfg, co)
+            if co.exists() or co.is_symlink()
+            else work_recovery.retain(cfg, co, "fresh generation")
+        )
     )
     if not decision.ok:
         log(f"checkout preparation refused: {decision.reason}")
@@ -671,7 +689,7 @@ def prepare_checkout(
         if not (co / ".git").is_dir() and not clone("fresh generation"):
             return False
     except (OSError, work_recovery.RecordError) as error:
-        log(f"checkout preparation failed at {co}: {error}")
+        work_recovery.report_workspace_failure(cfg, co, error)
         return False
 
     def g(*a) -> int:
@@ -695,8 +713,13 @@ def prepare_checkout(
         if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
             return False
         co = active_checkout(cfg)
-        work_recovery.workspace_environment(cfg)
-        if not clone("forced checkout failed") or g(
+        try:
+            work_recovery.workspace_environment(cfg)
+            cloned = clone("forced checkout failed")
+        except (OSError, work_recovery.RecordError) as error:
+            work_recovery.report_workspace_failure(cfg, co, error)
+            return False
+        if not cloned or g(
             "checkout",
             "-q",
             "-f",
@@ -715,7 +738,7 @@ def prepare_checkout(
     if g("clean", "-fdxq", "-e", ".lake"):
         return False
     # Attribution only: a failure is logged by note_owner and never stops the round.
-    work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
+    work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap, prepared_head=work_recovery._rev(co, "HEAD"))
     return True
 
 

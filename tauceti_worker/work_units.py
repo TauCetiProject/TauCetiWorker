@@ -103,7 +103,7 @@ from .survey import (
     spread_candidates,
     survey,
 )
-from .work_recovery import active_checkout, progress_checkout, progress_work
+from .work_recovery import RecordError, active_checkout, progress_checkout, progress_work
 
 # ============================================================================
 # Round — the want-gated cascade over survey(): classify every open PR, then do ONE work unit.
@@ -635,7 +635,7 @@ def _checkout_head(cfg: Config) -> str | None:
         p = subprocess.run(
             ["git", "-C", str(active_checkout(cfg)), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, RecordError):
         return None
     return p.stdout.strip() or None if p.returncode == 0 else None
 
@@ -655,7 +655,7 @@ def _candidate_checkout_unchanged(cfg: Config, c: Candidate) -> bool:
             text=True,
             timeout=30,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, RecordError):
         return False
     return status.returncode == 0 and not status.stdout.strip()
 
@@ -676,12 +676,24 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
     Best effort throughout: this is a log line. Any git failure is silently nothing rather than an
     error on a round that may well have succeeded."""
 
+    try:
+        checkout = active_checkout(cfg)
+    except RecordError:
+        return
+    if hasattr(cfg, "state"):
+        from .runtime_status import read_json
+        from .work_recovery import owner_path
+
+        owner = read_json(owner_path(cfg))
+        if owner.get("checkout") == str(checkout) and owner.get("prepared_head"):
+            pre_head = owner["prepared_head"]
+
     def git(*args) -> str:
         try:
             p = subprocess.run(
                 ["git", "-C", str(active_checkout(cfg)), *args], capture_output=True, text=True, timeout=60
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, RecordError):
             return ""
         return p.stdout if p.returncode == 0 else ""
 
@@ -1670,8 +1682,8 @@ def _do_fixlike(
         w.counters.record_foreign_repair_launch(pr, head, scope.evidence_base, foreign)
     from .verification import begin_attempt
 
-    capacity_wait = begin_attempt(w, charged, bubble=bubble)
     if bubble:
+        capacity_wait = begin_attempt(w, charged, bubble=True)
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
         rc = run_in_bubble(
@@ -1687,6 +1699,7 @@ def _do_fixlike(
             )
             return 1
         co = active_checkout(w.cfg)
+        capacity_wait = begin_attempt(w, charged)
         from .activity import current_round_id
 
         conversation_round = current_round_id()
@@ -2153,7 +2166,14 @@ def _install_progress_body(source, target):
 
 def _do_progress_inner(w, opts) -> int | None:
     from . import progress_publication as publication
+    from .work_recovery import recover_selection
 
+    try:
+        progress_checkout(w.cfg)
+    except RecordError:
+        decision = recover_selection(w.cfg, label="progress-roadmap")
+        if not decision.ok:
+            raise Die(decision.reason) from None
     retained = publication.retained(w.cfg)
     marker = progress_work(w.cfg) / "publication.json"
     if marker.exists() and not retained:
@@ -2183,9 +2203,11 @@ def _do_progress_inner(w, opts) -> int | None:
 
     if retained:
         if not (roadmap_dir / ".git").is_dir():
-            # Keep publication inputs attached to their saved generation. A damaged publication
-            # checkout is handled by saved-work recovery, without switching its work directory.
-            return _defer_progress_publication(w, retained, f"retained roadmap metadata unavailable at {roadmap_dir}")
+            # This is a permanent local defect, not a seven-day network wait. Park the exact
+            # fingerprinted inputs before releasing progress to prepare another generation.
+            saved = publication.park(w.cfg, retained, f"retained roadmap metadata unavailable at {roadmap_dir}")
+            log(f"progress: saved damaged publication inputs at {saved}; selecting unrelated work")
+            return None
         # A prepared local branch is an immutable publication artifact. Fetch
         # the live cursor, while leaving its branch and working tree intact.
         if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:

@@ -144,3 +144,7 @@ and have unrestricted network access. Use it only on a trusted, dedicated Docker
 
 The deployment was adapted from
 [eohjelle/TauCetiWorker-docker](https://github.com/eohjelle/TauCetiWorker-docker).
+
+Host authoring checkout generations and their private build caches now live under
+the worker `state` volume. Size that volume for retained source and build outputs;
+retained generations survive rollback. See [work recovery](work-recovery.md).

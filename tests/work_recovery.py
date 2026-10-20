@@ -479,6 +479,39 @@ def test_selection_failures(root):
         check("invalid selector refuses legacy fallback", False)
     except wr.RecordError:
         check("invalid selector refuses legacy fallback", (old / "Draft.lean").exists())
+    check("invalid selector automatically isolates on retry", tc.agents.prepare_checkout(cfg))
+    check("invalid selector evidence retained", bool(list(wr.selection_path(cfg).parent.glob("*.invalid-*"))))
+    aliased = wr.active_checkout(cfg)
+    physical = aliased.with_name("old-source")
+    (aliased / "Valuable.lean").write_text("keep physical source\n")
+    aliased.rename(physical)
+    aliased.symlink_to(physical, target_is_directory=True)
+    check("aliased generation automatically isolates", tc.agents.prepare_checkout(cfg))
+    check("aliased physical source preserved", (physical / "Valuable.lean").read_text() == "keep physical source\n")
+    check("aliased path never routes fresh work", wr.active_checkout(cfg) != aliased and aliased.resolve() == physical)
+    # Clone and writable-path failures report actual storage/permission errors to status.
+    origin, old, cfg = fixture(root / "clone-enospc")
+    run = subprocess.run
+
+    def full_clone(args, **kwargs):
+        if args[:3] == ["git", "clone", "-q"]:
+            return subprocess.CompletedProcess(args, 128, "", "No space left on device")
+        return run(args, **kwargs)
+
+    with (
+        patch.object(tc.agents.subprocess, "run", side_effect=full_clone),
+        patch("tauceti_worker.runtime_status.report_runtime") as status,
+    ):
+        check("clone ENOSPC is reported", not tc.agents.prepare_checkout(cfg))
+        check("clone ENOSPC prepared status", status.call_args.kwargs["workspace_error"] == "No space left on device")
+    check("clone ENOSPC old tree preserved", old.exists())
+    with (
+        patch.object(wr, "private_environment", side_effect=PermissionError(errno.EACCES, "Permission denied")),
+        patch("tauceti_worker.runtime_status.report_runtime") as status,
+    ):
+        check("cache directory permission failure is reported", not tc.agents.prepare_checkout(cfg))
+        check("cache failure prepared status", "Permission denied" in status.call_args.kwargs["workspace_error"])
+    check("cache directory permission retry continues", tc.agents.prepare_checkout(cfg))
     # Legacy cleanup markers are not evidence that a detached owner cannot write later.
     origin, old, cfg = fixture(root / "legacy-retained")
     doomed = old.parent / "retained-checkouts" / "TauCeti-old.deleting"
@@ -608,7 +641,10 @@ def main():
             test_work_paths,
         ):
             (root / test.__name__).mkdir()
-            test(root / test.__name__)
+            from unittest.mock import patch
+
+            with patch.dict(os.environ):
+                test(root / test.__name__)
     print("PASS" if not fails else f"FAIL ({fails})")
     return 1 if fails else 0
 

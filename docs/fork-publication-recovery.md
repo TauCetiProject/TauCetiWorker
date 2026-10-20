@@ -30,3 +30,9 @@ uvx --from "git+https://github.com/TauCetiProject/TauCetiProgress@$task_progress
 ```
 
 Exit 75 acknowledges an already published/in-flight window. Exit 77 preserves a temporary wait; exit 78 preserves a stale or unusable report for inspection. Never remove the bundle or force a mutation retry to make this command proceed.
+
+For workers using workspace generations, the progress clone and work directory
+resolve through `state/<worker>/checkout-generations/progress-roadmap.json`.
+Use its canonical active checkout and the sibling `work` directory when inspecting
+current artifacts; legacy `progress/roadmap` and `progress/work` paths remain retained
+source/evidence. Preserve all generations on rollback. See [work recovery](work-recovery.md).

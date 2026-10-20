@@ -1384,13 +1384,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         if not dry and "security-audit" not in only:
             from .quota import mirror_creds
             from .repair_recovery import recover
-            from .work_recovery import active_checkout, guard
+            from .work_recovery import active_checkout, preserve
 
             try:
                 mirror_creds(cfg)
                 co = active_checkout(cfg)
                 if (co / ".git").exists():
-                    guard(cfg, co)  # Preserve the last round before selecting recovery.
+                    preserve(cfg, co)  # Snapshot only; preparation selects the next generation.
                 recovery_gh = GitHub()
                 recovery_worker = Worker(
                     cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)

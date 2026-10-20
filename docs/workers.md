@@ -462,3 +462,9 @@ work available. Automatic dependency bumps continue under the existing loop back
 and merges current main, diagnoses the actual integration failure, preserves
 the dependency target and verifies its changes before pushing. Healthy surveys
 make no additional API calls.
+
+Host authoring preparation isolates uncertain former owners at canonical workspace
+generations. Each new generation overrides writable Lake, Mathlib-download, XDG
+cache and temporary paths with private directories; the mutable Mathlib hardlink
+pool is not exchanged across these generations. Independently validated shared
+Mathlib views retain their sharing contract. See [work recovery](work-recovery.md).
