@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from . import github_transport as tr
+from .github_forks import ForkUnknown, discover
 
 
 def directory(env=None):
@@ -60,6 +61,35 @@ def intent_paths(env=None):
     return set(directory(env).glob("*.json")) | set(legacy.glob("*.json"))
 
 
+def fork_upstream(args):
+    """Recognize only the noninteractive personal-fork operation we can reconcile."""
+    if args[:2] != ["repo", "fork"] or len(args) < 3:
+        return None
+    if any(a not in ("--clone=false", "--remote=false") for a in args[3:]):
+        return None
+    upstream = args[2].removeprefix("https://github.com/").removesuffix(".git").rstrip("/")
+    return upstream if re.fullmatch(r"[\w.-]+/[\w.-]+", upstream) else None
+
+
+def fork_read(upstream, env):
+    def fetch():
+        from .config import GitHubUnavailable
+
+        def read(args):
+            with tr.read_context(fresh=True, direct=True):
+                result = tr.execute(["gh", *args], env={**env, "TAUCETI_OUTBOX_REPLAY": "1"})
+            if result.returncode:
+                raise ForkUnknown("fork discovery read failed")
+            return result.stdout
+
+        try:
+            return discover(read, upstream)
+        except (ForkUnknown, OSError, subprocess.SubprocessError, GitHubUnavailable):
+            return None
+
+    return tr.shared_read(["publication-fork-v1", upstream.lower()], fetch, ttl=60, identity=tr.scope(env))
+
+
 def prepare(argv, env, cwd=None, input=None):
     if env.get("TAUCETI_OUTBOX_REPLAY") == "1" or tr.proxy_readonly(argv[1:]) or local_operation(argv[1:]):
         return None
@@ -88,6 +118,18 @@ def prepare(argv, env, cwd=None, input=None):
     if args[:2] == ["pr", "close"]:
         context["expected_head"] = env.get("TAUCETI_PUSH_EXPECT")
         context["actor"] = env.get("TAUCETI_GITHUB_ACCOUNT") or actor(env)
+    upstream = fork_upstream(args)
+    if upstream:
+        evidence = fork_read(upstream, env)
+        if evidence is None or (
+            env.get("TAUCETI_GITHUB_ACCOUNT") and evidence["actor"] != env["TAUCETI_GITHUB_ACCOUNT"].lower()
+        ):
+            from .config import GitHubUnavailable
+
+            raise GitHubUnavailable("Cannot verify fork publication identity", retry_at=time.time() + 60)
+        context.update(
+            operation="fork", actor=evidence["actor"], upstream=upstream, upstream_id=evidence["upstream_id"]
+        )
     input_file = _flag(args, "--input")
     payload_input = (
         input
@@ -221,6 +263,10 @@ def finish(path, result, records=None, *, before_request=False):
 
 def _finish_locked(path, value, result, records=None, *, before_request=False):
     """Classify an initial attempt or replay while its intent lock is held."""
+    if result.returncode == 0 and value["argv"][:2] == ["repo", "fork"]:
+        value.update(status="ambiguous", updated=time.time(), retry_at=time.time() + 60)
+        tr.atomic(path, value)
+        return
     if result.returncode == 0:
         path.unlink(missing_ok=True)
         _report_mutation(value, result)
@@ -337,6 +383,36 @@ def reconcile(value, env):
     args = value["argv"]
     replay = {**env, "TAUCETI_OUTBOX_REPLAY": "1"}
     repo, number = target(value)
+    if args[:2] == ["repo", "fork"]:
+        upstream = fork_upstream(args)
+        if not upstream:
+            return None
+        evidence = fork_read(upstream, env)
+        context = value.setdefault("context", {})
+        # Legacy entries live in this credential/account's outbox. Require a
+        # pinned matching account to migrate them; never infer another author.
+        who = context.get("actor") or env.get("TAUCETI_GITHUB_ACCOUNT")
+        if not evidence or not who or evidence["actor"] != who.lower():
+            return None
+        if context.get("upstream_id") not in (None, evidence["upstream_id"]):
+            return None
+        if context.get("upstream", upstream).lower() != upstream.lower():
+            return None
+        context.update(
+            operation="fork", actor=evidence["actor"], upstream=upstream, upstream_id=evidence["upstream_id"]
+        )
+        if evidence["fork"]:
+            context["fork"] = evidence["fork"]
+            return True
+        if not evidence["absent"]:
+            return None
+        # Two complete public-visibility observations, separated by a grace
+        # period, authorize at most one replay. Persist the bound across crashes.
+        now = time.time()
+        first = value.setdefault("fork_absent_since", now)
+        if now - first < 300 or now - value.get("updated", value.get("created", now)) < 300:
+            return None
+        return False if value.get("fork_retries", 0) < 1 else None
     if args[:2] == ["pr", "close"]:
         context = value.get("context", {})
         expected, who = context.get("expected_head"), context.get("actor")
@@ -562,9 +638,12 @@ def drain(env=None):
                 continue
             allowed = value.get("status") in ("rejected", "prepared")
             optional_resolution = bool(resolution(value["argv"]))
-            if not allowed or optional_resolution:
+            fork_operation = value["argv"][:2] == ["repo", "fork"]
+            if not allowed or optional_resolution or fork_operation:
                 applied = reconcile(value, env)
                 if applied is True:
+                    if fork_operation:
+                        tr.atomic(path.with_suffix(".complete"), {**value, "status": "complete"})
                     path.unlink()
                     continue
                 if applied == "obsolete":
@@ -587,6 +666,10 @@ def drain(env=None):
                     tr.event({"kind": "publication_optional_pending", "intent": path.stem})
                 continue
             args = list(value["argv"])
+            if fork_operation:
+                # R0's valid CLI form. Preserve original argv in the intent.
+                args = ["repo", "fork", fork_upstream(args), "--clone=false"]
+                value["fork_retries"] = value.get("fork_retries", 0) + 1
             if not Path(value["cwd"]).is_dir():
                 archive(path, value, "Publication checkout no longer exists; retained for manual recovery")
                 continue

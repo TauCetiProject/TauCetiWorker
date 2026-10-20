@@ -54,6 +54,7 @@ RUN_STDLIB=(
   github_state_rollout.py
   github_state_reconciliation.py
   github_outbox.py
+  github_forks.py
   global_maintenance.py
   shared_state_outage.py
   github_pause.py
@@ -79,6 +80,7 @@ RUN_STDLIB=(
   preflight_review_lake.py
   prices.py
   progress_tool_failure_log.py
+  progress_publication.py
   prompt_wrapper_paths.py
   provider_usage.py
   quota_auto_refresh.py

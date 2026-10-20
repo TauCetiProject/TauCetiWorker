@@ -1821,6 +1821,14 @@ def _progress_tool_failed(w, sub: str, proc) -> str:
 
 
 def _do_progress_inner(w, opts) -> int | None:
+    from . import progress_publication as publication
+
+    retained = publication.retained(w.cfg)
+    marker = w.cfg.state / "progress/work/publication.json"
+    if marker.exists() and not retained:
+        raise Die("Prepared progress receipt does not match its files; preserving it for recovery")
+    if retained and retained["actor"] != me().lower():
+        raise Die("Prepared progress belongs to another GitHub actor; preserving its bodies and branch")
     # Record the ATTEMPT before anything fallible. The cadence check keys on the last *landed* report,
     # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
     # round, for ever.
@@ -1859,7 +1867,7 @@ def _do_progress_inner(w, opts) -> int | None:
         raise Die(f"could not record the round that owns {roadmap_dir}")
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
-    if not prepare_checkout(w.cfg, work="progress"):
+    if not retained and not prepare_checkout(w.cfg, work="progress"):
         from .work_recovery import LAST_REFUSAL
 
         raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
@@ -1871,7 +1879,7 @@ def _do_progress_inner(w, opts) -> int | None:
     facts_file = work / "facts.json"
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
-    for stale in (status_body, section_body):
+    for stale in () if retained else (status_body, section_body):
         stale.unlink(missing_ok=True)  # never ship a previous round's prose
 
     def run_tool(*args: str, capture: bool = False):
@@ -1887,6 +1895,11 @@ def _do_progress_inner(w, opts) -> int | None:
             errors="replace",
             timeout=1800,
         )
+
+    if retained:
+        log("progress: resuming prepared report publication with retained prose and window")
+        publication.defer(w.cfg, retained)
+        return _apply_prepared_progress(w, run_tool, roadmap_dir, work, retained)
 
     # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
     #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
@@ -1958,8 +1971,19 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.incr(PROGRESS_ERROR_KEY)
             raise Die(f"the agent did not write {f.name}")
 
+    receipt = publication.save(w.cfg, me(), PROGRESS_REF)
+    publication.defer(w.cfg, receipt)
+    return _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt)
+
+
+def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
     # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
     #    resumable, so a retry after an interrupted run converges rather than duplicating.
+    from . import progress_publication as publication
+
+    plan_file = work / "plan.json"
+    status_body = work / "status-body.md"
+    section_body = work / "section-body.md"
     proc = run_tool(
         "apply",
         "--plan",
@@ -1971,7 +1995,7 @@ def _do_progress_inner(w, opts) -> int | None:
         "--roadmap-dir",
         str(roadmap_dir),
         "--version",
-        PROGRESS_REF,
+        receipt.get("version") or PROGRESS_REF,
         capture=True,
     )
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
@@ -1981,6 +2005,7 @@ def _do_progress_inner(w, opts) -> int | None:
         w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(_progress_tool_failed(w, "apply", proc))
     log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
+    publication.complete(w.cfg, receipt)
     if proc.returncode == EX_NOPROGRESS:
         bust_progress_cache(w.cfg)
         raise NoProgress("progress: this window is already in flight or already landed")

@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Retained progress resumes apply with identical bodies/window and original actor."""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_worker import progress_publication as publication
+from tauceti_worker import work_units as wu
+from tauceti_worker.config import Die, NoProgress
+from tauceti_worker.constants import EX_NOPROGRESS, PROGRESS_REF, ROADMAP
+from tauceti_worker.github_outbox import directory
+from tauceti_worker.github_transport import atomic
+from tauceti_worker.survey import progress_due
+
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(
+        os.environ,
+        {
+            "TAUCETI_GITHUB_SHARED_DIR": tmp + "/shared",
+            "TAUCETI_WORKER_ID": "worker",
+            "TAUCETI_GITHUB_ACCOUNT": "author",
+            "GH_TOKEN": "fixture",
+        },
+    ),
+):
+    state = Path(tmp)
+    cfg = SimpleNamespace(state=state, logdir=state / "logs")
+    work = state / "progress/work"
+    work.mkdir(parents=True)
+    roadmap = state / "progress/roadmap"
+    (roadmap / ".git").mkdir(parents=True)
+    plan = {
+        "roadmap": "Area",
+        "from_sha": "a" * 40,
+        "to_sha": "b" * 40,
+        "status_path": "Area/STATUS.md",
+        "progress_path": "Area/PROGRESS.md",
+        "prs": [1, 2],
+    }
+    (work / "plan.json").write_text(json.dumps(plan))
+    (work / "status-body.md").write_text("Prepared status prose\n")
+    (work / "section-body.md").write_text("Prepared section prose\n")
+    original = publication.fingerprints(work)
+    # Upgrade from a legacy retained fork, already reconciled before the survey.
+    intent = directory() / "fork.complete"
+    atomic(
+        intent,
+        {
+            "argv": ["repo", "fork", ROADMAP, "--clone=false", "--remote=false"],
+            "cwd": str(roadmap),
+            "created": time.time() + 1,
+            "context": {"actor": "author"},
+        },
+    )
+    assert publication.retained(cfg)["legacy"]
+    writes, calls = [], []
+    worker = SimpleNamespace(
+        cfg=cfg,
+        counters=SimpleNamespace(
+            write=lambda *a: writes.append(a), incr=lambda *a: writes.append(a), read=lambda _: 999
+        ),
+    )
+
+    def run(args, **kwargs):
+        calls.append(args)
+        assert "plan" not in args and "facts" not in args and "prompt" not in args
+        if "apply" in args:
+            assert publication.fingerprints(work) == original
+            assert args[args.index("--plan") + 1] == str(work / "plan.json")
+            return subprocess.CompletedProcess(args, 1, "", "fork visibility uncertain")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    # The legacy report bypasses both a latched prose error breaker and attempt gap.
+    assert progress_due(cfg, worker.counters)[0]
+    with (
+        patch.object(wu, "me", return_value="author"),
+        patch.object(wu.subprocess, "run", side_effect=run),
+        patch.object(wu, "prepare_checkout") as checkout,
+        patch.object(wu, "run_agent_host") as model,
+    ):
+        try:
+            wu._do_progress_inner(worker, None)
+        except Die:
+            pass
+        else:
+            raise AssertionError("failed apply must retain report")
+        model.assert_not_called()
+        checkout.assert_not_called()
+    assert publication.retained(cfg)["files"] == original
+    assert progress_due(cfg, worker.counters)[0] is False, "publication backoff, without paying for prose"
+
+    # Repeated recovery sees the existing PR and retires only the receipt.
+    def resumed(args, **kwargs):
+        if "apply" in args:
+            return subprocess.CompletedProcess(args, EX_NOPROGRESS, "already open, in flight", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    with (
+        patch.object(wu, "me", return_value="author"),
+        patch.object(wu.subprocess, "run", side_effect=resumed),
+        patch.object(wu, "run_agent_host") as model,
+    ):
+        try:
+            wu._do_progress_inner(worker, None)
+        except NoProgress:
+            pass
+        model.assert_not_called()
+    assert publication.retained(cfg) is None
+    assert publication.fingerprints(work) == original and intent.exists()
+    # A changed author cannot publish the same saved report.
+    publication.save(cfg, "author", PROGRESS_REF)
+    with patch.object(wu, "me", return_value="another"), patch.object(wu.subprocess, "run") as run:
+        try:
+            wu._do_progress_inner(worker, None)
+        except Die:
+            pass
+        else:
+            raise AssertionError("author change must not publish")
+        run.assert_not_called()
+    # Receipt corruption or edited bodies preserve everything for recovery.
+    (work / "status-body.md").write_text("changed")
+    with patch.object(wu.subprocess, "run") as run:
+        try:
+            wu._do_progress_inner(worker, None)
+        except Die:
+            pass
+        else:
+            raise AssertionError("mismatched receipt must not regenerate prose")
+        run.assert_not_called()
+    assert (work / "publication.json").exists()
+print("PASS: saved progress resumes publication without model calls, author changes or duplicate reports")
