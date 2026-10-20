@@ -1802,20 +1802,10 @@ def _best_effort_log(msg: str) -> None:
         pass
 
 
-def _progress_tool_failed(w, sub: str, proc) -> str:
-    """Persist a failing `tauceti-progress <sub>`'s WHOLE output; return the reason to raise Die with.
-
-    These three subcommands must be captured rather than inherited — `prompt`'s stdout IS the prompt,
-    and `plan`'s carries the verdict — so on failure their output only exists in this process. It used
-    to be sliced to a few hundred characters straight into the main log, which cuts a Python traceback
-    off inside its FIRST frame: what got written down was the entry point and a path, never the
-    exception. A five-day reporting outage was diagnosed by re-running `plan` by hand, because the
-    error that caused it had been thrown away every time it happened.
-
-    Same convention as the review engine's per-review log (`agents.run_to_logfile`): the detail goes to
-    a file beside the round's other logs, the main log gets the last few lines and a pointer, and the
-    Die message carries the one line most likely to name the cause.
-    """
+def _progress_tool_output(w, sub, proc):
+    """Keep both streams for every stage, including successful preparation and infrastructure waits."""
+    if hasattr(proc, "_progress_output"):
+        return proc._progress_output
     # Labelled sections, not concatenation. `plan` puts its verdict on stdout and its traceback on
     # stderr, and joining them directly fuses the last line of one onto the first line of the other
     # whenever the first does not end in a newline — inventing a line that neither stream contains.
@@ -1846,6 +1836,26 @@ def _progress_tool_failed(w, sub: str, proc) -> str:
     except OSError as exc:  # a log we cannot write must never replace the error we were reporting
         _best_effort_log(f"  progress: could not save the {sub} output ({exc})")
 
+    proc._progress_output = saved, where
+    return saved, where
+
+
+def _progress_tool_failed(w, sub: str, proc) -> str:
+    """Persist a failing `tauceti-progress <sub>`'s WHOLE output; return the reason to raise Die with.
+
+    These three subcommands must be captured rather than inherited — `prompt`'s stdout IS the prompt,
+    and `plan`'s carries the verdict — so on failure their output only exists in this process. It used
+    to be sliced to a few hundred characters straight into the main log, which cuts a Python traceback
+    off inside its FIRST frame: what got written down was the entry point and a path, never the
+    exception. A five-day reporting outage was diagnosed by re-running `plan` by hand, because the
+    error that caused it had been thrown away every time it happened.
+
+    Same convention as the review engine's per-review log (`agents.run_to_logfile`): the detail goes to
+    a file beside the round's other logs, the main log gets the last few lines and a pointer, and the
+    Die message carries the one line most likely to name the cause.
+    """
+    saved, where = _progress_tool_output(w, sub, proc)
+
     # Bound what reaches the main log and the exception, in CHARACTERS as well as lines. A tool that
     # dies without printing a newline produces exactly one line, so a line count alone bounds nothing:
     # a megabyte of output became a megabyte-long log call and a megabyte-long Die message.
@@ -1857,6 +1867,79 @@ def _progress_tool_failed(w, sub: str, proc) -> str:
     # never name. Anything shorter than a tail loses it, which is exactly how this went undiagnosed.
     summary = next((s.strip() for s in reversed(saved.splitlines()) if s.strip()), "")
     return f"tauceti-progress {sub} failed (rc={proc.returncode}): {_clip(summary)}{where}"
+
+
+def _progress_generation_changed(proc):
+    """Exit 76 is the typed tool result; recognize only positive legacy build mismatches."""
+    if proc.returncode == 76:
+        return True
+    if proc.returncode != 1:
+        return False
+    detail = (proc.stderr or "") + "\n" + (proc.stdout or "")
+    return bool(
+        re.search(
+            r"documentation changed from planned commit [0-9a-f]{7,40} to [0-9a-f]{7,40} "
+            r"before facts were collected; replan the window",
+            detail,
+        )
+        or re.search(
+            r"was built from [0-9a-f]{7,40}, not [0-9a-f]{7,40}; "
+            r"the site is redeploying",
+            detail,
+        )
+    )
+
+
+def _prepare_progress(w, run_tool, roadmap_dir, work):
+    """Retry only free mechanical work. Keep the last coherent artifacts until replacement succeeds."""
+    from .config import DocumentationUnavailable
+
+    attempts = Path(tempfile.mkdtemp(prefix="mechanical-", dir=work))
+    reason = ""
+    for attempt in range(3):
+        output = attempts / str(attempt + 1)
+        output.mkdir()
+        plan_file, facts_file = output / "plan.json", output / "facts.json"
+        # Shared within an attempt, isolated from all other attempts and the global disk cache.
+        with tempfile.TemporaryDirectory(prefix="docs-", dir=output) as cache:
+            for stage, args in (
+                (
+                    "plan",
+                    (
+                        "--roadmap-dir",
+                        str(roadmap_dir),
+                        "--code-dir",
+                        str(w.cfg.checkout),
+                        "--min-prs",
+                        "25",
+                        "--out",
+                        str(plan_file),
+                    ),
+                ),
+                ("facts", ("--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file))),
+            ):
+                proc = run_tool(stage, *args, capture=True, docs_cache=cache)
+                if stage == "plan" and proc.returncode == EX_NOPROGRESS:
+                    log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
+                    return None
+                if proc.returncode:
+                    reason = _progress_tool_failed(w, stage, proc)
+                    if _progress_generation_changed(proc):
+                        log(f"progress: documentation changed on mechanical attempt {attempt + 1}/3; replanning")
+                        break
+                    w.counters.incr(PROGRESS_ERROR_KEY)
+                    raise Die(reason)
+            else:
+                plan = json.loads(plan_file.read_text())
+                facts = json.loads(facts_file.read_text())
+                if facts.get("docs_sha") != plan["to_sha"] or facts.get("to_sha") != plan["to_sha"]:
+                    raise Die("progress: successful facts do not match the planned documentation commit")
+                return plan_file, facts_file
+    # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
+    # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
+    w.counters.write("progress-docs-retry-at", int(time.time()) + 60)
+    bust_progress_cache(w.cfg)
+    raise DocumentationUnavailable(f"waiting-documentation: generation kept changing after 3 attempts; {reason}")
 
 
 def _do_progress_inner(w, opts) -> int | None:
@@ -1877,14 +1960,8 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.write(PROGRESS_ERROR_KEY, 0)
             return None
         retained = publication.defer(w.cfg, retained)
-    # Record the ATTEMPT before anything fallible. The cadence check keys on the last *landed* report,
-    # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
-    # round, for ever.
-    w.counters.write("progress-attempt-ts", int(time.time()))
-    # Consume the survey's cached verdict as soon as this worker commits to the attempt. In particular,
-    # a failure must not leave a cached `due=true` ahead of the attempt-gap/error checks in
-    # progress_due(): that used to launch the same broken plan every few minutes until all three error
-    # slots were spent. The next survey now observes the durable attempt timestamp and waits eight hours.
+    # Mechanical replanning does not spend a prose/cadence attempt. Consume the survey verdict
+    # now so any infrastructure wait is visible before its next due check.
     bust_progress_cache(w.cfg)
 
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
@@ -1936,63 +2013,62 @@ def _do_progress_inner(w, opts) -> int | None:
     facts_file = work / "facts.json"
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
-    for stale in () if retained else (status_body, section_body):
-        stale.unlink(missing_ok=True)  # never ship a previous round's prose
 
-    def run_tool(*args: str, capture: bool = False):
+    def run_tool(*args: str, capture: bool = False, docs_cache=None):
         # `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid
         # byte raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to
         # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
         # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
         log(f"  $ tauceti-progress {args[0]} …")
-        return subprocess.run(
+        proc = subprocess.run(
             progress_argv(w.cfg.state, *args),
             capture_output=capture,
             text=True,
             errors="replace",
             timeout=1800,
+            env={**os.environ, "TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else None,
         )
+        _progress_tool_output(w, args[0], proc)
+        return proc
 
     if retained:
         log("progress: resuming prepared report publication with retained prose and window")
         return _apply_prepared_progress(w, run_tool, roadmap_dir, work, retained)
 
-    # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
-    #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
-    proc = run_tool(
-        "plan",
-        "--roadmap-dir",
-        str(roadmap_dir),
-        "--code-dir",
-        str(w.cfg.checkout),
-        "--min-prs",
-        "25",
-        "--out",
-        str(plan_file),
-        capture=True,
-    )
-    if proc.returncode == EX_NOPROGRESS:
-        log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
-        bust_progress_cache(w.cfg)
+    prepared = _prepare_progress(w, run_tool, roadmap_dir, work)
+    if prepared is None:
         return None
-    if proc.returncode != 0:
-        w.counters.incr(PROGRESS_ERROR_KEY)
-        raise Die(_progress_tool_failed(w, "plan", proc))
-    plan = json.loads(plan_file.read_text())
+    new_plan, new_facts = prepared
+    plan = json.loads(new_plan.read_text())
     if saved := publication.parked_window(w.cfg, plan):
         log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
         return None
-    log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
-    # 2) Ground truth from git, so the prose can be checked against what really landed.
-    if (
-        run_tool(
-            "facts", "--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file)
-        ).returncode
-        != 0
-    ):
-        w.counters.incr(PROGRESS_ERROR_KEY)
-        raise Die("tauceti-progress facts failed")
+    def identity(p, f):
+        value = json.loads(p.read_text())
+        # Selection explanations can change without changing any writer input.
+        for field in ("reason", "skipped", "runner_up"):
+            value.pop(field, None)
+        return value, json.loads(f.read_text())
+
+    try:
+        same = identity(plan_file, facts_file) == identity(new_plan, new_facts)
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        # Preserve old artifacts for diagnosis/rollback, and invalidate prose only when its
+        # factual inputs changed. Receipted publication above never reaches this path.
+        previous = new_plan.parent.parent / "previous"
+        previous.mkdir()
+        for artifact in (plan_file, facts_file, prompt_file, status_body, section_body):
+            if artifact.exists():
+                shutil.copyfile(artifact, previous / artifact.name)
+        for body in (status_body, section_body):
+            body.unlink(missing_ok=True)
+    shutil.copyfile(new_plan, plan_file)
+    shutil.copyfile(new_facts, facts_file)
+    w.counters.write("progress-docs-retry-at", 0)
+    log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
     # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
     #
@@ -2015,6 +2091,7 @@ def _do_progress_inner(w, opts) -> int | None:
         SECTION_OUT=str(section_body),
         AGENT=opts.agent_name,
     )
+    w.counters.write("progress-attempt-ts", int(time.time()))
     rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
     if rc != 0:
         from .claude_api import blocked_reason
@@ -2073,6 +2150,7 @@ def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
     except (OSError, subprocess.SubprocessError) as exc:
         return _defer_progress_publication(w, receipt, f"publication temporarily unavailable ({exc})")
     if proc.returncode == 77:
+        _progress_tool_failed(w, "apply", proc)
         return _defer_progress_publication(w, receipt, "publication waiting for GitHub reconciliation")
 
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()

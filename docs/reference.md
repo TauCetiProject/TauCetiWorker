@@ -398,7 +398,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
-| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |
+| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
 | `TAUCETI_OVERLAP_BATCH_COMMITS` | `160` | First-parent Mathlib commits examined per overlap-scan conversation; `--overlap-batch-commits` overrides it. Calibrated with Codex `gpt-6.1-sol` at high effort. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
@@ -438,3 +438,20 @@ cumulative receipt before resuming; cost-only reconciliation does not restore
 its cumulative accounting baseline.
 See [the complete budget design](api-budget-plan.md) for state paths, recovery,
 and estimated-cost semantics.
+
+### Progress documentation deployment waits
+
+Before launching a progress writer, the worker runs `plan` and `facts` together up to three times.
+Each attempt uses a fresh isolated documentation cache. A typed generation-change result (tool exit
+76), or an older facts diagnostic naming two different builds, retries only these mechanical stages.
+Persistent churn reports `waiting-documentation` (worker exit 79) and rechecks after 60 seconds without
+advancing the report attempt timestamp, spending PR repair allowances, or escalating failure backoff.
+Other plan/facts errors remain specific failures. The published cursor changes only through normal
+report publication, so the next ordinary replan covers the same unadvanced history.
+
+Every completed plan, facts, prompt and apply command keeps labelled stdout/stderr in private
+`progress-<stage>-*.log` files beside the round logs. Mechanical attempt plans/facts live under
+`state/progress/work/mechanical-*`; a failed attempt does not overwrite coherent artifacts or prose.
+When a new coherent plan/facts identity changes, previous inputs and prose are archived there before
+prose is invalidated. Prepared publication receipts resume apply with their existing prose and version.
+Rolling back the tool pin preserves these artifacts and the published cursor.

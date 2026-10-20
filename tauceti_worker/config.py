@@ -297,6 +297,10 @@ class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
 
 
+class DocumentationUnavailable(NoProgress):
+    """Documentation deployment churn; replan without spending a report attempt."""
+
+
 class VerificationUnavailable(NoProgress):
     """Heavy verification capacity wait; separate from inference/API admission."""
 

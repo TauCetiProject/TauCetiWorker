@@ -50,6 +50,7 @@ from .config import (
     AdmissionUnavailable,
     Config,
     Die,
+    DocumentationUnavailable,
     GitHubUnavailable,
     NoProgress,
     VerificationUnavailable,
@@ -67,6 +68,7 @@ from .constants import (
     ALLOWED_TASKS,
     CLAIMS,
     EX_ADMISSION_WAIT,
+    EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
     EX_VERIFICATION_WAIT,
@@ -1692,6 +1694,17 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
+    except DocumentationUnavailable as e:
+        log(str(e))
+        report_runtime(
+            "waiting-documentation",
+            detail=str(e),
+            next_action_at=time.time() + 60,
+            failure_reason=None,
+            failure_code=None,
+            failure_log=None,
+        )
+        return EX_DOCUMENTATION_WAIT
     except VerificationUnavailable as e:
         report_runtime("waiting-verification-capacity", detail=str(e))
         return EX_VERIFICATION_WAIT
