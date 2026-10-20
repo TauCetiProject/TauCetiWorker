@@ -56,17 +56,18 @@ class Cleanup(unittest.TestCase):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(int(self.pidfile.read_text()), signal.SIGKILL)
 
-    def command(self, *, hang=False):
+    def command(self, *, hang=False, inherit_output=False):
         # The background child remains in its parent's group and ignores TERM so
-        # successful cleanup has to reach KILL. It does not inherit captured pipes.
+        # successful cleanup has to reach KILL. Some cases deliberately inherit pipes.
         code = (
             "import os,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
             "open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)"
         )
         parent = (
             "import subprocess,sys,time; from pathlib import Path; "
-            f"child=subprocess.Popen([sys.executable,'-c',{code!r},{str(self.pidfile)!r}], "
-            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            f"child=subprocess.Popen([sys.executable,'-c',{code!r},{str(self.pidfile)!r}]"
+            + ("" if inherit_output else ",stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL")
+            + "); "
             f"p=Path({str(self.pidfile)!r}); "
             "exec('while not p.exists(): time.sleep(.01)'); "
             "print('ready',flush=True); " + ("time.sleep(60)" if hang else "sys.exit(0)")
@@ -101,6 +102,66 @@ class Cleanup(unittest.TestCase):
             processes.run(self.command(hang=True), env=self.env, capture_output=True, timeout=1)
         self.assertIn(b"ready", error.exception.output)
         self.assert_cleaned()
+
+    def test_tool_leader_exit_cleans_children_that_inherit_output_pipes(self):
+        result = processes.run(
+            self.command(inherit_output=True), env=self.env, capture_output=True, text=True, timeout=10
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("ready", result.stdout)
+        self.assert_cleaned()
+
+    def test_agent_leader_exit_cleans_children_that_inherit_output_pipes(self):
+        code = (
+            "from pathlib import Path; import os; from tauceti_worker.agents import run_agent_proc; "
+            f"raise SystemExit(run_agent_proc({self.command(inherit_output=True)!r}, env=dict(os.environ), "
+            f"cwd=Path({str(self.root)!r}), logdir=Path({str(self.root / 'logs')!r}), "
+            "label='fixture', provider='test'))"
+        )
+        result = subprocess.run([sys.executable, "-c", code], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_cleaned()
+
+    def test_sigkilled_tool_owner_cleans_its_owned_group(self):
+        code = (
+            "from tauceti_worker.processes import run; "
+            f"run({self.command(hang=True)!r}, capture_output=True, timeout=60)"
+        )
+        owner = subprocess.Popen(
+            [sys.executable, "-c", code], env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not self.pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(self.pidfile.exists(), "tool never started")
+            owner.kill()
+            owner.wait(timeout=5)
+            self.assert_cleaned()
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+            owner.wait(timeout=5)
+
+    def test_tool_preserves_an_inherited_optional_cache_lease(self):
+        with (self.root / "lease").open("w+") as lease:
+            environment = {**self.env, "TAUCETI_SHARED_MATHLIB_LEASE_FD": str(lease.fileno())}
+            result = processes.run(
+                [sys.executable, "-c", "import os; os.fstat(int(os.environ['TAUCETI_SHARED_MATHLIB_LEASE_FD']))"],
+                env=environment,
+                capture_output=True,
+                timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_closed_optional_lease_does_not_block_tools(self):
+        result = processes.run(
+            [sys.executable, "-c", "import os; assert 'TAUCETI_SHARED_MATHLIB_LEASE_FD' not in os.environ"],
+            env={**self.env, "TAUCETI_SHARED_MATHLIB_LEASE_FD": "99999999"},
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_host_agent_needs_no_namespace_or_history_scan(self):
         profile = agents.AuthoringProfile("claude", "fixture", None, "fixture", "fixture")

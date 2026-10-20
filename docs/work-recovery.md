@@ -151,7 +151,7 @@ At a new host round boundary, the worker preserves the previous checkout and
 runs a bounded recovery phase before choosing unrelated work or selecting a
 model. Loop drivers can start a recovery-only child while model funding/quota
 is unavailable. Fleet capacity admission still applies. Recovery uses an independent real checkout
-and skips a checkout with observed local users. Rootless PID namespaces, global cleanup markers
+and skips a checkout with observed local users (Linux `/proc`; unavailable on other hosts). Rootless PID namespaces, global cleanup markers
 and quiescence proofs are not prerequisites.
 
 The immutable `tauceti-work-recovery/v1` manifest and payloads remain intact.

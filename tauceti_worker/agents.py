@@ -38,6 +38,8 @@ from .constants import (
 )
 from .github import me
 from .paths import HERE
+from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
+from .processes import owned_process
 from .processes import run as run_process
 from .quota import (
     Quota,
@@ -994,21 +996,6 @@ def take_last_agent_infra_failure() -> str | None:
     return reason
 
 
-_PARENT_BOUND_AGENT = """
-import os, signal, subprocess, sys, threading
-fd = int(sys.argv[1])
-def parent_gone():
-    while os.read(fd, 1):
-        pass
-    os.killpg(os.getpgrp(), signal.SIGKILL)
-threading.Thread(target=parent_gone, daemon=True).start()
-lease = os.environ.get("TAUCETI_SHARED_MATHLIB_LEASE_FD")
-child = subprocess.Popen(sys.argv[2:], close_fds=True, pass_fds=(int(lease),) if lease else ())
-rc = child.wait()
-os._exit(rc if rc >= 0 else 128 - rc)
-"""
-
-
 def run_agent_proc(
     argv: list[str],
     *,
@@ -1052,36 +1039,26 @@ def run_agent_proc(
         from .fleet_capacity import check_launch_admission
 
         check_launch_admission()
-        # A separate group permits lease-loss cancellation without signalling
-        # the worker's caller. Bind its life to the worker through a pipe: even
-        # SIGKILL closes the parent's only writer and kills the detached group.
-        reader, writer = os.pipe()
-        command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *argv]
         from .shared_mathlib import lease_fds
 
+        stack = contextlib.ExitStack()
         try:
-            proc = subprocess.Popen(
-                command,
-                cwd=cwds,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                bufsize=1,
-                start_new_session=True,
-                pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env)),
+            proc = stack.enter_context(
+                owned_process(
+                    argv,
+                    cwd=cwds,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    bufsize=1,
+                    pass_fds=lease_fds(env),
+                )
             )
-        except BaseException as error:
-            if writer is not None:
-                os.close(writer)
-            if isinstance(error, OSError):
-                raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
-            raise
-        finally:
-            if reader is not None:
-                os.close(reader)
+        except OSError as error:
+            raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
         assert proc.stdout is not None
         finished = threading.Event()
 
@@ -1132,15 +1109,9 @@ def run_agent_proc(
             rc = proc.wait()
         finally:
             try:
-                from .round import reap_round_group
-
-                reap_round_group(proc.pid)
-                proc.wait()
+                stack.close()
             finally:
-                proc.stdout.close()
                 finished.set()
-                if writer is not None:
-                    os.close(writer)
                 if monitor is not None:
                     monitor.join(3)
         from .overlap_support import atomic

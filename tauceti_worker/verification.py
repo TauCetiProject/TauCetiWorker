@@ -30,6 +30,7 @@ from pathlib import Path
 from .config import Die
 from .constants import LEAN_ROOT
 from .paths import HERE
+from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
@@ -278,17 +279,19 @@ class Verification:
         self.save()
         self.progress(f"{phase}: start {json.dumps(argv)} (log {log})")
         process = None
+        command_stack = contextlib.ExitStack()
         stdout_path = log.with_suffix(".stdout")
         offset = 0
         try:
             with log.open("wb") as output, stdout_path.open("wb") as captured:
-                process = subprocess.Popen(
-                    argv,
-                    cwd=self.root,
-                    env=env,
-                    stdout=captured if capture else output,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
+                process = command_stack.enter_context(
+                    owned_process(
+                        argv,
+                        cwd=self.root,
+                        env=env,
+                        stdout=captured if capture else output,
+                        stderr=subprocess.STDOUT,
+                    )
                 )
                 while process.poll() is None:
                     if not capture:
@@ -305,13 +308,9 @@ class Verification:
                 entry["exit"] = process.returncode
         finally:
             try:
+                command_stack.close()
                 if process is not None:
-                    # Best effort TERM/KILL cleanup, including on normal completion.
-                    from .round import reap_round_group
-
-                    reap_round_group(process.pid)
                     entry["cleanup"] = "process-group-best-effort"
-                    process.wait()
                     entry["exit"] = process.returncode
             finally:
                 entry["ended_at"] = time.time()

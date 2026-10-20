@@ -15,6 +15,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from process_cleanup import running
+
 from tauceti_worker.verification import (
     Verification,
     atomic,
@@ -274,8 +276,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             owned_tool = int((self.root / ".lake/tool.pid").read_text())
             p.kill()
             p.communicate(timeout=10)
-            # This fixture uses process-group fallback; SIGKILL cannot run Python cleanup.
-            os.kill(owned_tool, signal.SIGKILL)
+            limit = time.monotonic() + 5
+            while running(owned_tool) and time.monotonic() < limit:
+                time.sleep(0.02)
+            self.assertFalse(running(owned_tool), "verification tool survived its owner")
             receipt = json.loads(next(self.state.glob("verification/*/receipt.json")).read_text())
             self.assertEqual(receipt["status"], "incomplete")
             self.assertEqual(len(list((self.state / "verification-pending").glob("*.json"))), 1)

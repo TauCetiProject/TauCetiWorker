@@ -131,6 +131,11 @@ describes the kernel read counter and its scope.
 
 Sharing stays off throughout the #364 cutover. Any later rollout belongs to the existing
 rollout owner at idle boundaries; the optional procedure below is for that later decision.
+Every private writer on the host, including an `auto` worker that falls back after a capability,
+space or lock failure, can bypass the shared view. Do not activate sharing alongside those writers.
+`auto` provides private fallback, not host-wide write isolation; the inventory detects later
+mutation but cannot protect readers that already hold a lease. Reactivation must account for
+that limitation without relying on the removed global containment policy or status markers.
 
 Keep funding and worker capacity unchanged. Use only naturally selected work;
 do not trigger CI, run synthetic benchmarks, start paid measurement sessions or
