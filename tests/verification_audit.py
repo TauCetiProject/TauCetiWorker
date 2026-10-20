@@ -21,6 +21,14 @@ from tauceti_worker import verification as v
 from tauceti_worker.verification_jobs import resume_pending
 
 
+def hash_cache_entries(payload):
+    return {
+        key: dict(path=directory, sha256=value)
+        for directory, values in payload["directories"].items()
+        for key, value in values.items()
+    }
+
+
 class Recovery(Receipts):
     # Reuse the private Git/fake-verifier fixture; load_tests collects only these audit cases.
     def test_persisted_hash_cache_migrates_once_without_immutable_inventory_growth(self):
@@ -30,7 +38,7 @@ class Recovery(Receipts):
             write(self.prefix, f"lib/immutable-{index}", "immutable payload\n")
         self.assertEqual(self.verify(stage="build")["status"], "success")
         current = self.state / "verification-hashes-v2.json"
-        entries = v.read_json(current)["entries"]
+        entries = hash_cache_entries(v.read_json(current))
         self.assertGreater(len(entries), 2000)
         legacy = self.state / "verification-hashes.json"
         v.atomic(legacy, {key: value["sha256"] for key, value in entries.items()})
@@ -39,7 +47,7 @@ class Recovery(Receipts):
         # A deadline before full preparation must not retire the remaining legacy hashes.
         waiting = self.verify(stage="build", deadline=time.time() - 1)
         self.assertEqual(waiting["status"], "incomplete")
-        self.assertFalse(v.read_json(current)["legacy_imported"])
+        self.assertFalse(v.read_json(current)["legacy_imported_roots"])
         # This case tests cache migration in the original workspace; recovery ownership
         # and the independent snapshot are exercised separately in the recovery fixtures.
         Path(waiting["continuation_job"]).unlink()
@@ -66,11 +74,16 @@ class Recovery(Receipts):
             self.assertEqual(result["status"], "success", result.get("error"))
             self.assertEqual(reads.count(legacy), 1)
             self.assertNotIn(self.root / "TauCeti/A.lean", hashed, "retain unchanged mutable hashes")
+            self.assertNotIn(
+                REPO / "tauceti_worker/verification.py", hashed, "migrate inputs not visited before the deadline"
+            )
             self.assertNotIn(self.prefix / "lib/immutable-0", hashed, "retain valid stat-keyed payload hashes")
             compact = real_read(current)
-            self.assertTrue(compact["legacy_imported"])
-            self.assertLess(len(compact["entries"]), 200)
-            self.assertFalse(any(Path(e["path"]).is_relative_to(self.prefix) for e in compact["entries"].values()))
+            self.assertIn(v.digest(str(self.root.resolve())), compact["legacy_imported_roots"])
+            self.assertLess(len(hash_cache_entries(compact)), 200)
+            self.assertFalse(
+                any(Path(e["path"]).is_relative_to(self.prefix) for e in hash_cache_entries(compact).values())
+            )
             size = current.stat().st_size
             reads.clear()
             hashed.clear()
@@ -98,8 +111,90 @@ class Recovery(Receipts):
         with patch.object(hashlib, "file_digest", wraps=hashlib.file_digest) as hashes:
             self.assertEqual(self.verify(stage="build")["status"], "success")
             self.assertEqual(hashes.call_count, 0)
-        entries = v.read_json(self.state / "verification-hashes-v2.json")["entries"]
+        entries = hash_cache_entries(v.read_json(self.state / "verification-hashes-v2.json"))
         self.assertTrue(any(Path(e["path"]).is_relative_to(self.prefix) for e in entries.values()))
+        payload = v.read_json(self.state / "verification-hashes-v2.json")
+        opaque = {key: value["sha256"] for key, value in entries.items()}
+        self.assertLess(len(json.dumps(payload)), len(json.dumps(opaque)) + 4096)
+        self.assertEqual(json.dumps(payload).count(str(self.prefix / "lib")), 1)
+
+    def test_cache_migration_survives_a_real_isolated_continuation(self):
+        import hashlib
+
+        dependency = write(self.root, ".lake/packages/mathlib/Extra.lean", "unchanged dependency\n")
+        self.assertEqual(self.verify(stage="build")["status"], "success")
+        current = self.state / "verification-hashes-v2.json"
+        entries = hash_cache_entries(v.read_json(current))
+        legacy = self.state / "verification-hashes.json"
+        v.atomic(legacy, {key: value["sha256"] for key, value in entries.items()})
+        current.unlink()
+        waiting = self.verify(stage="build", deadline=time.time() - 1)
+        pending = Path(waiting["continuation_job"])
+        job = v.read_json(pending)
+        job["next_at"] = 0
+        v.atomic(pending, job)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        self.assertEqual(v.read_json(self.state / "verification-jobs" / pending.name)["status"], "success")
+        self.assertNotIn(v.digest(str(self.root.resolve())), v.read_json(current)["legacy_imported_roots"])
+        real_digest = hashlib.file_digest
+        hashed = []
+
+        def measured(stream, *args, **kwargs):
+            hashed.append(Path(stream.name))
+            return real_digest(stream, *args, **kwargs)
+
+        with patch.object(hashlib, "file_digest", side_effect=measured):
+            result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertNotIn(dependency, hashed, "the original workspace still imports its legacy hashes")
+
+    def test_concurrent_cache_saves_merge_entries_and_root_migrations(self):
+        first = v._HashCache(self.state, self.root)
+        second = v._HashCache(self.state, self.home / "other-root")
+        first.put("a" * 64, str(self.root / "First.lean"), "1" * 64)
+        second.put("b" * 64, str(self.root / "Second.lean"), "2" * 64)
+        first.finish_import()
+        first.save({})
+        # A stale early-deadline writer cannot lose entries or completed migration markers.
+        second.save({})
+        second.finish_import()
+        second.save({})
+        payload = v.read_json(first.path)
+        self.assertEqual(len(hash_cache_entries(payload)), 2)
+        self.assertEqual(set(payload["legacy_imported_roots"]), {first.root, second.root})
+
+    def test_optional_hash_cache_write_failure_preserves_completed_result_and_status(self):
+        with (
+            patch.object(v._HashCache, "save", side_effect=OSError("fixture cache failure")),
+            patch.object(v, "report_runtime") as status,
+        ):
+            result = self.verify(stage="all")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual(status.call_args.args[0], "working")
+
+    def test_direct_executable_hashes_inside_an_immutable_prefix_are_retained(self):
+        import hashlib
+        import shutil
+
+        lake = self.prefix / "bin/lake"
+        shutil.copy2(self.bin / "lake", lake)
+        manifest = self.home / "direct-executable.json"
+        v.atomic(manifest, {str(self.prefix): "publisher-1"})
+        with (
+            patch.dict(
+                os.environ,
+                PATH=f"{lake.parent}:{self.env['PATH']}",
+                TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS=str(manifest),
+            ),
+            patch("tauceti_worker.verification_installations.mount_identity", return_value=["fixture-readonly"]),
+        ):
+            self.assertEqual(self.verify(stage="build")["status"], "success")
+            with patch.object(hashlib, "file_digest", wraps=hashlib.file_digest) as hashes:
+                result = self.verify(stage="build")
+                self.assertEqual(result["status"], "success", result.get("error"))
+                self.assertIn("reused_from", result["phases"]["build"])
+                self.assertEqual(hashes.call_count, 0)
 
     def test_registering_an_existing_installation_prunes_its_v2_per_file_records(self):
         for index in range(100):
@@ -114,7 +209,7 @@ class Recovery(Receipts):
             patch("tauceti_worker.verification_installations.mount_identity", return_value=["fixture-readonly"]),
         ):
             self.assertEqual(self.verify(stage="build")["status"], "success")
-            entries = v.read_json(current)["entries"]
+            entries = hash_cache_entries(v.read_json(current))
             self.assertFalse(any(Path(e["path"]).is_relative_to(self.prefix) for e in entries.values()))
             self.assertLess(current.stat().st_size, before)
 
@@ -699,7 +794,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
         def record(path):
             metrics["files"] += 1
             metrics["bytes"] += path.stat().st_size
-            return v.file_record(path)
+            return v.installation_file_record(path)
 
         real_stat, real_lstat, real_read = os.stat, os.lstat, Path.read_text
 
@@ -752,7 +847,8 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             finally:
                 v._HASH_CACHE.reset(token)
             cache.save(installation.validated)
-            self.assertEqual(v.read_json(cache.path)["entries"], {})
+            self.assertEqual(v.read_json(cache.path)["directories"], {})
+            original_cache_size = cache.path.stat().st_size
             self.assertEqual(metrics["bytes"], 122880000)
             cold_metrics = dict(metrics)
             metrics.update({key: 0 for key in metrics})
@@ -792,6 +888,22 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             v.atomic(manifest, {str(large): "publisher-revision-3"})
             with self.assertRaisesRegex(ValueError, "provenance changed"):
                 installation.validate()
+            for index in range(3000):
+                write(large, f"growth/{index}.lean", "additional immutable payload\n")
+            larger = installations()
+            cache = v._HashCache(self.state)
+            token = v._HASH_CACHE.set(cache)
+            try:
+                grown = larger.inventory(large)
+            finally:
+                v._HASH_CACHE.reset(token)
+            cache.save(larger.validated)
+            self.assertEqual(grown["files"], 33000)
+            self.assertEqual(cache.path.stat().st_size, original_cache_size)
+            print(
+                "IMMUTABLE_CACHE_GROWTH",
+                json.dumps(dict(files=[30000, 33000], json_bytes=[original_cache_size, cache.path.stat().st_size])),
+            )
         # A registration alone never trusts a writable installation.
         with (
             patch.dict(os.environ, TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS=str(manifest)),

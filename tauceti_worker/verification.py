@@ -49,26 +49,44 @@ class Incomplete(Exception):
 
 
 class _HashCache:
-    """Keep mutable input hashes; import opaque V1 entries lazily without payload rereads."""
+    """Mutable input hashes grouped by directory, with lazy per-workspace V1 import."""
 
-    def __init__(self, state):
+    def __init__(self, state, root=None):
         self.path = state / "verification-hashes-v2.json"
         self.original = read_json(self.path)
-        entries = self.original.get("entries", {})
-        self.entries = dict(entries) if isinstance(entries, dict) else {}
-        self.imported = (
-            self.original.get("schema") == "tauceti-verification-hash-cache/v2"
-            and self.original.get("legacy_imported") is True
-        )
+        self.entries = self.directories(self.original)
+        self.completed = self.roots(self.original)
+        self.finished = []
+        self.root = digest(str(root.resolve())) if root is not None else None
         self.legacy_path = state / "verification-hashes.json"
-        self.legacy = {} if self.imported else None
+        self.legacy = {} if self.root in self.completed else None
+        self.retained = set()
+        self.inventory_depth = 0
 
-    def get(self, key, path):
-        entry = self.entries.get(key)
-        if isinstance(entry, dict) and entry.get("path") == path:
-            value = entry.get("sha256")
-            if isinstance(value, str) and len(value) == 64:
-                return value
+    @staticmethod
+    def directories(payload):
+        data = payload.get("directories", {})
+        if payload.get("schema") != "tauceti-verification-hash-cache/v2" or not isinstance(data, dict):
+            return {}
+        return {
+            directory: dict(values)
+            for directory, values in data.items()
+            if isinstance(directory, str) and Path(directory).is_absolute() and isinstance(values, dict)
+        }
+
+    @staticmethod
+    def roots(payload):
+        data = payload.get("legacy_imported_roots", [])
+        if payload.get("schema") != "tauceti-verification-hash-cache/v2" or not isinstance(data, list):
+            return []
+        return [value for value in data if isinstance(value, str) and len(value) == 64][-128:]
+
+    def lookup(self, key, path):
+        if not self.inventory_depth:
+            self.retained.add(key)
+        value = self.entries.get(str(Path(path).parent), {}).get(key)
+        if isinstance(value, str) and len(value) == 64:
+            return value
         if self.legacy is None:
             self.legacy = read_json(self.legacy_path)
         value = self.legacy.get(key)
@@ -78,29 +96,46 @@ class _HashCache:
         return None
 
     def put(self, key, path, value):
-        self.entries[key] = dict(path=path, sha256=value)
+        self.entries.setdefault(str(Path(path).parent), {})[key] = value
 
     def finish_import(self):
-        # Once complete preparation has visited the mutable inputs, future invocations
-        # need no historical opaque cache, including when a candidate source changes.
-        self.imported = True
+        # A continuation must not retire migration for its original workspace.
+        if self.root is not None:
+            self.completed = [value for value in self.completed if value != self.root] + [self.root]
+            self.finished = [self.root]
         if self.legacy is None:
             self.legacy = {}
 
     def save(self, immutable_roots):
-        # A previously unregistered read-only tree can become trusted later. Remove its old
-        # mutable-cache records once; warm cache JSON must not scale with sealed inventory.
-        entries = {
-            key: value
-            for key, value in self.entries.items()
-            if isinstance(value, dict)
-            and isinstance(value.get("path"), str)
-            and not any(Path(value["path"]).is_relative_to(root) for root in immutable_roots)
-        }
-        entries = dict(list(entries.items())[-200000:])
-        payload = dict(schema="tauceti-verification-hash-cache/v2", entries=entries, legacy_imported=self.imported)
-        if payload != self.original:
-            atomic(self.path, payload)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            disk = read_json(self.path)
+            merged = self.directories(disk)
+            for directory, values in self.entries.items():
+                merged.setdefault(directory, {}).update(values)
+            remaining = 200000
+            directories = {}
+            for directory, values in reversed(list(merged.items())):
+                compact = any(Path(directory).is_relative_to(root) for root in immutable_roots)
+                kept = {
+                    key: value
+                    for key, value in values.items()
+                    if isinstance(value, str) and len(value) == 64 and (not compact or key in self.retained)
+                }
+                kept = dict(list(kept.items())[-remaining:]) if remaining else {}
+                if kept:
+                    directories[directory] = kept
+                    remaining -= len(kept)
+            completed = self.roots(disk)
+            for root in self.finished:
+                completed = [value for value in completed if value != root] + [root]
+            completed = completed[-128:]
+            payload = dict(
+                schema="tauceti-verification-hash-cache/v2", directories=directories, legacy_imported_roots=completed
+            )
+            if payload != disk:
+                atomic(self.path, payload)
 
 
 def digest(value) -> str:
@@ -195,7 +230,7 @@ def hash_file(path: Path) -> str:
     )
     key = digest(identity)
     cache = _HASH_CACHE.get()
-    cached = cache.get(key, identity[0]) if isinstance(cache, _HashCache) else cache.get(key) if cache else None
+    cached = cache.lookup(key, identity[0]) if isinstance(cache, _HashCache) else cache.get(key) if cache else None
     if isinstance(cached, str) and len(cached) == 64:
         return cached
     with path.open("rb") as source:
@@ -208,6 +243,17 @@ def hash_file(path: Path) -> str:
     elif cache is not None:
         cache[key] = result
     return result
+
+
+def installation_file_record(path):
+    cache = _HASH_CACHE.get()
+    if not isinstance(cache, _HashCache):
+        return file_record(path)
+    cache.inventory_depth += 1
+    try:
+        return file_record(path)
+    finally:
+        cache.inventory_depth -= 1
 
 
 def source_names(root: Path, base: str) -> set[str]:
@@ -291,7 +337,7 @@ class Verification:
             atomic=atomic,
             read_json=read_json,
             files_under=files_under,
-            file_record=file_record,
+            file_record=installation_file_record,
             stamps=stamps,
             cache_directory=lambda: cache_root() / "installations",
         )
@@ -586,7 +632,7 @@ class Verification:
         previous = {}
         self.live_lease = (self.directory / "live.lock").open("a+")
         fcntl.flock(self.live_lease, fcntl.LOCK_EX)
-        cache = _HashCache(self.state)
+        cache = _HashCache(self.state, self.root)
         cache_token = _HASH_CACHE.set(cache)
         try:
 
@@ -723,7 +769,10 @@ class Verification:
             self.live_lease.close()
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
-            cache.save(self.installations.validated)
+            try:
+                cache.save(self.installations.validated)
+            except OSError as error:
+                self.progress(f"verification hash cache unavailable: {error}")
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
             if self.job and self.receipt["status"] == "incomplete":

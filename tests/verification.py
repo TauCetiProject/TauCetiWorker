@@ -422,11 +422,15 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
 
     def test_content_cache_rechecks_changed_ctime(self):
         self.verify(stage="build")
-        before = json.loads((self.state / "verification-hashes-v2.json").read_text())["entries"]
+        before = sum(
+            map(len, json.loads((self.state / "verification-hashes-v2.json").read_text())["directories"].values())
+        )
         write(self.root, "TauCeti/A.lean", "changed input\n")
         result = self.verify(stage="build")
-        after = json.loads((self.state / "verification-hashes-v2.json").read_text())["entries"]
-        self.assertGreater(len(after), len(before))
+        after = sum(
+            map(len, json.loads((self.state / "verification-hashes-v2.json").read_text())["directories"].values())
+        )
+        self.assertGreater(after, before)
         self.assertNotIn("reused_from", result["phases"]["build"])
         self.assertIn("path", result["inputs"])
 

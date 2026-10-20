@@ -74,14 +74,21 @@ all phases. Complete inventories are stored once under `verification-inputs/<dig
 from receipts. A phase index avoids scanning old receipts. Per-file digests are cached by path,
 device, inode, size, mtime and ctime; any metadata change rereads the bytes. The metadata cache is
 bounded. Receipts and logs remain retained; there is no automatic deletion of incomplete evidence.
-After an immutable identity validates, its per-file hashes are omitted from the persisted general
-cache. The path-aware
-`verification-hashes-v2.json` cache keeps mutable input hashes and removes records under validated
-immutable installations, including when an installation becomes registered later. Migration imports
-matching V1 stat-keyed hashes without rereading their payloads until the first complete preparation;
-early deadlines keep migration eligible. Later warm preparation reads only V2, including after source
-changes. The V1 cache remains intact for rollback. Immutable identity files and receipt indexes keep
-their existing formats.
+After an immutable identity validates, inventory-only hashes for it are omitted from the persisted
+`verification-hashes-v2.json` cache. Individually fingerprinted executable hashes remain cached even
+inside that installation. Directory paths are stored once; mutable input records remain bounded at
+200,000. Cache saves merge concurrent updates under a short per-state lock and an unavailable cache
+cannot change the verification result or skip runtime cleanup.
+Migration imports matching V1 stat-keyed hashes without rereading their payloads until each workspace
+completes preparation. Early deadlines and isolated continuations retain migration eligibility for
+the original workspace. The cache keeps at most 128 completed workspace markers; warm preparation
+in those workspaces reads only V2, including after source changes. The V1 file remains intact for
+rollback and may be removed once rollback support is no longer needed. Immutable identity files and
+receipt indexes keep their existing formats.
+The warm bound assumes a matching validated installation identity. A new identity after a reboot,
+mount/provenance change or identity-cache cleanup may require a full cold payload hash under the
+installation lock; other callers reuse the resulting seal. Writable/unavailable-cache fallbacks
+retain ordinary stat-keyed hashes and complete input validation.
 Temporary shim archives are removed after use. Source metadata sampling every two seconds catches mutations restored to their original bytes; a final full digest
 check rejects changed inputs. Mutable toolchain/dependency metadata is checked at phase boundaries rather
 than repeatedly scanning large installations during tool execution. Environment hashing is limited to build
