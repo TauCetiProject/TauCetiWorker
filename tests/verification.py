@@ -117,6 +117,10 @@ if mode == 'mutation':
 if mode == 'sleep':
     (p/'tool.pid').write_text(str(os.getpid()))
     time.sleep(float(os.environ.get('FIXTURE_SLEEP', '1.5')))
+if mode == 'storage-growth':
+    (p/'build').mkdir(exist_ok=True)
+    with (p/'build/oversized').open('wb') as out: out.truncate(int(os.environ['FIXTURE_GROW_BYTES']))
+    time.sleep(5)
 if mode == 'barrier':
     barrier = Path(os.environ['FIXTURE_BARRIER'])
     (barrier / ('ready-' + Path(os.environ['TAUCETI_VERIFY_STATE']).name)).touch()
@@ -143,6 +147,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_VERIFY_HELPER="1",
             TAUCETI_PROCESS_CONTAINMENT="invalid-old-policy",
             TAUCETI_VERIFY_STATE=str(self.state),
+            TAUCETI_VERIFY_STORAGE_DIR=str(self.home / "verification-storage"),
+            TAUCETI_VERIFY_STORAGE_BYTES=str(512 * 1024**2),
+            TAUCETI_VERIFY_CANDIDATE_BYTES=str(64 * 1024**2),
+            TAUCETI_VERIFY_MIN_FREE_BYTES="1",
             TAUCETI_VERIFY_CACHE_DIR=str(self.home / "cache"),
             TAUCETI_VERIFY_BASE=self.base,
             TAUCETI_VERIFY_CHECKPOINT_MARGIN="0",

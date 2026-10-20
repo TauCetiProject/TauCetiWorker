@@ -2123,6 +2123,7 @@ def run_in_bubble(
     local_axioms_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     if helper_on:
         from .verification import cache_root
+        from .verification_storage import root as storage_root
 
         package = rounddir / "tauceti_worker"
         shutil.copytree(
@@ -2134,6 +2135,8 @@ def run_in_bubble(
         (rounddir / "tauceti-verify").chmod(0o755)
         verify_state = cfg.state / "verification-state"
         verify_state.mkdir(parents=True, exist_ok=True)
+        verify_storage = storage_root().resolve()
+        verify_storage.mkdir(parents=True, exist_ok=True, mode=0o700)
         host_cache = None
         with contextlib.suppress(OSError, ValueError):
             host_cache = cache_root()
@@ -2158,6 +2161,8 @@ def run_in_bubble(
         mount_flags += [
             "--mount",
             f"{verify_state}:/opt/verification-state:rw",
+            "--mount",
+            f"{verify_storage}:{verify_storage}:rw",
         ]
         if host_cache is not None:
             mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
@@ -2240,6 +2245,8 @@ def run_in_bubble(
     if helper_on:
         for key, value in {
             "TAUCETI_VERIFY_STATE": "/opt/verification-state",
+            "TAUCETI_VERIFY_HOST_STATE": str(verify_state.resolve()),
+            "TAUCETI_VERIFY_STORAGE_DIR": str(verify_storage),
             "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
             if host_cache is not None
             else "/tmp/verification-cache",
@@ -2256,6 +2263,16 @@ def run_in_bubble(
             ),
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
+        for name in (
+            "STORAGE_BYTES",
+            "CANDIDATE_BYTES",
+            "CHECKPOINT_BYTES",
+            "MIN_FREE_BYTES",
+            "COMPLETED_CACHE_SECONDS",
+            "IDLE_CACHE_SECONDS",
+        ):
+            if value := os.environ.get("TAUCETI_VERIFY_" + name):
+                tcenv += f" TAUCETI_VERIFY_{name}={shlex.quote(value)}"
     if snapshot:
         tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
         from tauceti_tools.project import active

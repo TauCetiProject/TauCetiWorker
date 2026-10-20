@@ -660,12 +660,22 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 work_recovery.housekeep()
             except Exception as error:
                 errors.append(f"Recovery housekeeping deferred ({type(error).__name__}); retryable jobs retained")
+            from . import verification_storage
+
+            try:
+                from .retention import worker_configs
+
+                states = [state for cfg in worker_configs() for state in (cfg.state, cfg.state / "verification-state")]
+                verification_storage.housekeep(states)
+            except Exception as error:
+                errors.append(f"Verification storage housekeeping deferred ({type(error).__name__})")
             sharing = shared_mathlib.summary()
             value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
             value["all"]["shared_mathlib"] = sharing
             value["all"]["work_recovery"] = work_recovery.summary()
             value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
             value["all"]["expanded_cache"] = expanded_cache.summary()
+            value["all"]["verification_storage"] = read_json(verification_storage.root() / "status.json")
             for column, key in (("worker", "workers"), ("scope", "groups")):
                 ids = db.execute(
                     f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"

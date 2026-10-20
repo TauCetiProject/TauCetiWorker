@@ -154,6 +154,63 @@ in logs and do not invalidate successful checks. A prefix must name an absolute 
 containing `bin/lean`. Invalid final output still leaves verification incomplete. Deadline/signal jobs remain eligible without an expiry that discards their
 candidate. Terminal jobs move from `verification-pending/` into `verification-jobs/`.
 
+### Candidate storage and automatic reclamation
+
+Verification storage has a host-local byte reservation ledger, shared across worker HOME overrides
+and runtime versions. Before copying an independent candidate or launching its tools, the helper
+reserves space. Existing sibling workers' candidate directories are discovered without recursive
+inventory walks. Legacy candidates initially consume the entire host allowance until background
+compaction measures their retained source, so an unknown historical size cannot silently admit
+more copies. Bubble helpers mount the same ledger and record the host's canonical state paths.
+
+Default settings (positive integers, bytes or seconds as named):
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `TAUCETI_VERIFY_STORAGE_BYTES` | 128 GiB | Total reserved candidate/checkpoint storage per user and host |
+| `TAUCETI_VERIFY_CANDIDATE_BYTES` | 32 GiB | Reservation for a candidate that can copy caches or run tools |
+| `TAUCETI_VERIFY_CHECKPOINT_BYTES` | 256 MiB | Bound for one durable source checkpoint |
+| `TAUCETI_VERIFY_MIN_FREE_BYTES` | 20 GiB | Minimum filesystem reserve; at least 10% is always kept |
+| `TAUCETI_VERIFY_COMPLETED_CACHE_SECONDS` | 3600 | Completed-job cache grace period |
+| `TAUCETI_VERIFY_IDLE_CACHE_SECONDS` | 86400 | Idle pending-job cache lifetime |
+| `TAUCETI_VERIFY_STORAGE_DIR` | Host-local state directory | Explicit shared accounting root; use private state for tests |
+
+All workers sharing an accounting root should receive the same limits. Reservations count logical
+bytes, including reflinked data: shared extents are not treated as guaranteed free future capacity.
+Warm copies that exceed their reservation retry without `.lake/build` directories. Source copies
+that cannot fit return incomplete; the original source and pending job remain available. Source
+checkpoints count against the same host allowance, and archive writes have an explicit byte bound.
+
+The ordinary supervisor and activity preparer run one bounded cleanup slice per host every ten
+seconds. A separate cleanup timer is unnecessary. Disk pressure permits early eviction before the
+age threshold. Job and receipt flocks, live process references, mount observations and symlink
+guards protect active candidates. Cleanup removes only untracked build directories in the main
+checkout and its dependency checkouts; tracked files, dependency source edits, Git history, source
+checkpoints, receipts, accounting and publication journals are retained. Recursive removal has a
+durable cursor and byte/entry/time budgets. Process death releases locks and later ticks continue.
+Candidates rotate fairly so an active or large tree cannot starve the others.
+
+After cache removal, a bounded metadata inventory reduces the reservation to retained source/Git
+size, with a 64 MiB accounting floor per candidate. A cache-generation token invalidates receipt
+reuse after output eviction without scanning historical receipts. Small source-only candidates
+remain available for mechanical verification and publication recovery; they never expire merely
+because they are old. If unique source alone fills the allowance, new allocation stays deferred
+until space or the explicit budget changes. No unpublished source is deleted to satisfy a quota.
+
+Storage deferral returns `status: incomplete`, `incomplete_reason: disk-pressure`, and a pending
+continuation when a job exists. The supervisor retries without a model and without charging a
+verification attempt for failed storage admission. Other inference work remains eligible. Prepared
+activity status includes reserved bytes, the allowance, free bytes, source-only counts and cleanup
+errors; status reads never walk candidates.
+
+These are strict admission reservations and monitored write limits, not filesystem-enforced hard
+quotas. Owned candidate tools check free space once per second and incrementally inspect at most
+4096 file metadata entries per check. Detected pressure interrupts the owned tool group, records
+its actual exit and retains a pending job. A large tree takes several observations to measure, and
+a fast writer can overshoot between observations. A filesystem quota/dedicated volume is required
+for a strict kernel-enforced write ceiling. Existing source records outside verification storage
+remain governed by work-recovery policy. This feature does not raise capacity or change V0 dispatch.
+
 Recovery builds only in an independent candidate, never resets the original source and never pushes,
 creates a PR or bypasses accounting/publication guards.
 Jobs store canonical candidate paths. The helper resolves runtime state/workspace symlinks before

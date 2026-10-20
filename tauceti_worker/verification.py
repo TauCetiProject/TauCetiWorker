@@ -34,6 +34,7 @@ from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
+from .verification_storage import Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 4
@@ -359,6 +360,7 @@ class Verification:
         self.last_watch = 0.0
         self.live_lease = None
         self.job = job
+        self.storage_monitor = None
         self.installations = Installations(
             self.state,
             digest=digest,
@@ -387,6 +389,8 @@ class Verification:
 
     def watch(self):
         self.check_deadline()
+        if self.storage_monitor is not None:
+            self.storage_monitor.check()
         if self.watched and time.monotonic() - self.last_watch >= 2:
             self.last_watch = time.monotonic()
             if stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names:
@@ -564,6 +568,7 @@ class Verification:
             toolchain=toolchain,
             verifier=verifier,
             policy_version=POLICY_VERSION,
+            cache_generation=cache_generation(self.state, self.root),
             python=dict(version=sys.version, executable=file_record(Path(sys.executable))),
             lint_modules=file_record(Path(self.lint_modules)) if self.lint_modules else None,
         )
@@ -688,6 +693,10 @@ class Verification:
 
             self.job = prepare_job(self, dict(sources=candidate_sources))
             self.receipt["job"] = self.job["id"]
+            if self.job.get("isolated"):
+                from .verification_storage import Monitor
+
+                self.storage_monitor = Monitor(self.state, self.job["id"])
             if self.deadline is not None and time.time() >= self.deadline - float(
                 os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600")
             ):
@@ -784,6 +793,8 @@ class Verification:
                 incomplete_reason="toolchain" if probing else None,
                 error=f"command exited {error.returncode}: {error.cmd}",
             )
+        except Pressure as error:
+            self.receipt.update(status="incomplete", error=str(error), incomplete_reason="disk-pressure")
         except Incomplete as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason=error.reason)
         except (Die, OSError, ValueError, RuntimeError) as error:
@@ -803,6 +814,8 @@ class Verification:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
             self.live_lease.close()
+            if self.storage_monitor is not None:
+                self.storage_monitor.close()
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
             try:
@@ -867,15 +880,23 @@ class Verification:
         key = digest(dict(base=self.base, sources=inputs["sources"]))
         target = self.state / "verification-checkpoints" / key
         if not (target / "checkpoint.json").exists():
+            from .verification_storage import LimitedWriter, reserve_checkpoint
+
+            limit = reserve_checkpoint(self.state, key)
             target.mkdir(mode=0o700, parents=True, exist_ok=True)
             patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
+            names = sorted(untracked(self.root))
+            size = len(patch) + sum((self.root / name).lstat().st_size + 1024 for name in names)
+            if size > limit:
+                raise Pressure("source checkpoint exceeds its reserved byte budget; original source retained")
             with (target / "source.patch").open("wb") as out:
                 out.write(patch)
                 out.flush()
                 os.fsync(out.fileno())
-            with tarfile.open(target / "untracked.tar", "w") as archive:
-                for name in sorted(untracked(self.root)):
-                    archive.add(self.root / name, arcname=name, recursive=False)
+            with (target / "untracked.tar").open("wb") as out:
+                with tarfile.open(fileobj=LimitedWriter(out, limit - len(patch)), mode="w") as archive:
+                    for name in names:
+                        archive.add(self.root / name, arcname=name, recursive=False)
             with (target / "untracked.tar").open("rb") as source:
                 os.fsync(source.fileno())
             atomic(
