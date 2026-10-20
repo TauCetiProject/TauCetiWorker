@@ -16,6 +16,9 @@ tauceti = "tauceti_worker.cli:cli_main"
 # root for the `./tauceti` shim (HERE resolves to the repo root in a checkout); the wheel bundles
 # them INTO the package (tauceti_worker/{prompts,scripts}) so the same `HERE / "prompts"` lookup
 # works once installed (HERE then resolves to the package dir — see tauceti_worker/paths.py).
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["tauceti_worker"]
 

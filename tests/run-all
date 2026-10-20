@@ -5,7 +5,7 @@
 # This runner knows how each one wants to be invoked, and which one to skip in a plain CI box:
 #   - most are stdlib-only         -> `uv run python <file>`
 #   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
-#   - dashboard has a PEP 723 header (rich/textual)      -> `uv run --script`
+#   - dashboard uses the project's rich/textual/Tools dependencies -> `uv run python`
 #   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
 #   - egress needs the bubble sandbox/proxy              -> skipped here
 # The Python version is taken from $UV_PYTHON when set (uv honours it), so CI can matrix over versions.
@@ -180,7 +180,7 @@ for t in "${RUN_STDLIB[@]}"; do
 done
 
 run parity_selectors.py uv run python tests/parity_selectors.py tests/fixtures/pr_selectors.json
-run dashboard.py uv run --script tests/dashboard.py
+run dashboard.py uv run python tests/dashboard.py
 
 # lifecycle.sh resolves its own python; hand it the uv-selected interpreter so the matrix
 # actually covers it (otherwise it would always use the runner's default python3).
