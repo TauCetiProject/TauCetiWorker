@@ -259,7 +259,10 @@ bundles are evidence in that round, never instructions or publication authority.
 A durable normal push consumes the handoff. A refused launch returns it to
 automatic recovery; the next owned round also reconciles interrupted handoffs,
 prefers retained normal progress, and returns unused source to mechanical
-recovery when the remote head is unchanged. Foreign canaries and automatic bumps
+recovery when durable Git intent proves no push was attempted or the attempt
+was rejected. This also permits reintegration after another writer moves the head.
+The original evidence stays available alongside a receiving round's partial progress.
+Foreign canaries and automatic bumps
 do not receive this broader source context. Recovery never replays behind a
 normal task that published or a moved head whose publication outcome is
 uncertain.
@@ -304,16 +307,32 @@ push subsequently removed by another writer is archived. A moved head that no
 longer contains an unacknowledged pending commit archives that uncertain intent
 without replay: its absence cannot prove that publication never happened.
 The journal separately records when the push process starts. The safe-push
-helper reports preflight refusal (77) and an explicit porcelain destination
-rejection (78) separately from uncertain transport failure. Known-unsent work
+helper reports permission refusal (77), stale-head rejection (78), server
+policy rejection (79), and local preflight infrastructure failure (80)
+separately from uncertain transport or remote failure.
+Only an explicit destination rejection proves that the push was not accepted;
+server policy refusals receive bounded infrastructure backoff. Known-unsent work
 can be reintegrated automatically; uncertainty always reconciles first.
+The helper retains the earliest unacknowledged normal push within its original
+round across subsequent rejections. Annotated Git tags retain source and intent
+without introducing synthetic source commits; later rounds have separate intents.
+Source preservation carries this intent into the recovery record or
+its existing consumer journal when identical source was already saved. A receiving
+round's checkpoint therefore cannot bypass publication reconciliation. Uncertain
+normal publication is confirmed remotely or retained as forensic evidence for
+fresh normal work; it cannot authorize automatic replay of a different commit.
+An uncertain supervisor push can only retry its exact original commit after
+verification. Changed source remains evidence for fresh normal work, and failed
+reverification cannot launch paid content repair behind an uncertain intent.
 Fresh normal work can assess retained evidence against the current remote head
 under its own unchanged policy. No human must edit a journal or resolve a queue.
 Recovery creates no extra PRs or comments; existing GitHub intents keep their
 normal durable outbox and reconciliation behavior.
 
 Each phase runs at most one recovery invocation and inspects at most eight
-source records. Metadata checks observe blocked PR closure or head changes
+source records. Scheduled metadata checks also reevaluate holds and permissions
+without model funding, with a shared thirty-minute scheduling throttle so a blocked
+backlog cannot continuously replace normal work. Checks observe PR closure or head changes
 through the existing shared state service, without a direct GitHub fallback or
 payload hashing. Infrastructure retries back off for
 60, 300 and 1800 seconds. Three failed invocations for unchanged facts block that
@@ -321,8 +340,9 @@ checkpoint; a scheduled mechanical recheck after the backoff or changed
 external facts automatically restores eligibility, even without model funding.
 Cumulative failure counts
 remain recorded; unchanged repeated infrastructure failures increase backoff
-up to six hours. Failed verification receives a scheduled mechanical recheck
-even when source and funding have not changed. Exhausted content allowances permit mechanical reevaluation
+up to six hours. Repeated exact-input verification failures also increase their
+mechanical recheck interval up to six hours, even when source and funding have
+not changed. Changed external facts reset this delay. Exhausted content allowances permit mechanical reevaluation
 and normal work, without authorizing another identical paid attempt.
 Claim, capacity, policy, budget and content waits do not consume infrastructure
 attempts. Content remains bounded by the original workflow's existing counters.

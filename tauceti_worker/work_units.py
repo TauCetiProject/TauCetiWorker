@@ -1739,7 +1739,8 @@ def _do_fixlike(
 
         push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
         published_before = _rev(co, push_marker)
-        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before))
+        push_scope = conversation_round or os.urandom(16).hex()
+        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before, scope=push_scope))
         handoffs = []
         if (
             not foreign
@@ -1763,6 +1764,7 @@ def _do_fixlike(
                     checkout=co,
                     push_marker=push_marker,
                     published_before=published_before,
+                    push_scope=push_scope,
                 )
                 prompt += retained
             except (OSError, RuntimeError, RecoveryWait, RecoveryRecordError) as error:
@@ -1772,16 +1774,19 @@ def _do_fixlike(
         from .config import AdmissionUnavailable
 
         try:
-            rc = run_agent_host(
-                co,
-                prompt,
-                _effective_authoring_profile(opts),
-                w.cfg.logdir,
-                cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
-                session_path=conversation_path,
-                session_actor=getattr(sv, "me_login", ""),
-                session_scope=conversation_scope,
-            )
+            from .repair_recovery import environment
+
+            with environment(TAUCETI_PUSH_SCOPE=push_scope):
+                rc = run_agent_host(
+                    co,
+                    prompt,
+                    _effective_authoring_profile(opts),
+                    w.cfg.logdir,
+                    cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
+                    session_path=conversation_path,
+                    session_actor=getattr(sv, "me_login", ""),
+                    session_scope=conversation_scope,
+                )
             agent_rc = rc
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.

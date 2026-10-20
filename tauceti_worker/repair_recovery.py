@@ -32,6 +32,16 @@ RESERVATION_SECONDS = 300
 PROTOCOL = 3
 HOLDS = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
 LOCAL_WAITS = {"work-policy", "pr-policy", "profile-policy", "roadmap-policy"}
+METADATA_WAITS = {
+    "pr-held",
+    "push-permission",
+    "ownership-changed",
+    "maintenance-blocked",
+    "base-policy",
+    "ownership-policy",
+    "original-roadmap-policy",
+    "roadmap-policy",
+}
 PERMANENT_BLOCKS = {
     "missing-publication-scope",
     "original-authorization-missing",
@@ -220,6 +230,18 @@ class Recovery:
         try:
             facts = b.facts(m)
             j["observed_head"] = facts["head"]
+            normal_pending = j.get("normal_publication") or (m.get("round_outcome") or {}).get("pending_push")
+            if normal_pending:
+                j["forensic_only"] = True
+                if b.reconcile(m, normal_pending, facts) == "published":
+                    self.transition(
+                        "published", evidence=dict(remote_head=facts["head"], commit=normal_pending["oid"]), reason=None
+                    )
+                    return True
+                raise Obsolete(
+                    "publication-uncertain",
+                    "An unacknowledged normal push cannot be ruled out; retain source as evidence for fresh normal work",
+                )
             # Reconcile first, even after the third crash. A push may have succeeded just
             # before process death. Closed/held PRs must never cause that push to be replayed.
             self.discard_unstarted_publication()
@@ -251,7 +273,14 @@ class Recovery:
             )
             if j.get("external") != external:
                 self.transition(
-                    "eligible", external=external, attempts=0, infrastructure_streak=0, retry_at=0, reason=None
+                    "eligible",
+                    external=external,
+                    attempts=0,
+                    infrastructure_streak=0,
+                    verification_failures=0,
+                    failed_recheck_at=0,
+                    retry_at=0,
+                    reason=None,
                 )
             b.policy(m, facts)
             if (m.get("round_outcome") or {}).get("published_head"):
@@ -276,11 +305,6 @@ class Recovery:
                 self.transition("eligible", attempts=0, mechanical_recheck_at=None, reason=None)
             if j.get("retry_at", 0) > time.time() and not changed_selection:
                 return False
-            if (j.get("reason") or {}).get("code") == "content-allowance":
-                # A bounded mechanical reevaluation may observe repaired verifier
-                # infrastructure. Cached failure must not defeat that automatic
-                # recheck; the original paid counters still prohibit another model.
-                j.pop("failed_fingerprint", None)
             prior_checkout = self.record / "checkout"
             if (
                 j.get("failed_head") == facts["head"]
@@ -304,6 +328,16 @@ class Recovery:
             self.invoked = True
             checkout = b.restore(self.record, m, j)
             b.prepare_source(checkout, self.record, m, j)
+            pending = j.get("publication")
+            if pending and (
+                saved._rev(checkout, "HEAD") != pending["oid"]
+                or source_tree(checkout)
+                != saved._git(checkout, "rev-parse", f"{pending['oid']}^{{tree}}", text=True).strip()
+            ):
+                j["forensic_only"] = True
+                raise Obsolete(
+                    "publication-uncertain", "Uncertain publication can only replay its exact original commit"
+                )
             why = b.integration_reason(checkout, m, facts, j)
             if not why and b.superseded(checkout, m, facts):
                 raise Obsolete(
@@ -320,6 +354,11 @@ class Recovery:
             if receipt.get("status") != "success":
                 if receipt.get("status") == "incomplete":
                     raise RuntimeError(receipt.get("error") or "Verification incomplete")
+                if pending:
+                    raise Wait(
+                        "publication-revalidation-failed",
+                        "Recheck the exact pending commit before retry; uncertain publication cannot launch content repair",
+                    )
                 if why:
                     raise ContentFailure(
                         "source-verification-failed", receipt.get("error") or "Changed source still fails verification"
@@ -338,6 +377,12 @@ class Recovery:
             # A stable commit ID and its tree are durable BEFORE the first push. On
             # restart restore/commit is not rerun until remote reconciliation permits it.
             publication = b.prepare(checkout, m, facts, receipt)
+            if pending:
+                if publication["oid"] != pending["oid"]:
+                    j["forensic_only"] = True
+                    raise Obsolete("publication-uncertain", "A different commit cannot replace uncertain publication")
+                j.setdefault("publication_history", []).append(pending)
+                publication.update(prior_uncertain=True, push_started=True)
             self.transition("publication-pending", publication=publication)
             b.publish(checkout, m, facts, publication)
             latest = b.facts(m)
@@ -355,7 +400,11 @@ class Recovery:
                 state,
                 attempts=max(0, j.get("attempts", 0) - int(charged)),
                 reason=reason(error),
-                retry_at=time.time() + (1800 if isinstance(error, Block) else 60),
+                retry_at=(
+                    max(time.time() + 1800, j.get("failed_recheck_at", 0))
+                    if error.code in {"content-allowance", "publication-revalidation-failed"}
+                    else time.time() + (1800 if isinstance(error, Block) else 60)
+                ),
                 selection=selected,
                 reservation_until=j.get("reservation_until") or time.time() + RESERVATION_SECONDS,
             )
@@ -693,6 +742,9 @@ class WorkerBackend:
         transaction = j.get("delta_integration") or {}
         if frozen is not None or transaction.get("stage") != "prepared" or transaction.get("target") != facts["head"]:
             previous = {**transaction}
+            if frozen is None and source_ref is None:
+                self.commit_source(checkout, m)
+                source_ref = saved._rev(checkout, "HEAD")
             root = self.record / "reintegrations" / uuid.uuid4().hex
             root.mkdir(parents=True)
             snap = saved.inspect(checkout)
@@ -728,8 +780,6 @@ class WorkerBackend:
                 )
                 force_reasoning = force_reasoning or paid_progress
             else:
-                if source_ref is None:
-                    self.commit_source(checkout, m)
                 source = source_ref or saved._rev(checkout, "HEAD")
                 patch = saved._git(
                     checkout,
@@ -944,11 +994,12 @@ class WorkerBackend:
             and transaction.get("target") == facts["head"]
             and transaction.get("requires_reasoning")
         ):
+            tree = source_tree(checkout)
             if (
                 j.get("content_delta") == transaction["id"]
                 and not saved.inspect(checkout).conflicted
-                and source_tree(checkout)
-                != saved._git(checkout, "rev-parse", f"{facts['head']}^{{tree}}", text=True).strip()
+                and tree is not None
+                and tree != saved._git(checkout, "rev-parse", f"{facts['head']}^{{tree}}", text=True).strip()
             ):
                 # An interrupted model may already have resolved the delta. Try
                 # exact mechanical verification before spending another request.
@@ -964,18 +1015,20 @@ class WorkerBackend:
                     j,
                     expected,
                     source_ref=j.get("merge_source") or saved._rev(checkout, "HEAD"),
-                    force_reasoning=bool(j.get("content_started")),
+                    force_reasoning=bool(
+                        j.get("content_started") and j.get("content_started") != j.get("merge_content_before")
+                    ),
                 )
             return "resolve-owned-merge-conflicts" if saved.inspect(checkout).conflicted else None
+        snapshot = saved.inspect(checkout)
+        if snapshot.conflicted or snapshot.operations:
+            return "resolve-interrupted-source-operation"
         # Never commit an unresolved owned merge to derive a rewritten delta:
         # that would import the former writer's intentionally removed content.
         if not ancestor(expected, facts["head"]) and not (
             ancestor(facts["head"], "HEAD") and not ancestor(expected, "HEAD")
         ):
             return self.reintegrate_delta(checkout, m, facts, j, expected)
-        snapshot = saved.inspect(checkout)
-        if snapshot.conflicted or snapshot.operations:
-            return "resolve-interrupted-source-operation"
         if m.get("operations") and not j.get("content_attempts"):
             return "unfinished-source-operation"
         # A changed writer's head must be integrated or require source reasoning.
@@ -998,7 +1051,14 @@ class WorkerBackend:
         if merge.returncode:
             # Persist ownership before starting an operation; a crash must not turn
             # our own merge into an unrecognised original Git operation.
-            write(self.record, j, "resuming", pending_merge_head=facts["head"], merge_source=source)
+            write(
+                self.record,
+                j,
+                "resuming",
+                pending_merge_head=facts["head"],
+                merge_source=source,
+                merge_content_before=j.get("content_started"),
+            )
             result = subprocess.run(
                 ["git", "-C", str(checkout), *options, "merge", "--no-ff", "--no-commit", facts["head"]],
                 capture_output=True,
@@ -1016,7 +1076,14 @@ class WorkerBackend:
                 "source-superseded",
                 "The current writer already integrated all saved changes plus additional work",
             )
-        write(self.record, j, "resuming", pending_merge_head=facts["head"], merge_source=source)
+        write(
+            self.record,
+            j,
+            "resuming",
+            pending_merge_head=facts["head"],
+            merge_source=source,
+            merge_content_before=j.get("content_started"),
+        )
         saved._git(checkout, *options, "merge", "--no-edit", "--no-ff", facts["head"])
         write(
             self.record,
@@ -1081,6 +1148,7 @@ class WorkerBackend:
                 return j["failed_receipt"]
             result = verifier.run()
             if result.get("status") == "failed" and getattr(self, "record", None):
+                failures = j.get("verification_failures", 0) + 1 if j.get("failed_fingerprint") == current else 1
                 write(
                     self.record,
                     j,
@@ -1089,7 +1157,8 @@ class WorkerBackend:
                     failed_head=facts["head"],
                     failed_source=saved.inspect(checkout).fingerprint,
                     failed_receipt=result,
-                    failed_recheck_at=time.time() + 1800,
+                    verification_failures=failures,
+                    failed_recheck_at=time.time() + min(21600, 1800 * 2 ** min(failures - 1, 4)),
                 )
         return result
 
@@ -1343,11 +1412,14 @@ class WorkerBackend:
             [journal["delta_integration"]] if journal.get("delta_integration") else []
         )
         introduced = set(saved._git(checkout, "rev-list", oid, "--not", facts["head"], text=True).split())
+        prior_heads = {journal.get("integrated_head"), m.get("expected_remote_head")}
+        prior_heads.discard(None)
         for transaction in transactions:
             # A later rewrite may remove an earlier integration target as well
             # as the checkpoint's original ancestry. Frozen deltas retain their
             # original expected head, so checking only that head misses this case.
-            prior_heads = {transaction["expected"], transaction["target"]}
+            prior_heads.update((transaction["expected"], transaction["target"]))
+        if prior_heads:
             removed = set(
                 saved._git(checkout, "rev-list", *sorted(prior_heads), "--not", facts["head"], text=True).split()
             )
@@ -1431,16 +1503,22 @@ class WorkerBackend:
         except (FileNotFoundError, PermissionError):
             # These exec failures cannot have sent a push. Preserve uncertainty
             # for timeouts/process failures, whose external outcome is unknown.
-            publication["push_started"] = False
+            publication["push_started"] = bool(publication.get("prior_uncertain"))
             write(self.record, self.journal, "publication-pending", publication=publication)
             raise
         except subprocess.CalledProcessError as error:
             detail = (error.stderr or b"").decode(errors="replace")[-2000:]
             if error.returncode in (77, 78):
-                publication["push_started"] = False
+                publication["push_started"] = bool(publication.get("prior_uncertain"))
                 write(self.record, self.journal, "publication-pending", publication=publication)
                 raise Wait(
                     "push-rejected", f"Push definitively refused; re-integrate before retry: {detail}"
+                ) from error
+            if error.returncode in {79, 80}:
+                publication["push_started"] = bool(publication.get("prior_uncertain"))
+                write(self.record, self.journal, "publication-pending", publication=publication)
+                raise RuntimeError(
+                    f"Unsent publication infrastructure failure; bounded infrastructure backoff: {detail}"
                 ) from error
             raise RuntimeError(f"Push outcome uncertain; remote reconciliation required: {detail}") from error
 
@@ -1547,6 +1625,7 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True, agent=None):
     root = state / "recovery"
     if not root.is_dir():
         return False
+    metadata_due = read_json(root / "cursor.json").get("blocked_probe_at", 0) + 1800 <= time.time()
     for record in record_directories(root):
         journal = read_json(record / "recovery.json")
         if (journal.get("handoff") or {}).get("state") == "offered" and journal.get("retry_at", 0) <= time.time():
@@ -1574,12 +1653,24 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True, agent=None):
                 "retry_at", 0
             ) <= time.time():
                 return True
-            continue  # Normal rounds do bounded external-fact housekeeping.
+            if (
+                (journal.get("reason") or {}).get("code") in METADATA_WAITS
+                and journal.get("retry_at", 0) <= time.time()
+                and metadata_due
+            ):
+                return True
+            continue  # Other blocked records receive ordinary-round housekeeping.
         selected = selection(
             only or [], prs, sandbox_host, agent or (journal.get("selection") or {}).get("agent", "auto")
         )
         changed = only is not None and selection_changed(journal.get("selection"), selected)
         if changed:
+            return True
+        if (
+            (journal.get("reason") or {}).get("code") == "roadmap-policy"
+            and metadata_due
+            and journal.get("retry_at", 0) <= time.time()
+        ):
             return True
         if (journal.get("reason") or {}).get("code") in LOCAL_WAITS:
             continue
@@ -1620,7 +1711,12 @@ def evidence_records(cfg, repository, pr):
         if m.get("repository") != repository or m.get("pr") != pr:
             continue
         code = (j.get("reason") or {}).get("code")
-        if j.get("state") in TERMINAL and code not in {"publication-head-moved", "source-handed-to-normal-round"}:
+        if j.get("state") in TERMINAL and code not in {
+            "publication-head-moved",
+            "source-handed-to-normal-round",
+            "source-handoff-checkpoint",
+            "publication-uncertain",
+        }:
             continue
         if (m.get("authorization") or {}).get("foreign") or (m.get("authorization") or {}).get("automatic_bump"):
             continue
@@ -1642,7 +1738,8 @@ def immutable_evidence(record, m, j):
         delta_patch=(j.get("delta_integration") or {}).get("patch"),
         reason=j.get("reason"),
         pending_publication=j.get("publication"),
-        possibly_published_then_removed=(j.get("reason") or {}).get("code") == "publication-head-moved",
+        possibly_published_then_removed=j.get("forensic_only", False)
+        or (j.get("reason") or {}).get("code") == "publication-head-moved",
     )
 
 
@@ -1771,6 +1868,21 @@ def reconcile_handoff(cfg, record, j):
                         ),
                     )
                     return
+    attempt = None
+    attempted_commit = None
+    if h.get("attempt_marker") and (checkout / ".git").exists():
+        attempt = saved.ref_object(checkout, h["attempt_marker"])
+        rejected_marker = h["attempt_marker"].replace("refs/tauceti/push-attempt/", "refs/tauceti/push-rejected/", 1)
+        rejected = saved.ref_object(checkout, rejected_marker)
+        pending = saved.ref_object(
+            checkout, h.get("pending_marker") or saved.pending_push_ref(dict(ref=h["push_marker"]))
+        )
+        if (attempt == h.get("attempt_before") and pending == h.get("pending_before")) or (
+            attempt and rejected == attempt and not pending
+        ):
+            write(record, j, "eligible", handoff={**h, "state": "returned"}, retry_at=0, reason=None)
+            return
+        attempted_commit = saved._rev(checkout, h["attempt_marker"])
     auth = original.get("authorization") or {}
     try:
         remote = subprocess.run(
@@ -1793,7 +1905,16 @@ def reconcile_handoff(cfg, record, j):
             ),
         )
         return
-    if remote[0] != h["head"]:
+    if attempted_commit and remote[0] == attempted_commit:
+        write(
+            record,
+            j,
+            "obsolete",
+            handoff={**h, "state": "published", "published_head": attempted_commit},
+            reason=reason(Obsolete("source-handoff-published", "Remote state confirms the receiving normal push")),
+        )
+        return
+    if remote[0] != h["head"] or attempt or not h.get("attempt_marker") or not (checkout / ".git").exists():
         write(
             record,
             j,
@@ -1802,8 +1923,7 @@ def reconcile_handoff(cfg, record, j):
             forensic_only=True,
             reason=reason(
                 Obsolete(
-                    "publication-head-moved",
-                    "Normal handoff may have published before the remote head moved; do not replay",
+                    "publication-uncertain", "Normal publication cannot be ruled out; preserve evidence without replay"
                 )
             ),
         )
@@ -1811,7 +1931,9 @@ def reconcile_handoff(cfg, record, j):
     write(record, j, "eligible", handoff={**h, "state": "returned"}, retry_at=0, reason=None)
 
 
-def handoff_context(cfg, repository, pr, *, head, actor, checkout, push_marker, published_before):
+def handoff_context(
+    cfg, repository, pr, *, head, actor, checkout, push_marker, published_before, push_scope="unscoped"
+):
     """Retire recovery ownership before a normal claimed task receives its source.
 
     An unfinished normal task is reconciled by the next owned round. Publication
@@ -1820,82 +1942,100 @@ def handoff_context(cfg, repository, pr, *, head, actor, checkout, push_marker, 
     from .activity import current_round_id
 
     evidence, handoffs = [], []
-    for record, m, _old in evidence_records(cfg, repository, pr):
-        auth = m.get("authorization") or {}
-        if auth.get("actor") and auth["actor"].lower() != actor.lower():
-            continue
-        with (record / "recovery.lock").open("a+") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise Wait("source-handoff-owned", "Retained source still has another owner") from None
-            j = read_json(record / "recovery.json")
-            h = j.get("handoff") or {}
-            if j.get("state") in TERMINAL and (j.get("reason") or {}).get("code") not in {
-                "publication-head-moved",
-                "source-handed-to-normal-round",
-            }:
+    try:
+        for record, m, _old in evidence_records(cfg, repository, pr):
+            auth = m.get("authorization") or {}
+            if auth.get("actor") and auth["actor"].lower() != actor.lower():
                 continue
-            if h.get("state") == "published":
-                continue
-            if h.get("state") == "offered":
-                previous_checkout = Path(h["checkout"])
-                marker = (
-                    saved._rev(previous_checkout, h["push_marker"]) if (previous_checkout / ".git").exists() else None
-                )
-                if marker and marker != h.get("published_before"):
-                    write(
-                        record,
-                        j,
-                        "obsolete",
-                        handoff={**h, "state": "published", "published_head": marker},
-                        reason=reason(
-                            Obsolete("source-handoff-published", "Durable normal push reconciled after restart")
-                        ),
-                    )
+            with (record / "recovery.lock").open("a+") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise Wait("source-handoff-owned", "Retained source still has another owner") from None
+                j = read_json(record / "recovery.json")
+                h = j.get("handoff") or {}
+                if j.get("state") in TERMINAL and (j.get("reason") or {}).get("code") not in {
+                    "publication-head-moved",
+                    "source-handed-to-normal-round",
+                    "source-handoff-checkpoint",
+                    "publication-uncertain",
+                }:
                     continue
-            source = record / "checkout"
-            if source.is_dir():
-                snapshot = saved._record(
-                    SimpleNamespace(state=record / "handoff-sources", wid=cfg.wid),
-                    source,
-                    saved.inspect(source),
-                    "TauCeti",
-                    repository,
-                    owner=dict(round_id=m.get("source_round") or m["id"], pr=pr, work=m.get("work")),
+                if h.get("state") == "published":
+                    continue
+                if h.get("state") == "offered":
+                    reconcile_handoff(cfg, record, j)
+                    h = j.get("handoff") or {}
+                    if h.get("state") == "offered":
+                        raise Wait(
+                            "source-handoff-reconciliation", "Previous normal publication is awaiting reconciliation"
+                        )
+                    if h.get("state") == "published":
+                        continue
+                if j.get("forensic_only") or (j.get("reason") or {}).get("code") in {
+                    "publication-head-moved",
+                    "publication-uncertain",
+                    "source-handoff-checkpoint",
+                }:
+                    evidence.append(immutable_evidence(record, m, j))
+                    if len(evidence) >= 4:
+                        break
+                    continue  # Evidence cannot regain automatic publication ownership.
+                source = record / "checkout"
+                if source.is_dir():
+                    snapshot = saved._record(
+                        SimpleNamespace(state=record / "handoff-sources", wid=cfg.wid),
+                        source,
+                        saved.inspect(source),
+                        "TauCeti",
+                        repository,
+                        owner=dict(round_id=m.get("source_round") or m["id"], pr=pr, work=m.get("work")),
+                    )
+                    j["source_checkpoint"] = str(snapshot)
+                identity = uuid.uuid4().hex
+                attempt_marker = push_marker.replace("refs/tauceti/published/push/", "refs/tauceti/push-attempt/", 1)
+                pending_marker = saved.pending_push_ref(dict(ref=push_marker, scope=push_scope))
+                h = dict(
+                    id=identity,
+                    state="offered",
+                    source_round=current_round_id(),
+                    head=head,
+                    actor=actor,
+                    checkout=str(checkout),
+                    push_marker=push_marker,
+                    published_before=published_before,
+                    attempt_marker=attempt_marker,
+                    attempt_before=saved.ref_object(checkout, attempt_marker),
+                    pending_marker=pending_marker,
+                    pending_before=saved.ref_object(checkout, pending_marker),
                 )
-                j["source_checkpoint"] = str(snapshot)
-            identity = uuid.uuid4().hex
-            h = dict(
-                id=identity,
-                state="offered",
-                source_round=current_round_id(),
-                head=head,
-                actor=actor,
-                checkout=str(checkout),
-                push_marker=push_marker,
-                published_before=published_before,
-            )
-            # An uncertain wire intent remains forensic evidence, not a repair recipe.
-            uncertain = (j.get("reason") or {}).get("code") == "publication-head-moved" or j.get("forensic_only", False)
-            write(
-                record,
-                j,
-                "obsolete",
-                handoff=h,
-                retry_at=0,
-                forensic_only=uncertain,
-                reason=reason(
-                    Obsolete("source-handed-to-normal-round", "Normal claimed work now exclusively owns this source")
-                ),
-            )
-            item = immutable_evidence(record, m, j)
-            item["possibly_published_then_removed"] = uncertain
-            evidence.append(item)
-            handoffs.append((str(record), identity))
-            if len(evidence) >= 4:
-                break
-    return format_evidence(evidence), handoffs
+                # An uncertain wire intent remains forensic evidence, not a repair recipe.
+                uncertain = (j.get("reason") or {}).get("code") == "publication-head-moved" or j.get(
+                    "forensic_only", False
+                )
+                write(
+                    record,
+                    j,
+                    "obsolete",
+                    handoff=h,
+                    retry_at=0,
+                    forensic_only=uncertain,
+                    reason=reason(
+                        Obsolete(
+                            "source-handed-to-normal-round", "Normal claimed work now exclusively owns this source"
+                        )
+                    ),
+                )
+                handoffs.append((str(record), identity))
+                item = immutable_evidence(record, m, j)
+                item["possibly_published_then_removed"] = uncertain
+                evidence.append(item)
+                if len(evidence) >= 4:
+                    break
+        return format_evidence(evidence), handoffs
+    except Exception:
+        return_handoffs(handoffs)
+        raise
 
 
 def recover(w, opts):
@@ -1911,12 +2051,14 @@ def recover(w, opts):
         return False
     candidates = record_directories(root)
     cursor_path = root / "cursor.json"
-    cursor = read_json(cursor_path).get("after", "")
+    cursor_state = read_json(cursor_path)
+    cursor = cursor_state.get("after", "")
     candidates = [p for p in candidates if p.name > cursor] + [p for p in candidates if p.name <= cursor]
     inspected = 0
     probed = False
     for record in candidates:
-        atomic_json(cursor_path, dict(after=record.name))
+        cursor_state["after"] = record.name
+        atomic_json(cursor_path, cursor_state)
         j = read_json(record / "recovery.json")
         if (j.get("handoff") or {}).get("state") == "offered":
             with (record / "recovery.lock").open("a+") as lock:
@@ -1967,6 +2109,32 @@ def recover(w, opts):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 continue
+            if (j.get("reason") or {}).get("code") in METADATA_WAITS:
+                cursor_state["blocked_probe_at"] = time.time()
+                atomic_json(cursor_path, cursor_state)
+                backend = WorkerBackend(w, opts)
+                try:
+                    manifest = read_json(record / "manifest.json")
+                    facts = backend.facts(manifest, cached=True)
+                except Exception as error:
+                    write(record, j, j.get("state", "blocked"), retry_at=time.time() + 1800, probe_error=str(error))
+                    continue
+                try:
+                    backend.policy(manifest, facts)
+                except Wait as error:
+                    state = (
+                        "obsolete"
+                        if isinstance(error, Obsolete)
+                        else "blocked"
+                        if isinstance(error, Block)
+                        else "eligible"
+                    )
+                    write(record, j, state, reason=reason(error), retry_at=time.time() + 1800)
+                    continue
+                except Exception as error:
+                    write(record, j, j.get("state", "blocked"), retry_at=time.time() + 1800, probe_error=str(error))
+                    continue
+                write(record, j, "eligible", retry_at=0, reason=None)
             recovery = Recovery(record, WorkerBackend(w, opts))
             result = recovery.run()
             if result:

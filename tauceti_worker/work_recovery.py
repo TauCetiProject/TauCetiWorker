@@ -785,6 +785,16 @@ def _remember_commits(state, record, manifest, snap):
             )
 
 
+def ref_object(repo: Path, ref: str) -> str | None:
+    """Read an intent's object identity without peeling its annotated tag to source."""
+    return _git(repo, "rev-parse", "--verify", ref, check=False, text=True).strip() or None
+
+
+def pending_push_ref(marker: dict) -> str:
+    branch = marker["ref"].removeprefix("refs/tauceti/published/push/")
+    return f"refs/tauceti/pending-push/{marker.get('scope') or 'unscoped'}/{branch}"
+
+
 def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
     """Write or reuse a complete record for this exact snapshot. Raises RecordError on any failure."""
     from .activity import current_round_id
@@ -797,6 +807,20 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         published = _rev(repo, marker["ref"])
         if published and published != marker.get("before"):
             outcome = {**(outcome or {}), "published_head": published}
+        pending_ref = pending_push_ref(marker)
+        pending = ref_object(repo, pending_ref)
+        if pending:
+            message = _git(repo, "cat-file", "-p", pending, text=True).split("\n\n", 1)[-1].splitlines()
+            auth = owner.get("authorization") or {}
+            outcome = {
+                **(outcome or {}),
+                "pending_push": dict(
+                    oid=_rev(repo, pending_ref),
+                    expected=message[1] if len(message) > 1 else None,
+                    repository=auth.get("repository"),
+                    ref=auth.get("ref"),
+                ),
+            }
     source_round = owner.get("round_id") or current_round_id() or f"unattributed-{int(time.time())}"
     base_id = _safe_id(str(source_round))
     try:
@@ -807,6 +831,10 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         raise RecordError(f"could not create {root}: {error}") from None
     indexed = os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() != "off"
     if indexed and (record := _indexed_record(cfg.state, repository, snap.fingerprint, snapshot=snap)):
+        if (outcome or {}).get("pending_push"):
+            journal = read_json(record / "recovery.json")
+            atomic_json(record / "recovery.json", {**journal, "normal_publication": outcome["pending_push"]})
+            _fsync_dir(record)
         if snap.unpublished:
             _remember_commits(cfg.state, record, _read_manifest(record), snap)
         return record

@@ -22,7 +22,8 @@
 #   TAUCETI_CLAIM_SH     path to claim.sh (default: alongside this script)
 set -uo pipefail
 
-# 77 means refused before push; 78 means Git explicitly rejected the destination.
+# 77 means permission refusal; 78 is stale-head rejection; 79 is server policy;
+# 80 means local infrastructure failed before push.
 # Other failures may have an uncertain remote outcome and must be reconciled.
 [[ "${TAUCETI_RECOVERY_CONTINUATION:-}" != "1" ]] || { echo "git-safe-push: recovery supervisor must reverify and publish" >&2; exit 77; }
 
@@ -34,6 +35,7 @@ CLAIM_REPO_OVERRIDE="${TAUCETI_CLAIM_REPO:-}"
 CLAIM_SH="${TAUCETI_CLAIM_SH:-$(cd "$(dirname "$0")" && pwd)/claim.sh}"
 
 die() { echo "git-safe-push: $*" >&2; exit 77; }
+infra_die() { echo "git-safe-push: $*" >&2; exit 80; }
 claim() {
     if [[ -n "$CLAIM_REPO_OVERRIDE" ]]; then
         CLAIM_REPO="$CLAIM_REPO_OVERRIDE" "$CLAIM_SH" "$@"
@@ -53,26 +55,49 @@ fi
 
 # 2) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
 # Resolve HEAD once: the oid pushed is the oid later recorded as published, even if HEAD moves.
-OID="$(git rev-parse --verify 'HEAD^{commit}')" || die "HEAD does not name a commit"
+OID="$(git rev-parse --verify 'HEAD^{commit}')" || infra_die "HEAD does not name a commit"
 DEST="$REF"
 [[ "$DEST" == refs/* ]] || DEST="refs/heads/$REF"
 echo "git-safe-push: $REMOTE ${OID:0:12}:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2
-PUSH_STATUS="$(mktemp)" || die "cannot record push status"
+PUSH_STATUS="$(mktemp)" || infra_die "cannot record push status"
 trap 'rm -f "$PUSH_STATUS"' EXIT
+# An annotated tag retains the exact source and a distinct invocation identity
+# without synthetic source commits that would obstruct ordinary checkout cleanup.
+SCOPE="${TAUCETI_PUSH_SCOPE:-unscoped}"
+ATTEMPT="$(printf 'object %s\ntype commit\ntag tauceti-push-attempt\ntagger tauceti-worker <tauceti-worker@localhost> 0 +0000\n\n%s\n%s\n%s\n' "$OID" "$OID" "$EXPECT" "$PUSH_STATUS" | git mktag)" || infra_die "cannot record push attempt"
+PENDING="refs/tauceti/pending-push/$SCOPE/${REF#refs/heads/}"
+# Keep the earliest unacknowledged attempt across subsequent attempts. A later
+# rejection cannot prove that an earlier transport failure was never accepted.
+if ! git rev-parse --verify "$PENDING" >/dev/null 2>&1; then
+    git update-ref "$PENDING" "$ATTEMPT" "" || infra_die "cannot retain pending publication"
+fi
+git update-ref "refs/tauceti/push-attempt/${REF#refs/heads/}" "$ATTEMPT" || infra_die "cannot retain push attempt"
 if git -c push.followTags=false push --porcelain --force-with-lease="$REF:$EXPECT" "$REMOTE" "$OID:$DEST" >"$PUSH_STATUS"; then
     cat "$PUSH_STATUS"
     # Local publication evidence: checkout preparation treats commits reachable from
     # refs/tauceti/published/* as published, so pushed work is not mistaken for unfinished source.
-    git update-ref "refs/tauceti/published/push/${REF#refs/heads/}" "$OID" 2>/dev/null || true
+    if git update-ref "refs/tauceti/published/push/${REF#refs/heads/}" "$OID" 2>/dev/null; then
+        git update-ref -d "$PENDING" 2>/dev/null || true
+    fi
     if [[ -n "${TAUCETI_FLEET_EVENTS:-}" && -n "${TAUCETI_FLEET_PYTHON:-}" && -n "${TAUCETI_FLEET_EMITTER:-}" ]]; then
         "$TAUCETI_FLEET_PYTHON" -I "$TAUCETI_FLEET_EMITTER" pushed 2>/dev/null || true
     fi
     exit 0
 fi
 cat "$PUSH_STATUS"
-if awk -F '\t' -v expected="$OID:$DEST" '$1 == "!" && $2 == expected { rejected=1 } END { exit !rejected }' "$PUSH_STATUS"; then
-    echo "git-safe-push: destination explicitly rejected; re-integrate current facts before another CAS push" >&2
-    exit 78
-fi
+while IFS=$'\t' read -r flag destination summary; do
+    if [[ "$flag" == '!' && "$destination" == "$OID:$DEST" ]]; then
+        case "$summary" in
+            '[rejected]'*)
+                git update-ref "refs/tauceti/push-rejected/${REF#refs/heads/}" "$ATTEMPT" 2>/dev/null || true
+                git update-ref -d "$PENDING" "$ATTEMPT" 2>/dev/null || true
+                echo "git-safe-push: stale destination; re-integrate before another CAS push" >&2; exit 78 ;;
+            '[remote rejected]'*)
+                git update-ref "refs/tauceti/push-rejected/${REF#refs/heads/}" "$ATTEMPT" 2>/dev/null || true
+                git update-ref -d "$PENDING" "$ATTEMPT" 2>/dev/null || true
+                echo "git-safe-push: server policy rejected this push" >&2; exit 79 ;;
+        esac
+    fi
+done <"$PUSH_STATUS"
 echo "git-safe-push: push failed with an uncertain remote outcome; reconcile before replay" >&2
 exit 1
