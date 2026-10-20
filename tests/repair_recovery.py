@@ -1139,7 +1139,10 @@ class RealVerifierIntegration(unittest.TestCase):
             self.assertEqual(first["status"], "success", first.get("error"))
             second = backend.verify(case.root, manifest, facts)
             self.assertEqual(second["status"], "success", second.get("error"))
-            self.assertTrue(all("reused_from" in p for p in second["phases"].values()))
+            for name, phase in second["phases"].items():
+                # Artifact checks must run again: unchanged source alone cannot certify
+                # the build outputs inspected by a previous stage-only invocation.
+                self.assertEqual("reused_from" in phase, name not in {"axioms", "module-system"})
             warm.assert_called()
             publication = backend.prepare(case.root, manifest, facts, second)
         self.assertEqual(publication["oid"], git(case.root, "rev-parse", "HEAD"))
