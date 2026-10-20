@@ -1,6 +1,6 @@
 import { Env, EventPointer, Query, Repository, authorize, digest, json, repositories, repository, stub, validSignature, validateQuery, parseGitHub } from './protocol';
 import { classify, log, requestId } from './storage';
-import { PARK_AFTER_ATTEMPTS, backlog, backoff, drain, ingressMode, noteRepositoryFull, park, reconcile, setIngressMode } from './ingress';
+import { PARK_AFTER_ATTEMPTS, backlog, backoff, drain, ingressMode, noteRepositoryFull, park, reconcile, setIngressMode, storageState } from './ingress';
 export { RepositoryState } from './repository';
 export { InstallationScheduler } from './installation';
 
@@ -163,18 +163,23 @@ export default {
     }
   },
   async queue(batch:MessageBatch<EventPointer>,env:Env):Promise<void> {
-    const modes=new Map<string,Promise<{mode:string}>>();
-    for (const message of batch.messages) {
+    const modes=new Map<string,Promise<{mode:string}>>(),stored=new Map<string,Promise<any>>();
+    // Messages are independent: each is acknowledged only after its own
+    // receipt or durable parking, so a batch is handled concurrently.
+    await Promise.all(batch.messages.map(async message=>{
       const pointer=message.body,repo=repository(env,pointer.repository);
-      if (!repo) { message.ack(); continue; }
+      if (!repo) { message.ack(); return; }
       let reason:string,started=Date.now();
       try {
         if (!modes.has(repo.id)) modes.set(repo.id,ingressMode(env,repo));
+        if (!stored.has(repo.id)) stored.set(repo.id,storageState(env,repo).catch(()=>null));
         if ((await modes.get(repo.id)!).mode==='parked') reason='planned_migration';
+        // A recorded full repository cannot apply events; park without a round trip.
+        else if ((await stored.get(repo.id))?.state==='full') reason='storage_full';
         else {
           started=Date.now();
           const result=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/event',{method:'POST',body:JSON.stringify(pointer)});
-          if (result.ok) { message.ack(); continue; }
+          if (result.ok) { message.ack(); return; }
           const detail:any=await result.json().catch(()=>({}));
           // A full or unavailable repository is parked immediately rather
           // than spending the queue's retry budget.
@@ -183,7 +188,7 @@ export default {
           else if (message.attempts>=PARK_AFTER_ATTEMPTS) reason='retry_budget:'+String(detail.error || result.status);
           else {
             log('event_retry',{delivery:pointer.delivery,attempts:message.attempts,reason:detail.error || result.status,request_id:detail.request_id});
-            message.retry({delaySeconds:backoff(message.attempts)});continue;
+            message.retry({delaySeconds:backoff(message.attempts)});return;
           }
         }
       } catch(error) {
@@ -195,7 +200,7 @@ export default {
           reason=failure;
         } else if (message.attempts<PARK_AFTER_ATTEMPTS) {
           log('event_retry',{delivery:pointer.delivery,attempts:message.attempts,reason:failure});
-          message.retry({delaySeconds:backoff(message.attempts)});continue;
+          message.retry({delaySeconds:backoff(message.attempts)});return;
         } else reason='retry_budget:'+failure;
       }
       try {
@@ -206,7 +211,7 @@ export default {
         log('event_park_failed',{delivery:pointer.delivery,attempts:message.attempts,reason:classify(error)});
         message.retry({delaySeconds:backoff(message.attempts)});
       }
-    }
+    }));
   },
   async scheduled(_event:ScheduledController,env:Env,ctx:ExecutionContext):Promise<void> {
     for (const repo of repositories(env)) {
