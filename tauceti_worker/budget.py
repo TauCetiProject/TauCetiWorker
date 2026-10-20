@@ -13,29 +13,61 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+ESTIMATE_PROVENANCES = {"token-priced", "historical-estimate", "prelaunch-estimate"}
+
 
 class BudgetError(ValueError):
     pass
 
 
-def admission_pause(snapshot):
-    """Preflight funding and ledger integrity; missing receipts are audit work."""
+def admission_pause(snapshot, *, worker=None, model=None, now=None):
+    """Cheap preflight; invocation admission remains the authoritative atomic check."""
+    now = time.time() if now is None else now
+    waiting = snapshot.get("waiting", [])
+    if model is None and worker is not None:
+        previous = next((item for item in waiting if item["worker"] == worker), None)
+        model = previous.get("model") if previous else None
     if snapshot.get("ledger_repair_required"):
         return "ledger repair requires reconciliation"
+    if model and snapshot.get("cooldowns", {}).get(model, 0) > now:
+        return "API throughput cooldown"
+    if model and model in snapshot.get("calibrating_models", []):
+        return "waiting for calibration session cost"
     if money(snapshot["available"]) <= 0 or money(snapshot["available"]) < money(snapshot["admission_threshold"]):
         return "waiting for funding"
+    if worker is not None and model:
+        first = min(
+            (
+                item
+                for item in waiting
+                if item.get("model") == model
+                and item["reason"] in {"waiting for funding", "waiting behind another worker"}
+            ),
+            key=lambda item: (item["since"], item["ticket"]),
+            default=None,
+        )
+        if first and first["worker"] != worker:
+            return "waiting behind another worker"
     return None
 
 
-def process_identity():
+def process_identity(pid=None):
     """Host bridge identity, including PID reuse and reboot protection on Linux."""
+    if sys.platform == "darwin":
+        from .usage_lifecycle import identity
+
+        try:
+            return identity(pid)
+        except OSError:
+            return None
     if sys.platform != "linux":
         return None
     try:
-        pid = os.getpid()
+        pid = os.getpid() if pid is None else pid
         return dict(
             pid=pid,
             boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            view=os.readlink("/proc/self/ns/pid"),
             start=Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
         )
     except (OSError, IndexError):
@@ -43,9 +75,15 @@ def process_identity():
 
 
 def bridge_owner_alive(owner):
+    if owner and sys.platform == "darwin":
+        from .usage_lifecycle import alive
+
+        return alive(owner)
     if not owner or sys.platform != "linux":
         return False
     try:
+        if owner.get("view") and owner["view"] != os.readlink("/proc/self/ns/pid"):
+            return True
         fields = Path(f"/proc/{int(owner['pid'])}/stat").read_text().rsplit(")", 1)[1].split()
         return (
             owner["boot"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -54,6 +92,18 @@ def bridge_owner_alive(owner):
         )
     except (OSError, KeyError, ValueError, IndexError, TypeError):
         return False
+
+
+def orphaned_bridge(session, now):
+    """Use the same liveness evidence for preflight and authoritative admission."""
+    if session["status"] != "active" or not session.get("bridge"):
+        return False
+    heartbeat = Path(session["bridge"]) / "outbox/heartbeat"
+    try:
+        stale = now - heartbeat.stat().st_mtime > 30
+    except FileNotFoundError:
+        stale = True
+    return stale and not bridge_owner_alive(session.get("owner"))
 
 
 def money(value) -> Decimal:
@@ -109,17 +159,21 @@ class Budget:
                 raise BudgetError(f"invalid ledger record {i}: {self.ledger}") from None
         return records
 
-    def replay(self, records: list[dict] | None = None):
-        state = dict(
-            balance=Decimal(0),
-            rate=Decimal(0),
-            spent=Decimal(0),
-            watermark=Decimal(0),
-            sessions={},
-            waiting={},
-            cooldowns={},
-            samples={},
-            seq=0,
+    def replay(self, records: list[dict] | None = None, *, _state=None):
+        state = (
+            _state
+            if _state is not None
+            else dict(
+                balance=Decimal(0),
+                rate=Decimal(0),
+                spent=Decimal(0),
+                watermark=Decimal(0),
+                sessions={},
+                waiting={},
+                cooldowns={},
+                samples={},
+                seq=0,
+            )
         )
         try:
             for rec in self.records() if records is None else records:
@@ -134,7 +188,13 @@ class Budget:
                         if kind == "correction":
                             state["spent"] -= money(event["delta"])
                             state["sessions"][event["id"]]["cost"] = event["cost"]
-                            for field in ("cost_provenance", "totals"):
+                            for field in (
+                                "cost_provenance",
+                                "totals",
+                                "recovery_audit",
+                                "finished",
+                                "recovery_manifest",
+                            ):
                                 if field in event:
                                     state["sessions"][event["id"]][field] = event[field]
                     elif kind == "rate":
@@ -152,6 +212,9 @@ class Budget:
                             outcome=event["outcome"],
                             totals=event.get("totals", {}),
                             cost_provenance=event.get("cost_provenance", "native-reported"),
+                            finished=event.get("finished", None if event.get("note") else rec["timestamp"]),
+                            recovery_manifest=event.get("recovery_manifest"),
+                            recovery_audit=event.get("recovery_audit"),
                         )
                         cost = money(event["cost"])
                         state["balance"] -= cost
@@ -161,6 +224,8 @@ class Budget:
                     elif kind == "unresolved":
                         session = state["sessions"][event["id"]]
                         session["status"] = "provisional" if event.get("provisional") else "unresolved"
+                        if "finished" in event:
+                            session["finished"] = event["finished"]
                         if "reserve" in event:
                             session.update(
                                 reserve=event["reserve"],
@@ -211,6 +276,7 @@ class Budget:
 
     def append(self, state, events):
         data = self.record_bytes(state, events)
+        transaction = json.loads(data)["transaction"]
         fd = os.open(self.ledger, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         try:
             while data:
@@ -223,6 +289,7 @@ class Budget:
             os.close(fd)
         # Persist a newly created ledger's directory entry as well as its contents.
         self.sync_directory()
+        return dict(transaction=transaction, ledger_sequence=state["seq"] + 1)
 
     def configure(self, *, grant=None, set_grant=None, rate=None):
         if grant is not None and set_grant is not None:
@@ -279,6 +346,9 @@ class Budget:
                 self.save_waiting(queue)
 
     def wait_for_funding(self, worker, model, phase):
+        self.wait_for_admission(worker, model, phase, "waiting for funding")
+
+    def wait_for_admission(self, worker, model, phase, reason):
         with self.locked():
             state = self.replay()
             queue = self.waiting_state(state)
@@ -294,7 +364,7 @@ class Budget:
                 ticket=previous.get("ticket", uuid.uuid4().hex),
                 since=previous.get("since", now),
                 seen=now,
-                reason="waiting for funding",
+                reason=reason,
                 estimate=str(estimate),
             )
             self.save_waiting(queue)
@@ -365,9 +435,14 @@ class Budget:
             clock_backwards=money(now) < state["watermark"],
             ledger=str(self.ledger),
             cooldowns=state["cooldowns"],
+            calibrating_models=[
+                name
+                for name in {s["model"] for s in active if s["status"] == "active" and not orphaned_bridge(s, now)}
+                if not self.estimate(state, name)[0]
+            ],
         )
 
-    def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None):
+    def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None):
         with self.locked():
             state = self.replay()
             if invocation in state["sessions"]:
@@ -377,15 +452,9 @@ class Budget:
             if resume and not any(resume in s.get("totals", {}) for s in state["sessions"].values()):
                 raise BudgetError("resuming requires a recorded cost baseline for that provider session ID")
             for session in active:
-                if session["status"] == "active" and session.get("bridge"):
-                    heartbeat = Path(session["bridge"]) / "outbox/heartbeat"
-                    try:
-                        orphaned = self.clock() - heartbeat.stat().st_mtime > 30
-                    except FileNotFoundError:
-                        orphaned = True
-                    if orphaned and not bridge_owner_alive(session.get("owner")):
-                        session["status"] = "unresolved"
-                        events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
+                if orphaned_bridge(session, self.clock()):
+                    session["status"] = "unresolved"
+                    events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
             costs, estimate = self.estimate(state, model, phase)
             live = [s for s in active if s["status"] == "active"]
             available = state["balance"] - sum((money(s.get("reserve", s["estimate"])) for s in active), Decimal(0))
@@ -453,6 +522,7 @@ class Budget:
                     bridge=bridge,
                     resume=resume,
                     owner=owner,
+                    **({"lifecycle": lifecycle} if lifecycle else {}),
                 )
             )
             self.append(state, events)
@@ -460,7 +530,17 @@ class Budget:
             self.save_waiting(queue)
             return dict(allowed=True, estimate=str(estimate))
 
-    def settle(self, invocation, cost, outcome="completed", *, note=None, totals=None, provenance="native-reported"):
+    def settle(
+        self,
+        invocation,
+        cost,
+        outcome="completed",
+        *,
+        note=None,
+        totals=None,
+        provenance="native-reported",
+        finished=None,
+    ):
         value = money(cost) if cost is not None else None
         if value is not None and value < 0:
             raise BudgetError("session cost cannot be negative")
@@ -475,7 +555,10 @@ class Budget:
                 return
             events = [self.accrue(state)]
             if value is None:
-                events.append(dict(type="unresolved", id=invocation, outcome=outcome))
+                event = dict(type="unresolved", id=invocation, outcome=outcome)
+                if finished is not None:
+                    event["finished"] = finished
+                events.append(event)
             else:
                 if "cost" in session:
                     # Prefixes use ordinary correction events, so older ledger
@@ -498,6 +581,7 @@ class Budget:
                         note=note,
                         totals=totals or {},
                         cost_provenance=provenance,
+                        **({"finished": finished} if finished is not None else {}),
                     )
                 )
             self.append(state, events)
@@ -518,7 +602,9 @@ class Budget:
                     live = self.clock() - (Path(session["bridge"]) / "outbox/heartbeat").stat().st_mtime <= 30
                 except FileNotFoundError:
                     live = False
-                if live or bridge_owner_alive(session.get("owner")):
+                from .usage_supervisor import invocation_alive
+
+                if live or invocation_alive(self.directory, session):
                     raise BudgetError("cannot reconcile an active session with a live accounting bridge")
             if session["status"] != "settled":
                 events = [self.accrue(state)]
@@ -585,8 +671,34 @@ class Budget:
             session = state["sessions"].get(receipt["id"])
             if not session:
                 raise BudgetError("receipt has no recorded admission")
-            if session["status"] == "settled" and session.get("cost_provenance") != "token-priced":
+            from .usage_lifecycle import alive
+            from .usage_supervisor import external_exit_proved, invocation_lifecycle
+
+            if receipt.get("outcome") == "launch-failed" and totals and all(money(v) == 0 for v in totals.values()):
+                from .usage_accounting import session_usage
+
+                journal = session_usage(self.directory, session)
+                if money(session.get("cost", "0")) > 0 or (journal and journal["messages"]):
+                    raise BudgetError("no-inference receipt contradicts durable usage; reserve retained")
+
+            lifecycle = invocation_lifecycle(self.directory, session)
+            if (
+                totals is not None
+                and lifecycle
+                and lifecycle.get("native")
+                and alive(lifecycle["native"])
+                and not (lifecycle.get("external") and external_exit_proved(lifecycle))
+            ):
+                raise BudgetError("cannot settle a live native invocation; receipt retained for recovery")
+            if session["status"] == "settled" and session.get("cost_provenance") not in ESTIMATE_PROVENANCES:
                 return
+            finished = receipt.get("finished")
+            if finished is not None and (
+                isinstance(finished, bool)
+                or money(finished) < money(session["started"])
+                or money(finished) > money(self.clock())
+            ):
+                raise BudgetError("invalid receipt finish time")
             ordered = list(state["sessions"].values())
             position = next(i for i, entry in enumerate(ordered) if entry["id"] == receipt["id"])
             baseline = {}
@@ -628,6 +740,7 @@ class Budget:
                         lower_bound_totals=lower,
                         outcome=receipt["outcome"],
                         note=note,
+                        **({"finished": finished} if finished is not None else {}),
                     )
                     self.append(state, [self.accrue(state), event])
                     return
@@ -643,14 +756,14 @@ class Budget:
                         (
                             money(p["totals"][provider])
                             for p in priors
-                            if p.get("cost_provenance", "native-reported") != "token-priced"
+                            if p.get("cost_provenance", "native-reported") not in ESTIMATE_PROVENANCES
                         ),
                         default=Decimal(0),
                     )
                     estimates = [
                         p
                         for p in priors
-                        if p.get("cost_provenance") == "token-priced" and money(p["totals"][provider]) > exact
+                        if p.get("cost_provenance") in ESTIMATE_PROVENANCES and money(p["totals"][provider]) > exact
                     ]
                     if money(native) < exact or not estimates or any(set(p["totals"]) != {provider} for p in estimates):
                         break
@@ -672,7 +785,7 @@ class Budget:
                                 delta=str(money(prior["cost"]) - value),
                                 cost=str(value),
                                 totals={provider: str(cursor)},
-                                cost_provenance="token-priced",
+                                cost_provenance=prior["cost_provenance"],
                                 note="estimate constrained by native cumulative total",
                             )
                         )
@@ -691,6 +804,7 @@ class Budget:
                                 totals=totals,
                                 cost_provenance="native-reported",
                                 note=note or "native receipt replaces estimate",
+                                **({"finished": finished} if finished is not None else {}),
                             )
                         )
                         # Correcting an earlier estimated resume baseline must
@@ -704,7 +818,7 @@ class Budget:
                             if set(totals) != set(successor.get("totals", {})):
                                 raise BudgetError("late receipt has mixed cumulative baselines; reconcile explicitly")
                             delta = cost - previous
-                            if successor.get("cost_provenance") == "token-priced":
+                            if successor.get("cost_provenance") in ESTIMATE_PROVENANCES:
                                 rebased = {key: str(money(value) + delta) for key, value in successor["totals"].items()}
                                 events.append(
                                     dict(
@@ -752,12 +866,13 @@ class Budget:
                                 outcome=receipt["outcome"],
                                 cost_provenance="native-reported",
                                 note=note,
+                                **({"finished": finished} if finished is not None else {}),
                             )
                         )
                     self.append(state, events)
                     return
         if session["status"] != "settled":
-            self.settle(receipt["id"], None, receipt["outcome"], note=note)
+            self.settle(receipt["id"], None, receipt["outcome"], note=note, finished=finished)
 
     def recover_usage(self, invocation, *, note="saved usage checkpoint", allow_live_owner=False, dry_run=False):
         """Settle a stopped complete journal, or charge its prefix and reserve uncertainty.
@@ -766,15 +881,21 @@ class Budget:
         A late native receipt reverses the estimated prefix before settlement.
         """
         from .budget_usage import evidence
+        from .usage_supervisor import invocation_alive, invocation_lifecycle
+
+        def live(session):
+            # Legacy finish may bypass its bridge owner; a registered native
+            # invocation must always be stopped, even during bridge cleanup.
+            return (
+                invocation_alive(self.directory, session)
+                if invocation_lifecycle(self.directory, session)
+                else (not allow_live_owner and bridge_owner_alive(session.get("owner")))
+            )
 
         with self.locked():
             sessions = self.replay()["sessions"]
         session = sessions.get(invocation)
-        if (
-            not session
-            or session["status"] == "settled"
-            or (not allow_live_owner and bridge_owner_alive(session.get("owner")))
-        ):
+        if not session or session["status"] == "settled" or live(session):
             return None
         saved = evidence(self.directory, session, sessions)
         if not saved or not saved["items"]:
@@ -782,11 +903,7 @@ class Budget:
         with self.locked():
             state = self.replay()
             session = state["sessions"].get(invocation)
-            if (
-                not session
-                or session["status"] == "settled"
-                or (not allow_live_owner and bridge_owner_alive(session.get("owner")))
-            ):
+            if not session or session["status"] == "settled" or live(session):
                 return None
             cost = max(saved["cost"], money(session.get("lower_bound_cost", "0")))
             stamp = (
@@ -880,62 +997,10 @@ class Budget:
             self.append(state, [self.accrue(state), *events])
             return result
 
-    def recover(self, note, *, dry_run=False):
-        if not dry_run and not note.strip():
-            raise BudgetError("receipt recovery requires --note")
-        from .claude_api import safe_message
+    def recover(self, note, *, dry_run=False, plan=None):
+        from .budget_recovery import recover
 
-        with self.locked():
-            sessions = self.replay()["sessions"]
-        errors, actions = [], []
-        for session in sessions.values():
-            if (session["status"] == "settled" and session.get("cost_provenance") != "token-priced") or not session.get(
-                "bridge"
-            ):
-                continue
-            bridge = Path(session["bridge"])
-            if session["status"] == "active" and bridge_owner_alive(session.get("owner")):
-                continue
-            try:
-                if self.clock() - (bridge / "outbox/heartbeat").stat().st_mtime <= 30:
-                    continue
-            except FileNotFoundError:
-                pass
-            invocation = session["id"]
-            try:
-                if (
-                    not isinstance(invocation, str)
-                    or len(invocation) != 32
-                    or any(c not in "0123456789abcdef" for c in invocation)
-                ):
-                    raise BudgetError("invalid receipt invocation ID")
-                receipt = bridge / "inbox" / (invocation + ".receipt")
-                if receipt.exists():
-                    value = safe_message(receipt)
-                    if not isinstance(value, dict) or value.get("id") != invocation:
-                        raise BudgetError("receipt invocation mismatch")
-                    actions.append(
-                        dict(id=invocation, action="recover native receipt", complete=bool(value.get("totals")))
-                    )
-                    if not dry_run:
-                        self.settle_receipt(value, note=note)
-                    if not value.get("totals"):
-                        action = self.recover_usage(invocation, note=note, dry_run=dry_run)
-                        if action:
-                            actions.append(action)
-                else:
-                    action = self.recover_usage(invocation, note=note, dry_run=dry_run)
-                    if action:
-                        actions.append(action)
-                    elif not dry_run:
-                        self.settle(invocation, None, "orphaned without receipt", note=note)
-            except Exception as error:
-                errors.append(f"{invocation}: {error}")
-                if not dry_run:
-                    self.settle(invocation, None, "invalid recovered receipt", note=note)
-            if not dry_run and not bridge_owner_alive(session.get("owner")):
-                (bridge / "key").unlink(missing_ok=True)
-        return dict(self.snapshot(), recovery_errors=errors, recovery_actions=actions, dry_run=dry_run)
+        return recover(self, note, dry_run=dry_run, plan=plan)
 
     def cooldown(self, model, seconds):
         with self.locked():

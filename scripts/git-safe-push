@@ -22,6 +22,8 @@
 #   TAUCETI_CLAIM_SH     path to claim.sh (default: alongside this script)
 set -uo pipefail
 
+[[ "${TAUCETI_RECOVERY_CONTINUATION:-}" != "1" ]] || { echo "git-safe-push: recovery supervisor must reverify and publish" >&2; exit 1; }
+
 REF="${1:-${TAUCETI_PUSH_REF:-}}"
 EXPECT="${TAUCETI_PUSH_EXPECT:-}"
 REMOTE="${TAUCETI_PUSH_REMOTE:-origin}"
@@ -48,8 +50,15 @@ if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then
 fi
 
 # 2) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
-echo "git-safe-push: $REMOTE HEAD:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2
-if git push --force-with-lease="$REF:$EXPECT" "$REMOTE" "HEAD:$REF"; then
+# Resolve HEAD once: the oid pushed is the oid later recorded as published, even if HEAD moves.
+OID="$(git rev-parse --verify 'HEAD^{commit}')" || die "HEAD does not name a commit"
+DEST="$REF"
+[[ "$DEST" == refs/* ]] || DEST="refs/heads/$REF"
+echo "git-safe-push: $REMOTE ${OID:0:12}:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2
+if git push --force-with-lease="$REF:$EXPECT" "$REMOTE" "$OID:$DEST"; then
+    # Local publication evidence: checkout preparation treats commits reachable from
+    # refs/tauceti/published/* as published, so pushed work is not mistaken for unfinished source.
+    git update-ref "refs/tauceti/published/push/${REF#refs/heads/}" "$OID" 2>/dev/null || true
     if [[ -n "${TAUCETI_FLEET_EVENTS:-}" && -n "${TAUCETI_FLEET_PYTHON:-}" && -n "${TAUCETI_FLEET_EMITTER:-}" ]]; then
         "$TAUCETI_FLEET_PYTHON" -I "$TAUCETI_FLEET_EMITTER" pushed 2>/dev/null || true
     fi

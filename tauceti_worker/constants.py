@@ -7,19 +7,22 @@ import hashlib
 import os
 import re
 
-TAUCETI = "TauCetiProject/TauCeti"
+TAUCETI = os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti")
+BASE_BRANCH = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+LEAN_ROOT = os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti")
+ROADMAP_DIR = os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")
 
 TAUCETI_OWNER = TAUCETI.split("/", 1)[0]  # base-repo owner: a bot PR is first-party iff its head lives here
 
-ROADMAP = "TauCetiProject/TauCetiRoadmap"
+ROADMAP = os.environ.get("TAUCETI_ROADMAP_REPO", "TauCetiProject/TauCetiRoadmap")
 
-REVIEW = "TauCetiProject/TauCetiReview"
+REVIEW = os.environ.get("TAUCETI_REVIEW_REPO", "TauCetiProject/TauCetiReview")
 
 # The shared cooperative-claim namespace: a repository that holds nothing but `refs/tauceti-claims/*`
 # leases, so operators can coordinate without anyone holding write access to canonical. Push access is
 # granted automatically to the author of any merged TauCeti PR (canonical's `claims-access` workflow);
 # until then a worker claims in its own fork instead. See github.claims_repo.
-CLAIMS = "TauCetiProject/tauceti-claims"
+CLAIMS = os.environ.get("TAUCETI_CLAIMS_REPO", "TauCetiProject/tauceti-claims")
 
 
 # Per-PR budgets (a PR can never churn forever).
@@ -48,7 +51,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "1feea7926eefd7129089bb060a47c28ae915a877")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "2d7bd8b7636560a50acf1b419761186f247009b9")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -118,7 +121,9 @@ MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 
 MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across heads
 
-BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
+BUMP_HEAD_PREFIX = (
+    "bump-mathlib/" if TAUCETI == "TauCetiProject/TauCeti" else "bump-dependencies/"
+)  # branch prefix the review bot opens its mathlib-bump PRs on
 MAX_LINT_REPAIR_ATTEMPTS = 3  # per-head: stop trying to green a red lint-repair head
 MAX_LINT_REPAIR_PR_ATTEMPTS = 6  # per-PR lifetime backstop for lint repair across heads
 # Branch prefix of the repair PR TauCeti's daily full lint (.github/workflows/lint-full.yml) opens
@@ -155,8 +160,9 @@ ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min h
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
+EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without failed-round backoff
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
-EX_ADMISSION_WAIT = 76  # API funding/queue/throughput wait, outside the round timeout
+EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outside the round timeout
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)

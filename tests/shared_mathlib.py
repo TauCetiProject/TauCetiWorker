@@ -12,9 +12,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tauceti_worker import containment
 from tauceti_worker import shared_mathlib as s
 from tauceti_worker.runtime_status import atomic_json
 
@@ -81,18 +83,27 @@ class SharedTests(unittest.TestCase):
         self.library = self.root / "toolchain/lib/lean"
         self.library.mkdir(parents=True)
         (self.library / "Init.olean").write_text("fixture ABI")
-        real_run = subprocess.run
+        real_run, real_contained = subprocess.run, containment.run
 
-        def run(command, *args, **kwargs):
+        def fake_lake(command):
             if command == ["lake", "env", "lean", "--version"]:
                 return subprocess.CompletedProcess(command, 0, "Lean fixture ABI\n", "")
             if command == ["lake", "env", "lean", "--print-prefix"]:
                 return subprocess.CompletedProcess(command, 0, str(self.library.parents[1]) + "\n", "")
-            return real_run(command, *args, **kwargs)
+            return None
 
-        patcher = patch.object(s.subprocess, "run", side_effect=run)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        def run(command, *args, **kwargs):
+            return fake_lake(command) or real_run(command, *args, **kwargs)
+
+        def contained(command, *args, **kwargs):
+            return fake_lake(command) or real_contained(command, *args, **kwargs)
+
+        for patcher in (
+            patch.object(s.subprocess, "run", side_effect=run),
+            patch.object(containment, "run", side_effect=contained),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.downloads = 0
         disk = patch.object(
             s.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100_000_000, 20_000_000, 80_000_000)
@@ -100,7 +111,7 @@ class SharedTests(unittest.TestCase):
         disk.start()
         self.addCleanup(disk.stop)
 
-    def extract(self, command, cwd, env, output, timeout):
+    def extract(self, command, cwd, env, output, timeout, *, prefix=()):
         self.downloads += 1
         self.assertEqual(command, ["lake", "exe", "cache", "get"])
         self.assertNotEqual(cwd, self.cwd)
@@ -121,6 +132,79 @@ class SharedTests(unittest.TestCase):
         (self.mathlib / "Mathlib/Test.lean").write_text("changed")
         with self.assertRaises(s.Unavailable):
             s.signature(self.cwd, self.env)
+
+    def test_signature_binds_external_lake_config_by_content_and_cache_selection(self):
+        config = self.root / "lake.toml"
+        config.write_text("[cache]\n")
+        self.env["LAKE_CONFIG"] = str(config)
+        key, _ = s.signature(self.cwd, self.env)
+        other = self.root / "another-lake.toml"
+        other.write_text(config.read_text())
+        self.env["LAKE_CONFIG"] = str(other)
+        self.assertEqual(key, s.signature(self.cwd, self.env)[0])
+        other.write_text("[cache]\nservice = 'different'\n")
+        self.assertNotEqual(key, s.signature(self.cwd, self.env)[0])
+        key, _ = s.signature(self.cwd, self.env)
+        self.env["MATHLIB_CACHE_GET_URL"] = "https://secret-fixture@cache.invalid"
+        changed, spec = s.signature(self.cwd, self.env)
+        self.assertNotEqual(key, changed)
+        self.assertNotIn("secret-fixture", json.dumps(spec))
+
+    def test_signature_binds_resolved_toolchain_contents(self):
+        key, _ = s.signature(self.cwd, self.env)
+        (self.library / "Init.olean").write_text("different toolchain, same version output")
+        self.assertNotEqual(key, s.signature(self.cwd, self.env)[0])
+
+    def test_changed_dependency_pin_selects_new_snapshot(self):
+        key, _ = s.signature(self.cwd, self.env)
+        (self.mathlib / "Mathlib/Test.lean").write_text("def test := 2\n")
+        git(self.mathlib, "add", ".")
+        git(
+            self.mathlib,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "new pin",
+        )
+        manifest = json.loads((self.cwd / "lake-manifest.json").read_text())
+        manifest["packages"][0]["rev"] = git(self.mathlib, "rev-parse", "HEAD")
+        (self.cwd / "lake-manifest.json").write_text(json.dumps(manifest))
+        self.assertNotEqual(key, s.signature(self.cwd, self.env)[0])
+
+    def test_damaged_ready_snapshot_is_rejected_and_preserved(self):
+        self.require_overlay()
+        for damage in ("remove", "overwrite", "symlink"):
+            with self.subTest(damage=damage):
+                # Simulate operator acceptance before testing the next failure.
+                (self.pool / "policy.json").unlink(missing_ok=True)
+                (self.pool / "safety-stop.json").unlink(missing_ok=True)
+                (self.cwd / "lean-toolchain").write_text(damage)
+                key, _ = s.signature(self.cwd, self.env)
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    pass
+                artifact = self.pool / "entries" / key / "build/lib/lean/Mathlib/Test.ilean"
+                if damage == "overwrite":
+                    os.chmod(artifact, 0o644)
+                    artifact.write_bytes(b"corrupt artifact!")
+                else:
+                    artifact.unlink()
+                    if damage == "symlink":
+                        artifact.symlink_to(self.library / "Init.olean")
+                before = self.downloads
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                    self.assertEqual(prefix, [])
+                self.assertIn("integrity", " ".join(s.summary(self.env)["reasons"]))
+                self.assertEqual(self.downloads, before)
+                self.assertTrue(artifact.parent.exists())
+                self.assertEqual(s.mode(self.env), "off")
+                self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
+                with self.assertRaisesRegex(s.Unavailable, "integrity"):
+                    with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                        self.fail("required sharing started with a corrupt snapshot")
+                self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "auto"
 
     def test_local_clone_preserves_fork_cache_identity_and_disables_push(self):
         url = "https://github.com/TauCetiProject/mathlib4.git"
@@ -161,6 +245,19 @@ class SharedTests(unittest.TestCase):
         git(self.mathlib, "remote", "set-url", "origin", "https://github.com/other/mathlib4.git")
         self.assertNotEqual(changed, s.signature(self.cwd, self.env)[0])
 
+    def test_downstream_pr_branch_and_fork_do_not_split_mathlib_key(self):
+        key, _ = s.signature(self.cwd, self.env)
+        git(self.cwd, "checkout", "-qb", "different-pr")
+        git(self.cwd, "remote", "add", "fork", "https://github.com/fixture/project.git")
+        git(self.cwd, "config", "branch.different-pr.remote", "fork")
+        self.assertEqual(key, s.signature(self.cwd, self.env)[0])
+
+    def test_fetched_dependency_tags_do_not_split_key(self):
+        git(self.mathlib, "checkout", "--detach", "--quiet", self.rev)
+        key, _ = s.signature(self.cwd, self.env)
+        git(self.mathlib, "tag", "later-fetched-tag")
+        self.assertEqual(key, s.signature(self.cwd, self.env)[0])
+
     def test_clone_preserves_detached_nightly_tag_context(self):
         git(self.mathlib, "checkout", "--detach", "--quiet", self.rev)
         git(self.mathlib, "tag", "nightly-testing-fixture")
@@ -187,7 +284,7 @@ class SharedTests(unittest.TestCase):
     def test_failed_or_partial_extraction_never_publishes(self):
         self.pool.mkdir()
         key, spec = s.signature(self.cwd, self.env)
-        for fetch in (lambda *a: 1, lambda *a: 0):
+        for fetch in (lambda *a, **kw: 1, lambda *a, **kw: 0):
             with self.assertRaises(s.Unavailable):
                 s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", fetch)
             self.assertFalse((self.pool / "entries" / key).exists())
@@ -217,8 +314,354 @@ class SharedTests(unittest.TestCase):
             self.assertEqual(sorted(executor.map(lambda _: build(), range(2))), [False, True])
         self.assertEqual(self.downloads, 1)
 
+    def test_simultaneous_first_views_enter_before_either_reader_exits(self):
+        self.require_overlay()
+        second = self.root / "second-checkout"
+        shutil.copytree(self.cwd, second)
+        rendezvous = threading.Barrier(2)
+        release = threading.Event()
+        entered = [threading.Event(), threading.Event()]
+        local = threading.local()
+        real_ready = s.ready_entry
+
+        def ready(entry, key, spec):
+            if not getattr(local, "checked", False):
+                local.checked = True
+                self.assertFalse(entry.exists())
+                rendezvous.wait(timeout=5)
+                return False
+            return real_ready(entry, key, spec)
+
+        def reader(n):
+            env = {**self.env, "TAUCETI_WORKER_ID": f"reader{n}"}
+            with s.view((self.cwd, second)[n], env, self.root / f"logs{n}", self.extract) as prefix:
+                self.assertTrue(prefix)
+                entered[n].set()
+                self.assertTrue(release.wait(timeout=10))
+
+        with patch.object(s, "ready_entry", side_effect=ready), concurrent.futures.ThreadPoolExecutor(2) as executor:
+            futures = [executor.submit(reader, n) for n in range(2)]
+            try:
+                self.assertTrue(entered[0].wait(timeout=5))
+                self.assertTrue(entered[1].wait(timeout=5), "second first-user waited for a live reader to exit")
+            finally:
+                release.set()
+            for future in futures:
+                future.result(timeout=5)
+        self.assertEqual(self.downloads, 1)
+
+    def test_insufficient_disk_fails_private_or_required_without_publication(self):
+        self.require_overlay()
+        with patch.object(s.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100, 95, 5)):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+            self.assertIn("10%", " ".join(s.summary(self.env)["reasons"]))
+            self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
+            with self.assertRaisesRegex(s.Unavailable, "10%"):
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    self.fail("insufficient disk started inference")
+        self.assertEqual(self.downloads, 0)
+        self.assertEqual(list((self.pool / "entries").iterdir()), [])
+
+    def test_symlinked_extraction_directory_never_publishes(self):
+        self.pool.mkdir()
+        key, spec = s.signature(self.cwd, self.env)
+
+        def extract(*args, **kwargs):
+            self.extract(*args, **kwargs)
+            build = args[1] / ".lake/packages/mathlib/.lake/build"
+            (build / "external").symlink_to(self.root, target_is_directory=True)
+            return 0
+
+        with self.assertRaisesRegex(s.Unavailable, "unsupported snapshot file"):
+            s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", extract)
+        self.assertFalse((self.pool / "entries" / key).exists())
+
+    def test_interrupted_gc_hides_entry_before_removing_any_files(self):
+        self.pool.mkdir()
+        key, spec = s.signature(self.cwd, self.env)
+        with s.key_lock(self.pool, key):
+            entry, _ = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", self.extract)
+        old = time.time() - 8 * 86400
+        os.utime(entry, (old, old))
+        with patch.object(s, "remove_tree", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            s.collect(self.pool)
+        self.assertFalse(entry.exists())
+        self.assertEqual(len(list((self.pool / "trash").iterdir())), 1)
+        with s.key_lock(self.pool, key):
+            entry, hit = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", self.extract)
+        self.assertFalse(hit)
+        self.assertTrue(s.ready_entry(entry, key, spec))
+        self.assertEqual(list((self.pool / "trash").iterdir()), [])
+
+    def test_inventory_ignores_remounted_device_number_and_refuses_hardlinks(self):
+        build = self.root / "build"
+        build.mkdir()
+        artifact = build / "artifact"
+        artifact.write_text("artifact")
+        before = s.inventory(build)
+        real_stat = Path.stat
+
+        def remounted(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            return SimpleNamespace(
+                **{name: getattr(info, name) for name in dir(info) if name.startswith("st_") and name != "st_dev"},
+                st_dev=info.st_dev + 99,
+            )
+
+        with patch.object(Path, "stat", remounted), patch.object(Path, "lstat", remounted):
+            self.assertEqual(s.inventory(build), before)
+        os.link(artifact, self.root / "writable-alias")
+        with self.assertRaisesRegex(s.Unavailable, "hardlink alias"):
+            s.inventory(build)
+
+    def test_private_namespace_cannot_write_pool_or_policy(self):
+        self.require_overlay()
+        self.pool.mkdir()
+        artifact = self.pool / "artifact"
+        artifact.write_text("immutable")
+        atomic_json(self.pool / "policy.json", dict(mode="off"))
+        code = "from pathlib import Path; import sys\nfor name in ('artifact','policy.json','new-file'):\n try: (Path(sys.argv[1])/name).write_text('poison')\n except OSError: pass\n else: raise AssertionError('writable pool')"
+        result = containment.run(
+            [sys.executable, "-c", code, str(self.pool)], env=self.env, label="private-fixture", capture_output=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(artifact.read_text(), "immutable")
+
+    def test_publisher_namespace_only_writes_its_fresh_staging_project(self):
+        self.require_overlay()
+        from tauceti_worker import agents
+
+        self.pool.mkdir()
+        key, spec = s.signature(self.cwd, self.env)
+
+        def extract(command, cwd, env, output, timeout, *, prefix):
+            self.extract(command, cwd, env, output, timeout)
+            code = "from pathlib import Path; import sys; p=Path(sys.argv[1]); (p/'staging-write').write_text('ok')\ntry: Path(sys.argv[2]).write_text('poison')\nexcept OSError: pass\nelse: raise AssertionError('writable policy')"
+            return agents._cache_fetch(
+                [sys.executable, "-c", code, str(cwd), str(self.pool / "policy.json")],
+                cwd,
+                env,
+                output,
+                timeout,
+                prefix=prefix,
+            )
+
+        with s.key_lock(self.pool, key):
+            entry, _ = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", extract)
+        self.assertTrue(s.ready_entry(entry, key, spec))
+        self.assertFalse((self.pool / "policy.json").exists())
+
+    def test_missing_corrupt_policy_and_independent_safety_latch(self):
+        self.env.pop("TAUCETI_SHARED_MATHLIB_BUILDS")
+        self.assertEqual(s.mode(self.env), "off")
+        self.pool.mkdir()
+        (self.pool / "policy.json").write_text("{")
+        self.assertEqual(s.mode(self.env), "off")
+        atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
+        self.assertEqual(s.mode(self.env), "auto")
+        s.stop_sharing(self.pool, "fixture integrity failure")
+        atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
+        self.assertEqual(s.mode(self.env), "off")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
+        self.env["TAUCETI_WORKER_ID"] = "not-allowlisted"
+        self.assertEqual(s.mode(self.env), "off")
+
+    def test_reused_upper_whiteout_recovers_without_global_safety_stop(self):
+        self.require_overlay()
+        artifact = self.mathlib / ".lake/build/lib/lean/Mathlib.olean"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(prefix + ["rm", str(artifact)], check=True, pass_fds=s.lease_fds(self.env))
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+            result = subprocess.run(
+                prefix + ["cat", str(artifact)], capture_output=True, pass_fds=s.lease_fds(self.env)
+            )
+            self.assertEqual(result.stdout, b"verified artifact")
+        self.assertFalse((self.pool / "safety-stop.json").exists())
+        self.assertEqual(self.downloads, 1)
+
+    def test_each_round_clears_private_copies_and_submodule_whiteouts(self):
+        self.require_overlay()
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(
+                prefix
+                + [
+                    "sh",
+                    "-c",
+                    'rm "$1/lib/lean/Mathlib/Test.ilean"; echo private > "$1/lib/lean/Mathlib.olean"',
+                    "sh",
+                    str(build),
+                ],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertEqual(s.upper_usage(build)["upper_files"], 0)
+            for name in ("Mathlib.olean", "Mathlib/Test.ilean"):
+                result = subprocess.run(
+                    prefix + ["cat", str(build / "lib/lean" / name)],
+                    capture_output=True,
+                    pass_fds=s.lease_fds(self.env),
+                )
+                self.assertEqual(result.stdout, b"verified artifact")
+        self.assertEqual(self.downloads, 1)
+
+    def test_safety_stop_attempts_both_receipts_independently_and_never_raises(self):
+        self.pool.mkdir()
+        real_atomic = s.atomic_json
+        for failed_names in ({"safety-stop.json"}, {"policy.json"}, {"safety-stop.json", "policy.json"}):
+            for name in ("safety-stop.json", "policy.json"):
+                (self.pool / name).unlink(missing_ok=True)
+
+            def atomic(path, value, failed=failed_names):
+                if path.name in failed:
+                    raise OSError("fixture full disk")
+                real_atomic(path, value)
+
+            with patch.object(s, "atomic_json", side_effect=atomic):
+                self.assertEqual(s.stop_sharing(self.pool, "fixture stop"), len(failed_names) < 2)
+            self.assertEqual((self.pool / "safety-stop.json").exists(), "safety-stop.json" not in failed_names)
+            self.assertEqual((self.pool / "policy.json").exists(), "policy.json" not in failed_names)
+
+    def test_unconfirmed_publisher_does_not_pass_exclusive_lease_to_downloader(self):
+        self.require_overlay()
+
+        def extract(command, cwd, env, output, timeout, *, prefix):
+            self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", env)
+            raise containment.ContainmentUnconfirmed("fixture publisher namespace unconfirmed")
+
+        with self.assertRaisesRegex(containment.ContainmentUnconfirmed, "fixture publisher"):
+            with s.view(self.cwd, self.env, self.root / "logs", extract):
+                self.fail("inference started after unconfirmed publisher")
+        self.assertEqual(s.mode(self.env), "off")
+        self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", self.env)
+        self.assertEqual(s.summary(self.env)["blocked"], 1)
+
+    def test_busy_exclusive_lease_has_bounded_auto_fallback(self):
+        self.require_overlay()
+        key, _ = s.signature(self.cwd, self.env)
+        with s.key_lock(self.pool, key), patch.object(s, "LOCK_WAIT_SECONDS", 0.02):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertIn("lock wait timed out", " ".join(s.summary(self.env)["reasons"]))
+        self.assertEqual(self.downloads, 0)
+
+    def test_failed_boundary_argument_setup_records_not_started(self):
+        self.require_overlay()
+        from tauceti_worker import activity
+
+        with patch.object(activity, "current_round_id", return_value="setup-fixture"):
+            boundary = containment.Boundary("setup-fixture", env=self.env)
+            with patch.object(containment.os, "pipe", side_effect=OSError("fixture EMFILE")):
+                with self.assertRaisesRegex(OSError, "EMFILE"):
+                    boundary.argv(["true"])
+            self.assertTrue(containment.confirmed_empty("setup-fixture"))
+            self.assertFalse(containment.cleanup_unconfirmed("setup-fixture"))
+        containment._boundaries.pop("setup-fixture", None)
+
+    def test_live_weaker_worker_blocks_new_shared_round(self):
+        self.require_overlay()
+        s.report(self.pool, self.env, mode="private")
+        path = next((self.pool / "status").glob("*.json"))
+        row = json.loads(path.read_text())
+        row["containment_mode"] = "process-group"
+        atomic_json(path, row)
+        self.assertEqual(s.mode(self.env), "off")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
+        with self.assertRaisesRegex(s.Unavailable, "weaker containment"):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                self.fail("required mode started without isolation")
+
+    def test_required_missing_mathlib_reports_blocked_before_inference(self):
+        shutil.rmtree(self.mathlib)
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
+        with self.assertRaisesRegex(s.Unavailable, "Mathlib dependency"):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                self.fail("required mode started without Mathlib")
+        self.assertEqual(s.summary(self.env)["blocked"], 1)
+
+    def test_mount_setup_failure_does_not_latch_integrity_stop(self):
+        self.require_overlay()
+        real_run = subprocess.run
+
+        def run(command, *args, **kwargs):
+            if 'test -f "$1/lib/lean/Mathlib.olean" || exit 42' in command:
+                return subprocess.CompletedProcess(command, 1, b"", b"fixture mount failure")
+            return real_run(command, *args, **kwargs)
+
+        with patch.object(s.subprocess, "run", side_effect=run):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertFalse((self.pool / "safety-stop.json").exists())
+
+    def test_verified_lower_missing_in_fresh_mount_latches_stop(self):
+        self.require_overlay()
+        real_run = subprocess.run
+
+        def run(command, *args, **kwargs):
+            if 'test -f "$1/lib/lean/Mathlib.olean" || exit 42' in command:
+                return subprocess.CompletedProcess(command, 42, b"", b"")
+            return real_run(command, *args, **kwargs)
+
+        with patch.object(s.subprocess, "run", side_effect=run):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertEqual(s.mode(self.env), "off")
+
+    def test_lease_failure_latches_stop_without_deleting_lower(self):
+        self.require_overlay()
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            pass
+        real_lock = s.lease_lock
+        failed = False
+
+        def lock(stream, flags, *, timeout=None):
+            nonlocal failed
+            if not failed and Path(stream.name).stem != "policy":
+                failed = True
+                raise s.IntegrityFailure("fixture lease failure")
+            real_lock(stream, flags, timeout=timeout)
+
+        with patch.object(s, "lease_lock", side_effect=lock):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertEqual(s.mode(self.env), "off")
+        self.assertEqual(len(list((self.pool / "entries").iterdir())), 1)
+
+    def test_cleanup_failure_preserves_invocation_result_and_records_failure(self):
+        self.require_overlay()
+        build = self.mathlib / ".lake/build"
+        build.mkdir(parents=True)
+        (build / "old").write_text("private")
+        real_remove = s.remove_tree
+
+        def remove(path):
+            if path.name == "build-before-sharing":
+                raise OSError("fixture cleanup failure")
+            real_remove(path)
+
+        with patch.object(s, "remove_tree", side_effect=remove):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertTrue(prefix)
+                s.record_result(self.env, 0)
+        receipts = [json.loads(line) for line in (self.pool / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(receipts[-2]["exit_code"], 0)
+        self.assertEqual(receipts[-1]["cleanup_error"], "fixture cleanup failure")
+        self.assertFalse(receipts[-1]["cleanup_success"])
+
     def test_auto_fallback_and_required_fail_before_body(self):
-        with patch.object(s, "capability", return_value=(False, "enable user namespaces")):
+        with (
+            patch.object(s, "capability", return_value=(False, "enable user namespaces")),
+            patch.object(
+                containment,
+                "capability",
+                return_value=SimpleNamespace(strong=True, mode=containment.NAMESPACE, reason="fixture"),
+            ),
+        ):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
                 self.assertEqual(prefix, [])
             self.assertIn("enable user namespaces", s.summary(self.env)["reasons"])
@@ -279,6 +722,43 @@ class SharedTests(unittest.TestCase):
                 pass
         self.assertEqual(file.read_bytes(), b"copyup")
         self.assertFalse(old.with_name("build-before-sharing").exists())
+
+    def test_two_workers_write_private_outputs_and_cannot_poison_lower(self):
+        self.require_overlay()
+        second = self.root / "second-checkout"
+        shutil.copytree(self.cwd, second)
+        env = {**self.env, "TAUCETI_WORKER_ID": "second"}
+        with (
+            s.view(self.cwd, self.env, self.root / "logs1", self.extract) as one,
+            s.view(second, env, self.root / "logs2", self.extract) as two,
+        ):
+            key = self.env["TAUCETI_SHARED_MATHLIB_KEY"]
+            self.assertEqual(key, env["TAUCETI_SHARED_MATHLIB_KEY"])
+            lower = self.pool / "entries" / key / "build/lib/lean/Mathlib.olean"
+            for n, (cwd, prefix, worker_env) in enumerate(((self.cwd, one, self.env), (second, two, env))):
+                artifact = cwd / ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean"
+                code = (
+                    "import os,sys; from pathlib import Path; p=Path(sys.argv[1]); lower=Path(sys.argv[2]); "
+                    "assert p.read_bytes()==b'verified artifact'; "
+                    "print(lower.stat().st_dev,lower.stat().st_ino); p.write_text(sys.argv[3]); "
+                    "assert p.read_text()==sys.argv[3]; "
+                    "\\nfor action in (lambda: lower.write_text('poison'), lambda: lower.chmod(0o777)):\\n"
+                    " try: action()\\n except OSError: pass\\n else: raise AssertionError('writable lower')"
+                ).replace("\\n", "\n")
+                result = subprocess.run(
+                    prefix + [sys.executable, "-c", code, str(artifact), str(lower), f"private-{n}"],
+                    capture_output=True,
+                    text=True,
+                    pass_fds=s.lease_fds(worker_env),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), f"{lower.stat().st_dev} {lower.stat().st_ino}")
+            self.assertEqual(lower.read_bytes(), b"verified artifact")
+        self.assertEqual((self.mathlib / ".lake/build/lib/lean/Mathlib.olean").read_text(), "private-0")
+        self.assertEqual(
+            (second / ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean").read_text(), "private-1"
+        )
+        self.assertEqual(self.downloads, 1)
 
     def test_sandbox_retains_lease_after_parent_descriptor_closes(self):
         self.require_overlay()
@@ -377,39 +857,62 @@ class SharedTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
     def test_killed_cache_parent_terminates_detached_downloader_group(self):
-        pidfile = self.root / "downloader.pid"
-        childcode = 'import os,time,sys; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(100)'
-        parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1]],Path.cwd(),dict(os.environ),f,100)'
-        parent = subprocess.Popen(
-            [sys.executable, "-c", parentcode, str(pidfile), str(self.root / "cache.log"), childcode]
-        )
-        pid = None
-        try:
-            deadline = time.monotonic() + 5
-            while not pidfile.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(pidfile.exists())
-            pid = int(pidfile.read_text())
-            parent.kill()
-            parent.wait(timeout=5)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+        # A contained downloader's own pid is namespace-local; identify it by a unique argv token.
+        for policy in ("legacy", "auto"):
+            with self.subTest(policy=policy):
+                if policy == "auto" and not containment.probe()[0]:
+                    continue  # auto falls back to the legacy sweep, which a setsid escapes by design
+                token = f"tauceti-downloader-{os.getpid()}-{policy}"
+                ready = self.root / f"downloader-{policy}.ready"
+                # Only a namespace can catch a downloader that escapes its session.
+                childcode = 'import os,time,sys; sys.argv[3] == "auto" and os.setsid(); open(sys.argv[1],"w").write("up"); time.sleep(100)'
+                parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1],sys.argv[4],sys.argv[5]],Path.cwd(),dict(os.environ),f,100)'
+                parent = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        parentcode,
+                        str(ready),
+                        str(self.root / "cache.log"),
+                        childcode,
+                        token,
+                        policy,
+                    ],
+                    env={**os.environ, "TAUCETI_PROCESS_CONTAINMENT": policy},
+                )
+
+                def tagged(token=token):
+                    found = []
+                    for entry in Path("/proc").iterdir():
+                        if entry.name.isdigit():
+                            try:
+                                args = (entry / "cmdline").read_bytes().split(b"\0")
+                                state = (entry / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                            except OSError:
+                                continue
+                            if token.encode() in args and state != "Z":
+                                found.append(int(entry.name))
+                    return found
+
                 try:
-                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-                except FileNotFoundError:
-                    break
-                if state == "Z":
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail("detached cache downloader survived its killed parent")
-        finally:
-            if parent.poll() is None:
-                parent.kill()
-                parent.wait()
-            if pid:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, 9)
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    self.assertTrue(tagged())
+                    parent.kill()
+                    parent.wait(timeout=5)
+                    deadline = time.monotonic() + 5
+                    while tagged() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertFalse(tagged(), "detached cache downloader survived its killed parent")
+                finally:
+                    if parent.poll() is None:
+                        parent.kill()
+                        parent.wait()
+                    for pid in tagged():
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, 9)
 
     def test_gc_reclaims_killed_builder_staging_and_skips_live_builder(self):
         key = "a" * 64
@@ -467,6 +970,39 @@ class SharedTests(unittest.TestCase):
             self.assertIn("Lake installation unavailable", s.summary(self.env)["reasons"])
             s.preparation_status(self.env)
             self.assertEqual(s.summary(self.env)["shared"], 1)
+        self.assertEqual(s.summary(self.env)["shared"], 0)
+        self.assertEqual(s.summary(self.env)["idle"], 1)
+        receipts = [json.loads(line) for line in (self.pool / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(receipts[-1]["phase"], "cleanup")
+        self.assertEqual(receipts[-1]["key"], s.signature(self.cwd, self.env)[0])
+
+    def test_prepared_summary_does_not_count_a_dead_reader_as_current(self):
+        s.report(self.pool, self.env, mode="shared", key="a" * 64)
+        with s.key_lock(self.pool, "a" * 64, exclusive=False):
+            self.assertEqual(s.summary(self.env)["shared"], 1)
+        self.assertEqual(s.summary(self.env)["shared"], 0)
+        self.assertEqual(s.summary(self.env)["idle"], 1)
+
+    def test_dead_supervisor_does_not_count_as_live_when_another_worker_leases_key(self):
+        key = "b" * 64
+        s.report(self.pool, self.env, mode="shared", key=key)
+        path = next((self.pool / "status").glob("*.json"))
+        row = json.loads(path.read_text())
+        row["supervisor"]["start"] = "dead-process"
+        atomic_json(path, row)
+        with s.key_lock(self.pool, key, exclusive=False):
+            self.assertEqual(s.summary(self.env)["shared"], 0)
+            self.assertEqual(s.summary(self.env)["idle"], 1)
+        s.report(self.pool, self.env, mode="preparing")
+        row = json.loads(path.read_text())
+        row["supervisor"]["start"] = "dead-process"
+        atomic_json(path, row)
+        self.assertEqual(s.summary(self.env)["preparing"], 0)
+
+    def test_summary_rejects_invalid_lock_key(self):
+        s.report(self.pool, self.env, mode="shared", key="../unexpected")
+        self.assertEqual(s.summary(self.env)["blocked"], 1)
+        self.assertFalse((self.pool / "unexpected.lock").exists())
 
     def test_two_real_readers_share_physical_mmap_pages(self):
         self.require_overlay()

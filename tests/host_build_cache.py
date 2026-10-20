@@ -78,6 +78,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     env = {
         "PATH": f"{root}:{os.environ['PATH']}",
         "CACHE_TEST_CALLS": str(calls),
+        "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
         "LAKE_CACHE_DIR": str(root / "private-lake-store"),
         "LAKE_ARTIFACT_CACHE": "1",
         "LAKE_RESTORE_ARTIFACTS": "1",
@@ -203,7 +204,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         return real_run(command, **kwargs)
 
-    def prepare(cfg):
+    def prepare(cfg, **_):
         events.append("prepare")
         return True
 
@@ -250,12 +251,14 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
 
     proc = SimpleNamespace(pid=12345, wait=interrupted_wait)
     with (
+        # A fake process never reports a namespace; this case is about the legacy group signals.
+        patch.dict(os.environ, {"TAUCETI_PROCESS_CONTAINMENT": "legacy"}),
         patch.object(agents.subprocess, "Popen", lambda *a, **kw: proc),
         patch.object(agents.os, "killpg", lambda pid, sig: signals.append((pid, sig))),
         (root / "interrupt.log").open("ab") as output,
     ):
         try:
-            agents._cache_fetch(["lake"], co, env, output, 10)
+            agents._cache_fetch(["lake"], co, {**env, "TAUCETI_PROCESS_CONTAINMENT": "legacy"}, output, 10)
         except SystemExit as e:
             assert e.code == 143
         else:

@@ -25,11 +25,26 @@ def blocked_reason():
     return CURRENT_CONTEXT.blocked_reason if CURRENT_CONTEXT is not None else None
 
 
-def admission_failure(message):
+def blocked_failure():
+    if CURRENT_CONTEXT is not None and CURRENT_CONTEXT.blocked_reason:
+        return admission_failure(CURRENT_CONTEXT.blocked_reason, state=CURRENT_CONTEXT.wait_state)
+    return None
+
+
+def check_result(rc):
+    """Some engines swallow child exits; an entirely refused unit still waited."""
+    from .config import AdmissionUnavailable
+
+    if failure := blocked_failure():
+        if rc != 0 or (isinstance(failure, AdmissionUnavailable) and not CURRENT_CONTEXT.launched):
+            raise failure
+
+
+def admission_failure(message, *, state=None):
     from .config import AdmissionUnavailable, NoProgress
 
     waiting = message.startswith(("waiting", "unresolved", "API throughput", "provider session", "ledger repair"))
-    return AdmissionUnavailable(message) if waiting else NoProgress(message)
+    return AdmissionUnavailable(message, state=state or "waiting-budget") if state or waiting else NoProgress(message)
 
 
 def review_environment():
@@ -87,6 +102,9 @@ def configure_api(args, agent):
     args.anthropic_api_key_file = str(path)
     os.environ["TAUCETI_ANTHROPIC_KEY_FILE"] = str(path)
     os.environ.pop("ANTHROPIC_API_KEY", None)
+    from .usage_supervisor import ensure_supervisor
+
+    ensure_supervisor(directory)
 
 
 def api_mode():
@@ -108,13 +126,20 @@ class ClaudeAPIContext:
         self.stop = threading.Event()
         self.errors = []
         self.invocations = set()
+        self.launch_failures = set()
         self.admission_ids = {}
         self.models = {}
         self.blocked_reason = None
+        self.wait_state = None
         self.previous_path = os.environ.get("PATH", "")
         self.previous_context = os.environ.get("TAUCETI_API_CONTEXT")
         self.previous_cmd = os.environ.get("TAUCETI_CLAUDE_CMD")
         self.parent_context = CURRENT_CONTEXT
+
+    @property
+    def launched(self):
+        # Admissions are conservatively counted until a zero-spend launch failure is confirmed.
+        return bool(self.invocations - self.launch_failures)
 
     def __enter__(self):
         try:
@@ -134,15 +159,18 @@ class ClaudeAPIContext:
         from .fleet_capacity import admission_reason as fleet_admission_reason
 
         if reason := fleet_admission_reason(self.worker):
-            raise BudgetError(reason)
+            raise admission_failure(reason, state="waiting-capacity")
         if self.enabled:
             snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
-            reason = admission_pause(snapshot)
+            reason = admission_pause(snapshot, worker=self.worker, model=self.model)
             if reason:
-                if reason == "waiting for funding" and self.model:
-                    self.budget.wait_for_funding(self.worker, self.model, self.phase)
+                if self.model:
+                    self.budget.wait_for_admission(self.worker, self.model, self.phase, reason)
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
-                raise BudgetError(reason)
+                raise admission_failure(reason, state="waiting-budget")
+        from .usage_supervisor import ensure_supervisor
+
+        ensure_supervisor(self.budget.directory)
         self.directory.mkdir(parents=True, mode=0o700)
         self.bin.mkdir(mode=0o700)
         self.inbox.mkdir(mode=0o700)
@@ -167,7 +195,7 @@ class ClaudeAPIContext:
                 raise BudgetError(str(error)) from None
         shim = self.bin / "claude"
         shutil.copy(Path(__file__).with_name("claude_api_client.py"), shim)
-        for name in ("usage_accounting.py", "prices.json"):
+        for name in ("usage_accounting.py", "usage_lifecycle.py", "prices.json"):
             shutil.copy(Path(__file__).with_name(name), self.bin / name)
         usage = self.budget.directory / "usage" / self.directory.name
         usage.mkdir(mode=0o700, exist_ok=True, parents=True)
@@ -191,6 +219,7 @@ class ClaudeAPIContext:
     def handle(self, request):
         action = request["action"]
         if action == "preflight-failed":
+            self.wait_state = None
             self.blocked_reason = "Claude API authentication unavailable"
             return dict(ok=True)
         if action == "admit":
@@ -198,13 +227,38 @@ class ClaudeAPIContext:
 
             # A context can launch multiple calls or resume a paid session.
             # Once admitted, finish this work unit even if CI takes capacity.
-            if not self.invocations and (reason := fleet_admission_reason(self.worker)):
+            if not self.launched and (reason := fleet_admission_reason(self.worker)):
                 self.blocked_reason = reason
+                self.wait_state = "waiting-capacity"
+                report_runtime(self.wait_state, detail=reason)
                 return dict(allowed=False, reason=reason)
             ticket = request["id"]
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):
                 raise BudgetError("invalid admission request")
+            from .usage_lifecycle import identity
+            from .usage_supervisor import ensure_supervisor, register, registration
+
+            ensure_supervisor(self.budget.directory)
+
+            boundary = request.get("boundary")
+            if boundary is not None and boundary != safe_message(self.outbox / "active-boundary.json").get("boundary"):
+                raise BudgetError("API admission belongs to a different container boundary")
             invocation = self.admission_ids.setdefault(ticket, uuid.uuid4().hex)
+            lifecycle = registration(
+                invocation,
+                ticket,
+                self.directory,
+                request.get("process"),
+                enabled=self.enabled,
+                allow_remote=not self.host,
+                boundary=boundary,
+                supervisor_view=safe_message(self.budget.directory / "usage-supervisor.json")["owner"].get("view"),
+                owner=process_identity(),
+                parent=identity(os.getppid()),
+                deadline=float(os.environ["TAUCETI_ROUND_DEADLINE"])
+                if os.environ.get("TAUCETI_ROUND_DEADLINE")
+                else None,
+            )
             if self.enabled:
                 answer = self.budget.admit(
                     invocation,
@@ -214,13 +268,16 @@ class ClaudeAPIContext:
                     bridge=str(self.directory),
                     resume=request.get("resume"),
                     owner=process_identity(),
+                    lifecycle=lifecycle,
                 )
             else:
                 answer = dict(allowed=True)
             if answer["allowed"]:
+                register(self.budget.directory, lifecycle)
                 self.invocations.add(invocation)
                 self.models[invocation] = request["model"]
                 self.blocked_reason = None
+                self.wait_state = None
                 answer["id"] = invocation
                 report_runtime(
                     "running",
@@ -231,6 +288,7 @@ class ClaudeAPIContext:
                 )
             else:
                 self.blocked_reason = answer["reason"]
+                self.wait_state = "waiting-budget"
                 report_runtime("waiting-budget", detail=answer["reason"], budget=self.budget.snapshot())
             return answer
         if action == "settle":
@@ -247,6 +305,8 @@ class ClaudeAPIContext:
         if receipt["id"] not in self.invocations:
             raise BudgetError("receipt has no admission in this bridge")
         if receipt["outcome"] == "launch-failed":
+            self.launch_failures.add(receipt["id"])
+            self.wait_state = None
             self.blocked_reason = "native Claude launch failed before spending"
         if not self.enabled:
             return

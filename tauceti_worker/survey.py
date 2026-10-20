@@ -605,6 +605,33 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     so a broken `uvx`, a GitHub hiccup or a bad exit here must read as "not due" and let the round fall
     through to review and fix work. A stage that can throw is a stage that can wedge the worker.
     """
+    from .progress_publication import retained
+
+    prepared = retained(cfg)
+    if prepared:
+        from .github_outbox import actor
+
+        try:
+            selected = actor(dict(os.environ))
+        except Exception:
+            selected = None
+        if not selected:
+            return False, "prepared progress waiting for authenticated actor"
+        if prepared["actor"] != selected:
+            return False, "prepared progress belongs to another GitHub actor"
+        if prepared.get("retry_at", 0) > time.time():
+            return False, "prepared progress publication waiting for reconciliation"
+        return True, "prepared progress report ready to resume publication"
+    if (cfg.state / "progress/work/publication.json").exists():
+        return False, "prepared progress receipt needs recovery; files preserved"
+    if (retry_at := counters.read("progress-docs-retry-at")) > time.time():
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(retry_at))
+        return (
+            False,
+            f"waiting-documentation: mechanical preparation will retry after {when}; stage diagnostics retained",
+        )
+    if counters.read("progress-mechanical-retry-at") > time.time():
+        return False, "progress mechanical work is cooling down; prose cadence remains unspent"
     cache = cfg.state / "cache" / "progress-due.json"
     try:
         if cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:
@@ -1223,6 +1250,14 @@ def survey(
     #    other kind this is not about a PR of ours, so it carries a single pr=0 candidate whose reason
     #    is the cadence verdict. Deep only: the check costs an API call, and the shallow survey exists
     #    to be cheap. progress_due never raises.
+    from tauceti_tools.project import active
+
+    project = active()
+    if project:
+        if not project.feature("progress"):
+            enabled.discard("progress")
+        if not any(u.get("overlap") for u in project.raw.get("upstreams", [])):
+            enabled -= {"overlap-scan", "overlap-fix"}
     if deep and "progress" in enabled:
         due, reason = progress_due(cfg, counters)
         c = Candidate(0, "", reason or "progress report")

@@ -52,6 +52,7 @@ from .config import (
     Die,
     GitHubUnavailable,
     NoProgress,
+    ProgressPreparationUnavailable,
     acquire_slot,
     auto_assign_wid,
     is_git_url,
@@ -66,6 +67,7 @@ from .constants import (
     ALLOWED_TASKS,
     CLAIMS,
     EX_ADMISSION_WAIT,
+    EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
     EXPLICIT_TASKS,
@@ -169,6 +171,9 @@ def add_github_account_flag(p: argparse.ArgumentParser) -> None:
 
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--recovery-only", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--recovery-agent", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--recovery-unpinned-profile", action="store_true", help=argparse.SUPPRESS)
     from .config import positive_integer
 
     p.add_argument(
@@ -565,6 +570,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_github_account_flag(p)
     sub = p.add_subparsers(dest="cmd")
+    from .verification import add_parser as add_verification_parser
+
+    add_verification_parser(sub)
     activity = sub.add_parser("activity", help="read prepared local activity; never query GitHub")
     activity.add_argument("action", nargs="?", choices=("show", "refresh", "install-timer"), default="show")
     scope = activity.add_mutually_exclusive_group()
@@ -583,6 +591,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     activity.add_argument("--json", action="store_true")
     activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")
+
+    recovery = sub.add_parser("recovery", help="list saved unfinished source and moved-aside checkouts; local only")
+    recovery.add_argument("--worker-id", dest="worker_id", default=None)
+    recovery.add_argument("--json", action="store_true")
 
     w = sub.add_parser(
         "work",
@@ -798,6 +810,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
     add_github_account_flag(doctor)
+    doctor.add_argument("--extras", action="store_true")
+    doctor.add_argument("--online", action="store_true")
+    doctor.add_argument("--workflow")
+    doctor.add_argument("--field", action="append", default=[])
+    doctor.add_argument("--check")
+    doctor.add_argument("--fix")
+    doctor.add_argument("--apply", action="store_true")
+    doctor.add_argument("--json", action="store_true")
 
     add_workers_parser(sub)
     add_budget_parser(sub)
@@ -850,12 +870,21 @@ def resolve_pace(cmd: str | None, args) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    from tauceti_tools.project import conf_argument
+
+    selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
+    args = parser.parse_args(remaining)
     cmd = args.cmd
+    if cmd == "verify":
+        from .verification import command
+
+        return command(args)
     if cmd == "activity":
         from .activity import command
 
         return command(args)
+    if cmd == "recovery":
+        return cmd_recovery(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size
@@ -1129,6 +1158,38 @@ def cmd_usage(args) -> int:
     return 0 if all(v.get("ok") for v in snap.values()) else 1
 
 
+def cmd_recovery(args) -> int:
+    """Local recovery records: never GitHub, never a reset, never a required step."""
+    from . import work_recovery
+
+    rows = []
+    for worker, record, manifest, status in work_recovery.records():
+        if args.worker_id and worker != args.worker_id:
+            continue
+        rows.append(
+            dict(
+                worker=worker,
+                record=str(record) if record else None,
+                state=status.get("state") or ("corrupt" if record and manifest is None else "unknown"),
+                reason=status.get("reason"),
+                work=(manifest or {}).get("work"),
+                pr=(manifest or {}).get("pr"),
+                local_head=(manifest or {}).get("local_head"),
+            )
+        )
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("No local recovery records.")
+    for row in rows:
+        target = f" #{row['pr']}" if row["pr"] else ""
+        print(f"{row['worker']}: {row['state']} {row['record'] or '(incomplete save)'} {row['work'] or ''}{target}")
+        if row["reason"]:
+            print("  " + work_recovery.describe_reason(row["reason"]))
+    return 0
+
+
 def cmd_status(args) -> int:
     cfg = Config.resolve(getattr(args, "worker_id", None))
     gh = GitHub()
@@ -1314,6 +1375,52 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             time.sleep(int(slp))
             return 0
 
+        # Source recovery precedes provider selection/admission and unrelated work. A
+        # mechanically valid repair can publish even when all model budgets are closed.
+        if not dry and "security-audit" not in only:
+            from .quota import mirror_creds
+            from .repair_recovery import recover
+            from .work_recovery import guard
+
+            try:
+                mirror_creds(cfg)
+                if (cfg.checkout / ".git").exists():
+                    guard(cfg, cfg.checkout)  # Preserve the last round before selecting recovery.
+                recovery_gh = GitHub()
+                recovery_worker = Worker(
+                    cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
+                )
+                recovery_opts = RoundOpts(
+                    only=only,
+                    agent=getattr(args, "recovery_agent", None) or agent,
+                    work_model="auto",
+                    sandbox_host=not getattr(args, "bubble", False),
+                    dry_run=False,
+                    prs=prs,
+                    account=getattr(args, "account", None),
+                    ignore_quota=ignore_quota,
+                    authoring_profile=(
+                        resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
+                        if agent != "auto"
+                        and (author_model or author_effort)
+                        and not getattr(args, "recovery_unpinned_profile", False)
+                        else None
+                    ),
+                )
+                if recover(recovery_worker, recovery_opts):
+                    return 0
+            except Exception as error:
+                log(f"recovery phase deferred; existing source is preserved: {type(error).__name__}: {error}")
+                report_runtime(
+                    recovery_reason=dict(
+                        code="recovery-phase-unavailable",
+                        detail=str(error),
+                        next_action="Repair recovery state storage or its local prerequisites",
+                    )
+                )
+            if getattr(args, "recovery_only", False):
+                return EX_NOPROGRESS
+
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
         # rather than refuse the round on a cached verdict that may be an hour old.
@@ -1391,6 +1498,23 @@ def _have(tool: str) -> bool:
 
 
 def cmd_doctor(args) -> int:
+    if os.environ.get("TAUCETI_CONF"):
+        from tauceti_tools.cli import main as project_doctor
+
+        flags = ["doctor", "--conf", os.environ.get("TAUCETI_CONF_SOURCE", os.environ["TAUCETI_CONF"])]
+        for flag in ("extras", "online", "apply", "json"):
+            if getattr(args, flag, False):
+                flags.append("--" + flag)
+        for flag in ("workflow", "check", "fix"):
+            if getattr(args, flag, None):
+                flags.extend(["--" + flag, getattr(args, flag)])
+        for field in args.field:
+            flags.extend(["--field", field])
+        return project_doctor(flags)
+    return cmd_host_doctor(args)
+
+
+def cmd_host_doctor(args) -> int:
     """Report what the environment can do. The review engine is fetched on demand; a stable Bubble
     install is required only for real ``--bubble`` rounds."""
     cfg = Config.resolve(getattr(args, "worker_id", None))
@@ -1418,8 +1542,10 @@ def cmd_doctor(args) -> int:
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
-    from . import shared_mathlib
+    from . import containment, shared_mathlib
 
+    contained, contained_note = containment.doctor_row()
+    rows.append(("containment", contained, contained_note))
     shared_ok, shared_note = shared_mathlib.capability()
     rows.append(("shared Mathlib", shared_ok, shared_note + "; TAUCETI_SHARED_MATHLIB_BUILDS=auto|off|required"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
@@ -1544,7 +1670,12 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # Work-agent bubble rounds warm both Mathlib's cache and TauCeti's public Lake artifact cache before
     # launching the model. Require Bubble's host-global download proxy rather than exposing the cache's
     # public R2 domain directly to the container.
-    if uses_fork and not opts.dry_run and not bubble_supports_lake_cache_service():
+    if (
+        uses_fork
+        and not opts.dry_run
+        and os.environ.get("TAUCETI_CACHE_SERVICE", "tauceti-public")
+        and not bubble_supports_lake_cache_service()
+    ):
         raise Die(
             "preflight: this bubble is too old for TauCeti's Lake artifact cache — it has no "
             "`--lake-cache-service`. Install or update Bubble from kim-em/bubble, then re-run "
@@ -1610,9 +1741,26 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
+    except ProgressPreparationUnavailable as e:
+        log(str(e))
+        report_runtime(
+            e.state,
+            detail=str(e),
+            next_action_at=e.retry_at,
+            failure_reason=None,
+            failure_code=None,
+            failure_log=None,
+        )
+        return EX_DOCUMENTATION_WAIT
     except AdmissionUnavailable as e:
         log(str(e))
-        report_failure(str(e), code=EX_ADMISSION_WAIT)
+        report_runtime(
+            e.state,
+            detail=str(e),
+            failure_reason=None,
+            failure_code=None,
+            failure_log=None,
+        )
         return EX_ADMISSION_WAIT
     except NoProgress as e:
         event = blocking_event_since(started)
@@ -1631,7 +1779,7 @@ def cli_main() -> int:
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
     can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create"):
+    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "tauceti-verify", "tauceti-local-axioms"):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

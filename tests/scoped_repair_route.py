@@ -251,7 +251,12 @@ def test_paid_launch_rechecks_scope_and_requires_a_real_claim():
             release=Mock(),
         ),
     )
-    with patch.dict(os.environ, {route.ENV: SCOPE}), patch.object(work_units, "run_in_bubble", return_value=0) as agent:
+    with (
+        tempfile.TemporaryDirectory() as directory,
+        patch.dict(os.environ, {route.ENV: SCOPE}),
+        patch.object(work_units, "run_in_bubble", return_value=0) as agent,
+    ):
+        w.cfg = SimpleNamespace(state=Path(directory))
         assert work_units._still_actionable("rebase", w, sv, c)
         # A pause added after selection prevents both claim and paid launch, even
         # though a textual conflict would normally select an owned PR.
@@ -318,7 +323,9 @@ def test_current_at_launch_freezes_after_claim_and_survives_restart():
             c = sv.rebaseable.actionable[0]
             assert c.foreign_repair_base == BASE
             current = "c" * 40
-            w = SimpleNamespace(gh=gh, counters=counters, rs=SimpleNamespace(bust=Mock()))
+            w = SimpleNamespace(
+                cfg=SimpleNamespace(state=Path(directory)), gh=gh, counters=counters, rs=SimpleNamespace(bust=Mock())
+            )
             assert work_units._still_actionable("rebase", w, sv, c)
 
             def claim(*args):
@@ -463,7 +470,8 @@ def test_declined_foreign_claim_lifecycle_before_next_candidate():
                     assert claims.held is None and claims._hb is None and claims._hb_wfd is None
                     assert "TAUCETI_CLAIM_KEY" not in os.environ and "TAUCETI_CLAIM_REPO" not in os.environ
                 assert events == expected
-                children[0].wait.assert_called_once_with(5)
+                # stop_heartbeat's bounded wait; the lease-loss watcher's own wait(None) is separate.
+                children[0].wait.assert_any_call(5)
                 launch.assert_not_called()
                 assert counters.read(c.rebase_budget_key) == 0 and not counters.foreign_repair_launched(13940)
                 if refusal != "claim_replaced_during_prompt":

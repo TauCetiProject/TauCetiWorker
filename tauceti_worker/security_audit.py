@@ -23,6 +23,7 @@ from collections import Counter
 from contextlib import closing
 from pathlib import Path
 
+from . import containment
 from .audit_alerts import notify_block, save
 from .audit_progress import (
     GOAL_REQUEST,
@@ -256,7 +257,11 @@ def commit_input(repo: Path, sha: str) -> dict:
         paths = [
             p.decode("utf-8")
             for p in names
-            if (p == b"TauCeti.lean" or p.startswith(b"TauCeti/")) and p != b"TauCeti/mathlib-shims.json"
+            if (
+                p == (os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti") + ".lean").encode()
+                or p.startswith((os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti") + "/").encode())
+            )
+            and p != (os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti") + "/mathlib-shims.json").encode()
         ]
     except UnicodeDecodeError as exc:
         raise Die(f"security-audit: invalid library filename in {sha}") from exc
@@ -813,8 +818,19 @@ def run_client(
             )
         if provider == "codex" and "resume" in cmd:
             defer_goal_continuation(Path(env["CODEX_SQLITE_HOME"]), cmd[cmd.index("resume") + 1])
+        # The client and every tool it starts share one PID namespace, so a timeout or a torn-down
+        # round cannot leave a detached reader running (or reading) after the attempt is recorded.
         try:
-            result = subprocess.run(cmd, input=prompt, cwd=home, env=env, text=True, capture_output=True, timeout=1800)
+            result = containment.run(
+                cmd,
+                label="security-audit",
+                input=prompt,
+                cwd=home,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=1800,
+            )
         except subprocess.TimeoutExpired as exc:
             (work / "model-transcript.jsonl").write_bytes(
                 (exc.stdout or b"") if isinstance(exc.stdout, bytes) else (exc.stdout or "").encode()
@@ -1267,7 +1283,7 @@ def advance(repo: Path, batch: dict) -> str:
     old = remote_sha(CURSOR)
     if old != batch["from_sha"]:
         raise NoProgress("security-audit: cursor moved concurrently; replan without reusing this verdict")
-    main = remote_sha("main")
+    main = remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     refresh(repo, main)
     target = batch["commits"][-1]["sha"]
     validate_history(repo, old, main, target)
@@ -1301,7 +1317,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     require_admin()
     work = cfg.state / CURSOR
     repo = work / "objects.git"
-    cursor, main = remote_sha(CURSOR), remote_sha("main")
+    cursor, main = remote_sha(CURSOR), remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     refresh(repo, cursor, main)
     work.mkdir(parents=True, exist_ok=True)
     blocked = work / "blocked.json"
@@ -1441,7 +1457,7 @@ def resume_incomplete(
     work = cfg.state / CURSOR
     blocked = work / "blocked.json"
     previous = json.loads(blocked.read_text(encoding="utf-8"))
-    cursor, main = remote_sha(CURSOR), remote_sha("main")
+    cursor, main = remote_sha(CURSOR), remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     if previous.get("from_sha") != cursor:
         raise Die("security-audit: continuation block is not at the current cursor")
     original = Path(previous["attempt"]).resolve()
@@ -1693,7 +1709,7 @@ def attest(state: Path, through: str, reason: str) -> None:
         raise Die("attestation requires a full commit SHA and a nonempty human review reason")
     state.mkdir(parents=True, exist_ok=True)
     repo = state / "objects.git"
-    cursor, main = remote_sha(CURSOR), remote_sha("main")
+    cursor, main = remote_sha(CURSOR), remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     refresh(repo, cursor, main)
     remaining = validate_history(repo, cursor, main, through)
     commits = remaining[: remaining.index(through) + 1]
@@ -1762,7 +1778,7 @@ def setup(state: Path) -> None:
     require_admin()
     state.mkdir(parents=True, exist_ok=True)
     repo = state / "objects.git"
-    main = remote_sha("main")
+    main = remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     refresh(repo, main, BOOTSTRAP)
     validate_history(repo, BOOTSTRAP, main)
     current = {r["name"]: r for r in api(f"repos/{TAUCETI}/rulesets?per_page=100&includes_parents=false")}

@@ -70,7 +70,14 @@ class ObservabilityTests(unittest.TestCase):
                             raise AssertionError(action)
 
                         (root / "config.json").write_text(
-                            json.dumps({"key": "fake", "bridge": str(bridge), "command": ["fake-claude"]})
+                            json.dumps(
+                                {
+                                    "key": "fake",
+                                    "bridge": str(bridge),
+                                    "command": ["fake-claude"],
+                                    "usage_dir": str(root / "usage"),
+                                }
+                            )
                         )
                         native = SimpleNamespace(
                             stdout=io.StringIO(
@@ -107,7 +114,7 @@ class ObservabilityTests(unittest.TestCase):
                             self.assertEqual(client.main(), native_rc)
                         self.assertIn('"result": "done"', output.getvalue())
                         snapshot = budget.snapshot()
-                        if settlement_available:
+                        if settlement_available and native_rc == 0:
                             self.assertEqual(Decimal(snapshot["spent"]), 10)
                         else:
                             # Missing logging cannot silently erase costs or consume grants again.
@@ -194,7 +201,10 @@ class ObservabilityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            (root / "config.json").write_text(json.dumps({"key": "fake", "bridge": raw, "command": ["fake"]}))
+            (root / "inbox").mkdir()
+            (root / "config.json").write_text(
+                json.dumps({"key": "fake", "bridge": raw, "command": ["fake"], "usage_dir": str(root / "usage")})
+            )
             for output_format in ("text", "json", "stream-json"):
                 native = SimpleNamespace(
                     stdout=io.StringIO(json.dumps({"type": "result", "result": "done", "total_cost_usd": 1}) + "\n"),
@@ -206,7 +216,7 @@ class ObservabilityTests(unittest.TestCase):
                     patch.object(client, "api_environment", return_value={}),
                     patch.object(client, "authenticate"),
                     patch.object(client, "atomic"),
-                    patch.object(client, "request", return_value={"allowed": True, "id": "test"}),
+                    patch.object(client, "request", return_value={"allowed": True, "id": "a" * 32}),
                     patch.object(client.subprocess, "Popen", return_value=native),
                     contextlib.redirect_stdout(BrokenOutput()),
                 ):

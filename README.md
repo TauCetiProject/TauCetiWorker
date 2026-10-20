@@ -1,3 +1,18 @@
+Generic project configuration is provided by [TauCetiTools](https://github.com/TauCetiProject/TauCetiTools).
+This repository remains an example worker harness. Pass the same configuration to work and review commands:
+
+```sh
+./tauceti --conf https://raw.githubusercontent.com/YOUR_ORG/YOUR_PROJECT/main/tauceti.toml doctor
+./tauceti --conf ./tauceti.toml work --worker-id example
+```
+
+See the [architecture and manual setup](https://github.com/TauCetiProject/TauCetiTools/blob/main/docs/project-setup.md)
+for repository ownership, Apps, credentials, workflow installation and optional services.
+A configured project has its own checkouts, review store, activity and snapshots under
+`~/.local/state/tauceti/projects/OWNER__REPOSITORY/`. Starting a new worker reloads its canonical
+configuration; a running process tree keeps its saved snapshot. Worker IDs in a shared manager
+must remain unique. Commands without `--conf` retain Tau Ceti's existing behavior.
+
 # Tau Ceti Worker
 
 Cached round counts and authored/open/landed PR reporting are available with
@@ -52,6 +67,7 @@ uv tool install git+https://github.com/TauCetiProject/TauCetiWorker
 tauceti doctor                     # report the tools and credentials this host can use
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
+tauceti verify --json              # synchronous local verification receipts, from a TauCeti checkout
 tauceti usage --json               # prompt-free Kiro/OpenRouter credit telemetry
 tauceti cost-model                 # agent, CI, cache, and marginal/cumulative LOC-cost estimates
 tauceti work --only review         # one round of a specific kind of work, then exit
@@ -62,6 +78,8 @@ tauceti work --loop                # fully automatic: keep picking the most usef
 Ctrl-C stops the current round and exits. From a clone you can run `./tauceti`
 instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
+
+Local checks use [concurrent verification with exact-input receipts](docs/verification.md).
 
 ### Multiple GitHub accounts
 
@@ -677,7 +695,13 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
+- [Unfinished source recovery](docs/work-recovery.md): records saved before
+  checkout preparation resets, and checkouts moved aside while still in use.
 
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
 for initialization, coordination, and the live calibration results.
+
+Run Python host helpers from this checkout with `uv run python PATH_TO_HELPER` so they
+use the pinned shared Tools dependency. Update any local timer commands to use the same
+invocation before upgrading this checkout.

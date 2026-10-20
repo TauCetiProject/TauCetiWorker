@@ -531,10 +531,11 @@ def do_fix(w, sv, c, opts, bubble):
             FORK=fork,
             FORK_OWNER=fork.split("/", 1)[0],
             BIN=wrapper_bin(bubble=bubble),
-            LOCAL_VERIFICATION=local_verification("ordinary"),
+            LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         )
         with environment(
             {
+                "TAUCETI_VERIFY_POLICY": "ordinary",
                 "TAUCETI_WORKER_ID": lease.owner,
                 "CLAIM_REPO": CLAIMS,
                 "TAUCETI_CLAIM_REPO": CLAIMS,
@@ -549,8 +550,10 @@ def do_fix(w, sv, c, opts, bubble):
             if bubble:
                 rc = run_in_bubble(w, TAUCETI, prompt, opts, allow_push=fork, cancel_event=lease.lost)
             else:
-                if not prepare_checkout(w.cfg):
-                    raise Die("overlap-fix: checkout preparation failed")
+                if not prepare_checkout(w.cfg, work="overlap-fix"):
+                    from .work_recovery import LAST_REFUSAL
+
+                    raise Die(f"overlap-fix: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
                 lease.require()
                 rc = run_agent_host(
                     w.cfg.checkout,

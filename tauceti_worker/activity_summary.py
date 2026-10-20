@@ -10,6 +10,28 @@ from decimal import Decimal
 
 WINDOWS = ("3h", "24h", "7d", "total")
 COST_WINDOWS = ("7d", "total")
+RECOVERY_COUNTS = (
+    "records",
+    "retained",
+    "blocked",
+    "preserved",
+    "reset",
+    "superseded",
+    "incomplete",
+    "corrupt",
+) + tuple(
+    "recovery_" + state
+    for state in (
+        "retained",
+        "eligible",
+        "resuming",
+        "verified",
+        "publication_pending",
+        "published",
+        "obsolete",
+        "blocked",
+    )
+)
 
 
 def amount(value, *, rate=False):
@@ -147,13 +169,22 @@ def display(value, default_kinds=()):
             ("spent_usd", "API cost: completed sessions"),
             (
                 "active_accrued_usd" if costs.get("accounting_version", 1) >= 2 else "pending_usd",
-                "API cost: running/interrupted"
+                "API cost: live usage"
+                if costs.get("accounting_version", 1) >= 3
+                else "API cost: running/interrupted"
                 if costs.get("accounting_version", 1) >= 2
                 else "API cost: active estimates",
             ),
             ("estimated_usd", "API cost: estimated total"),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
+        if costs.get("accounting_version", 1) >= 3:
+            for key, label in (
+                ("settled_estimates_usd", "API cost: settled estimates"),
+                ("recovered_estimates_usd", "API cost: recovered estimates"),
+                ("unresolved_stopped_usd", "API cost: unresolved stopped"),
+            ):
+                cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
         for key, label in (
             ("landed_loc_added", "Authored Lean LOC: landed"),
             ("open_loc_added", "Authored Lean LOC: open"),
@@ -219,6 +250,12 @@ def display(value, default_kinds=()):
         print(
             f"Costs: native totals where available; token/interval estimates otherwise; {q.get('incomplete', 0)} conversations have incomplete usage. Reservations excluded."
         )
+    if spending_rows and costs.get("accounting_version", 1) >= 3:
+        q = costs["accounting"]
+        print(
+            f"Accounting: {q.get('live', 0)} live; {q.get('settled_estimates', 0)} settled estimates "
+            f"({q.get('recovered_estimates', 0)} recovered); {q.get('unresolved_stopped', 0)} unresolved stopped."
+        )
     if cost_rows:
         table("Costs / initiated PR output", ("7 days", "All time"), cost_rows)
         if any(windows[w].get("loc_estimated") for w in COST_WINDOWS):
@@ -231,13 +268,43 @@ def display(value, default_kinds=()):
         )
     sharing = s.get("shared_mathlib")
     if sharing and (
-        sharing.get("shared") or sharing.get("private") or sharing.get("preparing") or sharing.get("blocked")
+        sharing.get("shared")
+        or sharing.get("private")
+        or sharing.get("preparing")
+        or sharing.get("blocked")
+        or sharing.get("idle")
     ):
         print()
         print(
-            f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing, {sharing.get('blocked', 0)} blocked; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
+            f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing, {sharing.get('blocked', 0)} blocked, {sharing.get('idle', 0)} idle; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
         )
         for reason in sharing.get("reasons", []):
+            print("  " + reason)
+    recovery = s.get("work_recovery")
+    if recovery and any(recovery.get(key) for key in RECOVERY_COUNTS):
+        print()
+        print(
+            f"Local work recovery: {recovery.get('records', 0)} saved, "
+            f"{recovery.get('retained', 0)} checkouts moved aside, "
+            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt"
+        )
+        if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):
+            print(
+                "Repair recovery: "
+                + ", ".join(
+                    f"{recovery.get('recovery_' + state, 0)} {state.replace('_', '-')}"
+                    for state in (
+                        "eligible",
+                        "resuming",
+                        "verified",
+                        "publication_pending",
+                        "published",
+                        "obsolete",
+                        "blocked",
+                    )
+                )
+            )
+        for reason in recovery.get("reasons", []):
             print("  " + reason)
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
@@ -269,7 +336,7 @@ def combine(values):
     if len(known) != len(values):
         errors.append("Some hosts have no prepared activity")
     accounting_versions = {v.get("costs", {}).get("accounting_version", 1) for v in known}
-    compatible_costs = len(accounting_versions) == 1
+    compatible_costs = len(accounting_versions) == 1 or accounting_versions <= {2, 3}
     if not compatible_costs:
         errors.append("Hosts use different cost accounting versions; refresh their native activity collectors")
     s = dict(
@@ -311,13 +378,36 @@ def combine(values):
                 "open_prs",
             )
         }
-        for key in ("spent_usd", "active_accrued_usd", "pending_usd", "estimated_usd"):
+        for key in (
+            "spent_usd",
+            "active_accrued_usd",
+            "unresolved_stopped_usd",
+            "settled_estimates_usd",
+            "recovered_estimates_usd",
+            "pending_usd",
+            "estimated_usd",
+        ):
             row[key] = (
                 str(sum((Decimal(r[key]) for r in rows), Decimal(0)))
                 if compatible_costs and all(r.get(key) is not None for r in rows) and len(known) == len(values)
                 else None
             )
         row["measured_pr_weight"] = float(sum((measured_pr_weight(r) for r in rows), Decimal(0)))
+        if accounting_versions == {2, 3} and row.get("active_accrued_usd") is not None:
+            row["active_accrued_usd"] = str(
+                sum(
+                    (
+                        Decimal(v["costs"]["windows"][w]["active_accrued_usd"])
+                        + (
+                            Decimal(v["costs"]["windows"][w].get("unresolved_stopped_usd") or "0")
+                            if v["costs"].get("accounting_version") == 3
+                            else Decimal(0)
+                        )
+                        for v in known
+                    ),
+                    Decimal(0),
+                )
+            )
         row.update(loc_estimate(row))
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):
@@ -347,13 +437,21 @@ def combine(values):
         k: sum(v.get("costs", {}).get("quality", {}).get(k, 0) for v in known)
         for k in ("native", "estimated", "incomplete")
     }
+    s["costs"]["accounting"] = {
+        k: sum(v.get("costs", {}).get("accounting", {}).get(k, 0) for v in known)
+        for k in ("live", "settled_estimates", "recovered_estimates", "unresolved_stopped")
+    }
     sharing = [v.get("shared_mathlib", {}) for v in known]
     if any(sharing):
         s["shared_mathlib"] = {
             key: sum(row.get(key, 0) for row in sharing)
-            for key in ("shared", "private", "preparing", "blocked", "cache_hits", "preparation_seconds")
+            for key in ("shared", "private", "preparing", "blocked", "idle", "cache_hits", "preparation_seconds")
         }
         s["shared_mathlib"]["reasons"] = sorted({reason for row in sharing for reason in row.get("reasons", [])})
+    recovery = [v.get("work_recovery", {}) for v in known]
+    if any(recovery):
+        s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
+        s["work_recovery"]["reasons"] = sorted({reason for row in recovery for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):
         s["costs"]["funding"] = {

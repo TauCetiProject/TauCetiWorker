@@ -19,6 +19,7 @@ from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
     EX_ADMISSION_WAIT,
+    EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
     GH_MIN_BUDGET,
@@ -106,6 +107,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
     admission_streak = 0
+    recovery_probe_at = 0.0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -116,14 +118,27 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            from .verification_jobs import reap_continuations, resume_pending
+
+            reap_continuations(cfg)
             if reason := fleet_admission_reason(cfg.wid):
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)
                 continue
-            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
+            # Verification owns an isolated candidate and a separate job lease. Its execution
+            # must not block model selection, and host CI reservations still precede launch.
+            resume_pending(cfg, background=True)
+            from .repair_recovery import due
+
+            recovery_only = (
+                "security-audit" not in only
+                and time.time() >= recovery_probe_at
+                and due(cfg, only=only, prs=prs, sandbox_host=not bubble, agent=agent)
+            )
+            if not recovery_only and api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
-                    reason = admission_pause(snapshot)
+                    reason = admission_pause(snapshot, worker=cfg.wid)
                     blocked = reason is not None
                     if blocked:
                         Budget().refresh_waiter(cfg.wid)
@@ -131,7 +146,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     blocked, reason, snapshot = True, str(error), {}
                 if blocked:
                     wake = snapshot.get("funding_at")
-                    nap = max(1, min(60, (wake - time.time() + 1) if wake else 60))
+                    if reason == "API throughput cooldown":
+                        waiter = next((item for item in snapshot.get("waiting", []) if item["worker"] == cfg.wid), {})
+                        wake = snapshot.get("cooldowns", {}).get(waiter.get("model"))
+                    limit = 60 if reason in ("waiting for funding", "API throughput cooldown") else 5
+                    nap = max(1, min(limit, (wake - time.time() + 1) if wake else limit))
                     report_runtime("waiting-budget", detail=reason, budget=snapshot, next_action_at=time.time() + nap)
                     time.sleep(nap)
                     continue
@@ -148,7 +167,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # while a window of it is reset-but-unopened: the round is authorized to spend ONE small
             # request to open it, but only once it has found work (see work_units.dispatch).
             pending_init = False
-            if unpaced:
+            if recovery_only:
+                model = agent  # The child attempts recovery before any model selection.
+            elif unpaced:
                 model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
                 # --ignore-quota overrides PACING (the soft over-pace throttle), not AVAILABILITY. We
@@ -249,8 +270,20 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # flag omitted here would turn every round of a `--loop --pr` into a free-running one.
             if prs:
                 tail += ["--pr", ",".join(str(n) for n in prs)]
-            if model:
+            tail += ["--recovery-agent", agent]
+            if not (getattr(args, "author_model", None) or getattr(args, "author_effort", None)):
+                tail.append("--recovery-unpinned-profile")
+            if recovery_only:
+                tail += ["--recovery-only", "--agent", agent]
+            elif model:
                 tail += ["--agent", model, "--ignore-quota"]  # loop already paced; child must not re-pace
+            if recovery_only:
+                if getattr(args, "author_model", None):
+                    tail += ["--author-model", args.author_model]
+                if getattr(args, "author_effort", None):
+                    tail += ["--author-effort", args.author_effort]
+                if ignore_quota:
+                    tail.append("--ignore-quota")
             if pending_init:
                 # Authorization travels with the round, not with the pacer: the child asks for it only
                 # after it has surveyed and picked a work unit, so a round that finds nothing to do never
@@ -258,7 +291,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 tail.append("--claude-bootstrap")
             # Audit-capable workers use a fixed Luna/Haiku inspection profile and reject
             # authoring overrides. Their maintenance fallback resolves its normal defaults.
-            if model and "security-audit" not in only:
+            if model and not recovery_only and "security-audit" not in only:
                 profile = resolve_authoring_profile(
                     model,
                     cli_model=getattr(args, "author_model", None),
@@ -296,19 +329,35 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 wait_cached=None,
             )
             rc = run_round_subprocess(tail)
-
-            if rc == EX_ADMISSION_WAIT:
-                if reason := fleet_admission_reason(cfg.wid):
-                    report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
-                    time.sleep(5)
-                    continue
+            if recovery_only:
+                recovery_probe_at = time.time() + 300  # At most one quota-independent probe per five minutes.
+            if rc == EX_DOCUMENTATION_WAIT:
                 streak = 0
-                admission_streak += 1
-                nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))
-                with contextlib.suppress(BudgetError, OSError):
-                    Budget().refresh_waiter(cfg.wid)
+                paused = runtime_snapshot()
                 report_runtime(
-                    "waiting-budget", detail="rechecking local API admission", next_action_at=time.time() + nap
+                    paused.get("state") or "waiting-documentation",
+                    detail=paused.get("detail") or "progress preparation deferred; selecting other work",
+                    next_action_at=paused.get("next_action_at"),
+                )
+                time.sleep(5)
+                continue
+            if rc == EX_ADMISSION_WAIT:
+                paused = runtime_snapshot()
+                reason = fleet_admission_reason(cfg.wid)
+                waiting = paused.get("state") in ("waiting-capacity", "waiting-budget")
+                state = "waiting-capacity" if reason else (paused["state"] if waiting else "waiting-budget")
+                admission_streak = admission_streak + 1 if state == "waiting-budget" else 0
+                nap = min(60, 5 * (1 << min(max(0, admission_streak - 1), 4)))
+                with contextlib.suppress(BudgetError, OSError):
+                    if api_mode():
+                        Budget().refresh_waiter(cfg.wid)
+                report_runtime(
+                    state,
+                    detail=reason or (paused.get("detail") if waiting else None) or "rechecking local API admission",
+                    next_action_at=time.time() + nap,
+                    failure_reason=None,
+                    failure_code=None,
+                    failure_log=None,
                 )
                 time.sleep(nap)
                 continue
@@ -369,6 +418,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         log("loop interrupted — stopping")
         return 130
     finally:
+        from .verification_jobs import stop_continuations
+
+        stop_continuations(cfg)
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
 

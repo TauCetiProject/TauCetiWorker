@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from . import github_transport as tr
+from .github_forks import ForkUnknown, discover
 
 
 def directory(env=None):
@@ -47,6 +48,12 @@ def semantic_key(payload):
         prefix = args[i].split("=@", 1)[0] + "=@" if "=@" in args[i] else ""
         args[i] = prefix + "<retained-asset:" + index + ">"
     repository = _flag(args, "--repo", "-R")
+    upstream = fork_upstream(args)
+    if upstream:
+        # R0 changes argv but not the remote operation. A corrected command
+        # must find the retained legacy intent before it can send anything.
+        repository = upstream.lower()
+        args = ["repo", "fork", repository, "--clone=false"]
     if not repository:
         repository, _ = target(payload)
     cwd = "repository:" + repository if repository else payload.get("cwd")
@@ -54,10 +61,39 @@ def semantic_key(payload):
     return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
 
 
-def intent_paths(env=None):
+def intent_paths(env=None, *, suffix="json"):
     env = os.environ if env is None else env
     legacy = tr.root() / "outbox" / (tr.scope(env) or "unselected") / env.get("TAUCETI_WORKER_ID", "unknown")
-    return set(directory(env).glob("*.json")) | set(legacy.glob("*.json"))
+    return set(directory(env).glob(f"*.{suffix}")) | set(legacy.glob(f"*.{suffix}"))
+
+
+def fork_upstream(args):
+    """Recognize only the noninteractive personal-fork operation we can reconcile."""
+    if args[:2] != ["repo", "fork"] or len(args) < 3:
+        return None
+    if any(a not in ("--clone=false", "--remote=false") for a in args[3:]):
+        return None
+    upstream = args[2].removeprefix("https://github.com/").removesuffix(".git").rstrip("/")
+    return upstream if re.fullmatch(r"[\w.-]+/[\w.-]+", upstream) else None
+
+
+def fork_read(upstream, env):
+    def fetch():
+        from .config import GitHubUnavailable
+
+        def read(args):
+            with tr.read_context(fresh=True, direct=True):
+                result = tr.execute(["gh", *args], env={**env, "TAUCETI_OUTBOX_REPLAY": "1"})
+            if result.returncode:
+                raise ForkUnknown("fork discovery read failed")
+            return result.stdout
+
+        try:
+            return {**discover(read, upstream), "observed_at": time.time()}
+        except (ForkUnknown, OSError, subprocess.SubprocessError, GitHubUnavailable):
+            return None
+
+    return tr.shared_read(["publication-fork-v2", upstream.lower()], fetch, ttl=60, identity=tr.scope(env))
 
 
 def prepare(argv, env, cwd=None, input=None):
@@ -88,6 +124,18 @@ def prepare(argv, env, cwd=None, input=None):
     if args[:2] == ["pr", "close"]:
         context["expected_head"] = env.get("TAUCETI_PUSH_EXPECT")
         context["actor"] = env.get("TAUCETI_GITHUB_ACCOUNT") or actor(env)
+    upstream = fork_upstream(args)
+    if upstream:
+        evidence = fork_read(upstream, env)
+        if evidence is None or (
+            env.get("TAUCETI_GITHUB_ACCOUNT") and evidence["actor"] != env["TAUCETI_GITHUB_ACCOUNT"].lower()
+        ):
+            from .config import GitHubUnavailable
+
+            raise GitHubUnavailable("Cannot verify fork publication identity", retry_at=time.time() + 60)
+        context.update(
+            operation="fork", actor=evidence["actor"], upstream=upstream, upstream_id=evidence["upstream_id"]
+        )
     input_file = _flag(args, "--input")
     payload_input = (
         input
@@ -221,6 +269,10 @@ def finish(path, result, records=None, *, before_request=False):
 
 def _finish_locked(path, value, result, records=None, *, before_request=False):
     """Classify an initial attempt or replay while its intent lock is held."""
+    if result.returncode == 0 and value["argv"][:2] == ["repo", "fork"]:
+        value.update(status="ambiguous", updated=time.time(), retry_at=time.time() + 60)
+        tr.atomic(path, value)
+        return
     if result.returncode == 0:
         path.unlink(missing_ok=True)
         _report_mutation(value, result)
@@ -247,6 +299,7 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
         isinstance(e, dict) and (e.get("type") or e.get("extensions", {}).get("code")) in terminal_types for e in errors
     )
     if terminal and not quota:
+        result.github_permanent_failure = True
         archive(
             path,
             value,
@@ -254,20 +307,35 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
             error_types=[e.get("type") or e.get("extensions", {}).get("code") for e in errors],
         )
         return
-    if records and all(400 <= r.get("status", 0) < 500 for r in records) and not quota:
-        archive(path, value, "GitHub rejected the publication", http_statuses=[r["status"] for r in records])
-        return
     writes = [
         r for r in records if r.get("method") not in ("GET", "HEAD", "OPTIONS") and r.get("graphql_operation") != "read"
     ]
+    rejected_records = writes or records
+    auth_rejected = bool(rejected_records) and all(r.get("status") == 401 for r in rejected_records)
+    if (
+        rejected_records
+        and all(400 <= r.get("status", 0) < 500 for r in rejected_records)
+        and not quota
+        and not auth_rejected
+    ):
+        result.github_permanent_failure = True
+        archive(path, value, "GitHub rejected the publication", http_statuses=[r["status"] for r in records])
+        return
     logical_quota_rejection = rejected_logically and all(
         isinstance(e, dict) and (e.get("type") or e.get("extensions", {}).get("code")) in ("RATE_LIMIT", "RATE_LIMITED")
         for e in errors
     )
     definitive = (
-        before_request or logical_quota_rejection or (writes and all(r.get("status") in (403, 429) for r in writes))
+        before_request
+        or auth_rejected
+        or logical_quota_rejection
+        or (writes and all(r.get("status") in (403, 429) for r in writes))
     )
+    if definitive and value["argv"][:2] == ["repo", "fork"] and value.get("fork_retries", 0):
+        value["fork_retries"] -= 1  # Rejection before effects does not spend the ambiguous replay.
     value["status"] = "rejected" if definitive else "ambiguous"
+    if auth_rejected:
+        value["retry_at"] = time.time() + 300
     value["updated"] = time.time()
     tr.atomic(path, value)
     tr.event({"kind": "publication_deferred", "status": value["status"], "intent": path.stem})
@@ -337,16 +405,41 @@ def reconcile(value, env):
     args = value["argv"]
     replay = {**env, "TAUCETI_OUTBOX_REPLAY": "1"}
     repo, number = target(value)
+    if args[:2] == ["repo", "fork"]:
+        upstream = fork_upstream(args)
+        if not upstream:
+            return None
+        evidence = fork_read(upstream, env)
+        context = value.setdefault("context", {})
+        # Legacy entries live in this credential/account's outbox. Require a
+        # pinned matching account to migrate them; never infer another author.
+        who = context.get("actor") or env.get("TAUCETI_GITHUB_ACCOUNT")
+        if not evidence or not who or evidence["actor"] != who.lower():
+            return None
+        if context.get("upstream_id") not in (None, evidence["upstream_id"]):
+            return None
+        if context.get("upstream", upstream).lower() != upstream.lower():
+            return None
+        context.update(
+            operation="fork", actor=evidence["actor"], upstream=upstream, upstream_id=evidence["upstream_id"]
+        )
+        if evidence["fork"]:
+            context["fork"] = evidence["fork"]
+            return True
+        if not evidence["absent"]:
+            return None
+        # Two complete public-visibility observations, separated by a grace
+        # period, authorize at most one replay. Persist the bound across crashes.
+        now = time.time()
+        observed = evidence["observed_at"]
+        first = value.setdefault("fork_absent_since", observed)
+        if observed - first < 300 or now - value.get("updated", value.get("created", now)) < 300:
+            return None
+        return False if value.get("fork_retries", 0) < 1 else None
     if args[:2] == ["pr", "close"]:
         context = value.get("context", {})
         expected, who = context.get("expected_head"), context.get("actor")
-        if (
-            not repo
-            or not number
-            or not isinstance(expected, str)
-            or not re.fullmatch(r"[a-f0-9]{40}", expected)
-            or not who
-        ):
+        if not repo or not number:
             return None
         with tr.read_context(fresh=True, direct=True):
             result = tr.execute(["gh", "api", f"repos/{repo}/pulls/{number}"], env=replay)
@@ -356,6 +449,8 @@ def reconcile(value, env):
             live = json.loads(result.stdout)
             if live.get("state") == "closed":
                 return True
+            if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{40}", expected) or not who:
+                return None  # A compound close/comment may have applied only its comment.
             holds = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
             if (
                 live.get("head", {}).get("sha") != expected
@@ -394,10 +489,10 @@ def reconcile(value, env):
         context = value.get("context", {})
         repository_target = context.get("repository")
         head = context.get("head")
-        if not repository_target or not head or ":" not in head:
+        if not repository_target or not head:
             return None
         owner, name = repository_target.split("/", 1)
-        who, branch = head.split(":", 1)
+        who, branch = head.split(":", 1) if ":" in head else (owner, head)
         q = "query($owner:String!,$name:String!,$head:String!){repository(owner:$owner,name:$name){pullRequests(headRefName:$head,first:100,states:[OPEN,CLOSED,MERGED]){nodes{url createdAt headRepositoryOwner{login}} pageInfo{hasNextPage}}}}"
         result = tr.execute(
             [
@@ -533,7 +628,8 @@ def drain(env=None):
 
     def creation_order(path):
         try:
-            return json.loads(path.read_text()).get("created", 0), str(path)
+            created = json.loads(path.read_text()).get("created", 0)
+            return created if isinstance(created, (int, float)) else 0, str(path)
         except (OSError, ValueError, AttributeError):
             return 0, str(path)
 
@@ -547,6 +643,16 @@ def drain(env=None):
             except (OSError, ValueError):
                 remaining.append(path.stem)
                 continue
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("argv"), list)
+                or not value["argv"]
+                or not all(isinstance(a, str) for a in value["argv"])
+                or not isinstance(value.get("context", {}), dict)
+                or not isinstance(value.get("retry_at", 0), (int, float))
+            ):
+                remaining.append(path.stem)
+                continue  # Preserve malformed legacy evidence without blocking other repairs.
             destination = target(value)
             if value.get("retry_at", 0) > time.time():
                 remaining.append(path.stem)
@@ -562,9 +668,12 @@ def drain(env=None):
                 continue
             allowed = value.get("status") in ("rejected", "prepared")
             optional_resolution = bool(resolution(value["argv"]))
-            if not allowed or optional_resolution:
+            fork_operation = value["argv"][:2] == ["repo", "fork"]
+            if not allowed or optional_resolution or fork_operation:
                 applied = reconcile(value, env)
                 if applied is True:
+                    if fork_operation:
+                        tr.atomic(path.with_suffix(".complete"), {**value, "status": "complete"})
                     path.unlink()
                     continue
                 if applied == "obsolete":
@@ -579,7 +688,7 @@ def drain(env=None):
                 # review was posted. Preserve it for later reconciliation,
                 # while allowing this worker to select unrelated useful work.
                 if not optional_resolution:
-                    value["retry_at"] = time.time() + 60
+                    value["retry_at"] = time.time() + (3600 if fork_operation and value.get("fork_retries", 0) else 60)
                     tr.atomic(path, value)
                     remaining.append(path.stem)
                     blocked_targets.add(destination)
@@ -587,6 +696,13 @@ def drain(env=None):
                     tr.event({"kind": "publication_optional_pending", "intent": path.stem})
                 continue
             args = list(value["argv"])
+            if fork_operation:
+                # R0's valid CLI form. Preserve original argv in the intent.
+                args = ["repo", "fork", fork_upstream(args), "--clone=false"]
+                value["fork_retries"] = value.get("fork_retries", 0) + 1
+            if not isinstance(value.get("cwd"), str):
+                remaining.append(path.stem)
+                continue
             if not Path(value["cwd"]).is_dir():
                 archive(path, value, "Publication checkout no longer exists; retained for manual recovery")
                 continue

@@ -393,7 +393,11 @@ worker3 — backing off
 
     # A malformed generation is rejected wholesale; the last good fleet remains alive.
     worker1_pid = wm.runner_status("worker1").get("wrapper_pid")
-    config.write_text("version = 1\n[[workers]]\nid = 42\n")
+    # Replace the file atomically, as real writers do: a truncate-then-write lets a manager poll
+    # read the valid prefix "version = 1", an empty fleet, and stop every worker.
+    malformed = config.with_name(config.name + ".tmp")
+    malformed.write_text("version = 1\n[[workers]]\nid = 42\n")
+    os.replace(malformed, config)
     time.sleep(0.3)
     assert wm.runner_status("worker1").get("wrapper_pid") == worker1_pid
     response = wm.manager_request("ping")

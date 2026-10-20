@@ -5,7 +5,7 @@
 # This runner knows how each one wants to be invoked, and which one to skip in a plain CI box:
 #   - most are stdlib-only         -> `uv run python <file>`
 #   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
-#   - dashboard has a PEP 723 header (rich/textual)      -> `uv run --script`
+#   - dashboard uses the project's rich/textual/Tools dependencies -> `uv run python`
 #   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
 #   - egress needs the bubble sandbox/proxy              -> skipped here
 # The Python version is taken from $UV_PYTHON when set (uv honours it), so CI can matrix over versions.
@@ -17,12 +17,22 @@ cd "$(dirname "$0")/.." || exit 1
 FAIL_FAST=0
 [ "${1:-}" = "--fail-fast" ] && FAIL_FAST=1
 
+# No test may write receipts or containment markers into the operator's real activity store: a
+# stray "unconfirmed" marker there pauses that host's automatic recovery until someone removes it.
+TAUCETI_ACTIVITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-activity-XXXXXX")"
+TAUCETI_FLEET_EVENTS="$TAUCETI_ACTIVITY_DIR/worker-events.jsonl"
+TAUCETI_SHARED_MATHLIB_ROOT="$TAUCETI_ACTIVITY_DIR/mathlib-builds"
+export TAUCETI_ACTIVITY_DIR TAUCETI_FLEET_EVENTS TAUCETI_SHARED_MATHLIB_ROOT
+trap 'rm -rf "$TAUCETI_ACTIVITY_DIR"' EXIT
+
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
   activity.py
   activity_costs.py
   api_budget.py
+  budget_recovery.py
   usage_accounting.py
+  usage_supervisor.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
@@ -51,9 +61,11 @@ RUN_STDLIB=(
   github_ratelimit.py
   github_shared_transport.py
   github_state.py
+  github_state_retention.py
   github_state_rollout.py
   github_state_reconciliation.py
   github_outbox.py
+  github_forks.py
   global_maintenance.py
   shared_state_outage.py
   github_pause.py
@@ -66,6 +78,9 @@ RUN_STDLIB=(
   isolate_home_paths.py
   kiro.py
   local_verification_scope.py
+  local_axioms.py
+  verification.py
+  verification_audit.py
   ledger_blocking.py
   loop_sigterm.py
   lost_build.py
@@ -80,6 +95,8 @@ RUN_STDLIB=(
   preflight_review_lake.py
   prices.py
   progress_tool_failure_log.py
+  progress_generation_retry.py
+  progress_publication.py
   prompt_wrapper_paths.py
   provider_usage.py
   quota_auto_refresh.py
@@ -104,6 +121,7 @@ RUN_STDLIB=(
   roadmap_claims.py
   round_file_changes.py
   round_group_sweep.py
+  process_containment.py
   resources.py
   rubric_bundle.py
   safe_exists.py
@@ -118,6 +136,8 @@ RUN_STDLIB=(
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
+  work_recovery.py
+  repair_recovery.py
 )
 # special-cased python tests (handled explicitly below)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
@@ -170,7 +190,7 @@ for t in "${RUN_STDLIB[@]}"; do
 done
 
 run parity_selectors.py uv run python tests/parity_selectors.py tests/fixtures/pr_selectors.json
-run dashboard.py uv run --script tests/dashboard.py
+run dashboard.py uv run python tests/dashboard.py
 
 # lifecycle.sh resolves its own python; hand it the uv-selected interpreter so the matrix
 # actually covers it (otherwise it would always use the runner's default python3).

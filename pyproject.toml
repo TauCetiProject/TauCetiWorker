@@ -7,7 +7,7 @@ name = "tauceti"
 version = "0.1.0"
 description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
-dependencies = ["rich>=13", "textual>=8,<9"]
+dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@c2be6e124c8e6b5adcdb1fa8493eaee4d1b9552f", "rich>=13", "textual>=8,<9"]
 
 [project.scripts]
 tauceti = "tauceti_worker.cli:cli_main"
@@ -16,6 +16,9 @@ tauceti = "tauceti_worker.cli:cli_main"
 # root for the `./tauceti` shim (HERE resolves to the repo root in a checkout); the wheel bundles
 # them INTO the package (tauceti_worker/{prompts,scripts}) so the same `HERE / "prompts"` lookup
 # works once installed (HERE then resolves to the package dir — see tauceti_worker/paths.py).
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["tauceti_worker"]
 
@@ -27,7 +30,7 @@ packages = ["tauceti_worker"]
 target-version = "py311"
 line-length = 120
 # `tauceti` is the program but has no .py extension, so ruff won't pick it up by default.
-extend-include = ["tauceti"]
+extend-include = ["tauceti", "scripts/tauceti-local-axioms"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

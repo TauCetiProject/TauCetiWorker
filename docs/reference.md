@@ -362,6 +362,12 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `TAUCETI_VERIFY_CHECKPOINT_MARGIN` | `600` | Seconds reserved before the round deadline for checkpointing; verification returns incomplete at this boundary. |
+| `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS` | unset | JSON mapping of absolute resolved installation paths to publisher provenance tokens. Only validated read-only installations use compact cached identities; writable inputs retain full validation. See [verification](verification.md). |
+| `TAUCETI_VERIFY_CONTINUATION` | `1` | Set `0` to pause new mechanical verification continuations, preserving pending jobs and active helpers. |
+| `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
+| `TAUCETI_VERIFY_CACHE_DIR` | actual host identity under `/tmp` | Shared immutable-installation identity cache; no verification admission limit. Bubble mounts it automatically. |
+| `TAUCETI_PROCESS_CONTAINMENT` | `auto` | Process containment for host agents and tools; see [process-containment.md](process-containment.md). `auto` uses rootless bwrap PID namespaces where they work and otherwise reports best-effort process-group cleanup; `required` refuses to launch without them; `legacy` is the explicit rollback. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, shared by every worker: an install takes a lock and lands by rename. |
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
@@ -393,7 +399,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
-| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |
+| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
 | `TAUCETI_OVERLAP_BATCH_COMMITS` | `160` | First-parent Mathlib commits examined per overlap-scan conversation; `--overlap-batch-commits` overrides it. Calibrated with Codex `gpt-6.1-sol` at high effort. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
@@ -433,3 +439,29 @@ cumulative receipt before resuming; cost-only reconciliation does not restore
 its cumulative accounting baseline.
 See [the complete budget design](api-budget-plan.md) for state paths, recovery,
 and estimated-cost semantics.
+
+### Progress documentation deployment waits
+
+Before launching a progress writer, the worker runs `plan` and `facts` together up to three times.
+Each attempt uses a fresh isolated documentation cache. A typed generation-change result (tool exit
+76), or an older facts diagnostic naming two different builds, retries only these mechanical stages.
+Persistent churn reports `waiting-documentation` (worker exit 79) and defers progress for 60 seconds,
+then 5, 15 and at most 30 minutes on repeated churn, without
+advancing the report attempt timestamp, spending PR repair allowances, or escalating failure backoff.
+The scheduler can select other work during this cooldown. Other plan/facts/prompt errors remain specific
+failures with a separate mechanical retry delay preserving the existing eight-hour error spacing.
+A not-due recheck suppresses planning for the ordinary due-cache TTL; a parked window uses the
+existing eight-hour attempt spacing. The published cursor changes only through normal
+report publication, so the next ordinary replan covers the same unadvanced history.
+
+Every completed plan, facts, prompt and apply command keeps labelled stdout/stderr in private
+`progress-<stage>-*.log` files beside the round logs. Mechanical attempt plans/facts live under
+`state/progress/mechanical/attempt-*`; a failed attempt does not overwrite coherent artifacts or prose.
+Recent mechanical traces are bounded to 20 directories; archives containing prepared inputs or prose are retained.
+When a new coherent plan/facts identity changes, previous inputs and prose are archived there before
+prose is invalidated. Each writer uses fresh output paths under `state/progress/writing/`; existing prose
+cannot satisfy a new writer launch. Mechanical tool timeouts fit the remaining round deadline. Deadline exhaustion reports
+`waiting-progress-preparation` without increasing the churn or error counters, and no paid writer
+starts with less than five minutes remaining. A durable writing marker prevents older fork intents
+from adopting retained bodies from an unsuccessful fresh writer attempt. Prepared publication receipts resume apply with their existing prose and version.
+Rolling back the tool pin preserves these artifacts and the published cursor.

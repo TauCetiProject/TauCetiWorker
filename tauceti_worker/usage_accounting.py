@@ -63,11 +63,11 @@ def price_usage(model, usage, at, prices=None):
     ) / 1_000_000
 
 
-def _read(path, limit):
+def _read(path, limit, *, allow_foreign=False):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > limit:
+        if not stat.S_ISREG(info.st_mode) or (info.st_uid != os.getuid() and not allow_foreign) or info.st_size > limit:
             raise ValueError("unsafe or oversized usage evidence")
         return stream.read(limit + 1)
 
@@ -116,17 +116,20 @@ def usage_path(directory, identity, bridge=None):
 
 def session_usage(directory, session):
     path = usage_path(directory, session["id"], session.get("bridge"))
-    return read_usage(path) or (
-        read_usage(Path(directory) / "usage" / (session["id"] + ".json")) if path.parent.name != "usage" else None
+    external = bool(session.get("external") or session.get("lifecycle", {}).get("external"))
+    return read_usage(path, allow_foreign=external) or (
+        read_usage(Path(directory) / "usage" / (session["id"] + ".json"), allow_foreign=external)
+        if path.parent.name != "usage"
+        else None
     )
 
 
-def _latest_sequence(path):
+def _latest_sequence(path, *, allow_foreign=False):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            if not stat.S_ISREG(info.st_mode) or (info.st_uid != os.getuid() and not allow_foreign):
                 return 0
             offset = max(0, info.st_size - 65536)
             stream.seek(offset)
@@ -148,19 +151,22 @@ def _latest_sequence(path):
     return 0
 
 
-def read_usage(path):
-    """Reject links, foreign files and malformed data. Absence is never zero spend."""
+def read_usage(path, *, allow_foreign=False):
+    """Reject links and malformed data; only explicit remote bridges allow shifted file owners.
+
+    Absence is never zero spend.
+    """
     path = Path(path)
     checkpoint = None
     try:
-        checkpoint = _validate(json.loads(_read(path, MAX_CHECKPOINT)), path.stem)
-        if checkpoint.get("sequence", 0) >= _latest_sequence(path.with_suffix(".jsonl")):
+        checkpoint = _validate(json.loads(_read(path, MAX_CHECKPOINT, allow_foreign=allow_foreign)), path.stem)
+        if checkpoint.get("sequence", 0) >= _latest_sequence(path.with_suffix(".jsonl"), allow_foreign=allow_foreign):
             return checkpoint
     except (OSError, ValueError, TypeError, AttributeError, ArithmeticError):
         pass
     try:
         state = None
-        for raw in _read(path.with_suffix(".jsonl"), 128 * 1024**2).splitlines():
+        for raw in _read(path.with_suffix(".jsonl"), 128 * 1024**2, allow_foreign=allow_foreign).splitlines():
             try:
                 record = json.loads(raw)
                 if state is None:

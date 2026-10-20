@@ -28,7 +28,7 @@
 #      CLAIM_GITDIR (explicit scratch object store override).
 set -uo pipefail
 
-REPO="${CLAIM_REPO:-TauCetiProject/TauCeti}"
+REPO="${CLAIM_REPO:-${TAUCETI_REPO:-TauCetiProject/TauCeti}}"
 URL="https://github.com/$REPO"
 WID="${TAUCETI_WORKER_ID:-$(hostname)-$$}"
 DEFAULT_TTL="${CLAIM_TTL:-1500}"

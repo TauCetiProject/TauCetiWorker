@@ -329,6 +329,8 @@ def _resolve_claims_repo() -> str:
 def shared_claims_granted() -> bool:
     """Can this account push to the shared claim namespace? Accepts a pending invitation first, so an
     operator whose grant landed between rounds does not have to do anything by hand."""
+    if not CLAIMS:
+        return False
     if can_push(CLAIMS) is True:
         return True
     return accept_claims_invitation() and can_push(CLAIMS) is True

@@ -323,24 +323,151 @@ stdout event or final Claude result. Atomic checkpoints and the preceding valid
 journal prefix survive process termination and torn writes. Bubble mounts only its own round
 usage directory separately from the bridge and never receives the ledger.
 
+New invocations also record their exact admission ticket, invocation ID, bridge,
+shim and native process birth identities in `budget/lifecycles/`. The admission
+ledger event includes the initial lifecycle identity, so a bridge crash before
+writing its sidecar is recoverable. A detached host supervisor owns the sidecars
+and recovery, outside both the round process group and the agent containment
+boundary. It starts at API worker/context startup and is checked again at loop
+round boundaries. Restarting it replays the local evidence automatically; it does
+not poll providers or GitHub. Recovery progress is persisted, and a separate
+heartbeat remains responsive during ledger recovery. Admission checks restart a
+lost supervisor; source updates retire it at an invocation boundary. Only registered
+new invocations participate in this automatic recovery; historical cleanup remains
+separate. Reconciled native receipts are archived under `lifecycles/done/`;
+unchanged provisional journals are checked by file stamp without reparsing them.
+
+Every native launch, including an explicit resume or copied Bubble shim, must
+create a durable usage journal. A native exec gate waits until the supervisor has
+verified the journal and recorded the native process identity, then receives a
+durable permit containing a second copy of that native identity. A lost sidecar
+can recover the permitted identity without reclassifying real inference as zero
+spend. Missing or malformed accounting configuration fails before
+inference. Linux identities include the boot ID, start ticks, PID namespace and
+the observer's PID namespace;
+namespace-local PIDs are translated while the gate is alive. macOS identities use
+the boot session and process birth time in microseconds. On other platforms an
+unknown identity cannot authorize automatic stopped-process reconciliation.
+For Bubble across a VM or a host-uninspectable container, the bridge explicitly
+records the remote boot/start/namespace identity without interpreting its PID on
+the host. An exact gate-linked native exit receipt proves termination there;
+bridge death without that receipt records `remote-liveness-unconfirmed` and
+reserves observed usage plus an uncertain tail without charging a live invocation.
+A successful host Bubble cleanup records the exact non-reusable boundary token
+in its read-only outbox; cleanup for a prior boundary cannot stop a newer
+invocation. This local proof permits prefix recovery, retaining an uncertain
+tail until an authoritative receipt arrives. Receipts and journals remain
+available for later local reconciliation.
+
+Lifecycle evidence distinguishes observed native success, nonzero exit, signal,
+exec failure, bridge death and parent death; the outer loop records round timeout
+and signal outcomes separately. An unobserved death is recorded as stopped, not
+assigned a guessed exit status. A stopped process or `inflight=false` never closes
+a journal. Normal journal closure requires a successfully drained native exit, a
+successful result event and healthy journal writes. Without that proof recovery retains the
+priced prefix and an explicitly uncertain tail reserve. An admission with no
+launch evidence, or a gate-linked no-exec receipt, proves no inference and permits
+exact zero settlement.
+Late authoritative receipts remain readable and replace estimates with existing
+ledger corrections.
+
+For rollout, write `record-only` to `budget/usage-recovery-mode` before deployment.
+The supervisor records launches and exits while normal bridge receipts continue
+to settle. Observe naturally selected rounds, then change the file to `auto` to
+enable stopped-invocation recovery (the default when the file is absent). Workers
+from another installation can share a supervisor with the same protocol. To hand
+ownership to a new installation, call `ensure_supervisor(budget_dir(), refresh=True)`
+from that installation's `tauceti_worker.usage_supervisor` and `tauceti_worker.budget`
+modules; this retires the exact supervisor through a local marker and preserves
+paid processes. Changes
+are read on each pass and do not restart paid sessions. Rollback can restore
+`record-only`; it must retain lifecycle evidence, permits, receipts,
+journals and reservations; it must not undo committed corrections.
+
 Response counters merge by ID, including partial/repeated events. Replayed
 responses on resumed invocations are not charged twice. Decimal token pricing
 honours cache-write TTLs. Unknown models, missing counters, unpriced server-tool/priority-tier usage and
 requests still in flight remain incomplete rather than becoming zero-cost completed work.
 
-`tauceti budget --recover --dry-run --json` previews stopped-owner recovery without
-changing the ledger or deleting bridge keys. Apply with `--recover --note '…'`.
-Recovery tries native receipts first, then directly linked usage journals. Legacy
-transcripts are considered only when a saved receipt names the exact provider
-session and exactly one file belongs to that worker; time-overlap guesses are
-never used. A recovered transcript keeps an incomplete-request reservation. Complete
-saved usage can settle as a marked, correctable token-price estimate. Incomplete
-usage charges the known estimate once and retains a separate conservative
-reservation for uncertainty. Reservations never enter spend reports. Late native
-receipts correct estimates; resumed cumulative totals preserve previously recorded
-baselines and cannot debit the same response twice. Live owners remain protected.
+`tauceti budget --recover --dry-run --json` prepares a content-free manifest under
+`budget/recovery-audits/` without changing the ledger or deleting bridge keys.
+Every invocation has its recorded owner identity, current owner/heartbeat check,
+evidence source, known prefix, existing charge, reservation, proposed estimate,
+final total, spend delta and released reservation recorded. The manifest includes
+ledger sequence/hash, evidence hashes, interval endpoints, comparable IDs/costs/
+durations, median rate and pricing-table hash when available. It contains no
+prompts, response text, credentials or receipt outcome text.
 
-The authoritative ledger stays append-only. Estimated prefix charges use the
-existing correction/unresolved event vocabulary so previous ledger readers retain
-the right financial totals. Native final settlement reverses a prefix before
-recording the full native cost. All cost corrections preserve their audit trail.
+Apply with `tauceti budget --recover --note 'stopped usage policy v1' --json`.
+To bind application to the reviewed proposal, pass `--plan /path/to/dry-run.json`;
+a changed ledger or proposal requires another dry run. Application produces a fresh
+manifest and rechecks process identities immediately
+before its single append-only ledger transaction. Inspect the dry run's identities,
+evidence and totals first. Both a live process identity and a fresh bridge heartbeat
+protect **all** session statuses from modification, including late cumulative
+corrections that would affect a live successor. No grant or worker ceiling changes
+are part of recovery.
+
+Recovery tries authoritative native receipts first, then directly linked durable
+usage journals. Legacy transcripts are considered only when a saved receipt names
+the exact provider session and exactly one file belongs to that worker; worker/time
+overlap never establishes identity. Recorded finish times and later admissions
+resuming that exact provider session bound transcript attribution. Recovery shares
+response IDs across its plan, so a resume cannot charge responses recovered earlier
+in the same transaction. Complete saved usage can settle as a marked,
+correctable token-price estimate. An unclosed journal, an interrupted response,
+or a transcript remains incomplete even if all observed responses are priced,
+the owner has died, or `inflight=false`.
+
+For stopped incomplete usage (including sessions with no journal), policy
+`stopped-usage-v1` uses the median native cost per second of at least three sessions
+of the same model and phase completed in the seven days preceding admission.
+With fewer than three, it uses at least three sessions of that model in the same
+window. Estimates, manually reconciled totals, the invocation itself, negative
+or zero costs, failed launches, missing/zero/invalid intervals and future endpoints
+are excluded. The rate is multiplied by this invocation's recorded duration and
+rounded to twelve decimal places in USD (half-even). Normal native settlement
+timestamps or explicitly recorded finish times supply endpoints. The native shim records exit time in its final receipt when process exit
+is confirmed, including interrupted exits; provisional in-flight checkpoints never
+claim an exit. Old recovery timestamps without recorded endpoints are excluded.
+If a target has no recorded exit, a usage observation time can supply its end.
+That measures the observed portion rather than a confirmed process lifetime; the
+duration source remains labelled in the audit. Orphan detection and repair time never supply an endpoint.
+Replayed native receipts retain the original recorded endpoint; missing endpoints
+exclude them from rate comparables. An unusable duration or insufficient
+comparables uses the **saved prelaunch estimate**, without recalculating admission
+estimates. The resulting total is at least the already charged/known priced prefix.
+It never adds the prefix to the estimated total.
+
+The policy settles this labelled total and releases its residual reservation.
+The manifest reconciles before/after spend exactly to charge deltas and explains
+reservation releases separately: releasing a reservation is neither spending nor
+a refund. Repeat recovery makes no monetary change. A late native receipt replaces
+an estimate through idempotent corrections, including resumed cumulative baselines.
+During ordinary live teardown, `recover_usage` still charges known prefixes and
+retains reservations when evidence is incomplete; only explicit stopped recovery
+applies this policy.
+
+Usage evidence is collected outside the fleet ledger lock; planning replays the
+current ledger incrementally inside the lock and skips estimates with no new native
+receipt. Full comparable details stay in the manifest; ledger events retain a compact
+policy/rate/duration summary, count, audit hash and manifest reference.
+
+Prepared activity caches distinguish live usage, settled estimates (including
+recovered estimates), and unresolved stopped accounting. Existing spend and dollars
+per LOC measurements remain available, including during mixed version 2/3 rollouts.
+Estimates use their recorded interval in rate windows; without an interval they are
+placed at admission instead of being spread across downtime until repair.
+Reservations never enter spend reports;
+`status` still reads prepared local data without GitHub calls or recovery analysis.
+
+The authoritative ledger and retained recovery manifests are append-only evidence.
+Ledger repair transactions name their manifest; a manifest records a plan, and the
+matching ledger transaction establishes application. Manifests explicitly have
+`status: planned`; a separate `.application.json` records the committed transaction
+and sequence (or a no-change result). If a run stops before append,
+rerun dry-run and recovery. Do not truncate evidence or recreate consumed reservations.
+Correct a mistaken total with `tauceti budget --reconcile INVOCATION --cost USD
+--note 'reason and supporting evidence'`; this appends a compensating adjustment.
+Optional provider-admin reconciliation is separate work and does not block stopped
+settlement. Recovery is independent of issue #313.

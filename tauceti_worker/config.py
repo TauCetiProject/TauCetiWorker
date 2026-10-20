@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .constants import MAX_OPEN_PRS, ROADMAP
+from .constants import MAX_OPEN_PRS, ROADMAP, ROADMAP_DIR, TAUCETI
 from .paths import HERE
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
@@ -103,10 +103,10 @@ def roadmap_areas(gh) -> list[str]:
     try:
         tree = snapshot(ROADMAP, ttl=3600)
         if tree:
-            return sorted(path.name for path in (tree / "TauCetiRoadmap").iterdir() if path.is_dir())
+            return sorted(path.name for path in (tree / ROADMAP_DIR).iterdir() if path.is_dir())
     except (OSError, TimeoutError, subprocess.SubprocessError):
         pass
-    out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')
+    out = gh.api_jq(f"repos/{ROADMAP}/contents/{ROADMAP_DIR}", '.[] | select(.type=="dir") | .name')
     return sorted(out.splitlines()) if out else []
 
 
@@ -121,12 +121,22 @@ def sanitize_wid(raw: str) -> str:
 _HELD_SLOTS: list[int] = []
 
 
+def legacy_project() -> bool:
+    return TAUCETI.lower() == "taucetiproject/tauceti"
+
+
+def worker_state_root() -> Path:
+    if legacy_project():
+        return HERE / "state"
+    return Path(os.environ["TAUCETI_PROJECT_STATE"]) / "workers"
+
+
 def acquire_slot(wid: str) -> bool:
     """Hold an instance lock on this worker slot for the life of the process, returning False if another
     process already holds it. The lock auto-releases on exit/crash (the kernel drops the flock), so a
     restart reclaims the slot — reusing its seeded $HOME and recognising its own leases. Mirrors
     RoundContext's flock-NB pattern, one level up (per process, not per round)."""
-    state = HERE / "state" / wid
+    state = worker_state_root() / wid
     state.mkdir(parents=True, exist_ok=True)
     fd = os.open(state / "instance.lock", os.O_CREAT | os.O_WRONLY, 0o644)
     os.set_inheritable(fd, False)  # spawned rounds take their own round.lock; don't inherit this one
@@ -187,7 +197,12 @@ class Config:
         os.environ.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         h = home or Path(os.environ.get("HOME", os.path.expanduser("~")))
         # Export before worker HOME isolation so every local worker shares receipts.
-        os.environ.setdefault("TAUCETI_ACTIVITY_DIR", str(h / ".local/state/tauceti/activity"))
+        os.environ.setdefault(
+            "TAUCETI_ACTIVITY_DIR",
+            str(h / ".local/state/tauceti/activity")
+            if legacy_project()
+            else str(worker_state_root().parent / "activity"),
+        )
         # Two different homes, and conflating them is what made the macOS isolation change risky.
         # `home` answers "whose credentials?" and must follow the login user, because the macOS
         # Keychain, gh and git are per-login-user stores. `data_home` answers "whose working data?"
@@ -200,7 +215,7 @@ class Config:
         # data path is therefore the same one it had when isolation moved $HOME, on both platforms,
         # so nothing migrates.
         dh = Path(os.environ.get("TAUCETI_DATA_HOME") or h)
-        state = HERE / "state" / wid
+        state = worker_state_root() / wid
         # Per-worker, per-repository claim scratch. claim.sh defaults this under $HOME, which was
         # per-worker only while $HOME moved; use the worker data root while letting a dynamic
         # CLAIM_REPO select its own child store. An explicit CLAIM_GITDIR still overrides the base.
@@ -210,10 +225,12 @@ class Config:
             home=h,
             data_home=dh,
             state=state,
-            checkout=HERE / "checkouts" / wid / "TauCeti",
-            store_dir=dh / ".cache" / "tauceti-review" / wid / "store" / "TauCetiProject__TauCeti",
+            checkout=(HERE / "checkouts" / wid / "TauCeti")
+            if legacy_project()
+            else worker_state_root() / wid / "checkout",
+            store_dir=dh / ".cache" / "tauceti-review" / wid / "store" / TAUCETI.replace("/", "__"),
             sbcache=state / "cache" / "scoreboard",
-            logdir=HERE / "logs" / wid,
+            logdir=(HERE / "logs" / wid) if legacy_project() else state / "logs",
             quota_cache=state / "cache",
         )
 
@@ -280,8 +297,28 @@ class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
 
 
+class ProgressPreparationUnavailable(NoProgress):
+    """Mechanical progress preparation needs time or infrastructure, without a paid attempt."""
+
+    state = "waiting-progress-preparation"
+
+    def __init__(self, message, *, retry_at=None):
+        super().__init__(message)
+        self.retry_at = retry_at
+
+
+class DocumentationUnavailable(ProgressPreparationUnavailable):
+    """Documentation deployment churn; replan without spending a report attempt."""
+
+    state = "waiting-documentation"
+
+
 class AdmissionUnavailable(NoProgress):
-    """Local API admission needs a bounded recheck, without no-progress backoff."""
+    """Inference admission needs a bounded recheck, without no-progress backoff."""
+
+    def __init__(self, message: str, *, state: str = "waiting-budget"):
+        super().__init__(message)
+        self.state = state
 
 
 class GitHubUnavailable(NoProgress):

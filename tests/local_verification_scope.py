@@ -7,12 +7,12 @@ against small Git fixtures standing in for a TauCeti checkout. It must:
   1. include committed, staged, unstaged and untracked changes, measured from the merge base with the
      canonical main's remote-tracking ref (never fetched);
   2. list only existing, representable changed modules, in an absolute file;
-  3. choose the full audit for a deleted module (including the old end of a rename), a pin, lakefile
+  3. report full CI requirements for a deleted module (including the old end of a rename), a pin, lakefile
      or toolchain change (also when only in the working tree), a Lean file outside the module
      inventory (root, Unicode, newline), and any broad worker policy;
-  4. report `unknown` (full audit, no local lint) when the base or file list cannot be determined;
+  4. report `unknown` (no full local fallback) when the base or file list cannot be determined;
   5. accept an honestly empty documentation-only scope;
-  6. drive `lake exe axioms` with AXIOMS_ONLY_MODULES exactly when scoped;
+  6. drive only the cheap changed-file checker, never the whole-library audit;
   7. appear, with the foreground/exit-status rules, in every rendered authoring/repair prompt.
 
 The worker passes the policy from surveyed labels/branch; `scope_policy` is checked here too.
@@ -43,7 +43,10 @@ def check(name, cond, detail=""):
 
 
 def blocks(policy):
-    text = tc.agents.local_verification(policy)
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="0"):
+        text = tc.agents.local_verification(policy)
     found = re.findall(r"```bash\n(.*?)```", text, re.S)
     assert len(found) == 3, "expected scope, audit and lint blocks"
     return found
@@ -106,6 +109,19 @@ def scope(repo, policy="ordinary", cwd=None, config=None):
 
 def expect(name, repo, kind, modules=None, reason="", policy="ordinary", **kw):
     rc, mode, listed = scope(repo, policy, **kw)
+    from unittest.mock import patch
+
+    from tauceti_worker.verification_scope import local_main
+    from tauceti_worker.verification_scope import scope as helper_scope
+
+    try:
+        with patch.dict(os.environ, GIT_CONFIG_GLOBAL=kw.get("config") or "/dev/null", GIT_CONFIG_NOSYSTEM="1"):
+            actual = helper_scope(Path(repo), local_main(Path(repo)), policy)
+    except ValueError:
+        actual = dict(mode="unknown", modules=[])
+    check(
+        f"{name}: helper matches V0 scope", actual["mode"] == kind and actual["modules"] == (listed or []), str(actual)
+    )
     check(f"{name}: recipe exits 0", rc == 0, mode)
     check(f"{name}: mode {kind}", mode.startswith(kind), mode)
     if reason:
@@ -232,6 +248,15 @@ def main():
         for policy in ("full-lint", "lint-repair", "bump"):
             expect(f"{policy} policy", r, "full", ["TauCeti.A"], f"{policy} policy", policy=policy)
 
+        # Bubble sandboxes route https://github.com/ through a local proxy with url.insteadOf, and add
+        # an untracked SSH-form `github` remote; the canonical origin must still be recognised.
+        r = fixture(root, "insteadof")
+        git(r, "remote", "add", "github", "git@github.com:TauCetiProject/TauCeti.git")
+        write(r, "TauCeti/A.lean", "changed\n")
+        proxied = Path(root) / "proxy.gitconfig"
+        proxied.write_text('[url "http://127.0.0.1:7777/git/"]\n\tinsteadOf = https://github.com/\n')
+        expect("sandbox insteadOf proxy", r, "scoped", ["TauCeti.A"], config=str(proxied))
+
         r = fixture(root, "ssh-remote", remote="git@github.com:TauCetiProject/TauCeti.git")
         write(r, "TauCeti/A.lean", "changed\n")
         expect("ssh canonical remote", r, "scoped", ["TauCeti.A"])
@@ -272,9 +297,16 @@ def main():
         stub = bin_dir / "lake"
         stub.write_text(f'#!/bin/sh\necho "lake $* AXIOMS=${{AXIOMS_ONLY_MODULES-unset}}" >> {log}\n')
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        local_stub = bin_dir / "local-checker"
+        local_stub.write_text(
+            "import os, sys\nfrom pathlib import Path\n"
+            f"Path({str(log)!r}).write_text('local-checker ' + ' '.join(sys.argv[1:]) + "
+            "' AXIOMS=' + os.environ.get('AXIOMS_ONLY_MODULES', 'unset'))\n"
+        )
         # An inherited scope must never narrow a full audit.
         env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", AXIOMS_ONLY_MODULES="/stale/list")
         _, audit, lint = blocks("ordinary")
+        audit = audit.replace(str(tc.paths.HERE / "scripts/tauceti-local-axioms"), str(local_stub))
 
         def audit_call(repo):
             log.write_text("")
@@ -286,21 +318,31 @@ def main():
         rc, call = audit_call(r)
         listed = r / ".lake" / "tauceti-scope" / "modules.txt"
         check(
-            "scoped audit passes an absolute module list", rc == 0 and call == f"lake exe axioms AXIOMS={listed}", call
+            "scoped audit passes an absolute module list",
+            rc == 0 and "local-checker --modules" in call and str(listed) in call and "exe axioms" not in call,
+            call,
         )
         check("module list path is absolute", listed.is_absolute())
         r = Path(root) / "docs"
         scope(r)
         rc, call = audit_call(r)
-        check("empty scope still runs the scoped auditor (global duplicates)", call.endswith("/modules.txt"), call)
+        check(
+            "empty scope uses the cheap local checker",
+            "local-checker --modules" in call and "exe axioms" not in call,
+            call,
+        )
         r = Path(root) / "deleted"
         scope(r)
         rc, call = audit_call(r)
-        check("full scope clears an inherited scope", rc == 0 and call == "lake exe axioms AXIOMS=", call)
+        check(
+            "full CI scope still uses changed-file diagnostics",
+            rc == 0 and "local-checker --modules" in call and call.endswith("AXIOMS="),
+            call,
+        )
         r = Path(root) / "no-main"
         scope(r)
         rc, call = audit_call(r)
-        check("unknown scope runs the unscoped audit", rc == 0 and call == "lake exe axioms AXIOMS=", call)
+        check("unknown scope fails without any full-library fallback", rc != 0 and call == "", call)
         lint_run = subprocess.run(["bash", "-c", lint], cwd=r, env=env, capture_output=True, text=True)
         check("unknown scope skips the local lint", "CI runs the environment lint" in lint_run.stdout)
         r = fixture(root, "never-scoped")
@@ -311,6 +353,8 @@ def main():
         lint_run = subprocess.run(["bash", "-c", lint], cwd=r, env=env, capture_output=True, text=True)
         check("empty scope skips lint-env", "no changed TauCeti module" in lint_run.stdout, lint_run.stdout)
 
+    # The canary helper path is explicitly opted in; V0 remains the dispatch default.
+    os.environ["TAUCETI_VERIFY_HELPER"] = "1"
     # Every authoring/repair prompt, rendered as the worker renders it, carries the same rules.
     sys.path.insert(0, str(HERE))
     from prompt_wrapper_paths import CALL_SITES
@@ -320,11 +364,11 @@ def main():
         policy = subs.get("SCOPE_POLICY", "ordinary")
         subs["LOCAL_VERIFICATION"] = tc.agents.local_verification(policy)
         text = tc.agents.fill_prompt(tc.paths.HERE / "prompts" / name, **subs)
-        check(f"{name}: embeds the scope recipe", text.count("<<'TAUCETI_SCOPE'") == 1)
-        check(f"{name}: names its policy", f"policy='{policy}'" in text)
+        check(f"{name}: dispatches to the absolute helper", '/tauceti-verify"' in text)
+        check(f"{name}: names its policy", f"policy is `{policy}`" in text)
         check(f"{name}: forbids name-based waits", "`pgrep`" in text and "notify or resume you" in text)
         check(f"{name}: requires pipefail", "set -o pipefail" in text)
-        check(f"{name}: never runs lint-scope.sh", "never run `scripts/lint-scope.sh`" in text)
+        check(f"{name}: avoids GitHub scope reads", "`scripts/lint-scope.sh` alongside the helper" in text)
         check(f"{name}: report separates local checks from CI", "not full CI" in text)
         check(f"{name}: no unscoped whole-suite rerun", "run the WHOLE suite" not in text)
         check(f"{name}: no bare unscoped audit command block", "\nlake exe axioms\n" not in text)
