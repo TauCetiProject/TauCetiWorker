@@ -392,6 +392,36 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             newer.result(timeout=5)
         self.assertEqual(order, ["second", "first"])
 
+    def test_background_capacity_journal_does_not_overwrite_new_model_attempt(self):
+        from tauceti_worker.verification_jobs import reap_continuations, stop_continuations
+
+        result = self.verify(stage="build", deadline=time.time() - 1)
+        path = Path(result["continuation_job"])
+        job = v.read_json(path)
+        job["next_at"] = 0
+        v.atomic(path, job)
+        cfg = SimpleNamespace(state=self.state)
+        try:
+            with (v.queue_root() / "slot-0.lock").open("a+") as owner:
+                fcntl.flock(owner, fcntl.LOCK_EX)
+                self.assertTrue(resume_pending(cfg, background=True, seconds=10))
+                private = self.state / "verification-job-capacity" / path.name
+                limit = time.monotonic() + 10
+                while not v.read_json(private).get("waiting"):
+                    self.assertLess(time.monotonic(), limit)
+                    time.sleep(0.02)
+                marker = dict(attempt="new-model-round", waiting=True, at=time.time())
+                v.atomic(self.state / "verification-capacity.json", marker)
+            while path.exists():
+                reap_continuations(cfg)
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(0.02)
+            reap_continuations(cfg)
+            self.assertEqual(v.read_json(self.state / "verification-capacity.json"), marker)
+            self.assertEqual(v.read_json(self.state / "verification-jobs" / path.name)["status"], "success")
+        finally:
+            stop_continuations(cfg)
+
     def test_partial_phase_survives_next_queue_deadline(self):
         # A phase can establish durable evidence even when a later requested phase is interrupted.
         verification = v.Verification(self.root, self.state, stage="all")

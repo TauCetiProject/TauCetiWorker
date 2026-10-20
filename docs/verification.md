@@ -111,7 +111,8 @@ worker's round lock while waiting/building. Its queue wait leaves inference sche
 One continuation per worker bounds preparation concurrency. Ordinary child polling reaps results;
 supervisor shutdown terminates its owned helper, preserving a durable interrupted job.
 
-Counter refunds happen before replay resets old capacity evidence. Repeated queue deadlines retain
+Counter refunds happen before replay starts. Continuation capacity/runtime journals are separate
+from model-round journals, so concurrent replay cannot overwrite a newer authoring attempt. Repeated queue deadlines retain
 job age, candidate and validated phase evidence. Phase boundaries finish metadata/source validation
 and index publication even if the checkpoint margin arrives at command completion. Complete
 input/tool-version preparation runs at invocation boundaries; phase checkpoints use existing input

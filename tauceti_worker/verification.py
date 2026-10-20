@@ -237,6 +237,11 @@ class Verification:
         self.wait_lease = None
         self.interrupted_wait = False
         self.job = job
+        self.capacity_path = (
+            self.state / "verification-job-capacity" / f"{job['id']}.json"
+            if job
+            else self.state / "verification-capacity.json"
+        )
         self.installations = Installations(
             self.state,
             digest=digest,
@@ -328,7 +333,7 @@ class Verification:
 
     def capacity(self, waiting, *, interrupted=False):
         atomic(
-            self.state / "verification-capacity.json",
+            self.capacity_path,
             dict(
                 attempt=os.environ.get("TAUCETI_VERIFY_ATTEMPT"),
                 waiting=waiting,
