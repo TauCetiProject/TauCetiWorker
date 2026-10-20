@@ -1178,6 +1178,27 @@ class WorkerBackend:
                 )
         if published:
             return "published"
+        # A confirmed push that another writer subsequently removed must never be
+        # replayed. If the push died before local acknowledgement and the head
+        # moved, absence from the new history cannot prove it never happened.
+        co = self.w.cfg.state / "recovery" / m["id"] / "checkout"
+        marker = (
+            saved._rev(co, f"refs/tauceti/published/push/{publication['ref'].removeprefix('refs/heads/')}")
+            if (co / ".git").exists()
+            else None
+        )
+        if marker == publication["oid"]:
+            raise Obsolete(
+                "publication-superseded",
+                "A durable successful push was subsequently removed from the remote history",
+                "Keep this source archived; do not replay another writer's removed publication",
+            )
+        if head != publication["expected"] and facts["state"] == "OPEN":
+            raise Block(
+                "publication-head-moved",
+                "The remote head changed and no longer contains the pending commit; whether it was published is uncertain",
+                "Reconcile the retained commit and PR timeline before explicitly rescoping this source; never replay an uncertain publication",
+            )
         return "unpublished"
 
 

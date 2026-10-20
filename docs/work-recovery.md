@@ -157,7 +157,10 @@ expected-head CAS. No recovery comment or new PR is synthesized from agent prose
 Recovery creates no extra comments or PRs. Existing GitHub publication intents use
 the durable outbox's normal reconciliation before recovery; unrelated pending
 intents do not conceal a confirmed Git push. A crash after push reconciles the actual branch and commit ancestry before any
-replay, including after the invocation limit.
+replay, including after the invocation limit. A durable successful push later
+removed by another writer is archived rather than replayed. A moved head with an
+unacknowledged pending publication requires explicit reconciliation, because
+absence from rewritten history cannot prove that publication never happened.
 
 A clean three-way integration is attempted mechanically and reverified only when
 the current head preserves the expected history. Rewritten history is blocked

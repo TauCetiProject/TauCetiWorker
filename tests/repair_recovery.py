@@ -447,6 +447,42 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["state"], "published")
         self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
 
+    def test_confirmed_publication_removed_by_writer_is_not_replayed(self):
+        actual = self.backend.publish
+
+        def push_then_die(*args):
+            actual(*args)
+            raise Death()
+
+        with patch.object(self.backend, "publish", side_effect=push_then_die):
+            with self.assertRaises(Death):
+                self.run_recovery()
+        git(self.remote, "update-ref", "refs/heads/main", self.base)
+        self.current["head"] = self.base
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "publication-superseded")
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+
+    def test_uncertain_push_with_new_writer_is_blocked_before_replay(self):
+        actual = rr.write
+
+        def die_after_intent(record, journal, state, **fields):
+            actual(record, journal, state, **fields)
+            if state == "publication-pending":
+                raise Death()
+
+        with patch.object(rr, "write", side_effect=die_after_intent):
+            with self.assertRaises(Death):
+                self.run_recovery()
+        self.advance_writer()
+        writer = self.current["head"]
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "publication-head-moved")
+        self.assertEqual(self.journal()["state"], "blocked")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), writer)
+        self.assertEqual(FakeVerification.calls, 1)
+
     def test_three_failures_block_and_operator_rearms(self):
         with patch.object(self.backend, "verify", side_effect=RuntimeError("disk full")):
             for n in range(1, 4):
