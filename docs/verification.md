@@ -60,8 +60,7 @@ security boundary. Verification never weakens the axiom checks.
 Independent workers run build, axiom/duplicate audit, module-system audit and lint commands
 concurrently. Verification adds no host-wide slot limit, ticket scheduler, polling wait or
 capacity-specific retry/accounting path. Existing worker/fleet admission and host CPU/memory
-limits continue to apply. The obsolete `TAUCETI_VERIFY_HEAVY_SLOTS` and
-`TAUCETI_VERIFY_HOST_QUEUE` variables are ignored, including by Bubble's preliminary build.
+limits continue to apply.
 Per-job leases prevent duplicate execution of the same candidate; they never serialize independent
 candidates. Source style still runs before the default build so inexpensive diagnostics arrive early.
 
