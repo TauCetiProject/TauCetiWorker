@@ -26,12 +26,25 @@ back to ordinary private cache warming; required mode pauses before inference.
 
 The key includes pinned dependency revisions, the Mathlib manifest, the root Lake
 configuration and manifest, Lean toolchain and ABI, architecture and platform,
-and the Git remote/branch/tag context that selects Mathlib artifact caches.
+resolved toolchain location and Init artifact digest, external `LAKE_CONFIG` content,
+and the Git remote/branch/tag and environment context that select Mathlib artifact caches.
+Temporary config filenames and per-worker download directories do not split keys;
+cache-selection values are hashed to avoid persisting endpoint credentials.
 Remote URLs are hashed in published metadata; credentials are not copied there.
 Dirty or unpinned dependencies use private builds. A miss makes fresh local git
 clones at those revisions, downloads using `lake exe cache get`, and verifies
 Mathlib `.olean` and `.ilean` outputs before syncing the immutable tree and publishing it atomically. It never publishes
-an agent's mutable build directory. A per-key lock serializes builders.
+an agent's mutable build directory. A per-key publisher lock serializes builders separately from reader leases, so
+simultaneous first users can enter as soon as publication finishes. A ready receipt
+also records regular-file identity, mode, size, mtime and ctime. Every reuse checks
+that inventory without rereading all artifact bytes. This detects missing/replaced
+files and in-place corruption, including same-size writes with restored mtime.
+Links and special files are rejected, including symlinked directories. The local
+host owner is trusted; immutable mounts prevent writes from inside shared views.
+A damaged published lower is preserved for evidence and sets a persistent
+`safety_stop` in policy, forcing future auto rounds off even with an environment
+auto override. Required mode fails explicitly. Investigate before clearing that
+field; policy expiry does not clear it or interrupt any active reader.
 
 Each agent runs inside rootless bubblewrap mount and PID namespaces; this view is the
 same boundary as [process containment](process-containment.md), not a second one nested
@@ -64,13 +77,43 @@ reads only that prepared summary, including sharing/private modes, cache hits,
 preparation time and fallback reasons. A mounted overlay remains "preparing"
 until cache warming succeeds; a failed warmer is reported as blocked and never
 starts inference. `results.jsonl` in the pool contains
-content-free coding invocation results and native round IDs for rollout checks.
+content-free coding invocation results, cleanup phase receipts and native round IDs
+for joining the existing round/phase/resource records. A released shared view
+becomes idle rather than continuing to count as a current shared worker. Cleanup
+of a view is separate from completion of a full work round.
 
 ## Rollout
 
-Keep funding and the worker ceiling unchanged. Enable two existing workers first;
-observe at least five successful Mathlib coding rounds and thirty minutes before
-expanding. If five rounds have not completed within sixty minutes, stop the canary
-as inconclusive. Do not manufacture paid sessions or interrupt active rounds to
-obtain a result. Roll back at subsequent round boundaries with mode `off`; retain
-all usage journals and the append-only budget ledger.
+Keep funding and worker capacity unchanged. Use only naturally selected work;
+do not trigger CI, run synthetic benchmarks, start paid measurement sessions or
+restart active paid agents. Normal implementation PR checks still apply.
+
+1. Enable one existing worker with pool `policy.json`, mode `auto`, a one-worker
+   `workers` allowlist, `expires_at` set to now + 86400, and `expiry_mode: "off"`.
+   Environment mode/allowlist overrides take precedence during ordinary rollout;
+   inspect them before selecting the worker. Policies are read at natural round
+   boundaries. Off/private remains the rollback path.
+2. After a natural **full work round** completes with verified overlay isolation,
+   no preparation failure and successful cleanup, expand to five existing workers
+   and renew the 24-hour expiry to off.
+3. After five successful natural rounds across that group with no sharing-related
+   failures, allow all current workers, again retaining a 24-hour expiry to off
+   until explicitly accepted. Do not increase the worker ceiling or budget.
+
+For each gate retain the shared preparation/result/cleanup receipts, round ID,
+audit phase completion, actual storage read bytes and resource stalls, together
+with an existing comparable private run. Use existing local phase/resource logs
+and kernel observations; missing measurements stay unknown. RSS and worker counts
+are not evidence of page-cache savings or speedup. Record toolchain/pin, task,
+cache warmth, co-tenants and disk pressure as confounders.
+
+On any isolation, integrity or lease failure set future-round policy off
+immediately. Preserve the lower and evidence, all active leases/readers, usage
+journals and the append-only budget ledger. Never delete an active lower or kill
+paid agents to roll back. Integrity and failed mounted-view probes latch this
+stop automatically; other observed isolation/lease failures require the same
+operator rollback. An unsupported capability or insufficient space in auto uses
+private preparation; required mode refuses inference with the reason.
+
+See [the #311 validation record](evidence/shared-mathlib-311.json) for current
+local evidence and incomplete natural rollout gates.
