@@ -375,7 +375,26 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
                 if size > remaining:
                     if remaining <= 0 or info.st_nlink != 1:
                         raise ValueError("byte budget or shared large inode; retry later")
-                    child = os.open(entry.name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                    try:
+                        child = os.open(entry.name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                    except PermissionError:
+                        # Private copies of Git packs and immutable cache payloads can be
+                        # read-only. Change only an opened, owned, unique inode; a hardlink
+                        # or replaced path must never change another workspace's permissions.
+                        control = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                        try:
+                            current = os.fstat(control)
+                            if (current.st_dev, current.st_ino, current.st_nlink, current.st_uid) != (
+                                info.st_dev,
+                                info.st_ino,
+                                1,
+                                os.geteuid(),
+                            ):
+                                raise ValueError("cleanup read-only inode changed or is shared") from None
+                            os.fchmod(control, current.st_mode | stat.S_IWUSR)
+                        finally:
+                            os.close(control)
+                        child = os.open(entry.name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
                     try:
                         current = os.fstat(child)
                         if (current.st_dev, current.st_ino, current.st_nlink) != (info.st_dev, info.st_ino, 1):

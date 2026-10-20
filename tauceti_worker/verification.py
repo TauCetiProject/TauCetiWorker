@@ -34,7 +34,7 @@ from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
-from .verification_storage import Pressure, cache_generation
+from .verification_storage import Limit, Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 4
@@ -697,6 +697,9 @@ class Verification:
                     raise Pressure("candidate storage is being reclaimed; retry verification") from None
                 reserve(self.state, self.root.name)
                 self.storage_monitor = Monitor(self.state, self.root.name)
+                # A direct invocation claims this as an editable workspace, not a disposable
+                # failed copy left by a different invocation.
+                (self.state / "verification-copy-incomplete" / f"{self.root.name}.json").unlink(missing_ok=True)
             raw = self.base_arg or os.environ.get("TAUCETI_VERIFY_BASE") or local_main(self.root)
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
@@ -814,9 +817,15 @@ class Verification:
             self.receipt.update(
                 status="incomplete",
                 error=str(error),
-                incomplete_reason="disk-pressure",
+                incomplete_reason="storage-limit"
+                if error.reason == "limit"
+                else "storage-configuration"
+                if error.reason == "configuration"
+                else "disk-pressure",
                 result_type="incomplete",
-                next_action="reclaim verification storage and retry verify in this workspace",
+                next_action="adjust verification storage limits/inputs and invoke verify again"
+                if error.reason in {"limit", "configuration"}
+                else "reclaim verification storage and retry verify in this workspace",
             )
         except Incomplete as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason=error.reason)
@@ -853,7 +862,7 @@ class Verification:
                 report_runtime(
                     "verification-pending",
                     verification_phase=None,
-                    verification_job=self.job["id"],
+                    verification_job=self.job["id"] if self.job else Path(self.receipt["continuation_job"]).stem,
                     detail="durable verification job retained for mechanical continuation",
                 )
             elif self.receipt["status"] == "incomplete":
@@ -912,16 +921,17 @@ class Verification:
         try:
             with locked(self.state / "verification-checkpoint-locks" / f"{key}.lock"):
                 if not (target / "checkpoint.json").exists():
-                    limit = reserve_checkpoint(self.state, key)
+                    patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
+                    names = sorted(untracked(self.root))
+                    size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
+                    # Charge the bounded archive estimate, rather than a whole maximum-sized
+                    # checkpoint for a tiny patch. The writer still enforces the granted bytes.
+                    estimate = size + 16384 + sum(len(name.encode()) * 2 + 8192 for name in names)
+                    limit = reserve_checkpoint(self.state, key, amount=estimate)
                     target.mkdir(mode=0o700, parents=True, exist_ok=True)
                     try:
-                        patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
-                        names = sorted(untracked(self.root))
-                        size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
                         if size > limit:
-                            raise Pressure(
-                                "source checkpoint exceeds its reserved byte budget; original source retained"
-                            )
+                            raise Limit("source checkpoint exceeds its reserved byte budget; original source retained")
                         with (target / "source.patch").open("wb") as out:
                             out.write(patch)
                             out.flush()

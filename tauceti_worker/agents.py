@@ -2270,8 +2270,10 @@ def run_in_bubble(
             "CANDIDATE_BYTES",
             "SOURCE_CANDIDATE_BYTES",
             "CHECKPOINT_BYTES",
+            "CHECKPOINT_POOL_BYTES",
             "MIN_FREE_BYTES",
             "MIN_FREE_PERCENT",
+            "OWNERSHIP_SECONDS",
             "COMPLETED_CACHE_SECONDS",
             "IDLE_CACHE_SECONDS",
         ):
