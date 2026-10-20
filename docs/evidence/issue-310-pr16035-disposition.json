@@ -1,12 +1,18 @@
 {
-  "observed_at": "2026-10-20T03:55:52.822498+00:00",
+  "observed_at": "2026-10-20T04:31:32.610125+00:00",
   "pr": 16035,
   "reason": {
-    "code": "pr-closed-no-matching-local-checkpoint",
-    "detail": "PR16035 is closed. No matching PR identity, PR-commit tip, branch name, or source patch was found among the two retained recovery records on this host. No retained-checkout directory was found under the main worker checkouts tree. The former attempt cannot be asserted present. Its PolynomialDomain.lean module is present on canonical main.",
+    "code": "pr-merged-by-bors-no-matching-local-checkpoint",
+    "detail": "The authenticated TauCeti Bors bot confirms PR16035 was successfully merged into main at c344750968923c9333d63422404882683d2dd40a. GitHub represents this as CLOSED with merged_at=null. The module exists on canonical main. No matching retained source checkpoint or retained checkout was found in the inspected main worker trees on this host.",
     "next_action": "Keep all existing source/checkpoints. Do not reopen or replay the closed PR. Any subsequently discovered source requires a fresh relevance and authorization check."
   },
   "remote": {
+    "bors_merge": {
+      "author": "tau-ceti-bors[bot]",
+      "comment_id": 6281917756,
+      "commit": "c344750968923c9333d63422404882683d2dd40a",
+      "url": "https://github.com/TauCetiProject/TauCeti/pull/16035#issuecomment-6281917756"
+    },
     "closed_at": "2026-10-20T02:28:32Z",
     "github_merged_at": null,
     "head": "c344750968923c9333d63422404882683d2dd40a",
@@ -20,6 +26,24 @@
   "repository": "TauCetiProject/TauCeti",
   "schema": "tauceti-work-recovery-disposition/v1",
   "search": {
+    "activity": {
+      "database": "/home/kim/.local/state/tauceti/activity/activity.sqlite",
+      "exact_pr_matches": 0,
+      "maintenance_log_attributions": 0,
+      "mode": "read-only",
+      "tables": [
+        "prs",
+        "pr_contributions",
+        "pr_observations"
+      ],
+      "worker_resource_log_pr_attributions": 0
+    },
+    "limits": [
+      "The historical worker and round could not be attributed from available local activity and maintenance/resource logs.",
+      "The incident used a 20-worker fleet; this search covered the local main worker installation, not all fleet hosts.",
+      "Available local evidence does not establish whether the historical attempt preceded checkpoint-preservation deployment.",
+      "Mentioning PR16035 in agent discovery/research logs is not evidence of owning or retaining that attempt."
+    ],
     "records": [
       {
         "local_head": "a061077ccf95d1905daecea8539fa6fe7fbffe98",
@@ -43,7 +67,8 @@
   "sources": [
     "https://github.com/TauCetiProject/TauCeti/pull/16035",
     "https://api.github.com/repos/TauCetiProject/TauCeti/pulls/16035",
-    "https://github.com/TauCetiProject/TauCeti/blob/main/TauCeti/AlgebraicGeometry/AdicSpace/Spa/Polydisc/PolynomialDomain.lean"
+    "https://github.com/TauCetiProject/TauCeti/blob/main/TauCeti/AlgebraicGeometry/AdicSpace/Spa/Polydisc/PolynomialDomain.lean",
+    "https://github.com/TauCetiProject/TauCeti/pull/16035#issuecomment-6281917756"
   ],
   "state": "obsolete"
 }

@@ -142,7 +142,7 @@ Each record has a separate, private `recovery.json` consumer journal:
 | resuming | A claimed invocation owns the isolated checkout |
 | verified | An exact-input verifier succeeded; its receipt is retained |
 | publication-pending | A particular commit, expected head, destination and receipt are durable before push |
-| published | Actual remote Git state contains the intended commit and the GitHub outbox is reconciled |
+| published | Actual remote Git state contains the intended commit and any publication intents belonging to that outcome are reconciled |
 | obsolete | The PR closed/merged, or the exact saved source is already the remote tree; source stays archived |
 | blocked | A structured failure names the condition and next action; unrelated work can continue |
 
@@ -154,19 +154,34 @@ receipts may be reused by its normal input/phase matching. The complete input
 fingerprint is checked again before committing. Publication requires the current
 writer's head as an ancestor, fresh PR policy, a real claim, and `git-safe-push`'s
 expected-head CAS. No recovery comment or new PR is synthesized from agent prose.
-Existing GitHub publication intents use the durable outbox's reconciliation.
-A crash after push reconciles the actual branch and commit ancestry before any
+Recovery creates no extra comments or PRs. Existing GitHub publication intents use
+the durable outbox's normal reconciliation before recovery; unrelated pending
+intents do not conceal a confirmed Git push. A crash after push reconciles the actual branch and commit ancestry before any
 replay, including after the invocation limit.
 
-A model runs only for failed source verification, unfinished source integration,
-or a moved head that needs integration. It receives a narrow checkpoint-only
-prompt and the original profile/permissions, plus fresh subscription admission
-or API budget admission. A matching durable provider conversation is preferred;
-a missing or mismatched identity/profile starts a narrow new conversation.
-Continuation cannot publish through the worker's GitHub proxy or safe-push
-helper; the supervisor verifies the resulting source before publication. Changed
+A clean three-way integration is attempted mechanically and reverified. Changes
+already included by another writer, including a remote tree with additional work,
+are archived as obsolete. A model runs only for failed source verification or an
+integration that needs source reasoning. Unfinished native merge/rebase operations
+whose metadata v1 did not retain are blocked until their parents/metadata are
+explicitly reconstructed; they never become an accidental single-parent replay. It receives a narrow checkpoint-only
+prompt and the original profile/permissions, plus fresh subscription admission that honors pacing even when a normal loop child
+received an internal quota override, or fresh API budget admission. A matching durable provider conversation is preferred;
+a missing or mismatched stable account identity/profile or absent local session
+artifact starts a narrow new conversation. OAuth refresh preserves account
+identity. During a resume, the original cwd is bound to the isolated checkout in
+the same containing namespace so historical absolute paths cannot edit the live
+worker checkout. The GitHub proxy, safe-push helper and pre-push hook reject
+continuation publication; its origin is fetch-only and GitHub token environment
+variables are removed. The supervisor verifies the resulting source before
+publication and checks committed blob bytes, paths and executable bits against
+the verified inventory. Recovery commits disable hooks. Changed
 source is retained using the same checkpoint format. Content repair allowances
-remain separate from infrastructure retries. Full verification is required;
+remain separate from infrastructure retries; known failures before model launch
+refund content allowances. Publication includes only tracked changes and declared
+untracked source covered by the verifier. Ignored drafts outside that inventory,
+provider settings, notes and logs stay archived outside the publication checkout;
+continuation diagnostics are written below the recovery record, outside source. Full verification is required;
 recovery does not introduce a new source-only push-red route.
 
 One invocation and at most eight record inspections are allowed per phase, with
@@ -174,6 +189,9 @@ a cursor to avoid starvation. Infrastructure failures retry after 60, 300 and
 1800 seconds; three failed invocations for unchanged checkpoint/external facts
 block further invocations. Claim, verification-capacity, policy and admission
 waits do not consume those attempts. Changed PR facts re-enable eligibility.
+Blocked records and selection-local waits do not schedule recovery-only children.
+Quota-independent probes run at most once per five minutes; a probe that made no
+progress returns no-progress, preserving normal work and backoff behavior.
 An operator can place `{"retry_epoch": 1}` in a record's `operator.json` after
 repairing infrastructure; changing the epoch re-enables the bounded retries.
 `content_allowance` can explicitly authorize another narrow continuation without
@@ -182,11 +200,17 @@ publication authorization, sandbox-required rounds without a supported isolated
 sandbox recovery backend, unsupported destinations, new-PR authoring without a
 structured PR target, and exact one-launch foreign canaries retain a structured
 blocked disposition rather than gaining inferred permission. A trusted operator
-may supply the original structured `authorization` in `operator.json`.
+may supply the original structured `authorization` and an explicitly identified
+original `pr` in `operator.json`. After reconstructing and finishing a native
+operation in `record/checkout`, `operation_repaired: true` allows exact verification
+and current-head integration under the same publication checks.
 
 `tauceti recovery --json` and prepared local activity expose the consumer's durable
 state/reason; status does not read GitHub. For the historical PR16035 case, see
 [evidence/issue-310-pr16035-disposition.json](evidence/issue-310-pr16035-disposition.json).
+Terminal recovery evicts rebuildable caches from its isolated/restoration clones;
+source, Git history, immutable records and outboxes remain archived.
+
 The production disposition is also retained under the main worker state tree's
 `recovery-dispositions/pr-16035.json`; its search scope is explicitly local.
 

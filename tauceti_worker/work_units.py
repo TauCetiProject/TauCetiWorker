@@ -1714,6 +1714,14 @@ def _do_fixlike(
                 expected_head=checked,
                 authorization=dict(
                     actor=getattr(sv, "me_login", ""),
+                    git_author=dict(
+                        name=subprocess.run(
+                            ["git", "config", "user.name"], cwd=co, capture_output=True, text=True
+                        ).stdout.strip(),
+                        email=subprocess.run(
+                            ["git", "config", "user.email"], cwd=co, capture_output=True, text=True
+                        ).stdout.strip(),
+                    ),
                     author=getattr(p, "author", ""),
                     repository=f"{p.head_owner}/{p.head_repo}",
                     ref=p.head_ref,

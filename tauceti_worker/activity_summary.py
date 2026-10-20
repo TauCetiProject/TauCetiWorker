@@ -10,7 +10,28 @@ from decimal import Decimal
 
 WINDOWS = ("3h", "24h", "7d", "total")
 COST_WINDOWS = ("7d", "total")
-RECOVERY_COUNTS = ("records", "retained", "blocked", "preserved", "reset", "superseded", "incomplete", "corrupt")
+RECOVERY_COUNTS = (
+    "records",
+    "retained",
+    "blocked",
+    "preserved",
+    "reset",
+    "superseded",
+    "incomplete",
+    "corrupt",
+) + tuple(
+    "recovery_" + state
+    for state in (
+        "retained",
+        "eligible",
+        "resuming",
+        "verified",
+        "publication_pending",
+        "published",
+        "obsolete",
+        "blocked",
+    )
+)
 
 
 def amount(value, *, rate=False):
@@ -267,6 +288,22 @@ def display(value, default_kinds=()):
             f"{recovery.get('retained', 0)} checkouts moved aside, "
             f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt"
         )
+        if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):
+            print(
+                "Repair recovery: "
+                + ", ".join(
+                    f"{recovery.get('recovery_' + state, 0)} {state.replace('_', '-')}"
+                    for state in (
+                        "eligible",
+                        "resuming",
+                        "verified",
+                        "publication_pending",
+                        "published",
+                        "obsolete",
+                        "blocked",
+                    )
+                )
+            )
         for reason in recovery.get("reasons", []):
             print("  " + reason)
     if ci_rows:

@@ -1186,7 +1186,7 @@ def cmd_recovery(args) -> int:
         target = f" #{row['pr']}" if row["pr"] else ""
         print(f"{row['worker']}: {row['state']} {row['record'] or '(incomplete save)'} {row['work'] or ''}{target}")
         if row["reason"]:
-            print(f"  {row['reason']}")
+            print("  " + work_recovery.describe_reason(row["reason"]))
     return 0
 
 
@@ -1382,32 +1382,42 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             from .repair_recovery import recover
             from .work_recovery import guard
 
-            mirror_creds(cfg)
-            if (cfg.checkout / ".git").exists():
-                guard(cfg, cfg.checkout)  # Preserve the last round before selecting recovery.
-            recovery_gh = GitHub()
-            recovery_worker = Worker(
-                cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
-            )
-            recovery_opts = RoundOpts(
-                only=only,
-                agent=agent,
-                work_model="auto",
-                sandbox_host=not getattr(args, "bubble", False),
-                dry_run=False,
-                prs=prs,
-                account=getattr(args, "account", None),
-                ignore_quota=ignore_quota,
-                authoring_profile=(
-                    resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
-                    if agent != "auto" and (author_model or author_effort)
-                    else None
-                ),
-            )
-            if recover(recovery_worker, recovery_opts):
-                return 0
+            try:
+                mirror_creds(cfg)
+                if (cfg.checkout / ".git").exists():
+                    guard(cfg, cfg.checkout)  # Preserve the last round before selecting recovery.
+                recovery_gh = GitHub()
+                recovery_worker = Worker(
+                    cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
+                )
+                recovery_opts = RoundOpts(
+                    only=only,
+                    agent=agent,
+                    work_model="auto",
+                    sandbox_host=not getattr(args, "bubble", False),
+                    dry_run=False,
+                    prs=prs,
+                    account=getattr(args, "account", None),
+                    ignore_quota=ignore_quota,
+                    authoring_profile=(
+                        resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
+                        if agent != "auto" and (author_model or author_effort)
+                        else None
+                    ),
+                )
+                if recover(recovery_worker, recovery_opts):
+                    return 0
+            except Exception as error:
+                log(f"recovery phase deferred; existing source is preserved: {type(error).__name__}: {error}")
+                report_runtime(
+                    recovery_reason=dict(
+                        code="recovery-phase-unavailable",
+                        detail=str(error),
+                        next_action="Repair recovery state storage or its local prerequisites",
+                    )
+                )
             if getattr(args, "recovery_only", False):
-                return 0
+                return EX_NOPROGRESS
 
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,

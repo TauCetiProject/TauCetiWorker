@@ -813,6 +813,7 @@ def run_agent_host(
     session_path=None,
     session_actor=None,
     session_scope=None,
+    original_cwd=None,
 ) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
@@ -848,20 +849,27 @@ def run_agent_host(
             argv += [resume, prompt]
         elif profile.provider == "claude":
             argv += ["--resume", resume]
+    if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
     if session_path:
         from .repair_recovery import conversation_identity
         from .runtime_status import atomic_json
 
-        atomic_json(
-            session_path,
-            dict(
-                profile=asdict(profile),
-                actor=session_actor,
-                identity=conversation_identity(profile.provider),
-                scope=session_scope,
-                session=resume,
-            ),
-        )
+        try:
+            atomic_json(
+                session_path,
+                dict(
+                    profile=asdict(profile),
+                    actor=session_actor,
+                    identity=conversation_identity(profile.provider),
+                    scope=session_scope,
+                    session=resume,
+                ),
+            )
+        except OSError as error:
+            log(f"provider session identity could not be saved: {error}; starting without resumable identity")
+            session_path = None
     if not env.get("TAUCETI_VERIFY_BASE") and (cwd / ".git").exists():
         from .verification_scope import local_main
 
@@ -873,6 +881,15 @@ def run_agent_host(
         return 0
     _LAST_AGENT_FAILURE = None
     with host_build_cache_context(cwd, env, logdir) as prefix:
+        if original_cwd is not None:
+            if not containment.strong():
+                raise BuildCacheUnavailable("Recovery conversation cwd isolation requires strong containment")
+            # Keep one containing boundary. Existing conversation cwd lookup and
+            # absolute paths resolve to the recovery source through this bind.
+            prefix = list(prefix or containment.command())
+            if prefix[-1] != "--":
+                raise BuildCacheUnavailable("Cannot compose the recovery cwd view with this containment prefix")
+            prefix[-1:-1] = ["--bind", str(cwd), str(original_cwd), "--chdir", str(original_cwd)]
         rc = run_agent_proc(
             argv,
             env=env,
@@ -1124,6 +1141,8 @@ def run_agent_proc(
                             _fsync_dir(session_path.parent)
                     except (ValueError, AttributeError):
                         pass
+                    except OSError as error:
+                        log(f"provider session identity could not be saved: {error}; source remains recoverable")
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)

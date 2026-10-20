@@ -587,13 +587,13 @@ def _update_refs(repo: Path, commands: list[str], *, check: bool = True) -> None
 def _supersede(cfg, repo: Path, current: Path | None) -> None:
     """Records left `recovery-blocked` by the earlier blocking guard no longer describe the checkout.
     Their data is kept; only the disposition changes."""
-    for _, record, manifest, status in records(cfg.state.parent, workers={cfg.state.name}):
+    for _, record, manifest, _status in records(cfg.state.parent, workers={cfg.state.name}):
         if (
             record is not None
             and record != current
             and manifest is not None
             and manifest.get("checkout") == str(repo)
-            and status.get("state") == "recovery-blocked"
+            and read_json(record / "status.json").get("state") == "recovery-blocked"
         ):
             _set_status(
                 record, "superseded", f"checkout changed; see {current.name if current else 'a clean checkout'}"
@@ -863,9 +863,28 @@ def records(state_root: Path | None = None, *, workers=None):
                 )
 
 
+def describe_reason(value):
+    if isinstance(value, dict):
+        return str(value.get("detail") or value.get("code") or "") + (
+            f"; next action: {value['next_action']}" if value.get("next_action") else ""
+        )
+    return str(value)
+
+
 def summary(state_root: Path | None = None, *, workers=None) -> dict:
     """Background preparation only; status reads the resulting JSON and never GitHub."""
     counts = dict(records=0, retained=0, blocked=0, preserved=0, reset=0, superseded=0, incomplete=0, corrupt=0)
+    for state in (
+        "retained",
+        "eligible",
+        "resuming",
+        "verified",
+        "publication-pending",
+        "published",
+        "obsolete",
+        "blocked",
+    ):
+        counts["recovery_" + state.replace("-", "_")] = 0
     reasons = set()
     for worker, record, manifest, status in records(state_root, workers=workers):
         if record is None:
@@ -877,13 +896,22 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
             continue
         counts["records"] += 1
         state = status.get("state")
+        if status.get("schema") == "tauceti-work-recovery-consumer/v1":
+            key = "recovery_" + str(state).replace("-", "_")
+            if key in counts:
+                counts[key] += 1
+            if state == "blocked":
+                counts["blocked"] += 1
+            if status.get("reason"):
+                reasons.add(f"{worker}/{record.name}: {describe_reason(status['reason'])}")
+            continue
         if state == "retained":
             counts["retained"] += 1
             reasons.add(f"{worker}: {status.get('reason') or 'checkout moved aside'}")
         elif state in ("recovery-blocked", "blocked"):
             counts["blocked"] += 1
             if status.get("reason"):
-                reasons.add(f"{worker}/{record.name}: {status['reason']}")
+                reasons.add(f"{worker}/{record.name}: {describe_reason(status['reason'])}")
         elif state == "checkout-reset":
             counts["reset"] += 1
         elif state == "superseded":

@@ -108,6 +108,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
     admission_streak = 0
+    recovery_probe_at = 0.0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -130,7 +131,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             resume_pending(cfg, background=True)
             from .repair_recovery import due
 
-            recovery_only = "security-audit" not in only and due(cfg)
+            recovery_only = (
+                "security-audit" not in only
+                and time.time() >= recovery_probe_at
+                and due(cfg, only=only, prs=prs, sandbox_host=not bubble)
+            )
             if not recovery_only and api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
@@ -325,6 +330,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
             round_started = time.time()
             rc = run_round_subprocess(tail)
+            if recovery_only:
+                recovery_probe_at = time.time() + 300  # At most one quota-independent probe per five minutes.
             if rc in (124, 137, 143) and waiting_for_capacity(cfg, since=round_started):
                 rc = EX_VERIFICATION_WAIT
             if rc == EX_DOCUMENTATION_WAIT:

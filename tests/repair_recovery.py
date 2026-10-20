@@ -298,21 +298,38 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["reason"]["code"], "source-superseded")
         self.assertEqual(FakeVerification.calls, 0)
 
-    def test_head_moved_requires_continuation(self):
-        # A new writer's commit changes another file, so this checkpoint needs integration.
+    def advance_writer(self, *, conflicting=False, already_integrated=False):
         other = self.root / "other"
         subprocess.run(["git", "clone", "-q", str(self.remote), str(other)], check=True)
-        (other / "Other.lean").write_text("other writer\n")
+        if already_integrated:
+            saved.restore(self.record, other)
+        (other / ("A.lean" if conflicting else "Other.lean")).write_text("other writer\n")
         git(other, "add", "-A")
         git(other, "-c", "user.name=other", "-c", "user.email=other@example.com", "commit", "-qm", "other writer")
         git(other, "push", "-q", "origin", "HEAD:main")
         self.current["head"] = git(self.remote, "rev-parse", "main")
+
+    def test_head_moved_clean_merge_uses_zero_paid_invocations(self):
+        self.advance_writer()
+        self.assertTrue(self.run_recovery())
+        self.assertTrue(self.journal()["mechanical_integration"])
+        self.assertEqual(git(self.remote, "show", "main:Other.lean"), "other writer")
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained repair")
+
+    def test_head_moved_conflict_requires_admitted_continuation(self):
+        self.advance_writer(conflicting=True)
         with patch.object(self.backend, "continue_source", side_effect=rr.Wait("budget-refused", "no funds")) as model:
             self.assertFalse(self.run_recovery())
         self.assertEqual(model.call_args.args[4], "remote-head-moved-reintegration-required")
         self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.current["head"])
         self.assert_retained()
+
+    def test_other_writer_superseded_source_plus_more(self):
+        self.advance_writer(already_integrated=True)
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(FakeVerification.calls, 0)
 
     def test_claim_loss_and_changed_head_before_push(self):
         actual = self.backend.verify
@@ -327,11 +344,22 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["reason"]["code"], "claim-or-head-changed")
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
-    def test_outbox_uncertainty_reconciles_without_duplicate_push(self):
-        with patch("tauceti_worker.github_outbox.pending_for", return_value=True):
-            self.assertFalse(self.run_recovery())
-            self.assertFalse(self.run_recovery())
-        self.retry_now()
+    def test_unrelated_outbox_does_not_hide_confirmed_git_publication(self):
+        with (
+            patch("tauceti_worker.github_outbox.pending_for", return_value=True),
+            patch("tauceti_worker.github_outbox.drain") as drain,
+        ):
+            self.assertTrue(self.run_recovery())
+            drain.assert_not_called()
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
+
+    def test_remote_uncertainty_is_reconciled_before_replay(self):
+        with patch.object(self.backend, "reconcile", side_effect=RuntimeError("remote read unavailable")):
+            for _ in range(3):
+                self.assertFalse(self.run_recovery())
+                self.retry_now()
+        self.assertEqual(self.journal()["state"], "blocked")
         self.assertTrue(self.run_recovery())
         self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
 
@@ -347,8 +375,35 @@ class Fixture(unittest.TestCase):
         self.assertIn("inputs changed", self.journal()["reason"]["detail"])
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
+    def test_recovery_commit_does_not_execute_source_mutating_hooks(self):
+        actual = self.backend.prepare
+
+        def install_hook(checkout, *args):
+            hook = checkout / ".git/hooks/pre-commit"
+            hook.write_text('#!/bin/sh\nprintf "unverified hook change\\n" > A.lean\ngit add A.lean\n')
+            hook.chmod(0o755)
+            return actual(checkout, *args)
+
+        with patch.object(self.backend, "prepare", install_hook):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained repair")
+
+    def test_final_push_boundary_rechecks_exact_inputs(self):
+        actual = self.backend.prepare
+
+        def change_inputs(checkout, *args):
+            publication = actual(checkout, *args)
+            self.backend.verification_fingerprint = lambda *args: "changed-toolchain-or-source"
+            return publication
+
+        with patch.object(self.backend, "prepare", change_inputs):
+            self.assertFalse(self.run_recovery())
+        self.assertIn("final push boundary", self.journal()["reason"]["detail"])
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+
     def test_justified_continuation_fresh_admission_and_reverify(self):
         FakeVerification.failures = 1
+        self.opts.ignore_quota = True
         with (
             patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)) as admission,
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
@@ -357,6 +412,7 @@ class Fixture(unittest.TestCase):
             self.assertTrue(self.run_recovery())
         admission.assert_called_once()
         self.assertTrue(admission.call_args.kwargs["fresh"])
+        self.assertFalse(admission.call_args.kwargs["ignore_quota"])
         model.assert_called_once()
         self.assertEqual(FakeVerification.calls, 2)
         self.assertEqual(self.journal()["continuation_reason"], "exact-source-verification-failed")
@@ -466,11 +522,277 @@ class Fixture(unittest.TestCase):
             self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["attempts"], 1)
 
+    def save_updated_checkpoint(self):
+        self.record = saved._record(
+            self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=self.owner
+        )
+        self.manifest = saved._complete(self.record)
+
+    def test_ignored_and_scratch_files_are_archived_without_publication(self):
+        (self.co / ".gitignore").write_text(".lake/\nprivate-draft.txt\n")
+        (self.co / "private-draft.txt").write_text("retained draft bytes")
+        (self.co / "notes.md").write_text("retained scratch bytes")
+        (self.co / ".claude").mkdir()
+        (self.co / ".claude/settings.local.json").write_text("private settings")
+        self.save_updated_checkpoint()
+        self.assertTrue(self.run_recovery())
+        paths = git(self.remote, "ls-tree", "-r", "--name-only", "main").splitlines()
+        for rel in ("private-draft.txt", "notes.md", ".claude/settings.local.json"):
+            self.assertNotIn(rel, paths)
+        self.assertTrue(list(self.record.glob("retained-extra/*/notes.md")))
+        self.assert_retained()
+
+    def test_scratch_only_record_is_obsolete_without_build_or_model(self):
+        git(self.co, "reset", "--hard", self.base)
+        (self.co / "binary").unlink()
+        (self.co / "link").unlink()
+        (self.co / "notes.md").write_text("draft diagnostics")
+        self.save_updated_checkpoint()
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(FakeVerification.calls, 0)
+
+    def test_label_churn_does_not_reset_infrastructure_allowance(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("infrastructure")):
+            for count in range(1, 4):
+                self.current["labels"] = [f"status/{count}"]
+                self.retry_now() if self.journal() else None
+                self.assertFalse(self.run_recovery())
+                self.assertEqual(self.journal()["attempts"], count)
+        self.assertEqual(self.journal()["state"], "blocked")
+
+    def test_no_model_cache_outage_preserves_content_allowance(self):
+        from tauceti_worker.agents import BuildCacheUnavailable
+
+        FakeVerification.failures = 1
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=BuildCacheUnavailable("cache offline")),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.values["fix-10-head"], 0)
+        self.assertEqual(self.journal()["attempts"], 1)
+
+    def test_blocked_backlog_does_not_schedule_recovery_only_children(self):
+        for n in range(40):
+            record = self.cfg.state / "recovery" / f"blocked-{n}"
+            rr.write(
+                record, {}, "blocked", reason=rr.reason(rr.Block("missing-publication-scope", "legacy")), retry_at=0
+            )
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            reason=rr.reason(rr.Block("original-authorization-missing", "legacy")),
+            retry_at=0,
+        )
+        self.assertFalse(rr.due(self.cfg))
+        with patch.object(saved, "_complete", side_effect=AssertionError("Blocked records must not rehash source")):
+            self.assertFalse(rr.recover(self.w, self.opts))
+        from tauceti_worker import loop
+
+        tails = []
+
+        def run(tail):
+            tails.append(tail)
+            raise KeyboardInterrupt()
+
+        with (
+            patch.object(loop, "fleet_admission_reason", return_value=None),
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("claude", {})),
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop, "run_round_subprocess", run),
+        ):
+            args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None)
+            self.assertEqual(loop.cmd_loop(args, self.cfg, only=["fix"], agent="claude"), 130)
+        self.assertNotIn("--recovery-only", tails[0])
+        rr.atomic_json(self.record / "operator.json", dict(retry_epoch=1))
+        self.assertTrue(rr.due(self.cfg))
+
+    def test_one_invocation_even_when_capacity_refunds_attempt(self):
+        other = self.record.parent / "second"
+        other.mkdir()
+        for path in self.record.iterdir():
+            if path.is_file():
+                (other / path.name).write_bytes(path.read_bytes())
+        with patch.object(rr.WorkerBackend, "verify", side_effect=rr.Wait("verification-capacity", "busy")) as verify:
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(verify.call_count, 1)
+
+    def test_unfinished_native_git_operation_is_durably_blocked(self):
+        (self.co / ".git/MERGE_HEAD").write_text(self.base + "\n")
+        self.save_updated_checkpoint()
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "incomplete-git-operation")
+        self.assertFalse((self.record / "checkout").exists())
+
+    def test_git_clean_filter_cannot_publish_different_bytes(self):
+        (self.co / ".gitattributes").write_text("A.lean filter=poison\n")
+        git(self.co, "add", ".gitattributes")
+        self.save_updated_checkpoint()
+        actual = self.backend.verify
+
+        def configure_filter(checkout, *args):
+            git(checkout, "config", "filter.poison.clean", "sed s/retained/unverified/g")
+            return actual(checkout, *args)
+
+        with patch.object(self.backend, "verify", configure_filter):
+            self.assertFalse(self.run_recovery())
+        self.assertIn("Committed source differs", self.journal()["reason"]["detail"])
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+
+    def test_terminal_recovery_evicts_only_rebuildable_caches(self):
+        actual = self.backend.verify
+
+        def cache(checkout, *args):
+            (checkout / ".lake").mkdir(exist_ok=True)
+            (checkout / ".lake/large-build").write_bytes(b"cache")
+            return actual(checkout, *args)
+
+        with patch.object(self.backend, "verify", cache):
+            self.assertTrue(self.run_recovery())
+        self.assertFalse((self.record / "checkout/.lake").exists())
+        self.assert_retained()
+
+    def test_consumer_status_is_distinct_from_moved_aside_checkout(self):
+        rr.write(self.record, {}, "retained")
+        summary = saved.summary(self.cfg.state.parent, workers={"w"})
+        self.assertEqual(summary["recovery_retained"], 1)
+        self.assertEqual(summary["retained"], 0)
+        rr.write(
+            self.record, {}, "blocked", reason=rr.reason(rr.Block("repair", "precise failure", "restore dependency"))
+        )
+        summary = saved.summary(self.cfg.state.parent, workers={"w"})
+        self.assertIn("next action: restore dependency", summary["reasons"][0])
+
+    def test_valid_original_conversation_resumes_in_original_cwd_alias(self):
+        FakeVerification.failures = 1
+        recovery = rr.Recovery(self.record, self.backend)
+        recovery.manifest["conversation"] = dict(
+            profile=asdict(self.profile),
+            actor="alice",
+            identity="account-a",
+            session="session-12345",
+            scope=dict(repository="upstream/repo", pr=10, source_round="round-10"),
+        )
+        with (
+            patch.object(rr, "conversation_identity", return_value="account-a"),
+            patch.object(rr, "session_available", return_value=True),
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", return_value=0) as model,
+        ):
+            self.assertTrue(recovery.run())
+        self.assertEqual(model.call_args.kwargs["resume"], "session-12345")
+        self.assertEqual(model.call_args.kwargs["original_cwd"], self.co)
+
+    def test_continuation_raw_git_push_is_denied_but_supervisor_can_publish(self):
+        actual = self.backend.verify
+
+        def try_push(checkout, *args):
+            git(checkout, "add", "-u")
+            git(
+                checkout,
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-qm",
+                "private source checkpoint",
+            )
+            with rr.environment(TAUCETI_RECOVERY_CONTINUATION="1"):
+                attempt = subprocess.run(
+                    ["git", "-C", str(checkout), "push", str(self.remote), "HEAD:main"], capture_output=True
+                )
+            self.assertNotEqual(attempt.returncode, 0)
+            self.assertIn(b"supervisor", attempt.stderr)
+            self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+            return actual(checkout, *args)
+
+        with patch.object(self.backend, "verify", try_push):
+            self.assertTrue(self.run_recovery())
+
+    def test_lifted_hold_reenables_a_previously_exhausted_checkpoint(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            for _ in range(3):
+                self.run_recovery()
+                self.retry_now()
+        self.current["labels"] = ["hold"]
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "pr-held")
+        self.current["labels"] = []
+        self.retry_now()
+        self.assertTrue(self.run_recovery())
+
+    def test_changed_round_scope_reenables_local_policy_wait(self):
+        self.opts.only = ["review"]
+        self.assertFalse(self.run_recovery())
+        self.assertFalse(rr.due(self.cfg, only=["review"]))
+        self.assertTrue(rr.due(self.cfg, only=["fix"]))
+        self.opts.only = ["fix"]
+        self.assertTrue(self.run_recovery())
+
     def test_damaged_checkpoint_never_runs(self):
         (self.record / "staged.patch").write_text("corrupt")
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "corrupt-checkpoint")
         self.assertFalse((self.record / "checkout").exists())
+
+
+class ConversationIsolation(unittest.TestCase):
+    def test_oauth_refresh_keeps_account_identity_and_switch_invalidates_it(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for provider, envkey, filename, initial, refreshed in (
+                (
+                    "codex",
+                    "CODEX_HOME",
+                    "auth.json",
+                    {"tokens": {"account_id": "account-a", "access_token": "old"}},
+                    {"tokens": {"account_id": "account-a", "access_token": "new"}},
+                ),
+                (
+                    "claude",
+                    "CLAUDE_CONFIG_DIR",
+                    ".credentials.json",
+                    {"claudeAiOauth": {"accountUuid": "account-a", "accessToken": "old"}},
+                    {"claudeAiOauth": {"accountUuid": "account-a", "accessToken": "new"}},
+                ),
+            ):
+                with patch.dict(os.environ, {envkey: str(root), "TAUCETI_CLAUDE_BILLING": "subscription"}):
+                    rr.atomic_json(root / filename, initial)
+                    before = rr.conversation_identity(provider)
+                    rr.atomic_json(root / filename, refreshed)
+                    self.assertEqual(before, rr.conversation_identity(provider))
+                    rr.atomic_json(root / filename, {})
+                    self.assertIsNone(rr.conversation_identity(provider))
+
+    def test_original_absolute_cwd_maps_to_isolated_source(self):
+        from tauceti_worker import agents, containment
+
+        if not containment.capability().strong:
+            self.skipTest("rootless PID namespace unavailable")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            original, isolated = root / "original", root / "isolated"
+            original.mkdir()
+            isolated.mkdir()
+            (original / "source").write_text("live")
+            (isolated / "source").write_text("retained")
+            profile = agents.AuthoringProfile("claude", "fixture", "high", "fixture", "fixture")
+            script = f"from pathlib import Path; Path({str(original / 'source')!r}).write_text('repaired')"
+            with patch.object(
+                agents, "host_agent_argv", return_value=([sys.executable, "-c", script], os.environ.copy())
+            ):
+                self.assertEqual(
+                    agents.run_agent_host(isolated, "fixture", profile, root / "logs", original_cwd=original), 0
+                )
+            self.assertEqual((original / "source").read_text(), "live")
+            self.assertEqual((isolated / "source").read_text(), "repaired")
 
 
 class RealVerifierIntegration(unittest.TestCase):
