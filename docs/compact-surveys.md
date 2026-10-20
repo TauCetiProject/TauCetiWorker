@@ -40,7 +40,19 @@ cached histories enter review/fix classification; contest reaction claims are
 checked for the selected candidate at dispatch. Missing necessary coverage is
 reported and prevents new authoring, while known actionable work can proceed.
 The configured shared service becoming unavailable pauses global discovery;
-it never triggers a bulk direct-history fallback. Explicitly scoped rounds keep
+it never triggers a bulk direct-history fallback. The round exits as a typed
+dependency wait (`EX_GITHUB_WAIT`), not as no-work: it charges no PR repair
+allowance and no no-progress backoff, and the runtime status records
+`wait_dependency`, `wait_reason` (for example `http_503`, `timeout`,
+`connection`, `invalid_response`, `incompatible_protocol`,
+`coverage_unavailable`, `mixed_revision`) and a bounded, credential-free
+`wait_detail`. The worker rechecks at the shared circuit's jittered retry time
+and resumes on its own once a single half-open probe succeeds. Client
+authentication or configuration failure is instead reported as a failed round
+that names the operator action. A retained complete response keeps its
+revision, coverage and observed/verified timestamps bound to its query and
+client identity; it informs the wait report but never stands in for current
+coverage or an empty inventory. Explicitly scoped rounds keep
 the existing fallback, and installations without a shared service continue to
 use the direct facade and its existing transport budgets.
 

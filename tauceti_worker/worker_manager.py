@@ -1413,6 +1413,11 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             if state == "running":
                 detail_values = [_runtime_summary(part) for part in detail_values]
             lines.extend(_status_field(label, detail_values, width))
+        if state == "waiting-github" and item.get("wait_dependency"):
+            cause = str(item.get("wait_reason") or "unavailable")
+            if item.get("wait_detail"):
+                cause += f" ({item['wait_detail']})"
+            lines.extend(_status_field("waiting", [f"{item['wait_dependency']}: {cause}"], width))
         if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
             label = "retry" if state == "backoff" else "recheck"
             lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))

@@ -129,9 +129,15 @@ class Round:
             with contextlib.suppress(Exception):
                 if blocking_event_since(self.started_at):
                     code = 77
-        if code in (76, 77) or type(exc).__name__ in ("AdmissionUnavailable", "GitHubUnavailable"):
+        if code in (76, 77) or type(exc).__name__ in (
+            "AdmissionUnavailable",
+            "GitHubUnavailable",
+            "SharedStateUnavailable",
+        ):
             # Waiting for permission to work is not a finished work round.
-            emit("round_waited", key=self.id + ":wait", round_id=self.id, worker=self.worker)
+            failure = getattr(exc, "failure", None) or {}
+            dependency = {k: failure[k] for k in ("dependency", "reason") if failure.get(k)}
+            emit("round_waited", key=self.id + ":wait", round_id=self.id, worker=self.worker, **dependency)
             if _round is self:
                 _round = None
             return

@@ -286,7 +286,15 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             source = getattr(args, "source", None)
             if source is not None:
                 tail += ["--source", source]
-            report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
+            report_runtime(
+                "surveying",
+                detail="selecting the next work unit",
+                next_action_at=None,
+                wait_dependency=None,
+                wait_reason=None,
+                wait_detail=None,
+                wait_cached=None,
+            )
             rc = run_round_subprocess(tail)
 
             if rc == EX_ADMISSION_WAIT:

@@ -1583,6 +1583,7 @@ def cli_main() -> int:
 
     def github_pause(error, retry_at=None):
         log(str(error))
+        failure = getattr(error, "failure", None) or {}
         report_runtime(
             "waiting-github",
             detail=str(error),
@@ -1590,6 +1591,11 @@ def cli_main() -> int:
             failure_reason=None,
             failure_code=None,
             failure_log=None,
+            # Prepared for status readers: which dependency, and its concrete sanitized cause.
+            wait_dependency=failure.get("dependency"),
+            wait_reason=failure.get("reason"),
+            wait_detail=failure.get("detail") or None,
+            wait_cached=failure.get("cached"),
         )
         return EX_GITHUB_WAIT
 

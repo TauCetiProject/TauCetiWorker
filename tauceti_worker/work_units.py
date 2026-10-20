@@ -42,6 +42,7 @@ from .config import (
     Config,
     Die,
     NoProgress,
+    SharedStateUnavailable,
     is_git_url,
     log,
     one_line,
@@ -400,6 +401,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             # silently fall back to thousands of direct comment requests.
             cached_only=global_pick and bool(os.environ.get("TAUCETI_GITHUB_STATE_URL")),
         )
+    if sv.dependency_wait:
+        # Unknown global coverage is neither an empty backlog nor a failed round. Nothing is selected,
+        # so no PR repair allowance is charged; the loop resumes at the circuit's retry time.
+        why = "; ".join(sv.errors)
+        if sv.dependency_wait.get("actionable"):
+            raise Die(f"{why} — operator action required: check the shared GitHub state URL and client token")
+        raise SharedStateUnavailable(f"{why} — waiting, not falling through to authoring", sv.dependency_wait)
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
