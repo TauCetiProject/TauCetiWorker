@@ -1834,9 +1834,9 @@ def _do_progress_inner(w, opts) -> int | None:
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
-    if (roadmap_dir / ".git").is_dir():
-        from .work_recovery import guard
+    from .work_recovery import guard, note_owner
 
+    if (roadmap_dir / ".git").is_dir():
         # `apply` commits and pushes here; a leftover from an interrupted apply is saved, not discarded.
         decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
         if not decision.ok:
@@ -1855,6 +1855,8 @@ def _do_progress_inner(w, opts) -> int | None:
         roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
         if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
             raise Die(f"cloning {ROADMAP} failed")
+    if not note_owner(w.cfg, "progress-roadmap", work="progress"):
+        raise Die(f"could not record the round that owns {roadmap_dir}")
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
     if not prepare_checkout(w.cfg, work="progress"):

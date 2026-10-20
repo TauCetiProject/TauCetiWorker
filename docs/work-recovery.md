@@ -18,20 +18,24 @@ left the source. Each record is private to its worker (mode `0700`/`0600`):
 | `commits.bundle` | unpublished commits; absent when there are none |
 | `staged.patch` | binary diff of the index against HEAD |
 | `unstaged.patch` | binary diff of the worktree against the index |
-| `untracked.tar` | untracked source with original relative paths, plus conflicted paths; symlinks are stored as links and never followed |
+| `untracked.tar` | untracked and ignored source with original relative paths, plus the bytes of conflicted and assume-unchanged/skip-worktree paths; symlinks are stored as links and never followed |
 | `status.json` | mutable disposition: `preserved`, `recovery-blocked`, `checkout-reset` or `superseded` |
 
 The worker writes into a `.tmp-*` directory and fsyncs every file and the
 directory. It then renames the directory into place and fsyncs the parent.
-`manifest.json` is written last, so a directory without a valid manifest is
-never treated as a record. An interrupted save leaves at most a `.tmp-*`
+`manifest.json` is written last and lists each payload's size and digest. A
+record is trusted (for reuse, for exempting its commits, or for restore) only
+when every payload matches; a damaged record is reported as corrupt, kept, and
+replaced by a fresh copy. An interrupted save leaves at most a `.tmp-*`
 directory, which status reports as incomplete. Nothing in `state/*/recovery`
 is ever deleted automatically.
 
 Excluded by name: dependency and build caches (`.lake`, `node_modules`,
-`__pycache__` and similar) and credential-like files (`.env*`, `.netrc`,
-`*.pem`, `*.key`, SSH keys and similar). Ignored files are build output. The
-manifest lists every excluded path with its reason. The untracked archive is
+`__pycache__`, top-level `build`, `*.olean` and similar) and credential-like
+files (`.env*`, `.netrc`, `*.pem`, `*.key`, SSH keys and similar). Being ignored
+is not proof of a cache, because `git clean -x` deletes ignored drafts too, so
+other ignored files are archived. The manifest lists every excluded path with its
+reason, and records conflicted paths deleted from the worktree as `absent`. The untracked archive is
 bounded at 128 MiB and 20,000 files; a larger tree fails the save.
 
 ## When a reset may proceed
@@ -46,7 +50,12 @@ bounded at 128 MiB and 20,000 files; a larger tree fails the save.
   marked `recovery-blocked`, and the round fails with the record path and the
   command to run.
 - **Any process using the checkout** (Linux `/proc` cwd/root/open files) blocks
-  the reset, even after an operator confirmation.
+  the reset whenever anything is unpublished, even after an operator
+  confirmation, and even when the commits were already saved by an earlier
+  attempt.
+- **A late write**: every permission is checked against a final inspection. If
+  the checkout changed after the snapshot was saved, the newer state is saved
+  and judged again.
 - **Saving or inspection fails** (no space, permissions, archive bound, a git
   error): the checkout is left intact and the refusal says why.
 
@@ -69,7 +78,8 @@ in `state/<worker>/checkout-owners/TauCeti.json`.
 
 Publication is decided locally and never from GitHub. A commit is published if
 it is reachable from a remote-tracking ref, or from `refs/tauceti/published/*`.
-`git-safe-push` writes that ref after a successful push. The worker writes one
+`git-safe-push` resolves `HEAD` once, pushes that commit, and records that same
+commit after a successful push. The worker writes one
 for each PR head it checks out. Nothing in this path pushes, opens a PR, or
 infers publication from a transcript.
 
@@ -103,4 +113,12 @@ blocked like any other.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
 table). Preparation then writes no new records, but it still refuses to reset a
-checkout that has a `recovery-blocked` record. Never delete retained records.
+checkout with any record lacking a durable released disposition (`preserved`,
+`checkout-reset` or `superseded`). Never delete retained records.
+
+## Scope
+
+The guard covers the authoring checkout and the progress roadmap clone, where
+work is committed and published. Reference mirrors (`fetch_ref`,
+`fetch_git_source`, shared repository attachments) have pushing disabled and
+are refreshed as throwaway snapshots; nothing written there can be published.

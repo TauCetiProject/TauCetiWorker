@@ -60,10 +60,13 @@ PSEUDO_HEADS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD")
 MAX_UNTRACKED_BYTES = 128 * 1024 * 1024
 MAX_UNTRACKED_FILES = 20000
 
-# Untracked paths that are dependency/build caches, never source.
+# Untracked or ignored paths that are dependency/build caches, never source. Ignored is not by itself
+# proof of a cache: `git clean -x` would delete an ignored draft, so everything else is archived.
 CACHE_DIRS = frozenset(
     {".lake", "lake-packages", ".cache", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache", ".venv"}
 )
+CACHE_TOP = frozenset({"build"})  # Lake's legacy top-level build directory
+CACHE_SUFFIXES = (".olean", ".ilean", ".pyc", ".pyo")
 # Untracked paths that may carry credentials or runtime secrets; recorded by name only.
 SECRET_NAMES = frozenset(
     {
@@ -103,6 +106,8 @@ class Snapshot:
     staged: bytes
     unstaged: bytes
     conflicted: list[str]
+    flagged: list[str]  # assume-unchanged / skip-worktree paths, whose edits a diff would hide
+    absent: list[str]  # conflicted or flagged paths deleted from the worktree
     untracked: list[tuple[str, str]]  # (relative path, kind) for files and links to archive
     excluded: list[tuple[str, str]]  # (relative path, reason)
     operations: list[str]  # merge/rebase/cherry-pick in progress
@@ -112,11 +117,18 @@ class Snapshot:
     @property
     def dirty(self) -> bool:
         """Working-tree source a reset or clean would destroy."""
-        return bool(self.staged or self.unstaged or self.conflicted or self.untracked or self.operations)
+        return bool(
+            self.staged or self.unstaged or self.conflicted or self.flagged or self.untracked or self.operations
+        )
 
     @property
     def needs_record(self) -> bool:
         return self.dirty or bool(self.unpreserved)
+
+    @property
+    def published(self) -> bool:
+        """Nothing a reset could lose: a clean tree and every local commit published."""
+        return not self.dirty and not self.unpublished
 
 
 @dataclass
@@ -150,20 +162,27 @@ def _rev(repo: Path, name: str) -> str | None:
 
 def _excluded(rel: str) -> str | None:
     parts = rel.rstrip("/").split("/")
-    if any(part in CACHE_DIRS for part in parts):
-        return "dependency or build cache"
     name = parts[-1]
+    if any(part in CACHE_DIRS for part in parts) or parts[0] in CACHE_TOP or name.endswith(CACHE_SUFFIXES):
+        return "dependency or build cache"
     if name in SECRET_NAMES or name.startswith(".env.") or name.endswith(SECRET_SUFFIXES):
         return "possible credential or runtime secret"
     return None
 
 
+def _split(raw: bytes) -> list[str]:
+    return sorted(filter(None, raw.decode("utf-8", "surrogateescape").split("\0")))
+
+
 def _untracked(repo: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """Untracked, non-ignored entries, never following a symlink. A nested repository is walked."""
+    """Untracked entries, ignored ones included, never following a symlink. A nested repository or
+    an ignored directory is walked, skipping caches."""
     keep: list[tuple[str, str]] = []
     excluded: list[tuple[str, str]] = []
-    raw = _git(repo, "ls-files", "-z", "--others", "--exclude-standard")
-    for rel in sorted(filter(None, raw.decode("utf-8", "surrogateescape").split("\0"))):
+    listed = _split(_git(repo, "ls-files", "-z", "--others", "--exclude-standard")) + _split(
+        _git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
+    )
+    for rel in sorted(set(listed)):
         why = _excluded(rel)
         if why:
             excluded.append((rel.rstrip("/"), why))
@@ -192,8 +211,9 @@ def _untracked(repo: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]
     return keep, excluded
 
 
-def inspect(repo: Path) -> Snapshot:
-    """Read-only inspection. Raises RecordError when the checkout cannot be read reliably."""
+def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
+    """Read-only inspection. Raises RecordError when the checkout cannot be read reliably.
+    `preserved` names the complete records whose preserved refs may exempt commits from re-recording."""
     head = _rev(repo, "HEAD")
     branch = _git(repo, "symbolic-ref", "-q", "HEAD", check=False, text=True).strip() or None
     tips: dict[str, str] = {}
@@ -219,13 +239,13 @@ def inspect(repo: Path) -> Snapshot:
         return _git(repo, *args, text=True).split()
 
     unpublished = outside(f"--glob={PUBLISHED}")
-    unpreserved = outside(f"--glob={PUBLISHED}", f"--glob={PRESERVED}") if unpublished else []
+    globs = [f"--glob={PRESERVED}/{record_id}" for record_id in preserved or []]
+    unpreserved = outside(f"--glob={PUBLISHED}", *globs) if unpublished else []
 
-    conflicted = sorted(
-        filter(
-            None,
-            _git(repo, "diff", "--name-only", "-z", "--diff-filter=U").decode("utf-8", "surrogateescape").split("\0"),
-        )
+    conflicted = _split(_git(repo, "diff", "--name-only", "-z", "--diff-filter=U"))
+    # `ls-files -v` tags assume-unchanged entries in lowercase and skip-worktree entries with S.
+    flagged = sorted(
+        entry[2:] for entry in _split(_git(repo, "ls-files", "-v", "-z")) if entry[:1].islower() or entry[:1] == "S"
     )
     diff = ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color"]
     staged = b"".join(
@@ -236,11 +256,15 @@ def inspect(repo: Path) -> Snapshot:
     excludes = [f":(exclude,literal){p}" for p in conflicted]
     unstaged = _git(repo, *diff, "--", ".", *excludes)
     untracked, excluded = _untracked(repo)
-    untracked += [
-        (p, "link" if (repo / p).is_symlink() else "file")
-        for p in conflicted
-        if (repo / p).is_symlink() or (repo / p).is_file()
-    ]
+    # Conflicted and flagged paths are saved as bytes; deletion of one is recorded explicitly.
+    absent = []
+    for p in sorted(set(conflicted) | set(flagged)):
+        if (repo / p).is_symlink():
+            untracked.append((p, "link"))
+        elif (repo / p).is_file():
+            untracked.append((p, "file"))
+        elif not (repo / p).exists():
+            absent.append(p)
 
     digest = hashlib.sha256()
     archive_bytes = 0
@@ -267,6 +291,8 @@ def inspect(repo: Path) -> Snapshot:
         staged=hashlib.sha256(staged).hexdigest(),
         unstaged=hashlib.sha256(unstaged).hexdigest(),
         conflicted=conflicted,
+        flagged=flagged,
+        absent=absent,
         untracked=digest.hexdigest(),
     )
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
@@ -280,6 +306,8 @@ def inspect(repo: Path) -> Snapshot:
         staged=staged,
         unstaged=unstaged,
         conflicted=conflicted,
+        flagged=flagged,
+        absent=absent,
         untracked=untracked,
         excluded=excluded,
         operations=operations,
@@ -347,31 +375,77 @@ def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "-", value).strip(".-")[:80] or "unknown"
 
 
+REQUIRED = ("id", "checkout", "fingerprint", "files", "bundle_refs", "local_head")
+PAYLOADS = ("staged.patch", "unstaged.patch", "untracked.tar")
+
+
 def _read_manifest(record: Path) -> dict | None:
     value = read_json(record / "manifest.json")
-    return value if value.get("schema") == SCHEMA and isinstance(value.get("fingerprint"), str) else None
+    if value.get("schema") != SCHEMA or any(key not in value for key in REQUIRED):
+        return None
+    files = value["files"]
+    needed = PAYLOADS + (("commits.bundle",) if value["bundle_refs"] else ())
+    if not isinstance(files, dict) or any(name not in files for name in needed):
+        return None
+    return value
+
+
+def _complete(record: Path, *, digests: bool = True) -> dict | None:
+    """The manifest, if every payload it names is present with the recorded size (and digest)."""
+    manifest = _read_manifest(record)
+    if manifest is None:
+        return None
+    for name, meta in manifest["files"].items():
+        path = record / name
+        try:
+            if path.stat().st_size != meta.get("bytes"):
+                return None
+            if digests and hashlib.sha256(path.read_bytes()).hexdigest() != meta.get("sha256"):
+                return None
+        except OSError:
+            return None
+    return manifest
+
+
+def _sync_record(record: Path) -> None:
+    """Re-establish durability of a reused record: its files, its directory, and the directory chain."""
+    for path in record.iterdir():
+        if path.is_file():
+            with open(path, "rb") as handle:
+                os.fsync(handle.fileno())
+    _fsync_dir(record)
+    _fsync_dir(record.parent)
+    _fsync_dir(record.parent.parent)
 
 
 def owner_path(cfg, label: str = "TauCeti") -> Path:
     return cfg.state / "checkout-owners" / f"{label}.json"
 
 
-def note_owner(cfg, label: str = "TauCeti", **fields) -> None:
-    """Record which round now owns the checkout, so a later record names the round that left the source."""
+def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
+    """Record which round now owns the checkout, so a later record names the round that left the source
+    and a containment proof for an earlier round cannot vouch for this one. Callers must not hand the
+    checkout to a writer when this returns False."""
     from .activity import current_round_id
 
     path = owner_path(cfg, label)
     fields["round_id"] = fields.get("round_id") or current_round_id()
     previous = read_json(path)
     # A later note from the same round (the PR head it checked out) extends the first one.
-    value = previous if previous.get("round_id") == fields["round_id"] else {}
+    same = fields["round_id"] is not None and previous.get("round_id") == fields["round_id"]
+    value = previous if same else {}
     value.update({k: v for k, v in fields.items() if v is not None})
-    value.setdefault("claimed_at", time.time())
+    if not same:
+        value["round_id"] = fields["round_id"]  # None replaces an earlier round's identity
+        value["claimed_at"] = time.time()
     value["worker"] = getattr(cfg, "wid", None)
     try:
         atomic_json(path, value)
+        _fsync_dir(path.parent)
     except OSError as error:
         log(f"recovery: could not record checkout owner ({error})")
+        return False
+    return True
 
 
 def mark_published(repo: Path, name: str, oid: str) -> None:
@@ -389,12 +463,20 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str) -> Pat
     base_id = _safe_id(str(source_round))
     try:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _fsync_dir(root)
+        _fsync_dir(root.parent)
         existing = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
     except OSError as error:
         raise RecordError(f"could not create {root}: {error}") from None
     for record in existing:
         manifest = _read_manifest(record)
         if manifest and manifest["fingerprint"] == snap.fingerprint and manifest.get("checkout") == str(repo):
+            if _complete(record) is None:
+                continue  # damaged: never trusted, never deleted; write a fresh copy instead
+            try:
+                _sync_record(record)
+            except OSError as error:
+                raise RecordError(f"could not re-sync {record}: {error}") from None
             return record  # this exact source is already durable; never write it twice
     record_id, n = base_id, 1
     while (root / record_id).exists():
@@ -456,6 +538,8 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str) -> Pat
                 basis=f"remote-tracking refs and {PUBLISHED}/*; no GitHub read",
             ),
             conflicted=snap.conflicted,
+            flagged=snap.flagged,
+            absent=snap.absent,
             untracked=[p for p, _ in snap.untracked],
             excluded=[dict(path=p, reason=r) for p, r in snap.excluded],
             files=files,
@@ -510,11 +594,26 @@ def _supersede(cfg, repo: Path, current: Path | None) -> None:
             )
 
 
-def _set_status(record: Path, state: str, reason: str = "") -> None:
+def _set_status(record: Path, state: str, reason: str = "") -> bool:
     try:
         atomic_json(record / "status.json", dict(state=state, reason=reason, updated_at=time.time()))
+        _fsync_dir(record)
     except OSError as error:
         log(f"recovery: could not update {record.name} status ({error})")
+        return False
+    return True
+
+
+RELEASED = ("preserved", "checkout-reset", "superseded")
+
+
+def _preserved(cfg) -> list[str]:
+    """Record ids whose preserved refs may exempt commits: only complete records count."""
+    return [
+        record.name
+        for _, record, _, _ in records(cfg.state.parent, workers={cfg.state.name})
+        if record is not None and _complete(record) is not None
+    ]
 
 
 def live_users(repo: Path) -> list[str]:
@@ -554,12 +653,12 @@ def live_users(repo: Path) -> list[str]:
     return found
 
 
-def quiescence(cfg, repo: Path, record: Path, snap: Snapshot, label: str) -> tuple[str, str]:
+def quiescence(cfg, repo: Path, record: Path | None, snap: Snapshot, label: str) -> tuple[str, str]:
     """('quiescent' | 'active' | 'unknown', detail). Uncertainty is never permission to delete."""
     users = live_users(repo)
     if users:
         return "active", "processes still use the checkout: " + ", ".join(users[:8])
-    confirmed = read_json(record / "operator-quiescence.json")
+    confirmed = read_json(record / "operator-quiescence.json") if record else {}
     if confirmed.get("fingerprint") == snap.fingerprint:
         return "quiescent", "operator confirmed no process uses the checkout"
     # A round-containment owner reports an empty boundary for the exact round that left this source.
@@ -576,7 +675,10 @@ def quiescence(cfg, repo: Path, record: Path, snap: Snapshot, label: str) -> tup
 
 
 def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
-    """Decide whether destructive preparation of `repo` may start, saving source first when needed."""
+    """Decide whether destructive preparation of `repo` may start, saving source first when needed.
+
+    Every permission is checked against a final inspection: if the checkout changed after the
+    snapshot was saved (a late writer), the newer state is saved and judged again."""
     global LAST_REFUSAL
     LAST_REFUSAL = ""
 
@@ -585,53 +687,79 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
         LAST_REFUSAL = reason
         return Decision(False, reason, record, state)
 
+    def blocked(record: Path | None, detail: str, reason: str) -> Decision:
+        if record is not None and not _set_status(record, "recovery-blocked", detail):
+            reason += f" (its recovery-blocked status could not be written; {record} is still retained)"
+        return refuse(reason, record, "recovery-blocked")
+
     if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
-        # Rollback: no new records, but a checkout with pending recovery is still never reset.
+        # Rollback: no new records, but a checkout with pending recovery is still never reset. A
+        # record without a durable released disposition counts as pending.
         for _, record, manifest, status in records(cfg.state.parent, workers={cfg.state.name}):
-            if manifest and manifest.get("checkout") == str(repo) and status.get("state") == "recovery-blocked":
+            if record is None or (manifest or read_json(record / "manifest.json")).get("checkout") != str(repo):
+                continue
+            if status.get("state") not in RELEASED:
                 return refuse(f"{repo} has pending recovery in {record} (TAUCETI_WORK_RECOVERY=off)", record)
         return Decision(True, state="disabled")
-    try:
-        snap = inspect(repo)
-    except (OSError, subprocess.SubprocessError, RecordError) as error:
-        return refuse(f"could not inspect {repo} for unpublished source ({error}); the checkout is left intact")
-    if not snap.needs_record:
-        _supersede(cfg, repo, None)
-        return Decision(True, state="clean")
-    try:
-        record = _record(cfg, repo, snap, label, repository)
-    except RecordError as error:
-        return refuse(f"{error}; the checkout at {repo} is left intact and will not be reset")
-    _supersede(cfg, repo, record)
-    if not snap.dirty:
+
+    snap = None
+    for _ in range(3):
+        try:
+            snap = snap or inspect(repo, _preserved(cfg))
+        except (OSError, subprocess.SubprocessError, RecordError) as error:
+            return refuse(f"could not inspect {repo} for unpublished source ({error}); the checkout is left intact")
+        if snap.published:
+            _supersede(cfg, repo, None)
+            return Decision(True, state="clean")
+        record = None
+        if snap.needs_record:
+            try:
+                record = _record(cfg, repo, snap, label, repository)
+            except RecordError as error:
+                return refuse(f"{error}; the checkout at {repo} is left intact and will not be reset")
+            _supersede(cfg, repo, record)
         users = live_users(repo)
         if users:
-            reason = "processes still use the checkout: " + ", ".join(users[:8])
-            _set_status(record, "recovery-blocked", reason)
-            return refuse(f"{reason}; unpublished commits are saved in {record}", record, "recovery-blocked")
-        _set_status(record, "preserved", "unpublished commits saved; working tree was clean")
-        log(f"recovery: saved {len(snap.unpublished)} unpublished commit(s) in {record}")
-        return Decision(True, record=record, state="preserved")
-    state, detail = quiescence(cfg, repo, record, snap, label)
-    if state == "quiescent":
-        _set_status(record, "checkout-reset", detail)
-        log(f"recovery: saved unfinished source in {record}; {detail}")
-        return Decision(True, record=record, state="checkout-reset")
-    reason = (
-        f"unfinished source in {repo} is saved in {record}, but the checkout is retained: {detail}. "
-        f"After confirming nothing still runs there, run `tauceti recovery confirm {record.name} "
-        f"--worker-id {getattr(cfg, 'wid', '')}`"
-    )
-    _set_status(record, "recovery-blocked", detail)
-    return refuse(reason, record, "recovery-blocked")
+            detail = "processes still use the checkout: " + ", ".join(users[:8])
+            saved = f"; its source is saved in {record}" if record else "; its unpublished commits are already saved"
+            return blocked(record, detail, f"{detail}{saved} and the checkout is retained")
+        if snap.dirty:
+            state, detail = quiescence(cfg, repo, record, snap, label)
+            if state != "quiescent":
+                return blocked(
+                    record,
+                    detail,
+                    f"unfinished source in {repo} is saved in {record}, but the checkout is retained: {detail}. "
+                    f"After confirming nothing still runs there, run `tauceti recovery confirm {record.name} "
+                    f"--worker-id {getattr(cfg, 'wid', '')}`",
+                )
+        else:
+            # Commits only: they are immutable objects in a durable bundle (or an earlier one), and the
+            # tree holds nothing a late writer could lose, exactly as for a clean published checkout.
+            detail = "unpublished commits saved; working tree was clean"
+        try:
+            again = inspect(repo, _preserved(cfg))
+        except (OSError, subprocess.SubprocessError, RecordError) as error:
+            return refuse(f"could not re-inspect {repo} after saving ({error}); the checkout is left intact")
+        if again.fingerprint != snap.fingerprint:
+            snap = again  # a late write: save and judge the newer state
+            continue
+        if record is not None:
+            disposition = "checkout-reset" if snap.dirty else "preserved"
+            if not _set_status(record, disposition, detail):
+                return refuse(f"could not record the disposition of {record}; the checkout is left intact", record)
+            log(f"recovery: saved {'unfinished source' if snap.dirty else 'unpublished commits'} in {record}; {detail}")
+            return Decision(True, record=record, state=disposition)
+        return Decision(True, state="preserved")
+    return refuse(f"{repo} kept changing while it was being saved; something is still writing there", None)
 
 
 def confirm(cfg, record_id: str) -> str:
     """Operator assertion that nothing still runs in the checkout this record retains."""
     record = cfg.state / "recovery" / record_id
-    manifest = _read_manifest(record)
+    manifest = _complete(record)
     if manifest is None:
-        raise RecordError(f"{record} has no valid {SCHEMA} manifest")
+        raise RecordError(f"{record} is not a complete {SCHEMA} record")
     snap = inspect(Path(manifest["checkout"]))
     if snap.fingerprint != manifest["fingerprint"]:
         raise RecordError(
@@ -643,9 +771,9 @@ def confirm(cfg, record_id: str) -> str:
 
 def restore(record: Path, repo: Path) -> None:
     """Reconstruct a record's source into `repo`, a clone with the published history available."""
-    manifest = _read_manifest(record)
+    manifest = _complete(record)
     if manifest is None:
-        raise RecordError(f"{record} has no valid {SCHEMA} manifest")
+        raise RecordError(f"{record} is not a complete {SCHEMA} record")
     if (record / "commits.bundle").exists():
         _git(repo, "fetch", "-q", str(record / "commits.bundle"), f"{PENDING}/*:{PENDING}/*")
     if manifest.get("local_head"):
@@ -666,6 +794,9 @@ def restore(record: Path, repo: Path) -> None:
             else:
                 dest.write_bytes(tar.extractfile(member).read())
                 os.chmod(dest, member.mode & 0o777)
+    for rel in manifest.get("absent", []):
+        with contextlib.suppress(FileNotFoundError):
+            (repo / rel).unlink()
 
 
 def records(state_root: Path | None = None, *, workers=None):
@@ -684,7 +815,7 @@ def records(state_root: Path | None = None, *, workers=None):
                 if record.name.startswith(".tmp-"):
                     yield worker.name, None, None, {"state": "incomplete"}
                     continue
-                yield worker.name, record, _read_manifest(record), read_json(record / "status.json")
+                yield worker.name, record, _complete(record, digests=False), read_json(record / "status.json")
 
 
 def summary(state_root: Path | None = None, *, workers=None) -> dict:
@@ -697,7 +828,7 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
             continue
         if manifest is None:
             counts["corrupt"] += 1
-            reasons.add(f"{worker}/{record.name}: manifest missing or invalid")
+            reasons.add(f"{worker}/{record.name}: manifest or payload missing or invalid")
             continue
         counts["records"] += 1
         state = status.get("state")

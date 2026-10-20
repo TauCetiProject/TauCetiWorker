@@ -469,6 +469,136 @@ def test_work_paths(root):
     check("progress: refused before refreshing", "refused" in raised and (roadmap / "status.md").exists())
 
 
+def test_hidden_source(root):
+    """Ignored drafts, assume-unchanged edits and deleted conflicted paths are saved exactly."""
+    origin, co, cfg = fixture(root / "hidden")
+    (co / ".git" / "info" / "exclude").write_text("Scratch*.lean\n")
+    (co / "Scratch.lean").write_text("-- ignored but unfinished\n")
+    (co / "Main.olean").write_bytes(b"cache")
+    git(co, "update-index", "--assume-unchanged", "B.lean")
+    (co / "B.lean").write_text("hidden edit\n")
+    check("fixture: plain diff hides the assume-unchanged edit", git(co, "diff") == "")
+    before = snapshot_tree(co)
+    d = wr.guard(cfg, co)
+    manifest = json.loads((d.record / "manifest.json").read_text())
+    check("ignored draft saved", "Scratch.lean" in manifest["untracked"])
+    check("ignored build output excluded", any(e["path"] == "Main.olean" for e in manifest["excluded"]))
+    check("assume-unchanged edit saved", manifest["flagged"] == ["B.lean"] and not d.ok)
+    clone = reconstruct(origin, d.record, root / "hidden", "rebuilt")
+    check("hidden source reconstructed exactly", snapshot_tree(clone) == before)
+
+    origin, co, cfg = fixture(root / "conflict-deleted")
+    seed = root / "conflict-deleted" / "seed"
+    (seed / "A.lean").write_text("upstream\n")
+    git(seed, "commit", "-qam", "upstream")
+    git(seed, "push", "-q", str(origin), "main")
+    (co / "A.lean").write_text("local\n")
+    git(co, "commit", "-qam", "local")
+    git(co, "fetch", "-q")
+    git(co, "merge", "origin/main", check_rc=False)
+    (co / "A.lean").unlink()
+    d = wr.guard(cfg, co)
+    manifest = json.loads((d.record / "manifest.json").read_text())
+    check("deleted conflicted path recorded absent", manifest["absent"] == ["A.lean"])
+    clone = reconstruct(origin, d.record, root / "conflict-deleted", "rebuilt")
+    check("deleted conflicted path stays deleted", not (clone / "A.lean").exists())
+
+
+def test_review_hardening(root):
+    origin, co, cfg = fixture(root / "harden")
+    # Preserved commits never bypass a live-process refusal on a later attempt.
+    git(co, "commit", "-q", "--allow-empty", "-m", "local only")
+    if Path("/proc/self").exists():
+        child = subprocess.Popen(["sleep", "60"], cwd=co)
+        try:
+            time.sleep(0.2)
+            first, second = wr.guard(cfg, co), wr.guard(cfg, co)
+        finally:
+            child.kill()
+            child.wait()
+        check("preserved commits: first attempt blocked by live process", not first.ok)
+        check("preserved commits: second attempt still blocked", not second.ok and "processes" in second.reason)
+    check("preserved commits: allowed once no process remains", wr.guard(cfg, co).ok)
+
+    # An incomplete record with a matching fingerprint is neither trusted nor deleted.
+    origin, co, cfg = fixture(root / "incomplete")
+    wr.note_owner(cfg, round_id="round-i")
+    (co / "Draft.lean").write_text("x\n")
+    first = wr.guard(cfg, co)
+    (first.record / "untracked.tar").write_bytes(b"truncated")
+    second = wr.guard(cfg, co)
+    check("damaged record not reused", second.record != first.record and (first.record / "manifest.json").exists())
+    check("damaged record reported corrupt", wr.summary(root / "incomplete" / "state")["corrupt"] == 1)
+    git(co, "commit", "-q", "--allow-empty", "-m", "c")
+    (co / "Draft.lean").unlink()
+    third = wr.guard(cfg, co)
+    (third.record / "commits.bundle").unlink()
+    check("commits behind a damaged record are bundled again", wr.inspect(co, wr._preserved(cfg)).unpreserved)
+
+    # Rollback treats a record without a durable released disposition as pending.
+    origin, co, cfg = fixture(root / "rollback-status")
+    (co / "Draft.lean").write_text("x\n")
+    d = wr.guard(cfg, co)
+    (d.record / "status.json").unlink()
+    os.environ["TAUCETI_WORK_RECOVERY"] = "off"
+    try:
+        d = wr.guard(cfg, co)
+    finally:
+        del os.environ["TAUCETI_WORK_RECOVERY"]
+    check("rollback: missing status still refuses", not d.ok and "pending recovery" in d.reason)
+
+    # A write after the snapshot (before quiescence is proven) is saved, not discarded.
+    origin, co, cfg = fixture(root / "late")
+    wr.note_owner(cfg, round_id="round-late")
+    (co / "Draft.lean").write_text("early\n")
+    real = wr.quiescence
+    calls = []
+
+    def late_writer(*args):
+        if not calls:
+            (co / "Late.lean").write_text("written after the snapshot\n")
+        calls.append(1)
+        return "quiescent", "test containment"
+
+    wr.quiescence = late_writer
+    try:
+        d = wr.guard(cfg, co)
+    finally:
+        wr.quiescence = real
+    manifest = json.loads((d.record / "manifest.json").read_text())
+    check("late write: newer state saved before allowing reset", d.ok and "Late.lean" in manifest["untracked"])
+    check("late write: earlier record retained", len([p for p in (cfg.state / "recovery").iterdir()]) == 2)
+
+    # git-safe-push records exactly the oid it pushed.
+    origin, co, cfg = fixture(root / "push")
+    (co / "A.lean").write_text("pushed\n")
+    git(co, "commit", "-qam", "pushed")
+    pushed = git(co, "rev-parse", "HEAD").strip()
+    env = {**os.environ, "TAUCETI_PUSH_REF": "feature", "TAUCETI_PUSH_REMOTE": str(origin), "TAUCETI_CLAIM_KEY": ""}
+    env.pop("TAUCETI_PUSH_EXPECT", None)
+    rc = subprocess.run([str(REPO / "scripts" / "git-safe-push")], cwd=co, env=env, capture_output=True).returncode
+    check("git-safe-push: pushed", rc == 0 and git(origin, "rev-parse", "feature").strip() == pushed)
+    check(
+        "git-safe-push: published ref is the pushed oid",
+        git(co, "rev-parse", "refs/tauceti/published/push/feature").strip() == pushed,
+    )
+    check("pushed work needs no record", wr.guard(cfg, co).state == "clean")
+
+    # Without a durable owner, the checkout is not handed to a writer.
+    saved_sync, saved_atomic = tc.agents.sync_mathlib_pool, wr.atomic_json
+    tc.agents.sync_mathlib_pool = lambda cfg: None
+
+    def fail(*_a, **_k):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    wr.atomic_json = fail
+    try:
+        ok = tc.agents.prepare_checkout(cfg, work="fix", pr=1)
+    finally:
+        tc.agents.sync_mathlib_pool, wr.atomic_json = saved_sync, saved_atomic
+    check("owner write failure: preparation fails", ok is False and "owns the checkout" in wr.LAST_REFUSAL)
+
+
 def test_activity(root):
     """Prepared activity carries local counts; display and fleet aggregation read only that JSON."""
     import contextlib
@@ -513,6 +643,8 @@ def main():
             test_containment_proof,
             test_prepare_checkout,
             test_work_paths,
+            test_hidden_source,
+            test_review_hardening,
             test_activity,
         ):
             (root / test.__name__).mkdir()

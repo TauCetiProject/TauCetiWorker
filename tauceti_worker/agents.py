@@ -597,7 +597,11 @@ def prepare_checkout(
     # before anything can begin writing this worker's private Lake store again.
     clean_lake_cache_after_toolchain_bump(cfg)
     g("clean", "-fdxq", "-e", ".lake")
-    work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
+    if not work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap):
+        # Without a durable owner, a later record could be attributed to (and a containment proof
+        # accepted for) the previous round. Do not hand the checkout to a writer.
+        work_recovery.LAST_REFUSAL = "could not record the round that owns the checkout"
+        return False
     return True
 
 
