@@ -1853,7 +1853,12 @@ def _do_progress_inner(w, opts) -> int | None:
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
     from .work_recovery import guard, note_owner
 
-    if (roadmap_dir / ".git").is_dir():
+    if retained and (roadmap_dir / ".git").is_dir():
+        # A prepared local branch is an immutable publication artifact. Fetch
+        # the live cursor, while leaving its branch and working tree intact.
+        if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
+            raise Die(f"refreshing retained progress base in {roadmap_dir} failed")
+    elif (roadmap_dir / ".git").is_dir():
         # `apply` commits and pushes here; a leftover from an interrupted apply is saved, not discarded.
         decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
         if not decision.ok:
