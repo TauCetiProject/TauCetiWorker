@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -110,7 +111,7 @@ class SharedTests(unittest.TestCase):
         disk.start()
         self.addCleanup(disk.stop)
 
-    def extract(self, command, cwd, env, output, timeout):
+    def extract(self, command, cwd, env, output, timeout, *, prefix=()):
         self.downloads += 1
         self.assertEqual(command, ["lake", "exe", "cache", "get"])
         self.assertNotEqual(cwd, self.cwd)
@@ -179,6 +180,7 @@ class SharedTests(unittest.TestCase):
             with self.subTest(damage=damage):
                 # Simulate operator acceptance before testing the next failure.
                 (self.pool / "policy.json").unlink(missing_ok=True)
+                (self.pool / "safety-stop.json").unlink(missing_ok=True)
                 (self.cwd / "lean-toolchain").write_text(damage)
                 key, _ = s.signature(self.cwd, self.env)
                 with s.view(self.cwd, self.env, self.root / "logs", self.extract):
@@ -243,10 +245,12 @@ class SharedTests(unittest.TestCase):
         git(self.mathlib, "remote", "set-url", "origin", "https://github.com/other/mathlib4.git")
         self.assertNotEqual(changed, s.signature(self.cwd, self.env)[0])
 
-    def test_project_cache_context_changes_snapshot_key(self):
+    def test_downstream_pr_branch_and_fork_do_not_split_mathlib_key(self):
         key, _ = s.signature(self.cwd, self.env)
-        git(self.cwd, "remote", "add", "origin", "https://github.com/fixture/project.git")
-        self.assertNotEqual(key, s.signature(self.cwd, self.env)[0])
+        git(self.cwd, "checkout", "-qb", "different-pr")
+        git(self.cwd, "remote", "add", "fork", "https://github.com/fixture/project.git")
+        git(self.cwd, "config", "branch.different-pr.remote", "fork")
+        self.assertEqual(key, s.signature(self.cwd, self.env)[0])
 
     def test_clone_preserves_detached_nightly_tag_context(self):
         git(self.mathlib, "checkout", "--detach", "--quiet", self.rev)
@@ -274,7 +278,7 @@ class SharedTests(unittest.TestCase):
     def test_failed_or_partial_extraction_never_publishes(self):
         self.pool.mkdir()
         key, spec = s.signature(self.cwd, self.env)
-        for fetch in (lambda *a: 1, lambda *a: 0):
+        for fetch in (lambda *a, **kw: 1, lambda *a, **kw: 0):
             with self.assertRaises(s.Unavailable):
                 s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", fetch)
             self.assertFalse((self.pool / "entries" / key).exists())
@@ -357,15 +361,190 @@ class SharedTests(unittest.TestCase):
         self.pool.mkdir()
         key, spec = s.signature(self.cwd, self.env)
 
-        def extract(*args):
-            self.extract(*args)
+        def extract(*args, **kwargs):
+            self.extract(*args, **kwargs)
             build = args[1] / ".lake/packages/mathlib/.lake/build"
             (build / "external").symlink_to(self.root, target_is_directory=True)
             return 0
 
-        with self.assertRaisesRegex(s.IntegrityFailure, "unsupported file"):
+        with self.assertRaisesRegex(s.Unavailable, "unsupported snapshot file"):
             s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", extract)
         self.assertFalse((self.pool / "entries" / key).exists())
+
+    def test_interrupted_gc_hides_entry_before_removing_any_files(self):
+        self.pool.mkdir()
+        key, spec = s.signature(self.cwd, self.env)
+        with s.key_lock(self.pool, key):
+            entry, _ = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", self.extract)
+        old = time.time() - 8 * 86400
+        os.utime(entry, (old, old))
+        with patch.object(s, "remove_tree", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            s.collect(self.pool)
+        self.assertFalse(entry.exists())
+        self.assertEqual(len(list((self.pool / "trash").iterdir())), 1)
+        with s.key_lock(self.pool, key):
+            entry, hit = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", self.extract)
+        self.assertFalse(hit)
+        self.assertTrue(s.ready_entry(entry, key, spec))
+        self.assertEqual(list((self.pool / "trash").iterdir()), [])
+
+    def test_inventory_ignores_remounted_device_number_and_refuses_hardlinks(self):
+        build = self.root / "build"
+        build.mkdir()
+        artifact = build / "artifact"
+        artifact.write_text("artifact")
+        before = s.inventory(build)
+        real_stat = Path.stat
+
+        def remounted(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            return SimpleNamespace(
+                **{name: getattr(info, name) for name in dir(info) if name.startswith("st_") and name != "st_dev"},
+                st_dev=info.st_dev + 99,
+            )
+
+        with patch.object(Path, "stat", remounted), patch.object(Path, "lstat", remounted):
+            self.assertEqual(s.inventory(build), before)
+        os.link(artifact, self.root / "writable-alias")
+        with self.assertRaisesRegex(s.Unavailable, "hardlink alias"):
+            s.inventory(build)
+
+    def test_private_namespace_cannot_write_pool_or_policy(self):
+        self.require_overlay()
+        self.pool.mkdir()
+        artifact = self.pool / "artifact"
+        artifact.write_text("immutable")
+        atomic_json(self.pool / "policy.json", dict(mode="off"))
+        code = "from pathlib import Path; import sys\nfor name in ('artifact','policy.json','new-file'):\n try: (Path(sys.argv[1])/name).write_text('poison')\n except OSError: pass\n else: raise AssertionError('writable pool')"
+        result = containment.run(
+            [sys.executable, "-c", code, str(self.pool)], env=self.env, label="private-fixture", capture_output=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(artifact.read_text(), "immutable")
+
+    def test_publisher_namespace_only_writes_its_fresh_staging_project(self):
+        self.require_overlay()
+        from tauceti_worker import agents
+
+        self.pool.mkdir()
+        key, spec = s.signature(self.cwd, self.env)
+
+        def extract(command, cwd, env, output, timeout, *, prefix):
+            self.extract(command, cwd, env, output, timeout)
+            code = "from pathlib import Path; import sys; p=Path(sys.argv[1]); (p/'staging-write').write_text('ok')\ntry: Path(sys.argv[2]).write_text('poison')\nexcept OSError: pass\nelse: raise AssertionError('writable policy')"
+            return agents._cache_fetch(
+                [sys.executable, "-c", code, str(cwd), str(self.pool / "policy.json")],
+                cwd,
+                env,
+                output,
+                timeout,
+                prefix=prefix,
+            )
+
+        with s.key_lock(self.pool, key):
+            entry, _ = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", extract)
+        self.assertTrue(s.ready_entry(entry, key, spec))
+        self.assertFalse((self.pool / "policy.json").exists())
+
+    def test_missing_corrupt_policy_and_independent_safety_latch(self):
+        self.env.pop("TAUCETI_SHARED_MATHLIB_BUILDS")
+        self.assertEqual(s.mode(self.env), "off")
+        self.pool.mkdir()
+        (self.pool / "policy.json").write_text("{")
+        self.assertEqual(s.mode(self.env), "off")
+        atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
+        self.assertEqual(s.mode(self.env), "auto")
+        s.stop_sharing(self.pool, "fixture integrity failure")
+        atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
+        self.assertEqual(s.mode(self.env), "off")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
+        self.env["TAUCETI_WORKER_ID"] = "not-allowlisted"
+        self.assertEqual(s.mode(self.env), "off")
+
+    def test_reused_upper_whiteout_recovers_without_global_safety_stop(self):
+        self.require_overlay()
+        artifact = self.mathlib / ".lake/build/lib/lean/Mathlib.olean"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(prefix + ["rm", str(artifact)], check=True, pass_fds=s.lease_fds(self.env))
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+            result = subprocess.run(
+                prefix + ["cat", str(artifact)], capture_output=True, pass_fds=s.lease_fds(self.env)
+            )
+            self.assertEqual(result.stdout, b"verified artifact")
+        self.assertFalse((self.pool / "safety-stop.json").exists())
+        self.assertEqual(self.downloads, 1)
+
+    def test_mount_setup_failure_does_not_latch_integrity_stop(self):
+        self.require_overlay()
+        real_run = subprocess.run
+
+        def run(command, *args, **kwargs):
+            if 'test -f "$1/lib/lean/Mathlib.olean" || exit 42' in command:
+                return subprocess.CompletedProcess(command, 1, b"", b"fixture mount failure")
+            return real_run(command, *args, **kwargs)
+
+        with patch.object(s.subprocess, "run", side_effect=run):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertFalse((self.pool / "safety-stop.json").exists())
+
+    def test_verified_lower_missing_in_fresh_mount_latches_stop(self):
+        self.require_overlay()
+        real_run = subprocess.run
+
+        def run(command, *args, **kwargs):
+            if 'test -f "$1/lib/lean/Mathlib.olean" || exit 42' in command:
+                return subprocess.CompletedProcess(command, 42, b"", b"")
+            return real_run(command, *args, **kwargs)
+
+        with patch.object(s.subprocess, "run", side_effect=run):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertEqual(s.mode(self.env), "off")
+
+    def test_lease_failure_latches_stop_without_deleting_lower(self):
+        self.require_overlay()
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            pass
+        real_lock = s.lease_lock
+        failed = False
+
+        def lock(stream, flags):
+            nonlocal failed
+            if not failed and Path(stream.name).stem != "policy":
+                failed = True
+                raise s.IntegrityFailure("fixture lease failure")
+            real_lock(stream, flags)
+
+        with patch.object(s, "lease_lock", side_effect=lock):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertEqual(s.mode(self.env), "off")
+        self.assertEqual(len(list((self.pool / "entries").iterdir())), 1)
+
+    def test_cleanup_failure_preserves_invocation_result_and_records_failure(self):
+        self.require_overlay()
+        build = self.mathlib / ".lake/build"
+        build.mkdir(parents=True)
+        (build / "old").write_text("private")
+        real_remove = s.remove_tree
+
+        def remove(path):
+            if path.name == "build-before-sharing":
+                raise OSError("fixture cleanup failure")
+            real_remove(path)
+
+        with patch.object(s, "remove_tree", side_effect=remove):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertTrue(prefix)
+                s.record_result(self.env, 0)
+        receipts = [json.loads(line) for line in (self.pool / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(receipts[-2]["exit_code"], 0)
+        self.assertEqual(receipts[-1]["cleanup_error"], "fixture cleanup failure")
+        self.assertFalse(receipts[-1]["cleanup_success"])
 
     def test_auto_fallback_and_required_fail_before_body(self):
         with patch.object(s, "capability", return_value=(False, "enable user namespaces")):
@@ -684,11 +863,32 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(receipts[-1]["key"], s.signature(self.cwd, self.env)[0])
 
     def test_prepared_summary_does_not_count_a_dead_reader_as_current(self):
-        s.report(self.pool, self.env, mode="shared", key="fixture-key")
-        with s.key_lock(self.pool, "fixture-key", exclusive=False):
+        s.report(self.pool, self.env, mode="shared", key="a" * 64)
+        with s.key_lock(self.pool, "a" * 64, exclusive=False):
             self.assertEqual(s.summary(self.env)["shared"], 1)
         self.assertEqual(s.summary(self.env)["shared"], 0)
         self.assertEqual(s.summary(self.env)["idle"], 1)
+
+    def test_dead_supervisor_does_not_count_as_live_when_another_worker_leases_key(self):
+        key = "b" * 64
+        s.report(self.pool, self.env, mode="shared", key=key)
+        path = next((self.pool / "status").glob("*.json"))
+        row = json.loads(path.read_text())
+        row["supervisor"]["start"] = "dead-process"
+        atomic_json(path, row)
+        with s.key_lock(self.pool, key, exclusive=False):
+            self.assertEqual(s.summary(self.env)["shared"], 0)
+            self.assertEqual(s.summary(self.env)["idle"], 1)
+        s.report(self.pool, self.env, mode="preparing")
+        row = json.loads(path.read_text())
+        row["supervisor"]["start"] = "dead-process"
+        atomic_json(path, row)
+        self.assertEqual(s.summary(self.env)["preparing"], 0)
+
+    def test_summary_rejects_invalid_lock_key(self):
+        s.report(self.pool, self.env, mode="shared", key="../unexpected")
+        self.assertEqual(s.summary(self.env)["blocked"], 1)
+        self.assertFalse((self.pool / "unexpected.lock").exists())
 
     def test_two_real_readers_share_physical_mmap_pages(self):
         self.require_overlay()

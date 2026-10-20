@@ -257,7 +257,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         (root / "interrupt.log").open("ab") as output,
     ):
         try:
-            agents._cache_fetch(["lake"], co, env, output, 10)
+            agents._cache_fetch(["lake"], co, {**env, "TAUCETI_PROCESS_CONTAINMENT": "legacy"}, output, 10)
         except SystemExit as e:
             assert e.code == 143
         else:

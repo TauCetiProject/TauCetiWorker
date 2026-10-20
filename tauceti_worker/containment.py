@@ -48,9 +48,14 @@ LEGACY_NOTE = (
 )
 
 
-def command(*extra: str) -> list[str]:
+def command(*extra: str, env=None) -> list[str]:
     """The bwrap prefix for one boundary. `extra` adds mounts (the shared Mathlib overlay) to the
-    same namespace. The whole host filesystem, /dev and the network stay as they were."""
+    same namespace. The snapshot pool is read-only even for private agents; the remaining host
+    filesystem, /dev and network stay as they were."""
+    from .shared_mathlib import root
+
+    pool = root(env)
+    pool.mkdir(parents=True, exist_ok=True, mode=0o700)
     return [
         "bwrap",
         "--die-with-parent",
@@ -63,6 +68,9 @@ def command(*extra: str) -> list[str]:
         "/dev",
         "--proc",
         "/proc",
+        "--ro-bind",
+        str(pool),
+        str(pool),
         *extra,
         "--",
     ]
@@ -215,10 +223,11 @@ class Boundary:
     `ContainmentUnconfirmed` if emptiness cannot be established. Receipts never carry argv, which can
     hold prompts and credentials, and nothing here searches the host for processes it does not own."""
 
-    def __init__(self, label: str, *, prefix=(), contain=True):
+    def __init__(self, label: str, *, prefix=(), contain=True, env=None):
         self.id = uuid.uuid4().hex
         self.label = label
         self.prefix = list(prefix)
+        self.env = env
         self.identity: dict = {}
         self._info_r: int | None = None
         self._info_w: int | None = None
@@ -237,15 +246,15 @@ class Boundary:
         elif self.prefix:
             # The shared Mathlib view is already a bwrap PID namespace: it is the boundary. The view
             # is never offered under the legacy rollback (shared_mathlib.view refuses it).
-            self.strong, self.mode, self.reason = True, NAMESPACE, "shared Mathlib overlay namespace"
+            self.strong, self.mode, self.reason = True, NAMESPACE, "prepared containment namespace"
         else:
-            cap = capability()
+            cap = capability(env)
             self.strong, self.mode, self.reason = cap.strong, cap.mode, cap.reason
 
     def argv(self, argv) -> list[str]:
         if not self.strong:
             return list(argv)
-        base = self.prefix or command()
+        base = self.prefix or command(env=self.env)
         if base[0] != "bwrap":
             raise ValueError("containment prefix must be a bwrap command")
         self._info_r, self._info_w = os.pipe()
@@ -443,6 +452,12 @@ PROVEN = {"namespace-empty", "namespace-killed", "not-started"}
 _boundaries: dict[str, dict[str, tuple[str, str] | None]] = {}
 
 
+def confirmed_empty(round_id: str | None) -> bool:
+    """Whether all recorded boundaries so far have a proven namespace cleanup."""
+    outcomes = list(_boundaries.get(round_id, {}).values())
+    return bool(outcomes) and all(o is not None and o[0] == NAMESPACE and o[1] in PROVEN for o in outcomes)
+
+
 def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str | None = None) -> None:
     from . import activity
 
@@ -499,7 +514,7 @@ def write_quiescence(state_dir, round_id: str) -> bool:
 def run(argv, *, label: str, input=None, timeout: float | None = None, env=None, capture_output=False, **kwargs):
     """`subprocess.run` inside one boundary. On timeout or interruption the namespace is killed
     before its pipes are drained, so a survivor holding them cannot block cleanup."""
-    boundary = Boundary(label)
+    boundary = Boundary(label, env=env)
     if capture_output:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if input is not None:

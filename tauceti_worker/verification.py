@@ -331,7 +331,7 @@ class Verification:
         self.receipt["commands"].append(entry)
         self.save()
         self.progress(f"{phase}: start {json.dumps(argv)} (log {log})")
-        boundary = Boundary(f"verify-{phase}")
+        boundary = Boundary(f"verify-{phase}", env=env)
         entry["containment"] = dict(mode=boundary.mode, strong=boundary.strong, reason=boundary.reason)
         process = None
         stdout_path = log.with_suffix(".stdout")

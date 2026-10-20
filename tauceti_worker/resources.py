@@ -15,6 +15,30 @@ from pathlib import Path
 from .runtime_status import atomic_json, read_json, report_runtime
 
 
+def read_bytes(pid: int) -> int | None:
+    """Kernel storage reads, including children already reaped by this process."""
+    try:
+        values = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/io").read_text().splitlines())
+        return int(values["read_bytes"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def host_pressure() -> dict:
+    """Host-wide PSI totals; these include co-tenants and are not worker attribution."""
+    result = {}
+    for resource_name in ("cpu", "memory", "io"):
+        try:
+            rows = {}
+            for line in Path(f"/proc/pressure/{resource_name}").read_text().splitlines():
+                category, *fields = line.split()
+                rows[category] = int(dict(field.split("=", 1) for field in fields)["total"])
+            result[resource_name] = rows
+        except (OSError, ValueError, KeyError):
+            pass
+    return result
+
+
 def process_table() -> dict[int, dict]:
     """Read process identities, resident memory, and CPU time without command lines or credentials."""
     ticks = os.sysconf("SC_CLK_TCK")
@@ -96,6 +120,8 @@ class RoundResources:
         self.started_at = time.time()
         self.started = time.monotonic()
         self.baseline_cpu = usage()[0]
+        self.baseline_reads = read_bytes(self.root)
+        self.baseline_pressure = host_pressure()
         self.peak_rss = 0
         self.cpu = 0.0
         self.sample_count = 0
@@ -119,6 +145,8 @@ class RoundResources:
         self.cpu = max(self.cpu, kernel_cpu - self.baseline_cpu + live_children_cpu)
         self.peak_rss = max(self.peak_rss, rss)
         self.sample_count += 1
+        reads = read_bytes(self.root)
+        pressure = host_pressure()
         return dict(
             id=self.id,
             activity_id=self.activity_id,
@@ -134,6 +162,20 @@ class RoundResources:
             sample_count=self.sample_count,
             sample_interval_seconds=self.interval,
             scope="host process tree",
+            read_bytes=max(0, reads - self.baseline_reads)
+            if reads is not None and self.baseline_reads is not None
+            else None,
+            read_bytes_scope="supervisor and reaped children; excludes live or unreaped descendants",
+            host_pressure_stall_us={
+                name: {
+                    category: max(0, value - self.baseline_pressure[name][category])
+                    for category, value in rows.items()
+                    if category in self.baseline_pressure[name]
+                }
+                for name, rows in pressure.items()
+                if name in self.baseline_pressure
+            },
+            pressure_scope="host-wide, includes other workers and co-tenants",
         )
 
     def publish(self, current: dict, *, complete: bool = False) -> dict:

@@ -3,7 +3,7 @@
   "observed_at": "2026-10-20T03:52:33.528690+00:00",
   "implementation": {
     "branch": "issue-311",
-    "local_shared_fixture_tests": 36,
+    "local_shared_fixture_tests": 48,
     "real_overlay_available": true,
     "regressions_reproduced_before_fix": [
       "Lake config content omitted from key",
@@ -25,7 +25,19 @@
       "off detaches sparse upper before private warming",
       "split toolchain artifact completeness",
       "published symlink directory refused",
-      "released view idle in prepared summary"
+      "released view idle in prepared summary",
+      "downstream PR branches and forks reuse one dependency key",
+      "private namespaces cannot write pool or policy",
+      "trusted publisher only writes staging project",
+      "interrupted GC leaves no partial published entry",
+      "remount device changes preserve inventory; hardlink aliases refused",
+      "missing or malformed policy defaults off; separate safety latch survives policy rewrites",
+      "reused upper whiteout retries without global latch",
+      "mount setup errors fall back; missing verified fresh lower stops sharing",
+      "lease failure preserves lower and stops future sharing",
+      "cleanup failure preserves paid invocation result",
+      "per-worker supervisor identity and key validation",
+      "existing resource receipts retain actual storage reads and host-wide pressure deltas with explicit scope"
     ],
     "full_local_suite": {
       "passed_scripts": 107,
