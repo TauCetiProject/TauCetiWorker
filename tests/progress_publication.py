@@ -90,6 +90,9 @@ with (
 
     def publication_run(args, **kwargs):
         calls.append(args)
+        assert not (args[:1] == ["git"] and ("checkout" in args or "clean" in args)), (
+            "resume must not reset/clean retained source"
+        )
         if args[:1] == ["git"] and "show" in args:
             return real_run(args, **kwargs)
         assert "plan" not in args and "facts" not in args and "prompt" not in args
@@ -116,6 +119,7 @@ with (
         model.assert_not_called()
         checkout.assert_not_called()
     assert publication.retained(cfg)["files"] == original
+    assert publication.retained(cfg)["version"] == PROGRESS_REF, "first legacy resume pins its version label"
     assert progress_due(cfg, worker.counters)[0] is False, "publication backoff, without paying for prose"
 
     # Repeated recovery sees the existing PR and retires only the receipt.
