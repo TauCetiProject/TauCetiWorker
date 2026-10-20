@@ -255,6 +255,10 @@ test('a storage-full exception from the reset object parks immediately and recor
  assert.equal(message.acked,true);assert.equal(message.retried,null);
  assert.ok(durable(h,'thrown'));
  assert.equal(JSON.parse(h.archive.objects.get('control/100/storage.json').bytes).state,'full');
+ // A recorded full state parks without calling the repository object.
+ h.env.REPOSITORIES.get=()=>({fetch:async()=>{throw new Error('unexpected repository call');}});
+ assert.equal((await deliver(h.env,'recorded',1)).acked,true);assert.ok(durable(h,'recorded'));
+ h.archive.objects.delete('control/100/storage.json');
  h.env.REPOSITORIES.get=()=>({fetch:async()=>{throw new Error('out of memory: SQLITE_NOMEM');}});
  assert.deepEqual((await deliver(h.env,'nomem',1)).retried,{delaySeconds:5},'other storage errors retry');
 });
@@ -289,4 +293,22 @@ test('a failure report older than a verified probe cannot undo recovery',async()
  assert.equal(JSON.parse(archive.objects.get('control/100/storage.json').bytes).state,'writable');
  await noteRepositoryFull(env,'100','queue',Date.now()+1000);
  assert.equal(JSON.parse(archive.objects.get('control/100/storage.json').bytes).state,'full');
+});
+
+test('a batch parks its messages concurrently',async()=>{
+ const h=harness();
+ await h.archive.put('control/100/storage.json',JSON.stringify({state:'full',since:1,source:'queue'}));
+ const put=h.archive.put.bind(h.archive);
+ h.archive.put=async(...args)=>{await new Promise(resolve=>setTimeout(resolve,50));return put(...args);};
+ const messages=[];
+ for(let i=0;i<20;i++){
+  const key='webhooks/2026-10-20/c'+i+'.json',text=JSON.stringify({i});
+  await put(key,text,{customMetadata:{sha256:sha(Buffer.from(text))}});
+  messages.push({body:{key,delivery:'c'+i,event:'push',repository:repo.name,received:1792000000000+i},attempts:1,acked:false,ack(){this.acked=true;},retry(){}});
+ }
+ const began=Date.now();
+ await worker.queue({messages},h.env);
+ assert.ok(messages.every(m=>m.acked));
+ assert.ok(Date.now()-began<20*2*50,'not one message at a time');
+ for(let i=0;i<20;i++) assert.ok(durable(h,'c'+i));
 });

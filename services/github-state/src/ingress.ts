@@ -25,6 +25,9 @@ export async function noteRepositoryFull(env: Env, repo: string, source: string,
 }
 export function backoff(attempts: number): number { return Math.min(600, 5 * 2 ** Math.max(0, Math.min(attempts - 1, 8))); }
 
+export async function storageState(env: Env, repo: Repository): Promise<any> {
+  return env.ARCHIVE.get(storageKey(repo.id)).then(o => o ? o.json() : null);
+}
 export async function ingressMode(env: Env, repo: Repository): Promise<{ mode: 'apply' | 'parked'; reason?: string; at?: number }> {
   const object = await env.ARCHIVE.get(controlKey(repo.id));
   return object ? object.json() : { mode: 'apply' };
@@ -41,22 +44,22 @@ export async function setIngressMode(env: Env, repo: Repository, mode: unknown, 
 // succeed may the caller acknowledge the queue message.
 export async function park(env: Env, repo: Repository, pointer: EventPointer, reason: string): Promise<Parked> {
   const pinned = bodyKey(repo.id, pointer.delivery);
-  let sha256 = (await env.ARCHIVE.head(pinned))?.customMetadata?.sha256;
+  // Re-pinning identical bytes is harmless, so the common path reads the
+  // original once; an already pinned copy matters only once it has expired.
+  const source = await env.ARCHIVE.get(pointer.key);
+  let sha256 = source ? undefined : (await env.ARCHIVE.head(pinned))?.customMetadata?.sha256;
   if (!sha256) {
-    const source = await env.ARCHIVE.get(pointer.key);
     if (!source) throw new Error('event body unavailable');
     const bytes = await source.arrayBuffer();
     sha256 = await digest(bytes);
     if (source.customMetadata?.sha256 && source.customMetadata.sha256 !== sha256) throw new Error('event body digest mismatch');
-    // R2 rejects the write unless the stored bytes match this digest.
+    // R2 rejects the write unless the stored bytes match this digest, so a
+    // successful put is the verification.
     await env.ARCHIVE.put(pinned, bytes, { sha256, customMetadata: { kind: 'parked-body', sha256, delivery: pointer.delivery } });
-    const check = await env.ARCHIVE.head(pinned);
-    if (!check || check.size !== bytes.byteLength || check.customMetadata?.sha256 !== sha256) throw new Error('parked body verification failed');
   }
   const parked: Parked = { key: pinned, delivery: pointer.delivery, event: pointer.event, repository: repo.name, received: pointer.received, original_key: pointer.key, sha256, parked_at: Date.now(), reason };
   const text = JSON.stringify(parked), key = pointerKey(repo.id, pointer);
   await env.ARCHIVE.put(key, text, { sha256: await digest(text), customMetadata: { kind: 'parked-pointer', delivery: pointer.delivery } });
-  if (!await env.ARCHIVE.head(key)) throw new Error('parked pointer verification failed');
   return parked;
 }
 
