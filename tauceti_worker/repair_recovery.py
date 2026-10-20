@@ -1147,7 +1147,7 @@ class WorkerBackend:
         )
 
     def verify(self, checkout, m, facts):
-        from .agents import scope_policy, warm_host_build_caches
+        from .agents import prepare_host_build_caches, scope_policy
         from .verification import Verification
 
         policy = scope_policy(
@@ -1159,7 +1159,7 @@ class WorkerBackend:
             # Restore ordinary dependency/artifact prerequisites before fingerprinting;
             # an empty isolated clone must not compile missing Mathlib from scratch.
             if any((checkout / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
-                warm_host_build_caches(checkout, dict(os.environ), self.w.cfg.logdir)
+                prepare_host_build_caches(checkout, dict(os.environ), self.w.cfg.logdir)
             if getattr(self, "record", None):
                 self.prepare_source(checkout, self.record, m, self.journal)
             verifier = Verification(

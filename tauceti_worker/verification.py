@@ -37,7 +37,7 @@ from .verification_scope import git, local_main, scope, untracked
 from .verification_storage import Limit, Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 5
+POLICY_VERSION = 6
 LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
@@ -221,6 +221,14 @@ def files_under(root: Path):
     for directory, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"})
         for name in sorted(files + [d for d in dirs if (Path(directory) / d).is_symlink()]):
+            # Lake writes these ignored input-file digests while restoring ProofWidgets.
+            # Their source JSON files remain inputs; creating/replacing a derived digest
+            # must not invalidate an otherwise successful build.
+            if Path(directory).parts[-2:] == ("proofwidgets", "widget") and name in {
+                "package.json.hash",
+                "package-lock.json.hash",
+            }:
+                continue
             yield Path(directory) / name
 
 
