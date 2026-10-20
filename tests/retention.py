@@ -229,6 +229,81 @@ class Retention(unittest.TestCase):
             retention.recycle(self.cfg, now=self.clock)
         self.assertFalse(cache.exists())
 
+    def test_open_instance_lock_protects_workspace_without_proc_lock_device_matching(self):
+        self.old()
+        cache = self.cache()
+        with (self.state / "instance.lock").open("w"):
+            report = retention.sweep(now=self.clock)
+        self.assertTrue(cache.exists())
+        self.assertIn(str(self.state), report["protected"])
+        self.assertFalse((self.state / "round.lock").exists())
+
+    def test_first_sweep_gives_old_round_locks_the_generation_grace_period(self):
+        cache = self.cache()
+        lock = self.state / "round.lock"
+        lock.touch()
+        os.utime(lock, (0, 0))
+        retention.sweep(now=self.clock)
+        self.assertTrue(self.checkout.exists())
+        self.assertTrue(cache.exists())
+        retention.sweep(now=self.clock + retention.LIFETIME - 1)
+        self.assertTrue(self.checkout.exists())
+        retention.sweep(now=self.clock + retention.LIFETIME)
+        self.assertFalse(self.checkout.exists())
+
+    def test_missing_open_file_observations_protect_diagnostics_locally(self):
+        self.old()
+        cache = self.cache()
+        self.cfg.logdir.mkdir(parents=True)
+        diagnostic = self.cfg.logdir / "old.log"
+        diagnostic.write_text("possibly still open")
+        os.utime(diagnostic, (0, 0))
+        with patch.object(retention, "open_files", return_value=None):
+            report = retention.sweep(now=self.clock)
+        self.assertTrue(diagnostic.exists())
+        self.assertTrue(cache.exists())
+        self.assertTrue(report["protected"])
+
+    def test_vanishing_diagnostic_does_not_skip_other_logs_or_attempts(self):
+        self.cfg.logdir.mkdir(parents=True)
+        vanished = self.cfg.logdir / "vanishing.log"
+        old = self.cfg.logdir / "old.log"
+        old.write_text("remove me")
+        os.utime(old, (0, 0))
+        attempt = self.state / "verification/old"
+        attempt.mkdir(parents=True)
+        os.utime(attempt, (0, 0))
+        original = Path.iterdir
+
+        def entries(path):
+            if path == self.cfg.logdir:
+                return iter((vanished, old))
+            return original(path)
+
+        with patch.object(Path, "iterdir", entries):
+            report = retention.sweep(now=self.clock)
+        self.assertFalse(old.exists())
+        self.assertFalse(attempt.exists())
+        self.assertFalse(report["errors"])
+
+    def test_unreadable_managed_logs_does_not_prevent_cleanup_receipt(self):
+        root = self.root / "managed/logs"
+        original = Path.iterdir
+
+        def entries(path):
+            if path == root:
+                raise PermissionError("managed logs unavailable")
+            return original(path)
+
+        with patch.object(Path, "iterdir", entries):
+            report = retention.sweep(now=self.clock)
+        self.assertTrue(report["errors"])
+        self.assertEqual(read_json(activity.root() / "cleanup.json")["at"], self.clock)
+
+    def test_disabled_absent_shared_pool_is_not_created_by_cleanup(self):
+        retention.sweep(now=self.clock)
+        self.assertFalse(shared_mathlib.root().exists())
+
     def test_retired_worker_private_archives_are_reclaimed_without_touching_credentials(self):
         self.old()
         private = self.state / "home/.cache/lake" / "artifact"
@@ -611,9 +686,10 @@ class Retention(unittest.TestCase):
             patch.object(retention, "collect_retired", side_effect=AssertionError("no source archival on retry")),
             patch.object(shared_mathlib, "collect", side_effect=AssertionError("no recursive GC on retry")),
         ):
-            retention.pressure_cleanup()
+            report = retention.run(diagnostics_only=True)
         self.assertFalse(closed.exists())
         self.assertTrue(cache.exists())
+        self.assertEqual(report.get("protected_count", 0), 0)
 
     def test_cleanup_pins_activity_before_project_resolution(self):
         expected = self.root / "login/.local/state/tauceti/activity"
@@ -713,9 +789,12 @@ class Retention(unittest.TestCase):
             self.assertEqual((self.cfg.logdir / "work-20261021.log").read_text().count("concurrent rollover"), 8)
 
     def test_daily_timer_is_persistent_and_low_priority(self):
-        with patch.object(Path, "home", return_value=self.root), patch.object(subprocess, "run") as run:
+        with (
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "xdg")}),
+            patch.object(subprocess, "run") as run,
+        ):
             retention.install_timer()
-        directory = self.root / ".config/systemd/user"
+        directory = self.root / "xdg/systemd/user"
         self.assertIn("OnCalendar=daily", (directory / "tauceti-cleanup.timer").read_text())
         self.assertIn("Persistent=true", (directory / "tauceti-cleanup.timer").read_text())
         self.assertIn("IOSchedulingClass=idle", (directory / "tauceti-cleanup.service").read_text())
@@ -725,6 +804,20 @@ class Retention(unittest.TestCase):
     def test_timer_install_reports_unsupported_platform(self):
         with patch.object(sys, "platform", "darwin"), self.assertRaisesRegex(config.Die, "requires Linux"):
             retention.install_timer()
+
+    def test_timer_failure_does_not_fail_an_already_started_worker_service(self):
+        from tauceti_worker import worker_manager
+
+        service = self.root / "config/systemd/user/tauceti-workers.service"
+        with (
+            patch.object(worker_manager, "_service_path", return_value=service),
+            patch.object(worker_manager, "_systemd_unit", return_value="fixture unit"),
+            patch.object(shutil, "which", return_value="systemctl"),
+            patch.object(subprocess, "run"),
+            patch.object(retention, "install_timer", side_effect=config.Die("fixture timer unavailable")),
+        ):
+            self.assertEqual(worker_manager.service_action("install", self.root / "workers.toml"), 0)
+        self.assertEqual(service.read_text(), "fixture unit")
 
     def test_macos_boundary_recycles_only_the_managed_private_home(self):
         from tauceti_worker.agents import _worker_iso_home

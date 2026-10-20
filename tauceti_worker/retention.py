@@ -38,6 +38,8 @@ def safe(path, root):
 
 def open_files():
     """One /proc pass per daily sweep, rather than one pass per old log file."""
+    if not Path("/proc/self/fd").is_dir():
+        return None  # Missing observations never mean that diagnostics are unused.
     opened = set()
     for process in Path("/proc").glob("[0-9]*"):
         try:
@@ -50,29 +52,25 @@ def open_files():
     return opened
 
 
-def held_locks():
-    """Read ordinary flock ownership without briefly taking a starting loop's instance lock."""
-    try:
-        held = set()
-        for line in Path("/proc/locks").read_text().splitlines():
-            fields = line.split()
-            if fields[1] != "FLOCK":
-                continue
-            major, minor, inode = fields[5].split(":")
-            held.add((os.makedev(int(major, 16), int(minor, 16)), int(inode)))
-        return held
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def workspace_idle(cfg, held):
-    if held is None:
-        return False  # Skip this candidate; diagnostics and workers still proceed.
+def workspace_idle(cfg, opened):
+    if opened is None:
+        return False
     try:
         info = (cfg.state / "instance.lock").stat()
     except FileNotFoundError:
         return True
-    return (info.st_dev, info.st_ino) not in held
+    # FD and path stats use the same device numbering, including subvolumes/overlay filesystems.
+    # Merely opening the instance lock counts as live; no collector ever takes that lock.
+    return (info.st_dev, info.st_ino) not in opened
+
+
+def children(path, report):
+    try:
+        yield from path.iterdir()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        note(report, "errors", f"{path}: {error}")
 
 
 def note(report, key, value):
@@ -396,17 +394,17 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     report = fresh_report(now)
     opened = open_files()
     mounts = mount_points()
-    held = held_locks()
     configs = list(worker_configs())
     for cfg in configs:
         try:
             if not safe(cfg.state, cfg.state.parent):
                 continue
-            if diagnostics_only or not workspace_idle(cfg, held):
+            if diagnostics_only or not workspace_idle(cfg, opened):
                 raise BlockingIOError  # Live loops recycle their own caches at ordinary boundaries.
             generation = read_json(cfg.state / "cache-generation.json").get("started_at")
             round_lock = cfg.state / "round.lock"
-            idle_since = round_lock.stat().st_mtime if round_lock.exists() else generation
+            grace = generation if isinstance(generation, (int, float)) and math.isfinite(generation) else now
+            idle_since = max(round_lock.stat().st_mtime, grace) if round_lock.exists() else grace
             with locked(round_lock, dry=dry):
                 # A running loop owns instance.lock even between rounds. Retired or one-shot workers
                 # have no such owner: after three idle days their saved checkout is a candidate.
@@ -422,22 +420,30 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
                 except BlockingIOError:
                     note(report, "protected", str(cfg.state / "verification-jobs"))
         except BlockingIOError:
-            note(report, "protected", str(cfg.state))
+            if not diagnostics_only:
+                note(report, "protected", str(cfg.state))
         except (OSError, ValueError, TypeError) as error:
             note(report, "errors", f"{cfg.wid}: {error}")
-        try:
-            # Only known diagnostic artifacts; accounting, source, review outboxes and credentials
-            # are deliberately outside these paths. A held verification lease protects its attempt.
-            for root in (cfg.logdir, cfg.state / "verification", cfg.state / "verification-state" / "verification"):
+        # Diagnostic paths have their own independent references and leases. One disappearing
+        # telemetry file or inaccessible directory must not skip other roots or workers.
+        for root in (cfg.logdir, cfg.state / "verification", cfg.state / "verification-state" / "verification"):
+            try:
                 if not root.is_dir() or root.is_symlink():
                     continue
                 if root != cfg.logdir and not safe(root, cfg.state):
                     continue
-                for path in root.iterdir():
+                if opened is None:
+                    note(report, "protected", str(root))
+                    continue
+            except OSError as error:
+                note(report, "errors", f"{root}: {error}")
+                continue
+            for path in children(root, report):
+                try:
                     if path.is_symlink() or now - path.stat().st_mtime < LIFETIME:
                         continue
                     if diagnostics_only and not path.is_file():
-                        continue  # ENOSPC retry only unlinks closed files; no recursive deletion or source archival.
+                        continue
                     if root == cfg.logdir and (not path.is_file() or path.suffix != ".log"):
                         continue
                     if root != cfg.logdir and referenced_attempt(cfg, path):
@@ -451,12 +457,14 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
                             note(report, "protected", str(path))
                     else:
                         remove(path, root, report, dry=dry, opened=opened if path.is_file() else None, mounts=mounts)
-        except (OSError, ValueError, TypeError) as error:
-            note(report, "errors", f"{cfg.wid}: diagnostics: {error}")
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, TypeError) as error:
+                    note(report, "errors", f"{path}: {error}")
     try:
         for key in (
             ()
-            if diagnostics_only
+            if diagnostics_only or not (shared_mathlib.root() / "entries").is_dir()
             else shared_mathlib.collect(shared_mathlib.root(), max_age=LIFETIME, now=now, dry_run=dry)
         ):
             note(report, "removed", str(shared_mathlib.root() / "entries" / key))
@@ -465,15 +473,26 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     from .worker_manager import workers_state_dir
 
     log_root = workers_state_dir().resolve() / "logs"
-    for directory in log_root.iterdir() if log_root.is_dir() else ():
-        if directory.is_symlink() or not directory.is_dir():
-            continue
-        for path in directory.glob("work-*.log"):
+    if opened is None:
+        note(report, "protected", str(log_root))
+    else:
+        for directory in children(log_root, report):
             try:
-                if not path.is_symlink() and now - path.stat().st_mtime >= LIFETIME:
-                    remove(path, log_root, report, dry=dry, opened=opened, mounts=mounts)
+                if directory.is_symlink() or not directory.is_dir():
+                    continue
             except OSError as error:
-                note(report, "errors", str(error))
+                note(report, "errors", f"{directory}: {error}")
+                continue
+            for path in children(directory, report):
+                try:
+                    if not path.name.startswith("work-") or path.suffix != ".log":
+                        continue
+                    if not path.is_symlink() and path.is_file() and now - path.stat().st_mtime >= LIFETIME:
+                        remove(path, log_root, report, dry=dry, opened=opened, mounts=mounts)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    note(report, "errors", f"{path}: {error}")
     if not dry:
         base = worker_state_root()
         while not base.exists():
@@ -503,15 +522,16 @@ def run(*, dry=False, diagnostics_only=False):
 def install_timer():
     from .activity import pin_root
     from .paths import self_argv
+    from .worker_manager import _service_path, _systemd_quote
 
     if sys.platform != "linux":
         raise Die("the daily cleanup timer requires Linux with systemd user services")
     pin_root()
-    directory = Path.home() / ".config/systemd/user"
+    directory = _service_path().parent
     directory.mkdir(parents=True, exist_ok=True)
 
     def quote(value):
-        return json.dumps(str(value).replace("%", "%%"))
+        return _systemd_quote(str(value))
 
     environment = self_env()
     extra = "".join(
@@ -541,7 +561,11 @@ def install_timer():
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "tauceti-cleanup.timer"],
     ):
-        subprocess.run(argv, check=True, capture_output=True, timeout=15)
+        try:
+            subprocess.run(argv, check=True, capture_output=True, timeout=15)
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or b"").decode(errors="replace").strip()
+            raise Die(f"cleanup timer installation failed: {detail or error}") from None
 
 
 def cmd_cleanup(args):

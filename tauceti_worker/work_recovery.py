@@ -149,7 +149,7 @@ def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout
         ["git", "-C", str(repo), "-c", "core.quotepath=off", *args],
         capture_output=True,
         timeout=timeout,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"},
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
     )
     if check and p.returncode:
         detail = p.stderr.decode(errors="replace").strip().splitlines()

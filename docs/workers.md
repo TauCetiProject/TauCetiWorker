@@ -229,8 +229,8 @@ or stopping processes. Space-pressure snapshot collection may stop earlier in a
 real run once headroom recovers; candidate counts do not estimate reclaimed bytes.
 `tauceti cleanup` performs reclamation. Both discover retired
 workers from local storage, without GitHub requests. A live loop recycles its own private cache generation under its round lock;
-the daily collector skips that loop's workspace entirely and never probes its
-instance lock by taking it. Independent verification job leases and pending
+the daily collector skips that loop's workspace whenever its instance-lock file
+is open and never takes that lock itself. Independent verification job leases and pending
 references protect their caches and source too. An inactive checkout can be removed in full only after source recovery
 succeeds and its remaining Git state can be safely discarded. Failed source
 preservation retains source while recognized build caches can still be reclaimed.
@@ -241,11 +241,14 @@ keep their checkout when the recovery record cannot capture them. This is genera
 data retention; it does not discard uncaptured Git history to meet an age target.
 Credentials, review outboxes, source recovery, usage journals and budget accounting
 are preserved. Existing installations get one 72-hour grace
-period when their generation marker is first recorded.
+period when their generation marker is first recorded, including checkout removal.
+Without local process-file observations, diagnostic candidates are skipped; private
+cache recycling can still run at the worker's own safe boundary.
 
 Cleanup also expires closed diagnostic `.log` files, inactive verification attempts,
-and unused immutable Mathlib snapshots after three days. Snapshot GC uses existing
-reader leases. The login user's Mathlib archive pool and operator-selected external
+and unused immutable Mathlib snapshots in an existing login-wide pool after three
+days. Snapshot GC uses existing reader leases; cleanup does not create an absent
+pool or enable sharing. The login user's Mathlib archive pool and operator-selected external
 caches are outside this collector; only worker-private archive copies expire.
 Default session logs rotate daily even while a loop keeps running, without
 redirecting helpers' result pipes or files. Diagnostic age is based on last write;

@@ -1788,9 +1788,13 @@ def service_action(action: str, config: Path) -> int:
         path.write_text(_systemd_unit(config))
         subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
         subprocess.run([systemctl, "--user", "enable", "--now", path.name], check=True)
+        from .config import Die
         from .retention import install_timer
 
-        install_timer()
+        try:
+            install_timer()
+        except (Die, OSError, subprocess.SubprocessError) as error:
+            print(f"warning: worker service started; cleanup timer unavailable: {error}", file=sys.stderr)
         print(f"installed and started {path}")
         return 0
     if action == "uninstall":
