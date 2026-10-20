@@ -96,6 +96,7 @@ test('a full repository keeps serving stored reads, parks ingestion, recovers he
   assert.equal(survey.status,'ok');assert.equal(survey.data.length,count);
   const progress=await (await get(mf,'progress',{number:1})).json();
   assert.equal(progress.status,'ok');assert.equal(progress.data.head,head);
+  for(const result of [progress,survey]) {assert.ok(result.observed_at>0,'stored observation time');assert.ok(result.verified_at>0,'stored verification time');}
   const unknown=await (await get(mf,'issue_comments',{number:9999})).json();
   assert.equal(unknown.status,'unavailable');assert.equal(unknown.reason,'coverage_unavailable');assert.equal(Object.hasOwn(unknown,'data'),false);
   const batch=await (await mf.dispatchFetch('https://test/v1/query_batch',{method:'POST',headers:client,body:JSON.stringify({queries:[{repository:'org/repo',operation:'open_prs',cursor:before.first.cursor},{repository:'org/repo',operation:'issue_comments',args:{number:1}}]})})).json();
@@ -133,8 +134,9 @@ test('a full repository keeps serving stored reads, parks ingestion, recovers he
   const probe=await (await adminPost(mf,'/admin/storage/probe',{bytes:4096})).json();
   assert.equal(probe.writable,false);assert.equal(probe.reason,'storage_full');
   await send(stub,'/tick',{repository:repository.name});
+  await (await mf.getWorker()).scheduled({cron:'* * * * *'});
   await wait(300);
-  assert.equal(network.count,quota,'no GitHub requests while full');
+  assert.equal(network.count,quota,'no GitHub requests while full, including the cron delivery audit');
 
   // Cold start with the store still full: no startup write blocks the data,
   // and fresh multi-page snapshots still paginate through R2.
@@ -188,7 +190,11 @@ test('planned migration parks every delivery without calling the repository obje
  try {
   const ns=await mf.getDurableObjectNamespace('REPOSITORIES'),stub=ns.get(ns.idFromName(repository.id));
   await send(stub,'/configure',{repository:repository.name});
-  assert.equal((await adminPost(mf,'/admin/ingress',{mode:'parked',reason:'migration rehearsal'})).status,200);
+  const paused=await (await adminPost(mf,'/admin/ingress',{mode:'parked',reason:'migration rehearsal'})).json();
+  assert.equal(paused.repository.drained,true);
+  // The repository object itself is the barrier, even for an in-flight consumer.
+  const direct=await (await send(stub,'/event',{key:'webhooks/x.json',delivery:'direct',event:'push',repository:repository.name,received:Date.now()})).json();
+  assert.equal(direct.error,'ingress_parked');assert.equal(direct.parkable,true);
   const result=await event(mf,'planned-1',comment(777));
   assert.deepEqual(result.explicitAcks,['m-planned-1']);
   assert.deepEqual((await (await send(stub,'/storage/deliveries',{ids:['planned-1']})).json()).known,[]);

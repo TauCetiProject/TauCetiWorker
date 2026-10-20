@@ -8,6 +8,7 @@ const shim={name:'fixture',setup(b){b.onResolve({filter:/^cloudflare:workers$/},
 const load=async entry=>import('data:text/javascript;base64,'+Buffer.from((await build({entryPoints:[entry],bundle:true,platform:'node',format:'esm',write:false,plugins:[shim]})).outputFiles[0].text).toString('base64'));
 const worker=(await load('src/index.ts')).default;
 const {RepositoryState}=await load('src/repository.ts');
+const storage=await load('src/storage.ts');
 const repo={id:'100',name:'org/repo',installation:'200'};
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 
@@ -161,6 +162,10 @@ test('legacy SQL cursors and R2 cursors validate query, coverage and expiry',asy
  assert.equal((await queryFixture(state,{operation:'open_prs',cursor:id+':200'})).reason,'cursor_expired');
  assert.equal((await queryFixture(state,{operation:'open_prs',cursor:id+':300'})).reason,'cursor_expired','another repository cannot use the cursor');
  assert.equal((await queryFixture(state,{operation:'open_prs',cursor:'../../etc:1'})).reason,'cursor_expired');
+ // Very old whole-snapshot cursors continue only inside their snapshot.
+ db.prepare('INSERT INTO cursors VALUES(?,?,?)').run('whole',now+60000,JSON.stringify({key,result:{...page,data:undefined},rows:[{number:1},{number:2}]}));
+ assert.deepEqual((await queryFixture(state,{operation:'open_prs',cursor:'whole:1'})).data,[{number:2}]);
+ for(const cursor of ['whole:2','whole:900000','whole:1:extra']) assert.equal((await queryFixture(state,{operation:'open_prs',cursor})).reason,'cursor_invalid',cursor);
 });
 
 test('expiry runs before repair and hydration, survives their failure, and keeps semantic data',async()=>{
@@ -195,4 +200,30 @@ test('cold start on a current schema performs no writes',async()=>{
  const ctx={id:{toString:()=>'fixture'},storage:{sql:{exec(sql,...bindings){if(/^\s*(INSERT|UPDATE|REPLACE|CREATE|ALTER|DELETE)/i.test(sql))writes.push(sql.slice(0,40));let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};}},transactionSync:fn=>fn()}};
  const state=new RepositoryState(ctx,{ALLOWED_REPOSITORIES:JSON.stringify([repo])});
  assert.deepEqual(writes,[]);assert.equal(state.schema,'current');
+});
+
+test('verified cleanup never deletes a reused rowid written after the export began',()=>{
+ const db=new DatabaseSync(':memory:'),now=Date.now(),day=86400000;
+ const sql={exec(q,...b){let rows=[];const st=db.prepare(q);if(st.columns().length)rows=st.all(...b);else st.run(...b);return {toArray:()=>rows,one:()=>rows[0]};}};
+ db.exec('CREATE TABLE demand(key TEXT PRIMARY KEY,at INTEGER)');
+ db.prepare('INSERT INTO demand VALUES(?,?)').run('a',now-5*day);
+ db.prepare('INSERT INTO demand VALUES(?,?)').run('b',now-5*day);
+ const exported={upper:2,started:now-3*day};
+ db.prepare("DELETE FROM demand WHERE key='b'").run();
+ db.prepare('INSERT INTO demand VALUES(?,?)').run('reused',now-2*day);
+ assert.equal(db.prepare("SELECT rowid FROM demand WHERE key='reused'").get().rowid,2);
+ db.prepare("UPDATE demand SET at=? WHERE key='a'").run(now-2*day);
+ assert.equal(storage.deleteClass(sql,'stale_demand',exported,{}).rows,0,'rows written after export start survive');
+ db.prepare('INSERT INTO demand VALUES(?,?)').run('later',now-4*day);
+ assert.equal(storage.deleteClass(sql,'stale_demand',exported,{}).rows,0,'rows beyond the exported rowid survive');
+ db.prepare("UPDATE demand SET at=? WHERE key='a'").run(now-4*day);
+ assert.equal(storage.deleteClass(sql,'stale_demand',exported,{}).rows,1);
+});
+
+test('a replayed long-parked event keeps its receipt through maintenance',async()=>{
+ const {db,state,archive}=repositoryFixture();
+ await archive.put('parked/100/bodies/old.json',JSON.stringify({zen:'parked'}));
+ await state.ingest({key:'parked/100/bodies/old.json',delivery:'old',event:'ping',repository:'org/repo',received:Date.now()-20*86400000});
+ await state.maintenance();
+ assert.equal(db.prepare("SELECT COUNT(*) n FROM deliveries WHERE id='old'").get().n,1);
 });

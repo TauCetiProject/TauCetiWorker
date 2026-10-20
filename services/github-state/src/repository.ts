@@ -5,6 +5,7 @@ import { batchLimit } from './catalog';
 import { Lane, LANES, laneAt, settings } from './reconciliation';
 import { SURVEY_CONTRACT, compactPR, issueFragment, reviewFragment, summarizeFragments, inScope, roadmapFocuses } from './survey';
 import { readPromotionReceipts } from './activity_landings';
+import { controlKey } from './ingress';
 import { Failure, FULL_MESSAGE, AdminError, CLEANUP, PARKABLE, classify, createRecovery, deleteClass, exportPage, faultySql, log, missingSchema, requestId, readManifest, scan, summary, verifyExport } from './storage';
 
 const SCHEMA_VERSION=4;
@@ -21,6 +22,10 @@ export class RepositoryState extends DurableObject<Env> {
   degraded?:{since:number,reason:Failure,operation:string};
   schema:'current'|'legacy'|{error:Failure,missing:string[],cause:Failure}='current';
   private faultFull=false;
+  // Planned-migration barrier: loaded from R2 once per instance and updated
+  // by the admin endpoint, which waits for in-flight applications to finish.
+  private ingress?:string;
+  private applying=0;
   private logged=new Map<string,number>();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
@@ -351,6 +356,8 @@ export class RepositoryState extends DurableObject<Env> {
     await this.setAlarm(Date.now()+100);
   }
   async ingest(pointer:EventPointer): Promise<void> {
+    // Receipt retention counts from application, not original receipt: a
+    // replay of a long-parked event must keep deduplicating its cleanup.
     if (this.sql.exec('SELECT id FROM deliveries WHERE id=?',pointer.delivery).toArray().length) return;
     if (this.degraded) throw new Error('Exceeded the maximum database size; SQLITE_FULL recorded at '+new Date(this.degraded.since).toISOString());
     const object=await this.env.ARCHIVE.get(pointer.key); if (!object) throw new Error('event body unavailable');
@@ -421,7 +428,7 @@ export class RepositoryState extends DurableObject<Env> {
       const id=body.workflow_run?.id || body.workflow_job?.run_id;
       const attempt=Number(body.workflow_run?.run_attempt || body.workflow_job?.run_attempt || this.meta('workflow_attempt:'+id) || 1);
       if (id && !this.workflowAttempt(String(id),attempt)) {
-        this.sql.exec('INSERT OR IGNORE INTO deliveries VALUES(?,?,?)',pointer.delivery,event,pointer.received);
+        this.sql.exec('INSERT OR IGNORE INTO deliveries VALUES(?,?,?)',pointer.delivery,event,Date.now());
         return;
       }
       if (body.workflow_run) {
@@ -463,7 +470,7 @@ export class RepositoryState extends DurableObject<Env> {
         await this.enqueue(q,2,Date.now(),!known || operation==='repository' && event==='repository' || operation==='refs' && ['create','delete'].includes(event));
       }
     }
-    this.sql.exec('INSERT OR IGNORE INTO deliveries VALUES(?,?,?)',pointer.delivery,event,pointer.received);
+    this.sql.exec('INSERT OR IGNORE INTO deliveries VALUES(?,?,?)',pointer.delivery,event,Date.now());
     this.setMeta('last_webhook',Math.max(pointer.received,this.meta('last_webhook') || 0));
     this.setMeta('webhook_apply_ms',Math.max(0,Date.now()-pointer.received));
   }
@@ -539,10 +546,9 @@ export class RepositoryState extends DurableObject<Env> {
       if (!q.allow_observed && !this.complete(q)) await this.optionalAsync('enqueue',()=>this.enqueue(q,5));
       rows=await this.rows(q);
     }
-    const collection=this.sql.exec<any>('SELECT * FROM collections WHERE key=?',key).toArray()[0];
     const complete=rows!==null && (q.operation==='survey' || q.operation==='progress' || this.complete(q));
-    const observed=this.sql.exec<any>('SELECT MAX(r.observed) at FROM members m JOIN resources r ON r.kind=? AND r.id=m.id WHERE m.collection=?',this.kind(q),key).one().at;
-    const result:Result={version:1,repository:q.repository,operation:q.operation,status:rows===null?'unavailable':'ok',revision:this.revision(),observed_at:observed || collection?.verified,verified_at:collection?.verified,complete,coverage:complete?'complete':q.allow_observed?'webhook_observed':undefined};
+    const {observed,verified}=this.freshness(q);
+    const result:Result={version:1,repository:q.repository,operation:q.operation,status:rows===null?'unavailable':'ok',revision:this.revision(),observed_at:observed || verified,verified_at:verified,complete,coverage:complete?'complete':q.allow_observed?'webhook_observed':undefined};
     if(q.operation==='survey') {result.contract=SURVEY_CONTRACT;result.author_counts=author_counts;}
     const coverage=rows===null?'unavailable':result.coverage!;
     this.optional('query_metrics',()=>this.sql.exec('INSERT INTO query_metrics VALUES(?,?,1,?) ON CONFLICT(operation,coverage) DO UPDATE SET requests=requests+1,last_at=excluded.last_at',q.operation,coverage,Date.now()));
@@ -570,6 +576,23 @@ export class RepositoryState extends DurableObject<Env> {
     }
     return {...result,data:rows};
   }
+  // Derived results report the stored times of the collections they read:
+  // the newest observation and the oldest complete verification.
+  freshness(q:Query): {observed?:number,verified?:number} {
+    const args=q.args,number=q.args?.number;
+    const sources=q.operation==='survey'?[{key:queryKey({operation:'open_prs'}),kind:'pr'}]
+      :q.operation==='progress'?[{key:queryKey({operation:'pr',args}),kind:'pr',id:String(number)},{key:queryKey({operation:'issue_comments',args}),kind:'issue_comments'},{key:queryKey({operation:'review_comments',args}),kind:'review_comments'}]
+      :[{key:queryKey(q),kind:this.kind(q)}];
+    let observed:number | undefined,verified:number | undefined;
+    for (const source of sources as {key:string,kind:string,id?:string}[]) {
+      const at=source.id?this.sql.exec<any>('SELECT observed at FROM resources WHERE kind=? AND id=?',source.kind,source.id).toArray()[0]?.at
+        :this.sql.exec<any>('SELECT MAX(r.observed) at FROM members m JOIN resources r ON r.kind=? AND r.id=m.id WHERE m.collection=?',source.kind,source.key).one().at;
+      const checked=this.sql.exec<any>('SELECT verified FROM collections WHERE key=?',source.key).toArray()[0]?.verified;
+      if (at) observed=Math.max(observed ?? 0,at);
+      if (checked) verified=verified===undefined?checked:Math.min(verified,checked);
+    }
+    return {observed,verified};
+  }
   async continuation(q:Query,key:string): Promise<Result> {
     const cursor=q.cursor!,now=Date.now();
     // Legacy SQL cursors remain readable until they expire.
@@ -585,9 +608,10 @@ export class RepositoryState extends DurableObject<Env> {
     if (payload.key!==key) return this.unavailable(q,'cursor_query_mismatch');
     if (Boolean(payload.allow_observed)!==Boolean(q.allow_observed)) return this.unavailable(q,'cursor_coverage_mismatch');
     if (payload.result?.data!==undefined) return payload.result;
-    // Existing ten-minute cursors survive a rolling deployment.
-    const [id,offsetText]=cursor.split(':'); const offset=Number(offsetText);
-    if (!Number.isInteger(offset) || offset<0) return this.unavailable(q,'cursor_invalid');
+    // Existing ten-minute cursors survive a rolling deployment. Only an offset
+    // inside the stored snapshot can continue it; never fabricate an empty page.
+    const legacy=cursor.match(/^([^:]+):([1-9][0-9]{0,8})$/),offset=Number(legacy?.[2]),id=legacy?.[1] || '';
+    if (!legacy || !Array.isArray(payload.rows) || offset>=payload.rows.length) return this.unavailable(q,'cursor_invalid');
     return this.page(payload.result,payload.rows,id,offset);
   }
   page(result:Result,rows:any[],id:string,offset:number): Result {
@@ -1059,14 +1083,14 @@ export class RepositoryState extends DurableObject<Env> {
     if (path==='/storage/cleanup') {
       const rule=CLEANUP[input.class];
       if (!rule) throw new AdminError('unknown_cleanup_class');
-      let upper:number | null=null,recovery:string | null=null;
+      let bound:{upper:number,started:number} | null=null,recovery:string | null=null;
       if (rule.recovery) {
-        // Non-ephemeral rows are deleted only up to a verified export bound.
+        // Non-ephemeral rows are deleted only within a verified export.
         const manifest=await readManifest(this.env.ARCHIVE,repo,input.recovery),exported=manifest.tables[rule.table];
-        if (!exported?.verified) throw new AdminError('recovery_not_verified');
-        upper=exported.upper;recovery=manifest.id;
+        if (!exported?.verified || !Number.isSafeInteger(exported.started)) throw new AdminError('recovery_not_verified');
+        bound={upper:exported.upper,started:exported.started};recovery=manifest.id;
       }
-      const before=this.sql.databaseSize,result=deleteClass(this.sql,input.class,upper,input);
+      const before=this.sql.databaseSize,result=deleteClass(this.sql,input.class,bound,input);
       return json({class:input.class,table:rule.table,...result,recovery,database_size_before:before,database_size_after:this.sql.databaseSize,
         note:'Deleted rows become reusable free pages; the physical database size need not shrink. Prove headroom with /admin/storage/probe.'});
     }
@@ -1088,6 +1112,12 @@ export class RepositoryState extends DurableObject<Env> {
       this.faultFull=input.mode==='full';
       return json({storage:this.storageState()});
     }
+    if (path==='/storage/ingress') {
+      if (!['apply','parked'].includes(input.mode)) throw new AdminError('invalid_ingress_mode');
+      this.ingress=input.mode;
+      for (const deadline=Date.now()+25000;input.mode==='parked' && this.applying>0 && Date.now()<deadline;) await new Promise(resolve=>setTimeout(resolve,50));
+      return json({mode:this.ingress,in_flight:this.applying,drained:this.applying===0});
+    }
     if (path==='/storage/deliveries') {
       // Read-only receipt check for queue and DLQ reconciliation.
       if (!Array.isArray(input.ids) || input.ids.length>100 || input.ids.some((id:any)=>typeof id!=='string')) throw new AdminError('invalid_ids');
@@ -1102,7 +1132,14 @@ export class RepositoryState extends DurableObject<Env> {
       // A genuinely missing schema is a precise error, not empty data.
       if (typeof this.schema==='object' && path!=='/health') return json({error:this.schema.error,missing:this.schema.missing,cause:this.schema.cause,parkable:true,request_id},503);
       if (path==='/configure') { await this.configure((await req.json() as any).repository); return json({ok:true}); }
-      if (path==='/event') { await this.ingest(await req.json() as EventPointer); return json({ok:true}); }
+      if (path==='/event') {
+        const pointer=await req.json() as EventPointer,repo=repository(this.env,pointer.repository);
+        if (this.ingress===undefined && repo) this.ingress=(await this.env.ARCHIVE.get(controlKey(repo.id)).then(o=>o?.json<any>()))?.mode ?? 'apply';
+        if (this.ingress==='parked') return json({error:'ingress_parked',parkable:true,request_id},503);
+        this.applying++;
+        try {await this.ingest(pointer);} finally {this.applying--;}
+        return json({ok:true});
+      }
       if(path==='/retained-object') {
         const key=url.searchParams.get('key'),encoded=JSON.stringify({$r2:key});
         const retained=this.sql.exec('SELECT 1 FROM resources WHERE data=? UNION ALL SELECT 1 FROM cursors WHERE payload=? UNION ALL SELECT 1 FROM jobs WHERE nested=? LIMIT 1',encoded,encoded,encoded).toArray().length>0;

@@ -104,7 +104,7 @@ export function scan(sql: SqlStorage, input: any): any {
 // Recovery manifests and exports live in private R2, outside the full database.
 // They have no expiry metadata, so normal retention never removes them.
 export interface Manifest { id: string; repository: string; created: number; bookmark: string | null; database_size: number; revision: number; tables: Record<string, TableExport> }
-export interface TableExport { upper: number; after: number; rows: number; pages: { key: string; sha256: string; rows: number; first: number; last: number }[]; complete: boolean; verified: boolean; verified_pages: number; verified_at?: number }
+export interface TableExport { started: number; upper: number; after: number; rows: number; pages: { key: string; sha256: string; rows: number; first: number; last: number }[]; complete: boolean; verified: boolean; verified_pages: number; verified_at?: number }
 export const manifestKey = (repo: string, id: string) => `recovery/${repo}/${id}.json`;
 export async function readManifest(bucket: R2Bucket, repo: string, id: unknown): Promise<Manifest> {
   if (typeof id !== 'string' || !/^[0-9]{13}-[0-9a-f-]{36}$/.test(id)) throw new AdminError('invalid_recovery');
@@ -121,7 +121,7 @@ export async function createRecovery(bucket: R2Bucket, storage: DurableObjectSto
 }
 export async function exportPage(bucket: R2Bucket, sql: SqlStorage, repo: string, input: any): Promise<any> {
   const manifest = await readManifest(bucket, repo, input.recovery), name = table(sql, input.table);
-  const state = manifest.tables[name] ||= { upper: sql.exec<any>('SELECT COALESCE(MAX(rowid),0) n FROM ' + quote(name)).one().n, after: 0, rows: 0, pages: [], complete: false, verified: false, verified_pages: 0 };
+  const state = manifest.tables[name] ||= { started: Date.now(), upper: sql.exec<any>('SELECT COALESCE(MAX(rowid),0) n FROM ' + quote(name)).one().n, after: 0, rows: 0, pages: [], complete: false, verified: false, verified_pages: 0 };
   if (state.complete) return { table: name, ...state, pages: state.pages.length };
   const cols = columns(sql, name), limit = bounded(input.limit, 1000, 5000);
   const size = cols.map(c => 'COALESCE(length(CAST(' + quote(c) + ' AS BLOB)),0)').join('+');
@@ -173,11 +173,14 @@ export const CLEANUP: Record<string, { table: string; where: string; bound: (now
   // Demand older than its five-minute scheduling window is equivalent to absence.
   stale_demand: { table: 'demand', where: 'at<?', bound: now => now - 86400000, recovery: true },
 };
-export function deleteClass(sql: SqlStorage, name: string, upper: number | null, input: any, now = Date.now(), measure = true): { rows: number; logical_bytes: number | null } {
+// A verified export covers rows with rowid <= upper that were last written
+// before it started. Rowids can be reused, so both bounds are required.
+export function deleteClass(sql: SqlStorage, name: string, exported: { upper: number; started: number } | null, input: any, now = Date.now(), measure = true): { rows: number; logical_bytes: number | null } {
   const rule = CLEANUP[name], limit = bounded(input.limit, 100, 500);
   // Measuring reads every deleted payload; routine expiry skips that cost.
   const size = measure ? columns(sql, rule.table).map(c => 'COALESCE(length(CAST(' + quote(c) + ' AS BLOB)),0)').join('+') : '0';
-  const scope = rule.where + (upper === null ? '' : ' AND rowid<=?'), bindings = upper === null ? [rule.bound(now, input)] : [rule.bound(now, input), upper];
+  const bound = exported === null ? rule.bound(now, input) : Math.min(rule.bound(now, input), exported.started);
+  const scope = rule.where + (exported === null ? '' : ' AND rowid<=?'), bindings = exported === null ? [bound] : [bound, exported.upper];
   // Rowid order finds the oldest expired rows first and bounds every statement.
   const ids = sql.exec<any>('SELECT rowid id,' + size + ' bytes FROM ' + quote(rule.table) + ' WHERE ' + scope + ' ORDER BY rowid LIMIT ?', ...bindings, limit).toArray();
   for (let i = 0; i < ids.length; i += 50) {

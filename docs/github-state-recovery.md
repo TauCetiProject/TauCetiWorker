@@ -51,7 +51,14 @@ that fails replay five times for a non-storage reason moves to
 Setting the ingress mode to `parked` (planned migration, for example
 https://github.com/TauCetiProject/TauCetiWorker/issues/316) parks every
 delivery without calling the repository object, and stops replay until the
-mode returns to `apply`.
+mode returns to `apply`. The repository object is the barrier: once the admin
+call returns `drained: true`, it refuses every new application (including
+batches that read the earlier mode) and no application is still in flight.
+Receipts are retained for fourteen days after application, so a replay of a
+long-parked event still deduplicates its own cleanup.
+
+The cron delivery audit, which reads and redelivers from GitHub, is skipped
+while the repository is degraded or ingress is parked.
 
 ## Operator procedure
 

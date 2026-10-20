@@ -111,8 +111,14 @@ export default {
         if (url.pathname.startsWith('/admin/storage/') && req.method==='POST' && STORAGE_OPERATIONS.has(operation)) return forward('/storage/'+operation,{...input,repository_id:repo.id});
         try {
           if (url.pathname==='/admin/ingress' && req.method==='GET') return json(await backlog(env,repo));
-          if (url.pathname==='/admin/ingress' && req.method==='POST') return json(await setIngressMode(env,repo,input.mode,input.reason));
-          if (url.pathname==='/admin/ingress/replay' && req.method==='POST') return json(await drain(env,repo,{limit:input.limit,held:input.held===true,force:input.force===true}));
+          if (url.pathname==='/admin/ingress' && req.method==='POST') {
+            // Consumers see the R2 mode; the repository object then refuses new
+            // applications and reports once in-flight ones have finished.
+            const mode=await setIngressMode(env,repo,input.mode,input.reason);
+            const barrier=await forward('/storage/ingress',{mode:input.mode,repository_id:repo.id});
+            return json({...mode,repository:await barrier.json()},barrier.status);
+          }
+          if (url.pathname==='/admin/ingress/replay' && req.method==='POST') return json(await drain(env,repo,{limit:input.limit,held:input.held===true}));
           if (url.pathname==='/admin/ingress/reconcile' && req.method==='POST') return json(await reconcile(env,repo,input,(payload,event)=>targets(env,payload,event)));
         } catch(error) {return json({error:error instanceof Error?error.message.slice(0,200):'invalid_request',request_id},400);}
         return json({error:'not_found'},404);
@@ -181,9 +187,15 @@ export default {
   },
   async scheduled(_event:ScheduledController,env:Env,ctx:ExecutionContext):Promise<void> {
     for (const repo of repositories(env)) {
-      ctx.waitUntil(stub(env.REPOSITORIES,repo.id).fetch('https://internal/tick',{method:'POST',body:JSON.stringify({repository:repo.name})}));
       if(repo.name==='TauCetiProject/TauCeti') ctx.waitUntil(stub(env.REPOSITORIES,repo.id).fetch('https://internal/activity-refresh',{method:'POST'}));
-      ctx.waitUntil(stub(env.INSTALLATIONS,repo.installation).fetch('https://internal/audit',{method:'POST',body:JSON.stringify(repo)}));
+      ctx.waitUntil((async()=>{
+        const tick=await stub(env.REPOSITORIES,repo.id).fetch('https://internal/tick',{method:'POST',body:JSON.stringify({repository:repo.name})});
+        const state:any=await tick.json().catch(()=>({}));
+        // The delivery audit spends GitHub quota; skip it while the repository
+        // cannot store results or ingestion is deliberately parked.
+        if (!tick.ok || state.degraded || (await ingressMode(env,repo)).mode==='parked') {log('delivery_audit_skipped',{repository:repo.name,degraded:Boolean(state.degraded),status:tick.status});return;}
+        await stub(env.INSTALLATIONS,repo.installation).fetch('https://internal/audit',{method:'POST',body:JSON.stringify(repo)});
+      })().catch(error=>log('scheduled_failed',{repository:repo.name,reason:classify(error)})));
       ctx.waitUntil(drain(env,repo).catch(error=>log('parked_replay_failed',{repository:repo.name,reason:classify(error)})));
     }
     // R2 continuation pages are numerous and short-lived; sweep them separately.

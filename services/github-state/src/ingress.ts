@@ -11,7 +11,7 @@ const HOLD_AFTER_FAILURES = 5;
 const pad = (n: number) => String(Math.max(0, Math.floor(n))).padStart(15, '0');
 export const pointerKey = (repo: string, p: EventPointer, held = false) => `parked/${repo}/${held ? 'held' : 'pointers'}/${pad(p.received)}-${p.delivery}.json`;
 export const bodyKey = (repo: string, delivery: string) => `parked/${repo}/bodies/${delivery}.json`;
-const controlKey = (repo: string) => `control/${repo}/ingress.json`;
+export const controlKey = (repo: string) => `control/${repo}/ingress.json`;
 export function backoff(attempts: number): number { return Math.min(600, 5 * 2 ** Math.max(0, Math.min(attempts - 1, 8))); }
 
 export async function ingressMode(env: Env, repo: Repository): Promise<{ mode: 'apply' | 'parked'; reason?: string; at?: number }> {
@@ -51,8 +51,8 @@ export async function park(env: Env, repo: Repository, pointer: EventPointer, re
 
 // Replay oldest first. A pointer is removed only after the repository commits
 // the delivery receipt; a crash before removal repeats a deduplicated replay.
-export async function drain(env: Env, repo: Repository, options: { limit?: number; held?: boolean; force?: boolean } = {}): Promise<any> {
-  if (!options.force && (await ingressMode(env, repo)).mode === 'parked') return { replayed: 0, stopped: 'parked' };
+export async function drain(env: Env, repo: Repository, options: { limit?: number; held?: boolean } = {}): Promise<any> {
+  if ((await ingressMode(env, repo)).mode === 'parked') return { replayed: 0, stopped: 'parked' };
   const prefix = `parked/${repo.id}/${options.held ? 'held' : 'pointers'}/`;
   const page = await env.ARCHIVE.list({ prefix, limit: Math.min(Math.max(1, options.limit || 25), 100) });
   let replayed = 0, failed = 0;
