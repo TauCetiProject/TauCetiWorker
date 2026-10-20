@@ -11,7 +11,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   rerun every stage to diagnose one failure.
   Reproduce the failing phase through the helper, for example:
   ```
-  "__BIN__/tauceti-verify" --stage shim-expiry
+  "$TAUCETI_VERIFY_PYTHON" "__BIN__/tauceti-verify" --stage shim-expiry
   ```
   The other stage names are `build`, `axioms`, `module-system` and `lint`. The helper checks
   the merge-base shim registry with `--fail-on-available`, `--base-manifest` and `--base-root`,

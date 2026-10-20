@@ -1794,7 +1794,11 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     library from source, every round, for as long as the endpoint stayed down.
     """
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
-    preliminary = '"/opt/round/tauceti-verify" --stage build' if verify_helper else "timeout 1800 lake build"
+    preliminary = (
+        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
+        if verify_helper
+        else "timeout 1800 lake build"
+    )
     return (
         "set -e; "
         "lake exe cache get || lake exe cache get; "

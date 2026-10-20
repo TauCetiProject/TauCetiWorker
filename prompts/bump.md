@@ -8,7 +8,7 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 Read the failing CI log first and reproduce the stage that failed, not every check. The usual
 failure is the build: use the helper's `--stage build`. If the expired-shim check failed:
 ```
-"__BIN__/tauceti-verify" --stage shim-expiry
+"$TAUCETI_VERIFY_PYTHON" "__BIN__/tauceti-verify" --stage shim-expiry
 ```
 The helper uses `--fail-on-available`, checks the merge-base registry with `--base-manifest`
 and `--base-root`, and probes all obligations after a pin change. It never fetches.
