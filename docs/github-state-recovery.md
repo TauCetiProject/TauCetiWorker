@@ -14,7 +14,11 @@ service is built so that this state degrades writes only:
   hydration and snapshots stop, so no GitHub quota is spent on results that
   cannot be stored. Responses keep their original observation timestamps and
   completeness; unknown coverage stays `status: "unavailable"`. Degraded
-  responses carry `X-TauCeti-Storage: degraded`.
+  responses carry `X-TauCeti-Storage: degraded`. Clients do not judge data
+  age, so once a degraded mirror has not changed (no applied webhook or
+  stored repair) for ten minutes, queries return `status: "unavailable"` with
+  reason `mirror_frozen` and existing clients use their direct GitHub
+  fallback instead of acting on frozen state.
 - New continuation pages are written to private R2 (`cursors/<repo>/<id>/<offset>.json`),
   using the existing `id:offset` cursor syntax and the same repository,
   query, coverage and expiry checks. Legacy SQL cursors remain readable until
@@ -42,7 +46,8 @@ the tenth attempt, well inside the queue's 20-retry budget. A failed parking
 write is retried with the same backoff and never acknowledged. Parked objects
 carry no expiry metadata, so normal R2 retention keeps them.
 
-The cron drains up to 25 pointers per repository per minute, oldest first.
+The cron drains parked pointers for up to twenty seconds of each minute, in
+pages of 100 replayed in concurrent groups of ten, oldest page first.
 A pointer is removed only after the repository commits the receipt. A crash
 after commit repeats a replay that the receipt table deduplicates. An item
 that fails replay five times for a non-storage reason moves to

@@ -8,6 +8,7 @@ import { classify, log } from './storage';
 export interface Parked extends EventPointer { original_key: string; sha256: string; parked_at: number; reason: string; replay_failures?: number; last_error?: string }
 export const PARK_AFTER_ATTEMPTS = 10;
 const HOLD_AFTER_FAILURES = 5;
+const REPLAY_GROUP = 10;
 const pad = (n: number) => String(Math.max(0, Math.floor(n))).padStart(15, '0');
 export const pointerKey = (repo: string, p: EventPointer, held = false) => `parked/${repo}/${held ? 'held' : 'pointers'}/${pad(p.received)}-${p.delivery}.json`;
 export const bodyKey = (repo: string, delivery: string) => `parked/${repo}/bodies/${delivery}.json`;
@@ -65,14 +66,17 @@ export async function park(env: Env, repo: Repository, pointer: EventPointer, re
 
 // Replay oldest first. A pointer is removed only after the repository commits
 // the delivery receipt; a crash before removal repeats a deduplicated replay.
+// Replay oldest first, in small concurrent groups. Application tolerates
+// reordering (timestamps and tombstones guard newer state), so a group need
+// not be sequential; a storage stop still ends the pass after its group.
 export async function drain(env: Env, repo: Repository, options: { limit?: number; held?: boolean } = {}): Promise<any> {
   if ((await ingressMode(env, repo)).mode === 'parked') return { replayed: 0, stopped: 'parked' };
   const prefix = `parked/${repo.id}/${options.held ? 'held' : 'pointers'}/`;
   const page = await env.ARCHIVE.list({ prefix, limit: Math.min(Math.max(1, options.limit || 25), 100) });
-  let replayed = 0, failed = 0;
-  for (const object of page.objects) {
+  let replayed = 0, failed = 0, stopped: string | undefined;
+  const replay = async (object: R2Object): Promise<void> => {
     const parked = await env.ARCHIVE.get(object.key).then(o => o?.json<Parked>());
-    if (!parked) continue;
+    if (!parked) return;
     let response: Response;
     const started = Date.now();
     try { response = await stub(env.REPOSITORIES, repo.id).fetch('https://internal/event', { method: 'POST', body: JSON.stringify({ key: parked.key, delivery: parked.delivery, event: parked.event, repository: parked.repository, received: parked.received }) }); }
@@ -80,18 +84,19 @@ export async function drain(env: Env, repo: Repository, options: { limit?: numbe
       const reason = classify(error);
       if (reason === 'storage_full') await noteRepositoryFull(env, repo.id, 'replay', started);
       log('parked_replay_failed', { repository: repo.name, delivery: parked.delivery, error: reason });
-      return { replayed, failed, remaining: true, stopped: reason };
+      stopped = reason;
+      return;
     }
     if (response.ok) {
       // Body first: a missing body with a committed receipt still deduplicates.
       await env.ARCHIVE.delete(parked.key);
       await env.ARCHIVE.delete(object.key);
       replayed++;
-      continue;
+      return;
     }
     const error: any = await response.json().catch(() => ({}));
     log('parked_replay_failed', { repository: repo.name, delivery: parked.delivery, error: error.error, request_id: error.request_id });
-    if (error.parkable) return { replayed, failed, remaining: true, stopped: error.error };
+    if (error.parkable) { stopped = error.error; return; }
     // A repeatedly failing item moves aside so it cannot block newer events;
     // it remains durable and replayable from the held prefix.
     failed++;
@@ -99,8 +104,9 @@ export async function drain(env: Env, repo: Repository, options: { limit?: numbe
     const hold = !options.held && updated.replay_failures >= HOLD_AFTER_FAILURES, target = hold ? pointerKey(repo.id, parked, true) : object.key;
     await env.ARCHIVE.put(target, JSON.stringify(updated), { customMetadata: { kind: 'parked-pointer', delivery: parked.delivery } });
     if (hold) await env.ARCHIVE.delete(object.key);
-  }
-  return { replayed, failed, remaining: page.truncated || replayed < page.objects.length };
+  };
+  for (let i = 0; i < page.objects.length && !stopped; i += REPLAY_GROUP) await Promise.all(page.objects.slice(i, i + REPLAY_GROUP).map(replay));
+  return { replayed, failed, remaining: Boolean(stopped) || page.truncated || replayed < page.objects.length, ...(stopped ? { stopped } : {}) };
 }
 
 export async function backlog(env: Env, repo: Repository): Promise<any> {
