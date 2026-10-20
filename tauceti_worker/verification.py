@@ -31,10 +31,12 @@ from .constants import LEAN_ROOT
 from .containment import Boundary
 from .paths import HERE
 from .runtime_status import read_json, report_runtime
+from .verification_installations import Installations
+from .verification_queue import admitted
 from .verification_scope import git, local_main, scope, untracked
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
@@ -197,6 +199,7 @@ class Verification:
         policy="ordinary",
         deadline=None,
         lint_modules=None,
+        job=None,
     ):
         self.root, self.state = root.resolve(), state.resolve()
         self.base_arg, self.policy = base, policy
@@ -228,6 +231,16 @@ class Verification:
         self.last_watch = 0.0
         self.wait_lease = None
         self.interrupted_wait = False
+        self.job = job
+        self.installations = Installations(
+            self.state,
+            digest=digest,
+            atomic=atomic,
+            read_json=read_json,
+            files_under=files_under,
+            file_record=file_record,
+            stamps=stamps,
+        )
 
     def save(self):
         atomic(self.path, self.receipt)
@@ -254,6 +267,7 @@ class Verification:
     def final_watch(self):
         self.last_watch = 0
         self.watch()
+        self.installations.validate()
         if (
             stamps(self.static_stamps) != self.static_stamps
             or self.dependency_names is not None
@@ -263,50 +277,44 @@ class Verification:
 
     @contextlib.contextmanager
     def slot(self, phase):
-        count = heavy_slots()
-        root = queue_root()
         started = time.monotonic()
         waiting = False
-        handle = None
+        acquired = False
         published = 0.0
-        acquired_wait = None
+
+        def publish():
+            nonlocal waiting, published
+            if not waiting:
+                from .verification_jobs import preserve_candidate
+
+                if self.job:
+                    preserve_candidate(self)
+                self.progress(f"{phase}: waiting-verification-capacity")
+                self.receipt["waiting_for_capacity"] = True
+                self.save()
+                waiting = True
+            if time.monotonic() - published >= 15:
+                published = time.monotonic()
+                self.capacity(True)
+                report_runtime("waiting-verification-capacity", verification_receipt=str(self.path))
+
         try:
-            while handle is None:
-                self.watch()
-                for index in range(count):
-                    fd = os.open(root / f"slot-{index}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        handle = fd
-                        break
-                    except BlockingIOError:
-                        os.close(fd)
-                    except BaseException:
-                        os.close(fd)
-                        raise
-                if handle is None:
-                    if not waiting:
-                        self.progress(f"{phase}: waiting-verification-capacity")
-                        self.receipt["waiting_for_capacity"] = True
-                        self.save()
-                        waiting = True
-                    if time.monotonic() - published >= 15:
-                        published = time.monotonic()
-                        self.capacity(True)
-                        report_runtime("waiting-verification-capacity", verification_receipt=str(self.path))
-                    time.sleep(min(1, max(0.01, (self.deadline or time.time() + 1) - time.time())))
-            acquired_wait = time.monotonic() - started
-            self.capacity(False)
-            self.receipt["waiting_for_capacity"] = False
-            report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
-            yield
+            with admitted(
+                queue_root(),
+                heavy_slots(),
+                watch=self.watch,
+                waiting=publish,
+                priority=self.job.get("priority") if self.job else None,
+            ):
+                acquired = True
+                self.receipt["queue_wait_seconds"] += time.monotonic() - started if waiting else 0
+                self.capacity(False)
+                self.receipt["waiting_for_capacity"] = False
+                report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
+                yield
         finally:
-            self.receipt["queue_wait_seconds"] += (
-                (acquired_wait if acquired_wait is not None else time.monotonic() - started) if waiting else 0
-            )
-            if handle is not None:
-                os.close(handle)
-            elif waiting:
+            if not acquired and waiting:
+                self.receipt["queue_wait_seconds"] += time.monotonic() - started
                 self.capacity(False, interrupted=True)
             self.save()
 
@@ -419,9 +427,9 @@ class Verification:
         prefix = Path(toolchain["lake env lean --print-prefix"])
         if not prefix.is_absolute() or not prefix.is_dir():
             raise ValueError("Lean did not report an absolute installed toolchain prefix")
-        toolchain["distribution"] = {str(p.relative_to(prefix)): file_record(p) for p in files_under(prefix)}
+        toolchain["distribution"] = self.installations.inventory(prefix)
         deps = self.root / ".lake" / "packages"
-        dependencies = {str(p.relative_to(deps)): file_record(p) for p in files_under(deps)}
+        dependencies = self.installations.inventory(deps)
         config = os.environ.get("LAKE_CONFIG")
         # Hash environment values to avoid recording credentials. Volatile orchestration values do not build inputs.
         environment = {
@@ -479,7 +487,7 @@ class Verification:
         if phase == "lint":
             if selected["mode"] == "unknown":
                 raise Incomplete("lint: changed modules unknown; CI owns the full environment lint")
-            commands = []
+            commands = [(["bash", "-o", "pipefail", "scripts/lint-style.sh"], env)]
             lint_list = self.directory / "lint-modules.txt"
             lint_modules = set(selected["modules"])
             if self.lint_modules:
@@ -497,7 +505,6 @@ class Verification:
             if lint_modules:
                 env["LINT_ONLY_MODULES"] = str(lint_list)
                 commands.append((["bash", "-o", "pipefail", "scripts/lint-env.sh"], env))
-            commands.append((["bash", "-o", "pipefail", "scripts/lint-style.sh"], env))
             return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
@@ -561,25 +568,34 @@ class Verification:
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
             self.progress(f"scope: {self.receipt['scope']['mode']}: {self.receipt['scope']['reason']}")
+            candidate_sources = inventory(self.root, self.base)
             if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
-                self.checkpoint_sources(dict(sources=inventory(self.root, self.base)))
+                self.checkpoint_sources(dict(sources=candidate_sources))
+            from .verification_jobs import prepare_job
+
+            self.job = prepare_job(self, dict(sources=candidate_sources))
+            self.receipt["job"] = self.job["id"]
+            if self.deadline is not None and time.time() >= self.deadline - float(
+                os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600")
+            ):
+                from .verification_jobs import preserve_candidate
+
+                preserve_candidate(self)
             self.check_deadline()
             self.watch_names = source_names(self.root, self.base)
-            dep_paths = list(files_under(self.root / ".lake/packages"))
             self.watched = stamps([self.root / p for p in self.watch_names])
-            self.static_stamps = stamps(dep_paths)
             inputs = self.inputs()
             self.watch()
             extra = list(Path(__file__).parent.glob("*.py")) + [HERE / "scripts/tauceti-verify"]
-            prefix = Path(inputs["toolchain"]["lake env lean --print-prefix"])
-            extra += list(files_under(prefix))
+            extra += [p for root in self.installations.walked for p in files_under(root)]
             extra += [
                 Path(entry["path"])
                 for entry in inputs["toolchain"].values()
                 if isinstance(entry, dict) and "path" in entry
             ]
             extra.append(Path(sys.executable))
-            self.dependency_names = {str(p) for p in files_under(self.root / ".lake/packages")}
+            if (self.root / ".lake/packages").resolve() in self.installations.walked:
+                self.dependency_names = {str(p) for p in files_under(self.root / ".lake/packages")}
             if os.environ.get("LAKE_CONFIG"):
                 extra.append(Path(os.environ["LAKE_CONFIG"]))
             if self.lint_modules:
@@ -593,6 +609,8 @@ class Verification:
             if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
                 self.checkpoint_sources(inputs)
 
+            if digest(inputs["sources"]) != self.job["source_digest"]:
+                raise Incomplete("candidate changed while preparing verification")
             modules = self.directory / "modules.txt"
             modules.write_text("".join(f"{m}\n" for m in self.receipt["scope"]["modules"]))
             self.save()
@@ -606,14 +624,26 @@ class Verification:
                     self.progress(f"{phase}: reused exact-input success ({reused})")
                     self.save()
                     continue
+                from .verification_jobs import preserve_candidate
+
+                preserve_candidate(self, disposable_only=True)
                 record = dict(status="incomplete", started_at=time.time(), ended_at=None)
                 self.receipt["phases"][phase] = record
                 self.save()
-                with self.slot(phase):
-                    for argv, env in self.phase_commands(phase, modules):
+                # Shim and source-style checks are cheap. Environment lint/build/audits alone
+                # consume heavy capacity; release it between commands.
+                for argv, env in self.phase_commands(phase, modules):
+                    heavy = phase in {"build", "axioms", "module-system"} or (
+                        phase == "lint" and "scripts/lint-env.sh" in argv
+                    )
+                    with self.slot(phase) if heavy else contextlib.nullcontext():
                         self.command(phase, argv, env=env)
-                record.update(status="success", ended_at=time.time())
-                self.save()
+                self.final_watch()
+                if self.mutated or digest(self.inputs()) != fingerprint:
+                    raise Incomplete("verification inputs changed during execution")
+                self.final_watch()
+                record.update(status="success", ended_at=time.time(), validated_fingerprint=fingerprint)
+                self.index_success()
             # Recompute bytes, pins, dependencies, toolchain, environment and verifier after all tools exit.
             self.final_watch()
             if self.mutated or digest(self.inputs()) != fingerprint:
@@ -642,6 +672,10 @@ class Verification:
             for phase in self.receipt["phases"].values():
                 if phase.get("ended_at") is None:
                     phase.update(ended_at=self.receipt["ended_at"], status=self.receipt["status"])
+            if self.job:
+                from .verification_jobs import finish_job
+
+                finish_job(self)
             self.save()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
@@ -662,7 +696,7 @@ class Verification:
             fcntl.flock(lock, fcntl.LOCK_EX)
             entries = read_json(index)
             for phase, result in self.receipt["phases"].items():
-                if "reused_from" not in result:
+                if "reused_from" not in result and result.get("validated_fingerprint") == self.receipt["fingerprint"]:
                     entries[phase] = str(self.path)
             # Publish the receipt before its index; interrupted publication never grants evidence.
             self.save()
@@ -683,7 +717,7 @@ class Verification:
             return None
         if (
             old.get("schema") == SCHEMA
-            and old.get("status") == "success"
+            and (old.get("status") == "success" or evidence.get("validated_fingerprint") == fingerprint)
             and old.get("fingerprint") == fingerprint
             and evidence.get("status") == "success"
             and Path(old.get("inputs", {}).get("path", "")).is_file()

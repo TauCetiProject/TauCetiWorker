@@ -118,6 +118,13 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            from .verification_jobs import resume_pending
+
+            if resume_pending(cfg):
+                # Local work needs neither inference admission nor a fresh GitHub survey.
+                streak = 0
+                time.sleep(1)
+                continue
             if reason := fleet_admission_reason(cfg.wid):
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)

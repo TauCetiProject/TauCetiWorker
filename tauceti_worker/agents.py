@@ -440,7 +440,7 @@ def fill_prompt(path: Path, **subs) -> str:
     path = Path(path)
     if (
         path.parent == HERE / "prompts"
-        and os.environ.get("TAUCETI_VERIFY_HELPER", "1") == "0"
+        and os.environ.get("TAUCETI_VERIFY_HELPER", "0") == "0"
         and (path.parent / "v0" / path.name).is_file()
     ):
         path = path.parent / "v0" / path.name
@@ -483,7 +483,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
     """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
     if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
         raise Die(f"unknown local verification scope policy {policy!r}")
-    if os.environ.get("TAUCETI_VERIFY_HELPER", "1") == "0":
+    if os.environ.get("TAUCETI_VERIFY_HELPER", "0") == "0":
         return fill_prompt(HERE / "prompts" / "local-verification.md", SCOPE_POLICY=policy)
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
@@ -1999,7 +1999,7 @@ def run_in_bubble(
     # replace it in this subprocess env with a private, transient Keychain handoff below; the process-wide
     # value and any operator-owned credential file remain untouched.
     env = ensure_bubble_home(cfg)
-    helper_on = inner_cmd is None and os.environ.get("TAUCETI_VERIFY_HELPER", "1") != "0"
+    helper_on = inner_cmd is None and os.environ.get("TAUCETI_VERIFY_HELPER", "0") != "0"
     rounddir = cfg.state / "bubble-round"
 
     shutil.rmtree(rounddir, ignore_errors=True)

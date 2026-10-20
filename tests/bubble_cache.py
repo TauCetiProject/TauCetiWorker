@@ -207,7 +207,7 @@ tc.agents._bubble_pop = lambda _cfg, _env: None
 os.environ["TAUCETI_AGENT_ECHO"] = "1"
 try:
     out = io.StringIO()
-    with contextlib.redirect_stdout(out):
+    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"), contextlib.redirect_stdout(out):
         rc = tc.run_in_bubble(w, tc.TAUCETI, "PROMPT", opts)
     work_argv = out.getvalue()
     check("work echo succeeds", rc == 0)
