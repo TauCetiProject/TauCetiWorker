@@ -252,12 +252,15 @@ def main():
         rc = proc.wait()
         process_exited = True
         outcome = f"exit:{rc}"
-        kind = "successful-exit" if rc == 0 else "signal" if rc < 0 or rc >= 128 else "failed-exit"
+        exec_failed = (bridge / "inbox" / (invocation + ".exec-failed")).exists()
+        kind = (
+            "failed-launch" if exec_failed else "successful-exit" if rc == 0 else "signal" if rc < 0 else "failed-exit"
+        )
         try:
             durable(bridge / "inbox" / (invocation + ".terminal"), dict(id=invocation, kind=kind, returncode=rc))
         except OSError as error:
             warning(f"tauceti lifecycle terminal evidence pending: {type(error).__name__}")
-        if (bridge / "inbox" / (invocation + ".exec-failed")).exists():
+        if exec_failed:
             outcome = "launch-failed"
             totals = {invocation: "0"}
             unknown_segments.clear()

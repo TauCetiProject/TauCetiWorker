@@ -74,7 +74,12 @@ def darwin_process(pid):
     library.proc_pidinfo.restype = ctypes.c_int
     info = BSDInfo()
     if library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
-        raise ProcessLookupError(pid)
+        import errno
+
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            raise ProcessLookupError(pid)
+        raise OSError(error or errno.EIO, "process birth identity unavailable")
     return dict(pid=pid, boot=darwin_boot(), start=f"{info.start_seconds}:{info.start_microseconds}"), info.status
 
 
@@ -139,8 +144,10 @@ def alive(owner):
         current = identity(int(owner["pid"]))
         fields = Path(f"/proc/{owner['pid']}/stat").read_text().rsplit(")", 1)[1].split()
         return current == owner and fields[0] not in {"Z", "X"}
-    except (OSError, ValueError, KeyError, IndexError):
+    except (ProcessLookupError, FileNotFoundError):
         return False
+    except (OSError, ValueError, KeyError, IndexError):
+        return True  # Unreadable birth evidence is not proof of termination.
 
 
 def exec_gate(bridge, invocation, command):

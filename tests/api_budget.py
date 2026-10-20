@@ -793,6 +793,29 @@ with ClaudeAPIContext("crash-fixture", "fix"):
                 os.killpg(driver.pid, signal.SIGKILL)
             driver.wait()
 
+    def test_native_exec_gate_inside_real_pid_namespace(self):
+        from tauceti_worker.containment import command, probe
+
+        supported, reason = probe()
+        if not supported:
+            self.skipTest(reason)
+        with ClaudeAPIContext("worker1", "fix") as context:
+            result = subprocess.run(
+                command()
+                + [str(context.bin / "claude"), "-p", "fixture", "--model", "opus", "--output-format", "stream-json"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            native_pid = json.loads(result.stdout.splitlines()[0])["pid"]
+            invocation = next(iter(context.invocations))
+            lifecycle = json.loads((self.root / "budget/lifecycles" / (invocation + ".json")).read_text())
+            self.assertNotEqual(lifecycle["native"]["pid"], native_pid)
+            self.assertEqual(lifecycle["gate"]["pid"], native_pid)
+            self.assertEqual(lifecycle["native"]["start"], lifecycle["gate"]["start"])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
+
     def test_internal_partial_events_are_not_forwarded_to_ordinary_callers(self):
         os.environ["FAKE_EVENTS"] = json.dumps(
             [

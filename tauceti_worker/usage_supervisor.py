@@ -95,7 +95,18 @@ def tick(budget, cache=None):
             print(f"{path.stem}: usage recovery retained for retry: {type(error).__name__}: {error}", flush=True)
 
 
+def recovery_mode(directory):
+    try:
+        mode = (Path(directory) / "usage-recovery-mode").read_text().strip()
+    except FileNotFoundError:
+        mode = "auto"
+    if mode not in {"auto", "record-only"}:
+        raise ValueError("usage-recovery-mode must contain auto or record-only")
+    return mode
+
+
 def recover_invocation(budget, path, *, cache=None):
+    mode = recovery_mode(budget.directory)
     value = read_lifecycle(budget.directory, path.stem)
     bridge, invocation = Path(value["bridge"]), value["id"]
     inbox, outbox = bridge / "inbox", bridge / "outbox"
@@ -155,12 +166,6 @@ def recover_invocation(budget, path, *, cache=None):
         durable(path, value)
     if not stopped or not value["budgeted"]:
         return
-    try:
-        mode = (budget.directory / "usage-recovery-mode").read_text().strip()
-    except FileNotFoundError:
-        mode = "auto"
-    if mode not in {"auto", "record-only"}:
-        raise ValueError("usage-recovery-mode must contain auto or record-only")
     if mode == "record-only":
         return
     receipt_path = inbox / (invocation + ".receipt")

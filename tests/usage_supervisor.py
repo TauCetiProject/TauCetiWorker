@@ -269,6 +269,13 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(saved["shim"], self.lifecycle["shim"])
         self.assertEqual(self.saved()["status"], "settled")
 
+    def test_unreadable_process_birth_is_not_proof_of_death(self):
+        owner = identity()
+        with patch("tauceti_worker.usage_lifecycle.identity", side_effect=PermissionError("unreadable proc")):
+            self.assertTrue(alive(owner))
+        with patch("tauceti_worker.usage_lifecycle.identity", side_effect=FileNotFoundError("gone")):
+            self.assertFalse(alive(owner))
+
     def test_reused_pid_is_not_the_registered_process(self):
         owner = identity()
         self.assertFalse(alive({**owner, "start": "different-birth"}))
@@ -309,6 +316,14 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(BudgetError, "live accounting"):
             self.budget.reconcile(self.id, 3, "fixture")
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+
+    def test_invalid_recovery_policy_never_permits_inference(self):
+        (self.root / "usage-recovery-mode").write_text("typo")
+        native = self.sleeper()
+        durable(self.bridge / "inbox" / (self.id + ".launch"), dict(id=self.id, native=identity(native.pid)))
+        with patch("builtins.print"):
+            tick(self.budget)
+        self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
 
     def test_bad_lifecycle_does_not_block_other_recovery(self):
         (self.root / "lifecycles" / ("0" * 32 + ".json")).write_text("bad json")
