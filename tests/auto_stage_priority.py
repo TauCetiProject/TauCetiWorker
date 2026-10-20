@@ -109,7 +109,7 @@ def fake_run(argv, *_a, **_k):
 
 with tempfile.TemporaryDirectory() as tmp:
     progress_worker = SimpleNamespace(
-        cfg=SimpleNamespace(state=Path(tmp), checkout=Path(tmp) / "code"),
+        cfg=SimpleNamespace(state=Path(tmp), checkout=Path(tmp) / "code", logdir=Path(tmp) / "logs"),
         counters=SimpleNamespace(write=lambda name, value: writes.append((name, value))),
     )
     tc.work_units.prepare_checkout = lambda _cfg, **_: True
@@ -123,11 +123,10 @@ checks.append(check("fresh not-due plan returns the fallthrough signal", progres
 checks.append(
     check("worker requires 25 PRs for a progress report", plan_calls[0][plan_calls[0].index("--min-prs") + 1], "25")
 )
-checks.append(check("fresh plan re-check records the attempt", writes[0][0], "progress-attempt-ts"))
+checks.append(check("fresh not-due plan does not spend a prose attempt", writes, []))
 
-# Starting a progress attempt consumes the cached due verdict even when the fresh plan fails. Without
-# this, the cache is consulted before the eight-hour attempt gap and the worker can spend its whole
-# three-error breaker in a few minutes retrying the identical failure.
+# Starting mechanical progress work consumes the cached verdict even when the fresh plan fails.
+# Genuine errors still charge the tool error breaker, while the prose cadence remains unspent.
 with tempfile.TemporaryDirectory() as tmp:
     state = Path(tmp)
     due_cache = state / "cache" / "progress-due.json"
@@ -158,13 +157,8 @@ with tempfile.TemporaryDirectory() as tmp:
         tc.work_units.subprocess.run = saved_run
     checks.append(check("a failed attempt consumes the cached due verdict", due_cache.exists(), False))
     checks.append(check("a failed plan still charges the error breaker", counters.read(tc.PROGRESS_ERROR_KEY), 1))
-    due, reason = tc.progress_due(progress_worker.cfg, counters)
     checks.append(
-        check(
-            "the next survey observes the attempt gap instead of retrying cached due work",
-            due is False and "waiting out the attempt gap" in reason,
-            True,
-        )
+        check("a failed mechanical plan does not spend the prose cadence", counters.read("progress-attempt-ts"), 0)
     )
 
 # Upgrading the progress tool must recover workers latched by the previous release, while
