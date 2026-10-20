@@ -300,6 +300,10 @@ class NoProgress(Exception):
 class DocumentationUnavailable(NoProgress):
     """Documentation deployment churn; replan without spending a report attempt."""
 
+    def __init__(self, message, *, retry_at=None):
+        super().__init__(message)
+        self.retry_at = retry_at
+
 
 class VerificationUnavailable(NoProgress):
     """Heavy verification capacity wait; separate from inference/API admission."""

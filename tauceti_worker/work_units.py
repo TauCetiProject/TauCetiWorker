@@ -63,10 +63,12 @@ from .constants import (
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
     PR_TASKS,
+    PROGRESS_ATTEMPT_GAP,
     PROGRESS_ERROR_KEY,
     PROGRESS_REF,
     PROGRESS_TOOL_LINE,
     PROGRESS_TOOL_TAIL,
+    PROGRESS_TTL,
     REVIEW,
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_PROVIDER_DOWN_EXIT,
@@ -1869,32 +1871,64 @@ def _progress_tool_failed(w, sub: str, proc) -> str:
     return f"tauceti-progress {sub} failed (rc={proc.returncode}): {_clip(summary)}{where}"
 
 
-def _progress_generation_changed(proc):
-    """Exit 76 is the typed tool result; recognize only positive legacy build mismatches."""
+def _progress_generation_changed(stage, proc):
+    """Exit 76 is typed; older facts diagnostics must name two different builds."""
     if proc.returncode == 76:
         return True
-    if proc.returncode != 1:
+    if stage != "facts" or proc.returncode != 1:
         return False
     detail = (proc.stderr or "") + "\n" + (proc.stdout or "")
-    return bool(
-        re.search(
-            r"documentation changed from planned commit [0-9a-f]{7,40} to [0-9a-f]{7,40} "
-            r"before facts were collected; replan the window",
-            detail,
-        )
-        or re.search(
-            r"was built from [0-9a-f]{7,40}, not [0-9a-f]{7,40}; "
-            r"the site is redeploying",
-            detail,
-        )
-    )
+    for pattern in (
+        r"documentation changed from planned commit ([0-9a-f]{7,40}) to ([0-9a-f]{7,40}) "
+        r"before facts were collected; replan the window",
+        r"was built from ([0-9a-f]{7,40}), not ([0-9a-f]{7,40}); the site is redeploying",
+    ):
+        if match := re.search(pattern, detail):
+            if match[1] != match[2]:
+                return True
+    return False
+
+
+def _progress_mechanical_delay(w, delay=PROGRESS_TTL):
+    w.counters.write("progress-mechanical-retry-at", int(time.time()) + delay)
+    bust_progress_cache(w.cfg)
+
+
+def _progress_mechanical_failed(w, reason):
+    # Preserve the old spacing of genuine failures without spending the prose cadence window.
+    w.counters.incr(PROGRESS_ERROR_KEY)
+    _progress_mechanical_delay(w, PROGRESS_ATTEMPT_GAP)
+    raise Die(reason)
+
+
+def _progress_documentation_wait(w, reason):
+    from .config import DocumentationUnavailable
+
+    waits = w.counters.read("progress-docs-waits") + 1
+    delay = (60, 300, 900, 1800)[min(waits - 1, 3)]
+    retry_at = int(time.time()) + delay
+    w.counters.write("progress-docs-waits", waits)
+    w.counters.write("progress-docs-retry-at", retry_at)
+    bust_progress_cache(w.cfg)
+    raise DocumentationUnavailable(f"waiting-documentation: {reason}", retry_at=retry_at)
 
 
 def _prepare_progress(w, run_tool, roadmap_dir, work):
     """Retry only free mechanical work. Keep the last coherent artifacts until replacement succeeds."""
-    from .config import DocumentationUnavailable
+    from . import progress_publication as publication
 
-    attempts = Path(tempfile.mkdtemp(prefix="mechanical-", dir=work))
+    archive = w.cfg.state / "progress/mechanical"
+    archive.mkdir(parents=True, exist_ok=True)
+    # Keep recent traces and every archive containing prepared prose. Full stage diagnostics are
+    # retained independently beside the round logs. Never prune publication receipts or bodies.
+    traces = sorted(
+        (p for p in archive.glob("attempt-*") if not (p / "previous").exists()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in traces[19:]:
+        shutil.rmtree(old)
+    attempts = Path(tempfile.mkdtemp(prefix="attempt-", dir=archive))
     reason = ""
     for attempt in range(3):
         output = attempts / str(attempt + 1)
@@ -1921,25 +1955,45 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                 proc = run_tool(stage, *args, capture=True, docs_cache=cache)
                 if stage == "plan" and proc.returncode == EX_NOPROGRESS:
                     log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
+                    _progress_mechanical_delay(w)
                     return None
                 if proc.returncode:
                     reason = _progress_tool_failed(w, stage, proc)
-                    if _progress_generation_changed(proc):
+                    if _progress_generation_changed(stage, proc):
                         log(f"progress: documentation changed on mechanical attempt {attempt + 1}/3; replanning")
                         break
-                    w.counters.incr(PROGRESS_ERROR_KEY)
-                    raise Die(reason)
+                    _progress_mechanical_failed(w, reason)
+                if stage == "plan":
+                    try:
+                        plan = json.loads(plan_file.read_text())
+                        if not isinstance(plan, dict) or not all(
+                            plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "prs")
+                        ):
+                            raise ValueError("plan is missing its roadmap/window/PR identity")
+                    except (OSError, ValueError) as exc:
+                        _progress_mechanical_failed(w, f"progress: invalid plan artifact: {exc}")
+                    if saved := publication.parked_window(w.cfg, plan):
+                        log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
+                        _progress_mechanical_delay(w)
+                        return None
             else:
-                plan = json.loads(plan_file.read_text())
-                facts = json.loads(facts_file.read_text())
-                if facts.get("docs_sha") != plan["to_sha"] or facts.get("to_sha") != plan["to_sha"]:
-                    raise Die("progress: successful facts do not match the planned documentation commit")
-                return plan_file, facts_file
+                try:
+                    facts = json.loads(facts_file.read_text())
+                    if not all(isinstance(facts.get(k), str) and facts[k] for k in ("docs_sha", "to_sha")):
+                        raise ValueError("facts must contain docs_sha and to_sha")
+                except (OSError, ValueError, AttributeError) as exc:
+                    _progress_mechanical_failed(w, f"progress: invalid facts artifact: {exc}")
+                if facts["docs_sha"] != plan["to_sha"] or facts["to_sha"] != plan["to_sha"]:
+                    reason = (
+                        f"successful facts name docs={facts['docs_sha']} to={facts['to_sha']}, "
+                        f"expected={plan['to_sha']}; replanning"
+                    )
+                    log(f"progress: {reason}")
+                else:
+                    return plan_file, facts_file
     # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
     # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
-    w.counters.write("progress-docs-retry-at", int(time.time()) + 60)
-    bust_progress_cache(w.cfg)
-    raise DocumentationUnavailable(f"waiting-documentation: generation kept changing after 3 attempts; {reason}")
+    _progress_documentation_wait(w, f"generation kept changing after 3 attempts; {reason}")
 
 
 def _do_progress_inner(w, opts) -> int | None:
@@ -2014,11 +2068,16 @@ def _do_progress_inner(w, opts) -> int | None:
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
 
+    deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or time.time() + ROUND_TIMEOUT)
+
     def run_tool(*args: str, capture: bool = False, docs_cache=None):
         # `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid
         # byte raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to
         # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
         # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
+        remaining = deadline - time.time() - 15
+        if remaining <= 0 and args[0] in ("plan", "facts"):
+            _progress_documentation_wait(w, "mechanical preparation reached its round deadline; artifacts retained")
         log(f"  $ tauceti-progress {args[0]} …")
         try:
             proc = subprocess.run(
@@ -2026,7 +2085,7 @@ def _do_progress_inner(w, opts) -> int | None:
                 capture_output=capture,
                 text=True,
                 errors="replace",
-                timeout=1800,
+                timeout=max(1, min(1800, remaining)),
                 env={**os.environ, "TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else None,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -2055,9 +2114,6 @@ def _do_progress_inner(w, opts) -> int | None:
         return None
     new_plan, new_facts = prepared
     plan = json.loads(new_plan.read_text())
-    if saved := publication.parked_window(w.cfg, plan):
-        log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
-        return None
 
     def identity(p, f):
         value = json.loads(p.read_text())
@@ -2078,11 +2134,15 @@ def _do_progress_inner(w, opts) -> int | None:
         for artifact in (plan_file, facts_file, prompt_file, status_body, section_body):
             if artifact.exists():
                 shutil.copyfile(artifact, previous / artifact.name)
+        if not any(previous.iterdir()):
+            previous.rmdir()
         for body in (status_body, section_body):
             body.unlink(missing_ok=True)
     shutil.copyfile(new_plan, plan_file)
     shutil.copyfile(new_facts, facts_file)
     w.counters.write("progress-docs-retry-at", 0)
+    w.counters.write("progress-docs-waits", 0)
+    w.counters.write("progress-mechanical-retry-at", 0)
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
     # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
@@ -2093,21 +2153,24 @@ def _do_progress_inner(w, opts) -> int | None:
     # one versioned thing. No new failure mode: `plan` and `facts` above already ran from that build.
     proc = run_tool("prompt", "progress", capture=True)
     if proc.returncode != 0 or not proc.stdout.strip():
-        w.counters.incr(PROGRESS_ERROR_KEY)
-        raise Die(_progress_tool_failed(w, "prompt", proc))
+        _progress_mechanical_failed(w, _progress_tool_failed(w, "prompt", proc))
     prompt_file.write_text(proc.stdout, encoding="utf-8")
+    writing = w.cfg.state / "progress/writing"
+    writing.mkdir(parents=True, exist_ok=True)
+    writing = Path(tempfile.mkdtemp(prefix="writer-", dir=writing))
+    status_out, section_out = writing / status_body.name, writing / section_body.name
     prompt = fill_prompt(
         prompt_file,
         ROADMAP=plan["roadmap"],
         ROADMAP_DIR=str(roadmap_dir),
         PLAN_FILE=str(plan_file),
         FACTS_FILE=str(facts_file),
-        STATUS_OUT=str(status_body),
-        SECTION_OUT=str(section_body),
+        STATUS_OUT=str(status_out),
+        SECTION_OUT=str(section_out),
         AGENT=opts.agent_name,
     )
     w.counters.write("progress-attempt-ts", int(time.time()))
-    rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
+    rc = run_agent_host(writing, prompt, opts.work_model, w.cfg.logdir)
     if rc != 0:
         from .claude_api import blocked_reason
 
@@ -2117,11 +2180,13 @@ def _do_progress_inner(w, opts) -> int | None:
             raise admission_failure(reason)
         w.counters.incr(PROGRESS_ERROR_KEY)
         raise Die(f"the writing agent exited {rc}")
-    for f in (status_body, section_body):
+    for f in (status_out, section_out):
         if not f.is_file() or not f.read_text().strip():
             w.counters.incr(PROGRESS_ERROR_KEY)
             raise Die(f"the agent did not write {f.name}")
 
+    shutil.copyfile(status_out, status_body)
+    shutil.copyfile(section_out, section_body)
     receipt = publication.save(w.cfg, me(), PROGRESS_REF)
     receipt = publication.defer(w.cfg, receipt)
     return _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt)

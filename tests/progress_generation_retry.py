@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,7 +54,7 @@ class GenerationRetryTests(unittest.TestCase):
                 incr=lambda key: self.values.__setitem__(key, self.values.get(key, 0) + 1),
             ),
         )
-        self.calls, self.caches = [], []
+        self.calls, self.caches, self.timeouts = [], [], []
 
     def run_tool(self, stage, *args, capture=False, docs_cache=None):
         self.calls.append(stage)
@@ -147,7 +148,7 @@ class GenerationRetryTests(unittest.TestCase):
             )
             self.assert_uncharged()
 
-    def drive_inner(self, failures=0, fail_stage="facts", code=76, timeout_stage=None):
+    def drive_inner(self, failures=0, fail_stage="facts", code=76, timeout_stage=None, write_bodies=True):
         remaining = failures
         options = SimpleNamespace(agent_name="fixture", work_model="fixture")
 
@@ -156,6 +157,8 @@ class GenerationRetryTests(unittest.TestCase):
             if args[0] == "git":
                 return subprocess.CompletedProcess(args, 0, "", "")
             stage = args[1]
+            self.assertLessEqual(kwargs["timeout"], 1800)
+            self.timeouts.append(kwargs["timeout"])
             if stage == timeout_stage:
                 raise subprocess.TimeoutExpired(args, 1800, output=b"partial stdout", stderr=b"partial stderr")
             if stage in ("plan", "facts"):
@@ -175,8 +178,12 @@ class GenerationRetryTests(unittest.TestCase):
             self.calls.append("writer")
             self.assertEqual(json.loads((self.work / "plan.json").read_text())["to_sha"], NEW)
             self.assertEqual(json.loads((self.work / "facts.json").read_text())["docs_sha"], NEW)
-            (self.work / "status-body.md").write_text("new status")
-            (self.work / "section-body.md").write_text("new section")
+            writer_dir = Path(_args[0])
+            self.assertFalse((writer_dir / "status-body.md").exists())
+            self.assertFalse((writer_dir / "section-body.md").exists())
+            if write_bodies:
+                (writer_dir / "status-body.md").write_text("new status")
+                (writer_dir / "section-body.md").write_text("new section")
             return 0
 
         with contextlib.ExitStack() as stack:
@@ -227,7 +234,7 @@ class GenerationRetryTests(unittest.TestCase):
             (self.work / "facts.json").write_text(json.dumps(FACTS))
             (self.work / "status-body.md").write_text("prior prose")
             self.assertEqual(self.drive_inner(), 0)
-            archives = list(self.work.glob("mechanical-*/previous/status-body.md"))
+            archives = list((self.root / "progress/mechanical").glob("attempt-*/previous/status-body.md"))
             self.assertEqual(bool(archives), not same)
             if archives:
                 self.assertEqual(archives[-1].read_text(), "prior prose")
@@ -242,6 +249,123 @@ class GenerationRetryTests(unittest.TestCase):
         self.assertEqual(len(saved), 1)
         self.assertIn("partial stdout", saved[0].read_text())
         self.assertIn("partial stderr", saved[0].read_text())
+        self.assert_uncharged()
+
+    def test_genuine_errors_have_separate_retry_spacing(self):
+        for stage in ("plan", "facts", "prompt"):
+            with self.assertRaises(Die):
+                self.drive_inner(
+                    failures=1, fail_stage=stage, code=1, timeout_stage="prompt" if stage == "prompt" else None
+                )
+            self.assert_uncharged()
+            self.assertGreater(self.values["progress-mechanical-retry-at"], time.time() + 28000)
+            with patch("tauceti_worker.survey.subprocess.run") as tool:
+                self.assertFalse(progress_due(self.cfg, self.worker.counters)[0])
+                tool.assert_not_called()
+
+    def test_not_due_and_parked_windows_suppress_replanning_and_facts(self):
+        for parked in (False, True):
+            self.calls.clear()
+
+            def run(stage, *args, parked=parked, **kw):
+                if not parked:
+                    self.calls.append(stage)
+                    return subprocess.CompletedProcess([], 75, "", "not enough PRs")
+                return self.run_tool(stage, *args, **kw)
+
+            with patch.object(publication, "parked_window", return_value=self.root if parked else None):
+                self.assertIsNone(wu._prepare_progress(self.worker, run, self.roadmap, self.work))
+            self.assertEqual(self.calls, ["plan"])
+            self.assert_uncharged()
+            with patch("tauceti_worker.survey.subprocess.run") as tool:
+                self.assertFalse(progress_due(self.cfg, self.worker.counters)[0])
+                tool.assert_not_called()
+
+    def test_churn_cooldown_grows_and_leaves_other_work_available(self):
+        for expected in (60, 300, 900, 1800, 1800):
+            with patch.object(wu.time, "time", return_value=1000):
+                with self.assertRaises(DocumentationUnavailable) as raised:
+                    wu._progress_documentation_wait(self.worker, "deployment changing")
+                self.assertEqual(raised.exception.retry_at, 1000 + expected)
+                with patch("tauceti_worker.survey.subprocess.run") as tool:
+                    self.assertFalse(progress_due(self.cfg, self.worker.counters)[0])
+                    tool.assert_not_called()
+            self.assert_uncharged()
+        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
+
+    def test_successful_but_incoherent_facts_retry_and_missing_identity_is_fatal(self):
+        remaining = 1
+
+        def incoherent(stage, *args, **kw):
+            nonlocal remaining
+            proc = self.run_tool(stage, *args, **kw)
+            if stage == "facts" and remaining:
+                remaining -= 1
+                Path(args[args.index("--out") + 1]).write_text(json.dumps({**FACTS, "docs_sha": OLD}))
+            return proc
+
+        self.assertIsNotNone(wu._prepare_progress(self.worker, incoherent, self.roadmap, self.work))
+        self.assertEqual(self.calls, ["plan", "facts"] * 2)
+
+        def missing(stage, *args, **kw):
+            proc = self.run_tool(stage, *args, **kw)
+            if stage == "facts":
+                Path(args[args.index("--out") + 1]).write_text("{}")
+            return proc
+
+        with self.assertRaisesRegex(Die, "facts must contain"):
+            wu._prepare_progress(self.worker, missing, self.roadmap, self.work)
+        self.assertGreater(self.values["progress-mechanical-retry-at"], 0)
+        self.assert_uncharged()
+
+    def test_noop_writer_cannot_publish_retained_prose(self):
+        (self.work / "plan.json").write_text(json.dumps(PLAN))
+        (self.work / "facts.json").write_text(json.dumps(FACTS))
+        for name in ("status-body.md", "section-body.md"):
+            (self.work / name).write_text("retained body")
+        with self.assertRaisesRegex(Die, "agent did not write"):
+            self.drive_inner(write_bodies=False)
+        self.assertEqual((self.work / "status-body.md").read_text(), "retained body")
+
+    def test_legacy_retry_requires_distinct_facts_builds(self):
+        proc = subprocess.CompletedProcess([], 1, "", LEGACY)
+        self.assertFalse(wu._progress_generation_changed("plan", proc))
+        self.assertTrue(wu._progress_generation_changed("facts", proc))
+        proc.stderr = LEGACY.replace(NEW[:7], OLD[:7])
+        self.assertFalse(wu._progress_generation_changed("facts", proc))
+
+    def test_documentation_wait_is_not_a_failed_activity_round(self):
+        from tauceti_worker import activity
+
+        with patch.object(activity, "emit") as emit:
+            record = activity.Round("fixture")
+            record.finish(DocumentationUnavailable("deployment changing"))
+            self.assertIn("round_waited", [c.args[0] for c in emit.call_args_list])
+            self.assertNotIn("round_finished", [c.args[0] for c in emit.call_args_list])
+
+    def test_stage_timeout_fits_the_remaining_round_budget(self):
+        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() - 1)}):
+            with self.assertRaises(DocumentationUnavailable):
+                self.drive_inner()
+        self.assertNotIn("plan", self.calls)
+        self.assert_uncharged()
+        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 25)}):
+            self.assertEqual(self.drive_inner(), 0)
+        self.assertTrue(self.timeouts)
+        self.assertTrue(all(timeout <= 10 for timeout in self.timeouts))
+
+    def test_mechanical_traces_are_bounded_and_prepared_archives_survive(self):
+        archive = self.root / "progress/mechanical/attempt-prepared/previous"
+        archive.mkdir(parents=True)
+        (archive / "status-body.md").write_text("prepared prose")
+
+        def not_due(*_args, **_kw):
+            return subprocess.CompletedProcess([], 75, "", "not due")
+
+        for _ in range(25):
+            self.assertIsNone(wu._prepare_progress(self.worker, not_due, self.roadmap, self.work))
+        self.assertEqual(len(list(archive.parent.parent.glob("attempt-*"))), 21)
+        self.assertEqual((archive / "status-body.md").read_text(), "prepared prose")
         self.assert_uncharged()
 
     def test_cli_and_loop_keep_documentation_wait_out_of_failure_backoff(self):
@@ -275,7 +399,7 @@ class GenerationRetryTests(unittest.TestCase):
             self.assertEqual(
                 loop.cmd_loop(args, SimpleNamespace(wid="fixture"), only=["progress"], agent="claude"), 130
             )
-        self.assertEqual(sleeps, [60, 60, 60])
+        self.assertEqual(sleeps, [60, 5, 60])
 
 
 if __name__ == "__main__":

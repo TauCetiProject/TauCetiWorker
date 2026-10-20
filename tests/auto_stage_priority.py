@@ -123,7 +123,11 @@ checks.append(check("fresh not-due plan returns the fallthrough signal", progres
 checks.append(
     check("worker requires 25 PRs for a progress report", plan_calls[0][plan_calls[0].index("--min-prs") + 1], "25")
 )
-checks.append(check("fresh not-due plan does not spend a prose attempt", writes, []))
+checks.append(
+    check(
+        "fresh not-due plan does not spend a prose attempt", any(k == "progress-attempt-ts" for k, _ in writes), False
+    )
+)
 
 # Starting mechanical progress work consumes the cached verdict even when the fresh plan fails.
 # Genuine errors still charge the tool error breaker, while the prose cadence remains unspent.

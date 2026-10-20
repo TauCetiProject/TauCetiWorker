@@ -307,10 +307,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 streak = 0
                 report_runtime(
                     "waiting-documentation",
-                    detail="replanning after documentation deployment churn",
-                    next_action_at=time.time() + 60,
+                    detail="documentation replanning deferred; selecting other work",
+                    next_action_at=time.time() + 5,
                 )
-                time.sleep(60)
+                time.sleep(5)
                 continue
             if rc == EX_VERIFICATION_WAIT:
                 streak = 0

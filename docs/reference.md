@@ -444,14 +444,19 @@ and estimated-cost semantics.
 Before launching a progress writer, the worker runs `plan` and `facts` together up to three times.
 Each attempt uses a fresh isolated documentation cache. A typed generation-change result (tool exit
 76), or an older facts diagnostic naming two different builds, retries only these mechanical stages.
-Persistent churn reports `waiting-documentation` (worker exit 79) and rechecks after 60 seconds without
+Persistent churn reports `waiting-documentation` (worker exit 79) and defers progress for 60 seconds,
+then 5, 15 and at most 30 minutes on repeated churn, without
 advancing the report attempt timestamp, spending PR repair allowances, or escalating failure backoff.
-Other plan/facts errors remain specific failures. The published cursor changes only through normal
+The scheduler can select other work during this cooldown. Other plan/facts/prompt errors remain specific
+failures with a separate mechanical retry delay preserving the existing eight-hour error spacing.
+A not-due recheck or parked window suppresses planning for the ordinary due-cache TTL. The published cursor changes only through normal
 report publication, so the next ordinary replan covers the same unadvanced history.
 
 Every completed plan, facts, prompt and apply command keeps labelled stdout/stderr in private
 `progress-<stage>-*.log` files beside the round logs. Mechanical attempt plans/facts live under
-`state/progress/work/mechanical-*`; a failed attempt does not overwrite coherent artifacts or prose.
+`state/progress/mechanical/attempt-*`; a failed attempt does not overwrite coherent artifacts or prose.
+Recent mechanical traces are bounded to 20 directories; archives containing prepared inputs or prose are retained.
 When a new coherent plan/facts identity changes, previous inputs and prose are archived there before
-prose is invalidated. Prepared publication receipts resume apply with their existing prose and version.
+prose is invalidated. Each writer uses fresh output paths under `state/progress/writing/`; existing prose
+cannot satisfy a new writer launch. Mechanical tool timeouts fit the remaining round deadline. Prepared publication receipts resume apply with their existing prose and version.
 Rolling back the tool pin preserves these artifacts and the published cursor.

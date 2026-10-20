@@ -1699,7 +1699,7 @@ def cli_main() -> int:
         report_runtime(
             "waiting-documentation",
             detail=str(e),
-            next_action_at=time.time() + 60,
+            next_action_at=e.retry_at,
             failure_reason=None,
             failure_code=None,
             failure_log=None,
