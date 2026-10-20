@@ -345,16 +345,30 @@ def cmd_heartbeat(args) -> int:
 def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:
     """Run one round as a child under a hard timeout; tear down the group on expiry. Used by the loop.
     Maps a timed-out round to rc 124, a SIGKILL-after-grace to 137 (matching the shell's `timeout`)."""
+    from .budget import budget_dir, process_identity
+    from .claude_api import api_mode
+    from .usage_supervisor import ensure_supervisor, record_round_end
+
+    accounting = api_mode()
+    if accounting:
+        try:
+            ensure_supervisor(budget_dir())
+        except Exception as error:
+            log(f"usage supervisor startup pending: {error}")
     p = spawn_round(argv_tail, timeout=timeout)
+    owner = process_identity(p.pid) if accounting else None
+    ending = "exit"
     pgid = p.pid  # spawn_round's start_new_session ⇒ the round leads its own group; pgid == leader pid
     try:
         return p.wait(timeout)
     except subprocess.TimeoutExpired:
+        ending = "timeout"
         log(f"round timed out after {timeout}s — tearing down")
         kill_round_group(p)
         rc = p.returncode
         return 137 if rc is not None and rc < 0 and -rc == signal.SIGKILL else 124
     except KeyboardInterrupt:
+        ending = "signal"
         kill_round_group(p)
         raise
     finally:
@@ -368,3 +382,14 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         # fallback: on a host with PID-namespace containment (containment.py) every agent and tool, in
         # --loop and one-shot rounds alike, already died with its namespace, setsid'd ones included.
         reap_round_group(pgid)
+        if accounting:
+            try:
+                record_round_end(
+                    budget_dir(),
+                    owner,
+                    "signal" if ending == "exit" and p.returncode is not None and p.returncode < 0 else ending,
+                    p.returncode,
+                )
+                ensure_supervisor(budget_dir())
+            except Exception as error:
+                log(f"usage supervisor recovery pending: {error}")

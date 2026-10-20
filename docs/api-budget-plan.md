@@ -323,6 +323,67 @@ stdout event or final Claude result. Atomic checkpoints and the preceding valid
 journal prefix survive process termination and torn writes. Bubble mounts only its own round
 usage directory separately from the bridge and never receives the ledger.
 
+New invocations also record their exact admission ticket, invocation ID, bridge,
+shim and native process birth identities in `budget/lifecycles/`. The admission
+ledger event includes the initial lifecycle identity, so a bridge crash before
+writing its sidecar is recoverable. A detached host supervisor owns the sidecars
+and recovery, outside both the round process group and the agent containment
+boundary. It starts at API worker/context startup and is checked again at loop
+round boundaries. Restarting it replays the local evidence automatically; it does
+not poll providers or GitHub. Recovery progress is persisted, and a separate
+heartbeat remains responsive during ledger recovery. Admission checks restart a
+lost supervisor; source updates retire it at an invocation boundary. Only registered
+new invocations participate in this automatic recovery; historical cleanup remains
+separate. Reconciled native receipts are archived under `lifecycles/done/`;
+unchanged provisional journals are checked by file stamp without reparsing them.
+
+Every native launch, including an explicit resume or copied Bubble shim, must
+create a durable usage journal. A native exec gate waits until the supervisor has
+verified the journal and recorded the native process identity, then receives a
+durable permit containing a second copy of that native identity. A lost sidecar
+can recover the permitted identity without reclassifying real inference as zero
+spend. Missing or malformed accounting configuration fails before
+inference. Linux identities include the boot ID, start ticks, PID namespace and
+the observer's PID namespace;
+namespace-local PIDs are translated while the gate is alive. macOS identities use
+the boot session and process birth time in microseconds. On other platforms an
+unknown identity cannot authorize automatic stopped-process reconciliation.
+For Bubble across a VM or a host-uninspectable container, the bridge explicitly
+records the remote boot/start/namespace identity without interpreting its PID on
+the host. An exact gate-linked native exit receipt proves termination there;
+bridge death without that receipt records `remote-liveness-unconfirmed` and
+reserves observed usage plus an uncertain tail without charging a live invocation.
+A successful host Bubble cleanup records the exact non-reusable boundary token
+in its read-only outbox; cleanup for a prior boundary cannot stop a newer
+invocation. This local proof permits prefix recovery, retaining an uncertain
+tail until an authoritative receipt arrives. Receipts and journals remain
+available for later local reconciliation.
+
+Lifecycle evidence distinguishes observed native success, nonzero exit, signal,
+exec failure, bridge death and parent death; the outer loop records round timeout
+and signal outcomes separately. An unobserved death is recorded as stopped, not
+assigned a guessed exit status. A stopped process or `inflight=false` never closes
+a journal. Normal journal closure requires a successfully drained native exit, a
+successful result event and healthy journal writes. Without that proof recovery retains the
+priced prefix and an explicitly uncertain tail reserve. An admission with no
+launch evidence, or a gate-linked no-exec receipt, proves no inference and permits
+exact zero settlement.
+Late authoritative receipts remain readable and replace estimates with existing
+ledger corrections.
+
+For rollout, write `record-only` to `budget/usage-recovery-mode` before deployment.
+The supervisor records launches and exits while normal bridge receipts continue
+to settle. Observe naturally selected rounds, then change the file to `auto` to
+enable stopped-invocation recovery (the default when the file is absent). Workers
+from another installation can share a supervisor with the same protocol. To hand
+ownership to a new installation, call `ensure_supervisor(budget_dir(), refresh=True)`
+from that installation's `tauceti_worker.usage_supervisor` and `tauceti_worker.budget`
+modules; this retires the exact supervisor through a local marker and preserves
+paid processes. Changes
+are read on each pass and do not restart paid sessions. Rollback can restore
+`record-only`; it must retain lifecycle evidence, permits, receipts,
+journals and reservations; it must not undo committed corrections.
+
 Response counters merge by ID, including partial/repeated events. Replayed
 responses on resumed invocations are not charged twice. Decimal token pricing
 honours cache-write TTLs. Unknown models, missing counters, unpriced server-tool/priority-tier usage and

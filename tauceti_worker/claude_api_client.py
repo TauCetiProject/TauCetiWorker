@@ -13,6 +13,13 @@ import uuid
 from decimal import Decimal
 from pathlib import Path
 
+if __package__:
+    from .usage_accounting import UsageJournal
+    from .usage_lifecycle import durable, identity
+else:
+    from usage_accounting import UsageJournal
+    from usage_lifecycle import durable, identity
+
 
 def atomic(path, value):
     tmp = path.with_suffix(".tmp")
@@ -118,7 +125,15 @@ def main():
             resume = args[index + 1]
     previous_reason = None
     while True:
-        admission = request(bridge, "admit", id=invocation, model=model, resume=resume)
+        admission = request(
+            bridge,
+            "admit",
+            id=invocation,
+            model=model,
+            resume=resume,
+            process=identity(),
+            boundary=config.get("boundary"),
+        )
         if admission["allowed"]:
             invocation = admission["id"]
             break
@@ -134,6 +149,7 @@ def main():
     else:
         args += ["--output-format", "stream-json"]
     journal = None
+    journal_healthy = True
     requested_partials = "--include-partial-messages" in args
     if "--verbose" not in args:
         args.append("--verbose")
@@ -162,13 +178,16 @@ def main():
 
     process_exited = False
     try:
-        if config.get("usage_dir"):
-            from usage_accounting import UsageJournal
-
-            journal = UsageJournal(config["usage_dir"], invocation, model=model)
-            if not requested_partials:
-                args.append("--include-partial-messages")
-        proc = subprocess.Popen(real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
+        usage_dir = config.get("usage_dir")
+        if not isinstance(usage_dir, str) or not Path(usage_dir).is_absolute():
+            raise ValueError("API accounting requires an absolute durable usage_dir")
+        journal = UsageJournal(usage_dir, invocation, model=model)
+        if not requested_partials:
+            args.append("--include-partial-messages")
+        gate = [sys.executable, str(Path(__file__).with_name("usage_lifecycle.py")), str(bridge), invocation]
+        proc = subprocess.Popen(
+            gate + real + args, env=env, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1
+        )
         outcome = "started"
         assert proc.stdout is not None
         try:
@@ -189,9 +208,10 @@ def main():
                     try:
                         journal.observe(event)
                     except (OSError, ValueError, TypeError, KeyError, ArithmeticError) as error:
+                        journal_healthy = False
                         warning(f"tauceti usage checkpoint pending: {type(error).__name__}")
                 if final is not None and (
-                    event.get("type") == "assistant"
+                    event.get("type") in {"assistant", "stream_event", "user"}
                     or event.get("type") == "system"
                     and event.get("subtype") == "api_retry"
                 ):
@@ -240,6 +260,22 @@ def main():
         rc = proc.wait()
         process_exited = True
         outcome = f"exit:{rc}"
+        exec_failed = (bridge / "inbox" / (invocation + ".exec-failed")).exists()
+        kind = (
+            "failed-launch" if exec_failed else "successful-exit" if rc == 0 else "signal" if rc < 0 else "failed-exit"
+        )
+        try:
+            launch_identity = json.loads((bridge / "inbox" / (invocation + ".launch")).read_text()).get("native")
+            durable(
+                bridge / "inbox" / (invocation + ".terminal"),
+                dict(id=invocation, kind=kind, returncode=rc, native=launch_identity),
+            )
+        except (OSError, ValueError) as error:
+            warning(f"tauceti lifecycle terminal evidence pending: {type(error).__name__}")
+        if exec_failed:
+            outcome = "launch-failed"
+            totals = {invocation: "0"}
+            unknown_segments.clear()
         try:
             if output_format == "json" and final is not None:
                 print(json.dumps(final))
@@ -258,12 +294,16 @@ def main():
         else:
             raise
     finally:
+        successful_result = (
+            final is not None and final.get("subtype") in (None, "success") and not final.get("is_error")
+        )
+        successful_exit = process_exited and rc == 0 and successful_result
         if journal is not None:
             try:
-                journal.flush(closed=process_exited)
+                journal.flush(closed=successful_exit and journal_healthy)
             except OSError as error:
                 warning(f"tauceti usage checkpoint pending: {type(error).__name__}")
-        authoritative = outcome == "launch-failed" or process_exited and 0 <= rc < 128
+        authoritative = outcome == "launch-failed" or successful_exit
         receipt = dict(
             id=invocation,
             totals=totals if totals and not unknown_segments and authoritative else None,

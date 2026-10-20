@@ -51,15 +51,23 @@ def admission_pause(snapshot, *, worker=None, model=None, now=None):
     return None
 
 
-def process_identity():
+def process_identity(pid=None):
     """Host bridge identity, including PID reuse and reboot protection on Linux."""
+    if sys.platform == "darwin":
+        from .usage_lifecycle import identity
+
+        try:
+            return identity(pid)
+        except OSError:
+            return None
     if sys.platform != "linux":
         return None
     try:
-        pid = os.getpid()
+        pid = os.getpid() if pid is None else pid
         return dict(
             pid=pid,
             boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            view=os.readlink("/proc/self/ns/pid"),
             start=Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
         )
     except (OSError, IndexError):
@@ -67,9 +75,15 @@ def process_identity():
 
 
 def bridge_owner_alive(owner):
+    if owner and sys.platform == "darwin":
+        from .usage_lifecycle import alive
+
+        return alive(owner)
     if not owner or sys.platform != "linux":
         return False
     try:
+        if owner.get("view") and owner["view"] != os.readlink("/proc/self/ns/pid"):
+            return True
         fields = Path(f"/proc/{int(owner['pid'])}/stat").read_text().rsplit(")", 1)[1].split()
         return (
             owner["boot"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -428,7 +442,7 @@ class Budget:
             ],
         )
 
-    def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None):
+    def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None):
         with self.locked():
             state = self.replay()
             if invocation in state["sessions"]:
@@ -508,6 +522,7 @@ class Budget:
                     bridge=bridge,
                     resume=resume,
                     owner=owner,
+                    **({"lifecycle": lifecycle} if lifecycle else {}),
                 )
             )
             self.append(state, events)
@@ -587,7 +602,9 @@ class Budget:
                     live = self.clock() - (Path(session["bridge"]) / "outbox/heartbeat").stat().st_mtime <= 30
                 except FileNotFoundError:
                     live = False
-                if live or bridge_owner_alive(session.get("owner")):
+                from .usage_supervisor import invocation_alive
+
+                if live or invocation_alive(self.directory, session):
                     raise BudgetError("cannot reconcile an active session with a live accounting bridge")
             if session["status"] != "settled":
                 events = [self.accrue(state)]
@@ -654,6 +671,25 @@ class Budget:
             session = state["sessions"].get(receipt["id"])
             if not session:
                 raise BudgetError("receipt has no recorded admission")
+            from .usage_lifecycle import alive
+            from .usage_supervisor import external_exit_proved, invocation_lifecycle
+
+            if receipt.get("outcome") == "launch-failed" and totals and all(money(v) == 0 for v in totals.values()):
+                from .usage_accounting import session_usage
+
+                journal = session_usage(self.directory, session)
+                if money(session.get("cost", "0")) > 0 or (journal and journal["messages"]):
+                    raise BudgetError("no-inference receipt contradicts durable usage; reserve retained")
+
+            lifecycle = invocation_lifecycle(self.directory, session)
+            if (
+                totals is not None
+                and lifecycle
+                and lifecycle.get("native")
+                and alive(lifecycle["native"])
+                and not (lifecycle.get("external") and external_exit_proved(lifecycle))
+            ):
+                raise BudgetError("cannot settle a live native invocation; receipt retained for recovery")
             if session["status"] == "settled" and session.get("cost_provenance") not in ESTIMATE_PROVENANCES:
                 return
             finished = receipt.get("finished")
@@ -845,15 +881,21 @@ class Budget:
         A late native receipt reverses the estimated prefix before settlement.
         """
         from .budget_usage import evidence
+        from .usage_supervisor import invocation_alive, invocation_lifecycle
+
+        def live(session):
+            # Legacy finish may bypass its bridge owner; a registered native
+            # invocation must always be stopped, even during bridge cleanup.
+            return (
+                invocation_alive(self.directory, session)
+                if invocation_lifecycle(self.directory, session)
+                else (not allow_live_owner and bridge_owner_alive(session.get("owner")))
+            )
 
         with self.locked():
             sessions = self.replay()["sessions"]
         session = sessions.get(invocation)
-        if (
-            not session
-            or session["status"] == "settled"
-            or (not allow_live_owner and bridge_owner_alive(session.get("owner")))
-        ):
+        if not session or session["status"] == "settled" or live(session):
             return None
         saved = evidence(self.directory, session, sessions)
         if not saved or not saved["items"]:
@@ -861,11 +903,7 @@ class Budget:
         with self.locked():
             state = self.replay()
             session = state["sessions"].get(invocation)
-            if (
-                not session
-                or session["status"] == "settled"
-                or (not allow_live_owner and bridge_owner_alive(session.get("owner")))
-            ):
+            if not session or session["status"] == "settled" or live(session):
                 return None
             cost = max(saved["cost"], money(session.get("lower_bound_cost", "0")))
             stamp = (

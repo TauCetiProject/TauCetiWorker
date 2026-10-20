@@ -27,6 +27,8 @@ from tauceti_worker.cli import build_parser
 from tauceti_worker.config import AdmissionUnavailable
 from tauceti_worker.constants import PROGRESS_ERROR_KEY
 from tauceti_worker.survey import Counters
+from tauceti_worker.usage_lifecycle import identity
+from tauceti_worker.usage_supervisor import read_lifecycle
 from tauceti_worker.worker_manager import WorkersError, WorkerSpec
 
 
@@ -648,7 +650,9 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 self.assertTrue(context.invocations)
                 self.assertFalse(context.launched)
                 self.budget.configure(set_grant=0)
-                self.assertFalse(context.handle(dict(action="admit", id="c" * 32, model="opus"))["allowed"])
+                self.assertFalse(
+                    context.handle(dict(action="admit", id="c" * 32, model="opus", process=identity()))["allowed"]
+                )
                 return 75
 
             with self.assertRaises(AdmissionUnavailable):
@@ -720,6 +724,153 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             self.assertIn("no inference started", result.stderr)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
         self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    def test_missing_usage_directory_rejects_launch(self):
+        with ClaudeAPIContext("worker1", "fix") as context:
+            settings = dict(context.config)
+            settings.pop("usage_dir")
+            (context.bin / "config.json").write_text(json.dumps(settings))
+            result = self.run_claude()
+            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertNotIn('"type": "system"', result.stdout)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+        self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 0)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process group crash fixture")
+    def test_supervisor_survives_bridge_and_shim_sigkill_without_finally(self):
+        from tauceti_worker.usage_accounting import read_usage
+        from tauceti_worker.usage_lifecycle import alive
+
+        os.environ["FAKE_EVENTS"] = json.dumps(
+            [
+                dict(
+                    type="assistant",
+                    session_id="provider",
+                    message=dict(
+                        id="response", model="claude-opus-5-5", usage=dict(input_tokens=100, output_tokens=100000)
+                    ),
+                )
+            ]
+        )
+        os.environ["FAKE_POST_RESULT_DELAY"] = "120"
+        driver_source = """
+import subprocess, time
+from tauceti_worker.claude_api import ClaudeAPIContext
+with ClaudeAPIContext("crash-fixture", "fix"):
+    p = subprocess.Popen(["claude", "-p", "fixture", "--model", "opus"], stdout=subprocess.DEVNULL)
+    p.wait()
+    time.sleep(120)
+"""
+        with (self.root / "driver.log").open("w") as log:
+            driver = subprocess.Popen([sys.executable, "-c", driver_source], start_new_session=True, stderr=log)
+        try:
+            deadline = time.monotonic() + 10
+            journal = None
+            while time.monotonic() < deadline:
+                paths = list((self.root / "budget/usage").glob("*/*.json"))
+                if paths:
+                    journal = read_usage(paths[0])
+                    if journal and journal["messages"]:
+                        break
+                time.sleep(0.02)
+            self.assertTrue(journal and journal["messages"], (self.root / "driver.log").read_text())
+            invocation = journal["id"]
+            lifecycle = read_lifecycle(self.root / "budget", invocation)
+            supervisor = json.loads((self.root / "budget/usage-supervisor.json").read_text())["owner"]
+            self.assertEqual(lifecycle["owner"]["pid"], driver.pid)
+            os.killpg(driver.pid, signal.SIGKILL)
+            driver.wait()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                snapshot = self.budget.snapshot()
+                if invocation in snapshot["provisional"]:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(alive(supervisor))
+            self.assertIn(invocation, snapshot["provisional"])
+            self.assertGreater(Decimal(snapshot["spent"]), 2)
+            self.assertGreater(Decimal(snapshot["pending"]), 0)
+            self.assertFalse(read_usage(paths[0])["closed"])
+        finally:
+            if driver.poll() is None:
+                os.killpg(driver.pid, signal.SIGKILL)
+            driver.wait()
+
+    def test_error_result_with_zero_exit_keeps_uncertain_tail(self):
+        from tauceti_worker.usage_accounting import read_usage
+
+        os.environ["FAKE_EVENTS"] = json.dumps(
+            [
+                dict(
+                    type="assistant",
+                    session_id="provider",
+                    message=dict(
+                        id="response", model="claude-opus-5-5", usage=dict(input_tokens=100, output_tokens=100000)
+                    ),
+                ),
+                dict(
+                    type="result",
+                    session_id="provider",
+                    subtype="error_during_execution",
+                    is_error=True,
+                    total_cost_usd=3,
+                ),
+            ]
+        )
+        with ClaudeAPIContext("worker1", "fix") as context:
+            result = self.run_claude()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.budget.snapshot()["provisional"]), 1)
+        self.assertGreater(Decimal(self.budget.snapshot()["pending"]), 0)
+        self.assertFalse(read_usage(next(Path(context.config["usage_dir"]).glob("*.json")))["closed"])
+
+    def test_stale_container_boundary_is_rejected_before_admission(self):
+        from tauceti_worker.usage_supervisor import prepare_boundary
+
+        with ClaudeAPIContext("worker1", "fix") as context:
+            stale = prepare_boundary(context.directory)
+            prepare_boundary(context.directory)
+            with self.assertRaisesRegex(BudgetError, "different container boundary"):
+                context.handle(dict(action="admit", id="f" * 32, model="opus", process=identity(), boundary=stale))
+            self.assertFalse(context.invocations)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 0)
+
+    def test_admission_restarts_a_supervisor_lost_mid_context(self):
+        from tauceti_worker.usage_lifecycle import alive
+
+        with ClaudeAPIContext("worker1", "fix") as context:
+            owner = json.loads((self.root / "budget/usage-supervisor.json").read_text())["owner"]
+            os.kill(owner["pid"], signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while alive(owner) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            result = self.run_claude()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(context.invocations), 1)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
+
+    def test_native_exec_gate_inside_real_pid_namespace(self):
+        from tauceti_worker.containment import command, probe
+
+        supported, reason = probe()
+        if not supported:
+            self.skipTest(reason)
+        with ClaudeAPIContext("worker1", "fix") as context:
+            result = subprocess.run(
+                command()
+                + [str(context.bin / "claude"), "-p", "fixture", "--model", "opus", "--output-format", "stream-json"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            native_pid = json.loads(result.stdout.splitlines()[0])["pid"]
+            invocation = next(iter(context.invocations))
+            lifecycle = read_lifecycle(self.root / "budget", invocation)
+            self.assertNotEqual(lifecycle["native"]["pid"], native_pid)
+            self.assertEqual(lifecycle["gate"]["pid"], native_pid)
+            self.assertEqual(lifecycle["native"]["start"], lifecycle["gate"]["start"])
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)
 
     def test_internal_partial_events_are_not_forwarded_to_ordinary_callers(self):
         os.environ["FAKE_EVENTS"] = json.dumps(
@@ -924,7 +1075,14 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
             (context.inbox / ("c" * 32 + ".receipt")).write_text("{}")
             with self.assertRaises(BudgetError):
                 context.handle(dict(action="cooldown", id="forged", model="opus", seconds=3600))
-            admitted = context.handle(dict(action="admit", id="d" * 32, model="sonnet"))
+            admitted = context.handle(
+                dict(
+                    action="admit",
+                    id="d" * 32,
+                    model="sonnet",
+                    process=identity(),
+                )
+            )
             with self.assertRaises(BudgetError):
                 context.handle(dict(action="settle", id=admitted["id"], totals="malformed", outcome="exit:0"))
             context.handle(dict(action="settle", id=admitted["id"], totals={"unused": "0"}, outcome="exit:0"))
@@ -936,7 +1094,10 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
 
     def test_stale_receipt_recovery_and_live_reconciliation_guard(self):
         with ClaudeAPIContext("worker1", "fix") as context:
-            admission = context.handle(dict(action="admit", id="a" * 32, model="opus"))
+            invocation = "a" * 32
+            self.budget.admit(invocation, "worker1", "opus", "fix", bridge=str(context.directory))
+            context.invocations.add(invocation)
+            admission = dict(id=invocation)
             invocation = admission["id"]
             with self.assertRaises(BudgetError):
                 self.budget.reconcile(invocation, 0, "cannot ignore a running session")

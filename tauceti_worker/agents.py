@@ -1912,8 +1912,8 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     )
 
 
-def _bubble_pop(cfg: Config, env: dict) -> None:
-    subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
+def _bubble_pop(cfg: Config, env: dict) -> bool:
+    return subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True).returncode == 0
 
 
 def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
@@ -2046,6 +2046,7 @@ def run_in_bubble(
             f"{host_queue}:/opt/verification-queue:rw",
         ]
     api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
+    api_boundary = None
     if api_bridge and _uses_claude_credentials(cred_model):
         from .claude_api_client import atomic
 
@@ -2053,7 +2054,7 @@ def run_in_bubble(
         api_bin = rounddir / "api-bin"
         api_bin.mkdir(mode=0o700)
         shutil.copy(Path(__file__).with_name("claude_api_client.py"), api_bin / "claude")
-        for name in ("usage_accounting.py", "prices.json"):
+        for name in ("usage_accounting.py", "usage_lifecycle.py", "prices.json"):
             shutil.copy(Path(__file__).with_name(name), api_bin / name)
         (api_bin / "claude").chmod(0o700)
         keyfile = rounddir / "anthropic.key"
@@ -2062,7 +2063,14 @@ def run_in_bubble(
         w.rc.add_cleanup(lambda: keyfile.unlink(missing_ok=True))
         settings = json.loads((bridge / "bin/config.json").read_text())
         usage_dir = settings.get("usage_dir")
-        settings.update(command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge")
+        if not isinstance(usage_dir, str) or not Path(usage_dir).is_absolute():
+            raise Die("API accounting requires an absolute durable usage_dir")
+        from .usage_supervisor import prepare_boundary
+
+        api_boundary = prepare_boundary(bridge)
+        settings.update(
+            command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge", boundary=api_boundary
+        )
         if usage_dir:
             settings["usage_dir"] = "/opt/api-usage"
             mount_flags += ["--mount", f"{usage_dir}:/opt/api-usage:rw"]
@@ -2229,7 +2237,17 @@ def run_in_bubble(
             # Register the seed first: RoundContext cleans up LIFO, so the pop registered next runs
             # before the container's credential source disappears.
             w.rc.add_cleanup(lambda p=claude_seed: shutil.rmtree(p, ignore_errors=True))
-    w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
+
+    def cleanup_bubble():
+        if _bubble_pop(cfg, env) and api_bridge and api_boundary:
+            from .usage_supervisor import record_boundary_stopped
+
+            try:
+                record_boundary_stopped(api_bridge, api_boundary)
+            except OSError as error:
+                log(f"usage boundary evidence pending: {error}")
+
+    w.rc.add_cleanup(cleanup_bubble)  # pop if we're killed mid-run
     try:
         if inner_cmd is None:  # the work agent — quiet/log it like the host path
             rc = run_agent_proc(
@@ -2248,7 +2266,7 @@ def run_in_bubble(
             rc = subprocess.run(argv, env=env).returncode
     finally:
         try:
-            _bubble_pop(cfg, env)  # don't rely on --ephemeral alone, and pop even on an exception
+            cleanup_bubble()  # confirm this bridge's container stopped even on an exception
         finally:
             if claude_seed is not None:
                 shutil.rmtree(claude_seed, ignore_errors=True)
