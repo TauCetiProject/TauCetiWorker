@@ -229,7 +229,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "incomplete")
         self.assertLess(result["commands"][-1]["exit"], 0)
         (self.root / ".lake/calls").unlink()
-        p = self.spawn(FIXTURE_MODE="sleep")
+        p = self.spawn(FIXTURE_MODE="sleep", TAUCETI_VERIFY_STATE=str(self.home / "sigterm-state"))
         self.wait_calls(p)
         p.send_signal(signal.SIGTERM)
         out, _ = p.communicate(timeout=10)

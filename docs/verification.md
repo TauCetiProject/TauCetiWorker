@@ -59,8 +59,8 @@ security boundary. Verification never weakens the axiom checks.
 
 Build, axiom/duplicate audit, module-system audit and environment lint acquire a host-shared
 flock slot, released between commands and never held during the conversation. Shim and source
-style checks bypass heavy admission; style runs before environment lint so it can make progress
-while unrelated builds occupy capacity. `TAUCETI_VERIFY_HEAVY_SLOTS` must be a positive integer and defaults to 1. All workers
+style checks bypass heavy admission. The default `all` request runs style before waiting for its
+build, and stage-only lint runs style before environment lint. `TAUCETI_VERIFY_HEAVY_SLOTS` must be a positive integer and defaults to 1. All workers
 on a host should use the same setting. The default lock directory uses the real host boot/machine
 identity and UID under `/tmp`, independent of worker ID, HOME, checkout or fleet labels. The directory
 must be owned by the user and not writable by others. Bubble mounts the host's same directory at
@@ -75,7 +75,8 @@ Waiting prints and publishes `waiting-verification-capacity`, keeps the existing
 heartbeat running, performs no claim reads, and observes the round deadline. A short scheduler
 flock serializes ticket registration and grants. Only the oldest leased ticket may acquire a free
 slot; dead-owner tickets are pruned by attempting their flock. Pending jobs retain their original
-age across interrupted waits. Admission is checked every 100 ms; status is refreshed at most
+age across interrupted waits and across their heavy commands; admission is FIFO by job age rather
+than a fresh age for each phase. Admission is checked every 100 ms; status is refreshed at most
 every fifteen seconds. Each invocation resets its wait record
 and holds a separate live-invocation flock, so a cancelled helper cannot grant a later successful
 invocation a stale retry refund. It does not alter
@@ -90,28 +91,42 @@ nonnegative number of seconds; fixtures explicitly use zero). At that boundary t
 incomplete with “checkpoint now”. Bubble candidate edits are saved as a base-bound binary patch and
 an untracked-file archive in `verification-checkpoints/` before checks begin, including when there is
 insufficient time to start verification. These artifacts are retained alongside a durable verification job in `verification-pending/`.
-Queued candidates are copied to independent `verification-candidates/` workspaces before a wait is
-published. Disposable Bubble candidates are preserved before a non-reused phase starts; a fully
-reused invocation does not copy dependencies or Git history. Copies include local Git history,
-actual source/index state and dependency sources, excluding generated Lake builds. This copying
-has a storage and I/O cost that still needs canary measurement. No clone contacts a remote.
+Capacity wait/refund evidence is published before candidate preservation. Queued candidates are
+copied to independent `verification-candidates/` workspaces; disposable Bubble candidates are
+preserved before a non-reused phase starts. A fully reused invocation copies no dependencies or
+Git history. Copies preserve actual sources/index, local Git history and warm Lake/Mathlib build
+caches. The original Git index is read through a private copy. Linux uses independent CoW extents
+when supported, with portable copying otherwise; trusted external immutable host dependencies can
+retain their validated read-only identity. Absolute/escaping source symlinks fail incomplete because
+they need specific recovery ownership. Copying still has production storage/I/O cost to measure
+before broad dispatch. No clone contacts a remote. Candidate source/checkpoint data is retained for
+publication/reconciliation; disk retention and package history cost remain canary measurements.
 
-Interrupted CLI results remain `status: incomplete`, exit nonzero, and include `result_type: pending`,
-the continuation job path and the next automatic action. SIGKILL leaves the already published job
-eligible once its live flock releases. The ordinary supervisor consumes pending jobs before model
-selection, inference admission or GitHub budget checks, under the existing per-worker round lock.
-It refunds interrupted capacity charges before resetting capacity evidence. It validates the preserved
-source digest, then runs the helper synchronously with a new verification deadline, without a model
-conversation. Repeated queue deadlines retain job age, candidate and completed phase evidence.
-Job leases prevent overlapping helpers/supervisors. Pending cooldowns stay with the mechanical owner;
-blocked candidates remain recorded and are retried locally without globally blocking unrelated work.
-Completed/failed jobs move out of the active queue to `verification-jobs/`; receipts and candidates remain.
+Interrupted CLI results remain `status: incomplete`, exit nonzero, and include a typed incomplete
+reason, `result_type: pending`, the continuation job and its next automatic action. SIGKILL leaves
+the published job eligible once its live flocks release. The ordinary supervisor checks fleet/CI
+admission, then launches an owned fresh installed helper before model selection or GitHub reads.
+The helper inherits the job lease, works only in the isolated candidate, and does not hold the
+worker's round lock while waiting/building. Its queue wait leaves inference scheduling available.
+One continuation per worker bounds preparation concurrency. Ordinary child polling reaps results;
+supervisor shutdown terminates its owned helper, preserving a durable interrupted job.
+
+Counter refunds happen before replay resets old capacity evidence. Repeated queue deadlines retain
+job age, candidate and validated phase evidence. Phase boundaries finish metadata/source validation
+and index publication even if the checkpoint margin arrives at command completion. Complete
+input/tool-version preparation runs at invocation boundaries; phase checkpoints use existing input
+metadata and exact source/configuration checks. Job/index leases suppress duplicate exact-candidate
+jobs. Permanent scope/configuration/ownership errors become terminal incomplete results with retained
+artifacts, so they cannot starve inference. Missing tools remain dormant without repeated verifier
+launches until local toolchain availability/provenance changes. Capacity/signal jobs remain eligible;
+there is no expiry that discards a legitimately queued candidate. Terminal jobs move out of the
+active queue into `verification-jobs/`.
 
 Recovery builds only in an independent candidate, never resets the original source and never pushes,
 creates a PR or bypasses accounting/publication guards. Receipts bind the actual replay environment;
 a different toolchain/configuration invalidates prior evidence. Bubble recovery needs the host's
-normal verification tools for the pinned project; unavailable tools leave incomplete evidence for
-retry. Publication/reconciliation of a recovered candidate remains #310's separate concern. This
+normal verification tools for the pinned project; unavailable tools leave typed incomplete evidence
+and a dormant job that wakes on local tool availability changes. Publication/reconciliation of a recovered candidate remains #310's separate concern. This
 verification continuation does not require #310. Claude Bash timeout variables cover the remaining
 round; Codex prompts instruct the agent to wait on its returned execution session. SIGINT, SIGTERM
 and SIGHUP cause owned cleanup and incomplete receipts.
@@ -131,14 +146,20 @@ and replace the installation/provenance token on updates. Registration alone gra
 Linux must report a read-only filesystem, all nested mounts must be read-only, and cold validation
 rejects external symlink targets. Unsupported hosts and writable/unregistered installations retain
 complete inventory and stat-keyed hash validation. A cold validation stores a content digest and
-file count. Warm validation binds that digest to the root device/inode/metadata, mount topology and
-publisher provenance; it performs no recursive immutable walk. Remounts, replacement roots or
-provenance changes invalidate the identity, including at phase boundaries. Source/configuration,
+file count in a host-shared cache under the same private queue directory, serialized per identity.
+Separate worker states reuse that validated installation. Warm validation binds that digest to the root device/inode/metadata, mount topology and
+publisher provenance; it performs no recursive immutable walk. A currently writable mount,
+replacement root, changed mount topology or changed provenance invalidates the identity, including
+at phase boundaries. A writable-to-read-only remount cycle that restores the observed topology is
+not detectable: the trusted publisher must change provenance after any mutation, including writes
+through aliases. Read-only mount observations alone do not establish immutability. Source/configuration,
 base, executable/version and verifier checks remain exact. The trust contract and local cache are
 accidental-mutation guards, not protection from an adversary changing read-only aliases or receipts.
 
 Set `TAUCETI_VERIFY_HELPER=0` to retain/restore bundled V0 prompts at the next round. This changes
-dispatch only: it does not delete receipts/checkpoints/jobs or terminate active verification. Host
+dispatch only: it does not delete receipts/checkpoints/jobs or terminate active verification.
+`TAUCETI_VERIFY_CONTINUATION=0` separately pauses launching new mechanical continuations while
+retaining eligible jobs and allowing active helpers to finish. Host
 slot count and containment policy are also read at the next phase/boundary. One heavy slot is an
 initial canary configuration, not a measured fleet optimum. Green fixture tests do not authorize
 blanket fleet dispatch.
@@ -151,11 +172,14 @@ deadlines, containment and accounting. `tests/verification_audit.py` adds twenty
 contenders (including owner death), cheap-check bypass, repeated deadlines followed by an actual
 successful build in the isolated candidate, Bubble namespace recovery after original deletion,
 phase evidence after interruption, dispatch gating and immutable preparation costs. Its 30,000-file,
-122,880,000-byte installation uses a fixture-only read-only identity; real writable installations
-are also tested to fall back. It prints cold and twenty-contender warm bytes, file records, stat/lstat
+122,880,000-byte installation uses fixture read-only `statvfs` flags with the real mountinfo
+reader/parser; real writable installations are also tested to fall back. Twenty contenders use
+separate worker states and the host-shared validated identity cache. It prints cold and twenty-contender warm bytes, file records, stat/lstat
 calls and walks, with 2,000 unrelated historical receipts. A local run observed 122,880,000 bytes,
 30,000 file records and 180,204 stat/lstat calls cold; twenty warm contenders performed zero
-payload reads/file records/walks and 100 stat/lstat calls. These are fixture preparation costs,
+payload reads/file records/walks and 100 stat/lstat calls, plus 40 `statvfs` calls and 40 mountinfo
+reads (108,680 bytes on that host). This fixed mount-metadata cost depends on host mount topology.
+These are fixture preparation costs,
 not a production throughput measurement. Warm payload bytes/file records/walks
 must be zero, and metadata work remains bounded independently of immutable payload/history.
 All fixtures use private activity/queue/state paths and fake verifiers; they launch no paid agents.

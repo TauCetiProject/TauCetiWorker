@@ -14,11 +14,15 @@ def admitted(root, slots, *, watch, waiting, priority=None):
     handle = None
     ticket = None
     lease = None
+    prepared = False
     # A short scheduler lock serializes ticket creation and slot grants, never expensive work.
     with (root / "scheduler.lock").open("a+") as scheduler:
         fcntl.flock(scheduler, fcntl.LOCK_EX)
         counter = root / "sequence"
-        number = int(counter.read_text()) + 1 if counter.exists() else 1
+        try:
+            number = int(counter.read_text()) + 1 if counter.exists() else 1
+        except ValueError:
+            number = max((int(p.name.split("-")[1]) for p in root.glob("wait-*")), default=0) + 1
         temporary = root / f"sequence-{uuid.uuid4().hex}.tmp"
         temporary.write_text(str(number))
         os.replace(temporary, counter)
@@ -44,7 +48,9 @@ def admitted(root, slots, *, watch, waiting, priority=None):
                                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
                                 path.unlink(missing_ok=True)
                             except BlockingIOError:
-                                live.append((int(other.read()), path.name))
+                                data = other.read().splitlines()
+                                if len(data) == 1:  # a candidate checkpoint is not ready for capacity yet
+                                    live.append((int(data[0]), path.name))
                     except FileNotFoundError:
                         pass
                 # Only the oldest waiter tries slots. Multiple free slots are filled in FIFO order.
@@ -62,7 +68,27 @@ def admitted(root, slots, *, watch, waiting, priority=None):
                             os.close(fd)
                             raise
             if handle is None:
-                waiting()
+                if not prepared:
+                    # Slow preservation must not leave idle slots behind an unready oldest ticket.
+                    with (root / "scheduler.lock").open("a+") as scheduler:
+                        fcntl.flock(scheduler, fcntl.LOCK_EX)
+                        age = ticket.read_text().splitlines()[0]
+                        lease.seek(0)
+                        lease.truncate()
+                        lease.write(age + "\npreparing")
+                        lease.flush()
+                    try:
+                        waiting()
+                    finally:
+                        with (root / "scheduler.lock").open("a+") as scheduler:
+                            fcntl.flock(scheduler, fcntl.LOCK_EX)
+                            lease.seek(0)
+                            lease.truncate()
+                            lease.write(age)
+                            lease.flush()
+                    prepared = True
+                else:
+                    waiting()
                 time.sleep(0.1)
         yield
     finally:

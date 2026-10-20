@@ -6,6 +6,7 @@ A receipt is durable and incomplete before any child starts; SIGKILL cannot turn
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import contextvars
 import fcntl
@@ -43,7 +44,9 @@ STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
 
 
 class Incomplete(Exception):
-    pass
+    def __init__(self, message, *, reason="invalid-input"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def digest(value) -> str:
@@ -225,6 +228,8 @@ class Verification:
         self.base = ""
         self.watched = {}
         self.static_stamps = {}
+        self.static_names = {}
+        self.at_boundary = False
         self.watch_names = set()
         self.dependency_names = None
         self.mutated = False
@@ -240,6 +245,7 @@ class Verification:
             files_under=files_under,
             file_record=file_record,
             stamps=stamps,
+            cache_directory=lambda: queue_root() / "installations",
         )
 
     def save(self):
@@ -249,12 +255,14 @@ class Verification:
         print(message, file=sys.stderr, flush=True)
 
     def check_deadline(self):
+        if self.at_boundary:
+            return  # Finish validation/index publication for an already completed phase.
         margin = float(os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"))
         if not math.isfinite(margin) or margin < 0:
             raise ValueError("TAUCETI_VERIFY_CHECKPOINT_MARGIN must be a nonnegative number of seconds")
         if self.deadline is not None and time.time() >= self.deadline - margin:
             self.interrupted_wait = bool(self.receipt.get("waiting_for_capacity"))
-            raise Incomplete("round deadline checkpoint margin reached; checkpoint now")
+            raise Incomplete("round deadline checkpoint margin reached; checkpoint now", reason="deadline")
 
     def watch(self):
         self.check_deadline()
@@ -268,10 +276,8 @@ class Verification:
         self.last_watch = 0
         self.watch()
         self.installations.validate()
-        if (
-            stamps(self.static_stamps) != self.static_stamps
-            or self.dependency_names is not None
-            and {str(p) for p in files_under(self.root / ".lake/packages")} != self.dependency_names
+        if stamps(self.static_stamps) != self.static_stamps or any(
+            {str(p) for p in files_under(root)} != names for root, names in self.static_names.items()
         ):
             raise Incomplete("dependency, toolchain or verifier mutated during verification")
 
@@ -287,12 +293,14 @@ class Verification:
             if not waiting:
                 from .verification_jobs import preserve_candidate
 
-                if self.job:
-                    preserve_candidate(self)
+                waiting = True
                 self.progress(f"{phase}: waiting-verification-capacity")
                 self.receipt["waiting_for_capacity"] = True
+                self.capacity(True)
                 self.save()
-                waiting = True
+                report_runtime("waiting-verification-capacity", verification_receipt=str(self.path))
+                if self.job:
+                    preserve_candidate(self)
             if time.monotonic() - published >= 15:
                 published = time.monotonic()
                 self.capacity(True)
@@ -327,6 +335,7 @@ class Verification:
                 interrupted=interrupted,
                 deadline=self.interrupted_wait,
                 receipt=str(self.path),
+                job=f"verification-pending/{self.job['id']}.json" if self.job else None,
                 lease=str((self.directory / "live.lock").relative_to(self.state)),
                 at=time.time(),
             ),
@@ -406,33 +415,8 @@ class Verification:
             raise subprocess.CalledProcessError(entry["exit"], argv, output=text)
         return (captured_text if capture else text).strip()
 
-    def inputs(self):
-        self.check_deadline()
-        toolchain = {}
-        for name in ("lake", "lean", "bash", "python3", "git", "tar"):
-            executable = shutil.which(name)
-            if executable is None:
-                raise ValueError(f"verification tool missing: {name}")
-            toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
-        for name in ("cc", "c++", "clang", "ar", "ld"):
-            selected = shlex.split(os.environ.get(name.upper(), name))
-            if selected and (executable := shutil.which(selected[0])):
-                toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
-        for command in (
-            ["lake", "--version"],
-            ["lake", "env", "lean", "--version"],
-            ["lake", "env", "lean", "--print-prefix"],
-        ):
-            toolchain[" ".join(command)] = self.command("toolchain", command, capture=True)
-        prefix = Path(toolchain["lake env lean --print-prefix"])
-        if not prefix.is_absolute() or not prefix.is_dir():
-            raise ValueError("Lean did not report an absolute installed toolchain prefix")
-        toolchain["distribution"] = self.installations.inventory(prefix)
-        deps = self.root / ".lake" / "packages"
-        dependencies = self.installations.inventory(deps)
-        config = os.environ.get("LAKE_CONFIG")
-        # Hash environment values to avoid recording credentials. Volatile orchestration values do not build inputs.
-        environment = {
+    def environment(self):
+        return {
             k: digest(v)
             for k, v in os.environ.items()
             if k.startswith(("LEAN", "LAKE", "ELAN", "MATHLIB", "NIX_"))
@@ -452,6 +436,59 @@ class Verification:
                 "PYTHONSAFEPATH",
             }
         }
+
+    def validate_inputs(self, inputs, *, full=False):
+        self.at_boundary = True
+        try:
+            self.final_watch()
+            if full:
+                unchanged = digest(self.inputs()) == digest(inputs)
+            else:
+                config = os.environ.get("LAKE_CONFIG")
+                unchanged = (
+                    inventory(self.root, self.base) == inputs["sources"]
+                    and scope(self.root, self.base, self.policy) == inputs["scope"]
+                    and self.environment() == inputs["environment"]
+                    and (file_record(Path(config)) if config else None) == inputs["configuration"]
+                    and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
+                    and POLICY_VERSION == inputs["policy_version"]
+                    and {p.name for p in Path(__file__).parent.glob("*.py")} == set(inputs["verifier"]) - {"wrapper"}
+                )
+            if self.mutated or not unchanged:
+                raise Incomplete("verification inputs changed during execution")
+            self.final_watch()
+        finally:
+            self.at_boundary = False
+
+    def inputs(self):
+        self.check_deadline()
+        toolchain = {}
+        for name in ("lake", "lean", "bash", "python3", "git", "tar"):
+            executable = shutil.which(name)
+            if executable is None:
+                raise Incomplete(f"verification tool missing: {name}", reason="tool-missing")
+            toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
+        for name in ("cc", "c++", "clang", "ar", "ld"):
+            selected = shlex.split(os.environ.get(name.upper(), name))
+            if selected and (executable := shutil.which(selected[0])):
+                toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
+        for command in (
+            ["lake", "--version"],
+            ["lake", "env", "lean", "--version"],
+            ["lake", "env", "lean", "--print-prefix"],
+        ):
+            toolchain[" ".join(command)] = self.command("toolchain", command, capture=True)
+        prefix = Path(toolchain["lake env lean --print-prefix"])
+        if not prefix.is_absolute() or not prefix.is_dir():
+            if prefix.is_absolute() and self.job:
+                self.job["toolchain_wait_path"] = str(prefix)
+            raise Incomplete("Lean did not report an absolute installed toolchain prefix", reason="tool-missing")
+        toolchain["distribution"] = self.installations.inventory(prefix)
+        deps = self.root / ".lake" / "packages"
+        dependencies = self.installations.inventory(deps)
+        config = os.environ.get("LAKE_CONFIG")
+        # Hash environment values to avoid recording credentials. Volatile orchestration values do not build inputs.
+        environment = self.environment()
         verifier = {str(p.name): hash_file(p) for p in Path(__file__).parent.glob("*.py")}
         verifier["wrapper"] = hash_file(HERE / "scripts" / "tauceti-verify")
         sources = inventory(self.root, self.base)
@@ -559,7 +596,7 @@ class Verification:
         try:
 
             def interrupted(signum, _):
-                raise Incomplete(f"verification interrupted by signal {signum}")
+                raise Incomplete(f"verification interrupted by signal {signum}", reason="signal")
 
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 previous[sig] = signal.signal(sig, interrupted)
@@ -594,8 +631,7 @@ class Verification:
                 if isinstance(entry, dict) and "path" in entry
             ]
             extra.append(Path(sys.executable))
-            if (self.root / ".lake/packages").resolve() in self.installations.walked:
-                self.dependency_names = {str(p) for p in files_under(self.root / ".lake/packages")}
+            self.static_names = {root: {str(p) for p in files_under(root)} for root in self.installations.walked}
             if os.environ.get("LAKE_CONFIG"):
                 extra.append(Path(os.environ["LAKE_CONFIG"]))
             if self.lint_modules:
@@ -614,6 +650,17 @@ class Verification:
             modules = self.directory / "modules.txt"
             modules.write_text("".join(f"{m}\n" for m in self.receipt["scope"]["modules"]))
             self.save()
+            early_style = (
+                len(self.requested) > 1
+                and "lint" in self.requested
+                and not (self.reuse and self.find_reuse(fingerprint, "lint"))
+            )
+            if early_style:
+                from .verification_jobs import preserve_candidate
+
+                preserve_candidate(self, disposable_only=True)
+                self.receipt["phases"]["lint"] = dict(status="incomplete", started_at=time.time(), ended_at=None)
+                self.command("lint", ["bash", "-o", "pipefail", "scripts/lint-style.sh"], env=dict(os.environ))
             for phase in self.requested:
                 self.watch()
                 reused = self.find_reuse(fingerprint, phase) if self.reuse else None
@@ -627,34 +674,39 @@ class Verification:
                 from .verification_jobs import preserve_candidate
 
                 preserve_candidate(self, disposable_only=True)
-                record = dict(status="incomplete", started_at=time.time(), ended_at=None)
+                record = self.receipt["phases"].get(phase) or dict(
+                    status="incomplete", started_at=time.time(), ended_at=None
+                )
                 self.receipt["phases"][phase] = record
                 self.save()
                 # Shim and source-style checks are cheap. Environment lint/build/audits alone
                 # consume heavy capacity; release it between commands.
                 for argv, env in self.phase_commands(phase, modules):
+                    if early_style and phase == "lint" and "scripts/lint-style.sh" in argv:
+                        continue
                     heavy = phase in {"build", "axioms", "module-system"} or (
                         phase == "lint" and "scripts/lint-env.sh" in argv
                     )
                     with self.slot(phase) if heavy else contextlib.nullcontext():
                         self.command(phase, argv, env=env)
-                self.final_watch()
-                if self.mutated or digest(self.inputs()) != fingerprint:
-                    raise Incomplete("verification inputs changed during execution")
-                self.final_watch()
+                self.validate_inputs(inputs)
                 record.update(status="success", ended_at=time.time(), validated_fingerprint=fingerprint)
                 self.index_success()
             # Recompute bytes, pins, dependencies, toolchain, environment and verifier after all tools exit.
-            self.final_watch()
-            if self.mutated or digest(self.inputs()) != fingerprint:
-                raise Incomplete("verification inputs changed during execution")
-            self.final_watch()
-            self.receipt["status"] = "success"
+            self.validate_inputs(inputs, full=True)
+            self.receipt.update(status="success", ended_at=time.time())
             self.index_success()
         except subprocess.CalledProcessError as error:
-            self.receipt.update(status="failed", error=f"command exited {error.returncode}: {error.cmd}")
-        except (Incomplete, Die, OSError, ValueError, RuntimeError) as error:
-            self.receipt.update(status="incomplete", error=str(error))
+            probing = bool(self.receipt["commands"] and self.receipt["commands"][-1]["phase"] == "toolchain")
+            self.receipt.update(
+                status="incomplete" if probing else "failed",
+                incomplete_reason="toolchain" if probing else None,
+                error=f"command exited {error.returncode}: {error.cmd}",
+            )
+        except Incomplete as error:
+            self.receipt.update(status="incomplete", error=str(error), incomplete_reason=error.reason)
+        except (Die, OSError, ValueError, RuntimeError) as error:
+            self.receipt.update(status="incomplete", error=str(error), incomplete_reason="preparation")
         finally:
             self.receipt["ended_at"] = time.time()
             timings = []
@@ -686,7 +738,20 @@ class Verification:
                 atomic(self.state / "verification-hashes.json", dict(list(cache.items())[-200000:]))
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
-            report_runtime("working", verification_phase=None)
+            if self.job and self.receipt["status"] == "incomplete":
+                status = (
+                    "waiting-verification-capacity"
+                    if self.receipt.get("waiting_for_capacity")
+                    else "verification-pending"
+                )
+                report_runtime(
+                    status,
+                    verification_phase=None,
+                    verification_job=self.job["id"],
+                    detail="durable verification job retained for mechanical continuation",
+                )
+            else:
+                report_runtime("working", verification_phase=None)
         return self.receipt
 
     def index_success(self):
@@ -766,6 +831,7 @@ def add_parser(sub):
         "--json", action="store_true", help="emit exactly one JSON result on stdout; progress on stderr"
     )
     parser.add_argument("--no-reuse", action="store_true", help="run requested phases even when exact evidence exists")
+    parser.add_argument("--resume-job", type=Path, help=argparse.SUPPRESS)
 
 
 def command(args):
@@ -777,6 +843,22 @@ def command(args):
         deadline = float(os.environ["TAUCETI_ROUND_DEADLINE"]) if os.environ.get("TAUCETI_ROUND_DEADLINE") else None
         if deadline is not None and not math.isfinite(deadline):
             raise ValueError("round deadline must be finite")
+        job = None
+        if getattr(args, "resume_job", None):
+            job_path = args.resume_job.resolve()
+            job = read_json(job_path)
+            if (
+                job.get("schema") != "tauceti-verification-job/v1"
+                or job_path != state.resolve() / "verification-pending" / f"{job.get('id')}.json"
+                or job.get("root") != str(root)
+            ):
+                raise ValueError("invalid mechanical verification job")
+            descriptor = int(os.environ.get("TAUCETI_VERIFY_JOB_FD", "-1"))
+            owned = os.fstat(descriptor)
+            lease = (state / "verification-jobs" / f"{job['id']}.lock").stat()
+            if (owned.st_dev, owned.st_ino) != (lease.st_dev, lease.st_ino):
+                raise ValueError("mechanical helper requires its supervisor's job lease")
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         verification = Verification(
             root,
             state,
@@ -786,6 +868,7 @@ def command(args):
             policy=os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
             deadline=deadline,
             lint_modules=getattr(args, "lint_modules", None),
+            job=job,
         )
         result = verification.run()
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
@@ -817,6 +900,9 @@ def capacity_evidence(wait: dict, state: Path, *, interrupted_round=False) -> bo
     return bool(
         wait.get("deadline")
         and wait.get("interrupted")
+        or wait.get("interrupted")
+        and isinstance(wait.get("job"), str)
+        and (state / wait["job"]).is_file()
         or live_wait(wait, state)
         or interrupted_round
         and (wait.get("waiting") or wait.get("interrupted"))

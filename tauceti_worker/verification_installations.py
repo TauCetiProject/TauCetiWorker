@@ -6,6 +6,7 @@ alias. Read-only mount checks are an accidental-mutation guard, not a security b
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 from pathlib import Path
@@ -32,8 +33,9 @@ def mount_identity(root: Path):
 
 
 class Installations:
-    def __init__(self, state, *, digest, atomic, read_json, files_under, file_record, stamps):
+    def __init__(self, state, *, digest, atomic, read_json, files_under, file_record, stamps, cache_directory=None):
         self.state = state
+        self.cache_directory = cache_directory
         self.digest, self.atomic, self.read_json = digest, atomic, read_json
         self.files_under, self.file_record, self.stamps = files_under, file_record, stamps
         self.validated = {}
@@ -50,9 +52,22 @@ class Installations:
             return {str(p.relative_to(root)): self.file_record(p) for p in self.files_under(root)}
         identity = dict(root=str(root), provenance=provenance, mount=mount, stamp=self.stamps([root]))
         key = self.digest(identity)
-        cache = self.state / "verification-installations" / f"{key}.json"
+        directory = self.cache_directory() if self.cache_directory else self.state / "verification-installations"
+        cache = directory / f"{key}.json"
+        directory.mkdir(parents=True, exist_ok=True)
+        with cache.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return self.validated_inventory(root, identity, key, cache)
+
+    def validated_inventory(self, root, identity, key, cache):
         old = self.read_json(cache)
-        if self.digest(old.get("identity")) != self.digest(identity) or not isinstance(old.get("sha256"), str):
+        if (
+            self.digest(old.get("identity")) != self.digest(identity)
+            or not isinstance(old.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", old["sha256"])
+            or type(old.get("files")) is not int
+            or old["files"] < 0
+        ):
             # An external symlink could change independently of this installation. Fall back rather
             # than attest a mutable target. Internal symlinks are bound to the same mount identity.
             files = list(self.files_under(root))
