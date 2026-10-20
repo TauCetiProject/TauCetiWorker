@@ -197,6 +197,7 @@ def tool_readiness(job):
     paths += [
         str(Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))) / "toolchains"),
         str(Path(__file__)),
+        str(Path(__file__).with_name("verification.py")),
         str(HERE / "scripts/tauceti-verify"),
     ]
     if job.get("toolchain_wait_path"):

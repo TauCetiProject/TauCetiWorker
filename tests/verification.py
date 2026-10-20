@@ -93,7 +93,13 @@ args = sys.argv[1:]
 if args == ['--version'] or '--version' in args:
     print('fixture Lean/Lake version 1'); sys.exit(0)
 if '--print-prefix' in args:
-    print({str(self.prefix)!r}); sys.exit(0)
+    if os.environ.get('FIXTURE_PROBE_WARNING'):
+        print('warning: batteries: repository has local changes:')
+        print('  ' + str(Path.cwd() / '.lake/packages/batteries'))
+        print('stderr package diagnostic', file=sys.stderr)
+    print({str(self.prefix)!r})
+    if os.environ.get('FIXTURE_PROBE_TRAILER'): print('not a toolchain prefix')
+    sys.exit(0)
 p = Path('.lake'); p.mkdir(exist_ok=True)
 with (p/'calls').open('a') as f: f.write(' '.join(args)+' AXIOMS='+os.environ.get('AXIOMS_ONLY_MODULES','')+'\\n')
 mode = os.environ.get('FIXTURE_MODE', '')
@@ -163,6 +169,28 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             self.assertIsNone(p.poll())
             self.assertLess(time.monotonic(), limit)
             time.sleep(0.02)
+
+    def test_package_warnings_preserve_prefix_and_probe_logs(self):
+        os.environ["FIXTURE_PROBE_WARNING"] = "1"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        probe = next(c for c in result["commands"] if c["argv"][-1] == "--print-prefix")
+        self.assertEqual(probe["exit"], 0)
+        self.assertIn("stderr package diagnostic", Path(probe["log"]).read_text())
+        stdout = Path(probe["stdout_log"]).read_text()
+        self.assertIn("warning: batteries", stdout)
+        self.assertEqual(stdout.splitlines()[-1], str(self.prefix))
+        inputs = json.loads(Path(result["inputs"]["path"]).read_text())
+        self.assertEqual(inputs["toolchain"]["lake env lean --print-prefix"], stdout.strip())
+        self.assertEqual(self.verify(stage="build")["phases"]["build"]["reused_from"], result["receipt"])
+
+    def test_prefix_probe_rejects_trailing_nonpath_output(self):
+        os.environ["FIXTURE_PROBE_TRAILER"] = "1"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertNotIn("build", result["phases"])
+        self.assertFalse((self.root / ".lake/calls").exists())
 
     def test_success_reuse_and_phase_reuse(self):
         first = self.verify(stage="build")

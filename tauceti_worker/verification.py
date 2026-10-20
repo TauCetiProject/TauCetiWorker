@@ -422,7 +422,7 @@ class Verification:
                         cwd=self.root,
                         env=env,
                         stdout=captured if capture else output,
-                        stderr=subprocess.STDOUT,
+                        stderr=output if capture else subprocess.STDOUT,
                     )
                 )
                 while process.poll() is None:
@@ -533,7 +533,11 @@ class Verification:
             ["lake", "env", "lean", "--print-prefix"],
         ):
             toolchain[" ".join(command)] = self.command("toolchain", command, capture=True)
-        prefix = Path(toolchain["lake env lean --print-prefix"])
+        # Lake may emit package diagnostics on stdout before Lean's result. Keep
+        # the complete probe output in the fingerprint/log; Lean prints its
+        # prefix last. Never search earlier diagnostics for a usable path.
+        lines = toolchain["lake env lean --print-prefix"].splitlines()
+        prefix = Path(lines[-1] if lines else "")
         if not prefix.is_absolute() or not prefix.is_dir():
             if prefix.is_absolute() and self.job:
                 self.job["toolchain_wait_path"] = str(prefix)
