@@ -175,6 +175,27 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             self.assertEqual(len(v.read_json(path)["sha256"]), 64)
             self.assertEqual(v.read_json(path)["files"], 1)
 
+    def test_unavailable_identity_cache_falls_back_to_complete_validation(self):
+        manifest = self.home / "installations.json"
+        v.atomic(manifest, {str(self.prefix): "publisher-1"})
+        for error in (PermissionError("cache unavailable"), ValueError("unsafe cache")):
+            with (
+                self.subTest(error=error),
+                patch.dict(os.environ, TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS=str(manifest)),
+                patch("tauceti_worker.verification_installations.mount_identity", return_value=["fixture-read-only"]),
+                patch.object(v, "cache_root", side_effect=error),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                verification = v.Verification(self.root, self.state, stage="build", reuse=False)
+                first = verification.run()
+                self.assertEqual(first["status"], "success", first.get("error"))
+                self.assertIn(self.prefix, verification.installations.walked)
+                self.assertNotIn(self.prefix, verification.installations.validated)
+                write(self.prefix, "bin/lean", str(error))
+                changed = self.verify(stage="build")
+                self.assertEqual(changed["status"], "success", changed.get("error"))
+                self.assertNotIn("reused_from", changed["phases"]["build"])
+
     def test_permanent_incomplete_does_not_suppress_inference(self):
         from tauceti_worker import loop
 

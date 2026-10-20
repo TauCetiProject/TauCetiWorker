@@ -2114,7 +2114,9 @@ def run_in_bubble(
         (rounddir / "tauceti-verify").chmod(0o755)
         verify_state = cfg.state / "verification-state"
         verify_state.mkdir(parents=True, exist_ok=True)
-        host_cache = cache_root()
+        host_cache = None
+        with contextlib.suppress(OSError, ValueError):
+            host_cache = cache_root()
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -2131,9 +2133,9 @@ def run_in_bubble(
         mount_flags += [
             "--mount",
             f"{verify_state}:/opt/verification-state:rw",
-            "--mount",
-            f"{host_cache}:/opt/verification-cache:rw",
         ]
+        if host_cache is not None:
+            mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
     api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
     api_boundary = None
     if api_bridge and _uses_claude_credentials(cred_model):
@@ -2213,7 +2215,9 @@ def run_in_bubble(
     if helper_on:
         for key, value in {
             "TAUCETI_VERIFY_STATE": "/opt/verification-state",
-            "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache",
+            "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
+            if host_cache is not None
+            else "/tmp/verification-cache",
             "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
             "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
             "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),

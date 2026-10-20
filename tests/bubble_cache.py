@@ -218,6 +218,21 @@ try:
     )
     check("work configures long foreground tool timeouts", "BASH_MAX_TIMEOUT_MS=" in work_argv)
     with (
+        patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"),
+        patch("tauceti_worker.verification.cache_root", side_effect=PermissionError("unavailable cache")),
+    ):
+        fallback = io.StringIO()
+        with contextlib.redirect_stdout(fallback):
+            check(
+                "unavailable shared cache does not block helper launch",
+                tc.run_in_bubble(w, tc.TAUCETI, "PROMPT", opts) == 0,
+            )
+        check("unavailable shared cache is not mounted", "/opt/verification-cache" not in fallback.getvalue())
+        check(
+            "helper uses a private cache fallback",
+            "TAUCETI_VERIFY_CACHE_DIR=/tmp/verification-cache" in fallback.getvalue(),
+        )
+    with (
         patch.dict(os.environ, TAUCETI_VERIFY_HELPER="0"),
         patch("tauceti_worker.verification.cache_root", side_effect=AssertionError("rollback must not use cache")),
     ):

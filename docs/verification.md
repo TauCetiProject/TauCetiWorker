@@ -70,7 +70,9 @@ uses the host boot/machine identity and UID under `/tmp`. The directory must be 
 and not writable by others. Bubble mounts it at `/opt/verification-cache` and persists receipts
 separately under worker state. Cache locks protect creation/validation of one installation identity;
 they are released before expensive verification commands run. Unregistered writable installations
-retain complete inventory validation without requiring a shared cache.
+retain complete inventory validation without requiring a shared cache. If the shared cache is
+unavailable or unsafe, host verification falls back to complete validation and Bubble uses a
+private cache directory. Cache availability never grants success or prevents the checks from running.
 
 `TAUCETI_VERIFY_CHECKPOINT_MARGIN` reserves 600 seconds before the round deadline by default (a
 nonnegative number of seconds; fixtures explicitly use zero). At that boundary the helper returns
@@ -153,8 +155,7 @@ blanket fleet dispatch.
 pin/base/toolchain/executable changes, deletions, renames, untracked/ignored sources, owner death,
 deadlines and containment. Twenty independent fake verifiers must enter their builds together,
 even with an old one-slot lock held and stale wait records present. `tests/verification_audit.py` adds
-repeated deadlines followed by an actual
-successful build in the isolated candidate, Bubble namespace recovery after original deletion,
+repeated deadlines followed by an actual successful build in the isolated candidate, Bubble namespace recovery after original deletion,
 phase evidence after interruption, dispatch gating and immutable preparation costs. Its 30,000-file,
 122,880,000-byte installation uses fixture read-only `statvfs` flags with the real mountinfo
 reader/parser; real writable installations are also tested to fall back. Twenty contenders use

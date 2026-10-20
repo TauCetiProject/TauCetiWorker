@@ -125,7 +125,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)
                 continue
-            # Verification owns an isolated candidate and a separate job lease. Its queue wait
+            # Verification owns an isolated candidate and a separate job lease. Its execution
             # must not block model selection, and host CI reservations still precede launch.
             resume_pending(cfg, background=True)
             from .repair_recovery import due

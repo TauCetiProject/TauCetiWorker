@@ -52,12 +52,17 @@ class Installations:
             return {str(p.relative_to(root)): self.file_record(p) for p in self.files_under(root)}
         identity = dict(root=str(root), provenance=provenance, mount=mount, stamp=self.stamps([root]))
         key = self.digest(identity)
-        directory = self.cache_directory() if self.cache_directory else self.state / "verification-installations"
-        cache = directory / f"{key}.json"
-        directory.mkdir(parents=True, exist_ok=True)
-        with cache.with_suffix(".lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            return self.validated_inventory(root, identity, key, cache)
+        try:
+            directory = self.cache_directory() if self.cache_directory else self.state / "verification-installations"
+            cache = directory / f"{key}.json"
+            directory.mkdir(parents=True, exist_ok=True)
+            with cache.with_suffix(".lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                return self.validated_inventory(root, identity, key, cache)
+        except (OSError, ValueError):
+            # An optional cache cannot prevent verification. Retain full input validation.
+            self.walked.add(root)
+            return {str(p.relative_to(root)): self.file_record(p) for p in self.files_under(root)}
 
     def validated_inventory(self, root, identity, key, cache):
         old = self.read_json(cache)
