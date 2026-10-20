@@ -9,7 +9,7 @@ const {RepositoryState}=await import('data:text/javascript;base64,'+Buffer.from(
 function fixture(){
  const db=new DatabaseSync(':memory:');
  const forbidden=()=>{throw new Error('Reporting attempted upstream/scheduler access');};
- const ctx={storage:{sql:{exec(sql,...bindings){let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};}},getAlarm:forbidden,setAlarm:forbidden}};
+ const ctx={storage:{sql:{exec(sql,...bindings){let rows=[];if(!bindings.length && sql.includes(';'))db.exec(sql);else{const st=db.prepare(sql);if(st.columns().length)rows=st.all(...bindings);else st.run(...bindings);}return {toArray:()=>rows,one:()=>rows[0]};}},transactionSync(fn){db.exec('SAVEPOINT tx');try{const value=fn();db.exec('RELEASE tx');return value;}catch(error){db.exec('ROLLBACK TO tx');db.exec('RELEASE tx');throw error;}},getAlarm:forbidden,setAlarm:forbidden}};
  const state=new RepositoryState(ctx,{INSTALLATIONS:new Proxy({},{get:forbidden}),ARCHIVE:{get:forbidden},BORS_ACTIVITY:{fetch:(...args)=>globalThis.fetch(...args)}});
  for(const name of ['configure','noteDemand','enqueue','query','runAttempt'])state[name]=forbidden;
  return {db,state};

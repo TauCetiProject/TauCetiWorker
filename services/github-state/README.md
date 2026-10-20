@@ -39,8 +39,10 @@ SQLite stores indexed resources, collection membership and coverage, repair
 jobs with pagination state, a seven-day change journal, and stable query
 snapshots. Initial inventories and histories publish complete coverage after
 all pages finish. A failed page preserves the previous complete collection.
-Snapshots paginate at 500 rows or approximately 1.49 MB per page; continuation
-reads individual pages rather than repeatedly decoding the entire inventory.
+Snapshots paginate at 500 rows or approximately 1.49 MB per page. Continuation
+pages are written to private R2 (at most four uploads at a time), never to
+SQLite; continuation reads individual pages rather than repeatedly decoding the
+entire inventory. Legacy SQL cursors stay readable until they expire.
 Concurrent queries at the same revision share a snapshot.
 
 PR and issue headers, commit statuses, check runs, workflow runs, and workflow
@@ -56,7 +58,14 @@ reactivates background reconciliation while returning the stored result.
 
 Raw deliveries expire after fourteen days, daily snapshots after seven days,
 staging pages after one day, and query cursors after ten minutes. R2 cursor
-objects expire after a one-minute grace period. Active resource spill objects
+objects expire after a one-minute grace period and have their own retention
+sweep.
+
+At the SQLite size limit, stored reads keep working and ingestion parks
+durably in R2 until headroom returns. Expiry runs before repair and
+hydration. See the [storage recovery runbook](../../docs/github-state-recovery.md)
+for degraded mode, parked ingress, bounded admin diagnostics, export, cleanup,
+probe, replay, reconciliation and rollback. Active resource spill objects
 remain readable while referenced by the SQL state.
 
 The installation object owns token refresh, all GitHub read requests,
@@ -182,7 +191,8 @@ client demand, upstream request, repair job, or closed-PR polling is created.
 client token. Valid credentials querying an unavailable repository scope get
 a structured `status:unavailable` response with no data, so that scope cannot
 poison outage handling for supported repositories. Invalid credentials still
-return 401. `/admin/bootstrap` requires the separate admin credential.
+return 401. `/admin/bootstrap`, `/admin/storage[/...]` and `/admin/ingress[/...]`
+require the separate admin credential.
 Installation tokens and private keys never reach clients.
 
 `workflow_jobs` queries may explicitly request `allow_observed=true` (top-level
@@ -338,5 +348,6 @@ They record the starting and ending revisions and are observational archives;
 Durable Object point-in-time recovery remains the database backup. Unreferenced
 R2 spill objects can be collected eight days after retirement, leaving seven-day archive
 references and active SQL references intact. SQLite resource rows are retained;
-long-term database growth still needs a cold-storage policy before claiming
+long-term database growth still needs a cold-storage policy
+(https://github.com/TauCetiProject/TauCetiWorker/issues/316) before claiming
 sustained operation at the modeled $1,500/hour scale.
