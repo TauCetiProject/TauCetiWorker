@@ -20,12 +20,34 @@ class BudgetError(ValueError):
     pass
 
 
-def admission_pause(snapshot):
-    """Preflight funding and ledger integrity; missing receipts are audit work."""
+def admission_pause(snapshot, *, worker=None, model=None, now=None):
+    """Cheap preflight; invocation admission remains the authoritative atomic check."""
+    now = time.time() if now is None else now
+    waiting = snapshot.get("waiting", [])
+    if model is None and worker is not None:
+        previous = next((item for item in waiting if item["worker"] == worker), None)
+        model = previous.get("model") if previous else None
     if snapshot.get("ledger_repair_required"):
         return "ledger repair requires reconciliation"
+    if model and snapshot.get("cooldowns", {}).get(model, 0) > now:
+        return "API throughput cooldown"
+    if model and model in snapshot.get("calibrating_models", []):
+        return "waiting for calibration session cost"
     if money(snapshot["available"]) <= 0 or money(snapshot["available"]) < money(snapshot["admission_threshold"]):
         return "waiting for funding"
+    if worker is not None and model:
+        first = min(
+            (
+                item
+                for item in waiting
+                if item.get("model") == model
+                and item["reason"] in {"waiting for funding", "waiting behind another worker"}
+            ),
+            key=lambda item: (item["since"], item["ticket"]),
+            default=None,
+        )
+        if first and first["worker"] != worker:
+            return "waiting behind another worker"
     return None
 
 
@@ -56,6 +78,18 @@ def bridge_owner_alive(owner):
         )
     except (OSError, KeyError, ValueError, IndexError, TypeError):
         return False
+
+
+def orphaned_bridge(session, now):
+    """Use the same liveness evidence for preflight and authoritative admission."""
+    if session["status"] != "active" or not session.get("bridge"):
+        return False
+    heartbeat = Path(session["bridge"]) / "outbox/heartbeat"
+    try:
+        stale = now - heartbeat.stat().st_mtime > 30
+    except FileNotFoundError:
+        stale = True
+    return stale and not bridge_owner_alive(session.get("owner"))
 
 
 def money(value) -> Decimal:
@@ -298,6 +332,9 @@ class Budget:
                 self.save_waiting(queue)
 
     def wait_for_funding(self, worker, model, phase):
+        self.wait_for_admission(worker, model, phase, "waiting for funding")
+
+    def wait_for_admission(self, worker, model, phase, reason):
         with self.locked():
             state = self.replay()
             queue = self.waiting_state(state)
@@ -313,7 +350,7 @@ class Budget:
                 ticket=previous.get("ticket", uuid.uuid4().hex),
                 since=previous.get("since", now),
                 seen=now,
-                reason="waiting for funding",
+                reason=reason,
                 estimate=str(estimate),
             )
             self.save_waiting(queue)
@@ -384,6 +421,11 @@ class Budget:
             clock_backwards=money(now) < state["watermark"],
             ledger=str(self.ledger),
             cooldowns=state["cooldowns"],
+            calibrating_models=[
+                name
+                for name in {s["model"] for s in active if s["status"] == "active" and not orphaned_bridge(s, now)}
+                if not self.estimate(state, name)[0]
+            ],
         )
 
     def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None):
@@ -396,15 +438,9 @@ class Budget:
             if resume and not any(resume in s.get("totals", {}) for s in state["sessions"].values()):
                 raise BudgetError("resuming requires a recorded cost baseline for that provider session ID")
             for session in active:
-                if session["status"] == "active" and session.get("bridge"):
-                    heartbeat = Path(session["bridge"]) / "outbox/heartbeat"
-                    try:
-                        orphaned = self.clock() - heartbeat.stat().st_mtime > 30
-                    except FileNotFoundError:
-                        orphaned = True
-                    if orphaned and not bridge_owner_alive(session.get("owner")):
-                        session["status"] = "unresolved"
-                        events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
+                if orphaned_bridge(session, self.clock()):
+                    session["status"] = "unresolved"
+                    events.append(dict(type="unresolved", id=session["id"], outcome="bridge disappeared"))
             costs, estimate = self.estimate(state, model, phase)
             live = [s for s in active if s["status"] == "active"]
             available = state["balance"] - sum((money(s.get("reserve", s["estimate"])) for s in active), Decimal(0))

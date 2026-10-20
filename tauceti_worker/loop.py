@@ -124,7 +124,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
-                    reason = admission_pause(snapshot)
+                    reason = admission_pause(snapshot, worker=cfg.wid)
                     blocked = reason is not None
                     if blocked:
                         Budget().refresh_waiter(cfg.wid)
@@ -132,7 +132,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     blocked, reason, snapshot = True, str(error), {}
                 if blocked:
                     wake = snapshot.get("funding_at")
-                    nap = max(1, min(60, (wake - time.time() + 1) if wake else 60))
+                    if reason == "API throughput cooldown":
+                        waiter = next((item for item in snapshot.get("waiting", []) if item["worker"] == cfg.wid), {})
+                        wake = snapshot.get("cooldowns", {}).get(waiter.get("model"))
+                    limit = 60 if reason in ("waiting for funding", "API throughput cooldown") else 5
+                    nap = max(1, min(limit, (wake - time.time() + 1) if wake else limit))
                     report_runtime("waiting-budget", detail=reason, budget=snapshot, next_action_at=time.time() + nap)
                     time.sleep(nap)
                     continue
@@ -313,17 +317,22 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 continue
 
             if rc == EX_ADMISSION_WAIT:
-                if reason := fleet_admission_reason(cfg.wid):
-                    report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
-                    time.sleep(5)
-                    continue
-                streak = 0
-                admission_streak += 1
-                nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))
+                paused = runtime_snapshot()
+                reason = fleet_admission_reason(cfg.wid)
+                waiting = paused.get("state") in ("waiting-capacity", "waiting-budget")
+                state = "waiting-capacity" if reason else (paused["state"] if waiting else "waiting-budget")
+                admission_streak = admission_streak + 1 if state == "waiting-budget" else 0
+                nap = min(60, 5 * (1 << min(max(0, admission_streak - 1), 4)))
                 with contextlib.suppress(BudgetError, OSError):
-                    Budget().refresh_waiter(cfg.wid)
+                    if api_mode():
+                        Budget().refresh_waiter(cfg.wid)
                 report_runtime(
-                    "waiting-budget", detail="rechecking local API admission", next_action_at=time.time() + nap
+                    state,
+                    detail=reason or (paused.get("detail") if waiting else None) or "rechecking local API admission",
+                    next_action_at=time.time() + nap,
+                    failure_reason=None,
+                    failure_code=None,
+                    failure_log=None,
                 )
                 time.sleep(nap)
                 continue

@@ -395,7 +395,7 @@ gh: API rate limit exceeded
         ("rebase", ["rebase-pr-7"]),
         ("bump", ["bump-7-abc", "bump-pr-7"]),
         ("lint-repair", ["lint-repair-7-abc", "lint-repair-pr-7"]),
-        ("progress", ["progress-err"]),
+        ("progress", [work_units.PROGRESS_ERROR_KEY]),
         ("roadmap", []),
     ):
         for raises in (False, True):

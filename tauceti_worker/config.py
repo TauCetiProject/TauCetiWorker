@@ -302,7 +302,11 @@ class VerificationUnavailable(NoProgress):
 
 
 class AdmissionUnavailable(NoProgress):
-    """Local API admission needs a bounded recheck, without no-progress backoff."""
+    """Inference admission needs a bounded recheck, without no-progress backoff."""
+
+    def __init__(self, message: str, *, state: str = "waiting-budget"):
+        super().__init__(message)
+        self.state = state
 
 
 class GitHubUnavailable(NoProgress):

@@ -1697,7 +1697,13 @@ def cli_main() -> int:
         return EX_VERIFICATION_WAIT
     except AdmissionUnavailable as e:
         log(str(e))
-        report_failure(str(e), code=EX_ADMISSION_WAIT)
+        report_runtime(
+            e.state,
+            detail=str(e),
+            failure_reason=None,
+            failure_code=None,
+            failure_log=None,
+        )
         return EX_ADMISSION_WAIT
     except NoProgress as e:
         event = blocking_event_since(started)
