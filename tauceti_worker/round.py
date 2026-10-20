@@ -326,7 +326,7 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         # Unlike kill_round_group (which signals while the leader PID is still live), p.wait() has already
         # reaped the leader here, so the group is held open only by stragglers. The lone wrong-kill window
         # — the freed leader PID being reused AND the reuser making itself a group leader before this line
-        # — is microseconds wide and needs a deliberate setsid; we accept it. (One-shot `tauceti work`
-        # runs the round in-process, not through here, so it is not swept; only the unbounded --loop leak
-        # is operationally damaging, so that scope gap is acceptable.)
+        # — is microseconds wide and needs a deliberate setsid; we accept it. This sweep is the legacy
+        # fallback: on a host with PID-namespace containment (containment.py) every agent and tool, in
+        # --loop and one-shot rounds alike, already died with its namespace, setsid'd ones included.
         reap_round_group(pgid)

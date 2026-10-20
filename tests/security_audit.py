@@ -19,11 +19,16 @@ from tauceti_worker import audit_alerts as alerts
 from tauceti_worker import audit_progress as progress
 from tauceti_worker import audit_reader as ar
 from tauceti_worker import audit_recovery as recovery
-from tauceti_worker import cli
+from tauceti_worker import cli, containment
 from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
 from tauceti_worker.work_units import want
+
+# These fixtures stub the model client through subprocess.run, which would also intercept the host's
+# containment probe. Model a host whose PID namespaces work, so automatic recovery stays enabled.
+containment._probed = (True, "test fixture")
+os.environ.pop(containment.POLICY_ENV, None)
 
 
 def append_native(home, answer, thread="11111111-2222-4333-8444-555555555555"):
@@ -606,6 +611,20 @@ class WorkerBoundJudgments(unittest.TestCase):
             recovery.recover(self.cfg, self.opts, self.block)
         model.assert_not_called()
         self.assertFalse((self.work / "operational-recovery.json").exists())
+
+    def test_legacy_process_cleanup_pauses_automatic_recovery(self):
+        for env, probed in (({"TAUCETI_PROCESS_CONTAINMENT": "legacy"}, (True, "ok")), ({}, (False, "no bwrap"))):
+            with (
+                patch.dict(os.environ, env),
+                patch.object(containment, "_probed", probed),
+                patch("tauceti_worker.loop.resolve_work_model") as quota,
+                patch.object(sa, "inspect") as model,
+                self.assertRaisesRegex(NoProgress, "automatic recovery paused.*best-effort process-group"),
+            ):
+                recovery.recover(self.cfg, self.opts, self.block)
+            quota.assert_not_called()
+            model.assert_not_called()
+            self.assertFalse((self.work / "operational-recovery.json").exists())
 
     def test_recovery_preserves_round_pacing_override(self):
         opts = wu.RoundOpts(

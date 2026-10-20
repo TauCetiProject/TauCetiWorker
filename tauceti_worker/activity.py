@@ -202,6 +202,9 @@ def _connect():
       CREATE TABLE IF NOT EXISTS ci_activity(id TEXT PRIMARY KEY,scope TEXT,at REAL,
         conclusion TEXT,wait_seconds REAL,run_seconds REAL);
       CREATE INDEX IF NOT EXISTS ci_activity_scope ON ci_activity(scope,at);
+      CREATE TABLE IF NOT EXISTS containment(id TEXT PRIMARY KEY,round_id TEXT,worker TEXT,scope TEXT,
+        at REAL,label TEXT,mode TEXT,child_pid INTEGER,pid_namespace INTEGER,exit_code INTEGER,cleanup TEXT);
+      CREATE INDEX IF NOT EXISTS containment_round ON containment(round_id);
     """)
     if db.execute("INSERT OR IGNORE INTO meta VALUES ('contribution_schema','1')").rowcount:
         # Earlier collectors advanced these journals without storing contribution
@@ -249,6 +252,23 @@ def _ingest(db, e):
             (e["repository"], e["pr"], worker, scope, e["at"]),
         )
 
+    elif kind == "containment_result":
+        db.execute(
+            "INSERT OR IGNORE INTO containment VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                e["id"],
+                e.get("round_id"),
+                worker,
+                scope,
+                e["at"],
+                e.get("label"),
+                e.get("mode"),
+                e.get("child_pid"),
+                e.get("pid_namespace"),
+                e.get("exit_code"),
+                e.get("cleanup"),
+            ),
+        )
     elif kind == "ci_result":
         db.execute(
             "INSERT OR IGNORE INTO ci_activity VALUES (?,?,?,?,?,?)",

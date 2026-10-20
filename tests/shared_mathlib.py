@@ -377,39 +377,60 @@ class SharedTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
     def test_killed_cache_parent_terminates_detached_downloader_group(self):
-        pidfile = self.root / "downloader.pid"
-        childcode = 'import os,time,sys; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(100)'
-        parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1]],Path.cwd(),dict(os.environ),f,100)'
-        parent = subprocess.Popen(
-            [sys.executable, "-c", parentcode, str(pidfile), str(self.root / "cache.log"), childcode]
-        )
-        pid = None
-        try:
-            deadline = time.monotonic() + 5
-            while not pidfile.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(pidfile.exists())
-            pid = int(pidfile.read_text())
-            parent.kill()
-            parent.wait(timeout=5)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+        # A contained downloader's own pid is namespace-local; identify it by a unique argv token.
+        for policy in ("legacy", "auto"):
+            with self.subTest(policy=policy):
+                token = f"tauceti-downloader-{os.getpid()}-{policy}"
+                ready = self.root / f"downloader-{policy}.ready"
+                # Only a namespace can catch a downloader that escapes its session.
+                childcode = 'import os,time,sys; sys.argv[3] == "auto" and os.setsid(); open(sys.argv[1],"w").write("up"); time.sleep(100)'
+                parentcode = 'from pathlib import Path; import os,sys; from tauceti_worker.agents import _cache_fetch; f=open(sys.argv[2],"wb"); _cache_fetch([sys.executable,"-c",sys.argv[3],sys.argv[1],sys.argv[4],sys.argv[5]],Path.cwd(),dict(os.environ),f,100)'
+                parent = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        parentcode,
+                        str(ready),
+                        str(self.root / "cache.log"),
+                        childcode,
+                        token,
+                        policy,
+                    ],
+                    env={**os.environ, "TAUCETI_PROCESS_CONTAINMENT": policy},
+                )
+
+                def tagged(token=token):
+                    found = []
+                    for entry in Path("/proc").iterdir():
+                        if entry.name.isdigit():
+                            try:
+                                args = (entry / "cmdline").read_bytes().split(b"\0")
+                                state = (entry / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                            except OSError:
+                                continue
+                            if token.encode() in args and state != "Z":
+                                found.append(int(entry.name))
+                    return found
+
                 try:
-                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-                except FileNotFoundError:
-                    break
-                if state == "Z":
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail("detached cache downloader survived its killed parent")
-        finally:
-            if parent.poll() is None:
-                parent.kill()
-                parent.wait()
-            if pid:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, 9)
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    self.assertTrue(tagged())
+                    parent.kill()
+                    parent.wait(timeout=5)
+                    deadline = time.monotonic() + 5
+                    while tagged() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertFalse(tagged(), "detached cache downloader survived its killed parent")
+                finally:
+                    if parent.poll() is None:
+                        parent.kill()
+                        parent.wait()
+                    for pid in tagged():
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, 9)
 
     def test_gc_reclaims_killed_builder_staging_and_skips_live_builder(self):
         key = "a" * 64

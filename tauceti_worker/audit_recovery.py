@@ -415,6 +415,15 @@ def recover(cfg, opts, previous: dict) -> bool:
         raise NoProgress("security-audit: retained recovery budget is unreadable; preserve it for inspection") from exc
     if entry.get("retry_at", 0) > time.time():
         raise NoProgress("security-audit: retained operational recovery is waiting for its cooldown")
+    from . import containment
+
+    if not containment.strong():
+        # A relaunched client could again outlive its round. Manual `resume` still works.
+        raise NoProgress(
+            "security-audit: automatic recovery paused: "
+            + containment.status().reason
+            + "; resume manually with `python -m tauceti_worker.security_audit resume`"
+        )
     from .loop import resolve_work_model
 
     resolve_work_model(cfg, "codex", dry=False, ignore_quota=getattr(opts, "ignore_quota", False), fresh=True)

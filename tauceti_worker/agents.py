@@ -708,13 +708,14 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
     _LAST_AGENT_FAILURE = None
     with host_build_cache_context(cwd, env, logdir) as prefix:
         rc = run_agent_proc(
-            [*(prefix or []), *argv],
+            argv,
             env=env,
             cwd=cwd,
             logdir=logdir,
             label=f"agent-{profile.provider}",
             provider=profile.provider,
             cancel_event=cancel_event,
+            containment_prefix=prefix or (),
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
@@ -837,12 +838,18 @@ def run_agent_proc(
     provider: str,
     cwd: Path | None = None,
     cancel_event=None,
+    contain: bool = True,
+    containment_prefix=(),
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
     By default the normalized transcript goes to a timestamped file under logdir. ``--stream`` sends
     the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
     failures aren't silent.
+
+    A host agent and all its tools run in one containment boundary (``containment_prefix`` is the
+    shared Mathlib view when it is active, and is reused rather than nested); it is empty before
+    this returns. ``contain=False`` is for launchers whose agent runs in a sandbox owned elsewhere.
     """
     global _LAST_AGENT_FAILURE
     _LAST_AGENT_FAILURE = None
@@ -867,14 +874,18 @@ def run_agent_proc(
     def run_rendered(destination) -> int:
         if cancel_event is not None and cancel_event.is_set():
             raise NoProgress("shared lease lost before agent launch")
+        from .containment import Boundary
+
+        boundary = Boundary(label, prefix=containment_prefix, contain=contain)
+        command = boundary.argv(argv)
         # A separate group permits lease-loss cancellation without signalling
-        # the worker's caller. Bind its life to the worker through a pipe: even
-        # SIGKILL closes the parent's only writer and kills the detached group.
+        # the worker's caller. A PID namespace dies with the worker by itself
+        # (--die-with-parent); otherwise bind its life to the worker through a
+        # pipe: even SIGKILL closes the parent's only writer and kills the group.
         reader = writer = None
-        command = argv
-        if cancel_event is not None:
+        if cancel_event is not None and not boundary.strong:
             reader, writer = os.pipe()
-            command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *argv]
+            command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command]
         from .shared_mathlib import lease_fds
 
         try:
@@ -889,13 +900,15 @@ def run_agent_proc(
                 errors="replace",
                 bufsize=1,
                 start_new_session=cancel_event is not None,
-                pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env)),
+                pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env), *boundary.pass_fds),
             )
         except BaseException:
             if writer is not None:
                 os.close(writer)
+            boundary.finish(None)
             raise
         finally:
+            boundary.launched()
             if reader is not None:
                 os.close(reader)
         assert proc.stdout is not None
@@ -922,6 +935,7 @@ def run_agent_proc(
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
+            rc = proc.wait()
         except BaseException:
             if cancel_event is not None:
                 with contextlib.suppress(ProcessLookupError):
@@ -937,11 +951,8 @@ def run_agent_proc(
                 os.close(writer)
             if monitor is not None:
                 monitor.join(3)
-        rc = proc.wait()
-        if cancel_event is not None:
-            from .round import reap_round_group
-
-            reap_round_group(proc.pid)
+            # Descendants must be gone before the caller treats the checkout as quiescent.
+            boundary.finish(proc.returncode, pgid=proc.pid if cancel_event is not None else None)
         from .overlap_support import atomic
 
         telemetry = {
@@ -1003,12 +1014,15 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     if label.startswith("review #"):
         api_env = {**(os.environ if api_env is None else api_env), "TAUCETI_GITHUB_HISTORY_BRIDGE": "1"}
     env_kwargs = {"env": api_env} if api_env is not None else {}
+    from . import containment
+
+    tag = "review-engine" if label.startswith("review #") else "engine"
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv, **env_kwargs).returncode
+        return containment.run(argv, label=tag, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
-        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
+        rc = containment.run(argv, label=tag, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
@@ -1116,19 +1130,27 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             ) from error
 
 
-def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float, *, prefix=()) -> int:
     """Bind detached downloaders to the worker, including after parent SIGKILL.
 
-    The pipe guardian retains the snapshot lease and kills its process group if
-    the worker disappears. Ordinary timeout/interruption also tears down the group.
+    Downloads run in a containment boundary (``prefix`` is the shared Mathlib view when active),
+    which dies with the worker. On a legacy host, the pipe guardian retains the snapshot lease and
+    kills its process group if the worker disappears. Ordinary timeout/interruption also tears down
+    the group, and the boundary is confirmed empty before this returns.
     """
+    from .containment import Boundary
     from .shared_mathlib import lease_fds
 
-    reader, writer = os.pipe()
+    boundary = Boundary("cache-fetch", prefix=prefix)
+    command = boundary.argv(command)
+    reader = writer = None
+    if not boundary.strong:
+        reader, writer = os.pipe()
+        command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command]
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command],
-            pass_fds=(reader, *lease_fds(env)),
+            command,
+            pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env), *boundary.pass_fds),
             cwd=cwd,
             env=env,
             stdout=output,
@@ -1136,14 +1158,20 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
             start_new_session=True,
         )
     except BaseException:
-        os.close(writer)
+        if writer is not None:
+            os.close(writer)
+        boundary.finish(None)
         raise
     finally:
-        os.close(reader)
+        boundary.launched()
+        if reader is not None:
+            os.close(reader)
+    sweep = None if boundary.strong else proc.pid
     try:
         try:
             return proc.wait(timeout=timeout)
         except BaseException:
+            sweep = None  # the group is SIGKILLed below
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGTERM)
             try:
@@ -1156,7 +1184,9 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
                 proc.wait()
             raise
     finally:
-        os.close(writer)
+        if writer is not None:
+            os.close(writer)
+        boundary.finish(getattr(proc, "returncode", None), pgid=sweep)
 
 
 def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
@@ -1189,7 +1219,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
                 output.flush()
                 try:
-                    rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
+                    rc = _cache_fetch(command, cwd, env, output, remaining, prefix=prefix)
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1987,6 +2017,7 @@ def run_in_bubble(
                 label=f"agent-{wm}",
                 provider=profile.provider,
                 cancel_event=cancel_event,
+                contain=False,  # the agent runs in Bubble's container, not on this host
             )
         else:  # review engine / probe — leave its output inline
             rc = subprocess.run(argv, env=env).returncode

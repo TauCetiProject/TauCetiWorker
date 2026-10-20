@@ -103,6 +103,7 @@ RUN_STDLIB=(
   roadmap_claims.py
   round_file_changes.py
   round_group_sweep.py
+  process_containment.py
   resources.py
   rubric_bundle.py
   safe_exists.py

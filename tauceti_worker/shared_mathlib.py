@@ -53,18 +53,10 @@ def mode(env):
 
 
 def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
-    return [
-        "bwrap",
-        "--die-with-parent",
-        "--unshare-pid",
-        "--bind",
-        "/",
-        "/",
-        "--dev-bind",
-        "/dev",
-        "/dev",
-        "--proc",
-        "/proc",
+    """The shared view is mounted in the round's one containment namespace, not a nested one."""
+    from .containment import command
+
+    return command(
         "--ro-bind",
         str(pool),
         str(pool),
@@ -75,8 +67,7 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
         str(upper),
         str(work),
         str(target),
-        "--",
-    ]
+    )
 
 
 def capability(directory=None):
