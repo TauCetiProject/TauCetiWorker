@@ -3,7 +3,7 @@
   "observed_at": "2026-10-20T03:52:33.528690+00:00",
   "implementation": {
     "branch": "issue-311",
-    "local_shared_fixture_tests": 48,
+    "local_shared_fixture_tests": 56,
     "real_overlay_available": true,
     "regressions_reproduced_before_fix": [
       "Lake config content omitted from key",
@@ -37,7 +37,15 @@
       "lease failure preserves lower and stops future sharing",
       "cleanup failure preserves paid invocation result",
       "per-worker supervisor identity and key validation",
-      "existing resource receipts retain actual storage reads and host-wide pressure deltas with explicit scope"
+      "existing resource receipts retain actual storage reads and host-wide pressure deltas with explicit scope",
+      "dependency tag fetches preserve key identity",
+      "fresh uppers prevent submodule whiteouts and private copies from shadowing lower",
+      "staging downloader does not inherit exclusive publication lease",
+      "unconfirmed staging boundary stops sharing and refuses inference",
+      "bounded lease contention falls back privately",
+      "independent safety writes preserve cleanup even on disk errors",
+      "failed namespace argument setup records not-started",
+      "live weaker worker receipt prevents activation"
     ],
     "full_local_suite": {
       "passed_scripts": 107,
@@ -46,6 +54,14 @@
         "egress.sh",
         "integration_repair_fixture.py"
       ]
+    },
+    "namespace_validation": {
+      "focused_tests_passed": 21,
+      "intermediate_failures": [
+        "namespace cleanup briefly unconfirmed during successful-exit fixture; focused repeat passed",
+        "required legacy selection suppressed by weaker-worker receipt; fixed and focused repeat passed"
+      ],
+      "uncertainty": "No natural production cleanup or isolation gate completed."
     }
   },
   "production": {

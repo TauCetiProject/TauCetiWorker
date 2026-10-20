@@ -34,12 +34,15 @@ class IntegrityFailure(Unavailable):
     pass
 
 
+LOCK_WAIT_SECONDS = 1500  # fresh extraction can take up to 1200 seconds
+
+
 def root(env=None):
     env = os.environ if env is None else env
     login = Path(pwd.getpwuid(os.getuid()).pw_dir)
     if value := env.get("TAUCETI_SHARED_MATHLIB_ROOT"):
         return (login / value[2:] if value.startswith("~/") else Path(value)).resolve()
-    return login / ".cache/tauceti/mathlib-builds"
+    return (login / ".cache/tauceti/mathlib-builds").resolve()
 
 
 def pin_root(env):
@@ -84,6 +87,23 @@ def selection(env):
                 + "; investigate before clearing safety-stop.json and restoring policy"
             )
         return "off", "shared Mathlib safety stop: " + reason
+    if value != "off":
+        if value == "required" and env.get("TAUCETI_PROCESS_CONTAINMENT") == "legacy":
+            raise Unavailable("TAUCETI_PROCESS_CONTAINMENT=legacy disables the namespace-based shared view")
+        for path in (pool / "status").glob("*.json"):
+            row = read_json(path)
+            identity = row.get("supervisor")
+            if (
+                isinstance(identity, dict)
+                and isinstance(identity.get("pid"), int)
+                and process_identity(identity["pid"]) == identity
+                and row.get("containment_mode") not in {None, "pid-namespace"}
+            ):
+                if value == "required":
+                    raise Unavailable(
+                        "live worker reports weaker containment; wait for natural cleanup or use private mode"
+                    )
+                return "off", "live worker reports weaker containment; keep sharing off until natural cleanup"
     reason = "sharing enabled"
     if value == "off":
         reason = (
@@ -194,7 +214,6 @@ def cache_context(path):
         selected=selected,
         raw_urls={name: url for name, url in raw.items() if url},
         resolved_urls=resolved,
-        tag=git(path, "name-rev", "--tags", "HEAD") if branch == "HEAD" else None,
     )
 
 
@@ -204,7 +223,6 @@ def cache_identity(context):
     return dict(
         branch=context["branch"],
         selected=context["selected"],
-        tag=context["tag"],
         remotes={
             name: hashlib.sha256(url.encode()).hexdigest() if url else None
             for name, url in context["resolved_urls"].items()
@@ -290,7 +308,7 @@ def signature(cwd, env):
     if lake_config and not lake_config.is_absolute():
         lake_config = cwd / lake_config
     spec = dict(
-        version=2,
+        version=3,
         artifacts=artifacts,
         mathlib=dependencies["mathlib"],
         dependencies=dependencies,
@@ -311,22 +329,31 @@ def signature(cwd, env):
 
 
 @contextlib.contextmanager
-def key_lock(pool, key, exclusive=True, nonblocking=False):
+def key_lock(pool, key, exclusive=True, nonblocking=False, timeout=None):
     locks = pool / "locks"
     locks.mkdir(parents=True, exist_ok=True)
     with (locks / (key + ".lock")).open("a+") as stream:
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        lease_lock(stream, flags | (fcntl.LOCK_NB if nonblocking else 0))
+        lease_lock(stream, flags | (fcntl.LOCK_NB if nonblocking else 0), timeout=timeout)
         yield stream
 
 
-def lease_lock(stream, flags):
-    try:
-        fcntl.flock(stream, flags)
-    except BlockingIOError:
-        raise
-    except OSError as error:
-        raise IntegrityFailure(f"shared Mathlib lease failure: {error}; stop sharing and investigate") from error
+def lease_lock(stream, flags, *, timeout=None):
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while True:
+        try:
+            fcntl.flock(stream, flags | (fcntl.LOCK_NB if deadline is not None else 0))
+            return
+        except BlockingIOError:
+            if deadline is None:
+                raise
+            if time.monotonic() >= deadline:
+                raise Unavailable(
+                    "shared Mathlib lock wait timed out; use private mode and inspect publisher/reader leases"
+                ) from None
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        except OSError as error:
+            raise IntegrityFailure(f"shared Mathlib lease failure: {error}; stop sharing and investigate") from error
 
 
 def remove_tree(path):
@@ -357,6 +384,15 @@ def detach_upper(upper, marker):
     upper.mkdir(parents=True, exist_ok=True)
     remove_tree(upper.with_name("tauceti-overlay-work"))
     marker.unlink(missing_ok=True)
+
+
+def upper_usage(upper):
+    try:
+        files = [path.lstat() for path in upper.rglob("*")]
+        regular = [info for info in files if stat.S_ISREG(info.st_mode)]
+        return dict(upper_files=len(regular), upper_bytes=sum(info.st_size for info in regular))
+    except OSError:
+        return dict(upper_files=None, upper_bytes=None)
 
 
 def durable_tree(path):
@@ -434,15 +470,31 @@ def ready_entry(entry, key, spec):
 
 def stop_sharing(pool, reason):
     """Stop future rounds; never disturb existing leases or immutable readers."""
-    atomic_json(pool / "safety-stop.json", dict(reason=reason, stopped_at=time.time()))
+    from .config import log
+
+    recorded = False
     try:
-        with key_lock(pool, "policy"):
+        atomic_json(pool / "safety-stop.json", dict(reason=reason, stopped_at=time.time()))
+        recorded = True
+    except OSError as error:
+        log(f"shared Mathlib SAFETY STOP receipt could not be written: {error}")
+    try:
+        with key_lock(pool, "policy", timeout=1):
             policy = read_json(pool / "policy.json")
             atomic_json(pool / "policy.json", {**policy, "mode": "off"})
-    except (OSError, IntegrityFailure):
-        from .config import log
-
-        log("shared Mathlib safety stop recorded; policy rewrite unavailable")
+            recorded = True
+    except (OSError, Unavailable) as error:
+        log(f"shared Mathlib SAFETY STOP policy could not be written: {error}")
+    if recorded:
+        try:
+            fd = os.open(pool, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as error:
+            log(f"shared Mathlib SAFETY STOP directory sync unavailable: {error}")
+    return recorded
 
 
 def discard_entry(pool, entry):
@@ -461,6 +513,14 @@ def discard_entry(pool, entry):
 
 
 def collect(pool, *, protect=(), now=None):
+    try:
+        with key_lock(pool, "gc", nonblocking=True):
+            return _collect(pool, protect=protect, now=now)
+    except BlockingIOError:
+        return []
+
+
+def _collect(pool, *, protect=(), now=None):
     """Bounded by snapshot count. Locked readers/builders are never reclaimed."""
     now = time.time() if now is None else now
     entries = pool / "entries"
@@ -474,9 +534,9 @@ def collect(pool, *, protect=(), now=None):
         key = stage.name.split("-", 1)[0]
         if key in protect or len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
             continue
-        if not stage.is_dir() or now - stage.stat().st_mtime < 4 * 3600:
-            continue
         try:
+            if not stage.is_dir() or now - stage.stat().st_mtime < 4 * 3600:
+                continue
             with key_lock(pool, key, nonblocking=True):
                 remove_tree(stage)
         except (BlockingIOError, FileNotFoundError):
@@ -626,6 +686,7 @@ def report(pool, env, **fields):
     worker = env.get("TAUCETI_WORKER_ID", "default")
     identity = hashlib.sha256(worker.encode()).hexdigest()
     from .activity import current_round_id
+    from .containment import status
 
     try:
         atomic_json(
@@ -635,6 +696,7 @@ def report(pool, env, **fields):
                 scope=env.get("TAUCETI_FLEET_MACHINE_ID", "local"),
                 round_id=current_round_id(),
                 supervisor=process_identity(os.getpid()),
+                containment_mode=status(env).mode,
                 observed_at=time.time(),
                 **fields,
             ),
@@ -705,6 +767,7 @@ def view(cwd, env, logdir, fetch):
         # sharing is enabled again at a later idle boundary.
         detach_upper(upper, marker)
         if selected != "off" and selected == "required":
+            report(pool, env, mode="blocked", reason="Mathlib dependency is not available for sharing")
             raise Unavailable("Mathlib dependency is not available for sharing")
         report(
             pool,
@@ -715,6 +778,7 @@ def view(cwd, env, logdir, fetch):
         yield []
         return
     prefix, backup, backup_created, backup_sparse = [], None, False, False
+    safety_stop_recorded = None
     with contextlib.ExitStack() as stack:
         try:
             from . import containment
@@ -723,6 +787,8 @@ def view(cwd, env, logdir, fetch):
             if containment.policy(env) == "legacy":
                 # The view is itself a PID namespace; the rollback must not keep using one.
                 raise Unavailable(f"{containment.POLICY_ENV}=legacy disables the namespace-based shared view")
+            if not containment.capability(env, fresh=True).strong:
+                raise Unavailable("strong process containment is unavailable; keep sharing off and use private builds")
             pool.mkdir(parents=True, exist_ok=True, mode=0o700)
             ok, reason = capability(pool)
             if not ok:
@@ -731,8 +797,7 @@ def view(cwd, env, logdir, fetch):
                 raise Unavailable(reason)
             key, spec = signature(cwd, env)
             report(pool, env, mode="preparing", key=key)
-            lease = stack.enter_context(key_lock(pool, key, exclusive=False))
-            env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = str(lease.fileno())
+            lease = stack.enter_context(key_lock(pool, key, exclusive=False, timeout=LOCK_WAIT_SECONDS))
             entry = pool / "entries" / key
             hit = ready_entry(entry, key, spec)
             if hit:
@@ -741,20 +806,22 @@ def view(cwd, env, logdir, fetch):
                 # Serialize publishers separately: a waiting first user must not
                 # wait for the winner's entire paid round to release its lease.
                 lease_lock(lease, fcntl.LOCK_UN)
-                with key_lock(pool, key + "-publisher"):
-                    lease_lock(lease, fcntl.LOCK_SH)
+                with key_lock(pool, key + "-publisher", timeout=LOCK_WAIT_SECONDS):
+                    lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
                     hit = ready_entry(entry, key, spec)
                     if not hit:
                         lease_lock(lease, fcntl.LOCK_UN)
-                        lease_lock(lease, fcntl.LOCK_EX)
+                        lease_lock(lease, fcntl.LOCK_EX, timeout=LOCK_WAIT_SECONDS)
                         entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
-                        lease_lock(lease, fcntl.LOCK_SH)
+                        lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
             upper.parent.mkdir(parents=True, exist_ok=True)
             ok, reason = capability(upper.parent)
             if not ok:
                 if reason.startswith("isolation failure"):
                     raise IntegrityFailure(reason)
                 raise Unavailable(reason)
+            # Prior copies and whiteouts must not shadow the lower next round.
+            detach_upper(upper, marker)
             old = read_json(marker)
             backup = upper.with_name("build-before-sharing")
             work = upper.with_name("tauceti-overlay-work")
@@ -771,26 +838,17 @@ def view(cwd, env, logdir, fetch):
                 atomic_json(marker, dict(key=key, activated_at=time.time()))
             work.mkdir(exist_ok=True)
             candidate = overlay_command(entry / "build", upper, work, upper, pool, lease_fd=lease.fileno())
-            for attempt in range(2):
-                probe = subprocess.run(
-                    candidate + ["sh", "-c", 'test -f "$1/lib/lean/Mathlib.olean" || exit 42', "sh", str(upper)],
-                    capture_output=True,
-                    timeout=15,
-                    pass_fds=(lease.fileno(),),
-                )
-                if probe.returncode == 0:
-                    break
-                if probe.returncode == 42 and old.get("key") == key and attempt == 0:
-                    # A previous agent may have cleaned an output, leaving a
-                    # legitimate whiteout. Retry preparation with an empty upper.
-                    detach_upper(upper, marker)
-                    work.mkdir(exist_ok=True)
-                    atomic_json(marker, dict(key=key, activated_at=time.time()))
-                    continue
-                if probe.returncode == 42:
-                    raise IntegrityFailure("verified lower missing through fresh overlay; stop sharing and investigate")
+            probe = subprocess.run(
+                candidate + ["sh", "-c", 'test -f "$1/lib/lean/Mathlib.olean" || exit 42', "sh", str(upper)],
+                capture_output=True,
+                timeout=15,
+                pass_fds=(lease.fileno(),),
+            )
+            if probe.returncode == 42:
+                raise IntegrityFailure("verified lower missing through fresh overlay; stop sharing and investigate")
+            if probe.returncode:
                 raise Unavailable("shared Mathlib view unavailable: " + probe.stderr.decode(errors="replace")[-300:])
-            lease_lock(lease, fcntl.LOCK_SH)
+            lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
             prefix = candidate
             env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = str(lease.fileno())
             env["TAUCETI_SHARED_MATHLIB_KEY"] = key
@@ -798,9 +856,15 @@ def view(cwd, env, logdir, fetch):
             report(
                 pool, env, mode="overlay-ready", key=key, cache_hit=hit, preparation_seconds=time.monotonic() - started
             )
-        except (Unavailable, OSError, ValueError, subprocess.TimeoutExpired) as error:
-            if isinstance(error, IntegrityFailure):
-                stop_sharing(pool, str(error))
+        except (
+            Unavailable,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+            containment.ContainmentUnconfirmed,
+        ) as error:
+            if isinstance(error, (IntegrityFailure, containment.ContainmentUnconfirmed)):
+                safety_stop_recorded = stop_sharing(pool, str(error))
             if backup_created and backup and backup.exists():
                 remove_tree(upper)
                 if backup_sparse:
@@ -813,14 +877,19 @@ def view(cwd, env, logdir, fetch):
             report(
                 pool,
                 env,
-                mode="blocked" if selected == "required" else "private",
+                mode="blocked"
+                if selected == "required" or isinstance(error, containment.ContainmentUnconfirmed)
+                else "private",
                 reason=str(error),
                 preparation_seconds=time.monotonic() - started,
+                safety_stop_recorded=safety_stop_recorded,
             )
             stack.close()
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
+            if isinstance(error, containment.ContainmentUnconfirmed):
+                raise
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []
@@ -832,7 +901,9 @@ def view(cwd, env, logdir, fetch):
         except BaseException as error:
             body_error = type(error).__name__
             if prefix and isinstance(error, containment.ContainmentUnconfirmed):
-                stop_sharing(pool, "shared namespace cleanup unconfirmed; preserve active leases and investigate")
+                safety_stop_recorded = stop_sharing(
+                    pool, "shared namespace cleanup unconfirmed; preserve active leases and investigate"
+                )
             raise
         finally:
             if prefix:
@@ -844,10 +915,11 @@ def view(cwd, env, logdir, fetch):
                 stack.close()
                 from . import activity, containment
 
-                empty = containment.confirmed_empty(activity.current_round_id())
-                if activity.current_round_id() is not None and not empty:
-                    stop_sharing(
-                        pool, "shared round boundaries not confirmed empty; preserve active leases and investigate"
+                round_id = activity.current_round_id()
+                empty = containment.confirmed_empty(round_id) if round_id is not None else None
+                if containment.cleanup_unconfirmed(round_id):
+                    safety_stop_recorded = stop_sharing(
+                        pool, "shared round namespace cleanup unconfirmed; preserve active leases and investigate"
                     )
                 record_result(
                     env,
@@ -857,7 +929,11 @@ def view(cwd, env, logdir, fetch):
                     body_error=body_error,
                     cleanup_error=cleanup_error,
                     boundaries_confirmed_empty=empty,
-                    cleanup_success=body_error is None and cleanup_error is None and empty,
+                    cleanup_success=(body_error is None and cleanup_error is None and empty)
+                    if empty is not None
+                    else None,
+                    safety_stop_recorded=safety_stop_recorded,
+                    **upper_usage(upper),
                 )
                 previous = read_json(
                     pool
@@ -870,7 +946,9 @@ def view(cwd, env, logdir, fetch):
                         env,
                         mode="blocked" if cleanup_error else "idle",
                         key=env["TAUCETI_SHARED_MATHLIB_KEY"],
-                        reason=cleanup_error or "shared view released; awaiting next natural round",
+                        reason=cleanup_error
+                        or read_json(pool / "safety-stop.json").get("reason")
+                        or "shared view released; awaiting next natural round",
                         preparation_seconds=previous.get("preparation_seconds", 0),
                         cache_hit=previous.get("cache_hit", False),
                     )

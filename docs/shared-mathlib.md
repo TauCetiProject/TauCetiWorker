@@ -28,8 +28,10 @@ back to ordinary private cache warming; required mode pauses before inference.
 The key includes pinned dependency revisions, the Mathlib manifest, the root Lake
 configuration and manifest, Lean toolchain and ABI, architecture and platform,
 resolved toolchain location and Init artifact digest, external `LAKE_CONFIG` content,
-and the dependency Git remote/branch/tag and environment context that select Mathlib artifact caches.
-The downstream project branch/fork does not split snapshots across PRs.
+and the dependency Git remote/branch and environment context that select Mathlib artifact caches.
+The downstream project branch/fork and fetched tag descriptions do not split
+snapshots. Mathlib selects its cache by the dependency remote/tracking context,
+not by `name-rev` tag descriptions.
 Temporary config filenames and per-worker download directories do not split keys;
 cache-selection values are hashed to avoid persisting endpoint credentials.
 Remote URLs are hashed in published metadata; credentials are not copied there.
@@ -50,6 +52,9 @@ forcing future auto rounds off even with an environment auto override. Required
 mode fails explicitly. A policy rewrite or expiry cannot clear the latch.
 Investigate, then explicitly remove the stop file and restore the intended policy
 mode; stopping also writes policy mode off for compatibility with older releases.
+Both writes are attempted independently, followed by a directory sync. Failures
+are logged explicitly and recorded when possible; inability to persist the stop
+never replaces a paid outcome or prevents upper restoration.
 
 Each agent runs inside rootless bubblewrap mount and PID namespaces; this view is the
 same boundary as [process containment](process-containment.md), not a second one nested
@@ -57,7 +62,7 @@ around it. The published pool
 is read-only in all supported containment namespaces, including private agents,
 cache fetches and verification tools. Trusted publication alone gets a writable
 bind of its fresh staging project inside that pool. OverlayFS combines the shared Mathlib lower with that worker's
-persistent private upper; in-place writes copy up. The entire coding process and
+fresh private upper per round; in-place writes copy up. The entire coding process and
 its tools see this view. Networking, credentials and the existing cancellation
 lifecycle are retained. This is build storage isolation, not an additional security
 boundary for untrusted code. Processes outside these namespaces (including legacy
@@ -67,25 +72,31 @@ with such writers; do not terminate paid agents to establish this condition.
 Lower file modes permit private copy-up writes; changing them to read-only would
 also prohibit ordinary upper writes through OverlayFS.
 
-At an idle round boundary, first activation or a key change moves the previous
-private Mathlib build aside and starts with an empty upper. Duplicate old artifacts
-therefore cannot shadow the shared lower. The backup survives failed activation;
+At every idle round boundary, the previous shared delta moves aside and a fresh
+empty upper starts, so old extracted copies, whiteouts and opaque directories
+cannot shadow the shared lower. First activation also moves the previous private
+Mathlib build aside. The backup survives failed activation;
 it is removed after a successful invocation. Toolchain/dependency changes made by
 an agent affect private files; the following round selects a new key. Disabling
 sharing moves the sparse private delta aside, starts an empty private build, and
 reconstructs outputs through normal cache preparation. Sparse deltas and whiteouts
 are never reused outside their overlay. Cache warming still runs inside the view
-to prepare other dependencies, skipping already verified Mathlib outputs. If an
-old upper hides a required output with a whiteout, preparation moves the delta
-aside and retries once with an empty upper. A bwrap setup failure uses private
-fallback; a verified artifact still missing through a fresh overlay stops sharing.
+to prepare other dependencies, skipping already verified Mathlib outputs. A bwrap
+setup failure uses private fallback; a verified artifact missing through the fresh
+overlay stops sharing.
 
 Running readers hold shared leases; the sandbox also retains the lease descriptor
-so collection cannot race a surviving process. Cleanup removes unused snapshots
+so collection cannot race a surviving process. Trusted staging downloaders never
+inherit the exclusive publication lease; only completed shared views pass reader
+leases to children. A preparation namespace with unconfirmed cleanup stops future
+sharing and refuses inference. Lock waits are bounded to 25 minutes (the normal
+extraction timeout is 20 minutes), then auto falls back privately and required
+mode fails with an actionable reason. Cleanup removes unused snapshots
 after seven days, or oldest unused snapshots under disk pressure, until at least
 10% disk space is free. Leased entries are skipped. An unused entry moves atomically
 to a synced trash directory before deletion; interrupted deletion cannot leave a
-partial lower in the published namespace. Subsequent collection reclaims trash. Unlocked staging trees left by killed builders are
+partial lower in the published namespace. A pool-level collector lock serializes
+trash reclamation and entry selection. Subsequent collection reclaims trash. Unlocked staging trees left by killed builders are
 reclaimed after four hours, before useful snapshots are evicted for disk pressure. Publication refuses to leave
 less than 10% free if no unused entries can be reclaimed.
 
@@ -102,6 +113,10 @@ and backup-removal errors, retained backups, and the existing containment proof;
 a successful invocation does not imply successful cleanup. Backup-removal errors
 preserve the paid invocation result. Supervisor PID/start/boot identity prevents
 stale per-worker preparation from counting another worker's lease as its own.
+Receipts include upper file count/bytes, stop-write outcome and nullable boundary
+proof outside native rounds. New shared rounds require a fresh strong namespace
+probe and refuse sharing while a live worker receipt reports weaker containment.
+Unregistered and pre-deployment writers still require operator verification.
 
 Existing `resources.jsonl` round receipts now include `read_bytes` deltas from
 `/proc/self/io` for the supervisor and reaped children, and host-wide CPU, memory

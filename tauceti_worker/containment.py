@@ -48,14 +48,17 @@ LEGACY_NOTE = (
 )
 
 
-def command(*extra: str, env=None) -> list[str]:
+def command(*extra: str, env=None, protect_pool=True) -> list[str]:
     """The bwrap prefix for one boundary. `extra` adds mounts (the shared Mathlib overlay) to the
     same namespace. The snapshot pool is read-only even for private agents; the remaining host
     filesystem, /dev and network stay as they were."""
     from .shared_mathlib import root
 
-    pool = root(env)
-    pool.mkdir(parents=True, exist_ok=True, mode=0o700)
+    mounts = []
+    if protect_pool:
+        pool = root(env)
+        pool.mkdir(parents=True, exist_ok=True, mode=0o700)
+        mounts = ["--ro-bind", str(pool), str(pool)]
     return [
         "bwrap",
         "--die-with-parent",
@@ -68,9 +71,7 @@ def command(*extra: str, env=None) -> list[str]:
         "/dev",
         "--proc",
         "/proc",
-        "--ro-bind",
-        str(pool),
-        str(pool),
+        *mounts,
         *extra,
         "--",
     ]
@@ -83,7 +84,9 @@ def probe() -> tuple[bool, str]:
     if not shutil.which("bwrap"):
         return False, "bubblewrap (bwrap) is not on PATH"
     try:
-        p = subprocess.run(command() + ["readlink", "/proc/self/ns/pid"], capture_output=True, text=True, timeout=10)
+        p = subprocess.run(
+            command(protect_pool=False) + ["readlink", "/proc/self/ns/pid"], capture_output=True, text=True, timeout=10
+        )
         outer = os.readlink("/proc/self/ns/pid")
         inner = p.stdout.strip()
     except Exception as error:  # a broken probe means no containment, never a crashed round
@@ -254,11 +257,15 @@ class Boundary:
     def argv(self, argv) -> list[str]:
         if not self.strong:
             return list(argv)
-        base = self.prefix or command(env=self.env)
-        if base[0] != "bwrap":
-            raise ValueError("containment prefix must be a bwrap command")
-        self._info_r, self._info_w = os.pipe()
-        return [base[0], "--info-fd", str(self._info_w), *base[1:], *argv]
+        try:
+            base = self.prefix or command(env=self.env)
+            if base[0] != "bwrap":
+                raise ValueError("containment prefix must be a bwrap command")
+            self._info_r, self._info_w = os.pipe()
+            return [base[0], "--info-fd", str(self._info_w), *base[1:], *argv]
+        except BaseException:
+            self.finish(None)
+            raise
 
     @property
     def pass_fds(self) -> tuple[int, ...]:
@@ -456,6 +463,10 @@ def confirmed_empty(round_id: str | None) -> bool:
     """Whether all recorded boundaries so far have a proven namespace cleanup."""
     outcomes = list(_boundaries.get(round_id, {}).values())
     return bool(outcomes) and all(o is not None and o[0] == NAMESPACE and o[1] in PROVEN for o in outcomes)
+
+
+def cleanup_unconfirmed(round_id: str | None) -> bool:
+    return any(o is not None and o[1] == "namespace-unconfirmed" for o in _boundaries.get(round_id, {}).values())
 
 
 def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str | None = None) -> None:
