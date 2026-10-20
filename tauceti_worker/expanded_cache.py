@@ -311,16 +311,21 @@ def expand(download, private, cwd, env, pool, report):
                     report["expanded"] += 1
 
 
-def transfer(download, private):
+def transfer(download, private, seeded=()):
     """Preserve downloads on unsupported toolchains, without linking mutable metadata."""
     try:
         wanted = {name for _, name in entries(download)}
+        for mapping in (download / "outputs/TauCeti").glob("*.json"):
+            data = read_json(mapping).get("data")
+            if isinstance(data, dict):
+                with contextlib.suppress(ValueError):
+                    wanted.update(descriptions(data))
         for directory in ("artifacts", "outputs", "revisions"):
             for source in (download / directory).rglob("*"):
                 if source.is_file() and not source.is_symlink():
                     target = private / directory / source.relative_to(download / directory)
                     if directory == "artifacts":
-                        if source.name in wanted:
+                        if source.name in wanted or source.name not in seeded:
                             link(source, target)
                     else:
                         if directory == "outputs" and isinstance(read_json(target).get("data"), dict):
@@ -366,11 +371,13 @@ def preparation(cwd, env, *, refetch=None):
         download = Path(tmp)
         # Pool contains only previously verified CI artifacts; private .ltars are also
         # candidates, but the native verifier checks their hash before publication.
+        seeded = set()
         try:
             for source in (pool / "archives", private / "artifacts"):
                 for path in source.glob("*.ltar"):
                     if ARTIFACT.fullmatch(path.name) and not path.is_symlink():
                         link(path, download / "artifacts" / path.name)
+                        seeded.add(path.name)
             # Reuse only the host-owned immutable revision maps, never agent-created metadata.
             revisions = pool / "revisions/TauCeti"
             recent = sorted(revisions.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:64]
@@ -388,7 +395,7 @@ def preparation(cwd, env, *, refetch=None):
         finally:
             # Even failed/unsupported expansion retains the ordinary verified downloads.
             # Copy mutable metadata, never hard-link it to something Lake may rewrite.
-            transfer(download, private)
+            transfer(download, private, seeded)
             if ready:
                 with contextlib.suppress(OSError):
                     for path in (download / "revisions/TauCeti").glob("*.jsonl"):
@@ -410,7 +417,7 @@ def preparation(cwd, env, *, refetch=None):
                         (private / "artifacts" / error.name).unlink(missing_ok=True)
                         if refetch is not None:
                             refetch(warm_env)
-                            transfer(download, private)
+                            transfer(download, private, seeded)
                             expand(download, private, cwd, warm_env, pool, report)
                 except Exception as error:
                     # Sharing is an optimization; report its failure without spending a
