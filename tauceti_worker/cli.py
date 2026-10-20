@@ -596,10 +596,10 @@ def build_parser() -> argparse.ArgumentParser:
     recovery.add_argument("--worker-id", dest="worker_id", default=None)
     recovery.add_argument("--json", action="store_true")
 
-    cleanup = sub.add_parser("cleanup", help="expire three-day-old generated worker data; local only")
+    cleanup = sub.add_parser("cleanup", help="reclaim disposable caches and expired diagnostics; local only")
     cleanup_mode = cleanup.add_mutually_exclusive_group()
     cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
-    cleanup_mode.add_argument("--install-timer", action="store_true", help="install daily systemd user cleanup")
+    cleanup_mode.add_argument("--install-timer", action="store_true", help="install hourly systemd user cleanup")
 
     w = sub.add_parser(
         "work",

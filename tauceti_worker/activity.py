@@ -654,7 +654,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
                 _refresh_prs(db, config, now, errors)
                 _bors(db, errors)
-            from . import shared_mathlib, work_recovery
+            from . import expanded_cache, shared_mathlib, work_recovery
 
             try:
                 work_recovery.housekeep()
@@ -665,6 +665,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             value["all"]["shared_mathlib"] = sharing
             value["all"]["work_recovery"] = work_recovery.summary()
             value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
+            value["all"]["expanded_cache"] = expanded_cache.summary()
             for column, key in (("worker", "workers"), ("scope", "groups")):
                 ids = db.execute(
                     f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
@@ -681,6 +682,10 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                         else {row[0]}
                     )
                     value[key][row[0]]["work_recovery"] = work_recovery.summary(workers=members)
+                    if key == "groups":
+                        # Storage belongs to the host, not to the accounting worker window.
+                        value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]
+                        value[key][row[0]]["expanded_cache"] = value["all"]["expanded_cache"]
                     atomic_json(
                         scope_path(key, row[0]), dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors)
                     )

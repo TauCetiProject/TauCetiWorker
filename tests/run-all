@@ -22,6 +22,8 @@ FAIL_FAST=0
 TAUCETI_ACTIVITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-activity-XXXXXX")"
 TAUCETI_FLEET_EVENTS="$TAUCETI_ACTIVITY_DIR/worker-events.jsonl"
 TAUCETI_SHARED_MATHLIB_ROOT="$TAUCETI_ACTIVITY_DIR/mathlib-builds"
+TAUCETI_BUILD_CACHE_ROOT="$TAUCETI_ACTIVITY_DIR/builds"
+export TAUCETI_BUILD_CACHE_ROOT
 export TAUCETI_ACTIVITY_DIR TAUCETI_FLEET_EVENTS TAUCETI_SHARED_MATHLIB_ROOT
 trap 'rm -rf "$TAUCETI_ACTIVITY_DIR"' EXIT
 
@@ -33,6 +35,8 @@ RUN_STDLIB=(
   budget_recovery.py
   usage_accounting.py
   usage_supervisor.py
+  expanded_cache.py
+  cache_storage.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py

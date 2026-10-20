@@ -80,6 +80,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     env = {
         "PATH": f"{root}:{os.environ['PATH']}",
         "CACHE_TEST_CALLS": str(calls),
+        "TAUCETI_SHARED_ARTIFACTS": "0",
         "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
         "LAKE_CACHE_DIR": str(root / "private-lake-store"),
         "LAKE_ARTIFACT_CACHE": "1",
@@ -248,6 +249,36 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert worker.counters.read(key) == 0
     assert worker.counters.read("infra-fix-ci-1434") == 99
     print("[OK] fix checkout precedes warming; even an exhausted provider-refund allowance cannot charge cache outages")
+
+    # The owned Mathlib archive pool must not resurrect stale private links forever.
+    from tauceti_worker import cache_storage
+
+    owned = root / "owned-cache"
+    cache_storage.initialize(owned)
+    isolated = root / "isolated"
+    mathlib = isolated / ".cache/mathlib"
+    mathlib.mkdir(parents=True)
+    (mathlib / ("a" * 16 + ".ltar")).write_bytes(b"current-tree-archive")
+
+    @contextlib.contextmanager
+    def private_preparation(cwd, warm_env, **kwargs):
+        yield warm_env
+
+    with patch("tauceti_worker.expanded_cache.preparation", private_preparation):
+        overrides = dict(
+            TAUCETI_SHARED_ARTIFACTS="1",
+            TAUCETI_BUILD_CACHE_ROOT=str(owned),
+            HOME=str(isolated),
+            MATHLIB_CACHE_DIR=str(mathlib),
+        )
+        rc, records, text = run(**overrides)
+        assert rc == 0, text
+        assert sum(r["args"] == ["exe", "cache", "clean"] for r in records) == 1
+        assert (owned / "mathlib" / ("a" * 16 + ".ltar")).exists()
+        rc, records, text = run(**overrides)
+        assert rc == 0, text
+        assert not any(r["args"] == ["exe", "cache", "clean"] for r in records)
+    print("[OK] Mathlib prunes stale private archive links once daily and records current-tree pool reuse")
 
     waits = []
     signals = []

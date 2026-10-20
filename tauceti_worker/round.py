@@ -57,10 +57,6 @@ class RoundContext:
                 f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
             ) from None
         self._fd = fd
-        if self.record_activity:
-            from .activity import Round
-
-            self.activity = Round(self.cfg.wid)
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
@@ -75,6 +71,17 @@ class RoundContext:
                     log(f"retention: recycled {result.get('removed_count', len(result['removed']))} generated paths")
             except Exception as error:
                 log(f"retention: cache recycling deferred: {error}")
+        if self.record_activity:
+            from .cache_storage import admit
+
+            try:
+                admit(self.cfg)
+            except BaseException:
+                self._cleanup()
+                raise
+            from .activity import Round
+
+            self.activity = Round(self.cfg.wid)
         # Register first: LIFO cleanup records resources after claim/build teardown.
         try:
             from .resources import RoundResources

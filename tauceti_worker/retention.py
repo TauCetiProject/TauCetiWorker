@@ -269,7 +269,26 @@ def recycle(cfg, *, now=None, dry=False):
     ]
     pending = [(path, root) for path, root in pending if path.exists() and safe(path, root)]
     valid = isinstance(born, (float, int)) and math.isfinite(born)
-    if valid and now - born < LIFETIME and not pending:
+    from .activity import root as activity_root
+
+    request = read_json(activity_root() / "cache-pressure.json")
+    devices = {str(cfg.state.stat().st_dev)}
+    with contextlib.suppress(OSError):
+        devices.add(str(cfg.checkout.stat().st_dev))
+    applicable = (not request.get("devices") or bool(devices.intersection(request["devices"]))) and (
+        "workers" not in request or cfg.wid in request["workers"]
+    )
+    last_pressure = row.get("last_pressure_at", 0)
+    critical = False
+    for location in (cfg.state, cfg.checkout):
+        while not location.exists():
+            location = location.parent
+        usage = shutil.disk_usage(location)
+        critical = critical or usage.free / usage.total < 0.05
+    forced = (
+        applicable and request.get("until", 0) > now and (not valid or request.get("requested_at", 0) > last_pressure)
+    ) or (critical and (not valid or now - last_pressure > 300))
+    if valid and not forced and now - born < LIFETIME and not pending:
         return report
     with contextlib.ExitStack() as stack:
         # Independent verification continuations may outlive the inference round. Their existing
@@ -291,23 +310,35 @@ def recycle(cfg, *, now=None, dry=False):
                 note(report, "protected", str(path))
             else:
                 remove(path, root, report, dry=dry)
-        if not valid:
+        if not valid and not forced:
             if not dry:
                 try:
                     atomic_json(marker, dict(started_at=now))
                 except OSError as error:
                     note(report, "errors", str(error))
             return report
-        if now - born < LIFETIME:
+        if not forced and now - born < LIFETIME:
             return report
         cache_result = fresh_report(now)
-        evict_workspace(cfg, cache_result, dry=dry)
+        private_only = forced and not critical and valid and now - born < LIFETIME
+        if private_only:
+            # Drop old private artifact-store references, retaining the warm build tree.
+            for path, anchor in cache_roots(cfg):
+                remove(path, anchor, cache_result, dry=dry)
+        else:
+            evict_workspace(cfg, cache_result, dry=dry)
         merge_report(report, cache_result)
     # A blocked candidate must not keep every other cache in an expired generation. Renamed
     # deletions retry independently; paths still in use can wait for the next generation boundary.
     if not dry:
         try:
-            atomic_json(marker, dict(started_at=now))
+            atomic_json(
+                marker,
+                dict(
+                    started_at=born if private_only else now,
+                    last_pressure_at=now if forced else row.get("last_pressure_at", 0),
+                ),
+            )
         except OSError as error:
             note(report, "errors", str(error))
     return report
@@ -371,6 +402,22 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     opened = open_files()
     mounts = mount_points()
     configs = list(worker_configs())
+    if not diagnostics_only:
+        from .cache_storage import collect
+
+        try:
+            storage = collect(configs, dry=dry, now=now, opened=opened)
+            merge_report(report, storage)
+            report.update(
+                {
+                    key: value
+                    for key, value in storage.items()
+                    if key
+                    not in ("at", "removed", "protected", "errors", "removed_count", "protected_count", "errors_count")
+                }
+            )
+        except (OSError, ValueError) as error:
+            note(report, "errors", f"shared cache cleanup: {error}")
     for cfg in configs:
         try:
             if not safe(cfg.state, cfg.state.parent):
@@ -479,6 +526,29 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     return report
 
 
+def request_cleanup():
+    """Ask the installed project collector to run asynchronously, without a disk scan."""
+    from .activity import root
+
+    directory = root()
+    try:
+        if not read_json(directory / "cleanup-service.json").get("installed"):
+            return  # Do not invoke a global unit for an uninstalled/isolated project.
+        with locked(directory / "cleanup-request.lock"):
+            marker = directory / "cleanup-request.json"
+            if time.time() - read_json(marker).get("at", 0) < 300:
+                return
+            atomic_json(marker, dict(at=time.time()))
+            subprocess.run(
+                ["systemctl", "--user", "start", "--no-block", "tauceti-cleanup.service"],
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass  # The hourly collector remains independent of ordinary worker progress.
+
+
 def pressure_cleanup():
     """Preparation invokes this only after a concrete ENOSPC; never touches its active workspace."""
     try:
@@ -501,7 +571,7 @@ def install_timer():
     from .worker_manager import _service_path, _systemd_quote
 
     if sys.platform != "linux":
-        raise Die("the daily cleanup timer requires Linux with systemd user services")
+        raise Die("the hourly cleanup timer requires Linux with systemd user services")
     pin_root()
     directory = _service_path().parent
     directory.mkdir(parents=True, exist_ok=True)
@@ -523,6 +593,8 @@ def install_timer():
             "TAUCETI_WORKERS_STATE_DIR",
             "XDG_STATE_HOME",
             "PATH",
+            "TAUCETI_BUILD_CACHE_ROOT",
+            "TAUCETI_CACHE_MAX_GIB",
         }
     )
     (directory / "tauceti-cleanup.service").write_text(
@@ -530,8 +602,8 @@ def install_timer():
         "IOSchedulingClass=idle\nExecStart=" + " ".join(map(quote, self_argv("cleanup"))) + "\n" + extra
     )
     (directory / "tauceti-cleanup.timer").write_text(
-        "[Unit]\nDescription=Daily TauCeti cleanup\n[Timer]\nOnCalendar=daily\nPersistent=true\n"
-        "RandomizedDelaySec=30m\n[Install]\nWantedBy=timers.target\n"
+        "[Unit]\nDescription=Hourly TauCeti cleanup\n[Timer]\nOnCalendar=hourly\nPersistent=true\n"
+        "RandomizedDelaySec=5m\n[Install]\nWantedBy=timers.target\n"
     )
     for argv in (
         ["systemctl", "--user", "daemon-reload"],
@@ -542,6 +614,9 @@ def install_timer():
         except subprocess.CalledProcessError as error:
             detail = (error.stderr or b"").decode(errors="replace").strip()
             raise Die(f"cleanup timer installation failed: {detail or error}") from None
+    from .activity import root
+
+    atomic_json(root() / "cleanup-service.json", dict(installed=True))
 
 
 def cmd_cleanup(args):
