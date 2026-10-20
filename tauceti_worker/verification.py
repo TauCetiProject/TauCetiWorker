@@ -391,7 +391,7 @@ class Verification:
     def watch(self):
         self.check_deadline()
         if self.storage_monitor is not None:
-            self.storage_monitor.check()
+            self.storage_monitor.check(resources=not self.at_boundary)
         if self.watched and time.monotonic() - self.last_watch >= 2:
             self.last_watch = time.monotonic()
             if stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names:
@@ -833,6 +833,11 @@ class Verification:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason="preparation")
         finally:
             self.receipt["ended_at"] = time.time()
+            if self.storage_monitor is not None:
+                try:
+                    self.storage_monitor.settle_idle()
+                except (OSError, Pressure) as error:
+                    self.progress(f"verification storage accounting deferred: {error}")
             # Retain the legacy field for readers; local checks no longer import an environment.
             self.receipt["audit_phase_timings"] = []
             for phase in self.receipt["phases"].values():

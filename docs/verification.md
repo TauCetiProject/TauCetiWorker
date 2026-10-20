@@ -177,18 +177,21 @@ Default settings (positive integers except the percentage, which permits zero):
 | `TAUCETI_VERIFY_STORAGE_DIR` | Host-local state directory | Explicit shared accounting root; use private state for tests |
 
 Workers sharing an accounting root should receive the same limits. The checkpoint pool is inside
-the total allowance; its default scales down for small configured budgets, leaving room for one
-running candidate. A historical candidate backlog therefore cannot consume checkpoint capacity. Reservations count logical
+the total allowance; its default scales down for small configured budgets. Configuration must leave
+room for one running candidate plus the checkpoint pool. A historical candidate backlog therefore cannot consume checkpoint capacity. Reservations count logical
 bytes, including reflinked data. Completed snapshots and checkpoints immediately reduce their
 reservation to measured size, with a 16 KiB accounting floor; they do not retain a whole 32 GiB or
 256 MiB allowance. Starting candidate tools reserves possible growth again. Free-space admission
-counts only unwritten growth on the target filesystem, rather than counting already-written bytes
-twice. If a warm snapshot cannot fit, preservation retries without generated Lake builds under the
-smaller source allowance. Source copies that cannot fit return incomplete while leaving the original
+counts only live, unwritten growth on the target filesystem, rather than counting already-written bytes
+twice. Every quiescent completion, including interruption/failure, releases unused growth reservations.
+If a warm snapshot exceeds its item limit, preservation retries without generated Lake builds under
+the full candidate allowance. Transient host capacity exhaustion instead tries the smaller source
+allowance; exhausting that fallback remains transient pressure rather than a permanent item failure.
+Source copies that cannot fit return incomplete while leaving the original
 workspace intact. Checkpoint archive writes have an explicit byte bound; failures retain partial
 source payloads and release unused reservations. Per-item overflow returns `storage-limit`, with
 limit/input guidance; an isolated oversized job stays dormant until limits or verifier inputs
-change. It does not relaunch an unchanged oversized verifier every minute. Invalid settings defer
+change. Exhausting the protected checkpoint pool requests archival or a budget adjustment. It does not relaunch an unchanged oversized verifier every minute. Invalid settings defer
 continuations without retiring jobs or charging an attempt.
 
 Shallow discovery accounts for historical directories and candidates written by older runtimes.
@@ -205,7 +208,7 @@ process-reference observation has its separate two-second bound, so it cannot re
 the deletion allowance. Prepared metrics report that overhead and total wall time separately. Recursive removal
 has a durable cursor. Read-only inventory resumes within a long-lived collector and restarts safely
 after process death. Read-only inventories retain no directory descriptors between ticks that
-could masquerade as live workspace users. Collection rotates, prioritizes terminal candidates, skips already-compacted
+could masquerade as live workspace users. Collection rotates fairly across candidates, skips already-compacted
 rows, and never follows symlinks or crosses observed mounts. Job/receipt/workspace flocks and live
 process references protect active work. Missing ownership or mount observations withhold that tree.
 
@@ -220,7 +223,11 @@ intact. Failed copies carry a durable construction marker until isolated ownersh
 exceptions remove their partial files/reservations, and a process death leaves bounded mechanical
 cleanup. A direct invocation claims its workspace before such disposal is permitted. Removed
 artifacts also release their accounting, including when an entire worker was archived. A cache-generation token invalidates receipt reuse after output eviction without historical
-receipt scans. Cleanup errors, including ENOSPC, remain retryable and cannot terminate the supervisor.
+receipt scans. Cleanup errors remain retryable and cannot terminate the supervisor. If ENOSPC prevents
+writing cleanup intent, the collector may discard the optional V2 stat-hash cache under its writer
+lock, then retry journaling and cache reclamation once. This can require a cold hash on the next
+verification; ordinary warm operation retains the cache and receipt index. No source, checkpoint,
+receipt or publication metadata is sacrificed for this emergency reserve.
 
 Retained source and protected dependency builds still count against the allowance. No unpublished
 source expires merely because it is old. If these protected bytes exhaust the budget, prepared

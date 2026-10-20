@@ -8,6 +8,7 @@ a hard write quota, so running tools additionally observe free space and increme
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -63,9 +64,9 @@ def setting(name, default):
 
 
 def checkpoint_pool():
-    total, running = setting("STORAGE_BYTES", 128 * GIB), setting("CANDIDATE_BYTES", 32 * GIB)
+    total = setting("STORAGE_BYTES", 128 * GIB)
     # Reserve a small part of the total for source preservation during legacy migration.
-    default = min(GIB, total // 128, max(0, total - running))
+    default = min(GIB, max(FLOOR, total // 128))
     return (
         setting("CHECKPOINT_POOL_BYTES", default) if "TAUCETI_VERIFY_CHECKPOINT_POOL_BYTES" in os.environ else default
     )
@@ -83,7 +84,12 @@ def validate_settings():
         ("IDLE_CACHE_SECONDS", 86400),
     ):
         setting(name, default)
-    checkpoint_pool()
+    pool = checkpoint_pool()
+    if (
+        pool >= setting("STORAGE_BYTES", 128 * GIB)
+        or setting("CANDIDATE_BYTES", 32 * GIB) > setting("STORAGE_BYTES", 128 * GIB) - pool
+    ):
+        raise Configuration("verification storage must fit one candidate plus the protected checkpoint pool")
     try:
         percent = int(os.environ.get("TAUCETI_VERIFY_MIN_FREE_PERCENT", "10"))
     except ValueError:
@@ -281,12 +287,19 @@ def discover_family(state):
     for sibling in base.iterdir():
         if sibling.is_symlink() or not sibling.is_dir():
             continue
-        discover(sibling)
-        discover(sibling / "verification-state")
+        for member in (sibling, sibling / "verification-state"):
+            if member.resolve() == state.resolve():
+                discover(member)
+            else:
+                try:
+                    discover(member)
+                except (OSError, ValueError):
+                    continue  # Unsupported sibling aliases never retire this worker's job.
 
 
 def reserve(state, identifier, *, source_only=False):
     """Acquire a byte reservation before copying caches or starting candidate tools."""
+    validate_settings()
     prepare(state)
     target = candidate(state, identifier)
     amount = setting("CANDIDATE_BYTES", 32 * GIB)
@@ -296,6 +309,7 @@ def reserve(state, identifier, *, source_only=False):
 
 
 def reserve_checkpoint(state, identifier, *, amount=None):
+    validate_settings()
     if not re.fullmatch(r"[0-9a-f]{64}", identifier):
         raise ValueError("invalid verification checkpoint identifier")
     prepare(state)
@@ -321,6 +335,8 @@ def _reserve(state, identifier, target, amount, kind):
                     root() / "pressure.json",
                     dict(at=time.time(), kind=kind, requested=amount, reserved=total - amount, allowance=allowance),
                 )
+            if kind == "checkpoint":
+                raise Limit("checkpoint pool exhausted; archive retained checkpoints or adjust its allowance")
             raise Pressure("host verification candidate byte budget exhausted; awaiting cache reclamation")
         parent = target.parent
         while not parent.exists():
@@ -328,13 +344,20 @@ def _reserve(state, identifier, target, amount, kind):
         device = parent.stat().st_dev
         # Actual written bytes have already reduced statvfs.free; reserve only future growth
         # and only on the same filesystem.
-        outstanding = sum(
-            max(0, row["reserved"] - row.get("measured", 0))
-            for k, row in entries.items()
-            if k != identity and row.get("device") == device
-        )
+        outstanding = future_growth(entries, device, exclude=identity) if kind != "checkpoint" else 0
         measured = old.get("measured", 0)
-        free_space(target.parent, additional=outstanding + max(0, amount - measured))
+        try:
+            free_space(target.parent, additional=outstanding + max(0, amount - measured))
+        except Pressure:
+            with contextlib.suppress(OSError):
+                atomic_json(
+                    root() / "pressure.json",
+                    dict(at=time.time(), kind=kind, requested=amount, reason="filesystem-headroom"),
+                )
+            raise
+        from .work_recovery import process_owner
+
+        owner = None if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1" else process_owner()
         entries[identity] = dict(
             state=str(canonical_state(state)),
             id=identifier,
@@ -345,8 +368,23 @@ def _reserve(state, identifier, target, amount, kind):
             settled=False,
             measured=measured,
             device=device,
+            growing=True,
+            owner=owner,
         )
     return amount
+
+
+def future_growth(entries, device, *, exclude=None):
+    from .work_recovery import owner_stopped
+
+    return sum(
+        max(0, row["reserved"] - row.get("measured", 0))
+        for identity, row in entries.items()
+        if identity != exclude
+        and row.get("device") == device
+        and row.get("growing")
+        and (row.get("owner") is None or not owner_stopped(row["owner"]))
+    )
 
 
 def settle(state, identifier, size, *, compact=False):
@@ -354,7 +392,10 @@ def settle(state, identifier, size, *, compact=False):
     with ledger() as data:
         row = data["candidates"].get(key(state, identifier))
         if row is not None:
-            row.update(reserved=max(FLOOR, size), measured=size, compact=compact, legacy=False, settled=True)
+            row.update(
+                reserved=max(FLOOR, size), measured=size, compact=compact, legacy=False, settled=True, growing=False
+            )
+            row.pop("reclamation_blocked", None)
 
 
 def release(state, identifier):
@@ -436,11 +477,12 @@ class Monitor:
         self.limit = setting("CANDIDATE_BYTES", 32 * GIB)
         self.next_check, self.scan, self.bytes = 0, None, 0
 
-    def check(self):
+    def check(self, *, resources=True):
         if time.monotonic() < self.next_check:
             return
         self.next_check = time.monotonic() + 1
-        free_space(self.tree)
+        if resources:
+            free_space(self.tree)
         if self.scan is None:
             self.scan, self.bytes = _sizes(self.tree), 0
         # Bound each observation. On large candidates the size observation spans several ticks.
@@ -464,7 +506,6 @@ class Monitor:
     def finish(self):
         """A fast writer cannot finish successfully between incremental observations."""
         self.close()
-        free_space(self.tree)
         size = 0
         with contextlib.closing(_sizes(self.tree)) as inventory:
             for amount in inventory:
@@ -474,6 +515,14 @@ class Monitor:
                         overflow(self.state, self.identifier, size)
                     raise Limit("completed candidate exceeds its logical byte reservation")
         settle(self.tree.parent.parent, self.tree.name, size)
+        self.final_size = size
+
+    def settle_idle(self):
+        self.close()
+        size = getattr(self, "final_size", None)
+        if size is None:
+            size = sum(_sizes(self.tree))
+        settle(self.state, self.identifier, size)
 
 
 def _builds(tree, work, *, dependencies=True):
@@ -535,6 +584,8 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
             with ledger() as data:
                 data["candidates"].pop(key(state, identifier), None)
             return "absent"
+        if not job:
+            return _measure(state, row, tree, work, compact=True)
         if _observe_users(tree, work):
             return "active"
         mounts = mount_points()
@@ -550,7 +601,10 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
         ):
             progress = read_json(journal)
             info = tree.stat()
-            deletion = progress.setdefault("discard-copy", dict(tree_identity=[info.st_dev, info.st_ino], stack=[""]))
+            identity = [info.st_dev, info.st_ino]
+            if progress.get("discard-copy", {}).get("tree_identity") != identity:
+                progress["discard-copy"] = dict(tree_identity=identity, stack=[""])
+            deletion = progress["discard-copy"]
             try:
                 atomic_json(journal, progress)
                 if maintenance._remove(tree, deletion, work):
@@ -562,14 +616,13 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
             finally:
                 if tree.exists():
                     atomic_json(journal, progress)
-        if row.get("legacy") and not job:
-            return _measure(state, row, tree, work)
-        if not job:
-            return "unknown-owner"  # measured source remains protected; no blind deletion
         with ledger(write=False) as data:
             current = data["candidates"].get(key(state, identifier))
         if current is None or current["last_used"] != row["last_used"]:
             return "recently-used"
+        if row.get("reclamation_blocked"):
+            with ledger() as data:
+                data["candidates"][key(state, identifier)].pop("reclamation_blocked", None)
         progress = read_json(journal)
         for repo, name in _builds(tree, work, dependencies=bool(terminal) or drop_dependencies):
             cache = repo / name
@@ -604,6 +657,10 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
             try:
                 if "_generation" not in progress:
                     progress["_generation"] = uuid.uuid4().hex
+                if (
+                    read_json(state / "verification-storage-generations" / f"{identifier}.json").get("generation")
+                    != progress["_generation"]
+                ):
                     atomic_json(
                         state / "verification-storage-generations" / f"{identifier}.json",
                         dict(generation=progress["_generation"]),
@@ -657,7 +714,9 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
                         legacy=False,
                         dependency_cache_evicted=bool(terminal) or drop_dependencies,
                         overflow=size > setting("CANDIDATE_BYTES", 32 * GIB),
+                        growing=False,
                     )
+                    row.pop("reclamation_blocked", None)
             journal.unlink(missing_ok=True)
             return "source-retained"
         finally:
@@ -696,7 +755,9 @@ def _measure(state, row, target, work, *, compact=False):
         with ledger() as data:
             current = data["candidates"].get(key(state, row["id"]))
             if current is not None:
-                current.update(reserved=max(FLOOR, size), measured=size, compact=compact, legacy=False, settled=True)
+                current.update(
+                    reserved=max(FLOOR, size), measured=size, compact=compact, legacy=False, settled=True, growing=False
+                )
         return "source-retained"
     finally:
         if scan.gi_frame is not None:
@@ -717,7 +778,12 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
     token = wr._WORK.set(work)
     try:
         for state in states:
-            discover(state)
+            try:
+                discover(state)
+            except (OSError, ValueError) as error:
+                if isinstance(error, OSError) and error.errno in {errno.ENOSPC, errno.EDQUOT}:
+                    raise
+                report["errors"].append(str(error)[:300])
         with ledger(write=False) as data:
             rows = list(data["candidates"].items())
         pending_order = []
@@ -734,8 +800,16 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
         allowed = {str(canonical_state(state)) for state in states}
         rows = [(identity, row) for identity, row in rows if row["state"] in allowed or not Path(row["state"]).exists()]
         try:
-            free_space(root())
-            candidate_reserved = sum(row["reserved"] for _, row in rows if row.get("kind") != "checkpoint")
+            with ledger(write=False) as data:
+                all_entries = data["candidates"]
+            devices = {}
+            for _, row in rows:
+                state = Path(row["state"])
+                if state.exists():
+                    devices[state.stat().st_dev] = state
+            for device, target in devices.items():
+                free_space(target, additional=future_growth(all_entries, device))
+            candidate_reserved = sum(row["reserved"] for row in all_entries.values() if row.get("kind") != "checkpoint")
             pressure = (
                 candidate_reserved + setting("CANDIDATE_BYTES", 32 * GIB)
                 > setting("STORAGE_BYTES", 128 * GIB) - checkpoint_pool()
@@ -746,15 +820,7 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
         last = read_json(cursor_path).get("last", "")
         if not isinstance(last, str):
             last = ""
-        inventories = {key(identity[1], identity[2]) for identity in _SCANS if identity[0] == root().resolve()}
-        rows.sort(
-            key=lambda item: (
-                item[0] not in inventories,
-                not (Path(item[1]["state"]) / "verification-jobs" / f"{item[1]['id']}.json").exists(),
-                item[0] <= last,
-                item[0],
-            )
-        )
+        rows.sort(key=lambda item: (item[0] <= last, item[0]))
         for identity, row in rows:
             work.charge(entries=1)
             if work.removal_remaining <= 0 or getattr(work, "ownership_probed", False):
@@ -762,7 +828,7 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
             last_processed = identity
             state, identifier = Path(row["state"]), row["id"]
             directory = "verification-checkpoints" if row.get("kind") == "checkpoint" else "verification-candidates"
-            if row.get("compact") and not (state / directory / identifier).exists():
+            if not state.exists() or row.get("compact") and not (state / directory / identifier).exists():
                 with ledger() as data:
                     if data["candidates"].get(identity) == row:
                         data["candidates"].pop(identity, None)
@@ -807,6 +873,8 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                 if isinstance(error, wr.BudgetExhausted):
                     raise
                 report["errors"].append(str(error)[:300])
+                if isinstance(error, OSError) and error.errno in {errno.ENOSPC, errno.EDQUOT}:
+                    report["enospc"] = True
                 with contextlib.suppress(OSError, Pressure):
                     with ledger() as data:
                         current = data["candidates"].get(identity)
@@ -816,6 +884,8 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
         report["next_action"] = "resume-verification-storage-housekeeping"
     except (OSError, ValueError, Pressure) as error:
         report["errors"].append(str(error)[:300])
+        if isinstance(error, OSError) and error.errno in {errno.ENOSPC, errno.EDQUOT}:
+            report["enospc"] = True
         if isinstance(error, Pressure) and error.reason == "accounting":
             with contextlib.suppress(OSError, ValueError, Pressure):
                 recover(states)
@@ -891,6 +961,30 @@ def housekeep(states=(), **budgets):
     """Storage failures cannot take down the ordinary inference/verification supervisor."""
     states = tuple(states)
     try:
-        return _scheduled(states, **budgets)
+        validate_settings()
+        result = _scheduled(states, **budgets)
     except (OSError, ValueError, KeyError, TypeError, Pressure) as error:
-        return dict(errors=[str(error)[:300]], next_action="retry-verification-storage-housekeeping")
+        result = dict(errors=[str(error)[:300]], next_action="retry-verification-storage-housekeeping")
+        result["enospc"] = isinstance(error, OSError) and error.errno in {errno.ENOSPC, errno.EDQUOT}
+    if result.get("enospc"):
+        # A full filesystem may prevent writing the deletion journal itself. Discard only
+        # optional derived hash metadata, under its ordinary writer lock, to make room for
+        # durable cleanup intent. Receipts, indexes, source and checkpoints remain intact.
+        for state in states:
+            cache = state / "verification-hashes-v2.json"
+            lock = cache.with_suffix(".lock")
+            try:
+                if state.is_symlink() or not lock.is_file():
+                    continue
+                with lock.open("a+") as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    info = cache.lstat()
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                        continue
+                    cache.unlink()
+                    retry = _scheduled(states, **{**budgets, "now": budgets.get("now") or time.time()})
+                    retry["emergency_hash_cache_reclaimed"] = str(cache)
+                    return retry
+            except (OSError, ValueError, KeyError, TypeError, Pressure):
+                continue
+    return result

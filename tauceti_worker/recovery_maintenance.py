@@ -344,8 +344,13 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
                 stack.pop()  # crash after rmdir but before saving the cursor
                 continue
             try:
-                if os.fstat(fd).st_dev != root_stat.st_dev:
+                directory = os.fstat(fd)
+                if directory.st_dev != root_stat.st_dev:
                     raise ValueError("cleanup reached another filesystem")
+                if directory.st_uid == os.geteuid() and directory.st_mode & 0o300 != 0o300:
+                    # Immutable private copies may have readable but unwritable directories.
+                    # Operate on the already opened directory, never a replacement/symlink.
+                    os.fchmod(fd, directory.st_mode | 0o300)
                 with os.scandir(fd) as entries:
                     entry = next(entries, None)
                 if entry is None:
@@ -373,8 +378,8 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
                 size = info.st_size if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 else 0
                 remaining = work.removal_remaining
                 if size > remaining:
-                    if remaining <= 0 or info.st_nlink != 1:
-                        raise ValueError("byte budget or shared large inode; retry later")
+                    if remaining <= 0:
+                        return False
                     try:
                         child = os.open(entry.name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
                     except PermissionError:

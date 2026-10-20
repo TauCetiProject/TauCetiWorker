@@ -70,12 +70,14 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
     from .verification_storage import CopyBudget, CopyLimit, reserve, settle
 
     try:
+        reduced_for_capacity = False
         try:
-            amount = reserve(target.parent.parent, target.name, source_only=not include_builds)
+            amount = reserve(target.parent.parent, target.name)
         except Pressure as error:
             if not include_builds or error.reason != "capacity":
                 raise
             include_builds = False
+            reduced_for_capacity = True
             amount = reserve(target.parent.parent, target.name, source_only=True)
         budget = CopyBudget(amount, target)
 
@@ -148,11 +150,15 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
         settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
-    except CopyLimit:
+    except CopyLimit as error:
         if not include_builds:
+            if reduced_for_capacity:
+                raise Pressure("source preservation needs more temporarily available candidate capacity") from error
             raise
         if target.exists():
-            shutil.rmtree(target)  # incomplete snapshot; original source is still intact
+            from .shared_mathlib import remove_tree
+
+            remove_tree(target)  # incomplete snapshot; original source is still intact
         _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=False)
     except (OSError, subprocess.CalledProcessError) as error:
         raise Incomplete(f"candidate preservation incomplete: {error}", reason="preservation") from error
@@ -507,7 +513,6 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             raise ValueError("isolated candidate path does not match its job")
                         if digest(inventory(root, job["base"])) != job["source_digest"]:
                             raise ValueError("candidate source changed; preserved job requires reconciliation")
-                        reserve(state, identifier)
                         if not job.get("isolated"):
                             if target == root or target in root.parents or root in target.parents:
                                 raise ValueError("continuation snapshot path overlaps its source")
@@ -520,9 +525,11 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             root = target
                             job["isolated"] = True
                         job["root"] = str(root)
-                        job["attempts"] += 1
                         atomic(path, job)
                         commit_copy(state, identifier)
+                        reserve(state, identifier)
+                        job["attempts"] += 1
+                        atomic(path, job)
                         report_runtime(
                             "verifying",
                             detail="mechanically continuing preserved candidate",
