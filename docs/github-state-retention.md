@@ -13,10 +13,10 @@ endpoints; they do not query GitHub or print credentials:
 
 ```sh
 S=services/github-state/scripts/storage_recovery.py
-python3 "$S" --environment test retention
-python3 "$S" --environment test retention --mode dry_run --archive-ci
-python3 "$S" --environment test export --table resources --table deliveries --table demand
-python3 "$S" --environment test receipt --probe-bytes 65536
+uv run python "$S" --environment test retention
+uv run python "$S" --environment test retention --mode dry_run --archive-ci
+uv run python "$S" --environment test export --table resources --table deliveries --table demand
+uv run python "$S" --environment test receipt --probe-bytes 65536
 ```
 
 Inspect complete dry-run scan counts, verify the export/restore receipt and
@@ -26,9 +26,9 @@ requires multiple bounded passes. Each policy update replaces the complete
 set of overrides:
 
 ```sh
-python3 "$S" --environment test retention --mode enforce --archive-ci
-python3 "$S" --environment test retention --mode enforce --disable expired_changes --pin expired_deliveries --pin daily_archives
-python3 "$S" --environment test retention --mode dry_run --disable expired_changes
+uv run python "$S" --environment test retention --mode enforce --archive-ci
+uv run python "$S" --environment test retention --mode enforce --disable expired_changes --pin expired_deliveries --pin daily_archives
+uv run python "$S" --environment test retention --mode dry_run --disable expired_changes
 ```
 
 The last command disables future CI archival and the named journal cleanup
