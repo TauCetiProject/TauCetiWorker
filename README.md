@@ -678,7 +678,7 @@ in `workers.toml`. Keep the raw API key out of that file.
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
 - [Unfinished source recovery](docs/work-recovery.md): records saved before
-  checkout preparation resets, and releasing a recovery-blocked checkout.
+  checkout preparation resets, and checkouts moved aside while still in use.
 
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)

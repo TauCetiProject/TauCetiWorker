@@ -455,12 +455,13 @@ def record(boundary: Boundary, kind: str, *, rc: int | None = None, cleanup: str
 
 
 def write_quiescence(state_dir, round_id: str) -> bool:
-    """At the end of a round, tell checkout recovery whether that round left any process behind.
+    """At the end of a round, record whether that round left any process behind.
 
-    `state/<worker>/quiescence.json` is the proof work_recovery accepts for the round that owns a
-    dirty checkout. It is empty only when this host contains every launch and each of the round's
-    boundaries was confirmed empty; any best-effort, external or unconfirmed boundary withholds it.
-    A round killed before its cleanup writes nothing, which leaves the checkout's state unknown."""
+    `state/<worker>/quiescence.json` is diagnostic: it is empty only when this host contains every
+    launch and each of the round's boundaries was confirmed empty; any best-effort, external or
+    unconfirmed boundary withholds it. A round killed before its cleanup writes nothing. Checkout
+    recovery never waits for it: leftovers are saved first, and a checkout still in use is moved
+    aside rather than reset."""
     from .runtime_status import atomic_json
 
     outcomes = list(_boundaries.pop(round_id, {}).values())

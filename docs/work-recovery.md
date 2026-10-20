@@ -19,7 +19,7 @@ left the source. Each record is private to its worker (mode `0700`/`0600`):
 | `staged.patch` | binary diff of the index against HEAD |
 | `unstaged.patch` | binary diff of the worktree against the index |
 | `untracked.tar` | untracked and ignored source with original relative paths, plus the bytes of conflicted and assume-unchanged/skip-worktree paths; symlinks are stored as links and never followed |
-| `status.json` | mutable disposition: `preserved`, `recovery-blocked`, `checkout-reset` or `superseded` |
+| `status.json` | mutable disposition: `preserved`, `checkout-reset`, `retained` or `superseded` |
 
 The worker writes into a `.tmp-*` directory and fsyncs every file and the
 directory. It then renames the directory into place and fsyncs the parent.
@@ -38,42 +38,29 @@ other ignored files are archived. The manifest lists every excluded path with it
 reason, and records conflicted paths deleted from the worktree as `absent`. The untracked archive is
 bounded at 128 MiB and 20,000 files; a larger tree fails the save.
 
-## When a reset may proceed
+## Preparation never waits for a human
+
+OOMs, SIGKILLs and timeouts are routine, so whatever they leave behind must never
+stop a worker. Preparation always saves first and then always continues:
 
 - **Clean and published**: no record and no change from earlier behaviour.
-- **Commits only**: the commits are bundled once and marked
-  `refs/tauceti/preserved/<record>/...`, and preparation proceeds. Commits are
-  immutable objects, so a late writer cannot change what was saved.
-- **Working-tree source**: the record must be durable *and* the checkout
-  quiescent. Until round containment reports an empty boundary for the round
-  that left the source, quiescence is unknown. The checkout is then retained,
-  marked `recovery-blocked`, and the round fails with the record path and the
-  command to run.
-- **Any process using the checkout** (Linux `/proc` cwd/root/open files) blocks
-  the reset whenever anything is unpublished, even after an operator
-  confirmation, and even when the commits were already saved by an earlier
-  attempt.
-- **A late write**: every permission is checked against a final inspection. If
-  the checkout changed after the snapshot was saved, the newer state is saved
-  and judged again.
-- **Saving or inspection fails** (no space, permissions, archive bound, a git
-  error): the checkout is left intact and the refusal says why.
+- **Anything unpublished** (commits, edits, untracked or ignored source): saved
+  in a durable record. A final inspection then checks that the checkout still
+  matches it; a write that landed after the snapshot is saved too. The checkout
+  is then reset in place. Commits are bundled once and marked
+  `refs/tauceti/preserved/<record>/...`.
+- **A process still uses the checkout** (Linux `/proc` cwd/root/open files),
+  saving fails (no space, permissions, the archive bound, a git error), or the
+  tree keeps changing: the whole checkout is moved aside unmodified to
+  `<checkout parent>/retained/<name>-<time>-<id>`, a same-directory rename that
+  needs no free space, and preparation clones a fresh checkout. Any process
+  still working in the old one keeps working there.
+- **Retained checkouts clean themselves up**: each later preparation saves any
+  retained checkout that nothing uses any more into a record, then removes it.
 
-To release a blocked checkout, first confirm that nothing from the earlier round
-still runs there. Then run:
-
-```sh
-tauceti recovery                                  # list local records
-tauceti recovery confirm <record> --worker-id <worker>
-```
-
-A confirmation applies only to the exact saved source, compared by fingerprint.
-If the checkout changes after confirmation, the next preparation saves a new
-record and blocks again. [Process containment](process-containment.md) instead
-writes `state/<worker>/quiescence.json` as
-`{"round_id": ..., "empty": true, "boundary": ...}` when a round's boundaries all
-ended empty. That proof applies only to the exact round recorded in
-`state/<worker>/checkout-owners/TauCeti.json`.
+Preparation refuses only when a checkout can be neither saved nor moved aside,
+and the next round simply retries. Nothing in this path asks an operator to do
+anything; `tauceti recovery` only lists what was saved.
 
 ## Publication
 
@@ -102,20 +89,20 @@ tar -xf <record>/untracked.tar
 ## Status
 
 The activity collector adds local counts to the prepared summaries: records,
-blocked, incomplete and corrupt, with block reasons. `tauceti activity` and
-`tauceti workers status` show them, and fleet summaries only add host counts.
+checkouts moved aside, incomplete and corrupt, with reasons. `tauceti activity`
+and `tauceti workers status` show them, and fleet summaries only add host counts.
 Status never reads GitHub.
 
 ## Rollout and rollback
 
 Rollout does not reset existing checkouts. On a worker's first preparation, its
-local-only commits are bundled once. A dirty existing checkout is saved and
-blocked like any other.
+local-only commits are bundled once and any dirty tree is saved before the
+reset. Records left `recovery-blocked` by the first version of this guard are
+marked `superseded` when their checkout is next prepared.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
-table). Preparation then writes no new records, but it still refuses to reset a
-checkout with any record lacking a durable released disposition (`preserved`,
-`checkout-reset` or `superseded`). Never delete retained records.
+table). Preparation then resumes the earlier destructive reuse without saving.
+Existing records are never deleted.
 
 ## Scope
 

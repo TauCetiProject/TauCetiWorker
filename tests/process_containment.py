@@ -272,22 +272,13 @@ class Namespace(Base):
         cfg = SimpleNamespace(state=self.tmp / "state", wid="containment-test", logdir=self.tmp / "logs")
         return cfg, round_.RoundContext(cfg)
 
-    def test_round_cleanup_proves_quiescence_for_checkout_recovery(self):
-        from tauceti_worker import work_recovery
-
+    def test_round_cleanup_records_quiescence(self):
         cfg, context = self.round_context()
         with context as ctx:
             self.assertEqual(self.run_agent(), 0)
             round_id = ctx.activity.id
         proof = json.loads((cfg.state / "quiescence.json").read_text())
         self.assertEqual((proof["round_id"], proof["empty"], proof["boundaries"]), (round_id, True, 1))
-        # The checkout-recovery consumer accepts it for the round that owns the checkout, only.
-        work_recovery.owner_path(cfg).parent.mkdir(parents=True)
-        work_recovery.owner_path(cfg).write_text(json.dumps({"round_id": round_id}))
-        snap = SimpleNamespace(fingerprint="unused")
-        self.assertEqual(work_recovery.quiescence(cfg, self.tmp / "checkout", None, snap, "TauCeti")[0], "quiescent")
-        work_recovery.owner_path(cfg).write_text(json.dumps({"round_id": "another-round"}))
-        self.assertEqual(work_recovery.quiescence(cfg, self.tmp / "checkout", None, snap, "TauCeti")[0], "unknown")
 
     def test_best_effort_or_unconfirmed_rounds_withhold_the_proof(self):
         cfg, context = self.round_context()
