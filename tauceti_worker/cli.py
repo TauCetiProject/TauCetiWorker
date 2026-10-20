@@ -584,11 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
     activity.add_argument("--json", action="store_true")
     activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")
 
-    recovery = sub.add_parser(
-        "recovery", help="list saved unfinished source or confirm a retained checkout is quiescent; local only"
-    )
-    recovery.add_argument("action", nargs="?", choices=("list", "confirm"), default="list")
-    recovery.add_argument("record", nargs="?", help="confirm: the record id under state/<worker>/recovery/")
+    recovery = sub.add_parser("recovery", help="list saved unfinished source and moved-aside checkouts; local only")
     recovery.add_argument("--worker-id", dest="worker_id", default=None)
     recovery.add_argument("--json", action="store_true")
 
@@ -1140,18 +1136,9 @@ def cmd_usage(args) -> int:
 
 
 def cmd_recovery(args) -> int:
-    """Local recovery records: never GitHub, never a reset. `confirm` only records an operator's
-    assertion of quiescence for the exact saved source; the next preparation acts on it."""
+    """Local recovery records: never GitHub, never a reset, never a required step."""
     from . import work_recovery
 
-    if args.action == "confirm":
-        if not args.record:
-            raise Die("tauceti recovery confirm needs a record id")
-        try:
-            print(work_recovery.confirm(Config.resolve(args.worker_id), args.record))
-        except work_recovery.RecordError as error:
-            raise Die(str(error)) from None
-        return 0
     rows = []
     for worker, record, manifest, status in work_recovery.records():
         if args.worker_id and worker != args.worker_id:

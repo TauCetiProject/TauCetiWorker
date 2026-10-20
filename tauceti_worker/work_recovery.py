@@ -11,14 +11,15 @@ unpublished is present, writes an atomic, worker-private recovery record:
         staged.patch     binary index-vs-HEAD diff
         unstaged.patch   binary worktree-vs-index diff (conflicted paths are archived instead)
         untracked.tar    bounded archive of untracked source and conflicted paths; symlinks as links
-        status.json      mutable disposition: preserved, recovery-blocked, checkout-reset
+        status.json      mutable disposition: preserved, checkout-reset, retained, superseded
 
-Destruction then requires two things: the record is durable (every file fsynced, directory renamed
-into place), and the checkout is quiescent. Until round containment can prove that no descendant of
-the previous round is alive, quiescence of a dirty checkout is UNKNOWN, so the checkout is retained
-and marked recovery-blocked rather than reset. A checkout whose only unpublished state is commits is
-not exposed to that race: commits are immutable objects, now in a durable bundle, so preparation may
-proceed. A clean checkout with nothing unpublished needs no record at all.
+A reset happens only after the record is durable (every file fsynced, the directory renamed into
+place) and a final inspection shows the checkout still matches it. Preparation never stops for a
+human: OOMs and SIGKILLs are routine, so their leftovers are saved and the checkout is reset. When a
+process still uses the checkout, saving fails, or the tree will not hold still, the whole checkout
+is moved aside unmodified and preparation continues on a fresh clone; a later preparation saves and
+removes the retained copy once nothing uses it. A clean checkout with nothing unpublished needs no
+record at all.
 
 "Published" is decided locally, never from GitHub: a commit is published when it is reachable from a
 remote-tracking ref or from refs/tauceti/published/*, which git-safe-push writes after a successful
@@ -423,9 +424,8 @@ def owner_path(cfg, label: str = "TauCeti") -> Path:
 
 
 def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
-    """Record which round now owns the checkout, so a later record names the round that left the source
-    and a containment proof for an earlier round cannot vouch for this one. Callers must not hand the
-    checkout to a writer when this returns False."""
+    """Record which round now owns the checkout, so a later record names the round that left the source.
+    Attribution only: a failure is logged and never stops a round."""
     from .activity import current_round_id
 
     path = owner_path(cfg, label)
@@ -453,12 +453,12 @@ def mark_published(repo: Path, name: str, oid: str) -> None:
     subprocess.run(["git", "-C", str(repo), "update-ref", f"{PUBLISHED}/{name}", oid], capture_output=True, check=False)
 
 
-def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str) -> Path:
+def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
     """Write or reuse a complete record for this exact snapshot. Raises RecordError on any failure."""
     from .activity import current_round_id
 
     root = cfg.state / "recovery"
-    owner = read_json(owner_path(cfg, label))
+    owner = owner or read_json(owner_path(cfg, label))
     source_round = owner.get("round_id") or current_round_id() or f"unattributed-{int(time.time())}"
     base_id = _safe_id(str(source_round))
     try:
@@ -470,7 +470,9 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str) -> Pat
         raise RecordError(f"could not create {root}: {error}") from None
     for record in existing:
         manifest = _read_manifest(record)
-        if manifest and manifest["fingerprint"] == snap.fingerprint and manifest.get("checkout") == str(repo):
+        # The fingerprint covers every tip and every saved byte, so a match is the same source even
+        # when the checkout has since been moved aside.
+        if manifest and manifest["fingerprint"] == snap.fingerprint:
             if _complete(record) is None:
                 continue  # damaged: never trusted, never deleted; write a fresh copy instead
             try:
@@ -579,8 +581,8 @@ def _update_refs(repo: Path, commands: list[str], *, check: bool = True) -> None
 
 
 def _supersede(cfg, repo: Path, current: Path | None) -> None:
-    """A blocked record whose checkout has since changed or been released no longer blocks anything.
-    Its data is retained; only the disposition changes."""
+    """Records left `recovery-blocked` by the earlier blocking guard no longer describe the checkout.
+    Their data is kept; only the disposition changes."""
     for _, record, manifest, status in records(cfg.state.parent, workers={cfg.state.name}):
         if (
             record is not None
@@ -602,9 +604,6 @@ def _set_status(record: Path, state: str, reason: str = "") -> bool:
         log(f"recovery: could not update {record.name} status ({error})")
         return False
     return True
-
-
-RELEASED = ("preserved", "checkout-reset", "superseded")
 
 
 def _preserved(cfg) -> list[str]:
@@ -653,120 +652,153 @@ def live_users(repo: Path) -> list[str]:
     return found
 
 
-def quiescence(cfg, repo: Path, record: Path | None, snap: Snapshot, label: str) -> tuple[str, str]:
-    """('quiescent' | 'active' | 'unknown', detail). Uncertainty is never permission to delete."""
-    users = live_users(repo)
-    if users:
-        return "active", "processes still use the checkout: " + ", ".join(users[:8])
-    confirmed = read_json(record / "operator-quiescence.json") if record else {}
-    if confirmed.get("fingerprint") == snap.fingerprint:
-        return "quiescent", "operator confirmed no process uses the checkout"
-    # A round-containment owner reports an empty boundary for the exact round that left this source.
+MAX_PRUNE_PER_PREPARATION = 3
+# Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks
+# publication bundles in state/<worker>/progress/retained, beside the roadmap clone.
+RETAINED_DIR = "retained-checkouts"
+
+
+def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> Decision:
+    """Move the whole checkout aside, unmodified, so preparation can continue on a fresh one.
+
+    A same-directory rename needs no free space and leaves every byte (and any process still
+    working there) exactly where it was. The retained copy is saved and removed automatically by a
+    later preparation once nothing uses it, so no operator is ever needed."""
+    global LAST_REFUSAL
+    parent = repo.parent / RETAINED_DIR
+    dest = parent / f"{repo.name}-{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.rename(repo, dest)
+    except OSError as error:
+        # Neither saved nor movable: leave everything untouched; the next round tries again.
+        LAST_REFUSAL = f"{reason}, and moving {repo} aside failed ({error}); the checkout is left intact"
+        return Decision(False, LAST_REFUSAL, record, "refused")
+    with contextlib.suppress(OSError):  # durability and attribution are best effort here
+        _fsync_dir(parent)
+        _fsync_dir(repo.parent)
     owner = read_json(owner_path(cfg, label))
-    proof = read_json(cfg.state / "quiescence.json")
-    if (
-        owner.get("round_id")
-        and proof.get("round_id") == owner.get("round_id")
-        and proof.get("empty") is True
-        and proof.get("boundary")
-    ):
-        return "quiescent", f"round {owner['round_id']} containment reported empty ({proof['boundary']})"
-    return "unknown", "no containment result proves that the previous round's descendants have exited"
+    if owner:
+        with contextlib.suppress(OSError):
+            atomic_json(dest.with_name(dest.name + ".owner.json"), owner)
+    if record is not None:
+        _set_status(record, "retained", f"{reason}; checkout moved to {dest}")
+    log(f"recovery: {reason}; moved the checkout to {dest} and continuing with a fresh one")
+    return Decision(True, reason, record, "retained", dict(retained=str(dest)))
+
+
+def retain(cfg, repo: Path, reason: str, *, label: str = "TauCeti") -> Decision:
+    """Move an unusable checkout (a stale lock, damaged metadata, an interrupted clone) aside whole."""
+    return _retain(cfg, repo, reason, None, label)
+
+
+def _evict_caches(tree: Path) -> None:
+    """Reclaim a retained checkout's dependency and build caches; never its source."""
+    for root, dirs, _ in os.walk(tree, followlinks=False):
+        for name in [d for d in dirs if d in CACHE_DIRS or (root == str(tree) and d in CACHE_TOP)]:
+            path = Path(root) / name
+            if not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+        dirs[:] = [d for d in dirs if d not in CACHE_DIRS and d != ".git"]
+
+
+def _prune_retained(cfg, repo: Path, label: str, repository: str) -> None:
+    """Save and remove retained checkouts that nothing uses any more, a few per preparation.
+
+    A copy is removed only after a record of it is durable and a second inspection shows it did not
+    change meanwhile. A copy that cannot be saved keeps its source but loses its caches, so retained
+    checkouts cannot fill the disk with build output. Removal renames to `*.deleting` first, so an
+    interrupted delete is finished later without needing git."""
+    parent = repo.parent / RETAINED_DIR
+    if not parent.is_dir():
+        return
+    for doomed in parent.glob("*.deleting"):
+        shutil.rmtree(doomed, ignore_errors=True)
+    budget = MAX_PRUNE_PER_PREPARATION
+    for old in sorted(p for p in parent.glob(f"{repo.name}-*") if p.is_dir() and not p.name.endswith(".deleting")):
+        if budget <= 0:
+            return
+        budget -= 1
+        if live_users(old):
+            continue
+        sidecar = old.with_name(old.name + ".owner.json")
+        try:
+            snap = inspect(old, _preserved(cfg))
+            record = _record(cfg, old, snap, label, repository, owner=read_json(sidecar)) if snap.needs_record else None
+            if live_users(old) or inspect(old, _preserved(cfg)).fingerprint != snap.fingerprint:
+                continue  # something touched it while saving; try again later
+            doomed = old.with_name(old.name + ".deleting")
+            os.rename(old, doomed)
+            if record is not None:
+                _set_status(record, "checkout-reset", f"retained checkout {old.name} saved and removed")
+            shutil.rmtree(doomed, ignore_errors=True)
+            sidecar.unlink(missing_ok=True)
+            log(f"recovery: removed retained checkout {old}" + (f"; its source is in {record}" if record else ""))
+        except (OSError, subprocess.SubprocessError, RecordError) as error:
+            log(f"recovery: keeping retained checkout {old} for now ({error}); evicting its caches")
+            _evict_caches(old)
+
+
+def _dirty_without_inspection(repo: Path) -> bool:
+    """Rollback's only check: does git report anything a reset would discard? Unknown counts as yes."""
+    p = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--ignored=no", "--untracked-files=all"],
+        capture_output=True,
+    )
+    return p.returncode != 0 or bool(p.stdout.strip())
 
 
 def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
-    """Decide whether destructive preparation of `repo` may start, saving source first when needed.
+    """Save anything unpublished in `repo`, then let preparation continue. Never waits for a human.
 
-    Every permission is checked against a final inspection: if the checkout changed after the
-    snapshot was saved (a late writer), the newer state is saved and judged again."""
+    The normal outcome is a durable record followed by a reset in place, including after an OOM or
+    SIGKILL. Every reset is checked against a final inspection, so a write that lands after the
+    snapshot is saved too. When a process still uses the checkout, the save fails, or the checkout
+    will not hold still, the whole checkout is moved aside instead (`state == "retained"`) and the
+    caller creates a fresh one. Refusal is left only for a checkout that can be neither saved nor
+    moved, and the next round simply retries."""
     global LAST_REFUSAL
     LAST_REFUSAL = ""
-
-    def refuse(reason: str, record: Path | None = None, state: str = "refused") -> Decision:
-        global LAST_REFUSAL
-        LAST_REFUSAL = reason
-        return Decision(False, reason, record, state)
-
-    def blocked(record: Path | None, detail: str, reason: str) -> Decision:
-        if record is not None and not _set_status(record, "recovery-blocked", detail):
-            reason += f" (its recovery-blocked status could not be written; {record} is still retained)"
-        return refuse(reason, record, "recovery-blocked")
-
+    _prune_retained(cfg, repo, label, repository)
     if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
-        # Rollback: no new records, but a checkout with pending recovery is still never reset. A
-        # record without a durable released disposition counts as pending.
-        for _, record, manifest, status in records(cfg.state.parent, workers={cfg.state.name}):
-            if record is None or (manifest or read_json(record / "manifest.json")).get("checkout") != str(repo):
-                continue
-            if status.get("state") not in RELEASED:
-                return refuse(f"{repo} has pending recovery in {record} (TAUCETI_WORK_RECOVERY=off)", record)
+        # Rollback: no inspection or records. A dirty tree is still never reset; it is moved aside.
+        if _dirty_without_inspection(repo):
+            return _retain(cfg, repo, "TAUCETI_WORK_RECOVERY=off and the checkout is dirty", None, label)
         return Decision(True, state="disabled")
-
-    snap = None
+    record = None
     for _ in range(3):
         try:
-            snap = snap or inspect(repo, _preserved(cfg))
+            snap = inspect(repo, _preserved(cfg))
         except (OSError, subprocess.SubprocessError, RecordError) as error:
-            return refuse(f"could not inspect {repo} for unpublished source ({error}); the checkout is left intact")
+            return _retain(cfg, repo, f"could not inspect {repo} ({error})", record, label)
         if snap.published:
+            users = live_users(repo)
+            if users:  # nothing to lose now, but a live writer could still create some
+                return _retain(cfg, repo, "processes still use the checkout: " + ", ".join(users[:8]), None, label)
             _supersede(cfg, repo, None)
             return Decision(True, state="clean")
-        record = None
         if snap.needs_record:
             try:
                 record = _record(cfg, repo, snap, label, repository)
             except RecordError as error:
-                return refuse(f"{error}; the checkout at {repo} is left intact and will not be reset")
+                return _retain(cfg, repo, f"could not save its source ({error})", record, label)
             _supersede(cfg, repo, record)
         users = live_users(repo)
         if users:
-            detail = "processes still use the checkout: " + ", ".join(users[:8])
-            saved = f"; its source is saved in {record}" if record else "; its unpublished commits are already saved"
-            return blocked(record, detail, f"{detail}{saved} and the checkout is retained")
-        if snap.dirty:
-            state, detail = quiescence(cfg, repo, record, snap, label)
-            if state != "quiescent":
-                return blocked(
-                    record,
-                    detail,
-                    f"unfinished source in {repo} is saved in {record}, but the checkout is retained: {detail}. "
-                    f"After confirming nothing still runs there, run `tauceti recovery confirm {record.name} "
-                    f"--worker-id {getattr(cfg, 'wid', '')}`",
-                )
-        else:
-            # Commits only: they are immutable objects in a durable bundle (or an earlier one), and the
-            # tree holds nothing a late writer could lose, exactly as for a clean published checkout.
-            detail = "unpublished commits saved; working tree was clean"
+            return _retain(cfg, repo, "processes still use the checkout: " + ", ".join(users[:8]), record, label)
         try:
             again = inspect(repo, _preserved(cfg))
         except (OSError, subprocess.SubprocessError, RecordError) as error:
-            return refuse(f"could not re-inspect {repo} after saving ({error}); the checkout is left intact")
+            return _retain(cfg, repo, f"could not re-inspect {repo} ({error})", record, label)
         if again.fingerprint != snap.fingerprint:
-            snap = again  # a late write: save and judge the newer state
-            continue
+            continue  # a late write: save the newer state before resetting
+        state = "checkout-reset" if snap.dirty else "preserved"
         if record is not None:
-            disposition = "checkout-reset" if snap.dirty else "preserved"
-            if not _set_status(record, disposition, detail):
-                return refuse(f"could not record the disposition of {record}; the checkout is left intact", record)
-            log(f"recovery: saved {'unfinished source' if snap.dirty else 'unpublished commits'} in {record}; {detail}")
-            return Decision(True, record=record, state=disposition)
-        return Decision(True, state="preserved")
-    return refuse(f"{repo} kept changing while it was being saved; something is still writing there", None)
-
-
-def confirm(cfg, record_id: str) -> str:
-    """Operator assertion that nothing still runs in the checkout this record retains."""
-    record = cfg.state / "recovery" / record_id
-    manifest = _complete(record)
-    if manifest is None:
-        raise RecordError(f"{record} is not a complete {SCHEMA} record")
-    snap = inspect(Path(manifest["checkout"]))
-    if snap.fingerprint != manifest["fingerprint"]:
-        raise RecordError(
-            f"{manifest['checkout']} changed since {record_id} was saved; the next preparation will save it again"
-        )
-    atomic_json(record / "operator-quiescence.json", dict(fingerprint=snap.fingerprint, confirmed_at=time.time()))
-    return f"{record_id}: quiescence confirmed; the next checkout preparation may reset {manifest['checkout']}"
+            _set_status(record, state, "saved before the checkout was reset")
+            what = "unfinished source" if snap.dirty else f"{len(snap.unpublished)} unpublished commit(s)"
+            log(f"recovery: saved {what} in {record}")
+        return Decision(True, record=record, state=state)
+    return _retain(cfg, repo, "the checkout kept changing while it was being saved", record, label)
 
 
 def restore(record: Path, repo: Path) -> None:
@@ -820,7 +852,7 @@ def records(state_root: Path | None = None, *, workers=None):
 
 def summary(state_root: Path | None = None, *, workers=None) -> dict:
     """Background preparation only; status reads the resulting JSON and never GitHub."""
-    counts = dict(records=0, blocked=0, preserved=0, reset=0, superseded=0, incomplete=0, corrupt=0)
+    counts = dict(records=0, retained=0, blocked=0, preserved=0, reset=0, superseded=0, incomplete=0, corrupt=0)
     reasons = set()
     for worker, record, manifest, status in records(state_root, workers=workers):
         if record is None:
@@ -832,9 +864,11 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
             continue
         counts["records"] += 1
         state = status.get("state")
-        if state == "recovery-blocked":
-            counts["blocked"] += 1
-            reasons.add(f"{worker}: {status.get('reason') or 'recovery blocked'}")
+        if state == "retained":
+            counts["retained"] += 1
+            reasons.add(f"{worker}: {status.get('reason') or 'checkout moved aside'}")
+        elif state == "recovery-blocked":
+            counts["blocked"] += 1  # written only by the earlier blocking guard; superseded on next use
         elif state == "checkout-reset":
             counts["reset"] += 1
         elif state == "superseded":

@@ -1857,36 +1857,38 @@ def _do_progress_inner(w, opts) -> int | None:
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
-    from .work_recovery import guard, note_owner
+    from .work_recovery import guard, note_owner, retain
 
     if retained and (roadmap_dir / ".git").is_dir():
         # A prepared local branch is an immutable publication artifact. Fetch
         # the live cursor, while leaving its branch and working tree intact.
         if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
             return _defer_progress_publication(w, retained, f"temporary fetch failure in {roadmap_dir}")
-    elif (roadmap_dir / ".git").is_dir():
-        # `apply` commits and pushes here; a leftover from an interrupted apply is saved, not discarded.
-        decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
-        if not decision.ok:
-            raise Die(f"refreshing {roadmap_dir} refused: {decision.reason}")
-        ok = (
-            subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode == 0
-            and subprocess.run(
-                ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
-            ).returncode
-            == 0
-        )
-        subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
-        if not ok:
-            raise Die(f"refreshing {roadmap_dir} failed")
     else:
-        roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
-        if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
-            if retained:
-                return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
-            raise Die(f"cloning {ROADMAP} failed")
-    if not note_owner(w.cfg, "progress-roadmap", work="progress"):
-        raise Die(f"could not record the round that owns {roadmap_dir}")
+        if roadmap_dir.exists() and not (roadmap_dir / ".git").is_dir():
+            retain(w.cfg, roadmap_dir, "the roadmap clone has no git metadata", label="progress-roadmap")
+        if (roadmap_dir / ".git").is_dir():
+            # `apply` commits and pushes here; an interrupted apply's leftovers are saved, not discarded.
+            decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
+            if not decision.ok:
+                raise Die(f"refreshing {roadmap_dir} refused: {decision.reason}")
+        if (roadmap_dir / ".git").is_dir():  # still in place unless the guard moved it aside
+            if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
+                raise Die(f"refreshing {roadmap_dir} failed")  # usually the network; retried next round
+            if subprocess.run(
+                ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
+            ).returncode:
+                # A local failure (a stale lock): move the clone aside and clone afresh below.
+                retain(w.cfg, roadmap_dir, "forced checkout of the roadmap clone failed", label="progress-roadmap")
+            else:
+                subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
+        if not (roadmap_dir / ".git").is_dir():
+            roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
+            if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
+                if retained:
+                    return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
+                raise Die(f"cloning {ROADMAP} failed")
+    note_owner(w.cfg, "progress-roadmap", work="progress")  # attribution only; never stops the round
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
     if not retained and not prepare_checkout(w.cfg, work="progress"):

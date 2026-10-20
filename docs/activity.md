@@ -82,8 +82,8 @@ Cost preparation runs in the existing background collector;
 `activity` and `workers status` still only read small JSON summaries.
 
 Local [work recovery](work-recovery.md) counts come from each worker's
-`state/<worker>/recovery` directory: saved, recovery-blocked, incomplete and
-corrupt records, with block reasons. The background collector prepares them.
+`state/<worker>/recovery` directory: saved, checkouts moved aside, incomplete and
+corrupt records, with reasons. The background collector prepares them.
 Fleet summaries add host counts.
 
 Completed review counts include reviews of other authors' PRs. `PRs assisted`
