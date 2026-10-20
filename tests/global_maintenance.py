@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker.config import NoProgress, SharedStateUnavailable
+from tauceti_worker.config import ClaimCollision, NoProgress, SharedStateUnavailable
 from tauceti_worker.github_state import SurveyRows
 from tauceti_worker.review_state import ReviewState
 from tauceti_worker.survey import PRInfo
@@ -150,6 +150,13 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertEqual(query.call_args.kwargs["stages"], [])
         self.assertEqual(query.call_args.args[1], "auto")
         areas.assert_not_called()
+
+    def test_all_claimed_without_authoring_is_a_collision_not_failure(self):
+        self.opts.only = ["fix"]
+        with patch.object(work, "_branch_claimed_elsewhere", return_value=True):
+            with self.assertRaises(ClaimCollision):
+                self.run_round([row(10, "Other")])
+        self.assertEqual(self.calls, [])
 
     def test_git_claim_precheck_handles_owner_expiry_and_failures(self):
         leases = [

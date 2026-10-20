@@ -262,11 +262,11 @@ def preserve_candidate(verification, *, disposable_only=False):
 
 
 def tool_readiness(job):
-    from .verification import digest, stamps
+    from .verification import LOCAL_CHECKERS, digest, stamps
 
     paths = [path for name in ("lake", "lean", "bash", "python3", "git", "tar") if (path := shutil.which(name))]
     paths += [str(p) for p in Path(__file__).parent.glob("*.py")]
-    paths += [str(HERE / "scripts" / name) for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")]
+    paths += [str(HERE / "scripts" / name) for name in ("tauceti-verify", *LOCAL_CHECKERS)]
     paths.append(str(Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))) / "toolchains"))
     if registration := os.environ.get("TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS"):
         paths.append(registration)

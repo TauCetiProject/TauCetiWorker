@@ -37,7 +37,8 @@ from .verification_scope import git, local_main, scope, untracked
 from .verification_storage import Limit, Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 4
+POLICY_VERSION = 5
+LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
@@ -512,7 +513,7 @@ class Verification:
                     and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
                     and POLICY_VERSION == inputs["policy_version"]
                     and {p.name for p in Path(__file__).parent.glob("*.py")}
-                    == set(inputs["verifier"]) - {"wrapper", "tauceti-local-axioms", "LocalAxioms.lean"}
+                    == set(inputs["verifier"]) - {"wrapper", *LOCAL_CHECKERS}
                 )
             if self.mutated or not unchanged:
                 raise Incomplete("verification inputs changed during execution")
@@ -555,7 +556,7 @@ class Verification:
         environment = self.environment()
         verifier = {str(p.name): hash_file(p) for p in Path(__file__).parent.glob("*.py")}
         verifier["wrapper"] = hash_file(HERE / "scripts" / "tauceti-verify")
-        for name in ("tauceti-local-axioms", "LocalAxioms.lean"):
+        for name in LOCAL_CHECKERS:
             verifier[name] = hash_file(HERE / "scripts" / name)
         sources = inventory(self.root, self.base)
         return dict(
@@ -621,8 +622,9 @@ class Verification:
                     lint_modules.add(module)
             lint_list.write_text("".join(f"{m}\n" for m in sorted(lint_modules)))
             if lint_modules:
-                env["LINT_ONLY_MODULES"] = str(lint_list)
-                commands.append((["bash", "-o", "pipefail", "scripts/lint-env.sh"], env))
+                commands.append(
+                    ([sys.executable, "-I", str(HERE / "scripts/tauceti-local-lint"), "--modules", str(lint_list)], env)
+                )
             return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
@@ -728,7 +730,7 @@ class Verification:
             cache.finish_import()
             self.watch()
             extra = list(Path(__file__).parent.glob("*.py")) + [
-                HERE / "scripts" / name for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")
+                HERE / "scripts" / name for name in ("tauceti-verify", *LOCAL_CHECKERS)
             ]
             extra += [p for root in self.installations.walked for p in files_under(root)]
             extra += [
@@ -791,9 +793,10 @@ class Verification:
                     try:
                         self.command(phase, argv, env=env)
                     except subprocess.CalledProcessError as error:
-                        if phase == "axioms" and error.returncode in {2, 75}:
+                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in error.cmd)
+                        if (phase == "axioms" or local_lint) and error.returncode in {2, 75}:
                             raise Incomplete(
-                                "local axiom checker unavailable; see the phase log",
+                                f"local {phase} checker unavailable; see the phase log",
                                 reason="tool-missing" if error.returncode == 75 else "invalid-input",
                             ) from error
                         raise

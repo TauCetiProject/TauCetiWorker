@@ -4,6 +4,7 @@
 import contextlib
 import io
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -174,6 +175,7 @@ class Storage(Receipts):
         outside = self.home / "external"
         write(outside, "dep/.lake/build/keep", "external")
         (tree / ".lake").mkdir(exist_ok=True)
+        shutil.rmtree(tree / ".lake/packages")
         (tree / ".lake/packages").symlink_to(outside, target_is_directory=True)
         cache = write(tree, ".lake/build/keep", "active")
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=tree)

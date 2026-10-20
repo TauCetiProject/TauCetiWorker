@@ -58,7 +58,9 @@ CALL_SITES = {
     "rebase.md": FIXLIKE,
     "bump.md": dict(FIXLIKE, SCOPE_POLICY="bump"),
     "lint-repair.md": dict(FIXLIKE, SCOPE_POLICY="lint-repair"),
-    "local-verification.md": dict(SCOPE_POLICY="ordinary", LOCAL_AXIOMS="/bin/tauceti-local-axioms"),
+    "local-verification.md": dict(
+        SCOPE_POLICY="ordinary", LOCAL_AXIOMS="/bin/tauceti-local-axioms", LOCAL_LINT="/bin/tauceti-local-lint"
+    ),
     "roadmap.md": dict(
         ONLY="CFSGStatement",
         SKIP="none",

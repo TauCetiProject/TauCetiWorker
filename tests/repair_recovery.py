@@ -1039,6 +1039,56 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "pr-policy")
 
+    def test_idle_recovery_immediately_selects_normal_work_without_backoff(self):
+        from tauceti_worker import loop
+        from tauceti_worker.constants import EX_RECOVERY_IDLE
+
+        args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None)
+        tails = []
+
+        def run(tail):
+            tails.append(tail)
+            if len(tails) == 1:
+                return EX_RECOVERY_IDLE
+            raise KeyboardInterrupt()
+
+        with (
+            patch.object(loop, "api_mode", return_value=True),
+            patch.object(loop, "fleet_admission_reason", return_value=None),
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop, "run_round_subprocess", run),
+            patch.object(loop.time, "sleep", side_effect=AssertionError("recovery collision slept")),
+            patch.dict(os.environ, TAUCETI_USE_BUDGET="0"),
+        ):
+            self.assertEqual(loop.cmd_loop(args, self.cfg, only=["fix"], agent="claude"), 130)
+        self.assertIn("--recovery-only", tails[0])
+        self.assertNotIn("--recovery-only", tails[1])
+
+    def test_repeated_claim_collisions_never_enter_failure_backoff(self):
+        from tauceti_worker import loop
+        from tauceti_worker.constants import EX_CLAIM_COLLISION
+
+        args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None)
+        calls = []
+
+        def run(tail):
+            calls.append(tail)
+            if len(calls) > 9:
+                raise KeyboardInterrupt()
+            return EX_CLAIM_COLLISION
+
+        with (
+            patch("tauceti_worker.repair_recovery.due", return_value=False),
+            patch.object(loop, "api_mode", return_value=True),
+            patch.object(loop, "fleet_admission_reason", return_value=None),
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop, "run_round_subprocess", run),
+            patch.object(loop.time, "sleep") as sleep,
+            patch.dict(os.environ, TAUCETI_USE_BUDGET="0"),
+        ):
+            self.assertEqual(loop.cmd_loop(args, self.cfg, only=["fix"], agent="claude"), 130)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 10, 15, 20, 25, 30, 30, 30])
+
     def test_loop_recovery_precedes_model_budget(self):
         from tauceti_worker import loop
 

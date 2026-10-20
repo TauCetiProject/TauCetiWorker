@@ -571,3 +571,7 @@ work available. Automatic dependency bumps continue under the existing loop back
 and merges current main, diagnoses the actual integration failure, preserves
 the dependency target and verifies its changes before pushing. Healthy surveys
 make no additional API calls.
+
+Claim collisions skip to other candidates without consuming a repair attempt. An idle mechanical
+recovery probe returns immediately to normal work selection. Only consecutive all-busy passes
+use a small capped retry pause; they never enter the general failed-round backoff.

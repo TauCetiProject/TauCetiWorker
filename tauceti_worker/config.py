@@ -358,6 +358,10 @@ class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
 
 
+class ClaimCollision(NoProgress):
+    """Available candidates were claimed by peers; reselect without failure backoff."""
+
+
 class ProgressPreparationUnavailable(NoProgress):
     """Mechanical progress preparation needs time or infrastructure, without a paid attempt."""
 
