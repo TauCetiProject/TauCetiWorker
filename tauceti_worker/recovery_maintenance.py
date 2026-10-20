@@ -550,6 +550,9 @@ def _cleanup(state, tree, root, work, observation=None):
                 return
             saving_source = True
             snap = wr.inspect(tree, history=True)
+            if snap.published:
+                wr._handoff_source_receipts(cfg, owner, None, checkout=tree)
+                owner = {**owner, "recovery_handoffs": []}
             record = wr._record(
                 cfg,
                 tree,

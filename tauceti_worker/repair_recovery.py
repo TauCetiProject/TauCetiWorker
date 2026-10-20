@@ -1521,11 +1521,18 @@ class WorkerBackend:
         if self.verification_fingerprint(checkout, m, facts) != publication.get("fingerprint"):
             raise RuntimeError("Exact verification inputs changed at the final push boundary")
         self.validate_commit(checkout)
+        if normal_publication(self.record, m, self.journal):
+            raise Wait("normal-publication-arrived", "Reconcile the newly captured normal push before publication")
         publication["push_started"] = True
         write(self.record, self.journal, "publication-pending", publication=publication)
         try:
             subprocess.run(
-                [str(HERE / "scripts/git-safe-push")], cwd=checkout, capture_output=True, check=True, timeout=300
+                [str(HERE / "scripts/git-safe-push")],
+                cwd=checkout,
+                capture_output=True,
+                check=True,
+                timeout=300,
+                env={**os.environ, "TAUCETI_PUSH_OID": publication["oid"]},
             )
         except (FileNotFoundError, PermissionError):
             # These exec failures cannot have sent a push. Preserve uncertainty
@@ -1655,7 +1662,9 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True, agent=None):
     metadata_due = read_json(root / "cursor.json").get("blocked_probe_at", 0) + 1800 <= time.time()
     for record in record_directories(root):
         journal = read_json(record / "recovery.json")
-        if (journal.get("handoff") or {}).get("state") == "offered" and journal.get("retry_at", 0) <= time.time():
+        h = journal.get("handoff") or {}
+        changed_receipt = h.get("state") == "offered" and saved.source_receipt(record, h) != h.get("source_receipt")
+        if h.get("state") == "offered" and (journal.get("retry_at", 0) <= time.time() or changed_receipt):
             return True  # The next owned round reconciles an unfinished normal task.
         if journal.get("state") in TERMINAL:
             continue
@@ -1870,8 +1879,14 @@ def reconcile_handoff(cfg, record, j):
     until normal work assesses it; an old attempt must not replay behind it.
     """
     h = j.get("handoff") or {}
-    if h.get("state") != "offered" or j.get("retry_at", 0) > time.time():
+    receipt = saved.source_receipt(record, h)
+    changed_receipt = receipt and receipt != h.get("source_receipt")
+    if h.get("state") != "offered" or (j.get("retry_at", 0) > time.time() and not changed_receipt):
         return
+    if changed_receipt:
+        h = {**h, "source_receipt": receipt}
+        j["handoff"] = h
+        j["retry_at"] = 0
     if j.get("forensic_only"):
         write(
             record,
@@ -1895,6 +1910,17 @@ def reconcile_handoff(cfg, record, j):
     original = read_json(record / "manifest.json")
     receipt = h.get("source_receipt")
     receipt_checked = bool(receipt and receipt.get("round_id") == h.get("source_round"))
+    if receipt_checked and receipt.get("published_head"):
+        write(
+            record,
+            j,
+            "obsolete",
+            handoff={**h, "state": "published", "published_head": receipt["published_head"]},
+            reason=reason(
+                Obsolete("source-handoff-published", "Durable publication evidence retained with the original checkout")
+            ),
+        )
+        return
     receipt_checkpoint = Path(receipt["checkpoint"]) if receipt_checked and receipt.get("checkpoint") else None
     if h.get("source_round"):
         # Round-named preservation records permit bounded point lookups; never
@@ -1918,7 +1944,8 @@ def reconcile_handoff(cfg, record, j):
                         "obsolete",
                         handoff={**h, "state": "transferred", "checkpoint": str(other)},
                         forensic_only=bool(
-                            normal_publication(other, m, read_json(other / "recovery.json"))
+                            (receipt or {}).get("pending_publication")
+                            or normal_publication(other, m, read_json(other / "recovery.json"))
                             or uncertain_publication(read_json(other / "recovery.json"))
                         ),
                         reason=reason(
@@ -1931,6 +1958,21 @@ def reconcile_handoff(cfg, record, j):
                     return
     if receipt_checkpoint and receipt_checkpoint != record:
         receipt_checked = False  # An invalid/missing positive pointer never proves absence.
+    if receipt and receipt.get("pending_publication"):
+        write(
+            record,
+            j,
+            "obsolete",
+            handoff={**h, "state": "forensic"},
+            forensic_only=True,
+            reason=reason(
+                Obsolete(
+                    "publication-uncertain",
+                    "Original checkout retained an uncertain push; source is evidence without replay",
+                )
+            ),
+        )
+        return
     attempt = None
     attempted_commit = None
     if h.get("attempt_marker") and (checkout / ".git").exists():
@@ -1944,7 +1986,11 @@ def reconcile_handoff(cfg, record, j):
         if (
             (attempt == h.get("attempt_before") and pending == h.get("pending_before"))
             or (attempt and rejected == attempt and not pending)
-            or (last_intent and last_intent["oid"] == last_intent["expected"])
+            or (
+                last_intent
+                and last_intent["oid"] == last_intent["expected"]
+                and pending in (None, h.get("pending_before"), attempt)
+            )
         ):
             if h.get("source_receipt_required") and h.get("accepted") and not receipt_checked:
                 waits = h.get("source_waits", 0) + 1
@@ -2175,7 +2221,7 @@ def recover(w, opts):
             handoff.get("id") == identity
             and handoff.get("state") == "offered"
             and handoff.get("source_receipt_required")
-            and not handoff.get("source_receipt")
+            and not saved.source_receipt(candidate, handoff)
             and (w.cfg.checkout / ".git").exists()
         ):
             saved.guard(w.cfg, w.cfg.checkout, repository=w.gh.repo)

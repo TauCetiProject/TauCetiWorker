@@ -48,6 +48,7 @@ left the source. Each record is private to its worker (mode `0700`/`0600`):
 | `untracked.tar` | untracked and ignored source with original relative paths, plus the bytes of conflicted and assume-unchanged/skip-worktree paths; symlinks are stored as links and never followed |
 | `status.json` | mutable disposition: `preserved`, `checkout-reset`, `retained` or `superseded` |
 | `normal-publication.json` | optional durable normal-push intent on reused source; separate from the consumer journal so concurrent journal updates cannot erase it |
+| `source-outcomes/` | optional per-handoff checkpoint or clean-inspection outcomes, including publication evidence from the original checkout |
 
 The worker writes into a `.tmp-*` directory and fsyncs every file and the
 directory. It then renames the directory into place and fsyncs the parent.
@@ -263,8 +264,13 @@ prefers retained normal progress, and returns unused source to mechanical
 recovery when durable Git intent proves no push was attempted or the attempt
 was rejected. This also permits reintegration after another writer moves the head.
 The normal saver records the actual captured checkpoint, or a completed clean
-inspection, under the existing handoff lock. This durable source outcome survives
-disposable-index loss and non-sequential checkpoint names. An interrupted capture
+inspection, in independent atomic outcome files. The consumer incorporates them
+under its existing journal lock; a concurrent source save never rewrites that
+journal. These durable outcomes survive disposable-index loss and non-sequential
+checkpoint names. They retain scoped publication and uncertain-push evidence
+from the original checkout. Before replacement or destructive reset, the live
+checkout owner sheds the old handoff attribution; retained source keeps its
+original owner record. An interrupted capture
 retries through ordinary preservation while independent normal work proceeds;
 missing cache entries never prove that no newer source exists. A clean inspection
 cannot erase an earlier positive checkpoint receipt.

@@ -62,7 +62,7 @@ fi
 
 # 2) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
 # Resolve HEAD once: the oid pushed is the oid later recorded as published, even if HEAD moves.
-OID="$(git rev-parse --verify 'HEAD^{commit}')" || infra_die "HEAD does not name a commit"
+OID="$(git rev-parse --verify "${TAUCETI_PUSH_OID:-HEAD}^{commit}")" || infra_die "publication does not name a commit"
 DEST="$REF"
 [[ "$DEST" == refs/* ]] || DEST="refs/heads/$REF"
 echo "git-safe-push: $REMOTE ${OID:0:12}:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2

@@ -2076,12 +2076,163 @@ class Fixture(unittest.TestCase):
         self.assertNotEqual(latest.name, "receiving-round")
         git(self.co, "push", "-q", "origin", "HEAD:main")
         self.assertEqual(saved.guard(self.cfg, self.co, repository="upstream/repo").state, "clean")
-        self.assertEqual(self.journal()["handoff"]["source_receipt"]["checkpoint"], str(latest))
+        self.assertEqual(saved.source_receipt(self.record, self.journal()["handoff"])["checkpoint"], str(latest))
         for entry in (self.cfg.state / "recovery-index").glob("*.json"):
             entry.unlink()  # Fault injection: this cache is explicitly disposable.
         rr.reconcile_handoff(self.cfg, self.record, self.journal())
         self.assertEqual(self.journal()["handoff"]["checkpoint"], str(latest))
         self.assertEqual(self.journal()["handoff"]["state"], "transferred")
+
+    def test_replacement_checkout_cannot_acknowledge_retained_source_as_clean(self):
+        from tauceti_worker import agents
+
+        self.handoff()
+        (self.co / "A.lean").write_text("receiving round retained source\n")
+        with patch.object(saved, "_record", side_effect=saved.RecordError("fixture source changing")):
+            decision = saved.guard(self.cfg, self.co, repository="upstream/repo")
+        self.assertEqual(decision.state, "retained")
+        with (
+            patch.object(agents, "CHECKOUT_URL", str(self.remote)),
+            patch.object(agents, "sync_mathlib_pool"),
+            patch.object(agents, "clean_lake_cache_after_toolchain_bump"),
+        ):
+            self.assertTrue(agents.prepare_checkout(self.cfg, work="fix", pr=11))
+        self.assertIsNone(saved.source_receipt(self.record, self.journal()["handoff"]))
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "offered")
+        with (
+            patch.object(saved, "owner_stopped", return_value=True),
+            patch.object(saved, "live_users", return_value=[]),
+        ):
+            saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
+        self.assertTrue(rr.due(self.cfg))
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "transferred")
+
+    def test_receipt_capture_does_not_wait_on_consumer_lock_or_mutate_journal(self):
+        self.handoff()
+        before = self.journal()
+        owner = read_json(saved.owner_path(self.cfg))
+        with (self.record / "recovery.lock").open("a+") as lock:
+            __import__("fcntl").flock(lock, __import__("fcntl").LOCK_EX)
+            checkpoint = saved._record(
+                self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=owner
+            )
+        self.assertEqual(self.journal(), before)
+        self.assertEqual(saved.source_receipt(self.record, before["handoff"])["checkpoint"], str(checkpoint))
+
+    def test_receipt_io_failure_retains_source_and_reuses_completed_record(self):
+        self.handoff()
+        (self.co / "A.lean").write_text("new receiving progress\n")
+        owner = read_json(saved.owner_path(self.cfg))
+        with patch.object(saved, "_handoff_source_receipts", side_effect=saved.RecordError("fixture full disk")):
+            with self.assertRaises(saved.RecordError):
+                saved._record(self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=owner)
+        before = list(self.record.parent.glob("receiving-round*"))
+        self.assertEqual(len(before), 1)
+        checkpoint = saved._record(self.cfg, self.co, saved.inspect(self.co), "TauCeti", "upstream/repo", owner=owner)
+        self.assertEqual(checkpoint, before[0])
+        self.assertEqual(len(list(self.record.parent.glob("receiving-round*"))), 1)
+
+    def test_later_noop_attempt_cannot_hide_earlier_uncertain_normal_push(self):
+        self.normal_lost_push()
+        git(self.co, "reset", "--hard", self.base)
+        self.assertEqual(self.normal_push().returncode, 78)
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertNotEqual(self.journal()["handoff"]["state"], "returned")
+
+    def test_push_pins_verified_commit_even_if_head_moves_at_helper_launch(self):
+        actual = subprocess.run
+
+        def late_writer(argv, *args, **kwargs):
+            if argv[0].endswith("git-safe-push"):
+                checkout = kwargs["cwd"]
+                (checkout / "A.lean").write_text("unverified late source\n")
+                git(checkout, "add", "A.lean")
+                git(
+                    checkout,
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "commit",
+                    "-qm",
+                    "late writer",
+                )
+            return actual(argv, *args, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=late_writer):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained repair")
+        self.assertEqual((self.record / "checkout/A.lean").read_text(), "unverified late source\n")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.journal()["publication"]["oid"])
+
+    def test_normal_publication_arriving_during_verification_prevents_replay(self):
+        prepare = self.backend.prepare
+
+        def captured_late(checkout, *args):
+            publication = prepare(checkout, *args)
+            rr.atomic_json(
+                self.record / "normal-publication.json",
+                {key: publication[key] for key in ("oid", "expected", "repository", "ref")},
+            )
+            return publication
+
+        with patch.object(self.backend, "prepare", side_effect=captured_late):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "normal-publication-arrived")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+        self.assertNotIn("publication", self.journal())
+
+    def test_retained_checkout_publication_evidence_survives_replacement(self):
+        from tauceti_worker import agents
+
+        self.handoff()
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "normal published source")
+        self.assertEqual(self.normal_push().returncode, 0)
+        published = git(self.co, "rev-parse", "HEAD")
+        with patch.object(saved, "inspect", side_effect=saved.RecordError("fixture interrupted inspection")):
+            self.assertEqual(saved.guard(self.cfg, self.co, repository="upstream/repo").state, "retained")
+        with (
+            patch.object(agents, "CHECKOUT_URL", str(self.remote)),
+            patch.object(agents, "sync_mathlib_pool"),
+            patch.object(agents, "clean_lake_cache_after_toolchain_bump"),
+        ):
+            self.assertTrue(agents.prepare_checkout(self.cfg, work="fix", pr=11))
+        with (
+            patch.object(saved, "owner_stopped", return_value=True),
+            patch.object(saved, "live_users", return_value=[]),
+        ):
+            saved.housekeep(self.cfg.state.parent, seconds=5, entries=10000)
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "published")
+        self.assertEqual(self.journal()["handoff"]["published_head"], published)
+        self.assertEqual(git(self.remote, "rev-parse", "main"), published)
+
+    def test_retained_checkout_uncertain_intent_is_not_erased_by_clean_replacement(self):
+        self.handoff()
+        git(self.co, "add", "-A")
+        git(self.co, "commit", "-qm", "uncertain source")
+        env = {
+            **os.environ,
+            "TAUCETI_PUSH_REF": "main",
+            "TAUCETI_PUSH_EXPECT": self.base,
+            "TAUCETI_PUSH_REMOTE": str(self.root / "missing-remote.git"),
+        }
+        result = subprocess.run(
+            [str(Path(__file__).resolve().parent.parent / "scripts/git-safe-push")],
+            cwd=self.co,
+            env=env,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        git(self.co, "reset", "--hard", self.base)
+        saved.guard(self.cfg, self.co, repository="upstream/repo")
+        rr.reconcile_handoff(self.cfg, self.record, self.journal())
+        self.assertEqual(self.journal()["handoff"]["state"], "forensic")
+        self.assertTrue(self.journal()["forensic_only"])
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
     def test_gc_cannot_prune_reintegration_lineage_inputs(self):
         self.rewritten_checkpoint(conflicting=True)

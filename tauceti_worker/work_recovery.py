@@ -33,7 +33,6 @@ was published from a transcript; resuming retained work is a separate consumer o
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import io
 import json
@@ -803,29 +802,66 @@ def push_intent(repo, ref):
     return dict(oid=_rev(repo, ref), expected=message[1] if len(message) > 1 else None)
 
 
-def _handoff_source_receipts(cfg, owner, checkpoint):
-    """A completed save/clean inspection acknowledges the receiving round, never agent text."""
+def source_receipt(record, handoff):
+    identity = handoff.get("id", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", identity):
+        return handoff.get("source_receipt")
+    root = record / "source-outcomes"
+    positive = read_json(root / f"{identity}.checkpoint.json")
+    clean = read_json(root / f"{identity}.clean.json")
+    receipt = positive or clean or handoff.get("source_receipt")
+    if receipt:
+        publication = positive.get("published_head") or clean.get("published_head")
+        pending = positive.get("pending_publication") or clean.get("pending_publication")
+        return {
+            **receipt,
+            **({"published_head": publication} if publication else {}),
+            **({"pending_publication": pending} if pending else {}),
+        }
+    return receipt
+
+
+def detach_handoff_owner(cfg, label="TauCeti"):
+    """Old source attribution must not follow a replacement or destructively reset checkout."""
+    path = owner_path(cfg, label)
+    owner = read_json(path)
+    if owner.get("recovery_handoffs"):
+        owner["recovery_handoffs"] = []
+        atomic_json(path, owner)
+        _fsync_dir(path.parent)
+
+
+def _handoff_source_receipts(cfg, owner, checkpoint, *, checkout=None):
+    """Independent, atomic handoff outcomes cannot race consumer journal/lock updates."""
     for record_name, identity in (owner.get("recovery_handoffs") or [])[:4]:
         record = Path(record_name)
-        if record.parent != cfg.state / "recovery" or record.is_symlink():
-            raise RecordError("handoff receipt destination is outside this worker's recovery records")
-        with (record / "recovery.lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            journal = read_json(record / "recovery.json")
-            handoff = journal.get("handoff") or {}
-            if handoff.get("id") != identity or handoff.get("state") != "offered":
-                continue
-            if handoff.get("source_round") != owner.get("round_id"):
-                raise RecordError("handoff source receipt round mismatch")
-            receipt = dict(round_id=owner.get("round_id"), checkpoint=str(checkpoint) if checkpoint else None)
-            if checkpoint is None and (handoff.get("source_receipt") or {}).get("checkpoint"):
-                continue  # A clean preserved checkout must not erase an earlier durable source pointer.
-            if handoff.get("source_receipt") == receipt:
-                continue
-            journal["handoff"] = {**handoff, "source_receipt": receipt}
-            journal["retry_at"] = 0
-            atomic_json(record / "recovery.json", journal)
-            _fsync_dir(record)
+        if (
+            record.parent != cfg.state / "recovery"
+            or record.is_symlink()
+            or not re.fullmatch(r"[0-9a-f]{32}", identity)
+        ):
+            raise RecordError("invalid handoff receipt destination")
+        handoff = read_json(record / "recovery.json").get("handoff") or {}
+        if handoff.get("id") != identity or handoff.get("state") != "offered":
+            continue
+        if handoff.get("source_round") != owner.get("round_id"):
+            raise RecordError("handoff source receipt round mismatch")
+        receipt = dict(round_id=owner.get("round_id"), checkpoint=str(checkpoint) if checkpoint else None)
+        if checkout is not None:
+            published = _rev(checkout, handoff["push_marker"])
+            if published and published != handoff.get("published_before"):
+                receipt["published_head"] = published
+            pending = push_intent(checkout, handoff["pending_marker"])
+            if pending and pending["oid"] != pending["expected"]:
+                receipt["pending_publication"] = pending
+        path = record / "source-outcomes" / f"{identity}.{'checkpoint' if checkpoint else 'clean'}.json"
+        try:
+            if read_json(path) != receipt:
+                atomic_json(path, receipt)
+                _fsync_dir(path.parent)
+                _fsync_dir(record)
+        except OSError as error:
+            raise RecordError(f"could not retain source outcome: {error}") from error
 
 
 def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
@@ -879,7 +915,7 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         if (outcome or {}).get("pending_push"):
             atomic_json(record / "normal-publication.json", outcome["pending_push"])
             _fsync_dir(record)
-        _handoff_source_receipts(cfg, owner, record)
+        _handoff_source_receipts(cfg, owner, record, checkout=repo)
         if snap.unpublished:
             _remember_commits(cfg.state, record, _read_manifest(record), snap)
         return record
@@ -966,7 +1002,11 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         if isinstance(error, RecordError):
             raise
         raise RecordError(f"could not save recovery record: {error}") from error
-    _handoff_source_receipts(cfg, owner, final)
+    receipt_error = None
+    try:
+        _handoff_source_receipts(cfg, owner, final, checkout=repo)
+    except RecordError as error:
+        receipt_error = error
     # The descriptor is durable before the disposable index is published. Failure/crash here is
     # safe: a later lookup misses and saves again, or housekeeping reconstructs an unverified entry.
     if indexed:
@@ -982,6 +1022,8 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         + [f"delete {pending}/{name}" for name in bundle_refs],
         check=False,
     )
+    if receipt_error:
+        raise receipt_error
     return final
 
 
@@ -1303,9 +1345,16 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
         decision = _guard(cfg, repo, label=label, repository=repository)
         if decision.ok and decision.state == "clean":
             try:
-                _handoff_source_receipts(cfg, owner, None)
+                _handoff_source_receipts(cfg, owner, None, checkout=repo)
             except (OSError, RecordError) as error:
-                log(f"handoff source inspection receipt deferred: {error}")
+                decision = _retain(
+                    cfg,
+                    repo,
+                    f"handoff source outcome could not be saved ({error})",
+                    None,
+                    label,
+                    repository=repository,
+                )
         decision.details["preparation"] = work.report()
         with contextlib.suppress(OSError):
             atomic_json(cfg.state / "recovery-preparation.json", dict(at=time.time(), **work.report()))
