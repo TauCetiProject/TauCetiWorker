@@ -16,7 +16,7 @@ function fixture(){
  const env={ALLOWED_REPOSITORIES:JSON.stringify([{id:'100',name:'org/repo',installation:'200'}]),ARCHIVE:{
   async put(key,text){objects.set(key,text);},async get(key){const text=objects.get(key);return text===undefined?null:{text:async()=>text,json:async()=>JSON.parse(text)};}
  }};
- const ctx={storage:{sql:{exec(sql,...bindings){
+ const ctx={blockConcurrencyWhile:fn=>fn(),storage:{sql:{exec(sql,...bindings){
   let rows=[];
   if(!bindings.length && sql.includes(';')) db.exec(sql);
   else {const statement=db.prepare(sql);if(statement.columns().length)rows=statement.all(...bindings);else statement.run(...bindings);}
