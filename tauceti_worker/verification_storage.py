@@ -452,7 +452,8 @@ class Monitor:
                 break
             if self.bytes > self.limit:
                 self.close()
-                overflow(self.state, self.identifier, self.bytes)
+                with contextlib.suppress(OSError, Pressure):
+                    overflow(self.state, self.identifier, self.bytes)
                 raise Limit("running verification candidate exceeded its byte reservation")
 
     def close(self):
@@ -469,7 +470,8 @@ class Monitor:
             for amount in inventory:
                 size += amount
                 if size > self.limit:
-                    overflow(self.state, self.identifier, size)
+                    with contextlib.suppress(OSError, Pressure):
+                        overflow(self.state, self.identifier, size)
                     raise Limit("completed candidate exceeds its logical byte reservation")
         settle(self.tree.parent.parent, self.tree.name, size)
 

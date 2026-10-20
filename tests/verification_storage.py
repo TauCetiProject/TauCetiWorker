@@ -646,6 +646,15 @@ class Storage(Receipts):
         with patch.dict(os.environ, TAUCETI_VERIFY_BUBBLE="1"):
             self.assertEqual(self.verify(stage="build")["status"], "success")
 
+    def test_accounting_contention_cannot_turn_a_fixed_limit_into_automatic_retries(self):
+        _, job, _ = self.pending()
+        os.environ["TAUCETI_VERIFY_CANDIDATE_BYTES"] = "10"
+        monitor = storage.Monitor(self.state, job["id"])
+        self.addCleanup(monitor.close)
+        with patch.object(storage, "overflow", side_effect=storage.Pressure("accounting busy")):
+            self.assertRaises(storage.Limit, monitor.check)
+            self.assertRaises(storage.Limit, monitor.finish)
+
 
 def load_tests(loader, suite, pattern):
     return unittest.TestSuite(
