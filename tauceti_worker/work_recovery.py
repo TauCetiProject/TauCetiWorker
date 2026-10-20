@@ -461,6 +461,12 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
 
     root = cfg.state / "recovery"
     owner = owner or read_json(owner_path(cfg, label))
+    marker = owner.get("publication_marker") or {}
+    outcome = owner.get("round_outcome")
+    if marker.get("ref"):
+        published = _rev(repo, marker["ref"])
+        if published and published != marker.get("before"):
+            outcome = {**(outcome or {}), "published_head": published}
     source_round = owner.get("round_id") or current_round_id() or f"unattributed-{int(time.time())}"
     base_id = _safe_id(str(source_round))
     try:
@@ -548,6 +554,7 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
             excluded=[dict(path=p, reason=r) for p, r in snap.excluded],
             files=files,
             authorization=owner.get("authorization"),
+            round_outcome=outcome,
             conversation=read_json(Path(owner["conversation_path"])) if owner.get("conversation_path") else None,
         )
         _write(tmp / "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())

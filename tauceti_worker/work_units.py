@@ -1744,6 +1744,12 @@ def _do_fixlike(
                 conversation_path=str(conversation_path),
             )
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
+        from .work_recovery import _rev
+
+        push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
+        published_before = _rev(co, push_marker)
+        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before))
+        agent_rc = None
         try:
             rc = run_agent_host(
                 co,
@@ -1755,6 +1761,7 @@ def _do_fixlike(
                 session_actor=getattr(sv, "me_login", ""),
                 session_scope=conversation_scope,
             )
+            agent_rc = rc
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.
@@ -1765,9 +1772,17 @@ def _do_fixlike(
             # Agent containment is empty before run_agent_host returns or raises.
             # Capture the final source now, so a quota-blocked loop can recover it
             # without needing another paid round to reach checkout preparation.
-            from .work_recovery import guard
+            from .work_recovery import guard, note_owner
 
             if (co / ".git").exists():
+                published_after = _rev(co, push_marker)
+                note_owner(
+                    w.cfg,
+                    round_outcome=dict(
+                        exit_code=agent_rc,
+                        published_head=published_after if published_after != published_before else None,
+                    ),
+                )
                 guard(w.cfg, co)
     if capacity_wait():
         from .config import VerificationUnavailable

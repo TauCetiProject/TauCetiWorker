@@ -128,11 +128,12 @@ def scratch_path(rel):
     )
 
 
-def selection(only, prs, sandbox_host):
+def selection(only, prs, sandbox_host, agent="auto"):
     return dict(
         only=sorted(only),
         prs=sorted(prs),
         sandbox_host=sandbox_host,
+        agent=agent,
         roadmap=os.environ.get("TAUCETI_ROADMAP_ONLY"),
         skip=os.environ.get("TAUCETI_ROADMAP_SKIP"),
     )
@@ -182,19 +183,14 @@ class Recovery:
             )
             return False
         operator = read_json(self.record / "operator.json")
-        if (
-            j.get("state") == "blocked"
-            and (j.get("reason") or {}).get("code") in PERMANENT_BLOCKS
-            and j.get("operator", {}) == operator
-        ):
-            return False
-        selected = selection(b.opts.only, b.opts.prs, b.opts.sandbox_host)
+        selected = selection(b.opts.only, b.opts.prs, b.opts.sandbox_host, b.opts.agent)
         changed_selection = j.get("selection") is not None and j.get("selection") != selected
         if j.get("retry_at", 0) > time.time() and j.get("operator", {}) == operator and not changed_selection:
             return False
         charged = False
         try:
             facts = b.facts(m)
+            j["observed_head"] = facts["head"]
             # Reconcile first, even after the third crash. A push may have succeeded just
             # before process death. Closed/held PRs must never cause that push to be replayed.
             if j.get("publication"):
@@ -224,6 +220,12 @@ class Recovery:
             if j.get("external") != external:
                 self.transition("eligible", external=external, operator=operator, attempts=0, retry_at=0, reason=None)
             b.policy(m, facts)
+            if (m.get("round_outcome") or {}).get("published_head"):
+                raise Obsolete(
+                    "post-publication-leftovers",
+                    "The original round already published through git-safe-push; these later edits have no publication authorization",
+                    "Keep the source archived; explicitly scope any remaining idea as new work",
+                )
             if j.get("attempts", 0) >= 3:
                 self.transition(
                     "blocked",
@@ -239,6 +241,16 @@ class Recovery:
                 return False
             if j.get("retry_at", 0) > time.time() and not changed_selection:
                 return False
+            prior_checkout = self.record / "checkout"
+            if (
+                j.get("failed_head") == facts["head"]
+                and j.get("failed_source")
+                and (prior_checkout / ".git").exists()
+                and saved.inspect(prior_checkout).fingerprint == j["failed_source"]
+            ):
+                # A known failed source needs reasoning. Admission waits must not
+                # warm caches or repeat the same expensive failed build each time.
+                b.continuation_admission(self.record, m, j)
             b.acquire(m, facts)
             # No attempt is consumed until a real claim and all prerequisites are available.
             claimed = b.facts(m)
@@ -316,7 +328,7 @@ class Recovery:
                 b.release()
             except Exception as error:
                 log(f"recovery claim release failed: {error}")
-            if j.get("state") in TERMINAL:
+            if j.get("state") in TERMINAL or j.get("state") == "blocked":
                 b.evict_caches(self.record)
 
     def continue_source(self, checkout, facts, why):
@@ -508,6 +520,20 @@ class WorkerBackend:
                     "Resumed source checkout is missing",
                     "Restore the isolated checkout from backup; original checkpoint remains available",
                 )
+            lock = checkout / ".git/index.lock"
+            if lock.exists() and (j.get("pending_merge_head") or j.get("content_started")):
+                from .containment import strong, unconfirmed
+
+                if not strong() or unconfirmed() or saved.live_users(checkout):
+                    raise Wait("continuation-cleanup", "Owned Git operation still needs confirmed quiescence")
+                lock.rename(record / f"retained-index-lock-{uuid.uuid4().hex}")
+                saved._fsync_dir(record)
+            if j.get("content_started") and j.get("source_checkpoint_for") != j["content_started"]:
+                from .containment import strong, unconfirmed
+
+                if not strong() or unconfirmed() or saved.live_users(checkout):
+                    raise Wait("continuation-cleanup", "Interrupted continuation still needs confirmed quiescence")
+                self.snapshot_continuation(checkout, record, m, j)
             return checkout
         temp = record / f"restore-{uuid.uuid4().hex}"
         source = self.w.cfg.checkout
@@ -583,18 +609,32 @@ class WorkerBackend:
             write(record, j, "resuming", retained_extra=str(dest))
 
     def evict_caches(self, record):
+        from .containment import strong, unconfirmed
+
+        if not strong() or unconfirmed():
+            return
+        marker = record / "cache-evicted.json"
+        if read_json(marker).get("done"):
+            return
         # Never delete source or Git history on a terminal transition. Build caches
         # are rebuildable; interrupted restores never ran a model and keep their bytes.
         for checkout in [record / "checkout", *record.glob("restore-*"), *record.glob("interrupted-restore-*")]:
             if checkout.is_dir():
+                if saved.live_users(checkout):
+                    return
                 try:
                     saved._evict_caches(checkout)
                 except OSError as error:
                     log(f"recovery cache eviction deferred: {error}")
+                    return
+        atomic_json(marker, dict(done=True))
 
     def commit_source(self, checkout, m):
         snap = saved.inspect(checkout)
-        if snap.operations or snap.conflicted:
+        journal = getattr(self, "journal", {})
+        owned_merge = journal.get("pending_merge_head") == saved._rev(checkout, "MERGE_HEAD")
+        owned_merge = bool(journal.get("pending_merge_head") and owned_merge)
+        if (snap.operations and not (owned_merge and set(snap.operations) == {"MERGE_HEAD"})) or snap.conflicted:
             raise Block(
                 "incomplete-git-operation",
                 "The isolated checkout has an unfinished Git operation",
@@ -620,8 +660,10 @@ class WorkerBackend:
             "-c",
             "core.hooksPath=/dev/null",
         ]
-        if saved._git(checkout, "diff", "--cached", "--name-only"):
+        if owned_merge or saved._git(checkout, "diff", "--cached", "--name-only"):
             saved._git(checkout, *options, "commit", "-m", f"Recover retained repair {m['id']}")
+        if owned_merge:
+            write(self.record, journal, "resuming", pending_merge_head=None)
         return options
 
     def superseded(self, checkout, m, facts):
@@ -639,6 +681,35 @@ class WorkerBackend:
                 "Checkpoint has no original expected remote head",
                 "Recover the original head from structured round evidence",
             )
+
+        def ancestor(old, new):
+            return (
+                subprocess.run(
+                    ["git", "-C", str(checkout), "merge-base", "--is-ancestor", old, new], capture_output=True
+                ).returncode
+                == 0
+            )
+
+        # A merge can resurrect commits deliberately removed by another writer's
+        # rebase. Only a fast-forward lineage, or an explicitly rebased saved delta,
+        # is eligible for automatic integration.
+        if not ancestor(expected, facts["head"]) and not (
+            ancestor(facts["head"], "HEAD") and not ancestor(expected, "HEAD")
+        ):
+            raise Block(
+                "head-rewritten",
+                "The current PR head rewrites the checkpoint's expected history",
+                "Re-integrate only the retained delta onto the current head in the isolated checkout, then retry; never merge or replay the removed lineage",
+            )
+        pending = j.get("pending_merge_head")
+        if pending and saved._rev(checkout, "MERGE_HEAD") == pending:
+            if pending != facts["head"]:
+                raise Block(
+                    "merge-head-changed",
+                    "An owned merge targets an older head",
+                    "Finish or explicitly reconstruct this merge against the current head",
+                )
+            return "resolve-owned-merge-conflicts" if saved.inspect(checkout).conflicted else None
         if m.get("operations") and not j.get("content_attempts"):
             return "unfinished-source-operation"
         # A changed writer's head must be integrated or require source reasoning.
@@ -659,6 +730,15 @@ class WorkerBackend:
         if merge.returncode not in (0, 1):
             raise RuntimeError("Mechanical integration requires a working git merge-tree --write-tree")
         if merge.returncode:
+            # Persist ownership before starting an operation; a crash must not turn
+            # our own merge into an unrecognised original Git operation.
+            write(self.record, j, "resuming", pending_merge_head=facts["head"])
+            result = subprocess.run(
+                ["git", "-C", str(checkout), *options, "merge", "--no-ff", "--no-commit", facts["head"]],
+                capture_output=True,
+            )
+            if result.returncode not in (0, 1):
+                raise RuntimeError("Could not prepare the owned recovery merge")
             return (
                 "remote-head-moved-reintegration-required"
                 if facts["head"] != expected
@@ -671,8 +751,16 @@ class WorkerBackend:
                 "The current writer already integrated all saved changes plus additional work",
                 "Keep the checkpoint archived; no replay or model invocation is needed",
             )
+        write(self.record, j, "resuming", pending_merge_head=facts["head"])
         saved._git(checkout, *options, "merge", "--no-edit", "--no-ff", facts["head"])
-        write(self.record, j, "resuming", integrated_head=facts["head"], mechanical_integration=True)
+        write(
+            self.record,
+            j,
+            "resuming",
+            integrated_head=facts["head"],
+            pending_merge_head=None,
+            mechanical_integration=True,
+        )
         return None
 
     def verification_environment(self, checkout):
@@ -706,6 +794,8 @@ class WorkerBackend:
         policy = scope_policy(
             facts["labels"], facts["ref"], bump=m.get("authorization", {}).get("automatic_bump", False)
         )
+        if getattr(self, "record", None):
+            (self.record / "cache-evicted.json").unlink(missing_ok=True)
         with environment(**self.verification_environment(checkout)):
             # Restore ordinary dependency/artifact prerequisites before fingerprinting;
             # an empty isolated clone must not compile missing Mathlib from scratch.
@@ -713,23 +803,35 @@ class WorkerBackend:
                 warm_host_build_caches(checkout, dict(os.environ), self.w.cfg.logdir)
             if getattr(self, "record", None):
                 self.prepare_source(checkout, self.record, m, self.journal)
-            result = Verification(
+            verifier = Verification(
                 checkout,
                 self.w.cfg.state,
                 base=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
                 policy=policy,
                 deadline=self.w.rc.deadline,
-            ).run()
+            )
+            j = getattr(self, "journal", {})
+            current = self.verification_fingerprint(checkout, m, facts)
+            if j.get("failed_fingerprint") == current:
+                return j["failed_receipt"]
+            result = verifier.run()
+            if result.get("status") == "failed" and getattr(self, "record", None):
+                write(
+                    self.record,
+                    j,
+                    "resuming",
+                    failed_fingerprint=current,
+                    failed_head=facts["head"],
+                    failed_source=saved.inspect(checkout).fingerprint,
+                    failed_receipt=result,
+                )
         if result.get("status") == "incomplete" and result.get("waiting_for_capacity"):
             raise Wait("verification-capacity", result["error"])
         return result
 
-    def continue_source(self, checkout, record, m, facts, why, j):
-        from .agents import AuthoringProfile, BuildCacheUnavailable, run_agent_host
-        from .budget import BudgetError
-        from .claude_api import api_context, api_mode
-        from .config import AdmissionUnavailable
-        from .fleet_capacity import admission_unit, unit_admitted
+    def continuation_admission(self, record, m, j):
+        from .agents import AuthoringProfile
+        from .claude_api import api_mode
         from .loop import resolve_work_model
         from .work_units import raise_on_account_mismatch
 
@@ -814,11 +916,21 @@ class WorkerBackend:
                 "Original workflow's content repair allowance is unavailable or exhausted",
                 "Resolve its existing retry policy before another model invocation",
             )
+        return auth, profile, keys
+
+    def continue_source(self, checkout, record, m, facts, why, j):
+        from .agents import BuildCacheUnavailable, run_agent_host, take_last_agent_infra_failure
+        from .budget import BudgetError
+        from .claude_api import api_context, api_mode
+        from .config import AdmissionUnavailable
+        from .fleet_capacity import admission_unit, unit_admitted
+
+        auth, profile, keys = self.continuation_admission(record, m, j)
         session = read_json(record / "continuation-session.json") or m.get("conversation")
         scope = dict(repository=m["repository"], pr=m["pr"], source_round=m.get("source_round"))
         resume = valid_conversation(session, profile, auth.get("actor"), scope=scope)
         conversation_reason = "validated-identity-profile" if resume else "missing-or-mismatched-identity-profile"
-        original = Path(m["checkout"])
+        original = Path((session or {}).get("cwd") or m["checkout"])
         if resume and not original.is_dir():
             resume, conversation_reason = None, "original-path-unavailable"
         if resume and not session_available(profile.provider, resume):
@@ -844,7 +956,7 @@ class WorkerBackend:
                 return False
             for key, value in before_counts.items():
                 self.w.counters.write(key, min(value, self.w.counters.read(key)))
-            write(record, j, "resuming", content_attempts=before_content)
+            write(record, j, "resuming", content_attempts=before_content, content_started=None)
             return True
 
         with (
@@ -870,6 +982,7 @@ class WorkerBackend:
                         j,
                         "resuming",
                         content_attempts=j.get("content_attempts", 0) + 1,
+                        content_started=uuid.uuid4().hex,
                         conversation_mode="resume" if resume else "narrow-new",
                         conversation_reason=conversation_reason,
                     )
@@ -886,7 +999,7 @@ class WorkerBackend:
                             session_scope=scope,
                             original_cwd=original if resume else None,
                         )
-                    except (BuildCacheUnavailable, FileNotFoundError) as error:
+                    except BuildCacheUnavailable as error:
                         refund_content(known_no_launch=True)
                         raise RuntimeError(
                             f"Continuation infrastructure failed before model launch: {error}"
@@ -905,6 +1018,24 @@ class WorkerBackend:
                 raise
             except BudgetError as error:
                 raise Wait("budget-refused", str(error)) from error
+        self.snapshot_continuation(checkout, record, m, j)
+        self.prepare_source(checkout, record, m, j)
+        if rc:
+            from .constants import MAX_INFRA_REFUNDS
+
+            infra = take_last_agent_infra_failure()
+            if (
+                infra
+                and not infra.startswith("local API admission")
+                and not (api and api.blocked_reason)
+                and j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS
+            ):
+                refund_content(known_no_launch=True)
+                write(record, j, "resuming", provider_refunds=j.get("provider_refunds", 0) + 1)
+                raise RuntimeError(f"Provider failed before structured work: {infra}")
+            raise RuntimeError(f"Narrow continuation exited {rc}; its exact source remains in the isolated checkout")
+
+    def snapshot_continuation(self, checkout, record, m, j):
         snapshot = saved._record(
             SimpleNamespace(state=record / "continuations", wid=self.w.cfg.wid),
             checkout,
@@ -915,14 +1046,18 @@ class WorkerBackend:
                 round_id=m.get("source_round") or m["id"],
                 pr=m["pr"],
                 work=m.get("work"),
-                expected_head=facts["head"],
+                expected_head=j.get("integrated_head") or m.get("expected_remote_head"),
                 authorization=m.get("authorization"),
             ),
         )
-        write(record, j, "resuming", integrated_head=facts["head"], continued=True, source_checkpoint=str(snapshot))
-        self.prepare_source(checkout, record, m, j)
-        if rc:
-            raise RuntimeError(f"Narrow continuation exited {rc}; its exact source remains in the isolated checkout")
+        write(
+            record,
+            j,
+            "resuming",
+            continued=True,
+            source_checkpoint=str(snapshot),
+            source_checkpoint_for=j.get("content_started"),
+        )
 
     def verification_fingerprint(self, checkout, m, facts):
         from .agents import scope_policy
@@ -1079,11 +1214,9 @@ def conversation_identity(provider):
         else:
             oauth = credentials.get("claudeAiOauth") or {}
             account = oauth.get("accountUuid") or (credentials.get("oauthAccount") or {}).get("accountUuid")
-            if not account:
-                for config in (root / ".claude.json", Path(str(root) + ".json")):
-                    account = (read_json(config).get("oauthAccount") or {}).get("accountUuid")
-                    if account:
-                        break
+            # A separate CLI profile can retain the old account after mirror_creds
+            # switches tokens. Without an ID in this credential document the
+            # binding is unknown, so use a narrow new conversation instead.
         return fingerprint(dict(provider=provider, billing=mode, home=str(root), account=account)) if account else None
     try:
         return fingerprint(
@@ -1108,7 +1241,7 @@ def session_available(provider, session):
     return any(root.glob(f"*/*/*/*{session}.jsonl"))
 
 
-def due(cfg, *, only=None, prs=(), sandbox_host=True):
+def due(cfg, *, only=None, prs=(), sandbox_host=True, agent=None):
     """Local-only scheduling hint: model funding is not needed to reconcile/publish."""
     if os.environ.get("TAUCETI_AUTO_RECOVERY", "on").lower() == "off":
         return False
@@ -1123,9 +1256,19 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True):
             journal = read_json(record / "recovery.json")
             changed = journal.get("operator", {}) != read_json(record / "operator.json")
             if journal.get("state") == "blocked" and not changed:
+                manifest = read_json(record / "manifest.json")
+                if (
+                    manifest.get("pr")
+                    and max(journal.get("probe_at", 0), journal.get("retry_at", 0)) <= time.time()
+                    and (journal.get("reason") or {}).get("code")
+                    not in {"missing-publication-scope", "original-authorization-missing"}
+                ):
+                    return True
                 continue
             if (journal.get("reason") or {}).get("code") in LOCAL_WAITS and not changed:
-                if only is None or journal.get("selection") == selection(only, prs, sandbox_host):
+                if only is None or journal.get("selection") == selection(
+                    only, prs, sandbox_host, agent or (journal.get("selection") or {}).get("agent", "auto")
+                ):
                     continue
                 return True
             if journal.get("state") not in TERMINAL and (
@@ -1167,7 +1310,9 @@ def recover(w, opts):
     cursor_path = root / "cursor.json"
     cursor = read_json(cursor_path).get("after", "")
     candidates = [p for p in candidates if p.name > cursor] + [p for p in candidates if p.name <= cursor]
-    for record in candidates[:MAX_INSPECT]:
+    inspected = 0
+    probed = False
+    for record in candidates:
         atomic_json(cursor_path, dict(after=record.name))
         j = read_json(record / "recovery.json")
         if j.get("state") in TERMINAL:
@@ -1175,15 +1320,37 @@ def recover(w, opts):
             continue
         unchanged_operator = j.get("operator", {}) == read_json(record / "operator.json")
         same_selection = j.get("selection") is None or j.get("selection") == selection(
-            opts.only, opts.prs, opts.sandbox_host
+            opts.only, opts.prs, opts.sandbox_host, opts.agent
         )
-        if unchanged_operator and (
-            j.get("state") == "blocked"
-            and (j.get("reason") or {}).get("code") in PERMANENT_BLOCKS
-            or j.get("retry_at", 0) > time.time()
-            and same_selection
-        ):
-            continue  # Do not hash large retained payloads just to rediscover a known wait.
+        permanent = j.get("state") == "blocked" and (j.get("reason") or {}).get("code") in PERMANENT_BLOCKS
+        if unchanged_operator and permanent:
+            # Metadata-only external-fact probe. No payload hashing or source work,
+            # and at most one network probe per phase even with a large backlog.
+            manifest = read_json(record / "manifest.json")
+            if not probed and manifest.get("pr") and j.get("probe_at", 0) <= time.time():
+                probed = True
+                backend = WorkerBackend(w, opts)
+                try:
+                    facts = backend.facts(manifest)
+                    if facts["state"] != "OPEN":
+                        write(
+                            record,
+                            j,
+                            "obsolete",
+                            reason=reason(Obsolete("pr-closed", f"PR is {facts['state']}; source archived")),
+                        )
+                    elif j.get("observed_head") and j["observed_head"] != facts["head"]:
+                        write(record, j, "eligible", retry_at=0, reason=None)
+                    else:
+                        write(record, j, "blocked", observed_head=facts["head"], probe_at=time.time() + 1800)
+                except Exception as error:
+                    write(record, j, "blocked", probe_at=time.time() + 1800, probe_error=str(error))
+            continue
+        if unchanged_operator and j.get("retry_at", 0) > time.time() and same_selection:
+            continue
+        if inspected >= MAX_INSPECT:
+            break
+        inspected += 1
         with (record / "recovery.lock").open("a+") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

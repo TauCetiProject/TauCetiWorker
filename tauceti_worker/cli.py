@@ -174,6 +174,8 @@ def add_github_account_flag(p: argparse.ArgumentParser) -> None:
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--recovery-only", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--recovery-agent", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--recovery-unpinned-profile", action="store_true", help=argparse.SUPPRESS)
     from .config import positive_integer
 
     p.add_argument(
@@ -1392,7 +1394,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                 )
                 recovery_opts = RoundOpts(
                     only=only,
-                    agent=agent,
+                    agent=getattr(args, "recovery_agent", None) or agent,
                     work_model="auto",
                     sandbox_host=not getattr(args, "bubble", False),
                     dry_run=False,
@@ -1401,7 +1403,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                     ignore_quota=ignore_quota,
                     authoring_profile=(
                         resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
-                        if agent != "auto" and (author_model or author_effort)
+                        if agent != "auto"
+                        and (author_model or author_effort)
+                        and not getattr(args, "recovery_unpinned_profile", False)
                         else None
                     ),
                 )

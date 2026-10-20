@@ -195,6 +195,210 @@ class Fixture(unittest.TestCase):
             self.assertEqual((co / "binary").read_bytes(), b"\x00\xff\x01")
             self.assertEqual(os.readlink(co / "link"), "A.lean")
 
+    def model_repair(self, checkout, *args, **kwargs):
+        (checkout / "A.lean").write_text("retained repair\n-- repaired\n")
+        return 0
+
+    def test_rewritten_head_does_not_resurrect_removed_history(self):
+        git(self.co, "reset", "--hard", self.base)
+        (self.co / "Dropped.lean").write_text("intentionally removed\n")
+        git(self.co, "add", "Dropped.lean")
+        git(self.co, "commit", "-qm", "later dropped")
+        old_head = git(self.co, "rev-parse", "HEAD")
+        self.owner["expected_head"] = old_head
+        (self.co / "A.lean").write_text("retained delta\n")
+        self.save_updated_checkpoint()
+        self.advance_writer()
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "head-rewritten")
+        self.assertEqual(FakeVerification.calls, 0)
+        self.assertNotIn("Dropped.lean", git(self.remote, "ls-tree", "--name-only", "main"))
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_successful_round_leftovers_are_archived(self):
+        self.owner["round_outcome"] = dict(published_head=self.base, exit_code=0)
+        recovery = rr.Recovery(self.record, self.backend)
+        recovery.manifest["round_outcome"] = self.owner["round_outcome"]
+        self.assertFalse(recovery.run())
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(self.journal()["reason"]["code"], "post-publication-leftovers")
+        self.assertEqual(FakeVerification.calls, 0)
+        self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
+
+    def test_push_marker_survives_death_before_round_finally(self):
+        self.owner["publication_marker"] = dict(ref="refs/tauceti/published/push/main", before=None)
+        git(self.co, "update-ref", "refs/tauceti/published/push/main", self.base)
+        (self.co / "New.lean").write_text("later idea\n")
+        self.save_updated_checkpoint()
+        self.assertEqual(self.manifest["round_outcome"]["published_head"], self.base)
+        self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["reason"]["code"], "post-publication-leftovers")
+
+    def test_interrupted_continuation_preserves_new_source_without_another_model(self):
+        FakeVerification.failures = 1
+
+        def interrupted(checkout, *args, **kwargs):
+            (checkout / "New.lean").write_bytes(b"new retained source\n")
+            raise Death()
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=interrupted),
+        ):
+            with self.assertRaises(Death):
+                self.run_recovery()
+        self.assertTrue(self.journal()["content_started"])
+        self.assertNotIn("source_checkpoint_for", self.journal())
+        self.assertTrue(self.run_recovery())
+        journal = self.journal()
+        self.assertEqual(journal["source_checkpoint_for"], journal["content_started"])
+        self.assertIn("New.lean", saved._complete(Path(journal["source_checkpoint"]))["untracked"])
+        self.assertEqual(git(self.remote, "show", "main:New.lean"), "new retained source")
+        self.assertEqual(journal["content_attempts"], 1)
+
+    def test_owned_conflict_merge_can_be_resolved_and_committed_by_supervisor(self):
+        self.advance_writer(conflicting=True)
+        writer_head = self.current["head"]
+
+        def resolve(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("retained repair plus other writer\n")
+            git(checkout, "add", "A.lean")
+            return 0
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
+        ):
+            self.assertTrue(self.run_recovery())
+        parents = git(self.remote, "show", "-s", "--format=%P", "main").split()
+        self.assertIn(writer_head, parents)
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "retained repair plus other writer")
+
+    def test_restart_after_owned_merge_is_resolved_needs_no_second_model(self):
+        self.advance_writer(conflicting=True)
+
+        def resolve_and_die(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("both writers\n")
+            git(checkout, "add", "A.lean")
+            raise Death()
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=resolve_and_die),
+        ):
+            with self.assertRaises(Death):
+                self.run_recovery()
+        self.assertTrue(self.run_recovery())
+        self.assertEqual(git(self.remote, "show", "main:A.lean"), "both writers")
+
+    def test_budget_wait_does_not_repeat_known_failed_build(self):
+        FakeVerification.failures = 1
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("budget closed")):
+            self.assertFalse(self.run_recovery())
+            self.retry_now()
+            with patch.object(self.backend, "restore", side_effect=AssertionError("restored during budget wait")):
+                self.assertFalse(self.run_recovery())
+        self.assertEqual(FakeVerification.calls, 1)
+        self.assertEqual(self.journal()["attempts"], 0)
+
+    def test_verified_provider_outage_refunds_content_but_counts_infrastructure(self):
+        FakeVerification.failures = 1
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", return_value=1),
+            patch("tauceti_worker.agents.take_last_agent_infra_failure", return_value="529 before work"),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.journal()["attempts"], 1)
+        self.assertEqual(self.journal()["provider_refunds"], 1)
+        self.assertEqual(self.values["fix-10-head"], 0)
+
+    def test_post_launch_file_error_does_not_refund_content(self):
+        FakeVerification.failures = 1
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=FileNotFoundError("after launch")),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 1)
+        self.assertEqual(self.values["fix-10-head"], 1)
+
+    def test_typed_process_creation_failure_refunds_content(self):
+        from tauceti_worker.agents import AgentLaunchUnavailable
+
+        FakeVerification.failures = 1
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=AgentLaunchUnavailable("missing binary")),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.journal()["attempts"], 1)
+        self.assertEqual(self.values["fix-10-head"], 0)
+
+    def test_automatic_loop_preserves_original_recovery_provider_policy(self):
+        from tauceti_worker import loop
+
+        tails = []
+
+        def run(tail):
+            tails.append(tail)
+            raise KeyboardInterrupt()
+
+        with (
+            patch.object(rr, "due", return_value=False),
+            patch.object(loop, "fleet_admission_reason", return_value=None),
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("codex", {})),
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop, "run_round_subprocess", run),
+        ):
+            args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None)
+            self.assertEqual(loop.cmd_loop(args, self.cfg, only=["fix"], agent="auto"), 130)
+        tail = tails[0]
+        self.assertEqual(tail[tail.index("--agent") + 1], "codex")
+        self.assertEqual(tail[tail.index("--recovery-agent") + 1], "auto")
+        self.assertIn("--recovery-unpinned-profile", tail)
+
+    def test_blocked_head_change_reenables_mechanical_recovery(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            observed_head=self.base,
+            reason=rr.reason(rr.Block("content-allowance", "spent")),
+        )
+        self.advance_writer()
+        self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "published")
+
+    def test_archived_backlog_does_not_delay_new_checkpoint(self):
+        for n in range(30):
+            record = self.cfg.state / "recovery" / f"archived-{n}"
+            rr.write(record, {}, "obsolete")
+            blocked = self.cfg.state / "recovery" / f"blocked-{n}"
+            rr.write(blocked, {}, "blocked", reason=rr.reason(rr.Block("missing-publication-scope", "legacy")))
+        self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "published")
+
+    def test_blocked_checkpoint_observes_closed_pr_without_hashing_payload(self):
+        rr.write(self.record, {}, "blocked", reason=rr.reason(rr.Block("content-allowance", "spent")))
+        self.current["state"] = "CLOSED"
+        self.assertTrue(rr.due(self.cfg))
+        with patch.object(saved, "_complete", side_effect=AssertionError("metadata probe rehashed source")):
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
+
     def test_mechanical_zero_paid_and_duplicate(self):
         self.assertTrue(self.run_recovery())
         self.assertEqual(self.journal()["state"], "published")
@@ -323,7 +527,9 @@ class Fixture(unittest.TestCase):
         self.assertEqual(model.call_args.args[4], "remote-head-moved-reintegration-required")
         self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.current["head"])
-        self.assert_retained()
+        self.assertEqual(saved._complete(self.record), self.manifest)
+        self.assertIn("retained repair", (self.record / "checkout/A.lean").read_text())
+        self.assertEqual(git(self.record / "checkout", "rev-parse", "MERGE_HEAD"), self.current["head"])
 
     def test_other_writer_superseded_source_plus_more(self):
         self.advance_writer(already_integrated=True)
@@ -407,7 +613,7 @@ class Fixture(unittest.TestCase):
         with (
             patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)) as admission,
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
-            patch("tauceti_worker.agents.run_agent_host", return_value=0) as model,
+            patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
             self.assertTrue(self.run_recovery())
         admission.assert_called_once()
@@ -683,7 +889,7 @@ class Fixture(unittest.TestCase):
             patch.object(rr, "session_available", return_value=True),
             patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
-            patch("tauceti_worker.agents.run_agent_host", return_value=0) as model,
+            patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
             self.assertTrue(recovery.run())
         self.assertEqual(model.call_args.kwargs["resume"], "session-12345")
@@ -843,10 +1049,21 @@ class ConversationIsolation(unittest.TestCase):
                 with patch.dict(os.environ, {envkey: str(root), "TAUCETI_CLAUDE_BILLING": "subscription"}):
                     rr.atomic_json(root / filename, initial)
                     before = rr.conversation_identity(provider)
+                    self.assertIsNotNone(before)
                     rr.atomic_json(root / filename, refreshed)
                     self.assertEqual(before, rr.conversation_identity(provider))
                     rr.atomic_json(root / filename, {})
                     self.assertIsNone(rr.conversation_identity(provider))
+
+    def test_cached_profile_cannot_bind_opaque_mirrored_credentials(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "isolated"
+            rr.atomic_json(root / ".credentials.json", dict(claudeAiOauth=dict(accessToken="opaque-old")))
+            rr.atomic_json(Path(str(root) + ".json"), dict(oauthAccount=dict(accountUuid="stale-account")))
+            with patch.dict(os.environ, CLAUDE_CONFIG_DIR=str(root), TAUCETI_CLAUDE_BILLING="subscription"):
+                self.assertIsNone(rr.conversation_identity("claude"))
+                rr.atomic_json(root / ".credentials.json", dict(claudeAiOauth=dict(accessToken="new-account-token")))
+                self.assertIsNone(rr.conversation_identity("claude"))
 
     def test_original_absolute_cwd_maps_to_isolated_source(self):
         from tauceti_worker import agents, containment

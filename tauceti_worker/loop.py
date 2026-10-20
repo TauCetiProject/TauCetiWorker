@@ -134,7 +134,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             recovery_only = (
                 "security-audit" not in only
                 and time.time() >= recovery_probe_at
-                and due(cfg, only=only, prs=prs, sandbox_host=not bubble)
+                and due(cfg, only=only, prs=prs, sandbox_host=not bubble, agent=agent)
             )
             if not recovery_only and api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
@@ -271,6 +271,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # flag omitted here would turn every round of a `--loop --pr` into a free-running one.
             if prs:
                 tail += ["--pr", ",".join(str(n) for n in prs)]
+            tail += ["--recovery-agent", agent]
+            if not (getattr(args, "author_model", None) or getattr(args, "author_effort", None)):
+                tail.append("--recovery-unpinned-profile")
             if recovery_only:
                 tail += ["--recovery-only", "--agent", agent]
             elif model:

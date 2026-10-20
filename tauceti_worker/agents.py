@@ -865,6 +865,7 @@ def run_agent_host(
                     identity=conversation_identity(profile.provider),
                     scope=session_scope,
                     session=resume,
+                    cwd=str(original_cwd or cwd),
                 ),
             )
         except OSError as error:
@@ -1088,10 +1089,12 @@ def run_agent_proc(
                 start_new_session=cancel_event is not None,
                 pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env), *boundary.pass_fds),
             )
-        except BaseException:
+        except BaseException as error:
             if writer is not None:
                 os.close(writer)
             boundary.finish(None)
+            if isinstance(error, OSError):
+                raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
             raise
         finally:
             if reader is not None:
@@ -1288,6 +1291,10 @@ class BuildCacheUnavailable(NoProgress):
     def __init__(self, message: str, *, log_file: Path | None = None):
         super().__init__(message)
         self.log_file = log_file
+
+
+class AgentLaunchUnavailable(BuildCacheUnavailable):
+    """A process creation failure before the agent existed."""
 
 
 HOST_CACHE_TIMEOUT = 1200

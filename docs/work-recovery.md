@@ -159,7 +159,12 @@ the durable outbox's normal reconciliation before recovery; unrelated pending
 intents do not conceal a confirmed Git push. A crash after push reconciles the actual branch and commit ancestry before any
 replay, including after the invocation limit.
 
-A clean three-way integration is attempted mechanically and reverified. Changes
+A clean three-way integration is attempted mechanically and reverified only when
+the current head preserves the expected history. Rewritten history is blocked
+until only the retained delta has been explicitly re-integrated; removed commits
+are never merged back automatically. Owned recovery merges retain their parent
+intent across crashes. Leftovers from a round with its own durable successful
+push marker are archived without publishing another idea. Changes
 already included by another writer, including a remote tree with additional work,
 are archived as obsolete. A model runs only for failed source verification or an
 integration that needs source reasoning. Unfinished native merge/rebase operations
@@ -169,14 +174,17 @@ prompt and the original profile/permissions, plus fresh subscription admission t
 received an internal quota override, or fresh API budget admission. A matching durable provider conversation is preferred;
 a missing or mismatched stable account identity/profile or absent local session
 artifact starts a narrow new conversation. OAuth refresh preserves account
-identity. During a resume, the original cwd is bound to the isolated checkout in
+identity when its stable account ID is bound to the credential document; separate
+cached CLI profiles do not establish that binding, so unknown accounts use a
+narrow new conversation. During a resume, the original cwd is bound to the isolated checkout in
 the same containing namespace so historical absolute paths cannot edit the live
 worker checkout. The GitHub proxy, safe-push helper and pre-push hook reject
 continuation publication; its origin is fetch-only and GitHub token environment
 variables are removed. The supervisor verifies the resulting source before
 publication and checks committed blob bytes, paths and executable bits against
 the verified inventory. Recovery commits disable hooks. Changed
-source is retained using the same checkpoint format. Content repair allowances
+source is retained using the same checkpoint format, including new files left by
+an interrupted continuation once containment confirms quiescence. Content repair allowances
 remain separate from infrastructure retries; known failures before model launch
 refund content allowances. Publication includes only tracked changes and declared
 untracked source covered by the verifier. Ignored drafts outside that inventory,
@@ -184,12 +192,18 @@ provider settings, notes and logs stay archived outside the publication checkout
 continuation diagnostics are written below the recovery record, outside source. Full verification is required;
 recovery does not introduce a new source-only push-red route.
 
-One invocation and at most eight record inspections are allowed per phase, with
-a cursor to avoid starvation. Infrastructure failures retry after 60, 300 and
+One invocation and at most eight source inspections are allowed per phase, with
+a cursor to avoid starvation. Archived and unchanged blocked metadata do not
+consume those source slots. At most one blocked PR receives a cheap current-fact
+probe per phase, at 30-minute intervals, to observe closure or changed heads. Infrastructure failures retry after 60, 300 and
 1800 seconds; three failed invocations for unchanged checkpoint/external facts
 block further invocations. Claim, verification-capacity, policy and admission
 waits do not consume those attempts. Changed PR facts re-enable eligibility.
-Blocked records and selection-local waits do not schedule recovery-only children.
+Selection-local waits do not schedule recovery-only children until the original
+operator policy changes. The loop preserves its requested provider policy
+separately from its model selection for unrelated work. Failed exact-input
+receipts may avoid repeating failed builds while waiting for continuation
+admission; they never authorize publication.
 Quota-independent probes run at most once per five minutes; a probe that made no
 progress returns no-progress, preserving normal work and backoff behavior.
 An operator can place `{"retry_epoch": 1}` in a record's `operator.json` after
@@ -206,9 +220,10 @@ operation in `record/checkout`, `operation_repaired: true` allows exact verifica
 and current-head integration under the same publication checks.
 
 `tauceti recovery --json` and prepared local activity expose the consumer's durable
-state/reason; status does not read GitHub. For the historical PR16035 case, see
+state/reason; status does not read GitHub. The fresh-repair fence is worker-local;
+shared claims and the expected-head CAS coordinate writers across the fleet. For the historical PR16035 case, see
 [evidence/issue-310-pr16035-disposition.json](evidence/issue-310-pr16035-disposition.json).
-Terminal recovery evicts rebuildable caches from its isolated/restoration clones;
+Terminal and blocked recovery evict rebuildable caches from its isolated/restoration clones;
 source, Git history, immutable records and outboxes remain archived.
 
 The production disposition is also retained under the main worker state tree's
