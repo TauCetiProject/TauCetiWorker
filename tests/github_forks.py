@@ -19,6 +19,7 @@ from tauceti_worker.github_forks import ForkUnknown, discover
 def page(*, fork=True, name="author/renamed", parent="UPSTREAM", permission="WRITE", collision=False):
     node = {
         "id": "FORK",
+        "name": name.split("/")[1],
         "nameWithOwner": name,
         "owner": {"login": "author"},
         "isFork": True,
@@ -30,11 +31,30 @@ def page(*, fork=True, name="author/renamed", parent="UPSTREAM", permission="WRI
     return [
         {
             "data": {
+                # The shape GitHub returns: every repository the actor owns. A collision is a
+                # same-named repository in the listing; a `viewer.repository(name:)` lookup is not
+                # used because for a missing name GitHub answers with an error, not null.
                 "viewer": {
                     "login": "author",
-                    "repository": {"id": "COLLISION"} if collision else None,
                     "repositories": {
-                        "nodes": [node] if fork else [],
+                        "nodes": ([node] if fork else [])
+                        + (
+                            [
+                                {
+                                    "id": "COLLISION",
+                                    "name": "repo",
+                                    "nameWithOwner": "author/repo",
+                                    "owner": {"login": "author"},
+                                    "isFork": False,
+                                    "isArchived": False,
+                                    "isLocked": False,
+                                    "viewerPermission": "ADMIN",
+                                    "parent": None,
+                                }
+                            ]
+                            if collision
+                            else []
+                        ),
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
                     },
                 },
@@ -92,6 +112,7 @@ deep[0]["data"]["viewer"]["repositories"]["nodes"].insert(
     0,
     {
         "id": "DEEP",
+        "name": "deep",
         "nameWithOwner": "author/deep",
         "owner": {"login": "author"},
         "isFork": True,

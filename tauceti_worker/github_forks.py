@@ -19,11 +19,18 @@ def discover(read, upstream):
     ancestry = "id nameWithOwner"
     for _ in range(8):
         ancestry = "id nameWithOwner parent{" + ancestry + "}"
+    # Every repository the actor owns, not only forks, because a name collision has to be read from
+    # the same listing. Asking `viewer{repository(name:)}` directly does not work: when no such
+    # repository exists GitHub answers `null` together with a NOT_FOUND error, so the query fails in
+    # exactly the case this exists for, an actor with no fork yet. What the listing cannot see is a
+    # repository hidden from a token restricted to selected repositories, or a redirect left by a
+    # rename; either way GitHub still refuses to overwrite a repository, and forks under a suffixed
+    # name, which the ancestry check then finds.
     query = (
         "query($owner:String!,$name:String!,$endCursor:String){"
-        "viewer{login repository(name:$name){id} "
-        "repositories(first:100,after:$endCursor,isFork:true,ownerAffiliations:[OWNER]){"
-        "nodes{id nameWithOwner isFork isArchived isLocked viewerPermission owner{login} parent{" + ancestry + "}}"
+        "viewer{login "
+        "repositories(first:100,after:$endCursor,ownerAffiliations:[OWNER]){"
+        "nodes{id name nameWithOwner isFork isArchived isLocked viewerPermission owner{login} parent{" + ancestry + "}}"
         "pageInfo{hasNextPage endCursor}}}"
         "repository(owner:$owner,name:$name){id nameWithOwner isPrivate}}"
     )
@@ -61,13 +68,17 @@ def discover(read, upstream):
             if identity is not None and identity != current:
                 raise ForkUnknown("fork discovery identity changed between pages")
             identity = current
-            collision = collision or viewer["repository"] is not None
             connection = viewer["repositories"]
             if not isinstance(connection["nodes"], list) or type(connection["pageInfo"]["hasNextPage"]) is not bool:
                 raise ForkUnknown("incomplete fork connection")
             for node in connection["nodes"]:
-                if node["isFork"] is not True or node["owner"]["login"].lower() != current[0]:
+                if node["owner"]["login"].lower() != current[0]:
                     raise ForkUnknown("fork discovery returned an unexpected owner")
+                if type(node["isFork"]) is not bool or not isinstance(node["name"], str):
+                    raise ForkUnknown("incomplete repository listing")
+                collision = collision or node["name"].lower() == name.lower()
+                if not node["isFork"]:
+                    continue
                 parent = node["parent"]
                 found = False
                 while parent is not None:
