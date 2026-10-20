@@ -728,6 +728,8 @@ class WorkerBackend:
         from .agents import AuthoringProfile, BuildCacheUnavailable, run_agent_host
         from .budget import BudgetError
         from .claude_api import api_context, api_mode
+        from .config import AdmissionUnavailable
+        from .fleet_capacity import admission_unit, unit_admitted
         from .loop import resolve_work_model
         from .work_units import raise_on_account_mismatch
 
@@ -833,10 +835,25 @@ class WorkerBackend:
             "reverify the complete resulting source and publish through the original branch CAS. "
             f"If no safe repair is possible, leave source in the checkout and structured diagnostics under {record / 'diagnostics'}, outside the source tree."
         )
-        with environment(
-            TAUCETI_RECOVERY_CONTINUATION="1",
-            TAUCETI_GITHUB_PR=m["pr"],
-            TAUCETI_VERIFY_BASE=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
+        before_counts = {key: self.w.counters.read(key) for key in keys}
+        before_content = j.get("content_attempts", 0)
+        api = None
+
+        def refund_content(*, known_no_launch=False):
+            if not known_no_launch and ((api is not None and api.launched) or unit_admitted()):
+                return False
+            for key, value in before_counts.items():
+                self.w.counters.write(key, min(value, self.w.counters.read(key)))
+            write(record, j, "resuming", content_attempts=before_content)
+            return True
+
+        with (
+            admission_unit(self.w.cfg.wid),
+            environment(
+                TAUCETI_RECOVERY_CONTINUATION="1",
+                TAUCETI_GITHUB_PR=m["pr"],
+                TAUCETI_VERIFY_BASE=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
+            ),
         ):
             try:
                 with api_context(
@@ -870,17 +887,22 @@ class WorkerBackend:
                             original_cwd=original if resume else None,
                         )
                     except (BuildCacheUnavailable, FileNotFoundError) as error:
-                        for key in keys:
-                            self.w.counters.write(key, max(0, self.w.counters.read(key) - 1))
-                        write(record, j, "resuming", content_attempts=max(0, j.get("content_attempts", 0) - 1))
+                        refund_content(known_no_launch=True)
                         raise RuntimeError(
                             f"Continuation infrastructure failed before model launch: {error}"
                         ) from error
+                    except AdmissionUnavailable as error:
+                        if refund_content():
+                            raise Wait("worker-capacity", str(error)) from error
+                        raise
                     if api and api.blocked_reason:
-                        for key in keys:
-                            self.w.counters.write(key, max(0, self.w.counters.read(key) - 1))
-                        write(record, j, "resuming", content_attempts=max(0, j.get("content_attempts", 0) - 1))
-                        raise Wait("budget-refused", api.blocked_reason)
+                        if refund_content():
+                            raise Wait("budget-refused", api.blocked_reason)
+                        write(record, j, "resuming", continuation_admission_note=api.blocked_reason)
+            except AdmissionUnavailable as error:
+                if refund_content():
+                    raise Wait("worker-capacity", str(error)) from error
+                raise
             except BudgetError as error:
                 raise Wait("budget-refused", str(error)) from error
         snapshot = saved._record(

@@ -736,6 +736,70 @@ class Fixture(unittest.TestCase):
         self.opts.only = ["fix"]
         self.assertTrue(self.run_recovery())
 
+    def test_api_refusal_before_admission_refunds_content(self):
+        import contextlib
+
+        FakeVerification.failures = 1
+        recovery = rr.Recovery(self.record, self.backend)
+        recovery.manifest["authorization"]["billing"] = "api"
+        api = SimpleNamespace(blocked_reason="waiting for funding", launched=False)
+        with (
+            patch("tauceti_worker.claude_api.api_mode", return_value=True),
+            patch("tauceti_worker.claude_api.api_context", return_value=contextlib.nullcontext(api)) as admission,
+            patch(
+                "tauceti_worker.loop.resolve_work_model",
+                side_effect=AssertionError("API mode must use fresh budget admission"),
+            ),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", return_value=75),
+        ):
+            self.assertFalse(recovery.run())
+        admission.assert_called_once()
+        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.values["fix-10-head"], 0)
+        self.assertEqual(self.journal()["attempts"], 0)
+
+    def test_late_api_refusal_preserves_spent_content_allowance(self):
+        import contextlib
+
+        FakeVerification.failures = 1
+        recovery = rr.Recovery(self.record, self.backend)
+        recovery.manifest["authorization"]["billing"] = "api"
+        api = SimpleNamespace(blocked_reason=None, launched=False)
+
+        def admitted(*args, **kwargs):
+            api.launched = True
+            api.blocked_reason = "waiting for funding after an admitted request"
+            return 75
+
+        with (
+            patch("tauceti_worker.claude_api.api_mode", return_value=True),
+            patch("tauceti_worker.claude_api.api_context", return_value=contextlib.nullcontext(api)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", admitted),
+        ):
+            self.assertFalse(recovery.run())
+        self.assertEqual(self.journal()["content_attempts"], 1)
+        self.assertEqual(self.values["fix-10-head"], 1)
+        self.assertTrue(Path(self.journal()["source_checkpoint"]).is_dir())
+
+    def test_late_capacity_refusal_before_launch_does_not_spend_content(self):
+        from tauceti_worker.config import AdmissionUnavailable
+
+        FakeVerification.failures = 1
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch(
+                "tauceti_worker.agents.run_agent_host",
+                side_effect=AdmissionUnavailable("capacity reserved", state="waiting-capacity"),
+            ),
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.values["fix-10-head"], 0)
+        self.assertEqual(self.journal()["attempts"], 0)
+
     def test_damaged_checkpoint_never_runs(self):
         (self.record / "staged.patch").write_text("corrupt")
         self.assertFalse(self.run_recovery())
