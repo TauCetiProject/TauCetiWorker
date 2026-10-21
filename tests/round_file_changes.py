@@ -199,6 +199,20 @@ def main():
                 tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
             )
 
+        for state, changed_head, expected in (("OPEN", head, False), ("CLOSED", head, True), ("OPEN", "b" * 40, True)):
+            gh = types.SimpleNamespace(
+                pr_progress_state=lambda _, state=state, changed_head=changed_head: {
+                    "head": changed_head,
+                    "ncomments": 1,
+                    "state": state,
+                }
+            )
+            pre = {"head": head, "ncomments": 0, "state": "OPEN", "require_push": True}
+            check(
+                "final resolution requires push or closure: " + state,
+                tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+            )
+
         # 4) a round that changed nothing is silent.
         check("a clean round logs nothing", run(repo, head) == "")
 

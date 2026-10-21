@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker.config import ClaimCollision, NoProgress
@@ -124,9 +124,9 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round([held, row(20, "Other")])
             self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
 
-    def test_authenticated_current_head_blocker_is_shared_without_label_permissions(self):
+    def test_old_pause_comments_cannot_strand_maintenance(self):
         for marker, expected in (
-            ({"head": HEAD, "author": "science"}, [("fix", 20)]),
+            ({"head": HEAD, "author": "science"}, [("fix", 10)]),
             ({"head": "b" * 40, "author": "science"}, [("fix", 10)]),
             ({"head": HEAD, "author": "peer"}, [("fix", 10)]),
         ):
@@ -134,6 +134,87 @@ class GlobalMaintenance(unittest.TestCase):
             blocked["review"]["blocked"] = [marker]
             self.run_round([blocked, row(20, "Other")])
             self.assertEqual([(s, n) for s, n, *_ in self.calls], expected)
+
+    def test_spent_owned_pr_is_selected_for_final_resolution(self):
+        from tauceti_worker.survey import MAX_FIX_ATTEMPTS
+
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = MAX_FIX_ATTEMPTS
+        flags = []
+        self.run_round([row(10, "Other")], lambda stage, c: flags.append(c.final_resolution) or 0)
+        self.assertEqual(self.calls[0][:2], ("fix", 10))
+        self.assertEqual(flags, [True])
+
+    def test_old_pause_comment_does_not_bypass_operator_hold(self):
+        pr = row(10, "Other")
+        pr["pr"]["labels"].append({"name": "hold"})
+        pr["review"]["blocked"] = [{"head": HEAD, "author": "science"}]
+        self.run_round([pr, row(20, "Other")])
+        self.assertEqual(self.calls[0][:2], ("fix", 20))
+
+    def test_last_permitted_fix_attempt_requires_resolution(self):
+        from tauceti_worker.survey import MAX_FIX_ATTEMPTS
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = MAX_FIX_ATTEMPTS - 1
+        flags = []
+        self.run_round([row(10, "Other")], lambda stage, c: flags.append(c.final_resolution) or 0)
+        self.assertEqual(flags, [True])
+
+    def spent_fixture(self, **changes):
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        live = dict(state="OPEN", headRefOid=HEAD, isDraft=False, labels=[], author={"login": "science"})
+        live.update(changes)
+        self.w.gh.pr_view = lambda *_: dict(live)
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+        self.w.rs = SimpleNamespace(
+            gh_meta=lambda *a, **k: SimpleNamespace(
+                data={"head_sha": HEAD, "states": {"reuse": "blocking_request"}}, provenance="fresh"
+            ),
+            ledger_blocking=lambda *a: True,
+            newest_contest_reply=lambda *a, **k: None,
+            bust=Mock(),
+        )
+        self.w.claims = SimpleNamespace(begin_branch_work=Mock(return_value=True), release=Mock())
+        return sv, work.Candidate(10, HEAD, final_resolution=True), live
+
+    def test_exhausted_head_closes_without_another_model_call(self):
+        sv, c, live = self.spent_fixture()
+
+        def close(*args, **kwargs):
+            live["state"] = "CLOSED"
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(work, "gh_run", side_effect=close) as mutation:
+            # gh_run is the existing quota-aware mutation transport.
+            self.assertEqual(work._close_spent_pr(self.w, sv, c), 0)
+        mutation.assert_called_once()
+        self.w.claims.release.assert_called_once()
+        self.assertEqual(self.counter_values[f"fix-10-{HEAD[:12]}"], 3)
+
+    def test_exhausted_closure_preserves_live_author_head_and_holds(self):
+        for changes in (
+            {"labels": [{"name": "hold"}]},
+            {"headRefOid": "b" * 40},
+            {"author": {"login": "peer"}},
+            {"isDraft": True},
+        ):
+            with self.subTest(changes=changes):
+                sv, c, _ = self.spent_fixture(**changes)
+                with patch.object(work, "gh_run") as mutation:
+                    self.assertIsNone(work._close_spent_pr(self.w, sv, c))
+                mutation.assert_not_called()
+
+    def test_exhausted_closure_waits_for_pending_contest_and_fresh_evidence(self):
+        sv, c, _ = self.spent_fixture()
+        self.w.rs.newest_contest_reply = lambda *a, **k: {"id": 123}
+        with patch.object(work, "gh_run") as mutation:
+            self.assertIsNone(work._close_spent_pr(self.w, sv, c))
+        mutation.assert_not_called()
+        self.w.rs.newest_contest_reply = lambda *a, **k: None
+        self.w.rs.gh_meta = lambda *a, **k: SimpleNamespace(data={}, provenance="fetch_failed")
+        c.partial_history = True
+        with patch.object(work, "gh_run") as mutation:
+            self.assertIsNone(work._close_spent_pr(self.w, sv, c))
+        mutation.assert_not_called()
 
     def test_other_roadmap_maintenance_and_claim_fallthrough(self):
         # Newest arrives first; a peer holds the oldest. Exhausted and contested
@@ -145,8 +226,8 @@ class GlobalMaintenance(unittest.TestCase):
             row(15, "Geometry", contest={"id": 1, "rubric": "reuse"}),
         ]
         self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
-        _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr == 20 else 0)
-        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20), ("fix", 30)])
+        _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr in (10, 20) else 0)
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20), ("fix", 30)])
         self.assertEqual(set(query.call_args.kwargs["stages"]), set(self.opts.only) - {"roadmap"})
         self.assertEqual(query.call_args.args[1], "auto")
         areas.assert_not_called()

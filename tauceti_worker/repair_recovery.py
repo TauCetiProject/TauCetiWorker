@@ -622,11 +622,6 @@ class WorkerBackend:
             raise Wait("work-policy", "Checkpoint work type is outside this round's --only authorization")
         if self.opts.prs and m["pr"] not in self.opts.prs:
             raise Wait("pr-policy", "Checkpoint is outside this round's --pr authorization")
-        if self.w.rs.maintenance_blocked(m["pr"], facts["head"], facts["author"], selected=True):
-            raise Block(
-                "maintenance-blocked",
-                "Current durable PR policy blocks maintenance",
-            )
 
     def acquire(self, m, facts):
         owner, repo = facts["repository"].split("/")

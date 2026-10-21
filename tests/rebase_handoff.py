@@ -262,7 +262,8 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         assert "Nobody reads your final transcript" in prompt
         assert "You may close this PR" in prompt
         assert "gh pr close 20 --repo TauCetiProject/TauCeti" in prompt
-        assert "<!--tauceti-blocked:v1 " + HEAD + "-->" in prompt
+        assert "tauceti-blocked" not in prompt
+        assert "Resolve review disagreements" in prompt
         if provisional:
             assert "attribution **unconfirmed**" in prompt
             assert "still complete all verification below" in prompt
