@@ -672,11 +672,10 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             errors = []
             with db:
                 # Follow registered PR journals by offset; resource logs are excluded.
-                if import_history or db.execute("SELECT 1 FROM cursors LIMIT 1").fetchone():
-                    try:
-                        backfill(db, history_roots)
-                    except (OSError, ValueError, KeyError):
-                        errors.append("PR creation receipt is unreadable")
+                try:
+                    backfill(db, history_roots)
+                except (OSError, ValueError, KeyError):
+                    errors.append("PR activity receipt is unreadable")
                 _consume(db, errors)
                 _clean_history(db)
                 machine = os.environ.get("TAUCETI_FLEET_MACHINE_ID") or read_json(
