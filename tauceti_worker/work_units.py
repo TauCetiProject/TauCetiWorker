@@ -1079,7 +1079,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
-    if stage == "fix" and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
+    if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
         return _close_spent_pr(w, sv, c)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
@@ -1902,7 +1902,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
             report_runtime(
                 "running", phase="fix", target=f"PR #{c.pr}", detail="closing owned PR after spent repair attempts"
             )
-            result = gh_run(
+            gh_run(
                 [
                     "gh",
                     "pr",
@@ -1917,12 +1917,13 @@ def _close_spent_pr(w, sv, c) -> int | None:
                 ]
             )
             after = w.gh.pr_view(c.pr, ["state"])
-            if result.returncode or not after or after.get("state") not in {"CLOSED", "MERGED"}:
+            if not after or after.get("state") not in {"CLOSED", "MERGED"}:
                 raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")
         w.rs.bust(c.pr)
         log(f"fix #{c.pr}: confirmed closure after spent repair attempts")
         return 0
     finally:
+        w.claims.stop_heartbeat()
         w.claims.release()
 
 
