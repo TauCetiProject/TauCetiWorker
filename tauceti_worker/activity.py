@@ -210,6 +210,10 @@ def _connect():
         # Earlier collectors advanced these journals without storing contribution
         # facts. Replay once; stable receipt IDs keep both streams idempotent.
         db.execute("DELETE FROM cursors WHERE path NOT LIKE '%/resources.jsonl'")
+    if db.execute("INSERT OR IGNORE INTO meta VALUES ('coordination_journal_schema','1')").rowcount:
+        # Older preparers advanced these journals while filtering review starts out.
+        # Replay once; stable event IDs keep already-counted activity idempotent.
+        db.execute("DELETE FROM cursors WHERE path NOT LIKE '%/resources.jsonl'")
     return db
 
 
@@ -323,7 +327,11 @@ def backfill(db, history_roots=()):
         Path(os.environ.get("TAUCETI_FLEET_EVENTS", Path.home() / ".local/state/tauceti-fleet/worker-events.jsonl"))
     )
     for path in sorted(paths):
-        backfill_file(db, path, lambda e: [e] if e.get("kind") in ("pr_created", "pr_activity", "ci_result") else [])
+        backfill_file(
+            db,
+            path,
+            lambda e: [e] if e.get("kind") in ("pr_created", "pr_activity", "ci_result", "review_coordination") else [],
+        )
 
 
 def _clean_history(db):
