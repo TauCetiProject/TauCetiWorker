@@ -182,7 +182,7 @@ class CostTests(unittest.TestCase):
     def test_all_fleet_costs_include_reviews_but_only_initiated_output_counts(self):
         s = self.summary()
         rows = s["costs"]["windows"]
-        self.assertEqual(set(rows), {"total", "7d"})
+        self.assertEqual(set(rows), {"24h", "7d", "total"})
         self.assertEqual(Decimal(rows["total"]["spent_usd"]), Decimal(60))
         self.assertEqual(Decimal(rows["total"]["active_accrued_usd"]), 0)
         self.assertEqual(Decimal(rows["total"]["unresolved_stopped_usd"]), Decimal(40))
@@ -200,6 +200,68 @@ class CostTests(unittest.TestCase):
         self.assertIn("7 days", output.getvalue())
         self.assertIn("$0.1538", output.getvalue())
         self.assertIn("$0.2571", output.getvalue())
+
+    def test_24h_costs_use_all_conversations_but_only_prs_opened_in_window(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT INTO prs VALUES ('org/repo',6,'author','machine',?,'OPEN',NULL,?,?,'head',NULL)",
+                (self.now - 3600, self.now, self.now),
+            )
+            db.execute("INSERT INTO pr_loc VALUES ('org/repo',6,'head',80,0,?)", (self.now,))
+        summary = self.summary()
+        row = summary["costs"]["windows"]["24h"]
+        self.assertEqual(Decimal(row["estimated_usd"]), 90)  # Includes the review of another author's PR.
+        self.assertEqual(row["open_prs"], 1)
+        self.assertEqual(row["landed_prs"], 0)  # Older PRs landing today do not enter this cohort.
+        self.assertEqual(Decimal(row["weighted_loc"]), 40)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("2.25"))
+
+    def test_cost_breakdown_is_additive_and_total_is_last(self):
+        summary = self.summary()
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(dict(available=True, summary=summary))
+        rows = [line for line in output.getvalue().splitlines() if line.startswith("API cost:")]
+        self.assertEqual(
+            [line.split("  ")[0] for line in rows],
+            [
+                "API cost: completed sessions",
+                "API cost: live usage",
+                "API cost: stopped usage estimate",
+                "API cost: estimated total",
+            ],
+        )
+        self.assertIn("settled_estimates_usd", summary["costs"]["windows"]["24h"])
+        self.assertIn("recovered_estimates_usd", summary["costs"]["windows"]["24h"])
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[lines.index(rows[-1]) + 1], "")
+
+    def test_old_prepared_windows_still_display_and_combine_without_io(self):
+        summary = self.summary()
+        older = json.loads(json.dumps(summary))
+        for key in ("rounds", "pr_windows", "ci_windows"):
+            if older.get(key):
+                older[key].pop("1h", None)
+        older["costs"]["spending"].pop("1h")
+        older["costs"]["windows"].pop("24h")
+        with (
+            patch.object(a, "_connect", side_effect=AssertionError("SQL in status")),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            a.display(dict(available=True, summary=older))
+            combined = activity_summary.combine(
+                [
+                    dict(available=True, summary=summary),
+                    dict(available=True, summary=older),
+                ]
+            )
+            a.display(combined)
+        self.assertNotIn("1h", combined["summary"]["rounds"])
+        self.assertNotIn("24h", combined["summary"]["costs"]["windows"])
+        for line in output.getvalue().splitlines():
+            if line.startswith("Finished rounds"):
+                self.assertNotIn("1h", line)
+            if line.startswith("Costs / initiated PR output"):
+                self.assertNotIn("24h", line)
 
     def test_odd_open_LOC_gets_exactly_half_credit(self):
         with contextlib.closing(a._connect()) as db, db:
@@ -266,14 +328,15 @@ class CostTests(unittest.TestCase):
             self.assertEqual(Decimal(window["spending"]["3h"]["spent_usd"]), 0)
 
     def test_hourly_spending_includes_running_usage_and_excludes_reservations(self):
-        self.session("recent", 3600, "author", "12", settled=True)
+        self.session("recent", 1800, "author", "12", settled=True)
         self.write_ledger()
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE rounds SET started=finished-1800 WHERE id='reviewer'")
         s = self.summary()
         rows = s["costs"]["spending"]
-        self.assertEqual(set(rows), {"3h", "24h", "7d", "total"})
+        self.assertEqual(set(rows), {"1h", "3h", "24h", "7d", "total"})
         for window, spent, seconds in (
+            ("1h", 52, 3600),
             ("3h", 52, 10800),
             ("24h", 102, DAY),
             ("7d", 102, 7 * DAY),
@@ -459,7 +522,7 @@ class CostTests(unittest.TestCase):
         ):
             a.display(dict(available=True, summary=s))
         rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / weighted LOC"))
-        self.assertEqual(rate.count("~$"), 2)
+        self.assertEqual(rate.count("~$"), 3)
         self.assertNotIn("—", rate)
 
     def test_zero_output_and_failed_ledger_are_not_zero_dollars_per_LOC(self):

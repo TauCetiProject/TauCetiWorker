@@ -8,8 +8,9 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
-WINDOWS = ("3h", "24h", "7d", "total")
-COST_WINDOWS = ("7d", "total")
+WINDOW_SECONDS = {"1h": 3600, "3h": 10800, "24h": 86400, "7d": 604800, "total": None}
+WINDOWS = tuple(WINDOW_SECONDS)
+COST_WINDOWS = ("24h", "7d", "total")
 RECOVERY_COUNTS = (
     "records",
     "retained",
@@ -100,6 +101,10 @@ def display(value, default_kinds=()):
         print("Activity: " + value.get("reason", "unavailable"))
         return
     s = value["summary"]
+    # An older preparer may not have published the new windows yet. Never
+    # invent shorter-window counts from a longer window or break cached status.
+    report_windows = tuple(w for w in WINDOWS if w in s["rounds"] and w in s["pr_windows"])
+    cost_windows = tuple(w for w in COST_WINDOWS if w in s.get("costs", {}).get("windows", {}))
     age = max(0, int(time.time() - s["prepared_at"]))
     print(f"Activity: prepared {age}s ago" + (" (stale)" if age > 180 else ""))
     if cleanup := s.get("storage_cleanup"):
@@ -135,10 +140,10 @@ def display(value, default_kinds=()):
             sum(r["finished"] for r in s["rounds"][w].values())
             if kind == "ALL"
             else s["rounds"][w].get(kind, {}).get("finished", 0)
-            for w in WINDOWS
+            for w in report_windows
         ]
         rounds.append(("  " + kind, counts))
-    rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in WINDOWS]))
+    rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in report_windows]))
     prs = []
     for key, label in (
         ("authored", "PRs authored"),
@@ -146,8 +151,8 @@ def display(value, default_kinds=()):
         ("assisted", "PRs assisted"),
         ("reviews", "Reviews completed"),
     ):
-        if key in ("authored", "landed") or all(s["pr_windows"][w].get(key) is not None for w in WINDOWS):
-            prs.append((label, [s["pr_windows"][w].get(key, 0) for w in WINDOWS]))
+        if key in ("authored", "landed") or all(s["pr_windows"][w].get(key) is not None for w in report_windows):
+            prs.append((label, [s["pr_windows"][w].get(key, 0) for w in report_windows]))
     ci = s.get("ci_windows")
     ci_rows = []
     if ci:
@@ -156,10 +161,16 @@ def display(value, default_kinds=()):
             ("successes", "CI jobs passed"),
             ("failures", "CI jobs failed"),
         ):
-            ci_rows.append((label, [ci[w][key] for w in WINDOWS]))
+            ci_rows.append((label, [ci.get(w, {}).get(key, "—") for w in report_windows]))
         for key, label in (("wait_seconds", "Mean CI queue wait (s)"), ("run_seconds", "Mean CI runtime (s)")):
             ci_rows.append(
-                (label, [f"{ci[w][key] / ci[w]['attempts']:.1f}" if ci[w]["attempts"] else "—" for w in WINDOWS])
+                (
+                    label,
+                    [
+                        f"{ci[w][key] / ci[w]['attempts']:.1f}" if ci.get(w, {}).get("attempts") else "—"
+                        for w in report_windows
+                    ],
+                )
             )
     costs = s.get("costs", {})
     spending_title = (
@@ -168,7 +179,7 @@ def display(value, default_kinds=()):
     spending_rows = []
     if costs.get("spending"):
         spending = costs["spending"]
-        hours = [spending[w].get("worker_seconds") for w in WINDOWS]
+        hours = [spending.get(w, {}).get("worker_seconds") for w in report_windows]
         spending_rows = [
             (
                 "Worker-hours recorded",
@@ -180,13 +191,18 @@ def display(value, default_kinds=()):
             (
                 "API spend ($/worker-hour)",
                 [
-                    amount(spending[w].get("usd_per_worker_hour", hourly_rate(spending[w].get("spent_usd"), hours[i])))
-                    for i, w in enumerate(WINDOWS)
+                    amount(
+                        spending.get(w, {}).get(
+                            "usd_per_worker_hour", hourly_rate(spending.get(w, {}).get("spent_usd"), hours[i])
+                        )
+                    )
+                    for i, w in enumerate(report_windows)
                 ],
             ),
-            ("API spend ($/elapsed hour)", [amount(spending[w].get("usd_per_hour")) for w in WINDOWS]),
+            ("API spend ($/elapsed hour)", [amount(spending.get(w, {}).get("usd_per_hour")) for w in report_windows]),
         ]
     cost_rows = []
+    loc_rows = []
     if costs.get("windows"):
         # Compatibility for snapshots prepared before partial-coverage estimates.
         windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
@@ -200,56 +216,58 @@ def display(value, default_kinds=()):
                 if costs.get("accounting_version", 1) >= 2
                 else "API cost: active estimates",
             ),
-            ("estimated_usd", "API cost: estimated total"),
         ):
-            cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
+            cost_rows.append((label, [amount(windows[w].get(key)) for w in cost_windows]))
         if costs.get("accounting_version", 1) >= 3:
-            for key, label in (
-                ("settled_estimates_usd", "API cost: settled estimates"),
-                ("recovered_estimates_usd", "API cost: recovered estimates"),
-                ("unresolved_stopped_usd", "API cost: unresolved stopped"),
-            ):
-                cost_rows.append((label, [amount(windows[w].get(key)) for w in COST_WINDOWS]))
+            # Settled estimates are already in completed sessions; recovered
+            # estimates are a subset of those. Only stopped usage adds a component.
+            cost_rows.append(
+                (
+                    "API cost: stopped usage estimate",
+                    [amount(windows[w].get("unresolved_stopped_usd")) for w in cost_windows],
+                )
+            )
+        cost_rows.append(("API cost: estimated total", [amount(windows[w].get("estimated_usd")) for w in cost_windows]))
         for key, label in (
             ("landed_loc_added", "Authored Lean LOC: landed"),
             ("open_loc_added", "Authored Lean LOC: open"),
         ):
-            cost_rows.append((label, [str(windows[w].get(key, 0)) for w in COST_WINDOWS]))
-        cost_rows.append(
+            loc_rows.append((label, [str(windows[w].get(key, 0)) for w in cost_windows]))
+        loc_rows.append(
             (
                 "Lean LOC (landed + ½ open)",
                 [
                     "~" + number(f"{Decimal(windows[w]['weighted_loc']):.1f}")
                     if windows[w].get("loc_estimated")
                     else number(windows[w].get("weighted_loc", 0))
-                    for w in COST_WINDOWS
+                    for w in cost_windows
                 ],
             )
         )
-        cost_rows.append(
+        loc_rows.append(
             (
                 "Estimated $ / weighted LOC",
                 [
                     ("~" if windows[w].get("loc_estimated") else "") + amount(windows[w].get("usd_per_loc"), rate=True)
-                    for w in COST_WINDOWS
+                    for w in cost_windows
                 ],
             )
         )
-        if any(windows[w].get("missing_loc_prs") for w in COST_WINDOWS):
-            cost_rows.append(
+        if any(windows[w].get("missing_loc_prs") for w in cost_windows):
+            loc_rows.append(
                 (
                     "Authored PRs with measured LOC",
                     [
                         f"{windows[w].get('known_loc_prs', 0)}/{windows[w].get('known_loc_prs', 0) + windows[w].get('missing_loc_prs', 0)}"
-                        for w in COST_WINDOWS
+                        for w in cost_windows
                     ],
                 )
             )
     label_width = max(
         len("Spending (recorded usage)"),
-        *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *spending_rows]),
+        *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *loc_rows, *spending_rows]),
     )
-    headers = ("3h", "24h", "7d", "All time")
+    headers = tuple("All time" if w == "total" else w for w in report_windows)
     widths = [
         max(len(h), *(len(str(values[i])) for _, values in [*rounds, *prs, *ci_rows, *spending_rows]))
         for i, h in enumerate(headers)
@@ -269,7 +287,7 @@ def display(value, default_kinds=()):
     table("Finished rounds", headers, rounds, widths)
     table(None, headers, prs, widths)
     if spending_rows:
-        table(spending_title, ("3h", "24h", "7d", "All time"), spending_rows, widths)
+        table(spending_title, headers, spending_rows, widths)
     if spending_rows and costs.get("quality") and costs.get("accounting_version", 1) >= 2:
         q = costs["quality"]
         print(
@@ -282,8 +300,14 @@ def display(value, default_kinds=()):
             f"({q.get('recovered_estimates', 0)} recovered); {q.get('unresolved_stopped', 0)} unresolved stopped."
         )
     if cost_rows:
-        table("Costs / initiated PR output", ("7 days", "All time"), cost_rows)
-        if any(windows[w].get("loc_estimated") for w in COST_WINDOWS):
+        cost_headers = tuple({"7d": "7 days", "total": "All time"}.get(w, w) for w in cost_windows)
+        cost_widths = [
+            max(len(h), *(len(str(values[i])) for _, values in [*cost_rows, *loc_rows]))
+            for i, h in enumerate(cost_headers)
+        ]
+        table("Costs / initiated PR output", cost_headers, cost_rows, cost_widths)
+        table(None, cost_headers, loc_rows, cost_widths)
+        if any(windows[w].get("loc_estimated") for w in cost_windows):
             print("~ Missing LOC estimated from measured PRs; zero if none measured. Unknown PR states count as zero.")
     funding = costs.get("funding")
     if funding:
@@ -368,6 +392,10 @@ def combine(values):
     if len(known) != len(values):
         errors.append("Some hosts have no prepared activity")
     accounting_versions = {v.get("costs", {}).get("accounting_version", 1) for v in known}
+    report_windows = tuple(w for w in WINDOWS if all(w in v["rounds"] and w in v["pr_windows"] for v in known))
+    cost_windows = tuple(
+        w for w in COST_WINDOWS if w != "24h" or all(w in v.get("costs", {}).get("windows", {}) for v in known)
+    )
     compatible_costs = len(accounting_versions) == 1 or accounting_versions <= {2, 3}
     if not compatible_costs:
         errors.append("Hosts use different cost accounting versions; refresh their native activity collectors")
@@ -375,8 +403,8 @@ def combine(values):
         prepared_at=min(v["prepared_at"] for v in known),
         history_since=min((v["history_since"] for v in known if v.get("history_since")), default=None),
         round_types=list(dict.fromkeys(k for v in known for k in v.get("round_types", []))),
-        rounds={w: {} for w in WINDOWS},
-        pr_windows={w: {} for w in WINDOWS},
+        rounds={w: {} for w in report_windows},
+        pr_windows={w: {} for w in report_windows},
         costs=dict(windows={}, accounting_version=min(v.get("costs", {}).get("accounting_version", 1) for v in known)),
         ci_windows=None,
         running=sum(v["running"] for v in known) if all(v["running"] is not None for v in known) else None,
@@ -388,6 +416,8 @@ def combine(values):
     )
     for v in known:
         for w, types in v["rounds"].items():
+            if w not in report_windows:
+                continue
             for kind, counts in types.items():
                 row = s["rounds"][w].setdefault(kind, dict(finished=0, failed=0, unknown=0))
                 for key in row:
@@ -415,12 +445,12 @@ def combine(values):
         s["expanded_cache"] = {
             key: sum(row.get(key, 0) for row in expanded) for key in ("workers", "hits", "expanded", "seconds")
         }
-    for w in WINDOWS:
+    for w in report_windows:
         for key in ("authored", "landed", "reviews", "fixes"):
             s["pr_windows"][w][key] = sum(v["pr_windows"][w].get(key, 0) for v in known)
         # Unique assisted PR counts are per-host; review events are additive.
         s["pr_windows"][w]["assisted"] = known[0]["pr_windows"][w].get("assisted") if len(known) == 1 else None
-    for w in COST_WINDOWS:
+    for w in cost_windows:
         rows = [v.get("costs", {}).get("windows", {}).get(w, {}) for v in known]
         row = {
             k: sum(r.get(k, 0) for r in rows)
@@ -467,7 +497,7 @@ def combine(values):
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):
         s["costs"]["spending"] = {}
-        for w in WINDOWS:
+        for w in report_windows:
             rows = [v.get("costs", {}).get("spending", {}).get(w, {}) for v in known]
             complete = (
                 compatible_costs and len(known) == len(values) and all(r.get("spent_usd") is not None for r in rows)
@@ -525,6 +555,8 @@ def combine(values):
         }
     if all(v.get("ci_windows") for v in known):
         s["ci_windows"] = {
-            w: {k: sum(v["ci_windows"][w][k] for v in known) for k in known[0]["ci_windows"][w]} for w in WINDOWS
+            w: {k: sum(v["ci_windows"][w][k] for v in known) for k in known[0]["ci_windows"][w]}
+            for w in report_windows
+            if all(w in v["ci_windows"] for v in known)
         }
     return dict(available=True, summary=s, errors=errors)

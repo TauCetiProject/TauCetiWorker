@@ -3,13 +3,14 @@
 import json
 from decimal import Decimal
 
-from .activity_summary import hourly_rate
+from .activity_summary import COST_WINDOWS as COST_WINDOW_NAMES
+from .activity_summary import WINDOW_SECONDS, hourly_rate
 from .budget import Budget, money
 from .budget_recovery import interval, live_identity
 from .usage_accounting import session_usage, usage_path
 
-COST_WINDOWS = {"total": None, "7d": 7 * 86400}
-SPENDING_WINDOWS = {"3h": 10800, "24h": 86400, "7d": 7 * 86400, "total": None}
+COST_WINDOWS = {key: WINDOW_SECONDS[key] for key in COST_WINDOW_NAMES}
+SPENDING_WINDOWS = WINDOW_SECONDS
 
 
 def install(db):
