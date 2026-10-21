@@ -234,6 +234,31 @@ class ActivityTests(unittest.TestCase):
             a.prepare(now=self.now)
         self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["landed"], 1)
 
+    def test_normal_refresh_imports_coordination_after_cursor_migration(self):
+        journal = Path(os.environ["TAUCETI_FLEET_EVENTS"])
+        event = dict(
+            version=1,
+            kind="review_coordination",
+            id="native-start",
+            at=self.now,
+            worker="worker",
+            machine_id="machine",
+            marker_posted=False,
+            git_held=True,
+        )
+        journal.write_text(json.dumps(event) + "\n")
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT OR REPLACE INTO cursors VALUES (?,?,?)",
+                (str(journal), journal.stat().st_ino, journal.stat().st_size),
+            )
+            db.execute("DELETE FROM meta WHERE key='coordination_journal_schema'")
+        a.prepare(now=self.now)
+        a.prepare(now=self.now)
+        self.assertEqual(
+            a.cached()["summary"]["local_coordination"]["24h"], dict(started=1, marker_failed=1, git_held=1)
+        )
+
     def test_backfill_ignores_resource_receipts(self):
         logs = Path(self.tmp.name) / "logs" / "worker"
         logs.mkdir(parents=True)
