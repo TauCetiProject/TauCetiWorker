@@ -17,14 +17,14 @@ A reset happens only after the record is durable (every file fsynced, the direct
 place) and a final inspection shows the checkout still matches it. Preparation never stops for a
 human: OOMs and SIGKILLs are routine, so their leftovers are saved and the checkout is reset. When a
 process still uses the checkout, saving fails, or the tree will not hold still, the whole checkout
-is moved aside unmodified and preparation continues on a fresh clone; a later preparation saves and
-removes the retained copy once nothing uses it. A clean checkout with nothing unpublished needs no
+is moved aside unmodified and preparation continues on a fresh clone; bounded background activity housekeeping saves and
+removes the retained copy once ordinary ownership and live-reference checks permit it. A clean checkout with nothing unpublished needs no
 record at all.
 
 "Published" is decided locally, never from GitHub: a commit is published when it is reachable from a
 remote-tracking ref or from refs/tauceti/published/*, which git-safe-push writes after a successful
-push and the worker writes for every remote head it checks out. Commits already captured by a durable
-record are excluded through refs/tauceti/preserved/*, so the same commits are bundled once.
+push and the worker writes for every remote head it checks out. The current source fingerprint looks up a completed descriptor in a disposable index,
+so warm preparation need not rehash historical bundles. Preserved refs remain for compatibility.
 
 This module saves work and prevents destruction. It never pushes, opens a PR, or infers that work
 was published from a transcript; resuming retained work is a separate consumer of this format.
@@ -39,16 +39,19 @@ import json
 import os
 import re
 import secrets
+import selectors
 import shutil
 import stat
 import subprocess
 import tarfile
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import recovery_index
 from .config import log
-from .constants import TAUCETI
+from .constants import ROADMAP, TAUCETI
 from .paths import HERE
 from .runtime_status import atomic_json, read_json
 
@@ -66,7 +69,10 @@ MAX_UNTRACKED_FILES = 20000
 CACHE_DIRS = frozenset(
     {".lake", "lake-packages", ".cache", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache", ".venv"}
 )
+# Reserved names used by crash-resumable retention deletion contain only generated artifacts.
+CACHE_DIRS |= frozenset(name + ".retention-deleting" for name in CACHE_DIRS)
 CACHE_TOP = frozenset({"build"})  # Lake's legacy top-level build directory
+CACHE_TOP |= frozenset(name + ".retention-deleting" for name in CACHE_TOP)
 CACHE_SUFFIXES = (".olean", ".ilean", ".pyc", ".pyo")
 # Untracked paths that may carry credentials or runtime secrets; recorded by name only.
 SECRET_NAMES = frozenset(
@@ -92,6 +98,97 @@ LAST_REFUSAL = ""
 
 class RecordError(Exception):
     """Saving a recovery record failed; the checkout must be left intact."""
+
+
+class HistoryLimit(RecordError):
+    """Source remains intact when history/metadata exceeds the descriptor's bounded format."""
+
+
+MAX_HISTORY_TIPS = 4096
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+
+
+class BudgetExhausted(RecordError):
+    """Housekeeping yielded; source and durable cleanup jobs remain retryable."""
+
+
+@dataclass
+class Work:
+    seconds: float = float("inf")
+    entries: int = 2**63
+    bytes: int = 2**63
+    started: float = field(default_factory=time.monotonic)
+    metadata_entries: int = 0
+    read_bytes: int = 0
+    hash_bytes: int = 0
+    removed_bytes: int = 0
+    removal_bytes: int | None = None
+    deadline: float = float("inf")
+    adaptive: bool = False
+    promoted: bool = False
+
+    @property
+    def read_remaining(self):
+        return self.bytes - self.read_bytes - (self.removed_bytes if self.removal_bytes is None else 0)
+
+    @property
+    def removal_remaining(self):
+        return (self.bytes - self.read_bytes if self.removal_bytes is None else self.removal_bytes) - self.removed_bytes
+
+    def charge(self, *, entries=0, read=0, hashed=0, removed=0):
+        if (
+            time.monotonic() >= min(self.started + self.seconds, self.deadline)
+            or self.metadata_entries + entries > self.entries
+            or read > self.read_remaining
+            or removed > self.removal_remaining
+        ):
+            raise BudgetExhausted("housekeeping budget; resume next preparation")
+        self.metadata_entries += entries
+        self.read_bytes += read
+        self.hash_bytes += hashed
+        self.removed_bytes += removed
+
+    def report(self):
+        return dict(
+            seconds=time.monotonic() - self.started,
+            metadata_entries=self.metadata_entries,
+            read_bytes=self.read_bytes,
+            hash_bytes=self.hash_bytes,
+            removed_bytes=self.removed_bytes,
+            limits=dict(
+                seconds=None if self.seconds == float("inf") else self.seconds,
+                entries=self.entries,
+                read_bytes=self.bytes,
+                removal_bytes=self.removal_bytes,
+                promoted=self.promoted,
+            ),
+        )
+
+
+_WORK = ContextVar("recovery_work", default=None)
+
+
+def _charge(**fields):
+    if work := _WORK.get():
+        work.charge(**fields)
+
+
+def _digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    _charge(entries=1)
+    with path.open("rb") as handle:
+        while True:
+            _charge()
+            # Charge before the read, including in bounded background work.
+            size = min(65536, max(0, path.stat().st_size - handle.tell()))
+            if not size:
+                break
+            _charge(read=size, hashed=size)
+            data = handle.read(size)
+            if not data:
+                break
+            digest.update(data)
+    return digest.hexdigest()
 
 
 @dataclass
@@ -141,24 +238,73 @@ class Decision:
     details: dict = field(default_factory=dict)
 
 
+def _git_environment(repo):
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "LC_ALL": "C",
+        "GIT_CEILING_DIRECTORIES": str(repo.parent.resolve()),
+    }
+    # Inspect this checkout even if the caller inherited an unrelated Git context.
+    env.pop("GIT_DIR", None)
+    env.pop("GIT_WORK_TREE", None)
+    return env
+
+
 def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout: int = 600):
-    p = subprocess.run(
-        ["git", "-C", str(repo), "-c", "core.quotepath=off", *args],
-        capture_output=True,
-        timeout=timeout,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"},
-    )
-    if check and p.returncode:
-        detail = p.stderr.decode(errors="replace").strip().splitlines()
-        raise RecordError(f"git {' '.join(args[:2])} failed: {detail[-1] if detail else f'exit {p.returncode}'}")
-    return p.stdout.decode(errors="replace") if text else p.stdout
+    work = _WORK.get()
+    if work is not None:
+        work.charge(entries=1)
+        timeout = min(timeout, max(0.001, work.seconds - (time.monotonic() - work.started)))
+    command = ["git", "-C", str(repo), "-c", "core.quotepath=off", *args]
+    env = _git_environment(repo)
+    if work is not None and work.seconds != float("inf"):
+        # Bound bytes at the pipe, rather than accounting for an arbitrarily large captured
+        # rev-list/diff/ls-files output after it has already been read into memory.
+        returncode, output, stderr = _bounded_git(command, env, work)
+    else:
+        p = subprocess.run(command, capture_output=True, timeout=timeout, env=env)
+        output, stderr, returncode = p.stdout, p.stderr, p.returncode
+        _charge(read=len(output) + len(stderr))
+    if check and returncode:
+        detail = stderr.decode(errors="replace").strip().splitlines()
+        raise RecordError(f"git {' '.join(args[:2])} failed: {detail[-1] if detail else f'exit {returncode}'}")
+    return output.decode(errors="replace") if text else output
+
+
+def _bounded_git(command, env, work):
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as process:
+        output = {process.stdout: bytearray(), process.stderr: bytearray()}
+        try:
+            with selectors.DefaultSelector() as selector:
+                for stream in output:
+                    selector.register(stream, selectors.EVENT_READ)
+                while selector.get_map():
+                    work.charge()
+                    remaining = min(work.started + work.seconds, work.deadline) - time.monotonic()
+                    for event, _ in selector.select(max(0, remaining)):
+                        capacity = min(65536, work.read_remaining)
+                        if capacity <= 0:
+                            raise BudgetExhausted("git output byte budget; retry preservation")
+                        data = os.read(event.fileobj.fileno(), capacity)
+                        work.charge(read=len(data))
+                        if data:
+                            output[event.fileobj].extend(data)
+                        else:
+                            selector.unregister(event.fileobj)
+            remaining = max(0.001, min(work.started + work.seconds, work.deadline) - time.monotonic())
+            rc = process.wait(timeout=remaining)
+            return rc, bytes(output[process.stdout]), bytes(output[process.stderr])
+        except BaseException:
+            # Only the Git subprocess started by this housekeeping operation, never a session.
+            process.kill()
+            process.wait()
+            raise
 
 
 def _rev(repo: Path, name: str) -> str | None:
-    p = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "-q", "--verify", f"{name}^{{commit}}"], capture_output=True, text=True
-    )
-    return p.stdout.strip() or None if p.returncode == 0 else None
+    return _git(repo, "rev-parse", "-q", "--verify", f"{name}^{{commit}}", check=False, text=True).strip() or None
 
 
 def _excluded(rel: str) -> str | None:
@@ -184,6 +330,7 @@ def _untracked(repo: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]
         _git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
     )
     for rel in sorted(set(listed)):
+        _charge(entries=1)
         why = _excluded(rel)
         if why:
             excluded.append((rel.rstrip("/"), why))
@@ -196,8 +343,10 @@ def _untracked(repo: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]
         if stat.S_ISDIR(st.st_mode):
             # `ls-files` reports a nested repository as `dir/`. Walk it without following links.
             for root, dirs, files in os.walk(path, followlinks=False):
+                _charge(entries=1)
                 dirs[:] = sorted(d for d in dirs if d not in CACHE_DIRS)
                 for name in sorted(files) + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+                    _charge(entries=1)
                     sub = os.path.relpath(os.path.join(root, name), repo)
                     why = _excluded(sub)
                     if why:
@@ -212,7 +361,7 @@ def _untracked(repo: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]
     return keep, excluded
 
 
-def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
+def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = False) -> Snapshot:
     """Read-only inspection. Raises RecordError when the checkout cannot be read reliably.
     `preserved` names the complete records whose preserved refs may exempt commits from re-recording."""
     head = _rev(repo, "HEAD")
@@ -231,6 +380,29 @@ def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
             tips[name] = oid
             operations.append(name)
     operations += [d for d in ("rebase-merge", "rebase-apply") if (gitdir / d).exists()]
+    if history:
+        # Archive only history outside the source tips already covered by ordinary v1 records.
+        # Deduplicate by oid so our own preservation-ref writes cannot change the snapshot.
+        extra = set(
+            _git(
+                repo,
+                "rev-list",
+                "--all",
+                "--reflog",
+                "--not",
+                "--remotes",
+                f"--glob={PUBLISHED}",
+                *sorted(set(tips.values())),
+                text=True,
+            ).split()
+        )
+        if extra:
+            heads = set(_git(repo, "rev-list", "--no-walk", "--all", "--reflog", text=True).split())
+            retained = extra & heads
+            if len(retained) > MAX_HISTORY_TIPS:
+                raise HistoryLimit("retained history exceeds bounded descriptor tip count")
+            for oid in retained:
+                tips[f"history/{oid}"] = oid
     base = _rev(repo, "refs/remotes/origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")) or _rev(
         repo, "refs/remotes/origin/HEAD"
     )
@@ -272,6 +444,7 @@ def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
     digest = hashlib.sha256()
     archive_bytes = 0
     for rel, kind in untracked:
+        _charge(entries=1)
         path = repo / rel
         digest.update(f"{rel}\0{kind}\0".encode("utf-8", "surrogateescape"))
         try:
@@ -282,7 +455,7 @@ def inspect(repo: Path, preserved: list[str] | None = None) -> Snapshot:
                 archive_bytes += st.st_size
                 digest.update(f"{st.st_mode & 0o777}\0".encode())
                 if archive_bytes <= MAX_UNTRACKED_BYTES:
-                    digest.update(hashlib.sha256(path.read_bytes()).digest())
+                    digest.update(bytes.fromhex(_digest(path)))
         except OSError as error:
             raise RecordError(f"could not read untracked {rel}: {error}") from None
     state = dict(
@@ -367,7 +540,10 @@ def _archive(repo: Path, entries: list[tuple[str, str]], dest: Path) -> None:
                     )
                 src = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
                 with os.fdopen(src, "rb") as handle:
-                    data = handle.read()
+                    _charge(entries=1, read=st.st_size)
+                    data = handle.read(st.st_size + 1)
+                if len(data) != st.st_size:
+                    raise RecordError(f"untracked {rel} changed size during the save")
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
         out.flush()
@@ -383,12 +559,34 @@ PAYLOADS = ("staged.patch", "unstaged.patch", "untracked.tar")
 
 
 def _read_manifest(record: Path) -> dict | None:
-    value = read_json(record / "manifest.json")
+    try:
+        size = (record / "manifest.json").stat().st_size
+        if size > MAX_MANIFEST_BYTES:
+            return None
+        _charge(entries=1, read=size)
+    except OSError:
+        return None
+    try:
+        value = read_json(record / "manifest.json")
+    except RecursionError:
+        return None
     if value.get("schema") != SCHEMA or any(key not in value for key in REQUIRED):
+        return None
+    if (
+        not isinstance(value["checkout"], str)
+        or not isinstance(value["fingerprint"], str)
+        or not isinstance(value["bundle_refs"], dict)
+        or (value["local_head"] is not None and not isinstance(value["local_head"], str))
+    ):
         return None
     files = value["files"]
     needed = PAYLOADS + (("commits.bundle",) if value["bundle_refs"] else ())
-    if not isinstance(files, dict) or any(name not in files for name in needed):
+    if (
+        not isinstance(files, dict)
+        or any(name not in files for name in needed)
+        or not set(files) <= set(PAYLOADS) | {"commits.bundle"}
+        or any(not isinstance(meta, dict) for meta in files.values())
+    ):
         return None
     return value
 
@@ -401,9 +599,11 @@ def _complete(record: Path, *, digests: bool = True) -> dict | None:
     for name, meta in manifest["files"].items():
         path = record / name
         try:
-            if path.stat().st_size != meta.get("bytes"):
+            st = path.lstat()
+            _charge(entries=1)
+            if not stat.S_ISREG(st.st_mode) or st.st_size != meta.get("bytes"):
                 return None
-            if digests and hashlib.sha256(path.read_bytes()).hexdigest() != meta.get("sha256"):
+            if digests and _digest(path) != meta.get("sha256"):
                 return None
         except OSError:
             return None
@@ -412,10 +612,13 @@ def _complete(record: Path, *, digests: bool = True) -> dict | None:
 
 def _sync_record(record: Path) -> None:
     """Re-establish durability of a reused record: its files, its directory, and the directory chain."""
-    for path in record.iterdir():
-        if path.is_file():
-            with open(path, "rb") as handle:
-                os.fsync(handle.fileno())
+    manifest = _read_manifest(record)
+    if manifest is None:
+        raise OSError("invalid recovery descriptor")
+    for name in ("manifest.json", *manifest["files"]):
+        _charge(entries=1)
+        with open(record / name, "rb") as handle:
+            os.fsync(handle.fileno())
     _fsync_dir(record)
     _fsync_dir(record.parent)
     _fsync_dir(record.parent.parent)
@@ -423,6 +626,51 @@ def _sync_record(record: Path) -> None:
 
 def owner_path(cfg, label: str = "TauCeti") -> Path:
     return cfg.state / "checkout-owners" / f"{label}.json"
+
+
+def process_owner():
+    """Process birth attribution without requiring PID namespace support."""
+    import sys
+
+    from .usage_lifecycle import identity
+
+    if sys.platform != "linux":
+        return identity()
+    fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+    owner = dict(pid=os.getpid(), start=fields[19], boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+    if os.getsid(0) == os.getpid():
+        owner["session"] = os.getpid()  # ordinary dedicated round session, when one exists
+    return owner
+
+
+def owner_stopped(owner):
+    """Unknown/unreadable owners stay queued; only this candidate is withheld."""
+    import sys
+    import uuid
+
+    if not isinstance(owner, dict) or not {"pid", "start", "boot"} <= owner.keys():
+        return False
+    if sys.platform != "linux":
+        from .usage_lifecycle import alive
+
+        return not alive(owner)
+    if not isinstance(owner["start"], str) or not owner["start"].isdigit() or not isinstance(owner["boot"], str):
+        return False
+    try:
+        uuid.UUID(owner["boot"])
+        pid = int(owner["pid"])
+        if pid <= 0:
+            return False
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if boot != owner["boot"]:
+            return True
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return fields[19] != owner["start"] or fields[0] in {"Z", "X"}
+    except (ProcessLookupError, FileNotFoundError):
+        # A missing boot-id file is unavailable ownership evidence, rather than a dead PID.
+        return Path("/proc/sys/kernel/random/boot_id").is_file() and not Path(f"/proc/{pid}").exists()
+    except (OSError, ValueError, TypeError, IndexError):
+        return False
 
 
 def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
@@ -440,6 +688,8 @@ def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
     if not same:
         value["round_id"] = fields["round_id"]  # None replaces an earlier round's identity
         value["claimed_at"] = time.time()
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        value["process"] = process_owner()
     value["worker"] = getattr(cfg, "wid", None)
     try:
         atomic_json(path, value)
@@ -455,43 +705,227 @@ def mark_published(repo: Path, name: str, oid: str) -> None:
     subprocess.run(["git", "-C", str(repo), "update-ref", f"{PUBLISHED}/{name}", oid], capture_output=True, check=False)
 
 
+def _commit_key(snap):
+    # A clean checkout may move HEAD while the same local-only branch tips remain. Their
+    # completed bundle is reusable independently of the whole working-tree fingerprint.
+    return "commits:" + hashlib.sha256("\0".join(sorted(snap.unpublished)).encode()).hexdigest()
+
+
+def _indexed_record(state, repository, fingerprint, *, source=True, snapshot=None):
+    cached = recovery_index.lookup(state, repository, fingerprint)
+    if not cached or (not source and cached.get("verified") is not True):
+        return None
+    record = state / "recovery" / cached["record"]
+    try:
+        manifest = _read_manifest(record)
+        if manifest is None or cached.get("manifest_checksum") != recovery_index.checksum(manifest):
+            return None
+        if snapshot is not None and (
+            any(
+                manifest.get(key) != getattr(snapshot, attribute)
+                for key, attribute in (
+                    ("local_head", "head"),
+                    ("branch", "branch"),
+                    ("tips", "tips"),
+                    ("operations", "operations"),
+                    ("conflicted", "conflicted"),
+                    ("flagged", "flagged"),
+                    ("absent", "absent"),
+                )
+            )
+            or manifest.get("untracked") != [path for path, _ in snapshot.untracked]
+            or manifest["files"]["staged.patch"].get("sha256") != hashlib.sha256(snapshot.staged).hexdigest()
+            or manifest["files"]["unstaged.patch"].get("sha256") != hashlib.sha256(snapshot.unstaged).hexdigest()
+        ):
+            return None
+        before = recovery_index.stamps(record, manifest)
+        _charge(entries=len(before))
+        trusted = cached.get("verified") is True and cached.get("evidence") == before
+        if (
+            manifest
+            and manifest["fingerprint"] == (fingerprint if source else cached.get("source_fingerprint"))
+            and manifest.get("repository", "") == repository
+            and (trusted or _complete(record) is not None)
+        ):
+            after = recovery_index.stamps(record, manifest)
+            if before == after:
+                if not trusted:
+                    _sync_record(record)
+                    with contextlib.suppress(OSError):
+                        recovery_index.remember(
+                            state, record, manifest, verified=True, evidence=after, fingerprint=fingerprint
+                        )
+                return record
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass  # invalidated evidence requires exact validation or a fresh source save
+    return None
+
+
+def _remember_commits(state, record, manifest, snap):
+    with contextlib.suppress(OSError, ValueError, TypeError, KeyError):
+        if not snap.unpublished:
+            return
+        fingerprint = _commit_key(snap)
+        previous = recovery_index.lookup(state, manifest["repository"], fingerprint)
+        evidence = recovery_index.stamps(record, manifest)
+        if (
+            previous.get("verified") is True
+            and previous.get("record") == record.name
+            and previous.get("evidence") == evidence
+        ):
+            return
+        with contextlib.suppress(OSError, ValueError):
+            recovery_index.remember(
+                state,
+                record,
+                manifest,
+                verified=True,
+                evidence=evidence,
+                fingerprint=fingerprint,
+            )
+
+
+def ref_object(repo: Path, ref: str) -> str | None:
+    """Read an intent's object identity without peeling its annotated tag to source."""
+    return _git(repo, "rev-parse", "--verify", ref, check=False, text=True).strip() or None
+
+
+def pending_push_ref(marker: dict) -> str:
+    if marker["ref"].startswith("refs/tauceti/published/scope/"):
+        return marker["ref"].replace("refs/tauceti/published/scope/", "refs/tauceti/pending-push/", 1)
+    branch = marker["ref"].removeprefix("refs/tauceti/published/push/")
+    return f"refs/tauceti/pending-push/{marker.get('scope') or 'unscoped'}/{branch}"
+
+
+def push_intent(repo, ref):
+    if not ref_object(repo, ref):
+        return {}
+    message = _git(repo, "cat-file", "-p", ref, text=True).split("\n\n", 1)[-1].splitlines()
+    return dict(oid=_rev(repo, ref), expected=message[1] if len(message) > 1 else None)
+
+
+def source_receipt(record, handoff):
+    identity = handoff.get("id", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", identity):
+        return handoff.get("source_receipt")
+    root = record / "source-outcomes"
+    positive = read_json(root / f"{identity}.checkpoint.json")
+    clean = read_json(root / f"{identity}.clean.json")
+    receipt = positive or clean or handoff.get("source_receipt")
+    if receipt:
+        publication = positive.get("published_head") or clean.get("published_head")
+        pending = positive.get("pending_publication") or clean.get("pending_publication")
+        return {
+            **receipt,
+            **({"published_head": publication} if publication else {}),
+            **({"pending_publication": pending} if pending else {}),
+        }
+    return receipt
+
+
+def detach_handoff_owner(cfg, label="TauCeti"):
+    """Old source attribution must not follow a replacement or destructively reset checkout."""
+    path = owner_path(cfg, label)
+    owner = read_json(path)
+    if owner.get("recovery_handoffs"):
+        owner["recovery_handoffs"] = []
+        atomic_json(path, owner)
+        _fsync_dir(path.parent)
+
+
+def _handoff_source_receipts(cfg, owner, checkpoint, *, checkout=None):
+    """Independent, atomic handoff outcomes cannot race consumer journal/lock updates."""
+    for record_name, identity in (owner.get("recovery_handoffs") or [])[:4]:
+        record = Path(record_name)
+        if (
+            record.parent != cfg.state / "recovery"
+            or record.is_symlink()
+            or not re.fullmatch(r"[0-9a-f]{32}", identity)
+        ):
+            raise RecordError("invalid handoff receipt destination")
+        handoff = read_json(record / "recovery.json").get("handoff") or {}
+        if handoff.get("id") != identity or handoff.get("state") != "offered":
+            continue
+        if handoff.get("source_round") != owner.get("round_id"):
+            raise RecordError("handoff source receipt round mismatch")
+        receipt = dict(round_id=owner.get("round_id"), checkpoint=str(checkpoint) if checkpoint else None)
+        if checkout is not None:
+            published = _rev(checkout, handoff["push_marker"])
+            if published and published != handoff.get("published_before"):
+                receipt["published_head"] = published
+            pending = push_intent(
+                checkout, handoff.get("pending_marker") or pending_push_ref(dict(ref=handoff["push_marker"]))
+            )
+            if pending and pending["oid"] != pending["expected"]:
+                receipt["pending_publication"] = pending
+        path = record / "source-outcomes" / f"{identity}.{'checkpoint' if checkpoint else 'clean'}.json"
+        try:
+            if read_json(path) != receipt:
+                atomic_json(path, receipt)
+                _fsync_dir(path.parent)
+                _fsync_dir(record)
+        except OSError as error:
+            raise RecordError(f"could not retain source outcome: {error}") from error
+
+
 def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
     """Write or reuse a complete record for this exact snapshot. Raises RecordError on any failure."""
     from .activity import current_round_id
 
     root = cfg.state / "recovery"
-    owner = owner or read_json(owner_path(cfg, label))
+    owner = read_json(owner_path(cfg, label)) if owner is None else owner
     marker = owner.get("publication_marker") or {}
     outcome = owner.get("round_outcome")
     if marker.get("ref"):
-        published = _rev(repo, marker["ref"])
-        if published and published != marker.get("before"):
+        branch = marker["ref"].removeprefix("refs/tauceti/published/push/")
+        publication_ref = (
+            f"refs/tauceti/published/scope/{marker['scope']}/{branch}" if marker.get("scope") else marker["ref"]
+        )
+        published = _rev(repo, publication_ref)
+        if published and (
+            marker.get("scope") or (published != marker.get("before") and published != owner.get("expected_head"))
+        ):
             outcome = {**(outcome or {}), "published_head": published}
+        pending_ref = pending_push_ref(marker)
+        pending = ref_object(repo, pending_ref)
+        if pending:
+            message = _git(repo, "cat-file", "-p", pending, text=True).split("\n\n", 1)[-1].splitlines()
+            auth = owner.get("authorization") or {}
+            outcome = {
+                **(outcome or {}),
+                "pending_push": dict(
+                    oid=_rev(repo, pending_ref),
+                    expected=message[1] if len(message) > 1 else None,
+                    repository=auth.get("repository"),
+                    ref=auth.get("ref"),
+                ),
+            }
     source_round = owner.get("round_id") or current_round_id() or f"unattributed-{int(time.time())}"
     base_id = _safe_id(str(source_round))
     try:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         _fsync_dir(root)
         _fsync_dir(root.parent)
-        existing = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
     except OSError as error:
         raise RecordError(f"could not create {root}: {error}") from None
-    for record in existing:
-        manifest = _read_manifest(record)
-        # The fingerprint covers every tip and every saved byte, so a match is the same source even
-        # when the checkout has since been moved aside.
-        if manifest and manifest["fingerprint"] == snap.fingerprint:
-            if _complete(record) is None:
-                continue  # damaged: never trusted, never deleted; write a fresh copy instead
-            try:
-                _sync_record(record)
-            except OSError as error:
-                raise RecordError(f"could not re-sync {record}: {error}") from None
-            return record  # this exact source is already durable; never write it twice
-    record_id, n = base_id, 1
-    while (root / record_id).exists():
-        n += 1
-        record_id = f"{base_id}.{n}"
+    indexed = os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() != "off"
+    record = _indexed_record(cfg.state, repository, snap.fingerprint, snapshot=snap) if indexed else None
+    pending_publication = (outcome or {}).get("pending_push")
+    if record and pending_publication:
+        previous = read_json(record / "normal-publication.json")
+        if previous and previous != pending_publication:
+            record = None  # Keep both distinct uncertain intents with their original source/authority.
+    if record:
+        if (outcome or {}).get("pending_push"):
+            atomic_json(record / "normal-publication.json", outcome["pending_push"])
+            _fsync_dir(record)
+        _handoff_source_receipts(cfg, owner, record, checkout=repo)
+        if snap.unpublished:
+            _remember_commits(cfg.state, record, _read_manifest(record), snap)
+        return record
+    record_id = base_id
+    if (root / record_id).exists():
+        record_id = f"{base_id}.{secrets.token_hex(8)}"
     tmp = root / f".tmp-{record_id}-{os.getpid()}-{secrets.token_hex(4)}"
     pending = f"{PENDING}/{tmp.name.lstrip('.')}"
     bundle_refs: dict[str, str] = {}
@@ -520,7 +954,7 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         _archive(repo, snap.untracked, tmp / "untracked.tar")
         files = {}
         for path in sorted(tmp.iterdir()):
-            files[path.name] = dict(bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            files[path.name] = dict(bytes=path.stat().st_size, sha256=_digest(path))
         manifest = dict(
             schema=SCHEMA,
             id=record_id,
@@ -557,7 +991,10 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
             round_outcome=outcome,
             conversation=read_json(Path(owner["conversation_path"])) if owner.get("conversation_path") else None,
         )
-        _write(tmp / "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
+        encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+        if len(encoded) > MAX_MANIFEST_BYTES:
+            raise HistoryLimit("preservation metadata exceeds bounded descriptor size")
+        _write(tmp / "manifest.json", encoded)
         _fsync_dir(tmp)
         final = root / record_id
         os.rename(tmp, final)
@@ -569,6 +1006,19 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         if isinstance(error, RecordError):
             raise
         raise RecordError(f"could not save recovery record: {error}") from error
+    receipt_error = None
+    try:
+        _handoff_source_receipts(cfg, owner, final, checkout=repo)
+    except RecordError as error:
+        receipt_error = error
+    # The descriptor is durable before the disposable index is published. Failure/crash here is
+    # safe: a later lookup misses and saves again, or housekeeping reconstructs an unverified entry.
+    if indexed:
+        with contextlib.suppress(OSError, ValueError):
+            recovery_index.remember(
+                cfg.state, final, manifest, verified=True, evidence=recovery_index.stamps(final, manifest)
+            )
+        _remember_commits(cfg.state, final, manifest, snap)
     # Durable: the bundle now preserves these commits, so later inspections need not re-record them.
     _update_refs(
         repo,
@@ -576,6 +1026,8 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         + [f"delete {pending}/{name}" for name in bundle_refs],
         check=False,
     )
+    if receipt_error:
+        raise receipt_error
     return final
 
 
@@ -586,25 +1038,10 @@ def _update_refs(repo: Path, commands: list[str], *, check: bool = True) -> None
         ["git", "-C", str(repo), "update-ref", "--stdin"],
         input="".join(c + "\n" for c in commands).encode(),
         capture_output=True,
+        env=_git_environment(repo),
     )
     if check and p.returncode:
         raise RecordError(f"git update-ref failed: {p.stderr.decode(errors='replace').strip()[-200:]}")
-
-
-def _supersede(cfg, repo: Path, current: Path | None) -> None:
-    """Records left `recovery-blocked` by the earlier blocking guard no longer describe the checkout.
-    Their data is kept; only the disposition changes."""
-    for _, record, manifest, _status in records(cfg.state.parent, workers={cfg.state.name}):
-        if (
-            record is not None
-            and record != current
-            and manifest is not None
-            and manifest.get("checkout") == str(repo)
-            and read_json(record / "status.json").get("state") == "recovery-blocked"
-        ):
-            _set_status(
-                record, "superseded", f"checkout changed; see {current.name if current else 'a clean checkout'}"
-            )
 
 
 def _set_status(record: Path, state: str, reason: str = "") -> bool:
@@ -617,18 +1054,9 @@ def _set_status(record: Path, state: str, reason: str = "") -> bool:
     return True
 
 
-def _preserved(cfg) -> list[str]:
-    """Record ids whose preserved refs may exempt commits: only complete records count."""
-    return [
-        record.name
-        for _, record, _, _ in records(cfg.state.parent, workers={cfg.state.name})
-        if record is not None and _complete(record) is not None
-    ]
-
-
-def live_users(repo: Path) -> list[str]:
+def live_users(repo: Path, *, session=None) -> list[str]:
     """Processes whose cwd, root, or open files lie inside the checkout (Linux /proc; read-only).
-    An empty result is NOT proof of quiescence: a detached process may hold nothing open there."""
+    Detached descendants without a live reference are outside this best-effort observation."""
     proc = Path("/proc")
     if not (proc / "self").exists():
         return []
@@ -644,12 +1072,24 @@ def live_users(repo: Path) -> list[str]:
             break
     found = []
     for entry in proc.iterdir():
-        if not entry.name.isdigit() or int(entry.name) in skip:
+        _charge()  # deadline also bounds ownership observation during housekeeping
+        if not entry.name.isdigit():
+            continue
+        if session is not None:
+            try:
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(fields[3]) == session and fields[0] not in {"Z", "X"}:
+                    found.append(f"{entry.name} (owner session)")
+                    continue
+            except (OSError, ValueError, IndexError):
+                pass
+        if int(entry.name) in skip:
             continue
         links = [entry / "cwd", entry / "root"]
         with contextlib.suppress(OSError):
             links += list((entry / "fd").iterdir())
         for link in links:
+            _charge()
             try:
                 where = os.readlink(link)
             except OSError:
@@ -663,35 +1103,47 @@ def live_users(repo: Path) -> list[str]:
     return found
 
 
-MAX_PRUNE_PER_PREPARATION = 3
 # Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks
 # publication bundles in state/<worker>/progress/retained, beside the roadmap clone.
 RETAINED_DIR = "retained-checkouts"
 
 
-def _retain(cfg, repo: Path, reason: str, record: Path | None, label: str) -> Decision:
+def _retain(
+    cfg, repo: Path, reason: str, record: Path | None, label: str, *, repository: str | None = None
+) -> Decision:
     """Move the whole checkout aside, unmodified, so preparation can continue on a fresh one.
 
     A same-directory rename needs no free space and leaves every byte (and any process still
-    working there) exactly where it was. The retained copy is saved and removed automatically by a
-    later preparation once nothing uses it, so no operator is ever needed."""
+    working there) exactly where it was. The retained copy is saved and removed automatically by
+    background activity housekeeping after ordinary ownership and live-reference checks permit it."""
     global LAST_REFUSAL
     parent = repo.parent / RETAINED_DIR
     dest = parent / f"{repo.name}-{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
+    from .recovery_maintenance import register
+
+    repository = repository or (ROADMAP if label == "progress-roadmap" else TAUCETI)
     try:
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # A same-volume rename must still work when the state volume is full/unwritable.
+        # Lost registration is rediscovered from known roots; lost attribution withholds cleanup.
+        with contextlib.suppress(OSError):
+            register(cfg.state, parent, label, repository=repository)
+        owner = read_json(owner_path(cfg, label))
+        owner.update(repository=repository, label=label)
+        with contextlib.suppress(OSError):
+            atomic_json(dest.with_name(dest.name + ".owner.json"), owner)
+            _fsync_dir(parent)
         os.rename(repo, dest)
     except OSError as error:
+        if repo.exists() and not dest.exists():
+            with contextlib.suppress(OSError):
+                dest.with_name(dest.name + ".owner.json").unlink(missing_ok=True)
         # Neither saved nor movable: leave everything untouched; the next round tries again.
         LAST_REFUSAL = f"{reason}, and moving {repo} aside failed ({error}); the checkout is left intact"
         return Decision(False, LAST_REFUSAL, record, "refused")
     with contextlib.suppress(OSError):  # durability and attribution are best effort here
         _fsync_dir(parent)
         _fsync_dir(repo.parent)
-    owner = read_json(owner_path(cfg, label))
-    if owner:
-        with contextlib.suppress(OSError):
-            atomic_json(dest.with_name(dest.name + ".owner.json"), owner)
     if record is not None:
         _set_status(record, "retained", f"{reason}; checkout moved to {dest}")
     log(f"recovery: {reason}; moved the checkout to {dest} and continuing with a fresh one")
@@ -703,63 +1155,121 @@ def retain(cfg, repo: Path, reason: str, *, label: str = "TauCeti") -> Decision:
     return _retain(cfg, repo, reason, None, label)
 
 
-def _evict_caches(tree: Path) -> None:
-    """Reclaim a retained checkout's dependency and build caches; never its source."""
-    for root, dirs, _ in os.walk(tree, followlinks=False):
-        for name in [d for d in dirs if d in CACHE_DIRS or (root == str(tree) and d in CACHE_TOP)]:
-            path = Path(root) / name
-            if not path.is_symlink():
-                shutil.rmtree(path, ignore_errors=True)
-        dirs[:] = [d for d in dirs if d not in CACHE_DIRS and d != ".git"]
+def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
+    """Save source without moving/resetting a tree; a collector can still evict caches on failure."""
+    record = None
+    try:
+        if not (repo / ".git").is_dir() or (repo / ".git").is_symlink():
+            return Decision(False, "not a standalone Git checkout; retaining source", state="protected")
+        snap = inspect(repo, history=True)
+        if len(snap.untracked) > MAX_UNTRACKED_FILES or snap.archive_bytes > MAX_UNTRACKED_BYTES:
+            return Decision(
+                False, "source exceeds the existing recovery archive bounds; retaining checkout", state="protected"
+            )
+        if snap.needs_record and not dry_run:
+            record = _record(cfg, repo, snap, "TauCeti", TAUCETI, owner=owner)
+        if any("credential" in reason for _, reason in snap.excluded):
+            return Decision(False, "credential-like files require retaining the checkout", record, "protected")
+        if _git(
+            repo, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/tags", "refs/notes", text=True
+        ).strip():
+            return Decision(False, "additional Git refs require retaining the checkout", record, "protected")
+        preserved = [f"--glob={PRESERVED}/{record.name}"] if record else []
+        if _git(
+            repo,
+            "rev-list",
+            "--reflog",
+            "--all",
+            "--not",
+            "--branches",
+            "--remotes",
+            f"--glob={PUBLISHED}",
+            *preserved,
+            text=True,
+        ).strip():
+            return Decision(False, "reflog-only commits require retaining the checkout", record, "protected")
+        if live_users(repo) or inspect(repo, history=True).fingerprint != snap.fingerprint:
+            return Decision(False, "checkout changed or acquired a live user during preservation", record)
+        return Decision(True, record=record, state="preserved")
+    except (OSError, subprocess.SubprocessError, RecordError) as error:
+        return Decision(False, f"could not preserve source: {error}", record)
 
 
-def _prune_retained(cfg, repo: Path, label: str, repository: str) -> None:
-    """Save and remove retained checkouts that nothing uses any more, a few per preparation.
+def _bundle_prerequisites(bundle):
+    """Read only the bounded text header, after exact validation of the bundle payload."""
+    prerequisites = []
+    with bundle.open("rb") as handle:
+        while True:
+            line = handle.readline(4097)
+            _charge(read=len(line))
+            if len(line) > 4096 or not line:
+                raise RecordError("invalid bundle header")
+            if line == b"\n":
+                break
+            if line.startswith(b"-"):
+                oid = line[1:].split(b" ", 1)[0].decode("ascii")
+                if not re.fullmatch(r"[0-9a-f]{40,64}", oid):
+                    raise RecordError("invalid bundle prerequisite")
+                prerequisites.append(oid)
+            if handle.tell() > MAX_MANIFEST_BYTES:
+                raise RecordError("oversized bundle header")
+    return prerequisites
 
-    A copy is removed only after a record of it is durable and a second inspection shows it did not
-    change meanwhile. A copy that cannot be saved keeps its source but loses its caches, so retained
-    checkouts cannot fill the disk with build output. Removal renames to `*.deleting` first, so an
-    interrupted delete is finished later without needing git."""
-    parent = repo.parent / RETAINED_DIR
-    if not parent.is_dir():
-        return
-    for doomed in parent.glob("*.deleting"):
-        shutil.rmtree(doomed, ignore_errors=True)
-    budget = MAX_PRUNE_PER_PREPARATION
-    for old in sorted(p for p in parent.glob(f"{repo.name}-*") if p.is_dir() and not p.name.endswith(".deleting")):
-        if budget <= 0:
-            return
-        budget -= 1
-        if live_users(old):
+
+def _rollback_commits(cfg, repo, snap, repository):
+    """Index-free fallback: validate one bundle named by this checkout's own preserved refs.
+
+    Only current Git-ref metadata is enumerated, never historic descriptor directories/trees.
+    A corrupt/missing candidate causes a fresh save; no other historical payload is hashed.
+    """
+    unpublished = set(snap.unpublished)
+    required = {oid for oid in snap.tips.values() if oid in unpublished}
+    if not required:
+        return None
+    groups = {}
+    prefix = PRESERVED + "/"
+    for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)", PRESERVED, text=True).splitlines():
+        oid, _, ref = line.partition(" ")
+        if not ref.startswith(prefix):
             continue
-        sidecar = old.with_name(old.name + ".owner.json")
+        record_id, separator, _ = ref[len(prefix) :].partition("/")
+        if separator and record_id and not record_id.startswith("."):
+            groups.setdefault(record_id, set()).add(oid)
+    selected, newest = None, -1
+    for record_id, oids in groups.items():
+        if not required <= oids:
+            continue
+        record = cfg.state / "recovery" / record_id
         try:
-            snap = inspect(old, _preserved(cfg))
-            record = _record(cfg, old, snap, label, repository, owner=read_json(sidecar)) if snap.needs_record else None
-            if live_users(old) or inspect(old, _preserved(cfg)).fingerprint != snap.fingerprint:
-                continue  # something touched it while saving; try again later
-            doomed = old.with_name(old.name + ".deleting")
-            os.rename(old, doomed)
-            if record is not None:
-                _set_status(record, "checkout-reset", f"retained checkout {old.name} saved and removed")
-            shutil.rmtree(doomed, ignore_errors=True)
-            sidecar.unlink(missing_ok=True)
-            log(f"recovery: removed retained checkout {old}" + (f"; its source is in {record}" if record else ""))
-        except (OSError, subprocess.SubprocessError, RecordError) as error:
-            log(f"recovery: keeping retained checkout {old} for now ({error}); evicting its caches")
-            _evict_caches(old)
+            _charge(entries=1)
+            modified = record.stat().st_mtime_ns
+            if modified > newest:
+                selected, newest = record, modified
+        except OSError:
+            continue
+    if selected is None:
+        return None
+    try:
+        manifest = _complete(selected)
+        if manifest is None or manifest.get("repository") != repository or not manifest["bundle_refs"]:
+            return None
+        prerequisites = _bundle_prerequisites(selected / "commits.bundle")
+        if (
+            prerequisites
+            and _git(repo, "rev-list", "--no-walk", *prerequisites, "--not", "--remotes", f"--glob={PUBLISHED}").strip()
+        ):
+            return None  # a former published base must now be included in a fresh bundle
+        _sync_record(selected)
+        heads = {
+            line.split()[0]
+            for line in _git(repo, "bundle", "list-heads", str(selected / "commits.bundle"), text=True).splitlines()
+        }
+        return selected if required <= heads else None
+    except (OSError, RecordError, ValueError, TypeError, UnicodeError):
+        return None
 
 
-def _dirty_without_inspection(repo: Path) -> bool:
-    """Rollback's only check: does git report anything a reset would discard? Unknown counts as yes."""
-    p = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain", "--ignored=no", "--untracked-files=all"],
-        capture_output=True,
-    )
-    return p.returncode != 0 or bool(p.stdout.strip())
-
-
-def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
+def _guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
     """Save anything unpublished in `repo`, then let preparation continue. Never waits for a human.
 
     The normal outcome is a durable record followed by a reset in place, including after an OOM or
@@ -770,37 +1280,53 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
     moved, and the next round simply retries."""
     global LAST_REFUSAL
     LAST_REFUSAL = ""
-    _prune_retained(cfg, repo, label, repository)
-    if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
-        # Rollback: no inspection or records. A dirty tree is still never reset; it is moved aside.
-        if _dirty_without_inspection(repo):
-            return _retain(cfg, repo, "TAUCETI_WORK_RECOVERY=off and the checkout is dirty", None, label)
-        return Decision(True, state="disabled")
+    indexed = os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() != "off"
     record = None
     for _ in range(3):
         try:
-            snap = inspect(repo, _preserved(cfg))
+            snap = inspect(repo)
         except (OSError, subprocess.SubprocessError, RecordError) as error:
-            return _retain(cfg, repo, f"could not inspect {repo} ({error})", record, label)
+            return _retain(cfg, repo, f"could not inspect {repo} ({error})", record, label, repository=repository)
         if snap.published:
             users = live_users(repo)
             if users:  # nothing to lose now, but a live writer could still create some
-                return _retain(cfg, repo, "processes still use the checkout: " + ", ".join(users[:8]), None, label)
-            _supersede(cfg, repo, None)
+                return _retain(
+                    cfg,
+                    repo,
+                    "processes still use the checkout: " + ", ".join(users[:8]),
+                    None,
+                    label,
+                    repository=repository,
+                )
             return Decision(True, state="clean")
-        if snap.needs_record:
+        committed = None
+        if snap.unpublished and not snap.dirty:
+            committed = (
+                _indexed_record(cfg.state, repository, _commit_key(snap), source=False)
+                if indexed
+                else _rollback_commits(cfg, repo, snap, repository)
+            )
+        if committed is not None:
+            record = committed  # still run the ordinary live-user and final-source rechecks below
+        elif snap.needs_record:
             try:
                 record = _record(cfg, repo, snap, label, repository)
             except RecordError as error:
-                return _retain(cfg, repo, f"could not save its source ({error})", record, label)
-            _supersede(cfg, repo, record)
+                return _retain(cfg, repo, f"could not save its source ({error})", record, label, repository=repository)
         users = live_users(repo)
         if users:
-            return _retain(cfg, repo, "processes still use the checkout: " + ", ".join(users[:8]), record, label)
+            return _retain(
+                cfg,
+                repo,
+                "processes still use the checkout: " + ", ".join(users[:8]),
+                record,
+                label,
+                repository=repository,
+            )
         try:
-            again = inspect(repo, _preserved(cfg))
+            again = inspect(repo)
         except (OSError, subprocess.SubprocessError, RecordError) as error:
-            return _retain(cfg, repo, f"could not re-inspect {repo} ({error})", record, label)
+            return _retain(cfg, repo, f"could not re-inspect {repo} ({error})", record, label, repository=repository)
         if again.fingerprint != snap.fingerprint:
             continue  # a late write: save the newer state before resetting
         state = "checkout-reset" if snap.dirty else "preserved"
@@ -809,7 +1335,46 @@ def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI)
             what = "unfinished source" if snap.dirty else f"{len(snap.unpublished)} unpublished commit(s)"
             log(f"recovery: saved {what} in {record}")
         return Decision(True, record=record, state=state)
-    return _retain(cfg, repo, "the checkout kept changing while it was being saved", record, label)
+    return _retain(
+        cfg, repo, "the checkout kept changing while it was being saved", record, label, repository=repository
+    )
+
+
+def guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI) -> Decision:
+    """Foreground preparation measures only the current candidate, never retained history."""
+    work = Work()
+    token = _WORK.set(work)
+    try:
+        owner = read_json(owner_path(cfg, label))
+        decision = _guard(cfg, repo, label=label, repository=repository)
+        if decision.ok and decision.state in {"clean", "preserved"} and owner.get("recovery_handoffs"):
+            try:
+                # Covered commits may belong to an older PR/round. Only current-round
+                # source is a successor; otherwise this round left no newer source.
+                manifest = _read_manifest(decision.record) if decision.record else {}
+                checkpoint = (
+                    decision.record
+                    if manifest
+                    and manifest.get("source_round") == owner.get("round_id")
+                    and manifest.get("pr") == owner.get("pr")
+                    else None
+                )
+                _handoff_source_receipts(cfg, owner, checkpoint, checkout=repo)
+            except (OSError, RecordError) as error:
+                decision = _retain(
+                    cfg,
+                    repo,
+                    f"handoff source outcome could not be saved ({error})",
+                    None,
+                    label,
+                    repository=repository,
+                )
+        decision.details["preparation"] = work.report()
+        with contextlib.suppress(OSError):
+            atomic_json(cfg.state / "recovery-preparation.json", dict(at=time.time(), **work.report()))
+        return decision
+    finally:
+        _WORK.reset(token)
 
 
 def restore(record: Path, repo: Path) -> None:
@@ -878,51 +1443,20 @@ def describe_reason(value):
     return str(value)
 
 
+def housekeep(state_root: Path | None = None, **budgets) -> dict:
+    from .recovery_maintenance import prepare
+
+    return prepare(state_root or _state_root(), **budgets)
+
+
 def summary(state_root: Path | None = None, *, workers=None) -> dict:
-    """Background preparation only; status reads the resulting JSON and never GitHub."""
-    counts = dict(records=0, retained=0, blocked=0, preserved=0, reset=0, superseded=0, incomplete=0, corrupt=0)
-    for state in (
-        "retained",
-        "eligible",
-        "resuming",
-        "verified",
-        "publication-pending",
-        "published",
-        "obsolete",
-        "blocked",
-    ):
-        counts["recovery_" + state.replace("-", "_")] = 0
-    reasons = set()
-    for worker, record, manifest, status in records(state_root, workers=workers):
-        if record is None:
-            counts["incomplete"] += 1
-            continue
-        if manifest is None:
-            counts["corrupt"] += 1
-            reasons.add(f"{worker}/{record.name}: manifest or payload missing or invalid")
-            continue
-        counts["records"] += 1
-        state = status.get("state")
-        if status.get("schema") == "tauceti-work-recovery-consumer/v1":
-            key = "recovery_" + str(state).replace("-", "_")
-            if key in counts:
-                counts[key] += 1
-            if state == "blocked":
-                counts["blocked"] += 1
-            if status.get("reason"):
-                reasons.add(f"{worker}/{record.name}: {describe_reason(status['reason'])}")
-            continue
-        if state == "retained":
-            counts["retained"] += 1
-            reasons.add(f"{worker}: {status.get('reason') or 'checkout moved aside'}")
-        elif state in ("recovery-blocked", "blocked"):
-            counts["blocked"] += 1
-            if status.get("reason"):
-                reasons.add(f"{worker}/{record.name}: {describe_reason(status['reason'])}")
-        elif state == "checkout-reset":
-            counts["reset"] += 1
-        elif state == "superseded":
-            counts["superseded"] += 1
-        else:
-            counts["preserved"] += 1
-    return dict(counts, reasons=sorted(reasons))
+    """Only prepared local receipts; no inventory traversal or payload reads."""
+    from .recovery_maintenance import cached_summary
+
+    return cached_summary(state_root or _state_root(), workers=workers)
+
+
+def _state_root() -> Path:
+    from .config import legacy_project, worker_state_root
+
+    return HERE / "state" if legacy_project() else worker_state_root()

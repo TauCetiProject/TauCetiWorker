@@ -60,6 +60,23 @@ class SupervisorTests(unittest.TestCase):
         register(self.root, self.lifecycle)
         self.journal = UsageJournal(self.root / "usage" / self.bridge.name, self.id, model=MODEL)
 
+    def ensure_supervisor(self, **kwargs):
+        ensure_supervisor(self.root, **kwargs)
+        owner = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
+        if owner["pid"] == os.getpid():
+            return  # a test-provided external-owner fixture, not a child daemon
+
+        def cleanup():
+            if not alive(owner):
+                return
+            os.kill(owner["pid"], signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while alive(owner) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(alive(owner), "fixture supervisor must exit before its temporary state is removed")
+
+        self.addCleanup(cleanup)
+
     def sleeper(self):
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
 
@@ -301,7 +318,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNone(resolve({**owner, "start": "different-birth"}))
 
     def test_daemon_is_detached_and_restarts_to_recover_stopped_invocation(self):
-        ensure_supervisor(self.root)
+        self.ensure_supervisor()
         first = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
         self.assertNotEqual(os.getpgid(first["pid"]), os.getpgrp())
         os.kill(first["pid"], signal.SIGKILL)
@@ -309,7 +326,7 @@ class SupervisorTests(unittest.TestCase):
         while alive(first) and time.monotonic() < deadline:
             time.sleep(0.02)
         self.stop(self.shim)
-        ensure_supervisor(self.root)
+        self.ensure_supervisor()
         deadline = time.monotonic() + 5
         while self.saved()["status"] != "settled" and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -529,13 +546,13 @@ class SupervisorTests(unittest.TestCase):
             ),
         )
         with patch("tauceti_worker.usage_supervisor.subprocess.Popen") as start:
-            ensure_supervisor(self.root)
+            self.ensure_supervisor()
             start.assert_not_called()
 
     def test_explicit_refresh_retires_the_exact_supervisor(self):
-        ensure_supervisor(self.root)
+        self.ensure_supervisor()
         first = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
-        ensure_supervisor(self.root, refresh=True)
+        self.ensure_supervisor(refresh=True)
         second = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
         self.assertFalse(alive(first))
         self.assertNotEqual(first, second)

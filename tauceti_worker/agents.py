@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
     from .work_units import RoundOpts, Worker
 
-from . import build_caches, containment
+from . import build_caches
 from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
@@ -38,6 +38,9 @@ from .constants import (
 )
 from .github import me
 from .paths import HERE
+from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
+from .processes import owned_process
+from .processes import run as run_process
 from .quota import (
     Quota,
     _claude_keychain_creds_interactive,
@@ -248,9 +251,8 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
         _CODEX_MODEL_ACCESS_PROMPT,
     ]
     try:
-        return containment.run(
+        return run_process(
             command,
-            label="codex-probe",
             cwd=cfg.state,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -489,6 +491,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
             HERE / "prompts" / "local-verification.md",
             SCOPE_POLICY=policy,
             LOCAL_AXIOMS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-axioms"',
+            LOCAL_LINT=f'"{python}" -I "{wrapper_bin(bubble)}/tauceti-local-lint"',
         )
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
@@ -504,6 +507,8 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
         "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
+        "On disk-pressure, preserve edits; a pending result with a continuation job belongs to the supervisor. "
+        "An incomplete result without a continuation needs a later invocation in the preserved workspace; do not spin on unchanged checks. "
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
         "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
         "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
@@ -528,8 +533,13 @@ def sync_mathlib_pool(cfg: Config) -> None:
     if private.resolve() == pool.resolve():
         return  # operator pointed this worker straight at the pool; nothing to exchange
     try:
+        from .cache_storage import initialize
+        from .expanded_cache import root
+
+        if pool == root() / "mathlib":
+            initialize(root())
         promoted, hydrated = build_caches.sync_pool(private, pool)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         log(f"mathlib cache pool: skipped ({e})")
         return
     if promoted or hydrated:
@@ -659,6 +669,11 @@ def prepare_checkout(
 
     def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            work_recovery.detach_handoff_owner(cfg)
+        except OSError as error:
+            log(f"checkout ownership detach deferred: {error}")
+            return False
         log(f"cloning {TAUCETI} → {co} ({why})")
         return subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)]).returncode == 0
 
@@ -685,6 +700,11 @@ def prepare_checkout(
         return False
     if g("fetch", "-q", "origin"):
         return False  # usually the network; the next round retries
+    try:
+        work_recovery.detach_handoff_owner(cfg)
+    except OSError as error:
+        log(f"checkout ownership detach deferred: {error}")
+        return False
     # -f discards a prior round's leftover edits (now saved) and lands us on main in one step; a plain
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
     # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
@@ -819,7 +839,6 @@ def run_agent_host(
     session_path=None,
     session_actor=None,
     session_scope=None,
-    original_cwd=None,
 ) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
@@ -871,7 +890,7 @@ def run_agent_host(
                     identity=conversation_identity(profile.provider),
                     scope=session_scope,
                     session=resume,
-                    cwd=str(original_cwd or cwd),
+                    cwd=str(cwd),
                 ),
             )
         except OSError as error:
@@ -888,24 +907,14 @@ def run_agent_host(
         return 0
     _LAST_AGENT_FAILURE = None
     with host_build_cache_context(cwd, env, logdir) as prefix:
-        if original_cwd is not None:
-            if not containment.strong():
-                raise BuildCacheUnavailable("Recovery conversation cwd isolation requires strong containment")
-            # Keep one containing boundary. Existing conversation cwd lookup and
-            # absolute paths resolve to the recovery source through this bind.
-            prefix = list(prefix or containment.command())
-            if prefix[-1] != "--":
-                raise BuildCacheUnavailable("Cannot compose the recovery cwd view with this containment prefix")
-            prefix[-1:-1] = ["--bind", str(cwd), str(original_cwd), "--chdir", str(original_cwd)]
         rc = run_agent_proc(
-            argv,
+            [*(prefix or []), *argv],
             env=env,
             cwd=cwd,
             logdir=logdir,
             label=f"agent-{profile.provider}",
             provider=profile.provider,
             cancel_event=cancel_event,
-            containment_prefix=prefix or (),
             session_path=session_path,
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
@@ -1005,21 +1014,6 @@ def take_last_agent_infra_failure() -> str | None:
     return reason
 
 
-_PARENT_BOUND_AGENT = """
-import os, signal, subprocess, sys, threading
-fd = int(sys.argv[1])
-def parent_gone():
-    while os.read(fd, 1):
-        pass
-    os.killpg(os.getpgrp(), signal.SIGKILL)
-threading.Thread(target=parent_gone, daemon=True).start()
-lease = os.environ.get("TAUCETI_SHARED_MATHLIB_LEASE_FD")
-child = subprocess.Popen(sys.argv[2:], close_fds=True, pass_fds=(int(lease),) if lease else ())
-rc = child.wait()
-os._exit(rc if rc >= 0 else 128 - rc)
-"""
-
-
 def run_agent_proc(
     argv: list[str],
     *,
@@ -1029,8 +1023,6 @@ def run_agent_proc(
     provider: str,
     cwd: Path | None = None,
     cancel_event=None,
-    contain: bool = True,
-    containment_prefix=(),
     session_path=None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
@@ -1038,10 +1030,6 @@ def run_agent_proc(
     By default the normalized transcript goes to a timestamped file under logdir. ``--stream`` sends
     the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
     failures aren't silent.
-
-    A host agent and all its tools run in one containment boundary (``containment_prefix`` is the
-    shared Mathlib view when it is active, and is reused rather than nested); it is empty before
-    this returns. ``contain=False`` is for launchers whose agent runs in a sandbox owned elsewhere.
     """
     global _LAST_AGENT_FAILURE
     _LAST_AGENT_FAILURE = None
@@ -1069,42 +1057,26 @@ def run_agent_proc(
         from .fleet_capacity import check_launch_admission
 
         check_launch_admission()
-        boundary = containment.Boundary(label, prefix=containment_prefix, contain=contain, env=env)
-        command = boundary.argv(argv)
-        # A separate group permits lease-loss cancellation without signalling
-        # the worker's caller. A PID namespace dies with the worker by itself
-        # (--die-with-parent); otherwise bind its life to the worker through a
-        # pipe: even SIGKILL closes the parent's only writer and kills the group.
-        reader = writer = None
-        if cancel_event is not None and not boundary.strong:
-            reader, writer = os.pipe()
-            command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command]
         from .shared_mathlib import lease_fds
 
+        stack = contextlib.ExitStack()
         try:
-            proc = subprocess.Popen(
-                command,
-                cwd=cwds,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                bufsize=1,
-                start_new_session=cancel_event is not None,
-                pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env), *boundary.pass_fds),
+            proc = stack.enter_context(
+                owned_process(
+                    argv,
+                    cwd=cwds,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    bufsize=1,
+                    pass_fds=lease_fds(env),
+                )
             )
-        except BaseException as error:
-            if writer is not None:
-                os.close(writer)
-            boundary.finish(None)
-            if isinstance(error, OSError):
-                raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
-            raise
-        finally:
-            if reader is not None:
-                os.close(reader)
+        except OSError as error:
+            raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
         assert proc.stdout is not None
         finished = threading.Event()
 
@@ -1118,13 +1090,10 @@ def run_agent_proc(
                     if not finished.wait(2):
                         with contextlib.suppress(ProcessLookupError):
                             os.killpg(proc.pid, signal.SIGKILL)
-                        boundary.abort()
                     return
 
         monitor = None
-        # One guard from launch to teardown: nothing below may leave the boundary running.
         try:
-            boundary.launched()
             if cancel_event is not None:
                 thread = threading.Thread(target=cancel_on_lease_loss, daemon=True)
                 thread.start()
@@ -1156,24 +1125,13 @@ def run_agent_proc(
                 if rendered:
                     write_rendered(destination, rendered)
             rc = proc.wait()
-        except BaseException:
-            boundary.abort()
-            if cancel_event is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-            else:
-                proc.kill()
-            proc.wait()
-            raise
         finally:
-            proc.stdout.close()
-            finished.set()
-            if writer is not None:
-                os.close(writer)
-            if monitor is not None:
-                monitor.join(3)
-            # Descendants must be gone before the caller treats the checkout as quiescent.
-            boundary.finish(proc.returncode, pgid=proc.pid if cancel_event is not None else None)
+            try:
+                stack.close()
+            finally:
+                finished.set()
+                if monitor is not None:
+                    monitor.join(3)
         from .overlap_support import atomic
 
         telemetry = {
@@ -1237,13 +1195,12 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     if label.startswith("review #"):
         api_env = {**(os.environ if api_env is None else api_env), "TAUCETI_GITHUB_HISTORY_BRIDGE": "1"}
     env_kwargs = {"env": api_env} if api_env is not None else {}
-    tag = "review-engine" if label.startswith("review #") else "engine"
     if os.environ.get("TAUCETI_STREAM"):
-        return containment.run(argv, label=tag, **env_kwargs).returncode
+        return run_process(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
-        rc = containment.run(argv, label=tag, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
+        rc = run_process(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
@@ -1342,7 +1299,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
                 try:
                     try:
-                        warm_host_build_caches(cwd, env, logdir)
+                        prepare_host_build_caches(cwd, env, logdir)
                     except Exception as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
@@ -1358,26 +1315,48 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             ) from error
 
 
-def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float, *, prefix=()) -> int:
-    """Bind detached downloaders to the worker, including after parent SIGKILL.
+def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
+    """Fetch and hydrate shared artifacts before either normal work or recovery verification."""
+    from . import expanded_cache
 
-    Downloads run in a containment boundary (``prefix`` is the shared Mathlib view when active),
-    which dies with the worker. On a legacy host, the pipe guardian retains the snapshot lease and
-    kills its process group if the worker disappears. Ordinary timeout/interruption also tears down
-    the group, and the boundary is confirmed empty before this returns.
+    prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
+    with expanded_cache.preparation(
+        cwd,
+        env,
+        refetch=lambda warm: _cache_fetch(
+            [
+                *prefix,
+                "lake",
+                "cache",
+                "get",
+                "--service",
+                TAUCETI_CACHE_SERVICE,
+                "--repo",
+                TAUCETI,
+                f"--max-revs={lake_cache_max_revs(warm)}",
+            ],
+            cwd,
+            warm,
+            subprocess.DEVNULL,
+            30,
+        ),
+    ) as warm_env:
+        warm_host_build_caches(cwd, warm_env, logdir)
+
+
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+    """Bind the downloader process group to the worker, including after parent SIGKILL.
+
+    The pipe guardian retains the snapshot lease and kills its process group if
+    the worker disappears. Ordinary timeout/interruption also tears down the group.
     """
     from .shared_mathlib import lease_fds
 
-    boundary = containment.Boundary("cache-fetch", prefix=prefix, env=env)
-    command = boundary.argv(command)
-    reader = writer = None
-    if not boundary.strong:
-        reader, writer = os.pipe()
-        command = [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command]
+    reader, writer = os.pipe()
     try:
         proc = subprocess.Popen(
-            command,
-            pass_fds=(*(() if reader is None else (reader,)), *lease_fds(env), *boundary.pass_fds),
+            [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command],
+            pass_fds=(reader, *lease_fds(env)),
             cwd=cwd,
             env=env,
             stdout=output,
@@ -1385,21 +1364,16 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
             start_new_session=True,
         )
     except BaseException:
-        if writer is not None:
-            os.close(writer)
-        boundary.finish(None)
+        os.close(writer)
         raise
     finally:
-        if reader is not None:
-            os.close(reader)
-    sweep = None if boundary.strong else proc.pid
+        os.close(reader)
+    sweep = True
     try:
         try:
-            boundary.launched()
             return proc.wait(timeout=timeout)
         except BaseException:
-            sweep = None  # the group is SIGKILLed below
-            boundary.abort()
+            sweep = False
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGTERM)
             try:
@@ -1412,9 +1386,11 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
                 proc.wait()
             raise
     finally:
-        if writer is not None:
-            os.close(writer)
-        boundary.finish(getattr(proc, "returncode", None), pgid=sweep)
+        os.close(writer)
+        if sweep:
+            from .round import reap_round_group
+
+            reap_round_group(proc.pid)
 
 
 def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
@@ -1447,7 +1423,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
                 output.flush()
                 try:
-                    rc = _cache_fetch(command, cwd, env, output, remaining, prefix=prefix)
+                    rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1457,6 +1433,10 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
             if rc == 0:
                 log(f"host build caches: {label} cache ready")
                 return "ready"
+            if attempt == 1 and re.search(r"(?i)no space left on device|disk quota exceeded|\bENOSPC\b", detail):
+                from .retention import pressure_cleanup
+
+                pressure_cleanup()
             # Preserve real outages even when Lake also wraps them in a dependency-fetch error.
             transport_error = re.search(
                 r"(?i)(?:\bHTTP\b|status(?: code)?|response)[^\n]*\b(?:401|403|429|5\d\d)\b|"
@@ -1500,6 +1480,44 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
 
     if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
         return
+    # Mathlib itself knows which compressed archives the selected dependency tree
+    # needs. Prune stale private links daily so pool GC can actually release them;
+    # otherwise the old promote/hydrate-all exchange resurrects dead archives forever.
+    from . import expanded_cache
+    from .runtime_status import read_json
+
+    mathlib_private = Path(env.get("MATHLIB_CACHE_DIR", "/nonexistent"))
+    home = Path(env.get("HOME", "/nonexistent"))
+    mathlib_pool = expanded_cache.root(env) / "mathlib"
+    marker = mathlib_private.parent / "mathlib-cleanup.json"
+    if (
+        env.get("TAUCETI_SHARED_ARTIFACTS", "1") != "0"
+        and mathlib_private.is_relative_to(home)
+        and mathlib_private != home
+        and (mathlib_pool.parent / "owner.json").is_file()
+        and time.time() - read_json(marker).get("at", 0) > 86400
+        and deadline - time.monotonic() > 60
+    ):
+        try:
+            # Failed housekeeping retries in an hour, never on every paid round.
+            expanded_cache.atomic_json(marker, dict(at=time.time() - 23 * 3600))
+            with logf.open("ab") as output:
+                rc = _cache_fetch(
+                    [*prefix, "lake", "exe", "cache", "clean"],
+                    cwd,
+                    env,
+                    output,
+                    max(1, min(30, deadline - time.monotonic())),
+                )
+            if rc == 0:
+                build_caches.link_into(mathlib_private, mathlib_pool)
+                for path in mathlib_private.glob("*.ltar"):
+                    pooled = mathlib_pool / path.name
+                    if pooled.is_file() and not pooled.is_symlink():
+                        os.utime(pooled, None)  # Current-tree reuse, not download age.
+                expanded_cache.atomic_json(marker, dict(at=time.time()))
+        except Exception as error:
+            log(f"Mathlib archive housekeeping deferred: {error}")
     if env.get("LAKE_ARTIFACT_CACHE", "1").lower() in _LAKE_FALSE:
         log("host build caches: TauCeti artifact caching explicitly disabled by LAKE_ARTIFACT_CACHE")
         return
@@ -2109,13 +2127,16 @@ def run_in_bubble(
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
     # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
-    for name in ("tauceti-local-axioms", "LocalAxioms.lean"):
+    for name in ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean"):
         shutil.copy(HERE / "scripts" / name, rounddir / name)
     # Container-produced executables must never enter the host's checker cache.
     local_axioms_cache = cfg.state / "bubble-local-axioms"
     local_axioms_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    local_lint_cache = cfg.state / "bubble-local-lint"
+    local_lint_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     if helper_on:
         from .verification import cache_root
+        from .verification_storage import root as storage_root
 
         package = rounddir / "tauceti_worker"
         shutil.copytree(
@@ -2127,6 +2148,8 @@ def run_in_bubble(
         (rounddir / "tauceti-verify").chmod(0o755)
         verify_state = cfg.state / "verification-state"
         verify_state.mkdir(parents=True, exist_ok=True)
+        verify_storage = storage_root().resolve()
+        verify_storage.mkdir(parents=True, exist_ok=True, mode=0o700)
         host_cache = None
         with contextlib.suppress(OSError, ValueError):
             host_cache = cache_root()
@@ -2146,11 +2169,15 @@ def run_in_bubble(
         f"{rounddir}:/opt/round:ro",
         "--mount",
         f"{local_axioms_cache}:/opt/local-axioms-cache:rw",
+        "--mount",
+        f"{local_lint_cache}:/opt/local-lint-cache:rw",
     ]
     if helper_on:
         mount_flags += [
             "--mount",
             f"{verify_state}:/opt/verification-state:rw",
+            "--mount",
+            f"{verify_storage}:{verify_storage}:rw",
         ]
         if host_cache is not None:
             mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
@@ -2220,6 +2247,7 @@ def run_in_bubble(
         tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
+    tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache"
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
@@ -2233,6 +2261,8 @@ def run_in_bubble(
     if helper_on:
         for key, value in {
             "TAUCETI_VERIFY_STATE": "/opt/verification-state",
+            "TAUCETI_VERIFY_HOST_STATE": str(verify_state.resolve()),
+            "TAUCETI_VERIFY_STORAGE_DIR": str(verify_storage),
             "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
             if host_cache is not None
             else "/tmp/verification-cache",
@@ -2247,9 +2277,22 @@ def run_in_bubble(
             "BASH_MAX_TIMEOUT_MS": str(
                 max(1000, int((getattr(getattr(w, "rc", None), "deadline", time.time() + 7200) - time.time()) * 1000))
             ),
-            "TAUCETI_PROCESS_CONTAINMENT": "legacy",  # Bubble owns the outer process boundary.
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
+        for name in (
+            "STORAGE_BYTES",
+            "CANDIDATE_BYTES",
+            "SOURCE_CANDIDATE_BYTES",
+            "CHECKPOINT_BYTES",
+            "CHECKPOINT_POOL_BYTES",
+            "MIN_FREE_BYTES",
+            "MIN_FREE_PERCENT",
+            "OWNERSHIP_SECONDS",
+            "COMPLETED_CACHE_SECONDS",
+            "IDLE_CACHE_SECONDS",
+        ):
+            if value := os.environ.get("TAUCETI_VERIFY_" + name):
+                tcenv += f" TAUCETI_VERIFY_{name}={shlex.quote(value)}"
     if snapshot:
         tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
         from tauceti_tools.project import active
@@ -2366,7 +2409,6 @@ def run_in_bubble(
                 label=f"agent-{wm}",
                 provider=profile.provider,
                 cancel_event=cancel_event,
-                contain=False,  # the agent runs in Bubble's container, not on this host
             )
         else:  # review engine / probe — leave its output inline
             from .fleet_capacity import check_launch_admission

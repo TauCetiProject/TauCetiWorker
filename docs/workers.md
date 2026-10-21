@@ -210,8 +210,117 @@ The trade is disk: old build generations remain in the store, and Lake supplies
 no selective eviction — `lake cache clean` empties it all or nothing. TauCeti
 records the toolchain on canonical `main` for each worker and clears that
 worker's default Lake cache when the pin changes. The first observed pin only
-seeds the record; there is deliberately no size- or calendar-based cleanup. An
-operator-supplied `LAKE_CACHE_DIR` is never deleted automatically.
+seeds that record. Worker-private build/cache generations also expire after
+72 hours and are recycled at the next round boundary, even when a worker keeps
+completing short rounds. An operator-supplied external `LAKE_CACHE_DIR` is never
+deleted automatically.
+
+### Shared artifacts and storage cleanup
+
+Private generated data is recycled after 72 hours at an ordinary round boundary,
+under the worker's existing round lock. Storage age does not terminate rounds;
+configured deadlines and owned-process-group cleanup continue to apply. Cleanup
+requires no PID namespace or containment marker/proof. An active, mounted or
+uncertain candidate is skipped locally and retried later, without pausing other
+cleanup or worker progress.
+
+`tauceti cleanup --dry-run` reports eligible generated paths without changing files
+or stopping processes. Space-pressure snapshot collection may stop earlier in a
+real run once headroom recovers; candidate counts do not estimate reclaimed bytes.
+`tauceti cleanup` performs reclamation. Both discover retired
+workers from local storage, without GitHub requests. A live loop recycles its own private cache generation under its round lock;
+the hourly collector skips that loop's workspace whenever its instance-lock file
+is open and never takes that lock itself. Independent verification job leases and pending
+references protect their caches and source too. An inactive checkout can be removed in full only after source recovery
+succeeds and its remaining Git state can be safely discarded. Failed source
+preservation retains source while recognized build caches can still be reclaimed.
+The hourly collector registers retained checkout roots using metadata only. Ordinary
+activity housekeeping owns their resumable deletion under time, entry and byte
+budgets; uncertain candidates are skipped while unrelated work continues. It
+archives extra commit/reflog tips in existing v1 bundles. Stashes, notes, native
+Git operations and credential-like files keep their original checkout when the
+recovery format cannot capture them. This is generated
+data retention; it does not discard uncaptured Git history to meet an age target.
+Credentials, review outboxes, source recovery, usage journals and budget accounting
+are preserved. Existing installations get one 72-hour grace
+period when their generation marker is first recorded, including checkout removal.
+Without local process-file observations, diagnostic candidates are skipped; private
+cache recycling can still run at the worker's own safe boundary.
+
+Cleanup also expires closed diagnostic `.log` files, inactive verification attempts,
+and unused immutable Mathlib snapshots in an existing login-wide pool after three
+days. Snapshot GC uses existing reader leases; cleanup does not create an absent
+pool or enable sharing. The default Mathlib archive pool now lives under the TauCeti-owned build-cache root
+and is collected too. Operator-selected external caches and the old interactive
+`~/.cache/mathlib` directory remain outside the collector.
+Default session logs rotate daily even while a loop keeps running, without
+redirecting helpers' result pipes or files. Diagnostic age is based on last write;
+private workspace age is a generation timestamp, not dependency file modification time.
+A partially blocked recycling attempt starts the next generation for other caches;
+interrupted deletions retry without removing a younger replacement. Closed logs
+and inactive verification attempts are collected even while the worker's round lock
+is held, using their own open-file checks, leases and pending references.
+
+On Linux, `tauceti cleanup --install-timer` installs a persistent hourly systemd
+user timer at low CPU/I/O priority, including a catch-up run after downtime. It is
+scoped to the selected project's storage roots; it does not discover other projects
+from worker configuration files. There is no macOS cleanup schedule in this change;
+private cache generations still recycle at round boundaries there. Installing the Linux
+worker service installs this timer too; existing services can install it separately
+without restarting workers. Cleanup uses one collector lock and resumes interrupted
+directory deletions. A concrete out-of-space error during cache preparation also
+unlinks closed diagnostics before the existing single retry, without synchronously
+archiving source or recursively collecting other workers' workspaces. Further failures follow normal
+worker backoff. Byte and free-space thresholds also trigger collection before the age limit.
+Removing the worker service leaves the cleanup timer installed so retired workers
+can still be reclaimed. To remove that schedule explicitly, run
+`systemctl --user disable --now tauceti-cleanup.timer`.
+
+The last cleanup result (counts, at most 100 sample paths per category, failures and
+remaining free bytes) is included in prepared activity data. Reading status does not
+scan storage or contact GitHub. Shared Mathlib rollout remains off; this collector
+does not change its policy or complete the natural rollout gates in #311.
+
+Host preparation downloads CI metadata into a fresh temporary Lake cache, expands verified
+archives into the machine pool, and populates each worker's private native Lake cache.
+Unchanged artifacts can then be restored by Lake without repeated decompression. Publication
+checks archives and extracted files with the selected Lean toolchain's own content hash.
+Mutable output/revision metadata is copied, while immutable artifacts use hard links where
+possible. Recompilation unlinks outputs before replacing them. Unsupported toolchains,
+contended entries and unavailable shared storage use ordinary private caches automatically.
+Full-project verification and Lake's build-input invalidation remain enabled.
+
+The pool defaults to `~/.cache/tauceti/builds` under the login user's home. Configure
+`TAUCETI_BUILD_CACHE_ROOT` before installing services to use another filesystem;
+`TAUCETI_SHARED_ARTIFACTS=0` disables expanded-artifact sharing. Explicit Mathlib/Lake
+cache overrides are preserved. Only directories carrying a valid TauCeti ownership record
+are collected; an arbitrary nonempty directory is never adopted or deleted.
+
+The collector measures allocated bytes across shared and worker-private caches, counting
+hard-linked inodes once. Its eviction target defaults to 25% of filesystem capacity;
+`TAUCETI_CACHE_MAX_GIB` sets an explicit target instead. Pressure collection begins when
+that target is exceeded or free space falls below 15%, and aims to restore 20% free space.
+Entries use explicit last-reuse timestamps. Unused entries expire after 72 hours; abandoned
+publication/download staging can be removed after four hours when its publisher lock is free.
+After pool eviction, the collector can request private-store reclamation from one older worker
+with substantial unused artifacts. This runs at an ordinary round boundary, keeps the current
+build tree warm, and has a 12-hour per-worker cooldown. Live build artifacts are protected;
+a target larger than the reclaimable data does not trigger a fleet-wide cache wipe.
+Mathlib's own `cache clean` runs at most daily in the private archive store, removing stale links
+for dependency trees no longer in use so those archives cannot be perpetually re-promoted.
+
+Below 5% free space, new rounds enter `waiting-storage`, without consuming repair attempts
+or escalating failure backoff. Existing rounds continue; admission resumes automatically above
+15% free. The existing cleanup service is requested asynchronously under pressure, with a
+five-minute request cooldown, in addition to its hourly schedule. No root, GitHub requests,
+whole-fleet drain, or human-resume action is needed.
+
+Cleanup and expanded-artifact metrics are prepared in activity data: managed and live-worker-held
+bytes, remaining free space, observed net space recovered, cleanup errors, and latest per-worker
+expanded/reused artifact counts and preparation time. `status` reads prepared data without
+walking cache trees. Space held by active work, preserved source or unrelated programs cannot
+be reclaimed to enforce an eviction target; this is not a filesystem quota. Retained source,
+usage/accounting records and credentials are never disposable cache data.
 
 ## `workers add` flags
 
@@ -462,3 +571,7 @@ work available. Automatic dependency bumps continue under the existing loop back
 and merges current main, diagnoses the actual integration failure, preserves
 the dependency target and verifies its changes before pushing. Healthy surveys
 make no additional API calls.
+
+Claim collisions skip to other candidates without consuming a repair attempt. An idle mechanical
+recovery probe returns immediately to normal work selection. Only consecutive all-busy passes
+use a small capped retry pause; they never enter the general failed-round backoff.

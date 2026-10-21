@@ -234,7 +234,7 @@ class FleetTests(unittest.TestCase):
                             provider="codex",
                         )
                     spawn.assert_not_called()
-                with patch.object(agents.containment, "run") as spawn:
+                with patch.object(agents, "run_process") as spawn:
                     with self.assertRaises(AdmissionUnavailable):
                         agents.run_to_logfile(["engine"], Path(tmp) / "review.log", "review #7")
                     spawn.assert_not_called()

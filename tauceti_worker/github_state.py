@@ -34,6 +34,9 @@ DEPENDENCY = "github-state"
 # Reasons a caller can act on. Authentication/configuration needs an operator; the rest recover.
 ACTIONABLE = frozenset({"client_auth_configuration"})
 _last_failure: contextvars.ContextVar[dict | None] = contextvars.ContextVar("github_state_failure", default=None)
+_planning_survey: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "github_state_planning_survey", default=None
+)
 
 
 class _Failure(OSError):
@@ -131,6 +134,8 @@ def _unavailable(repo, operation, reason, detail="", *, status=None, retry_at=No
             "verified_at": payload.get("verified_at"),
             "stored_at": cached.get("stored_at"),
         }
+        if operation == "survey" and payload.get("complete") is True:
+            _planning_survey.set(payload)
     _last_failure.set(record)
     transport.event(
         {
@@ -242,6 +247,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
         raise StateQueryError("observed coverage is available only for workflow jobs")
     began = time.monotonic()
     _last_failure.set(None)
+    _planning_survey.set(None)
     if transport.direct_reads():
         return False, None
     url = _url()
@@ -475,12 +481,13 @@ def read_workflow_jobs(repo: str, run_id: int | str, *, allow_observed=False):
 class SurveyRows(list):
     """Compact rows with small inventory-wide counts for automatic authoring limits."""
 
-    def __init__(self, rows, author_counts):
+    def __init__(self, rows, author_counts, *, cached=False):
         super().__init__(rows)
         self.author_counts = author_counts
+        self.cached = cached
 
 
-def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None):
+def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None, allow_cached=False):
     from .survey_facts import CONTRACT
 
     available, result = read(
@@ -493,8 +500,12 @@ def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None):
         _optional=True,
         _with_metadata=True,
     )
+    cached = False
     if not available:
-        return False, None
+        result = _planning_survey.get() if allow_cached else None
+        if result is None:
+            return False, None
+        cached = True
     try:
         if result.get("contract") != CONTRACT:
             raise ValueError("incompatible survey contract")
@@ -546,6 +557,12 @@ def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None):
             not isinstance(counts, dict) or any(type(count) is not int or count < 0 for count in counts.values())
         ):
             raise ValueError("invalid survey author counts")
-        return True, SurveyRows(rows, counts)
+        if cached:
+            # A last complete snapshot is a work-discovery hint, never evidence
+            # that a PR is still open, at this head, unclaimed or already reviewed.
+            rows = [
+                {**row, "review": {**row["review"], "issue_complete": False, "review_complete": False}} for row in rows
+            ]
+        return True, SurveyRows(rows, counts, cached=cached)
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         return _unavailable(repo, "survey", "incompatible_protocol", _sanitize(error))

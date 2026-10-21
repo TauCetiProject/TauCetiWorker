@@ -19,9 +19,11 @@ from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
     EX_ADMISSION_WAIT,
+    EX_CLAIM_COLLISION,
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
+    EX_RECOVERY_IDLE,
     GH_MIN_BUDGET,
     INTERROUND,
     OPENROUTER_MODELS,
@@ -108,6 +110,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     streak = 0
     admission_streak = 0
     recovery_probe_at = 0.0
+    collision_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -118,6 +121,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            from .config import rotate_console_log
+
+            rotate_console_log()
             from .verification_jobs import reap_continuations, resume_pending
 
             reap_continuations(cfg)
@@ -331,6 +337,25 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             rc = run_round_subprocess(tail)
             if recovery_only:
                 recovery_probe_at = time.time() + 300  # At most one quota-independent probe per five minutes.
+            if rc == EX_RECOVERY_IDLE:
+                # Busy claims and other unavailable recovery records already have local retry
+                # scheduling. They must not delay unrelated reviews, fixes or roadmap work.
+                streak = 0
+                report_runtime("idle", detail="recovery deferred; selecting other work", next_action_at=None)
+                continue
+            if rc == EX_CLAIM_COLLISION:
+                streak = 0
+                collision_streak += 1
+                # First collision reselects immediately. Repeated all-busy passes get only
+                # a tiny capped pause to avoid hammering shared claims or GitHub.
+                nap = min(30, 5 * (collision_streak - 1))
+                report_runtime(
+                    "idle", detail="peer claims busy; selecting other work", next_action_at=time.time() + nap
+                )
+                if nap:
+                    time.sleep(nap)
+                continue
+            collision_streak = 0
             if rc == EX_DOCUMENTATION_WAIT:
                 streak = 0
                 paused = runtime_snapshot()
@@ -344,10 +369,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if rc == EX_ADMISSION_WAIT:
                 paused = runtime_snapshot()
                 reason = fleet_admission_reason(cfg.wid)
-                waiting = paused.get("state") in ("waiting-capacity", "waiting-budget")
+                waiting = paused.get("state") in ("waiting-capacity", "waiting-budget", "waiting-storage")
                 state = "waiting-capacity" if reason else (paused["state"] if waiting else "waiting-budget")
                 admission_streak = admission_streak + 1 if state == "waiting-budget" else 0
-                nap = min(60, 5 * (1 << min(max(0, admission_streak - 1), 4)))
+                nap = 60 if state == "waiting-storage" else min(60, 5 * (1 << min(max(0, admission_streak - 1), 4)))
                 with contextlib.suppress(BudgetError, OSError):
                     if api_mode():
                         Budget().refresh_waiter(cfg.wid)

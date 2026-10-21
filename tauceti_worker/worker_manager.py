@@ -769,6 +769,9 @@ def cmd_managed_runner(args) -> int:
             try:
                 log_dir.mkdir(parents=True, exist_ok=True)
                 logf = log_path.open("ab", buffering=0)
+                env["TAUCETI_CONSOLE_LOG_FILE"] = str(log_path.resolve())
+                env["TAUCETI_CONSOLE_LOG_DAY"] = time.strftime("%Y%m%d")
+                env["TAUCETI_WORKERS_STATE_DIR"] = str(state_dir.resolve())
             except OSError:
                 logf = sys.stderr  # Retain console/journal output if file logging fails.
             publisher.update(
@@ -812,6 +815,8 @@ def cmd_managed_runner(args) -> int:
                 start_new_session=True,
                 pass_fds=(parent_pipe_read,),
             )
+            if logf is not sys.stderr:
+                logf.close()  # Only the loop owns the stream now; rotation can release the old inode.
             os.close(parent_pipe_read)
             parent_pipe_read = None
             publisher.update(child_pid=child.pid, process_group=child.pid)
@@ -1783,6 +1788,13 @@ def service_action(action: str, config: Path) -> int:
         path.write_text(_systemd_unit(config))
         subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
         subprocess.run([systemctl, "--user", "enable", "--now", path.name], check=True)
+        from .config import Die
+        from .retention import install_timer
+
+        try:
+            install_timer()
+        except (Die, OSError, subprocess.SubprocessError) as error:
+            print(f"warning: worker service started; cleanup timer unavailable: {error}", file=sys.stderr)
         print(f"installed and started {path}")
         return 0
     if action == "uninstall":

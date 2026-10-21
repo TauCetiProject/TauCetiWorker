@@ -23,6 +23,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .processes import run as run_process
 from .runtime_status import atomic_json, read_json
 
 
@@ -87,23 +88,6 @@ def selection(env):
                 + "; investigate before clearing safety-stop.json and restoring policy"
             )
         return "off", "shared Mathlib safety stop: " + reason
-    if value != "off":
-        if value == "required" and env.get("TAUCETI_PROCESS_CONTAINMENT") == "legacy":
-            raise Unavailable("TAUCETI_PROCESS_CONTAINMENT=legacy disables the namespace-based shared view")
-        for path in (pool / "status").glob("*.json"):
-            row = read_json(path)
-            identity = row.get("supervisor")
-            if (
-                isinstance(identity, dict)
-                and isinstance(identity.get("pid"), int)
-                and process_identity(identity["pid"]) == identity
-                and row.get("containment_mode") not in {None, "pid-namespace"}
-            ):
-                if value == "required":
-                    raise Unavailable(
-                        "live worker reports weaker containment; wait for natural cleanup or use private mode"
-                    )
-                return "off", "live worker reports weaker containment; keep sharing off until natural cleanup"
     reason = "sharing enabled"
     if value == "off":
         reason = (
@@ -123,10 +107,19 @@ def mode(env):
 
 
 def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
-    """The shared view is mounted in the round's one containment namespace, not a nested one."""
-    from .containment import command
+    """A private mount namespace with the overlay view and a read-only pool.
 
-    return command(
+    Deliberately no PID namespace: agents and their tools must see ordinary host PIDs and /proc.
+    Tools that report a PID to a service outside the namespace (systemd, D-Bus) break otherwise."""
+    return [
+        "bwrap",
+        "--die-with-parent",
+        "--bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
         "--ro-bind",
         str(pool),
         str(pool),
@@ -137,7 +130,8 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
         str(upper),
         str(work),
         str(target),
-    )
+        "--",
+    ]
 
 
 def capability(directory=None):
@@ -234,17 +228,8 @@ def signature(cwd, env):
     # Loading Lake synchronizes pinned dependency checkouts without compiling
     # Mathlib. Do this before deciding the key, so a manifest bump can hit a
     # shared snapshot on its first round instead of downloading privately first.
-    from .containment import run
-
-    # Loading Lake configuration can run repository code, so it is contained like any other tool.
-    lean = run(
-        ["lake", "env", "lean", "--version"],
-        label="lake-env",
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    lean = run_process(
+        ["lake", "env", "lean", "--version"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30
     )
     if lean.returncode:
         raise Unavailable("Lean toolchain is unavailable; run lake env lean --version")
@@ -267,14 +252,8 @@ def signature(cwd, env):
     if "mathlib" not in dependencies:
         raise Unavailable("manifest has no pinned Mathlib dependency")
     toolchain = (cwd / "lean-toolchain").read_text().strip()
-    prefix = run(
-        ["lake", "env", "lean", "--print-prefix"],
-        label="lake-env",
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    prefix = run_process(
+        ["lake", "env", "lean", "--print-prefix"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30
     )
     library = Path(prefix.stdout.strip()) / "lib/lean"
     if prefix.returncode or not (library / "Init.olean").is_file():
@@ -329,13 +308,21 @@ def signature(cwd, env):
 
 
 @contextlib.contextmanager
-def key_lock(pool, key, exclusive=True, nonblocking=False, timeout=None):
+def key_lock(pool, key, exclusive=True, nonblocking=False, timeout=None, readonly=False):
     locks = pool / "locks"
-    locks.mkdir(parents=True, exist_ok=True)
-    with (locks / (key + ".lock")).open("a+") as stream:
+    path = locks / (key + ".lock")
+    if readonly and not path.exists():
+        yield None
+        return
+    if not readonly:
+        locks.mkdir(parents=True, exist_ok=True)
+    with path.open("r" if readonly else "a+") as stream:
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         lease_lock(stream, flags | (fcntl.LOCK_NB if nonblocking else 0), timeout=timeout)
-        yield stream
+        if not readonly:
+            yield stream
+            return
+    yield None  # dry-run eligibility probe; release before any recursive inspection
 
 
 def lease_lock(stream, flags, *, timeout=None):
@@ -512,22 +499,27 @@ def discard_entry(pool, entry):
     remove_tree(retired)
 
 
-def collect(pool, *, protect=(), now=None):
+def collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
     try:
-        with key_lock(pool, "gc", nonblocking=True):
-            return _collect(pool, protect=protect, now=now)
+        with key_lock(pool, "gc", nonblocking=True, readonly=dry_run):
+            return _collect(pool, protect=protect, now=now, max_age=max_age, dry_run=dry_run)
     except BlockingIOError:
         return []
 
 
-def _collect(pool, *, protect=(), now=None):
+def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
     """Bounded by snapshot count. Locked readers/builders are never reclaimed."""
     now = time.time() if now is None else now
     entries = pool / "entries"
-    entries.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        if not entries.is_dir():
+            return []
+    else:
+        entries.mkdir(parents=True, exist_ok=True)
     for retired in (pool / "trash").glob("*"):
         with contextlib.suppress(FileNotFoundError):
-            remove_tree(retired)
+            if not dry_run:
+                remove_tree(retired)
     # A killed builder cannot run TemporaryDirectory cleanup. Reclaim its
     # staging tree before evicting useful published snapshots for disk pressure.
     for stage in (pool / "staging").glob("*"):
@@ -537,8 +529,9 @@ def _collect(pool, *, protect=(), now=None):
         try:
             if not stage.is_dir() or now - stage.stat().st_mtime < 4 * 3600:
                 continue
-            with key_lock(pool, key, nonblocking=True):
-                remove_tree(stage)
+            with key_lock(pool, key, nonblocking=True, readonly=dry_run):
+                if not dry_run:
+                    remove_tree(stage)
         except (BlockingIOError, FileNotFoundError):
             pass
     candidates = sorted((p for p in entries.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime)
@@ -547,11 +540,12 @@ def _collect(pool, *, protect=(), now=None):
         if entry.name in protect:
             continue
         usage = shutil.disk_usage(pool)
-        if now - entry.stat().st_mtime < 7 * 86400 and usage.free / usage.total >= 0.1:
+        if now - entry.stat().st_mtime < max_age and usage.free / usage.total >= 0.1:
             continue
         try:
-            with key_lock(pool, entry.name, nonblocking=True):
-                discard_entry(pool, entry)
+            with key_lock(pool, entry.name, nonblocking=True, readonly=dry_run):
+                if not dry_run:
+                    discard_entry(pool, entry)
                 removed.append(entry.name)
         except (BlockingIOError, FileNotFoundError):
             pass
@@ -626,18 +620,26 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         logdir.mkdir(parents=True, exist_ok=True)
         log = logdir / "shared-mathlib-prepare.log"
         with log.open("ab") as output:
-            from .containment import command
-
-            # Every tool sees a read-only pool, including private agents. Only
-            # this fresh trusted project's staging subtree is writable here.
-            rc = fetch(
-                ["lake", "exe", "cache", "get"],
-                project,
-                env,
-                output,
-                1200,
-                prefix=command("--bind", str(project), str(project), env=env),
-            )
+            # Keep the pool read-only for the extraction tool; only its trusted
+            # staging project is writable. This optional mount view has no PID gate.
+            prefix = [
+                "bwrap",
+                "--die-with-parent",
+                "--bind",
+                "/",
+                "/",
+                "--dev-bind",
+                "/dev",
+                "/dev",
+                "--ro-bind",
+                str(pool),
+                str(pool),
+                "--bind",
+                str(project),
+                str(project),
+                "--",
+            ]
+            rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, env, output, 1200)
         if rc:
             raise Unavailable(f"fresh Mathlib extraction failed (exit {rc}); see {log}")
         mathlib = project / ".lake/packages/mathlib"
@@ -686,7 +688,6 @@ def report(pool, env, **fields):
     worker = env.get("TAUCETI_WORKER_ID", "default")
     identity = hashlib.sha256(worker.encode()).hexdigest()
     from .activity import current_round_id
-    from .containment import status
 
     try:
         atomic_json(
@@ -696,7 +697,6 @@ def report(pool, env, **fields):
                 scope=env.get("TAUCETI_FLEET_MACHINE_ID", "local"),
                 round_id=current_round_id(),
                 supervisor=process_identity(os.getpid()),
-                containment_mode=status(env).mode,
                 observed_at=time.time(),
                 **fields,
             ),
@@ -781,14 +781,7 @@ def view(cwd, env, logdir, fetch):
     safety_stop_recorded = None
     with contextlib.ExitStack() as stack:
         try:
-            from . import containment
-
             report(pool, env, mode="preparing", reason="checking namespace capability and dependency identity")
-            if containment.policy(env) == "legacy":
-                # The view is itself a PID namespace; the rollback must not keep using one.
-                raise Unavailable(f"{containment.POLICY_ENV}=legacy disables the namespace-based shared view")
-            if not containment.capability(env, fresh=True).strong:
-                raise Unavailable("strong process containment is unavailable; keep sharing off and use private builds")
             pool.mkdir(parents=True, exist_ok=True, mode=0o700)
             ok, reason = capability(pool)
             if not ok:
@@ -856,14 +849,8 @@ def view(cwd, env, logdir, fetch):
             report(
                 pool, env, mode="overlay-ready", key=key, cache_hit=hit, preparation_seconds=time.monotonic() - started
             )
-        except (
-            Unavailable,
-            OSError,
-            ValueError,
-            subprocess.TimeoutExpired,
-            containment.ContainmentUnconfirmed,
-        ) as error:
-            if isinstance(error, (IntegrityFailure, containment.ContainmentUnconfirmed)):
+        except (Unavailable, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            if isinstance(error, IntegrityFailure):
                 safety_stop_recorded = stop_sharing(pool, str(error))
             if backup_created and backup and backup.exists():
                 remove_tree(upper)
@@ -877,9 +864,7 @@ def view(cwd, env, logdir, fetch):
             report(
                 pool,
                 env,
-                mode="blocked"
-                if selected == "required" or isinstance(error, containment.ContainmentUnconfirmed)
-                else "private",
+                mode="blocked" if selected == "required" else "private",
                 reason=str(error),
                 preparation_seconds=time.monotonic() - started,
                 safety_stop_recorded=safety_stop_recorded,
@@ -888,8 +873,6 @@ def view(cwd, env, logdir, fetch):
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
-            if isinstance(error, containment.ContainmentUnconfirmed):
-                raise
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []
@@ -900,10 +883,6 @@ def view(cwd, env, logdir, fetch):
             yield prefix
         except BaseException as error:
             body_error = type(error).__name__
-            if prefix and isinstance(error, containment.ContainmentUnconfirmed):
-                safety_stop_recorded = stop_sharing(
-                    pool, "shared namespace cleanup unconfirmed; preserve active leases and investigate"
-                )
             raise
         finally:
             if prefix:
@@ -913,14 +892,6 @@ def view(cwd, env, logdir, fetch):
                     except OSError as error:
                         cleanup_error = str(error)
                 stack.close()
-                from . import activity, containment
-
-                round_id = activity.current_round_id()
-                empty = containment.confirmed_empty(round_id) if round_id is not None else None
-                if containment.cleanup_unconfirmed(round_id):
-                    safety_stop_recorded = stop_sharing(
-                        pool, "shared round namespace cleanup unconfirmed; preserve active leases and investigate"
-                    )
                 record_result(
                     env,
                     None,
@@ -928,10 +899,7 @@ def view(cwd, env, logdir, fetch):
                     backup_retained=bool(backup and backup.exists()),
                     body_error=body_error,
                     cleanup_error=cleanup_error,
-                    boundaries_confirmed_empty=empty,
-                    cleanup_success=(body_error is None and cleanup_error is None and empty)
-                    if empty is not None
-                    else None,
+                    cleanup_success=body_error is None and cleanup_error is None,
                     safety_stop_recorded=safety_stop_recorded,
                     **upper_usage(upper),
                 )

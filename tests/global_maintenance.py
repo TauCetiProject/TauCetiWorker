@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker.config import NoProgress, SharedStateUnavailable
+from tauceti_worker.config import ClaimCollision, NoProgress
 from tauceti_worker.github_state import SurveyRows
 from tauceti_worker.review_state import ReviewState
 from tauceti_worker.survey import PRInfo
@@ -147,9 +147,25 @@ class GlobalMaintenance(unittest.TestCase):
         self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
         _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr == 20 else 0)
         self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20), ("fix", 30)])
-        self.assertEqual(query.call_args.kwargs["stages"], [])
+        self.assertEqual(set(query.call_args.kwargs["stages"]), set(self.opts.only) - {"roadmap"})
         self.assertEqual(query.call_args.args[1], "auto")
         areas.assert_not_called()
+
+    def test_all_claimed_without_authoring_is_a_collision_not_failure(self):
+        self.opts.only = ["fix"]
+        with patch.object(work, "_branch_claimed_elsewhere", return_value=True):
+            with self.assertRaises(ClaimCollision):
+                self.run_round([row(10, "Other")])
+        self.assertEqual(self.calls, [])
+
+    def test_authoring_limit_does_not_turn_maintenance_collisions_into_long_backoff(self):
+        with (
+            patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"),
+            patch.object(work, "_branch_claimed_elsewhere", return_value=True),
+        ):
+            with self.assertRaisesRegex(ClaimCollision, "maintenance is claimed"):
+                self.run_round([row(10, "Other")])
+        self.assertEqual(self.calls, [])
 
     def test_git_claim_precheck_handles_owner_expiry_and_failures(self):
         leases = [
@@ -219,22 +235,64 @@ class GlobalMaintenance(unittest.TestCase):
     def test_new_authoring_selects_area_last(self):
         _, query, areas = self.run_round([])
         self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
-        self.assertEqual(query.call_args.kwargs["stages"], [])
+        self.assertEqual(set(query.call_args.kwargs["stages"]), set(self.opts.only) - {"roadmap"})
         areas.assert_called_once_with(self.w.gh)
 
-    def test_incomplete_cache_does_not_author_or_fetch_histories(self):
-        with self.assertRaisesRegex(NoProgress, "need cached history"):
-            self.run_round([row(10, "Other", complete=False)])
-        self.assertEqual(self.calls, [])
+    def test_incomplete_cache_dispatches_review_without_global_history_reads(self):
+        self.run_round([row(10, "Other", complete=False)])
+        self.assertEqual(self.calls[0][:2], ("review", 10))
 
-    def test_unavailable_service_never_falls_back_to_global_github_scan(self):
+    def test_incomplete_cache_dispatches_author_repair(self):
+        pr = row(10, "Other", complete=False)
+        pr["pr"]["labels"].append({"name": "awaiting-author"})
+        self.run_round([pr])
+        self.assertEqual(self.calls[0][:2], ("fix", 10))
+
+    def test_partial_history_never_prevents_authoring_when_work_is_claimed(self):
+        self.run_round([row(10, "Other", complete=False)], lambda stage, c: 0 if stage == "roadmap" else None)
+        self.assertEqual([s for s, *_ in self.calls], ["review", "roadmap"])
+
+    def test_partial_history_preserves_authoring_backpressure_but_not_maintenance(self):
+        with patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"):
+            self.run_round([row(10, "Other", complete=False)])
+        self.assertEqual(self.calls[0][:2], ("review", 10))
+
+    def test_partial_history_does_not_bypass_authoring_limit(self):
+        with patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"):
+            with self.assertRaisesRegex(NoProgress, "backpressure"):
+                self.run_round([row(10, "Other", complete=False)], lambda stage, c: None)
+        self.assertEqual([s for s, *_ in self.calls], ["review"])
+
+    def test_previous_reviewer_preference_does_not_idle_capped_workers(self):
+        from tauceti_worker.survey import Candidate
+
+        deferred = Candidate(10, HEAD, "review preferred elsewhere")
+        with (
+            patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"),
+            patch.object(work, "prioritize_review_candidates", return_value=([], [deferred])),
+        ):
+            self.run_round([row(10, "Other", author="peer", blocking=False)])
+        self.assertEqual(self.calls[0][:2], ("review", 10))
+
+    def test_partial_history_can_launch_without_fetching_history_before_agent(self):
+        from tauceti_worker.survey import Candidate, Survey
+
+        c = Candidate(10, HEAD, partial_history=True)
+        self.w.gh.pr_view = lambda *a: dict(headRefOid=HEAD, isDraft=False, state="OPEN", labels=[])
+        with patch.object(self.w.rs, "gh_meta", side_effect=AssertionError("pre-agent history read")):
+            self.assertTrue(work._still_actionable("review", self.w, Survey("test"), c))
+            self.assertTrue(work._still_actionable("fix", self.w, Survey("test"), c))
+
+    def test_cold_service_outage_uses_only_shared_inventory_not_per_pr_histories(self):
         with (
             patch("tauceti_worker.github_state.read_survey", return_value=(False, None)),
-            patch.object(work, "roadmap_areas") as areas,
-            self.assertRaisesRegex(SharedStateUnavailable, "global maintenance cache unavailable"),
+            patch.object(self.w.gh, "open_prs", return_value=[row(10, "Other")["pr"]]) as inventory,
+            patch.object(work, "dispatch", return_value=0) as dispatch,
         ):
             run_round(self.w, self.opts)
-        areas.assert_not_called()
+        inventory.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[:1], ("review",))
+        self.assertEqual(dispatch.call_args.args[3].pr, 10)
 
     def test_explicit_roadmap_is_preserved(self):
         with patch.object(work, "roadmap_only", return_value="Topology"):
@@ -257,7 +315,7 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round([row(10, "Topology"), row(20, "Other")])
         self.assertEqual(self.calls[0][:2], ("fix", 20))
 
-    def test_missing_cache_predictor_does_not_offer_authoring(self):
+    def test_missing_cache_predictor_offers_review(self):
         survey = importlib.import_module("tauceti_worker.survey")
         with patch("tauceti_worker.github_state.read_survey", return_value=(True, [row(10, "Other", complete=False)])):
             result = survey.survey(
@@ -270,7 +328,8 @@ class GlobalMaintenance(unittest.TestCase):
                 cached_only=True,
             )
         self.assertEqual(result.discovery_gaps, 1)
-        self.assertIsNone(result.next_auto_stage)
+        self.assertEqual(result.discovery_gap_prs, [10])
+        self.assertEqual(result.next_auto_stage, "review")
 
     def test_disabled_maintenance_remains_disabled(self):
         self.opts.only = ["roadmap"]

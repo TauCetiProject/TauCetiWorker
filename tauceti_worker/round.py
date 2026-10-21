@@ -57,13 +57,31 @@ class RoundContext:
                 f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
             ) from None
         self._fd = fd
-        if self.record_activity:
-            from .activity import Round
-
-            self.activity = Round(self.cfg.wid)
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        if self.record_activity:
+            from .retention import recycle
+
+            try:
+                result = recycle(self.cfg)
+                for error in result["errors"]:
+                    log(f"retention: {error}")
+                if result["removed"]:
+                    log(f"retention: recycled {result.get('removed_count', len(result['removed']))} generated paths")
+            except Exception as error:
+                log(f"retention: cache recycling deferred: {error}")
+        if self.record_activity:
+            from .cache_storage import admit
+
+            try:
+                admit(self.cfg)
+            except BaseException:
+                self._cleanup()
+                raise
+            from .activity import Round
+
+            self.activity = Round(self.cfg.wid)
         # Register first: LIFO cleanup records resources after claim/build teardown.
         try:
             from .resources import RoundResources
@@ -88,16 +106,13 @@ class RoundContext:
                 fn()
             except Exception as e:
                 log(f"cleanup step failed: {e}")
-        if self.activity is not None:
-            # Every boundary this round launched has finished by now; say whether all were empty.
-            try:
-                from .containment import write_quiescence
-
-                write_quiescence(self.cfg.state, self.activity.id)
-            except Exception as e:
-                log(f"cleanup step failed: {e}")
         if self._fd is not None:
             try:
+                if self.record_activity:
+                    try:
+                        os.utime(self._fd, None)  # last use, without another lifecycle record
+                    except OSError as error:
+                        log(f"retention: could not record checkout use: {error}")
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
                 os.close(self._fd)
             except OSError:
@@ -215,9 +230,10 @@ class Claims:
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
         # Set when the heartbeat reports the lease lost; branch work passes it to the agent as its
-        # cancellation event, so a lost claim tears the agent's containment boundary down.
+        # cancellation event, so a lost claim cancels the owned agent process group.
         self.lost = threading.Event()
         self._stopped = threading.Event()
+        self.collisions = 0
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -232,6 +248,7 @@ class Claims:
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
         rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 1:
+            self.collisions += 1
             log(f"branch #{pr} claimed by another worker — skipping (COOP dedup)")
             return False
         os.environ["TAUCETI_PUSH_REF"] = refname
@@ -370,9 +387,8 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         # Unlike kill_round_group (which signals while the leader PID is still live), p.wait() has already
         # reaped the leader here, so the group is held open only by stragglers. The lone wrong-kill window
         # — the freed leader PID being reused AND the reuser making itself a group leader before this line
-        # — is microseconds wide and needs a deliberate setsid; we accept it. This sweep is the legacy
-        # fallback: on a host with PID-namespace containment (containment.py) every agent and tool, in
-        # --loop and one-shot rounds alike, already died with its namespace, setsid'd ones included.
+        # — is microseconds wide and needs a deliberate setsid; we accept it. Host agents and
+        # supervised tools also sweep their own groups, including in one-shot rounds.
         reap_round_group(pgid)
         if accounting:
             try:

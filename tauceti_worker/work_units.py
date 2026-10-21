@@ -41,6 +41,7 @@ from .agents import (
     wrapper_bin,
 )
 from .config import (
+    ClaimCollision,
     Config,
     Die,
     NoProgress,
@@ -490,6 +491,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             f"{stage}={len(sv.kind(stage).actionable)}" for stage in round_stages(opts) if want(opts.only, stage)
         )
         log(f"Global PR work: {counts}; {sv.discovery_gaps} PR(s) need cached history")
+        if sv.discovery_gaps:
+            log(
+                "Partial cached history; selecting work without waiting: "
+                + ", ".join(f"https://github.com/{w.gh.repo}/pull/{pr}" for pr in sv.discovery_gap_prs)
+            )
 
     # Spread concurrent workers across different branch-writing work: shuffle each non-review stage so
     # workers starting together don't all pick the lowest-numbered PR and spend a branch-claim round-trip
@@ -523,6 +529,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             except Die as exc:
                 log(f"  review: {exc}; reviewer affinity disabled for this round")
         ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
+        if sv.roadmap_backpressure and deferred:
+            log("  review: authoring paused; previous-reviewer preference will not leave workers idle")
+            ordered.extend(deferred)
+            deferred = []
         sv.reviewable.actionable = ordered
         if deferred:
             waits = [REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at) for c in deferred if c.ready_at is not None]
@@ -542,6 +552,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     declined: list[tuple[str, int]] = []
+    claim_collision = False
     for stage in round_stages(opts):
         if not want(opts.only, stage):
             continue
@@ -555,13 +566,16 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                 and _branch_claimed_elsewhere(w, c.pr)
             ):
                 log(f"Global PR work: {stage} #{c.pr} claimed by a peer — skipping before fresh PR reads")
+                claim_collision = True
                 declined.append((stage, c.pr))
                 continue
             if global_pick and c.pr:
                 p = next((p for p in sv.open_prs if p.number == c.pr), None)
                 areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
                 log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
+            collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
             rc = dispatch(stage, w, sv, c, opts)
+            claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
             if rc is not None:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
             declined.append((stage, c.pr))
@@ -569,12 +583,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
-        if sv.discovery_gaps:
-            raise NoProgress(
-                f"global maintenance: {sv.discovery_gaps} PR(s) need cached history — "
-                "not assuming the backlog is empty or starting new authoring"
-            )
         if sv.roadmap_backpressure:
+            if claim_collision:
+                raise ClaimCollision("authoring paused at the PR limit; available maintenance is claimed by peers")
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
                 f"(>= {sv.max_open_prs}) — backpressure, not authoring"
@@ -598,7 +609,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         # at a reason that was never printed.
         for stage, pr in declined:
             log(f"  --pr #{pr}: {stage} candidate was offered but not taken (claimed by a peer, or re-checked stale)")
-        raise NoProgress(
+        error = ClaimCollision if claim_collision else NoProgress
+        raise error(
             f"nothing actionable on the requested PR(s) {', '.join(f'#{n}' for n in opts.prs)} this "
             f"round ({scope}) — see the per-PR reasons above; no unrelated work was done"
         )
@@ -612,7 +624,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     for stage in ("overlap-fix", "overlap-scan"):
         if stage in opts.only and sv.kind(stage).suppressed:
             raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
-    raise NoProgress(f"no eligible work this round under {scope}")
+    error = ClaimCollision if claim_collision else NoProgress
+    raise error(f"no eligible work this round under {scope}")
 
 
 # Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a
@@ -869,6 +882,12 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
         paused |= {"keep", "do-not-close"}
     if {str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused:
         return False
+    if getattr(c, "partial_history", False):
+        # The agent/engine can inspect this selected PR. Unknown comment coverage
+        # must not turn into another pre-launch dependency wait. Ordinary branch
+        # claims and the review engine's per-head coordination remain authoritative.
+        log(f"  {stage} #{c.pr}: investigating with partial cached history")
+        return True
     meta = w.rs.gh_meta(c.pr, force=True)
     if meta.provenance in ("stale", "fetch_failed"):
         log(f"  {stage} #{c.pr}: could not re-read review state before launching — leaving it for a later round")
@@ -1258,8 +1277,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             log(f"  review #{pr}: contest claim (👀) failed to post — a peer may double-review")
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:
-        nrnd = w.rs.review_rounds(pr, w.counters)
-        log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
+        if getattr(c, "partial_history", False):
+            log(f"  review @ {head[:12]}, reviewers={reviewers}; engine will discover missing history")
+        else:
+            nrnd = w.rs.review_rounds(pr, w.counters)
+            log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
     try:
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts)
@@ -1748,41 +1770,94 @@ def _do_fixlike(
 
         push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
         published_before = _rev(co, push_marker)
-        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before))
+        push_scope = conversation_round or os.urandom(16).hex()
+        scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
+        scoped_published_before = _rev(co, scoped_push_marker)
+        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before, scope=push_scope))
+        handoffs = []
+        if (
+            not foreign
+            and label != "bump"
+            and not getattr(p, "automatic_bump", False)
+            and getattr(p, "author", None)
+            and getattr(sv, "me_login", None)
+            and p.author.lower() == sv.me_login.lower()
+        ):
+            from .repair_recovery import Wait as RecoveryWait
+            from .repair_recovery import handoff_context
+            from .work_recovery import RecordError as RecoveryRecordError
+
+            try:
+                retained, handoffs = handoff_context(
+                    w.cfg,
+                    getattr(getattr(w, "gh", None), "repo", TAUCETI),
+                    pr,
+                    head=checked,
+                    actor=getattr(sv, "me_login", ""),
+                    checkout=co,
+                    push_marker=push_marker,
+                    published_before=published_before,
+                    push_scope=push_scope,
+                )
+                prompt += retained
+            except (OSError, RuntimeError, RecoveryWait, RecoveryRecordError) as error:
+                log(f"  #{pr}: source handoff deferred without model launch: {error}")
+                return decline_foreign_repair()
         agent_rc = None
+        from .config import AdmissionUnavailable
+
         try:
-            rc = run_agent_host(
-                co,
-                prompt,
-                _effective_authoring_profile(opts),
-                w.cfg.logdir,
-                cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
-                session_path=conversation_path,
-                session_actor=getattr(sv, "me_login", ""),
-                session_scope=conversation_scope,
-            )
+            from .repair_recovery import environment
+
+            with environment(TAUCETI_PUSH_SCOPE=push_scope):
+                rc = run_agent_host(
+                    co,
+                    prompt,
+                    _effective_authoring_profile(opts),
+                    w.cfg.logdir,
+                    cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
+                    session_path=conversation_path,
+                    session_actor=getattr(sv, "me_login", ""),
+                    session_scope=conversation_scope,
+                )
             agent_rc = rc
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
+            from .repair_recovery import return_handoffs
+
+            return_handoffs(handoffs)
+            raise
+        except AdmissionUnavailable:
+            from .repair_recovery import return_handoffs
+
+            return_handoffs(handoffs)
             raise
         finally:
-            # Agent containment is empty before run_agent_host returns or raises.
+            # The owned agent process group has been swept before this returns or raises.
             # Capture the final source now, so a quota-blocked loop can recover it
             # without needing another paid round to reach checkout preparation.
             from .work_recovery import guard, note_owner
 
             if (co / ".git").exists():
-                published_after = _rev(co, push_marker)
+                published_after = _rev(co, scoped_push_marker)
                 note_owner(
                     w.cfg,
+                    recovery_handoffs=handoffs,
                     round_outcome=dict(
                         exit_code=agent_rc,
-                        published_head=published_after if published_after != published_before else None,
+                        published_head=published_after if published_after != scoped_published_before else None,
                     ),
                 )
+                if handoffs and published_after and published_after != scoped_published_before:
+                    from .repair_recovery import complete_handoffs
+
+                    try:
+                        complete_handoffs(w.cfg, handoffs, published_after)
+                    except OSError as error:
+                        log(f"recovery handoff acknowledgement deferred; durable push marker retained: {error}")
                 guard(w.cfg, co)
     if rc == 0:
         w.rs.bust(pr)

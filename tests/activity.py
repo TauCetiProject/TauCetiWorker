@@ -38,12 +38,40 @@ class ActivityTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.addCleanup(setattr, a, "_round", None)
+        from tauceti_worker import work_recovery
+
+        recovery_home = patch.object(work_recovery, "HERE", Path(self.tmp.name) / "worker")
+        recovery_home.start()
+        self.addCleanup(recovery_home.stop)
         self.now = time.time()
 
     def finish(self, age, kind="review", outcome="completed", rid=None):
         rid = rid or str(age)
         with patch.object(a.time, "time", return_value=self.now - age):
             a.emit("round_finished", key=rid, round_id=rid, round_type=kind, outcome=outcome)
+
+    def test_upgrade_preserves_usage_history_and_ignores_old_containment_projection(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("CREATE TABLE containment(boundary TEXT PRIMARY KEY, cleanup TEXT)")
+            db.execute("INSERT INTO containment VALUES ('historical', 'namespace-unconfirmed')")
+            db.execute("INSERT INTO conversation_costs VALUES ('paid', 'worker', 'machine', 1, 2, '17.25')")
+        a.emit("containment_result", boundary="old", cleanup="namespace-unconfirmed")
+        with contextlib.closing(a._connect()) as db, db:
+            a._consume(db, [])
+            self.assertEqual(
+                tuple(db.execute("SELECT * FROM containment").fetchone()), ("historical", "namespace-unconfirmed")
+            )
+            self.assertEqual(db.execute("SELECT cost FROM conversation_costs WHERE id='paid'").fetchone()[0], "17.25")
+
+    def test_host_cache_metrics_are_in_prepared_group_status(self):
+        from tauceti_worker import expanded_cache
+
+        a.atomic_json(a.root() / "cleanup.json", dict(at=1, managed_bytes=1024, protected_bytes=512))
+        a.emit("round_started", worker="one", group="host-one", round_id="round-one")
+        with patch.object(expanded_cache, "summary", return_value=dict(workers=1, hits=10, expanded=2, seconds=3)):
+            value = a.prepare()
+        self.assertEqual(value["groups"]["host-one"]["storage_cleanup"]["managed_bytes"], 1024)
+        self.assertEqual(a.cached(group="host-one")["summary"]["expanded_cache"]["hits"], 10)
 
     def test_table_aligns_all_rows_and_lists_zero_count_work_types(self):
         self.finish(10, kind="fix")
@@ -68,6 +96,14 @@ class ActivityTests(unittest.TestCase):
         self.assertNotIn("Outcome rows are subsets", output.getvalue())
         pr_start = next(i for i, line in enumerate(lines) if line.startswith("PRs authored"))
         self.assertEqual(lines[pr_start - 1], "")
+
+    def test_housekeeping_failure_does_not_abort_activity_refresh(self):
+        from tauceti_worker import work_recovery
+
+        with patch.object(work_recovery, "housekeep", side_effect=OSError("fixture housekeeping failure")):
+            value = a.prepare(now=self.now)
+        self.assertTrue(a.cached()["available"])
+        self.assertTrue(any("Recovery housekeeping deferred" in error for error in value["errors"]))
 
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
@@ -103,6 +139,14 @@ class ActivityTests(unittest.TestCase):
         r = a.Round("worker")
         r.rc = 76
         r.finish()
+        for code in (80, 81):
+            r = a.Round("worker")
+            r.rc = code
+            r.finish()
+        from tauceti_worker.config import ClaimCollision
+
+        r = a.Round("worker")
+        r.finish(ClaimCollision("peer owns this PR"))
         r = a.Round("worker")
         r.finish()
         a.emit("round_started", round_id="killed", pid=999999999, hostname=__import__("socket").gethostname())

@@ -38,6 +38,8 @@ with path.open('a') as f:
 mode = os.environ.get('CACHE_TEST_MODE', '')
 if mode == label + '-retry' and not any(c['label'] == label for c in prior):
  print('error: connection reset'); sys.exit(1)
+if mode == 'disk-full' and not prior:
+ print('error: No space left on device'); sys.exit(1)
 if mode == label + '-fail':
  print('error: artifact transfer failed'); sys.exit(1)
 if mode == 'miss' and label == 'TauCeti':
@@ -78,6 +80,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     env = {
         "PATH": f"{root}:{os.environ['PATH']}",
         "CACHE_TEST_CALLS": str(calls),
+        "TAUCETI_SHARED_ARTIFACTS": "0",
         "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
         "LAKE_CACHE_DIR": str(root / "private-lake-store"),
         "LAKE_ARTIFACT_CACHE": "1",
@@ -135,6 +138,13 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         assert agents.take_last_agent_infra_failure() is None
         assert "artifact transfer failed" in text
     print("[OK] transient fetch retries; persistent or partial download failures block the agent")
+
+    with patch("tauceti_worker.retention.pressure_cleanup") as cleanup:
+        rc, records, _ = run("disk-full")
+        assert rc == 0 and len(launched) == 1
+        cleanup.assert_called_once_with()
+        assert sum(r["label"] == "Mathlib" for r in records) == 2
+    print("[OK] disk pressure cleans once before the existing cache retry")
 
     rc, records, text = run("miss")
     assert rc == 75 and not launched and len(records) == 2
@@ -240,6 +250,36 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert worker.counters.read("infra-fix-ci-1434") == 99
     print("[OK] fix checkout precedes warming; even an exhausted provider-refund allowance cannot charge cache outages")
 
+    # The owned Mathlib archive pool must not resurrect stale private links forever.
+    from tauceti_worker import cache_storage
+
+    owned = root / "owned-cache"
+    cache_storage.initialize(owned)
+    isolated = root / "isolated"
+    mathlib = isolated / ".cache/mathlib"
+    mathlib.mkdir(parents=True)
+    (mathlib / ("a" * 16 + ".ltar")).write_bytes(b"current-tree-archive")
+
+    @contextlib.contextmanager
+    def private_preparation(cwd, warm_env, **kwargs):
+        yield warm_env
+
+    with patch("tauceti_worker.expanded_cache.preparation", private_preparation):
+        overrides = dict(
+            TAUCETI_SHARED_ARTIFACTS="1",
+            TAUCETI_BUILD_CACHE_ROOT=str(owned),
+            HOME=str(isolated),
+            MATHLIB_CACHE_DIR=str(mathlib),
+        )
+        rc, records, text = run(**overrides)
+        assert rc == 0, text
+        assert sum(r["args"] == ["exe", "cache", "clean"] for r in records) == 1
+        assert (owned / "mathlib" / ("a" * 16 + ".ltar")).exists()
+        rc, records, text = run(**overrides)
+        assert rc == 0, text
+        assert not any(r["args"] == ["exe", "cache", "clean"] for r in records)
+    print("[OK] Mathlib prunes stale private archive links once daily and records current-tree pool reuse")
+
     waits = []
     signals = []
 
@@ -251,14 +291,12 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
 
     proc = SimpleNamespace(pid=12345, wait=interrupted_wait)
     with (
-        # A fake process never reports a namespace; this case is about the legacy group signals.
-        patch.dict(os.environ, {"TAUCETI_PROCESS_CONTAINMENT": "legacy"}),
         patch.object(agents.subprocess, "Popen", lambda *a, **kw: proc),
         patch.object(agents.os, "killpg", lambda pid, sig: signals.append((pid, sig))),
         (root / "interrupt.log").open("ab") as output,
     ):
         try:
-            agents._cache_fetch(["lake"], co, {**env, "TAUCETI_PROCESS_CONTAINMENT": "legacy"}, output, 10)
+            agents._cache_fetch(["lake"], co, env, output, 10)
         except SystemExit as e:
             assert e.code == 143
         else:

@@ -48,6 +48,7 @@ from .budget_cli import add_budget_parser, cmd_budget
 from .claude_api import api_mode, configure_api
 from .config import (
     AdmissionUnavailable,
+    ClaimCollision,
     Config,
     Die,
     GitHubUnavailable,
@@ -67,9 +68,11 @@ from .constants import (
     ALLOWED_TASKS,
     CLAIMS,
     EX_ADMISSION_WAIT,
+    EX_CLAIM_COLLISION,
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
     EX_NOPROGRESS,
+    EX_RECOVERY_IDLE,
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -596,6 +599,11 @@ def build_parser() -> argparse.ArgumentParser:
     recovery.add_argument("--worker-id", dest="worker_id", default=None)
     recovery.add_argument("--json", action="store_true")
 
+    cleanup = sub.add_parser("cleanup", help="reclaim disposable caches and expired diagnostics; local only")
+    cleanup_mode = cleanup.add_mutually_exclusive_group()
+    cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
+    cleanup_mode.add_argument("--install-timer", action="store_true", help="install hourly systemd user cleanup")
+
     w = sub.add_parser(
         "work",
         help="do work: one round, or the driver loop with --loop",
@@ -810,7 +818,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
     add_github_account_flag(doctor)
-    doctor.add_argument("--extras", action="store_true")
+    extras = doctor.add_mutually_exclusive_group()
+    extras.add_argument(
+        "--no-extras", dest="extras", action="store_false", help="Report only core project setup checks"
+    )
+    extras.add_argument("--extras", dest="extras", action="store_true", help=argparse.SUPPRESS)
+    doctor.set_defaults(extras=True)
     doctor.add_argument("--online", action="store_true")
     doctor.add_argument("--workflow")
     doctor.add_argument("--field", action="append", default=[])
@@ -885,6 +898,10 @@ def main(argv: list[str] | None = None) -> int:
         return command(args)
     if cmd == "recovery":
         return cmd_recovery(args)
+    if cmd == "cleanup":
+        from .retention import cmd_cleanup
+
+        return cmd_cleanup(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size
@@ -1384,9 +1401,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
 
             try:
                 mirror_creds(cfg)
-                if (cfg.checkout / ".git").exists():
-                    guard(cfg, cfg.checkout)  # Preserve the last round before selecting recovery.
                 recovery_gh = GitHub()
+                if (cfg.checkout / ".git").exists():
+                    guard(cfg, cfg.checkout, repository=recovery_gh.repo)  # Preserve before selecting recovery.
                 recovery_worker = Worker(
                     cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
                 )
@@ -1419,7 +1436,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                     )
                 )
             if getattr(args, "recovery_only", False):
-                return EX_NOPROGRESS
+                if ctx.activity:
+                    ctx.activity.rc = EX_RECOVERY_IDLE
+                return EX_RECOVERY_IDLE
 
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
@@ -1502,7 +1521,9 @@ def cmd_doctor(args) -> int:
         from tauceti_tools.cli import main as project_doctor
 
         flags = ["doctor", "--conf", os.environ.get("TAUCETI_CONF_SOURCE", os.environ["TAUCETI_CONF"])]
-        for flag in ("extras", "online", "apply", "json"):
+        if not args.extras:
+            flags.append("--no-extras")
+        for flag in ("online", "apply", "json"):
             if getattr(args, flag, False):
                 flags.append("--" + flag)
         for flag in ("workflow", "check", "fix"):
@@ -1542,10 +1563,8 @@ def cmd_host_doctor(args) -> int:
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
-    from . import containment, shared_mathlib
+    from . import shared_mathlib
 
-    contained, contained_note = containment.doctor_row()
-    rows.append(("containment", contained, contained_note))
     shared_ok, shared_note = shared_mathlib.capability()
     rows.append(("shared Mathlib", shared_ok, shared_note + "; TAUCETI_SHARED_MATHLIB_BUILDS=auto|off|required"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
@@ -1762,6 +1781,13 @@ def cli_main() -> int:
             failure_log=None,
         )
         return EX_ADMISSION_WAIT
+    except ClaimCollision as e:
+        event = blocking_event_since(started)
+        if event:
+            return github_pause(e, event.get("reset"))
+        log(str(e))
+        report_runtime("idle", detail=str(e), failure_reason=None, failure_code=None, failure_log=None)
+        return EX_CLAIM_COLLISION
     except NoProgress as e:
         event = blocking_event_since(started)
         if event:
@@ -1779,7 +1805,14 @@ def cli_main() -> int:
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
     can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "tauceti-verify", "tauceti-local-axioms"):
+    for f in (
+        "claim.sh",
+        "git-safe-push",
+        "gh-safe-pr-create",
+        "tauceti-verify",
+        "tauceti-local-axioms",
+        "tauceti-local-lint",
+    ):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

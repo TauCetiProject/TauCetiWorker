@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import github_transport as transport
-from .config import Config, roadmap_only, roadmap_skip
+from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
@@ -291,6 +291,7 @@ class Candidate:
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
+    partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
 
 
 @dataclass
@@ -341,7 +342,8 @@ class Survey:
     github_failed: bool = False
     # Structured shared-state outage (github_state.last_failure()): unknown coverage, not an empty inventory.
     dependency_wait: dict | None = None
-    discovery_gaps: int = 0  # cached histories needed before ruling out global maintenance
+    discovery_gaps: int = 0  # diagnostic only; partial history never stops work selection
+    discovery_gap_prs: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
@@ -845,7 +847,8 @@ def survey(
                 sv.roadmap_only,
                 sv.roadmap_skip,
                 numbers=numbers,
-                stages=[] if cached_only else sorted(enabled),
+                stages=sorted(enabled),
+                allow_cached=cached_only,
             )
             if deep and hasattr(gh, "repo")
             else (False, [])
@@ -853,13 +856,14 @@ def survey(
         if cached_only and not available:
             from .github_state import DEPENDENCY, last_failure
 
-            sv.github_failed = True
-            sv.dependency_wait = last_failure() or {"dependency": DEPENDENCY, "reason": "transport", "detail": ""}
-            sv.errors.append(
-                "global maintenance cache unavailable; waiting for the shared GitHub state service "
-                f"({describe_dependency_wait(sv.dependency_wait)})"
+            failure = last_failure() or {"dependency": DEPENDENCY, "reason": "transport", "detail": ""}
+            log(
+                "Shared-state snapshot unavailable and no matching local snapshot; "
+                "using the ordinary shared GitHub inventory cache without fetching per-PR histories "
+                f"({describe_dependency_wait(failure)})"
             )
-            return sv
+        elif getattr(compact, "cached", False):
+            log("Shared-state refresh unavailable; selecting maintenance from the last complete local snapshot")
         raw = [row["pr"] for row in compact] if available else gh.open_prs()
         if available and seed:
             seed(compact)
@@ -1056,6 +1060,20 @@ def survey(
             )
             continue
         if not history_ready(p):
+            # A partial projection is not an empty history. Let the review engine
+            # inspect the selected PR and coordinate its real per-head claim.
+            # Author-action PRs are handled by their writer instead.
+            if "awaiting-author" not in p.labels and "ready-to-merge" not in p.labels:
+                c = Candidate(
+                    p.number,
+                    p.head_oid,
+                    "build-green; review history incomplete, investigate in review engine",
+                    attempts=counters.read(f"review-err-{p.number}"),
+                    budget=MAX_REVIEW_ERRORS,
+                    ready_at=p.build_status_at,
+                    partial_history=True,
+                )
+                (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         m = rs.gh_meta(p.number)
         if rs.ledger_clean_head(p.number) != p.head_oid:
@@ -1133,7 +1151,19 @@ def survey(
         #    green, attempts spent) so a fix-focused worker explains its idleness instead of a bare
         #    "no eligible work" — reviews are async, so a one-shot fix run can precede the scoreboard.
         for p in tended:
-            if cached_only and (not p.build_success or not history_ready(p)):
+            if cached_only and not p.build_success:
+                continue
+            if not history_ready(p):
+                if "awaiting-author" in p.labels:
+                    c = Candidate(
+                        p.number,
+                        p.head_oid,
+                        "author action requested; cached history incomplete, investigate on PR",
+                        attempts=counters.read(f"fix-{p.number}-{p.head_oid[:12]}"),
+                        budget=MAX_FIX_ATTEMPTS,
+                        partial_history=True,
+                    )
+                    (sv.needs_fix.suppressed if c.attempts >= c.budget else sv.needs_fix.actionable).append(c)
                 continue
             meta = rs.gh_meta(p.number)
             blocking = rs.ledger_blocking(p.number, p.head_oid)
@@ -1268,6 +1298,7 @@ def survey(
 
         survey_overlaps(cfg, gh, sv)
     sv.discovery_gaps = len(gaps)
+    sv.discovery_gap_prs = sorted(gaps)
     sv.next_auto_stage = _next_auto_stage(sv)
     if deep:
         from .github_transport import event
@@ -1291,6 +1322,6 @@ def _next_auto_stage(sv: Survey) -> str | None:
     for stage in AUTO_STAGES:
         if sv.kind(stage).actionable:
             return stage
-    if not sv.roadmap_backpressure and not sv.discovery_gaps:
+    if not sv.roadmap_backpressure:
         return "roadmap"
     return None

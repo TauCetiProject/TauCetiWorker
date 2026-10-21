@@ -29,14 +29,17 @@ from pathlib import Path
 
 from .config import Die
 from .constants import LEAN_ROOT
-from .containment import Boundary
 from .paths import HERE
+from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
+from .verification_storage import Limit, Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 4
+POLICY_VERSION = 6
+LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean")
+HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
@@ -46,6 +49,123 @@ class Incomplete(Exception):
     def __init__(self, message, *, reason="invalid-input"):
         super().__init__(message)
         self.reason = reason
+
+
+class _HashCache:
+    """Directory-grouped mutable hashes, with per-workspace lazy V1 migration."""
+
+    def __init__(self, state, root=None, *, fresh_candidate=False):
+        self.path = state / "verification-hashes-v2.json"
+        payload = read_json(self.path)
+        self.entries = self.directories(payload)
+        self.touched = {}
+        self.marker = state / "verification-hash-roots" / f"{digest(str(root.resolve()))}.json" if root else None
+        self.imported = bool(self.marker and read_json(self.marker).get("schema") == "tauceti-hash-root/v2")
+        self.finished = False
+        self.legacy_path = state / "verification-hashes.json"
+        self.legacy = {} if self.imported or fresh_candidate or root is None else None
+        self.retained = set()
+        self.inventory_depth = 0
+
+    @staticmethod
+    def directories(payload):
+        data = payload.get("directories", [])
+        if payload.get("schema") != "tauceti-verification-hash-cache/v2":
+            return {}
+        if isinstance(data, dict):
+            data = list(data.items())
+        if not isinstance(data, list):
+            return {}
+        return {
+            row[0]: dict(row[1])
+            for row in data
+            if isinstance(row, (list, tuple))
+            and len(row) == 2
+            and isinstance(row[0], str)
+            and Path(row[0]).is_absolute()
+            and isinstance(row[1], dict)
+        }
+
+    def lookup(self, key, path):
+        if not self.inventory_depth:
+            self.retained.add(key)
+        value = self.entries.get(str(Path(path).parent), {}).get(key)
+        if isinstance(value, str) and len(value) == 64:
+            self.put(key, path, value)
+            return value
+        if self.legacy is None:
+            self.legacy = read_json(self.legacy_path)
+        value = self.legacy.get(key)
+        if isinstance(value, str) and len(value) == 64:
+            self.put(key, path, value)
+            return value
+        return None
+
+    def put(self, key, path, value):
+        directory = str(Path(path).parent)
+        self.entries.setdefault(directory, {})[key] = value
+        self.touched.setdefault(directory, {})[key] = value
+
+    def finish_import(self):
+        self.finished = True
+        if self.legacy is None:
+            self.legacy = {}
+
+    def save(self, immutable_roots):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(".lock").open("a+") as lock:
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            disk = read_json(self.path)
+            merged = self.directories(disk)
+            direct = disk.get("direct", {})
+            direct = direct if isinstance(direct, dict) else {}
+            # Merge only used/new keys. A stale snapshot cannot restore pruned inventories.
+            # Move touched directories and keys last, ahead of cold history at the bound.
+            for directory, values in self.touched.items():
+                previous = merged.pop(directory, {})
+                for key, value in values.items():
+                    previous.pop(key, None)
+                    previous[key] = value
+                merged[directory] = previous
+            remaining = HASH_CACHE_LIMIT
+            directories = {}
+            retained_direct = {}
+            for directory, values in reversed(list(merged.items())):
+                compact = any(Path(directory).is_relative_to(root) for root in immutable_roots)
+                pinned = direct.get(directory, [])
+                pinned = set(value for value in pinned if isinstance(value, str)) if isinstance(pinned, list) else set()
+                if compact:
+                    pinned.update(self.retained.intersection(values))
+                kept = {
+                    key: value
+                    for key, value in values.items()
+                    if isinstance(value, str) and len(value) == 64 and (not compact or key in pinned)
+                }
+                kept = dict(list(kept.items())[-remaining:]) if remaining else {}
+                if kept:
+                    directories[directory] = kept
+                    remaining -= len(kept)
+                    pins = sorted(pinned.intersection(kept))
+                    if pins:
+                        retained_direct[directory] = pins
+            payload = dict(
+                schema="tauceti-verification-hash-cache/v2",
+                directories=list(reversed(list(directories.items()))),
+                direct=retained_direct,
+            )
+            if payload != disk:
+                atomic(self.path, payload)
+            if self.finished and self.marker and not self.imported:
+                atomic(self.marker, dict(schema="tauceti-hash-root/v2"))
+                self.imported = True
 
 
 def digest(value) -> str:
@@ -101,6 +221,14 @@ def files_under(root: Path):
     for directory, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"})
         for name in sorted(files + [d for d in dirs if (Path(directory) / d).is_symlink()]):
+            # Lake writes these ignored input-file digests while restoring ProofWidgets.
+            # Their source JSON files remain inputs; creating/replacing a derived digest
+            # must not invalidate an otherwise successful build.
+            if Path(directory).parts[-2:] == ("proofwidgets", "widget") and name in {
+                "package.json.hash",
+                "package-lock.json.hash",
+            }:
+                continue
             yield Path(directory) / name
 
 
@@ -140,16 +268,30 @@ def hash_file(path: Path) -> str:
     )
     key = digest(identity)
     cache = _HASH_CACHE.get()
-    if cache is not None and isinstance(cache.get(key), str) and len(cache[key]) == 64:
-        return cache[key]
+    cached = cache.lookup(key, identity[0]) if isinstance(cache, _HashCache) else cache.get(key) if cache else None
+    if isinstance(cached, str) and len(cached) == 64:
+        return cached
     with path.open("rb") as source:
         result = hashlib.file_digest(source, "sha256").hexdigest()
     after = path.stat()
     if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != identity[1:]:
         raise Incomplete(f"input changed while fingerprinting: {path}")
-    if cache is not None:
+    if isinstance(cache, _HashCache):
+        cache.put(key, identity[0], result)
+    elif cache is not None:
         cache[key] = result
     return result
+
+
+def installation_file_record(path):
+    cache = _HASH_CACHE.get()
+    if not isinstance(cache, _HashCache):
+        return file_record(path)
+    cache.inventory_depth += 1
+    try:
+        return file_record(path)
+    finally:
+        cache.inventory_depth -= 1
 
 
 def source_names(root: Path, base: str) -> set[str]:
@@ -227,13 +369,15 @@ class Verification:
         self.last_watch = 0.0
         self.live_lease = None
         self.job = job
+        self.storage_monitor = None
+        self.storage_lease = None
         self.installations = Installations(
             self.state,
             digest=digest,
             atomic=atomic,
             read_json=read_json,
             files_under=files_under,
-            file_record=file_record,
+            file_record=installation_file_record,
             stamps=stamps,
             cache_directory=lambda: cache_root() / "installations",
         )
@@ -255,6 +399,8 @@ class Verification:
 
     def watch(self):
         self.check_deadline()
+        if self.storage_monitor is not None:
+            self.storage_monitor.check(resources=not self.at_boundary)
         if self.watched and time.monotonic() - self.last_watch >= 2:
             self.last_watch = time.monotonic()
             if stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names:
@@ -278,23 +424,21 @@ class Verification:
         self.receipt["commands"].append(entry)
         self.save()
         self.progress(f"{phase}: start {json.dumps(argv)} (log {log})")
-        boundary = Boundary(f"verify-{phase}", env=env)
-        entry["containment"] = dict(mode=boundary.mode, strong=boundary.strong, reason=boundary.reason)
         process = None
+        command_stack = contextlib.ExitStack()
         stdout_path = log.with_suffix(".stdout")
         offset = 0
         try:
             with log.open("wb") as output, stdout_path.open("wb") as captured:
-                process = subprocess.Popen(
-                    boundary.argv(argv),
-                    cwd=self.root,
-                    env=env,
-                    stdout=captured if capture else output,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    pass_fds=boundary.pass_fds,
+                process = command_stack.enter_context(
+                    owned_process(
+                        argv,
+                        cwd=self.root,
+                        env=env,
+                        stdout=captured if capture else output,
+                        stderr=output if capture else subprocess.STDOUT,
+                    )
                 )
-                boundary.launched()
                 while process.poll() is None:
                     if not capture:
                         with log.open("rb") as progress:
@@ -310,16 +454,10 @@ class Verification:
                 entry["exit"] = process.returncode
         finally:
             try:
-                if process is not None and process.poll() is None:
-                    boundary.abort()
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                command_stack.close()
+                if process is not None:
+                    entry["cleanup"] = "process-group-best-effort"
                     entry["exit"] = process.returncode
-                entry["cleanup"] = boundary.finish(
-                    process.returncode if process is not None else None,
-                    pgid=process.pid if process is not None else None,
-                )
             finally:
                 entry["ended_at"] = time.time()
                 self.save()
@@ -383,7 +521,7 @@ class Verification:
                     and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
                     and POLICY_VERSION == inputs["policy_version"]
                     and {p.name for p in Path(__file__).parent.glob("*.py")}
-                    == set(inputs["verifier"]) - {"wrapper", "tauceti-local-axioms", "LocalAxioms.lean"}
+                    == set(inputs["verifier"]) - {"wrapper", *LOCAL_CHECKERS}
                 )
             if self.mutated or not unchanged:
                 raise Incomplete("verification inputs changed during execution")
@@ -403,14 +541,18 @@ class Verification:
             selected = shlex.split(os.environ.get(name.upper(), name))
             if selected and (executable := shutil.which(selected[0])):
                 toolchain[name] = dict(path=executable, file=file_record(Path(executable)))
+        # Lake can print package diagnostics before the actual version/prefix.
+        # Keep raw output in the command logs, but bind only the final result:
+        # diagnostics are not inputs, and may change after a successful build.
         for command in (
             ["lake", "--version"],
             ["lake", "env", "lean", "--version"],
             ["lake", "env", "lean", "--print-prefix"],
         ):
-            toolchain[" ".join(command)] = self.command("toolchain", command, capture=True)
+            lines = self.command("toolchain", command, capture=True).splitlines()
+            toolchain[" ".join(command)] = lines[-1] if lines else ""
         prefix = Path(toolchain["lake env lean --print-prefix"])
-        if not prefix.is_absolute() or not prefix.is_dir():
+        if not prefix.is_absolute() or not prefix.is_dir() or not (prefix / "bin" / "lean").is_file():
             if prefix.is_absolute() and self.job:
                 self.job["toolchain_wait_path"] = str(prefix)
             raise Incomplete("Lean did not report an absolute installed toolchain prefix", reason="tool-missing")
@@ -422,7 +564,7 @@ class Verification:
         environment = self.environment()
         verifier = {str(p.name): hash_file(p) for p in Path(__file__).parent.glob("*.py")}
         verifier["wrapper"] = hash_file(HERE / "scripts" / "tauceti-verify")
-        for name in ("tauceti-local-axioms", "LocalAxioms.lean"):
+        for name in LOCAL_CHECKERS:
             verifier[name] = hash_file(HERE / "scripts" / name)
         sources = inventory(self.root, self.base)
         return dict(
@@ -436,6 +578,7 @@ class Verification:
             toolchain=toolchain,
             verifier=verifier,
             policy_version=POLICY_VERSION,
+            cache_generation=cache_generation(self.state, self.root),
             python=dict(version=sys.version, executable=file_record(Path(sys.executable))),
             lint_modules=file_record(Path(self.lint_modules)) if self.lint_modules else None,
         )
@@ -487,8 +630,9 @@ class Verification:
                     lint_modules.add(module)
             lint_list.write_text("".join(f"{m}\n" for m in sorted(lint_modules)))
             if lint_modules:
-                env["LINT_ONLY_MODULES"] = str(lint_list)
-                commands.append((["bash", "-o", "pipefail", "scripts/lint-env.sh"], env))
+                commands.append(
+                    ([sys.executable, "-I", str(HERE / "scripts/tauceti-local-lint"), "--modules", str(lint_list)], env)
+                )
             return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
@@ -536,8 +680,11 @@ class Verification:
         previous = {}
         self.live_lease = (self.directory / "live.lock").open("a+")
         fcntl.flock(self.live_lease, fcntl.LOCK_EX)
-        cache = read_json(self.state / "verification-hashes.json")
-        cache_size = len(cache)
+        cache = _HashCache(
+            self.state,
+            self.root,
+            fresh_candidate=bool(self.job and self.job.get("isolated") and self.job.get("attempts") == 1),
+        )
         cache_token = _HASH_CACHE.set(cache)
         try:
 
@@ -546,6 +693,23 @@ class Verification:
 
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 previous[sig] = signal.signal(sig, interrupted)
+            if self.root.parent == self.state / "verification-candidates":
+                from .retention import locked
+                from .verification_storage import Monitor, reserve
+
+                # A direct CLI invocation in an older candidate can create a new job ID.
+                # Protect the actual workspace independently of whichever job refers to it.
+                self.storage_lease = locked(self.state / "verification-storage" / f"{self.root.name}.lock")
+                try:
+                    self.storage_lease.__enter__()
+                except BlockingIOError:
+                    self.storage_lease = None
+                    raise Pressure("candidate storage is being reclaimed; retry verification") from None
+                reserve(self.state, self.root.name)
+                self.storage_monitor = Monitor(self.state, self.root.name)
+                # A direct invocation claims this as an editable workspace, not a disposable
+                # failed copy left by a different invocation.
+                (self.state / "verification-copy-incomplete" / f"{self.root.name}.json").unlink(missing_ok=True)
             raw = self.base_arg or os.environ.get("TAUCETI_VERIFY_BASE") or local_main(self.root)
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
@@ -557,6 +721,10 @@ class Verification:
 
             self.job = prepare_job(self, dict(sources=candidate_sources))
             self.receipt["job"] = self.job["id"]
+            if self.job.get("isolated") and self.storage_monitor is None:
+                from .verification_storage import Monitor
+
+                self.storage_monitor = Monitor(self.state, self.job["id"])
             if self.deadline is not None and time.time() >= self.deadline - float(
                 os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600")
             ):
@@ -567,9 +735,10 @@ class Verification:
             self.watch_names = source_names(self.root, self.base)
             self.watched = stamps([self.root / p for p in self.watch_names])
             inputs = self.inputs()
+            cache.finish_import()
             self.watch()
             extra = list(Path(__file__).parent.glob("*.py")) + [
-                HERE / "scripts" / name for name in ("tauceti-verify", "tauceti-local-axioms", "LocalAxioms.lean")
+                HERE / "scripts" / name for name in ("tauceti-verify", *LOCAL_CHECKERS)
             ]
             extra += [p for root in self.installations.walked for p in files_under(root)]
             extra += [
@@ -632,9 +801,10 @@ class Verification:
                     try:
                         self.command(phase, argv, env=env)
                     except subprocess.CalledProcessError as error:
-                        if phase == "axioms" and error.returncode in {2, 75}:
+                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in error.cmd)
+                        if (phase == "axioms" or local_lint) and error.returncode in {2, 75}:
                             raise Incomplete(
-                                "local axiom checker unavailable; see the phase log",
+                                f"local {phase} checker unavailable; see the phase log",
                                 reason="tool-missing" if error.returncode == 75 else "invalid-input",
                             ) from error
                         raise
@@ -643,6 +813,8 @@ class Verification:
                 self.index_success()
             # Recompute bytes, pins, dependencies, toolchain, environment and verifier after all tools exit.
             self.validate_inputs(inputs, full=True)
+            if self.storage_monitor is not None:
+                self.storage_monitor.finish()
             self.receipt.update(status="success", ended_at=time.time())
             self.index_success()
         except subprocess.CalledProcessError as error:
@@ -652,12 +824,31 @@ class Verification:
                 incomplete_reason="toolchain" if probing else None,
                 error=f"command exited {error.returncode}: {error.cmd}",
             )
+        except Pressure as error:
+            self.receipt.update(
+                status="incomplete",
+                error=str(error),
+                incomplete_reason="storage-limit"
+                if error.reason == "limit"
+                else "storage-configuration"
+                if error.reason == "configuration"
+                else "disk-pressure",
+                result_type="incomplete",
+                next_action="adjust verification storage limits/inputs and invoke verify again"
+                if error.reason in {"limit", "configuration"}
+                else "reclaim verification storage and retry verify in this workspace",
+            )
         except Incomplete as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason=error.reason)
         except (Die, OSError, ValueError, RuntimeError) as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason="preparation")
         finally:
             self.receipt["ended_at"] = time.time()
+            if self.storage_monitor is not None:
+                try:
+                    self.storage_monitor.settle_idle()
+                except (OSError, Pressure) as error:
+                    self.progress(f"verification storage accounting deferred: {error}")
             # Retain the legacy field for readers; local checks no longer import an environment.
             self.receipt["audit_phase_timings"] = []
             for phase in self.receipt["phases"].values():
@@ -671,19 +862,27 @@ class Verification:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
             self.live_lease.close()
+            if self.storage_monitor is not None:
+                self.storage_monitor.close()
+            if self.storage_lease is not None:
+                self.storage_lease.__exit__(None, None, None)
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
-            if len(cache) != cache_size:
-                atomic(self.state / "verification-hashes.json", dict(list(cache.items())[-200000:]))
+            try:
+                cache.save(self.installations.validated)
+            except OSError as error:
+                self.progress(f"verification hash cache unavailable: {error}")
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
-            if self.job and self.receipt["status"] == "incomplete":
+            if self.receipt.get("result_type") == "pending":
                 report_runtime(
                     "verification-pending",
                     verification_phase=None,
-                    verification_job=self.job["id"],
+                    verification_job=self.job["id"] if self.job else Path(self.receipt["continuation_job"]).stem,
                     detail="durable verification job retained for mechanical continuation",
                 )
+            elif self.receipt["status"] == "incomplete":
+                report_runtime("verification-incomplete", verification_phase=None, detail=self.receipt.get("error"))
             else:
                 report_runtime("working", verification_phase=None)
         return self.receipt
@@ -730,30 +929,67 @@ class Verification:
 
     def checkpoint_sources(self, inputs):
         """Preserve pre-verification Bubble edits before its disposable container can disappear."""
+        from .retention import locked
+        from .verification_storage import LimitedWriter, release, reserve_checkpoint, settle
+
         key = digest(dict(base=self.base, sources=inputs["sources"]))
         target = self.state / "verification-checkpoints" / key
-        if not (target / "checkpoint.json").exists():
-            target.mkdir(mode=0o700, parents=True, exist_ok=True)
-            patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
-            with (target / "source.patch").open("wb") as out:
-                out.write(patch)
-                out.flush()
-                os.fsync(out.fileno())
-            with tarfile.open(target / "untracked.tar", "w") as archive:
-                for name in sorted(untracked(self.root)):
-                    archive.add(self.root / name, arcname=name, recursive=False)
-            with (target / "untracked.tar").open("rb") as source:
-                os.fsync(source.fileno())
-            atomic(
-                target / "checkpoint.json",
-                dict(
-                    base=self.base,
-                    root=str(self.root),
-                    patch="source.patch",
-                    untracked="untracked.tar",
-                    created_at=time.time(),
-                ),
-            )
+        try:
+            with locked(self.state / "verification-checkpoint-locks" / f"{key}.lock"):
+                if not (target / "checkpoint.json").exists():
+                    patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
+                    names = sorted(untracked(self.root))
+                    size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
+                    # Charge the bounded archive estimate, rather than a whole maximum-sized
+                    # checkpoint for a tiny patch. The writer still enforces the granted bytes.
+                    estimate = size + 16384 + sum(len(name.encode()) * 2 + 8192 for name in names)
+                    limit = reserve_checkpoint(self.state, key, amount=estimate)
+                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    try:
+                        if size > limit:
+                            raise Limit("source checkpoint exceeds its reserved byte budget; original source retained")
+                        with (target / "source.patch").open("wb") as out:
+                            out.write(patch)
+                            out.flush()
+                            os.fsync(out.fileno())
+                        with (target / "untracked.tar").open("wb") as out:
+                            with tarfile.open(fileobj=LimitedWriter(out, limit - len(patch)), mode="w") as archive:
+                                for name in names:
+                                    archive.add(self.root / name, arcname=name, recursive=False)
+                            out.flush()
+                            os.fsync(out.fileno())
+                        atomic(
+                            target / "checkpoint.json",
+                            dict(
+                                base=self.base,
+                                root=str(self.root),
+                                source_digest=digest(inputs["sources"]),
+                                patch="source.patch",
+                                untracked="untracked.tar",
+                                created_at=time.time(),
+                                payloads={
+                                    name: file_record(target / name) for name in ("source.patch", "untracked.tar")
+                                },
+                            ),
+                        )
+                    finally:
+                        # A failed write retains any partial source payload, but never books a
+                        # permanent 256 MiB for an empty directory or a tiny completed checkpoint.
+                        size = sum(path.stat().st_size for path in target.iterdir() if path.is_file())
+                        if not size:
+                            for name in ("source.patch", "untracked.tar"):
+                                path = target / name
+                                if path.is_file() and path.stat().st_size == 0:
+                                    path.unlink()
+                            if not any(target.iterdir()):
+                                target.rmdir()
+                                with contextlib.suppress(OSError, Pressure):
+                                    release(self.state, key)
+                        else:
+                            with contextlib.suppress(OSError, Pressure):
+                                settle(self.state, key, size, compact=True)
+        except BlockingIOError:
+            raise Pressure("exact source checkpoint is being preserved; retry verification", reason="busy") from None
         self.receipt["source_checkpoint"] = str(target / "checkpoint.json")
         self.save()
 

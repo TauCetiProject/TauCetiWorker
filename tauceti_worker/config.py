@@ -3,11 +3,13 @@ locking, and logging."""
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -236,24 +238,34 @@ class Config:
 
 
 _LOG_FH = None  # set by set_log_file(): tee log() to a per-worker file
+_LOG_DIR = None
+_LOG_DAY = None
+_LOG_LOCK = threading.RLock()
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")  # strip color codes from the on-disk copy
 
 
 def set_log_file(logdir: Path) -> None:
+    with _LOG_LOCK:
+        _set_log_file(logdir)
+
+
+def _set_log_file(logdir: Path) -> None:
     """Tee log() output to a per-worker file so a worker's activity is readable ON DISK, not only on the
     terminal it was launched from (a loop run directly in a shell otherwise leaves no log to inspect).
     The loop driver picks ONE timestamped file and exports its path so every round child appends to the
     SAME file — one continuous session log per worker; a standalone round with no parent makes its own.
     Idempotent and best-effort: a failure to open the file just leaves logging at stderr-only."""
-    global _LOG_FH
+    global _LOG_FH, _LOG_DIR, _LOG_DAY
     if _LOG_FH is not None:
         return
     path = os.environ.get("TAUCETI_LOG_FILE")
     try:
         logdir.mkdir(parents=True, exist_ok=True)
-        if not path:
-            path = str(logdir / f"work-{time.strftime('%Y%m%d-%H%M%S')}.log")
+        day = time.strftime("%Y%m%d")
+        if not path or (Path(path).parent == logdir and Path(path).name.startswith("work-")):
+            _LOG_DIR, _LOG_DAY = logdir, day
+            path = str(logdir / f"work-{day}.log")
             os.environ["TAUCETI_LOG_FILE"] = path  # children inherit and append to the same file
         _LOG_FH = open(path, "a", buffering=1)  # line-buffered: each log line flushes on its newline
     except OSError:
@@ -268,17 +280,66 @@ def one_line(text: str, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "\u2026"
 
 
+def rotate_console_log():
+    """Move a managed loop's own stdout/stderr to today's file without restarting its child work."""
+    current = os.environ.get("TAUCETI_CONSOLE_LOG_FILE")
+    if not current:
+        return
+    day = time.strftime("%Y%m%d")
+    if os.environ.get("TAUCETI_CONSOLE_LOG_DAY") == day:
+        return
+    with _LOG_LOCK:
+        if os.environ.get("TAUCETI_CONSOLE_LOG_DAY") == day:
+            return
+        target = Path(current).parent / f"work-{day}.log"
+        try:
+            original = os.stat(current)
+            descriptors = []
+            for descriptor in (1, 2):
+                with contextlib.suppress(OSError):
+                    info = os.fstat(descriptor)
+                    if (info.st_dev, info.st_ino) == (original.st_dev, original.st_ino):
+                        descriptors.append(descriptor)
+            if not descriptors:
+                return  # A helper's pipe/result file is unrelated to its inherited console metadata.
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                for stream in (sys.stdout, sys.stderr):
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.flush()
+                for descriptor in descriptors:
+                    os.dup2(fd, descriptor)
+            finally:
+                os.close(fd)
+            os.environ.update(TAUCETI_CONSOLE_LOG_FILE=str(target), TAUCETI_CONSOLE_LOG_DAY=day)
+            from .runtime_status import report_runtime
+
+            report_runtime(log_file=str(target))
+        except OSError:
+            pass  # Keep the current console usable; retry at the next ordinary loop tick.
+
+
 def log(msg: str) -> None:
+    global _LOG_FH
+
+    rotate_console_log()
     line = f"{time.strftime('%F %T')} tauceti: {msg}"
     try:
         print(line, file=sys.stderr, flush=True)
     except (OSError, ValueError):
         pass
-    if _LOG_FH is not None:
-        try:
-            _LOG_FH.write(_ANSI_RE.sub("", line) + "\n")
-        except (OSError, ValueError):
-            pass
+    with _LOG_LOCK:
+        if _LOG_DIR is not None and _LOG_DAY != time.strftime("%Y%m%d"):
+            if _LOG_FH is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    _LOG_FH.close()
+            _LOG_FH = None
+            set_log_file(_LOG_DIR)
+        if _LOG_FH is not None:
+            try:
+                _LOG_FH.write(_ANSI_RE.sub("", line) + "\n")
+            except (OSError, ValueError):
+                pass
 
 
 _RED, _RESET = "\033[1;31m", "\033[0m"
@@ -295,6 +356,10 @@ class Die(Exception):
 
 class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
+
+
+class ClaimCollision(NoProgress):
+    """Available candidates were claimed by peers; reselect without failure backoff."""
 
 
 class ProgressPreparationUnavailable(NoProgress):

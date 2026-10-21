@@ -19,6 +19,8 @@ RECOVERY_COUNTS = (
     "superseded",
     "incomplete",
     "corrupt",
+    "errors",
+    "cleanup_backlog",
 ) + tuple(
     "recovery_" + state
     for state in (
@@ -100,6 +102,29 @@ def display(value, default_kinds=()):
     s = value["summary"]
     age = max(0, int(time.time() - s["prepared_at"]))
     print(f"Activity: prepared {age}s ago" + (" (stale)" if age > 180 else ""))
+    if cleanup := s.get("storage_cleanup"):
+        print(
+            f"Storage cleanup: {cleanup.get('removed_count', len(cleanup.get('removed', [])))} paths removed; "
+            f"{cleanup.get('protected_count', len(cleanup.get('protected', [])))} protected; "
+            f"{cleanup.get('errors_count', len(cleanup.get('errors', [])))} errors; "
+            f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB free"
+        )
+        if "managed_bytes" in cleanup:
+            age = max(0, int(time.time() - cleanup.get("at", time.time())))
+            print(
+                f"  Managed caches: {cleanup['managed_bytes'] / 2**30:.1f} GiB; "
+                f"{cleanup.get('protected_bytes', 0) / 2**30:.1f} GiB held by live workers; "
+                f"{cleanup.get('reclaimed_bytes', 0) / 2**30:.1f} GiB space recovered; checked {age}s ago"
+            )
+            if cleanup.get("pressure"):
+                print("  Disk cleanup requested; live work and saved source remain protected")
+    if expanded := s.get("expanded_cache"):
+        if expanded.get("workers"):
+            print(
+                f"Expanded artifacts (latest preparation per worker): {expanded.get('hits', 0)} reused; "
+                f"{expanded.get('expanded', 0)} expanded; {expanded.get('seconds', 0):.1f}s preparation"
+            )
+
     since = s.get("history_since")
     print("Activity since: " + (datetime.fromtimestamp(since, UTC).isoformat(timespec="seconds") if since else "none"))
     kinds = list(dict.fromkeys(s.get("round_types", default_kinds)))
@@ -281,12 +306,12 @@ def display(value, default_kinds=()):
         for reason in sharing.get("reasons", []):
             print("  " + reason)
     recovery = s.get("work_recovery")
-    if recovery and any(recovery.get(key) for key in RECOVERY_COUNTS):
+    if recovery and (any(recovery.get(key) for key in RECOVERY_COUNTS) or recovery.get("preparation_metadata_entries")):
         print()
         print(
             f"Local work recovery: {recovery.get('records', 0)} saved, "
             f"{recovery.get('retained', 0)} checkouts moved aside, "
-            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt"
+            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt, {recovery.get('errors', 0)} errors"
         )
         if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):
             print(
@@ -304,6 +329,13 @@ def display(value, default_kinds=()):
                     )
                 )
             )
+        print(
+            f"  Cleanup: {recovery.get('cleanup_backlog', 0)} queued, "
+            f"oldest {int(recovery.get('cleanup_oldest_age_seconds', 0))}s; "
+            f"preparation {recovery.get('preparation_seconds', 0):.3f}s, "
+            f"read {recovery.get('preparation_read_bytes', 0)}B, "
+            f"hashed {recovery.get('preparation_hash_bytes', 0)}B"
+        )
         for reason in recovery.get("reasons", []):
             print("  " + reason)
     if ci_rows:
@@ -360,6 +392,29 @@ def combine(values):
                 row = s["rounds"][w].setdefault(kind, dict(finished=0, failed=0, unknown=0))
                 for key in row:
                     row[key] += counts.get(key, 0)
+    cleanup = [v["storage_cleanup"] for v in known if v.get("storage_cleanup")]
+    if cleanup:
+        s["storage_cleanup"] = dict(
+            at=min(row.get("at", 0) for row in cleanup),
+            **{
+                key: sum(row.get(key, 0) for row in cleanup)
+                for key in (
+                    "managed_bytes",
+                    "protected_bytes",
+                    "reclaimed_bytes",
+                    "free_bytes",
+                    "removed_count",
+                    "protected_count",
+                    "errors_count",
+                )
+            },
+            pressure=any(row.get("pressure", False) for row in cleanup),
+        )
+    expanded = [v["expanded_cache"] for v in known if v.get("expanded_cache")]
+    if expanded:
+        s["expanded_cache"] = {
+            key: sum(row.get(key, 0) for row in expanded) for key in ("workers", "hits", "expanded", "seconds")
+        }
     for w in WINDOWS:
         for key in ("authored", "landed", "reviews", "fixes"):
             s["pr_windows"][w][key] = sum(v["pr_windows"][w].get(key, 0) for v in known)
@@ -451,6 +506,16 @@ def combine(values):
     recovery = [v.get("work_recovery", {}) for v in known]
     if any(recovery):
         s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
+        for key in (
+            "preparation_seconds",
+            "preparation_read_bytes",
+            "preparation_hash_bytes",
+            "preparation_metadata_entries",
+        ):
+            s["work_recovery"][key] = sum(row.get(key, 0) for row in recovery)
+        s["work_recovery"]["cleanup_oldest_age_seconds"] = max(
+            (row.get("cleanup_oldest_age_seconds", 0) for row in recovery), default=0
+        )
         s["work_recovery"]["reasons"] = sorted({reason for row in recovery for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):

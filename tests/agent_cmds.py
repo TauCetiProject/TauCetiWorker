@@ -98,6 +98,10 @@ print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 
 # Agent prompts are always passed in argv. In Bubble, an inherited terminal crosses SSH as a non-TTY
 # stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.
+from tauceti_worker import processes as process_module
+
+saved_sweep = process_module.reap_round_group
+process_module.reap_round_group = lambda pid: None
 saved_popen = tc.agents.subprocess.Popen
 saved_stream = os.environ.get("TAUCETI_STREAM")
 saved_runtime_status = os.environ.get(tc.runtime_status.STATUS_ENV)
@@ -106,10 +110,15 @@ calls = []
 
 class FakeProc:
     def __init__(self, output="", returncode=0):
+        self.pid = 12345  # synthetic; group cleanup is mocked above
+        self.stdin = self.stderr = None
         self.stdout = io.StringIO(output)
         self.returncode = returncode
 
     def wait(self):
+        return self.returncode
+
+    def poll(self):
         return self.returncode
 
     def kill(self):
@@ -277,6 +286,7 @@ try:
         tc.run_agent_proc(["claude"], env={}, logdir=Path(td), label="agent-claude", provider="claude")
         check("structured work prevents a false attempt refund", tc.take_last_agent_infra_failure(), None)
 finally:
+    process_module.reap_round_group = saved_sweep
     tc.agents.subprocess.Popen = saved_popen
     if saved_stream is None:
         os.environ.pop("TAUCETI_STREAM", None)
