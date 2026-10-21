@@ -621,13 +621,20 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
             # Never remove a tracked build directory, nor a symlinked intermediate .lake.
             if (repo / ".lake").is_symlink():
                 continue
-            top = wr._git(repo, "rev-parse", "--show-toplevel", text=True).strip()
-            if (
-                Path(top).resolve() != repo.resolve()
-                or wr._git(repo, "ls-files", "-z", "--", name)
-                or wr._git(repo, "ls-files", "--others", "--exclude-standard", "-z", "--", name)
-            ):
-                continue
+            try:
+                top = wr._git(repo, "rev-parse", "--show-toplevel", text=True).strip()
+                if (
+                    Path(top).resolve() != repo.resolve()
+                    or wr._git(repo, "ls-files", "-z", "--", name)
+                    or wr._git(repo, "ls-files", "--others", "--exclude-standard", "-z", "--", name)
+                ):
+                    continue
+            except wr.BudgetExhausted:
+                raise
+            except wr.RecordError:
+                if repo == tree:
+                    raise
+                continue  # Unknown dependency ownership withholds that dependency only.
             # Removing outputs invalidates cached build-stage reuse in this workspace. Keep
             # the actual receipt as historical evidence; no scan of old receipts is needed.
             receipt_path = Path(job.get("receipt", ""))

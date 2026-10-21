@@ -789,16 +789,22 @@ class Storage(Receipts):
         keep = write(tree, ".lake/packages/other/.lake/build/keep", "warm output")
         storage.settle(self.state, job["id"], 10000, compact=True)
         row = v.read_json(storage.root() / "candidates.json")["candidates"][storage.key(self.state, job["id"])]
+        builds = storage._builds
+
+        def unknown_first(*args, **kwargs):
+            return sorted(builds(*args, **kwargs), key=lambda item: item[0].name != "other")
+
         with patch("tauceti_worker.work_recovery.live_users", return_value=[]):
-            result = storage._compact(
-                self.state,
-                job["id"],
-                wr.Work(seconds=10, entries=100000, removal_bytes=50),
-                now=time.time(),
-                row=row,
-                drop_dependencies=True,
-                evict=True,
-            )
+            with patch.object(storage, "_builds", side_effect=unknown_first):
+                result = storage._compact(
+                    self.state,
+                    job["id"],
+                    wr.Work(seconds=10, entries=100000, removal_bytes=50),
+                    now=time.time(),
+                    row=row,
+                    drop_dependencies=True,
+                    evict=True,
+                )
             self.assertEqual(result, "resume-cache-removal")
             for _ in range(30):
                 report = storage.housekeep((self.state,), seconds=10, entries=100000, removal_bytes=50, now=time.time())
