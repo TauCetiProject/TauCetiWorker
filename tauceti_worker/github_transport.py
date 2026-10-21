@@ -570,6 +570,40 @@ def parse_trace(stderr: str, *, identity=None, records=None) -> str:
     return "".join(clean)
 
 
+def cached_metadata(args, fetch, *, env=None):
+    """Coalesce the review CLI's metadata reads through the existing shared cache."""
+    if len(args) not in (2, 4) or args[0] != "api" or len(args) == 4 and args[2] != "--jq":
+        return None
+    path = args[1]
+    match = re.fullmatch(r"/?repos/([^/]+/[^/]+)/(?:commits|git/commits|git/trees)/[a-f0-9]{40}", path)
+    immutable = match is not None
+    if match is None:
+        # This check only adds a drift warning; main can change between reviews.
+        match = re.fullmatch(r"/?repos/([^/]+/[^/]+)/git/trees/main\?recursive=1", path)
+    if match is None:
+        return None
+    identity = scope(env)
+    if not identity:
+        return fetch()
+    attempted = None
+
+    def read():
+        nonlocal attempted
+        attempted = fetch()
+        if attempted.returncode == 0:
+            return {"stdout": attempted.stdout, "stderr": attempted.stderr}
+        return None  # A transient rejection is not immutable metadata.
+
+    value = shared_read(
+        ["cli_metadata", match[1].lower(), *args[1:]],
+        read,
+        identity=identity,
+        ttl=86400 if immutable else 60,
+        immutable=immutable,
+    )
+    return subprocess.CompletedProcess(["gh", *args], 0, **value) if value is not None else attempted
+
+
 def execute(argv, *, env=None, wait: bool = False, **kwargs):
     effective = dict(os.environ if env is None else env)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -599,7 +633,11 @@ def execute(argv, *, env=None, wait: bool = False, **kwargs):
                 "GitHub publication already retained; reconciling before another attempt",
                 retry_at=github_outbox.retry_at(intent),
             )
-        result = _execute(argv, env=env, wait=wait, _intent=intent, **kwargs)
+        result = cached_metadata(
+            args, lambda: _execute(argv, env=env, wait=wait, _intent=intent, **kwargs), env=effective
+        )
+        if result is None:
+            result = _execute(argv, env=env, wait=wait, _intent=intent, **kwargs)
         if intent:
             # The HTTP ledger is deliberately separate from private intent bodies.
             github_outbox.finish(
