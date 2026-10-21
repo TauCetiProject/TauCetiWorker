@@ -49,7 +49,6 @@ CALL_SITES = {
         PR=123,
         HEAD="a" * 40,
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
-        BLOCK_AUTHORITY="Block authority is pinned.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
     "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),

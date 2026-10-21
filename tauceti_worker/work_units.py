@@ -61,6 +61,7 @@ from .constants import (
     CLAIM_TTL_S,
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
+    MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -906,7 +907,12 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
             pending_contest=pending_contest,
             unlimited=getattr(p, "automatic_bump", False),
         )
-        if disp != "actionable":
+        c.final_resolution = (
+            w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS - 1
+            and p.author == sv.me_login
+            and not getattr(p, "automatic_bump", False)
+        )
+        if disp != "actionable" and not (disp == "exhausted" and c.final_resolution):
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
             return False
         return True
@@ -1073,6 +1079,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
+    if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
+        return _close_spent_pr(w, sv, c)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -1111,10 +1119,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # Last free check before anything that spends — the entitlement probe and the Claude bootstrap
     # below both cost a provider request. Everything above this line is local (a binary on PATH, the
     # configured account), so it stays ahead of a network read that only matters if we get this far.
-    if c.pr and hasattr(getattr(w, "rs", None), "maintenance_blocked"):
-        patch = next((p for p in sv.open_prs if p.number == c.pr), None)
-        if patch and w.rs.maintenance_blocked(c.pr, c.head, patch.author, selected=True):
-            return None
     if not _still_actionable(stage, w, sv, c):
         return None
     from .claude_api import admission_failure
@@ -1181,7 +1185,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     if pre is not None:
-        pre["require_push"] = any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
+        pre["require_push"] = getattr(c, "final_resolution", False) or any(
+            p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs
+        )
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
     # Fresh candidate/claim reads can exhaust a bucket after the initial dispatch preflight.
     _check_stage_read_quota(stage)
@@ -1618,8 +1624,7 @@ def _do_fixlike(
                 "finish the required full build and axiom checks, and use git-safe-push with the "
                 "existing branch lease and starting-head CAS. A new head ends this authorization.\n"
             )
-    # Every PR repair runs unattended. Persist blockers and retire verified
-    # superseded work instead of leaving an actionable decision in stdout.
+    # Every PR repair runs unattended: repair, answer the finding, or close owned work.
     author = getattr(p, "author", "")
     may_close = (
         bool(author)
@@ -1631,17 +1636,19 @@ def _do_fixlike(
         HERE / "prompts" / "pr-outcome.md",
         PR=pr,
         HEAD=head,
-        BLOCK_AUTHORITY=(
-            "If you own this PR, publish the head-bound blocker marker below."
-            if not foreign and not getattr(p, "automatic_bump", False)
-            else "For this scoped foreign or automatic bump repair, publish only an evidence comment; do NOT add a blocker marker or change labels. Preserve the existing retry/checkpoint policy."
-        ),
         CLOSE_AUTHORITY=(
             "You may close this PR only while its live author is the authenticated GitHub account."
             if may_close
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
     )
+    if getattr(c, "final_resolution", False) and may_close:
+        prompt += (
+            "\nThis is the last permitted per-head repair attempt. "
+            "Check the current rubric and actual source, then repair and push or close this PR "
+            "with the unresolved finding and a useful explanation for a fresh attempt. "
+            "A comment alone does not complete this attempt; confirm a push or closure.\n"
+        )
     if getattr(p, "automatic_bump", False):
         deadline = getattr(getattr(w, "rc", None), "deadline", time.time() + ROUND_TIMEOUT)
         prompt += (
@@ -1857,6 +1864,67 @@ def _do_fixlike(
         # provider later fails. Do not turn its scope into repeated paid tasks.
         _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
+
+
+def _close_spent_pr(w, sv, c) -> int | None:
+    """Retire an owned, still-blocked head after its existing repair attempts; no model call."""
+    from .github_transport import read_context
+
+    p = next((p for p in sv.open_prs if p.number == c.pr), None)
+    if (
+        not p
+        or p.author != sv.me_login
+        or p.automatic_bump
+        or c.foreign_repair_base
+        or w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
+    ):
+        return None
+    if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
+        return None
+    try:
+        with read_context(fresh=True, direct=True):
+            if not _still_actionable("fix", w, sv, replace(c, partial_history=False)):
+                return None
+            live = w.gh.pr_view(c.pr, ["state", "headRefOid", "author", "labels", "isDraft"])
+            if (
+                not live
+                or live.get("state") != "OPEN"
+                or live.get("headRefOid") != c.head
+                or live.get("isDraft") is not False
+                or (live.get("author") or {}).get("login", "").lower() != sv.me_login.lower()
+                or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
+                & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
+            ):
+                return None
+            from .activity import select
+
+            select("fix")
+            report_runtime(
+                "running", phase="fix", target=f"PR #{c.pr}", detail="closing owned PR after spent repair attempts"
+            )
+            gh_run(
+                [
+                    "gh",
+                    "pr",
+                    "close",
+                    str(c.pr),
+                    "--repo",
+                    TAUCETI,
+                    "--comment",
+                    f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
+                    f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
+                    "remaining findings using the current review rubric.",
+                ]
+            )
+            after = w.gh.pr_view(c.pr, ["state"])
+            if not after or after.get("state") not in {"CLOSED", "MERGED"}:
+                raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")
+        w.rs.bust(c.pr)
+        log(f"fix #{c.pr}: confirmed closure after spent repair attempts")
+        return 0
+    finally:
+        w.claims.stop_heartbeat()
+        w.claims.release()
 
 
 def do_fix(w, sv, c, opts, bubble) -> int | None:

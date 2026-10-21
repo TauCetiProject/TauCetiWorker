@@ -281,6 +281,7 @@ class Candidate:
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
+    final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
 
 
@@ -319,7 +320,6 @@ class Survey:
     overlap_scan: WorkKind = field(default_factory=lambda: WorkKind("overlap-scan"))
     overlap_fix: WorkKind = field(default_factory=lambda: WorkKind("overlap-fix"))
     me_login: str = ""
-    blocked_prs: list[int] = field(default_factory=list)
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -558,7 +558,7 @@ def fix_disposition(
     if not unlimited and per_head >= MAX_FIX_ATTEMPTS:
         return (
             "exhausted",
-            f"blocking review at head, but fix attempts are spent ({per_head}/{MAX_FIX_ATTEMPTS}) — needs a human",
+            f"blocking review at head, but fix attempts are spent ({per_head}/{MAX_FIX_ATTEMPTS}) — resolve or close the authored PR",
         )
     return ("actionable", "")
 
@@ -823,12 +823,6 @@ def survey(
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
-    if deep and rs is not None and hasattr(rs, "maintenance_blocked"):
-        blocked_prs = {p.number for p in nondraft if rs.maintenance_blocked(p.number, p.head_oid, p.author)}
-        sv.blocked_prs = sorted(blocked_prs)
-        tended = [p for p in tended if p.number not in blocked_prs]
-    else:
-        blocked_prs = set()
     gaps: set[int] = set()
 
     def history_ready(p):
@@ -937,7 +931,7 @@ def survey(
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
     for p in nondraft if "review" in enabled else []:
-        if p.number in blocked_prs or {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
+        if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
             continue
         if not p.build_success:
             continue
@@ -1050,7 +1044,12 @@ def survey(
                         budget=MAX_FIX_ATTEMPTS,
                         partial_history=True,
                     )
-                    (sv.needs_fix.suppressed if c.attempts >= c.budget else sv.needs_fix.actionable).append(c)
+                    c.final_resolution = c.attempts >= c.budget - 1 and p.author == me_login and not p.automatic_bump
+                    (
+                        sv.needs_fix.suppressed
+                        if c.attempts >= c.budget and not c.final_resolution
+                        else sv.needs_fix.actionable
+                    ).append(c)
                 continue
             meta = rs.gh_meta(p.number)
             blocking = rs.ledger_blocking(p.number, p.head_oid)
@@ -1074,7 +1073,12 @@ def survey(
                 continue
             if disp == "actionable":
                 c = Candidate(
-                    p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
+                    p.number,
+                    p.head_oid,
+                    "blocking review at head",
+                    attempts=per_head,
+                    budget=MAX_FIX_ATTEMPTS,
+                    final_resolution=per_head >= MAX_FIX_ATTEMPTS - 1 and p.author == me_login and not p.automatic_bump,
                 )
                 sv.needs_fix.actionable.append(c)
                 continue
@@ -1083,7 +1087,12 @@ def survey(
                 c = Candidate(
                     p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
                 )
-                sv.needs_fix.suppressed.append(c)
+                if p.author == me_login and not p.automatic_bump:
+                    c.final_resolution = True
+                    c.reason = "fix attempts spent; resolve or close the authored PR"
+                    sv.needs_fix.actionable.append(c)
+                else:
+                    sv.needs_fix.suppressed.append(c)
 
     # 4) fix-ci: tended (ours or bot-authored), build FAILED at head, under budgets. A red bump PR is
     #    the bump stage's job (its adaptation prompt knows mathlib moved), and a red lint-repair PR is
