@@ -303,7 +303,12 @@ def reserve(state, identifier, *, source_only=False):
 
 
 def _has_removal(state, identifier):
-    progress = read_json(state / "verification-storage" / f"{identifier}.json")
+    journal = state / "verification-storage" / f"{identifier}.json"
+    if not candidate(state, identifier).exists():
+        with contextlib.suppress(OSError):
+            journal.unlink(missing_ok=True)  # collector died after rmdir, before deleting its intent
+        return False
+    progress = read_json(journal)
     return any(isinstance(value, dict) and "stack" in value for value in progress.values())
 
 
@@ -564,6 +569,7 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
         if not tree.exists():
             with ledger() as data:
                 data["candidates"].pop(key(state, identifier), None)
+            journal.unlink(missing_ok=True)
             return "absent"
         if not job or not evict and (row.get("legacy") or not row.get("settled")):
             return _measure(state, row, tree, work, compact=not bool(job))
@@ -860,7 +866,11 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
         if positions:
             position = positions[0] + 1
             rows = rows[position:] + rows[:position]
-        continuing = {identity for identity, row in rows if _has_removal(Path(row["state"]), row["id"])}
+        continuing = {
+            identity
+            for identity, row in rows
+            if row.get("kind") != "checkpoint" and _has_removal(Path(row["state"]), row["id"])
+        }
         rows.sort(
             key=lambda item: (
                 item[0] not in continuing or bool(item[1].get("reclamation_blocked")),

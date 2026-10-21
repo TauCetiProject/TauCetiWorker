@@ -815,6 +815,21 @@ class Storage(Receipts):
         self.assertTrue(keep.exists())
         self.assertEqual((dep / "Dependency.lean").read_text(), "protected dependency source")
 
+    def test_death_after_removing_copy_before_intent_unlink_allows_fresh_continuation(self):
+        import shutil
+
+        pending, job, tree = self.pending()
+        shutil.rmtree(tree)
+        journal = self.state / "verification-storage" / f"{job['id']}.json"
+        v.atomic(journal, {".lake/build": dict(stack=[""], tree_identity=[0, 0])})
+        job.update(isolated=False, root=str(self.root), next_at=0)
+        v.atomic(pending, job)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        self.assertFalse(journal.exists())
+        self.assertEqual(v.read_json(self.state / "verification-jobs" / pending.name)["status"], "success")
+        self.assertTrue((tree / ".lake/calls").exists())
+
     def test_soft_pressure_reclaims_oldest_completed_cache_then_stops(self):
         jobs = []
         now = time.time()
