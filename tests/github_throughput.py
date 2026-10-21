@@ -143,3 +143,27 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_ACTI
     assert sum(b["marker_failed"] for b in buckets.values()) == 1
     db.close()
 print("PASS: targeted cache invalidation, shared pacing, recovery probe, both throttles and stable state")
+
+# Real journal import must retain coordination receipts, including those skipped by an older collector.
+with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_ACTIVITY_DIR": tmp}):
+    journal = Path(tmp) / "worker-events.jsonl"
+    with patch.dict(os.environ, {"TAUCETI_FLEET_EVENTS": str(journal)}):
+        event = dict(version=1, kind="review_coordination", id="journal-review", at=time.time(),
+                     worker="one", marker_posted=False, git_held=True)
+        journal.write_text(json.dumps(event) + "\n")
+        db = activity._connect()
+        # An older collector advanced past this kind without ingesting it.
+        db.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?)",
+                   (str(journal), journal.stat().st_ino, journal.stat().st_size))
+        db.execute("DELETE FROM meta WHERE key='coordination_journal_schema'")
+        db.commit()
+        db.close()
+        db = activity._connect()
+        activity.backfill(db)
+        activity.backfill(db)
+        buckets = json.loads(db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()[0])
+        assert sum(b["started"] for b in buckets.values()) == 1
+        assert sum(b["marker_failed"] for b in buckets.values()) == 1
+        assert sum(b["git_held"] for b in buckets.values()) == 1
+        db.close()
+print("PASS: coordination journal import and one-time cursor replay are idempotent")
