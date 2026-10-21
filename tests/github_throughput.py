@@ -148,13 +148,22 @@ print("PASS: targeted cache invalidation, shared pacing, recovery probe, both th
 with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_ACTIVITY_DIR": tmp}):
     journal = Path(tmp) / "worker-events.jsonl"
     with patch.dict(os.environ, {"TAUCETI_FLEET_EVENTS": str(journal)}):
-        event = dict(version=1, kind="review_coordination", id="journal-review", at=time.time(),
-                     worker="one", marker_posted=False, git_held=True)
+        event = dict(
+            version=1,
+            kind="review_coordination",
+            id="journal-review",
+            at=time.time(),
+            worker="one",
+            marker_posted=False,
+            git_held=True,
+        )
         journal.write_text(json.dumps(event) + "\n")
         db = activity._connect()
         # An older collector advanced past this kind without ingesting it.
-        db.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?)",
-                   (str(journal), journal.stat().st_ino, journal.stat().st_size))
+        db.execute(
+            "INSERT OR REPLACE INTO cursors VALUES (?,?,?)",
+            (str(journal), journal.stat().st_ino, journal.stat().st_size),
+        )
         db.execute("DELETE FROM meta WHERE key='coordination_journal_schema'")
         db.commit()
         db.close()

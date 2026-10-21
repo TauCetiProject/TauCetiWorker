@@ -327,7 +327,11 @@ def backfill(db, history_roots=()):
         Path(os.environ.get("TAUCETI_FLEET_EVENTS", Path.home() / ".local/state/tauceti-fleet/worker-events.jsonl"))
     )
     for path in sorted(paths):
-        backfill_file(db, path, lambda e: [e] if e.get("kind") in ("pr_created", "pr_activity", "ci_result", "review_coordination") else [])
+        backfill_file(
+            db,
+            path,
+            lambda e: [e] if e.get("kind") in ("pr_created", "pr_activity", "ci_result", "review_coordination") else [],
+        )
 
 
 def _clean_history(db):
