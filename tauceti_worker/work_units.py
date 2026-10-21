@@ -582,6 +582,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
         if sv.roadmap_backpressure:
+            if claim_collision:
+                raise ClaimCollision("authoring paused at the PR limit; available maintenance is claimed by peers")
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
                 f"(>= {sv.max_open_prs}) — backpressure, not authoring"

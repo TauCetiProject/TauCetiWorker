@@ -158,6 +158,15 @@ class GlobalMaintenance(unittest.TestCase):
                 self.run_round([row(10, "Other")])
         self.assertEqual(self.calls, [])
 
+    def test_authoring_limit_does_not_turn_maintenance_collisions_into_long_backoff(self):
+        with (
+            patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"),
+            patch.object(work, "_branch_claimed_elsewhere", return_value=True),
+        ):
+            with self.assertRaisesRegex(ClaimCollision, "maintenance is claimed"):
+                self.run_round([row(10, "Other")])
+        self.assertEqual(self.calls, [])
+
     def test_git_claim_precheck_handles_owner_expiry_and_failures(self):
         leases = [
             ({"owner": "peer", "expires_at": 200}, True),
