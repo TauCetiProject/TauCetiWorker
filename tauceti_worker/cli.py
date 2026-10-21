@@ -1517,10 +1517,17 @@ def _have(tool: str) -> bool:
 
 
 def cmd_doctor(args) -> int:
-    if os.environ.get("TAUCETI_CONF"):
+    from tauceti_tools.project import checkout_root
+
+    root = checkout_root()
+    if os.environ.get("TAUCETI_CONF") or any(
+        (root / file).is_file() for file in ("lean-toolchain", "lakefile.toml", "lakefile.lean")
+    ):
         from tauceti_tools.cli import main as project_doctor
 
-        flags = ["doctor", "--conf", os.environ.get("TAUCETI_CONF_SOURCE", os.environ["TAUCETI_CONF"])]
+        flags = ["doctor"]
+        if os.environ.get("TAUCETI_CONF"):
+            flags.extend(["--conf", os.environ.get("TAUCETI_CONF_SOURCE", os.environ["TAUCETI_CONF"])])
         if not args.extras:
             flags.append("--no-extras")
         for flag in ("online", "apply", "json"):
@@ -1532,6 +1539,7 @@ def cmd_doctor(args) -> int:
         for field in args.field:
             flags.extend(["--field", field])
         return project_doctor(flags)
+    print("For project setup, run tauceti-tools doctor from the content checkout.")
     return cmd_host_doctor(args)
 
 

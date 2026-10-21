@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@70a667775bb453ee169aabff6847b634df278733", "rich", "textual>=8,<9"]  # used ONLY by the TUI/status render; every other path is stdlib.
+# dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@cab8da15b8f3ad3592a9ef99543d2793dcf8a195", "rich", "textual>=8,<9"]  # used ONLY by the TUI/status render; every other path is stdlib.
 # ///
 """./tauceti — source-checkout entry point.
 
