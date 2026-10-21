@@ -83,13 +83,13 @@ class ActivityTests(unittest.TestCase):
             a.display(value)
         lines = output.getvalue().splitlines()
         header = next(line for line in lines if line.startswith("Finished rounds"))
-        expected_ends = [header.index(h) + len(h) for h in ("3h", "24h", "7d", "All time")]
+        expected_ends = [header.index(h) + len(h) for h in ("1h", "3h", "24h", "7d", "All time")]
         data_rows = [line for line in lines if re.search(r"\d+\s+\d+\s+\d+\s+\d+$", line)]
         for line in data_rows:
             self.assertEqual([m.end() for m in re.finditer(r"\d+", line)], expected_ends, line)
         for kind in ("roadmap", "review", "fix-ci", "progress", "security-audit", "no-work"):
             line = next(line for line in data_rows if line.strip().startswith(kind + " "))
-            self.assertEqual(re.findall(r"\d+", line), ["0"] * 4)
+            self.assertEqual(re.findall(r"\d+", line), ["0"] * 5)
         self.assertNotIn("unrecorded", output.getvalue())
         self.assertNotIn("Older resource logs", output.getvalue())
         self.assertNotIn("totals cover", output.getvalue())
@@ -120,13 +120,13 @@ class ActivityTests(unittest.TestCase):
         self.assertIn("Currently: 2 workers working;", output.getvalue())
 
     def test_windows_total_failures_and_idempotent_replays(self):
-        for age in (10, 10800, 10801, 86400, 86401, 604800, 604801):
+        for age in (10, 3600, 3601, 10800, 10801, 86400, 86401, 604800, 604801):
             self.finish(age)
         self.finish(10)  # Same receipt, not an additional round.
         self.finish(20, kind="fix", outcome="timeout")
         a.prepare(now=self.now)
         s = a.cached(group="machine")["summary"]
-        self.assertEqual([s["rounds"][w]["review"]["finished"] for w in a.WINDOWS], [2, 4, 6, 7])
+        self.assertEqual([s["rounds"][w]["review"]["finished"] for w in a.WINDOWS], [2, 4, 6, 8, 9])
         self.assertEqual(s["rounds"]["3h"]["fix"]["failed"], 1)
         a.prepare(now=self.now)
         self.assertEqual(a.cached()["summary"]["rounds"], s["rounds"])

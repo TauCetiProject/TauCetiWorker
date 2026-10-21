@@ -24,7 +24,7 @@ from . import activity_ci, activity_costs, activity_summary
 from .constants import WORK_TASKS
 from .runtime_status import atomic_json, read_json
 
-WINDOWS = {"3h": 10800, "24h": 86400, "7d": 604800, "total": None}
+WINDOWS = activity_summary.WINDOW_SECONDS
 ROUND_TYPES = (*WORK_TASKS, "no-work")
 _round = None
 

@@ -10,7 +10,7 @@ tauceti activity --worker reviewer --json
 tauceti activity --group FLEET_MACHINE_ID
 ```
 
-Finished rounds use their finish receipt in trailing 3-hour, 24-hour, and 7-day
+Finished rounds use their finish receipt in trailing 1-hour, 3-hour, 24-hour, and 7-day
 windows and an All time column. The type is the final selected work unit,
 such as `roadmap`, `review`, `fix`, or `security-audit`; fallback candidates are
 not additional rounds. All supported round types appear even when their counts
@@ -36,7 +36,7 @@ missing-landing warning.
 
 ## Costs and initiated PR output
 
-Average API spending has **3h**, **24h**, **7d** and **All time** columns in
+Average API spending has **1h**, **3h**, **24h**, **7d** and **All time** columns in
 $/hour. It uses accrued conversation costs, including running and interrupted work
 and reviews. Admission reservations do not enter this rate. Each average divides by elapsed recorded time within that window, so a
 new installation is not diluted by hours before recording began. `Worker-hours
@@ -53,14 +53,18 @@ wall-clock hours. Missing spending data leaves the fleet rate unavailable.
 Preparation reuses the existing local budget cache and collector, with no extra
 tasks or GitHub requests.
 
-Cost estimates have **7 days** and **All time** columns. They pool every
+Cost estimates have **24h**, **7 days** and **All time** columns. They pool every
 conversation in the reported worker/machine scope, including reviews and fixes
 on PRs initiated elsewhere. Native final costs correct response-level estimates at their usage timestamps;
 ongoing sessions use recorded usage, shown separately as running usage.
 Legacy costs without response timing are spread over their conversation duration. These are API costs,
 not machine charges or subscription fees. Reading the ledger never changes it.
+The cost breakdown lists completed sessions, live usage, stopped usage estimates,
+then the estimated total. Settled estimates already belong to completed sessions;
+recovered estimates are a subset of those. These diagnostic subsets remain in JSON
+but are omitted from the display to avoid suggesting they should be added again.
 
-The seven-day denominator contains only PRs initiated within those seven days;
+The 24-hour and seven-day denominators contain only PRs initiated within their respective windows;
 all-time contains all retained initiated PRs. Each verified landed PR contributes
 its Lean lines added, each currently open PR contributes half its Lean lines
 added, and a closed unmerged PR contributes nothing. Reviews and other assists
