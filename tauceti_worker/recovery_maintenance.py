@@ -17,6 +17,7 @@ import shutil
 import stat
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -724,6 +725,12 @@ class Sweep:
             "cleanup_oldest_at": None,
             "cleanup_actions": {},
         }
+        discarded = state / "recovery-cleanup" / "discarded"
+        if discarded.is_dir():
+            with os.scandir(discarded) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        yield state, "discarded", Path(entry.path), None
         for category, directory in (("cache", "cache-roots"), ("retained", "roots")):
             registrations = state / "recovery-cleanup" / directory
             if registrations.is_dir():
@@ -755,6 +762,22 @@ class Sweep:
         from . import work_recovery as wr
 
         row = self.rows[state]
+        if kind == "discarded":
+            if not path.is_dir() or path.is_symlink():
+                return
+            cursor = path.with_name(path.name + ".json")
+            job = read_json(cursor)
+            if not job:
+                info = path.stat()
+                job = dict(tree_identity=[info.st_dev, info.st_ino])
+            try:
+                if _remove(path, job, work):
+                    cursor.unlink(missing_ok=True)
+                    return
+            finally:
+                if path.exists():
+                    atomic_json(cursor, job)
+            return
         if kind == "registration":
             self.current_registration = {}
             registry = _metadata(path)
@@ -850,6 +873,25 @@ class Sweep:
             if path.name.startswith(".tmp-"):
                 row["incomplete"] += 1
                 return
+            consumer = read_json(path / "recovery.json")
+            from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE, write
+
+            state_name = consumer.get("state")
+            code = (consumer.get("reason") or {}).get("code")
+            if (
+                state_name == "obsolete"
+                and (consumer.get("handoff") or {}).get("state") == "offered"
+                and code in ACTIVE_HANDOFF
+            ):
+                write(path, consumer, "resuming")
+                state_name = "resuming"
+            if state_name in {"published", "obsolete", "blocked"}:
+                if state_name == "blocked" and code in RETRYABLE:
+                    # Migrate old infrastructure pauses to ordinary automatic retries.
+                    write(path, consumer, "eligible")
+                else:
+                    discard_record(state, path)
+                    return  # Done records never remain in the operator's task inventory.
             manifest = wr._complete(path, digests=False)
             if manifest is None:
                 row["corrupt"] += 1
@@ -958,7 +1000,7 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
                     continue
                 finally:
                     # Tree jobs have durable cursors; yield to unrelated jobs on the next tick.
-                    if item[1] in {"tree", "cache", "retained-entry", "cache-entry"}:
+                    if item[1] in {"tree", "cache", "retained-entry", "cache-entry", "discarded"}:
                         sweep.pending = None
                 sweep.pending = None
     except wr.BudgetExhausted:
@@ -971,6 +1013,47 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
     with contextlib.suppress(OSError):
         atomic_json(base / ".recovery-housekeeping.json", dict(at=time.time(), **report))
     return report
+
+
+def discard_record(state, record):
+    """Retire a finished/unrecoverable record; deletion reuses bounded housekeeping."""
+    from . import work_recovery as wr
+
+    if record.parent != state / "recovery" or record.is_symlink():
+        return False
+    with (record / "recovery.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        # An already-running verifier may still use this tree after the consumer
+        # finishes. It can finish; the next activity tick retries disposal.
+        if (record / "checkout").is_dir() and wr.live_users(record / "checkout"):
+            return False
+        # Same-device bind mounts need protection too; the bounded remover cannot
+        # distinguish them from ordinary directories using inode/device alone.
+        try:
+            mounts = Path("/proc/self/mountinfo").read_text()
+            wr._charge(read=len(mounts))
+            target = str(record.resolve())
+            for line in mounts.splitlines():
+                mount = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), line.split()[4])
+                if mount == target or mount.startswith(target + "/"):
+                    return False
+        except (OSError, IndexError):
+            return False
+        manifest = _metadata(record / "manifest.json")
+        directory = state / "recovery-cleanup" / "discarded"
+        directory.mkdir(parents=True, exist_ok=True)
+        record.rename(directory / (record.name + "-" + uuid.uuid4().hex))
+        if manifest.get("repository") and manifest.get("fingerprint"):
+            entry = recovery_index.location(state, manifest["repository"], manifest["fingerprint"])
+            if _metadata(entry).get("record") == record.name:
+                entry.unlink(missing_ok=True)
+        (state / "recovery-cleanup" / "cache-roots" / f"{_name(record)}.json").unlink(missing_ok=True)
+        wr._fsync_dir(record.parent)
+        wr._fsync_dir(directory)
+        return True
 
 
 def cached_summary(base, *, workers=None):

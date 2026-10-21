@@ -59,6 +59,55 @@ class RecoveryMaintenance(unittest.TestCase):
     def tick(self, **budgets):
         return wr.housekeep(self.cfg.state.parent, **({"seconds": 5, "entries": 10000} | budgets))
 
+    def test_finished_and_unrecoverable_records_are_deleted_and_forgotten(self):
+        for state in ["obsolete", "published", "blocked"]:
+            with self.subTest(state=state):
+                self.dirty()
+                record = wr.guard(self.cfg, self.co).record
+                maintenance.atomic_json(
+                    record / "recovery.json", dict(state=state, reason=dict(code="missing-publication-scope"))
+                )
+                self.tick()
+                self.assertFalse(record.exists())
+                for _ in range(3):
+                    self.tick()
+                self.assertFalse(list((self.cfg.state / "recovery-cleanup/discarded").glob("*")))
+                summary = wr.summary(self.cfg.state.parent)
+                self.assertEqual(summary["records"], 0)
+                self.assertEqual(summary["reasons"], [])
+
+    def test_infrastructure_retry_keeps_warm_artifacts(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        cache = record / "checkout/.lake/build/warm"
+        cache.parent.mkdir(parents=True)
+        cache.write_text("cached artifact")
+        maintenance.atomic_json(
+            record / "recovery.json",
+            dict(state="blocked", reason=dict(code="invocation-failed"), retry_at=time.time() + 60),
+        )
+        self.tick()
+        self.assertEqual(json.loads((record / "recovery.json").read_text())["state"], "eligible")
+        self.assertEqual(cache.read_text(), "cached artifact")
+
+    def test_disposal_preserves_live_recovery_and_external_symlinks(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        checkout = record / "checkout"
+        checkout.mkdir()
+        outside = self.root / "live-source"
+        outside.write_text("keep this source")
+        (checkout / "link").symlink_to(outside)
+        maintenance.atomic_json(record / "recovery.json", dict(state="obsolete"))
+        with patch.object(wr, "live_users", return_value=["live verifier"]):
+            self.tick()
+        self.assertTrue(record.exists())
+        with patch.object(wr, "live_users", return_value=[]):
+            for _ in range(3):
+                self.tick()
+        self.assertFalse(record.exists())
+        self.assertEqual(outside.read_text(), "keep this source")
+
     def restored(self, record, expected):
         dest = self.root / f"restore-{len(list(self.root.glob('restore-*')))}"
         clone = reconstruct(self.origin, record, self.root, dest.name)

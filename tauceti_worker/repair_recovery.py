@@ -30,6 +30,8 @@ RETRIES = (60, 300, 1800)
 MAX_INSPECT = 8
 RESERVATION_SECONDS = 300
 PROTOCOL = 3
+RETRYABLE = {"invocation-failed", "recovery-exhausted", "content-allowance", "publication-revalidation-failed"}
+ACTIVE_HANDOFF = {"source-handed-to-normal-round", "source-handoff-source-pending", "source-handoff-reconciliation"}
 HOLDS = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
 LOCAL_WAITS = {"work-policy", "pr-policy", "profile-policy", "roadmap-policy"}
 METADATA_WAITS = {
@@ -95,6 +97,12 @@ def normal_publication(record, manifest, journal):
 
 def write(record, journal, state, **fields):
     assert state in STATES
+    code = (fields.get("reason", journal.get("reason")) or {}).get("code")
+    handoff = fields.get("handoff", journal.get("handoff")) or {}
+    if state == "obsolete" and handoff.get("state") == "offered" and code in ACTIVE_HANDOFF:
+        state = "resuming"  # a live source handoff is active work, never finished history
+    if state == "blocked" and code in RETRYABLE:
+        state = "eligible"
     journal.update(
         fields, schema="tauceti-work-recovery-consumer/v1", protocol=PROTOCOL, state=state, updated_at=time.time()
     )
@@ -221,6 +229,8 @@ class Recovery:
         if j.get("state") in TERMINAL:
             b.evict_caches(self.record)
             return False
+        if (j.get("handoff") or {}).get("state") == "offered":
+            return False  # the normal receiving round owns the source until reconciled
         if not m:
             self.transition(
                 "blocked",
@@ -453,7 +463,9 @@ class Recovery:
                 next_action="scheduled-mechanical-recheck" if attempts >= 3 else "retry-infrastructure",
                 retry_when="scheduled-backoff-or-changed-authorized-external-facts",
             )
-            state = "blocked" if attempts >= 3 else "eligible"
+            # Infrastructure failures always retry automatically. The delay is
+            # bounded; exhausting invocation attempts never parks a recovery.
+            state = "eligible"
             self.transition(
                 state,
                 attempts=attempts,
@@ -471,7 +483,9 @@ class Recovery:
                 b.release()
             except Exception as error:
                 log(f"recovery claim release failed: {error}")
-            if j.get("state") in TERMINAL or j.get("state") == "blocked":
+            if j.get("state") in TERMINAL or (
+                j.get("state") == "blocked" and (j.get("reason") or {}).get("code") != "invocation-failed"
+            ):
                 b.evict_caches(self.record)
 
     def continue_source(self, checkout, facts, why):
@@ -1668,6 +1682,8 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True, agent=None):
             return True  # The next owned round reconciles an unfinished normal task.
         if journal.get("state") in TERMINAL:
             continue
+        if (journal.get("reason") or {}).get("code") in RETRYABLE and journal.get("retry_at", 0) > time.time():
+            continue
         if journal.get("protocol") != PROTOCOL:
             if journal.get("state") != "blocked" or (journal.get("reason") or {}).get("code") in {
                 "head-rewritten",
@@ -1731,6 +1747,10 @@ def pending_for(cfg, repository, pr):
             journal = read_json(record / "recovery.json")
             if journal.get("state") in TERMINAL | {"blocked"}:
                 continue
+            if (journal.get("handoff") or {}).get("state") == "offered":
+                continue  # real branch claims coordinate the receiving normal task
+            if (journal.get("reason") or {}).get("code") in RETRYABLE:
+                continue  # timed retries never reserve a PR against unrelated normal work
             if not journal.get("reason") or journal.get("state") in {"resuming", "verified", "publication-pending"}:
                 return True
             if journal.get("reservation_until", 0) > time.time():
@@ -2251,6 +2271,8 @@ def recover(w, opts):
                     continue
                 j = read_json(record / "recovery.json")
                 reconcile_handoff(w.cfg, record, j)
+                if (j.get("handoff") or {}).get("state") == "offered":
+                    continue  # the receiving normal round remains the sole source owner
         if j.get("state") in TERMINAL:
             WorkerBackend(w, opts).evict_caches(record)
             continue
