@@ -1,8 +1,7 @@
 ## Durable PR outcomes: this run is unattended
 
 Nobody reads your final transcript to decide what happens next. Before ending, leave the
-result on GitHub: a verified repair pushed to this PR, a justified closure, or an explicit
-blocked state. A recommendation in your final answer alone does not complete maintenance.
+result on GitHub: a verified repair pushed to this PR, a justified closure, or an evidence-based reply to a review finding. A recommendation in your final answer alone does not complete maintenance.
 
 ### Fully superseded PR
 __CLOSE_AUTHORITY__
@@ -32,28 +31,21 @@ Verify the close succeeded. Do not delete the branch, manufacture a commit, clea
 requests, or ask a maintainer to perform this closure for you. Stop once the closure is
 confirmed; build/push requirements apply to repairs, not to a verified supersession closure.
 
-### A real blocker requiring human attention
-__BLOCK_AUTHORITY__
+### Resolve review disagreements
 
-If a substantive decision or permission outside your task is essential, post ONE PR comment
-with the exact starting head, diagnosis, evidence, useful remaining work, and the precise
-decision required. For your own authored PR, begin the comment with this exact first line:
-```
-<!--tauceti-blocked:v1 __HEAD__-->
-```
-Publish with `gh pr comment __PR__ --repo TauCetiProject/TauCeti --body-file <file>`.
-Do not repeat an existing current-head blocker comment. The shared state service recognizes
-only the actual PR author's marker, pauses automatic work on that exact head, and automatically
-allows work again after a new push or deletion/editing of the marker. No label permissions are
-required. Include this resumption instruction in the comment. Honor the narrower authority
-above: scoped foreign repairs and automatic bump repairs must not publish this pause marker.
+Use the current review rubric, not an obsolete finding's description of the rules. Repair the
+PR, narrow or split its scope, or answer a mistaken finding with concrete source and rubric
+evidence through the existing review process. A roadmap restriction is a scope constraint:
+choose work supported by the existing roadmaps; do not change roadmaps.
 
-Recheck the live head and pause labels before publishing; never overwrite a newer task's
-state. Confirm the comment succeeded. Do not publish a blocker marker for an ordinary difficult
-proof, a transient provider/GitHub failure, a lost branch lease, or an expired round deadline.
-Use the existing retry/lease/checkpoint handling for those cases. If publication fails, retain
-its durable outbox intent and report failure; do not claim the task is complete.
+Continue repairs or the existing evidence-based review response process within the bounded
+attempts. When instructed that this is the final resolution attempt, repair and push or close
+your own PR with a concise explanation of the unresolved finding and what a fresh attempt should
+do differently. Preserve the branch. Re-read the live author, starting head and hold labels before
+commenting and closing, using the same checks above, then confirm closure succeeded.
+The closure authority above applies here too; never close somebody else's PR or a specially
+scoped automatic bump. For those repairs, preserve the existing retry/checkpoint policy.
 
-A withdrawn request, changed head, or lost claim needs no repetitive comment: stop safely;
-the changed shared state already routes future work. Never bypass a hold or close somebody
-else's PR. Do not change roadmaps to resolve a blocker.
+Transient provider/GitHub failures, lost claims and deadlines use existing retry and checkpoint
+handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop
+safely; the changed shared state already routes future work.
