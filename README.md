@@ -8,6 +8,9 @@ This repository remains an example worker harness. Pass the same configuration t
 
 See the [architecture and manual setup](https://github.com/TauCetiProject/TauCetiTools/blob/main/docs/project-setup.md)
 for repository ownership, Apps, credentials, workflow installation and optional services.
+The manual also covers [roadmap authoring (WIP)](https://github.com/TauCetiProject/TauCetiTools/blob/main/docs/project-setup.md#roadmap-authoring-wip)
+with TauCetiRoadmapWorker and a downstream-owned job board. This optional extra is disabled
+by default; project `doctor` prints setup instructions and the dedicated roadmap doctor command.
 A configured project has its own checkouts, review store, activity and snapshots under
 `~/.local/state/tauceti/projects/OWNER__REPOSITORY/`. Starting a new worker reloads its canonical
 configuration; a running process tree keeps its saved snapshot. Worker IDs in a shared manager
