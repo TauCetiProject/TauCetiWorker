@@ -1256,7 +1256,7 @@ def do_overlap_fix(w, sv, c, opts, bubble):
     return do_fix(w, sv, c, opts, bubble)
 
 
-def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
+def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
     from .github_transport import blocked_since
 
     github_started = time.time()
@@ -1317,6 +1317,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         from .claude_api import check_result
 
         check_result(rc)
+        if rc == 4:  # Review engine: another run already owns this head; no inference or verdict.
+            log(f"  review #{pr}: claimed by a peer — selecting other work")
+            return None
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without completing a review" streak up front — BEFORE the publish step, which is
@@ -1407,8 +1410,9 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     archive_repo = os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData")
     if not archive_repo:
         return 0
-    perm = gh_run(["gh", "api", f"repos/{archive_repo}", "--jq", ".permissions.push"])
-    if perm.returncode == 0 and perm.stdout.strip() == "false":
+    from .github import can_push
+
+    if can_push(archive_repo) is False:
         log(
             f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
             f"auto-merge; analytics/provenance records kept in {outbox}"

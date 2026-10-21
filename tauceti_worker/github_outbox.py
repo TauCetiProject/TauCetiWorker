@@ -6,6 +6,7 @@ Private bodies/files live here, separately from the allow-listed accounting ledg
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -96,8 +97,41 @@ def fork_read(upstream, env):
     return tr.shared_read(["publication-fork-v2", upstream.lower()], fetch, ttl=60, identity=tr.scope(env))
 
 
+def comment_patch(value):
+    args = value.get("argv", [])
+    endpoint = tr.api_endpoint(args) or ""
+    if _flag(args, "-X", "--method") != "PATCH" or not re.fullmatch(
+        r"/?repos/[^/]+/[^/]+/(?:issues|pulls)/comments/\d+", endpoint
+    ):
+        return None
+    return endpoint.lower()
+
+
+def supersede_comment_patches(payload, env):
+    endpoint = comment_patch(payload)
+    if not endpoint:
+        return
+    bases = {directory(env).parent, tr.root() / "outbox" / (tr.scope(env) or "unselected")}
+    for base in bases:
+        for path in base.glob("*/*.json"):
+            with tr.locked(path.with_suffix(".lock")):
+                try:
+                    old = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    continue
+                if comment_patch(old) == endpoint and old.get("status") in ("prepared", "rejected"):
+                    # A newer body supersedes an unsent/rejected edit. Forget it;
+                    # replaying it later would overwrite the new scoreboard/finding.
+                    path.unlink(missing_ok=True)
+
+
 def prepare(argv, env, cwd=None, input=None):
-    if env.get("TAUCETI_OUTBOX_REPLAY") == "1" or tr.proxy_readonly(argv[1:]) or local_operation(argv[1:]):
+    if (
+        env.get("TAUCETI_GITHUB_EPHEMERAL") == "1"
+        or env.get("TAUCETI_OUTBOX_REPLAY") == "1"
+        or tr.proxy_readonly(argv[1:])
+        or local_operation(argv[1:])
+    ):
         return None
     args = list(argv[1:])
     assets = {}
@@ -186,36 +220,53 @@ def prepare(argv, env, cwd=None, input=None):
         "input": input,
         "context": context,
     }
-    key = semantic_key(payload)
-    for previous_path in intent_paths(env):
-        try:
-            if semantic_key(json.loads(previous_path.read_text())) == key:
-                return previous_path
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-    path = directory(env) / (key + ".json")
-    with tr.locked(path.with_suffix(".lock")):
-        if path.exists():
-            previous = json.loads(path.read_text())
-            if previous.get("status") not in ("complete",):
-                return path
-        tr.atomic(path, {**payload, "created": time.time(), "status": "prepared"})
-    return path
+    # Serialize competing edits of comments; no network request is made under this lock.
+    guard = tr.locked(directory(env).parent / "patches.lock") if comment_patch(payload) else contextlib.nullcontext()
+    with guard:
+        key = semantic_key(payload)
+        for previous_path in intent_paths(env):
+            try:
+                if semantic_key(json.loads(previous_path.read_text())) == key:
+                    return previous_path
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        supersede_comment_patches(payload, env)
+        path = directory(env) / (key + ".json")
+        with tr.locked(path.with_suffix(".lock")):
+            if path.exists():
+                previous = json.loads(path.read_text())
+                if previous.get("status") not in ("complete",):
+                    return path
+            tr.atomic(path, {**payload, "created": time.time(), "status": "prepared"})
+        return path
 
 
 def may_send(path):
     with tr.locked(path.with_suffix(".lock")):
-        return json.loads(path.read_text()).get("status") in ("prepared", "rejected")
+        try:
+            return json.loads(path.read_text()).get("status") in ("prepared", "rejected")
+        except FileNotFoundError:
+            return False  # A newer comment body superseded this unsent edit.
 
 
 def retry_at(path):
     with tr.locked(path.with_suffix(".lock")):
-        return max(time.time() + 1, json.loads(path.read_text()).get("retry_at") or time.time() + 60)
+        try:
+            return max(time.time() + 1, json.loads(path.read_text()).get("retry_at") or time.time() + 60)
+        except FileNotFoundError:
+            return time.time() + 1
 
 
 def sending(path):
     with tr.locked(path.with_suffix(".lock")):
-        value = json.loads(path.read_text())
+        try:
+            value = json.loads(path.read_text())
+        except FileNotFoundError:
+            from .config import GitHubUnavailable
+
+            raise GitHubUnavailable(
+                "Publication superseded by a newer comment body; selecting other work", retry_at=time.time() + 1
+            ) from None
         if value.get("status") not in ("prepared", "rejected"):
             from .config import GitHubUnavailable
 
@@ -329,6 +380,8 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
         before_request
         or auth_rejected
         or logical_quota_rejection
+        or getattr(result, "github_content_throttle", False)
+        and getattr(result, "github_retry_safe", False)
         or (writes and all(r.get("status") in (403, 429) for r in writes))
     )
     if definitive and value["argv"][:2] == ["repo", "fork"] and value.get("fork_retries", 0):

@@ -23,9 +23,9 @@ _cache_hit = contextvars.ContextVar("overlap_cache_hit", default=False)
 
 
 def root() -> Path:
-    return Path(
-        os.environ.get("TAUCETI_GITHUB_SHARED_DIR", Path(__file__).resolve().parent.parent / "state/github-shared")
-    )
+    from .github_transport import root as shared_root
+
+    return shared_root()
 
 
 def scope(env=None) -> str | None:

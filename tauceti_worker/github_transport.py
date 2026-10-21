@@ -30,7 +30,10 @@ _request_context = contextvars.ContextVar("github_request_context", default=None
 
 def root() -> Path:
     return Path(
-        os.environ.get("TAUCETI_GITHUB_SHARED_DIR", Path(__file__).resolve().parent.parent / "state/github-shared")
+        os.environ.get(
+            "TAUCETI_GITHUB_SHARED_DIR",
+            Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "tauceti/github-shared",
+        )
     )
 
 
@@ -125,17 +128,72 @@ def atomic(path: Path, value):
         tmp.unlink(missing_ok=True)
 
 
-def generation() -> str:
+def _generation_file(scope):
+    return root() / "generations" / hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
+
+
+def generation(key=None) -> str:
+    if key and key[0] == "permissions":
+        paths = [_generation_file(["permissions", scope(), key[1]])]
+    else:
+        paths = [root() / "generation"]
+        if key and len(key) > 1 and isinstance(key[1], str) and "/" in key[1]:
+            repo = key[1].lower()
+            paths.append(_generation_file([repo]))
+            paths.append(
+                _generation_file(
+                    [
+                        repo,
+                        str(key[2])
+                        if key[0] != "open_prs" and len(key) > 2 and isinstance(key[2], int)
+                        else "inventory",
+                    ]
+                )
+            )
+    values = []
+    for path in paths:
+        try:
+            values.append(path.read_text())
+        except OSError:
+            values.append("")
+    return json.dumps(values)
+
+
+def invalidate_permissions(repo, env=None):
     try:
-        return (root() / "generation").read_text()
+        atomic(_generation_file(["permissions", scope(env), repo]), uuid.uuid4().hex)
     except OSError:
-        return ""
+        pass
 
 
-def invalidate():
-    """Invalidate every credential's view, including peers with different permissions."""
+def invalidate(args=None):
+    """Invalidate mutable reads affected by a write, without expiring permissions or immutable data."""
     try:
-        atomic(root() / "generation", uuid.uuid4().hex)
+        endpoint = api_endpoint(args or []) or ""
+        match = re.match(r"repos/([^/]+/[^/]+)/(issues|pulls)/(\d+)(/.*)?$", endpoint.split("?")[0])
+        repo = None
+        if match:
+            repo, _, number, suffix = match.groups()
+            scopes = [[repo.lower(), number]]
+            if not suffix:
+                scopes.append([repo.lower(), "inventory"])
+        else:
+            repository = re.match(r"repos/([^/]+/[^/]+)/", endpoint)
+            if repository:
+                repo = repository[1]
+            elif args:
+                repo = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("--repo", "-R")), None)
+            if repo and len(args) > 2 and args[:1] == ["pr"] and args[2].isdigit():
+                scopes = [[repo.lower(), args[2]]]
+                if args[1] in ("close", "reopen", "merge", "ready"):
+                    scopes.append([repo.lower(), "inventory"])
+            else:
+                scopes = [[repo.lower()]] if repo else []
+        if scopes:
+            for value in scopes:
+                atomic(_generation_file(value), uuid.uuid4().hex)
+        else:
+            atomic(root() / "generation", uuid.uuid4().hex)
     except OSError:
         pass
 
@@ -177,7 +235,7 @@ def shared_read(key, fetch, *, ttl: float = 30, identity=None, immutable: bool =
     except OSError:
         return fetch()
     try:
-        epoch = generation()
+        epoch = generation(key)
         try:
             cached = json.loads(path.read_text())
             if (
@@ -191,7 +249,7 @@ def shared_read(key, fetch, *, ttl: float = 30, identity=None, immutable: bool =
         except (OSError, ValueError, KeyError, TypeError):
             pass
         value = fetch()
-        if value is not None and (immutable or generation() == epoch):
+        if value is not None and (immutable or generation(key) == epoch):
             try:
                 atomic(path, {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value})
             except OSError:
@@ -308,13 +366,117 @@ def cooldown(env=None, *, until=None):
     try:
         with locked(path.with_suffix(".lock")):
             try:
-                current = json.loads(path.read_text())["until"]
+                state = json.loads(path.read_text())
+                current = state.get("until", 0)
             except (OSError, ValueError, KeyError, TypeError):
-                current = 0
+                state, current = {}, 0
             if until is not None:
                 current = max(current, until)
-                atomic(path, {"until": current})
+                atomic(path, {**state, "until": current})
             return max(0, current - time.time())
+    except OSError:
+        return 0
+
+
+def content_throttle(text):
+    """Recognize captured review anti-abuse errors, not arbitrary validation failures."""
+    try:
+        payload = json.loads(text[text.index("{") :])
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return any(
+        isinstance(e, dict)
+        and (
+            e.get("resource") == "PullRequestReviewComment"
+            and e.get("message") == "was submitted too quickly"
+            or e.get("resource") in ("PullRequestReview", "PullRequestReviewComment")
+            and e.get("code") == "abuse"
+        )
+        for e in (payload.get("errors") or [])
+    )
+
+
+def secondary_result(env, *, rejected=False, retry_after=0, content_only=False):
+    identity = quota_scope(scope(env))
+    if not identity:
+        return max(60, retry_after) if rejected else 0
+    path = root() / "quota" / identity / "secondary.json"
+    try:
+        with locked(path.with_suffix(".lock")):
+            try:
+                state = json.loads(path.read_text())
+            except (OSError, ValueError):
+                state = {}
+            if rejected:
+                field, counter = ("mutation_until", "mutation_failures") if content_only else ("until", "failures")
+                now = time.time()
+                prior = state.get(counter, 0)
+                failures = min(6, prior + 1) if state.get(field, 0) <= now else max(1, prior)
+                delay = max(retry_after, min(900, 60 * 2 ** (failures - 1)))
+                until = max(state.get(field, 0), now + (delay if state.get(field, 0) <= now else retry_after))
+                atomic(path, {**state, "probe_until": 0, counter: failures, field: until})
+                return max(1, until - now)
+            # An older request cannot clear a peer's still-active rejection.
+            if max(state.get("until", 0), state.get("mutation_until", 0)) <= time.time():
+                atomic(
+                    path,
+                    {**state, "probe_until": 0, "failures": 0, "mutation_failures": 0, "until": 0, "mutation_until": 0},
+                )
+    except OSError:
+        pass
+    return max(60, retry_after) if rejected else 0
+
+
+def content_write(args):
+    if proxy_readonly(args):
+        return False
+    endpoint = api_endpoint(args) or ""
+    method = next((args[i + 1].upper() for i, a in enumerate(args[:-1]) if a in ("-X", "--method")), "POST")
+    if method == "DELETE":
+        return False
+    if endpoint == "graphql":
+        query = next((a[6:] for a in args if a.startswith("query=")), "")
+        return bool(
+            re.search(
+                r"\b(?:addComment|addPullRequestReview|addPullRequestReviewComment|submitPullRequestReview|updateIssueComment|updatePullRequestReviewComment|createIssue|createPullRequest)\s*\(",
+                query,
+            )
+        )
+    if endpoint:
+        return bool(
+            re.search(r"/(?:comments(?:/\d+(?:/replies)?)?|reviews(?:/\d+/events)?)$", endpoint.split("?")[0])
+            or method == "POST"
+            and re.fullmatch(r"repos/[^/]+/[^/]+/(?:issues|pulls)", endpoint)
+        )
+    return len(args) > 1 and args[0] in ("pr", "issue") and args[1] in ("create", "comment", "review")
+
+
+def mutation_slot(env):
+    """Reserve one account-wide send; never hold the file lock during a request or sleep."""
+    identity = quota_scope(scope(env))
+    if not identity:
+        return 0
+    path = root() / "quota" / identity / "secondary.json"
+    try:
+        with locked(path.with_suffix(".lock")):
+            try:
+                state = json.loads(path.read_text())
+            except (OSError, ValueError):
+                state = {}
+            now = time.time()
+            blocked = max(state.get("until", 0), state.get("mutation_until", 0), state.get("probe_until", 0)) - now
+            if blocked > 0:
+                return blocked
+            slot = max(now, state.get("next_send", 0))
+            if slot > now:
+                return slot - now
+            state["next_send"] = now + 2
+            if state.get("failures", 0) or state.get("mutation_failures", 0):
+                state["probe_until"] = now + 30
+            atomic(path, state)
+            return 0
     except OSError:
         return 0
 
@@ -449,8 +611,9 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
     effective["GH_DEBUG"] = "api"
     args = argv[1:]
     readonly = proxy_readonly(args)
+    paced = content_write(args)
     if not readonly:
-        invalidate()
+        invalidate(args)
     if effective.get("TAUCETI_REAL_GH"):
         argv = [effective["TAUCETI_REAL_GH"], *argv[1:]]
     # Only direct GraphQL and quota probes can bypass a known REST block. Opaque gh commands
@@ -513,6 +676,17 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
                 return blocked
             print(f"gh: API rate limit exhausted ({resource}); waiting {int(delay)}s for reset", file=sys.stderr)
             time.sleep(delay)
+        if paced:
+            delay = mutation_slot(effective)
+            if delay:
+                if time.monotonic() - started + delay > ceiling:
+                    blocked = subprocess.CompletedProcess(
+                        argv, 1, "", f"gh: publication pacing; Retry-After: {int(delay) + 1}\n"
+                    )
+                    blocked.github_before_request = True
+                    return blocked
+                time.sleep(delay)
+                continue
         records = []
         try:
             if _intent and not sent_intent:
@@ -555,7 +729,7 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             except (ValueError, AttributeError):
                 event({"kind": "graphql_charge", "points": traced, "measured": isinstance(traced, int)})
         if not readonly:
-            invalidate()
+            invalidate(args)
         # Restore a machine-readable retry hint, never the private trace or response body.
         retry = next((r.get("retry_after") for r in reversed(records) if r.get("retry_after")), None)
         if p.returncode and retry:
@@ -591,8 +765,14 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
                 any(r.get("status") == 429 for r in records)
                 or "secondary rate limit" in p.stderr.lower()
                 or creation_cap
+                or any(r.get("status") == 422 for r in records)
+                and content_throttle(p.stdout)
             )
         )
+        content_only = any(r.get("status") == 422 for r in records) and content_throttle(p.stdout)
+        if retryable and secondary and content_only:
+            rejected = True
+            p.github_retry_safe = True
         if p.returncode and primary:
             # GraphQL errors can arrive with HTTP 200. The CLI still fails the logical read,
             # so record the exhaustion for stage accounting regardless of the HTTP status.
@@ -612,9 +792,24 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             record_block(resource, reset, scope(effective))
             primary = True
         if secondary:
-            delay = int(retry) if retry and retry.isdigit() else 60
-            cooldown(effective, until=time.time() + max(1, delay))
+            delay = secondary_result(
+                effective,
+                rejected=True,
+                retry_after=int(retry) if retry and retry.isdigit() else 0,
+                content_only=content_only,
+            )
             record_block("secondary", time.time() + max(1, delay), scope(effective))
+            p.github_content_throttle = True
+            # Preserve the shared classification for standalone callers and the durable outbox.
+            if "secondary rate limit" not in p.stderr.lower():
+                p.stderr += f"\ngh: secondary rate limit; Retry-After: {delay}\n"
+        elif not readonly:
+            if paced:
+                secondary_result(effective)
+            if any(r.get("status") in (401, 403) for r in records) and not primary:
+                match = re.match(r"repos/([^/]+/[^/]+)/", endpoint or "")
+                if match:
+                    invalidate_permissions(match[1], effective)
         if p.returncode and (primary or secondary):
             if primary:
                 actual = {r.get("resource", resource) for r in records if r.get("remaining") == 0} or {resource}
@@ -625,7 +820,8 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             if secondary:
                 quota_type("secondary:pr-creation-cap" if creation_cap else secondary_type(text), records, effective)
         if wait and p.returncode and secondary and rejected and not primary:
-            delay = int(retry) if retry and retry.isdigit() else 60
+            # The next loop reserves the single mutation recovery probe.
+            delay = max(1, delay)
             if time.monotonic() - started + max(1, delay) > ceiling:
                 return p
             print(f"gh: secondary rate limit; waiting {max(1, delay)}s", file=sys.stderr)
@@ -787,6 +983,7 @@ def _install_proxy(*, bindir=None):
         atomic_script.write_text(content)
         atomic_script.chmod(0o700)
         atomic_script.replace(proxy)
+    os.environ["TAUCETI_GITHUB_SHARED_PACING"] = str(proxy)
     os.environ["PATH"] = str(bindir) + os.pathsep + os.environ.get("PATH", "")
     os.environ["TAUCETI_GITHUB_TRANSPORT_REV"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -882,6 +1079,10 @@ def proxy_readonly(args):
                 elif token == "mutation" and depth == 0:
                     return False
             return depth == 0
+        method = next((args[i + 1].upper() for i, a in enumerate(args[:-1]) if a in ("-X", "--method")), None)
+        method = next((a.split("=", 1)[1].upper() for a in args if a.startswith("--method=")), method)
+        if method is not None:
+            return method in ("GET", "HEAD", "OPTIONS")
         if any(a in ("-f", "-F", "--field", "--raw-field", "--input") for a in args):
             return False
         for i, a in enumerate(args):
@@ -940,13 +1141,13 @@ if __name__ == "__main__":
         # Conservatively invalidate opaque CLI operations as well. Cache correctness wins over
         # retaining a hit after a child command whose write behavior cannot be proved.
         if not readonly:
-            invalidate()
+            invalidate(args)
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from tauceti_worker.config import GitHubUnavailable
         from tauceti_worker.constants import EX_GITHUB_WAIT
 
         try:
-            p = execute(["gh", *args], wait=True)
+            p = execute(["gh", *args], wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
         except GitHubUnavailable as error:
             # The shell caller cannot catch Python exceptions. Preserve the
             # infrastructure wait marker for its owning worker's stage guard.
@@ -956,7 +1157,7 @@ if __name__ == "__main__":
             )
         finally:
             if not readonly:
-                invalidate()
+                invalidate(args)
         if getattr(p, "github_permanent_failure", False):
             p.returncode = 78  # Definitive rejection; the private .failed intent is retained.
         sys.stdout.write(p.stdout or "")

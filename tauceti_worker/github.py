@@ -281,7 +281,7 @@ def can_push(repo: str) -> bool | None:
         out = (r.stdout or "").strip()
         return True if out == "true" else False if out == "false" else None
 
-    return transport.shared_read(["permissions", repo], fetch)
+    return transport.shared_read(["permissions", repo], fetch, ttl=300)
 
 
 def claims_repo() -> str:
@@ -663,12 +663,12 @@ class GitHub:
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         readonly = _gh_read_only(["gh", *args])
         if not readonly:
-            transport.invalidate()
+            transport.invalidate(args)
         try:
             return gh_run(["gh", *args])
         finally:
             if not readonly:
-                transport.invalidate()
+                transport.invalidate(args)
 
     def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
         from .github_state import read
@@ -773,10 +773,14 @@ class GitHub:
         args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit), "--json", ",".join(fields)]
         for label in labels or []:
             args += ["--label", label]
-        p = self._gh(args)
-        if p.returncode != 0:
-            raise GitHubError(f"gh issue list failed: {p.stderr.strip()}")
-        return json.loads(p.stdout or "[]")
+
+        def fetch():
+            p = self._gh(args)
+            if p.returncode != 0:
+                raise GitHubError(f"gh issue list failed: {p.stderr.strip()}")
+            return json.loads(p.stdout or "[]")
+
+        return transport.shared_read(["issue_list", repo, fields, labels, state, limit], fetch, ttl=120)
 
     def pr_view(self, pr: int, fields: list[str]) -> dict | None:
         from .github_state import read
