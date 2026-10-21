@@ -174,8 +174,25 @@ class GlobalMaintenance(unittest.TestCase):
             newest_contest_reply=lambda *a, **k: None,
             bust=Mock(),
         )
-        self.w.claims = SimpleNamespace(begin_branch_work=Mock(return_value=True), release=Mock())
+        self.w.claims = SimpleNamespace(
+            begin_branch_work=Mock(return_value=True), release=Mock(), stop_heartbeat=Mock()
+        )
         return sv, work.Candidate(10, HEAD, final_resolution=True), live
+
+    def test_unlimited_bump_is_not_redirected_to_closure_by_its_attempt_count(self):
+        sv, c, _ = self.spent_fixture()
+        c.final_resolution = False
+        sv.open_prs[0] = SimpleNamespace(number=10, author="bot", automatic_bump=True)
+        with (
+            patch("tauceti_worker.github_outbox.pending_for", return_value=False),
+            patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
+            patch.object(work, "_check_stage_read_quota"),
+            patch.object(work, "_close_spent_pr") as close,
+            patch.object(work, "_effective_authoring_profile", side_effect=RuntimeError("normal model path")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "normal model path"):
+                work.dispatch("fix", self.w, sv, c, self.opts)
+        close.assert_not_called()
 
     def test_exhausted_head_closes_without_another_model_call(self):
         sv, c, live = self.spent_fixture()
