@@ -108,6 +108,21 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertFalse(record.exists())
         self.assertEqual(outside.read_text(), "keep this source")
 
+    def test_large_old_deletion_cannot_delay_retiring_newer_tasks(self):
+        garbage = self.cfg.state / "recovery-cleanup/discarded/large"
+        garbage.mkdir(parents=True)
+        with (garbage / "payload").open("wb") as stream:
+            stream.truncate(64 * 1024**2)
+        other = self.cfg.state.parent / "other"
+        record = other / "recovery/finished"
+        record.mkdir(parents=True)
+        maintenance.atomic_json(record / "recovery.json", dict(state="obsolete"))
+        maintenance.atomic_json(other / "recovery-prepared.json", dict(records=1, recovery_obsolete=1))
+        self.tick(bytes=128 * 1024)
+        self.assertFalse(record.exists())
+        self.assertTrue(garbage.exists())
+        self.assertEqual(wr.summary(self.cfg.state.parent)["recovery_obsolete"], 0)
+
     def restored(self, record, expected):
         dest = self.root / f"restore-{len(list(self.root.glob('restore-*')))}"
         clone = reconstruct(self.origin, record, self.root, dest.name)

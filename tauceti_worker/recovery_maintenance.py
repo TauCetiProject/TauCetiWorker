@@ -683,6 +683,22 @@ class Sweep:
         self.pending = None
         self.current_registration = {}
         self.registered_roots = {}
+        self.retirements = self.retirement_scan()
+
+    def retirement_scan(self):
+        # Independent of bulk deletion: a large old checkout cannot delay
+        # retirement of a newer finished task on another worker.
+        with os.scandir(self.base) as workers:
+            for entry in workers:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                state = Path(entry.path)
+                root = state / "recovery"
+                if root.is_dir():
+                    with os.scandir(root) as records:
+                        for record in records:
+                            if record.is_dir(follow_symlinks=False) and not record.name.startswith("."):
+                                yield state, Path(record.path)
 
     def scan(self):
         if not self.base.is_dir():
@@ -977,6 +993,24 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
             except BlockingIOError:
                 return dict(busy=True)
             sweep = _SWEEPS.setdefault(base, Sweep(base))
+            while time.monotonic() - work.started < min(seconds, 0.05):
+                work.charge(entries=1)
+                try:
+                    state, record = next(sweep.retirements)
+                except StopIteration:
+                    sweep.retirements = sweep.retirement_scan()
+                    break
+                consumer = _metadata(record / "recovery.json")
+                from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE
+
+                code = (consumer.get("reason") or {}).get("code")
+                handed_off = (consumer.get("handoff") or {}).get("state") == "offered" and code in ACTIVE_HANDOFF
+                if (
+                    consumer.get("state") in {"published", "obsolete", "blocked"}
+                    and not handed_off
+                    and code not in RETRYABLE
+                ):
+                    discard_record(state, record)
             while True:
                 work.charge(entries=1)
                 try:
@@ -1026,6 +1060,14 @@ def discard_record(state, record):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
+        from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE
+
+        consumer = _metadata(record / "recovery.json")
+        code = (consumer.get("reason") or {}).get("code")
+        if consumer.get("state") not in {"published", "obsolete", "blocked"} or code in RETRYABLE:
+            return False
+        if (consumer.get("handoff") or {}).get("state") == "offered" and code in ACTIVE_HANDOFF:
+            return False
         # An already-running verifier may still use this tree after the consumer
         # finishes. It can finish; the next activity tick retries disposal.
         if (record / "checkout").is_dir() and wr.live_users(record / "checkout"):
@@ -1053,6 +1095,9 @@ def discard_record(state, record):
         (state / "recovery-cleanup" / "cache-roots" / f"{_name(record)}.json").unlink(missing_ok=True)
         wr._fsync_dir(record.parent)
         wr._fsync_dir(directory)
+        # Prepared status can lag the payload sweep. Invalidate this disposable
+        # row immediately instead of continuing to display finished task history.
+        (state / "recovery-prepared.json").unlink(missing_ok=True)
         return True
 
 
