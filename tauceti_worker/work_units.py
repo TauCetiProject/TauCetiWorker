@@ -60,6 +60,7 @@ from .constants import (
     AUTO_STAGES,
     CLAIM_TTL_S,
     CONTEST_CLAIM_TTL,
+    EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
@@ -79,7 +80,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
-from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
+from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_run, me
 from .intentions import avoid_list
 from .paths import CLAIM_SH, HERE
 from .quota import Quota, _unavail_reason, mirror_creds
@@ -1317,7 +1318,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         from .claude_api import check_result
 
         check_result(rc)
-        if rc == 4:  # Review engine: another run already owns this head; no inference or verdict.
+        if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
         if rc == 0:
@@ -1410,8 +1411,6 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     archive_repo = os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData")
     if not archive_repo:
         return 0
-    from .github import can_push
-
     if can_push(archive_repo) is False:
         log(
             f"  review #{pr}: no write access to TauCetiData — review posted and counts for "

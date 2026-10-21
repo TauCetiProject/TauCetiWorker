@@ -384,7 +384,7 @@ gh: API rate limit exceeded
             assert "not charged" in str(e)
 
     with (
-        patch.object(work_units, "run_to_logfile", return_value=4),
+        patch.object(work_units, "run_to_logfile", return_value=81),
         patch.object(work_units, "me", return_value="test"),
         patch.object(work_units, "_sync_review_outbox") as archive,
     ):
