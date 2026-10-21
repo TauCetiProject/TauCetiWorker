@@ -280,6 +280,29 @@ class StateClient(unittest.TestCase):
         self.assertEqual(self.fail_with(changed_mid_read)["reason"], "mixed_revision")
         self.assertEqual(path.read_text(), before)
 
+    def test_automatic_discovery_uses_bound_last_complete_snapshot_during_timeout(self):
+        from global_maintenance import row
+
+        from tauceti_worker.survey_facts import CONTRACT
+
+        item = {**row(7, "Other"), "contract": CONTRACT}
+        snapshot = {**page([item]), "operation": "survey", "contract": CONTRACT, "author_counts": {"science": 140}}
+        with patch.object(state.urllib.request, "urlopen", return_value=Response(snapshot)):
+            self.assertTrue(state.read_survey("org/repo", stages=["review"], allow_cached=True)[0])
+        with patch.object(state.urllib.request, "urlopen", side_effect=TimeoutError("timed out")):
+            ok, rows = state.read_survey("org/repo", stages=["review"], allow_cached=True)
+            self.assertTrue(ok)
+            self.assertTrue(rows.cached)
+            self.assertEqual(rows.author_counts, {"science": 140})
+            self.assertEqual(rows[0]["pr"]["number"], 7)
+            self.assertFalse(rows[0]["review"]["issue_complete"])
+            self.assertEqual(state.last_failure()["reason"], "timeout")
+            # Other scopes and non-planning consumers cannot borrow that snapshot.
+            self.assertEqual(
+                state.read_survey("org/repo", "Different", stages=["review"], allow_cached=True), (False, None)
+            )
+            self.assertEqual(state.read_survey("org/repo", stages=["review"]), (False, None))
+
     def test_probe_lease_is_renewed_across_a_long_paginated_read(self):
         for _ in range(3):
             self.fail_with(fails(503))
@@ -402,7 +425,7 @@ class RoundBoundary(unittest.TestCase):
 
         return unavailable
 
-    def test_outage_is_a_typed_wait_without_authoring_or_fallback(self):
+    def test_cold_outage_keeps_selecting_maintenance_without_per_pr_history_reads(self):
         failure = {
             "dependency": "github-state",
             "reason": "http_503",
@@ -414,22 +437,25 @@ class RoundBoundary(unittest.TestCase):
         with (
             patch("tauceti_worker.github_state.read_survey", side_effect=self.outage(failure)),
             patch.object(work_units, "roadmap_areas") as areas,
-            patch.object(work_units, "dispatch") as dispatch,
-            self.assertRaises(SharedStateUnavailable) as raised,
+            patch.object(self.w.gh, "open_prs", return_value=[row(10)["pr"]]) as inventory,
+            patch.object(work_units, "dispatch", return_value=0) as dispatch,
         ):
             run_round(self.w, self.opts)
         areas.assert_not_called()
-        dispatch.assert_not_called()
-        self.assertEqual((raised.exception.reason, raised.exception.retry_at), ("http_503", 2000000000))
-        self.assertIn("Exceeded the maximum database size", str(raised.exception))
+        inventory.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0], "rebase")
+        self.assertEqual(state.last_failure()["reason"], "http_503")
 
-    def test_authentication_failure_is_operator_actionable(self):
+    def test_service_authentication_failure_does_not_stop_valid_github_work(self):
         failure = {"dependency": "github-state", "reason": "client_auth_configuration", "actionable": True}
         with (
             patch("tauceti_worker.github_state.read_survey", side_effect=self.outage(failure)),
-            self.assertRaisesRegex(Die, "operator action required"),
+            patch.object(self.w.gh, "open_prs", return_value=[row(10)["pr"]]),
+            patch.object(work_units, "dispatch", return_value=0) as dispatch,
         ):
             run_round(self.w, self.opts)
+        self.assertEqual(dispatch.call_args.args[0], "rebase")
+        self.assertTrue(state.last_failure()["actionable"])
 
     def test_malformed_service_url_is_operator_actionable(self):
         with (

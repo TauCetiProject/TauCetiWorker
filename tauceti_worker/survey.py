@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import Config, roadmap_only, roadmap_skip
+from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
@@ -735,6 +735,7 @@ def survey(
                 sv.roadmap_skip,
                 numbers=numbers,
                 stages=sorted(enabled),
+                allow_cached=cached_only,
             )
             if deep and hasattr(gh, "repo")
             else (False, [])
@@ -742,13 +743,14 @@ def survey(
         if cached_only and not available:
             from .github_state import DEPENDENCY, last_failure
 
-            sv.github_failed = True
-            sv.dependency_wait = last_failure() or {"dependency": DEPENDENCY, "reason": "transport", "detail": ""}
-            sv.errors.append(
-                "global maintenance cache unavailable; waiting for the shared GitHub state service "
-                f"({describe_dependency_wait(sv.dependency_wait)})"
+            failure = last_failure() or {"dependency": DEPENDENCY, "reason": "transport", "detail": ""}
+            log(
+                "Shared-state snapshot unavailable and no matching local snapshot; "
+                "using the ordinary shared GitHub inventory cache without fetching per-PR histories "
+                f"({describe_dependency_wait(failure)})"
             )
-            return sv
+        elif getattr(compact, "cached", False):
+            log("Shared-state refresh unavailable; selecting maintenance from the last complete local snapshot")
         raw = [row["pr"] for row in compact] if available else gh.open_prs()
         if available and seed:
             seed(compact)

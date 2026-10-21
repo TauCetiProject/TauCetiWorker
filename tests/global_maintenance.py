@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker.config import ClaimCollision, NoProgress, SharedStateUnavailable
+from tauceti_worker.config import ClaimCollision, NoProgress
 from tauceti_worker.github_state import SurveyRows
 from tauceti_worker.review_state import ReviewState
 from tauceti_worker.survey import PRInfo
@@ -158,6 +158,15 @@ class GlobalMaintenance(unittest.TestCase):
                 self.run_round([row(10, "Other")])
         self.assertEqual(self.calls, [])
 
+    def test_authoring_limit_does_not_turn_maintenance_collisions_into_long_backoff(self):
+        with (
+            patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"),
+            patch.object(work, "_branch_claimed_elsewhere", return_value=True),
+        ):
+            with self.assertRaisesRegex(ClaimCollision, "maintenance is claimed"):
+                self.run_round([row(10, "Other")])
+        self.assertEqual(self.calls, [])
+
     def test_git_claim_precheck_handles_owner_expiry_and_failures(self):
         leases = [
             ({"owner": "peer", "expires_at": 200}, True),
@@ -274,14 +283,16 @@ class GlobalMaintenance(unittest.TestCase):
             self.assertTrue(work._still_actionable("review", self.w, Survey("test"), c))
             self.assertTrue(work._still_actionable("fix", self.w, Survey("test"), c))
 
-    def test_unavailable_service_never_falls_back_to_global_github_scan(self):
+    def test_cold_service_outage_uses_only_shared_inventory_not_per_pr_histories(self):
         with (
             patch("tauceti_worker.github_state.read_survey", return_value=(False, None)),
-            patch.object(work, "roadmap_areas") as areas,
-            self.assertRaisesRegex(SharedStateUnavailable, "global maintenance cache unavailable"),
+            patch.object(self.w.gh, "open_prs", return_value=[row(10, "Other")["pr"]]) as inventory,
+            patch.object(work, "dispatch", return_value=0) as dispatch,
         ):
             run_round(self.w, self.opts)
-        areas.assert_not_called()
+        inventory.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[:1], ("review",))
+        self.assertEqual(dispatch.call_args.args[3].pr, 10)
 
     def test_explicit_roadmap_is_preserved(self):
         with patch.object(work, "roadmap_only", return_value="Topology"):
