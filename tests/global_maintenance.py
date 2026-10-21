@@ -153,6 +153,7 @@ class GlobalMaintenance(unittest.TestCase):
 
     def test_last_permitted_fix_attempt_requires_resolution(self):
         from tauceti_worker.survey import MAX_FIX_ATTEMPTS
+
         self.counter_values[f"fix-10-{HEAD[:12]}"] = MAX_FIX_ATTEMPTS - 1
         flags = []
         self.run_round([row(10, "Other")], lambda stage, c: flags.append(c.final_resolution) or 0)
