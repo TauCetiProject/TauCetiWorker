@@ -704,7 +704,7 @@ class Verification:
                     self.storage_lease.__enter__()
                 except BlockingIOError:
                     self.storage_lease = None
-                    raise Pressure("candidate storage is being reclaimed; retry verification") from None
+                    raise Pressure("candidate storage is being reclaimed; retry verification", reason="busy") from None
                 reserve(self.state, self.root.name)
                 self.storage_monitor = Monitor(self.state, self.root.name)
                 # A direct invocation claims this as an editable workspace, not a disposable
@@ -832,10 +832,14 @@ class Verification:
                 if error.reason == "limit"
                 else "storage-configuration"
                 if error.reason == "configuration"
+                else "verification-busy"
+                if error.reason == "busy"
                 else "disk-pressure",
                 result_type="incomplete",
-                next_action="adjust verification storage limits/inputs and invoke verify again"
-                if error.reason in {"limit", "configuration"}
+                next_action="correct filesystem-headroom settings and invoke verify again"
+                if error.reason == "configuration"
+                else "retry after the current verification/cleanup owner finishes"
+                if error.reason == "busy"
                 else "reclaim verification storage and retry verify in this workspace",
             )
         except Incomplete as error:

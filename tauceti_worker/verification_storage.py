@@ -27,6 +27,13 @@ from .runtime_status import atomic_json, read_json
 GIB = 1024**3
 FLOOR = 16 * 1024
 _SCANS = {}
+_CLEANUP_SETTINGS = {
+    "STORAGE_BYTES": 128 * GIB,
+    "CANDIDATE_BYTES": 32 * GIB,
+    "COMPLETED_CACHE_SECONDS": 900,
+    "IDLE_CACHE_SECONDS": 21600,
+    "OWNERSHIP_SECONDS": 2,
+}
 
 
 class Pressure(Exception):
@@ -53,8 +60,12 @@ def setting(name, default):
     try:
         value = int(os.environ.get("TAUCETI_VERIFY_" + name, default))
     except ValueError:
+        if name in _CLEANUP_SETTINGS:
+            return default
         raise Configuration(f"TAUCETI_VERIFY_{name} must be a positive integer") from None
     if value <= 0:
+        if name in _CLEANUP_SETTINGS:
+            return default
         raise Configuration(f"TAUCETI_VERIFY_{name} must be a positive integer")
     return value
 
@@ -310,6 +321,8 @@ def _register(state, identifier, target, amount, kind):
             raise
         # The observation ledger is optional for verification. Source/job/receipt leases
         # still own cleanup safety, and ordinary discovery reconstructs missing records.
+    except OSError:
+        pass  # Optional observation state cannot refuse otherwise valid verification.
 
 
 def _reserve(state, identifier, target, amount, kind):
@@ -365,6 +378,14 @@ def settle(state, identifier, size, *, compact=False, running=False):
                 overflow=row.get("kind") != "checkpoint" and size > setting("CANDIDATE_BYTES", 32 * GIB),
             )
             row.pop("reclamation_blocked", None)
+            if not running:
+                row["last_used"] = time.time()
+
+
+def observed(row):
+    # Older live runtimes also write non-legacy rows with speculative reserved=32 GiB.
+    # Only measured payloads count, regardless of which runtime last touched the row.
+    return max(FLOOR, row.get("measured", 0))
 
 
 def release(state, identifier):
@@ -443,17 +464,19 @@ class Monitor:
         self.next_check = time.monotonic() + 1
         if resources:
             free_space(self.tree)
-        if self.scan is None:
-            self.scan, self.bytes = _sizes(self.tree), 0
-        # Bound each observation. On large candidates the size observation spans several ticks.
-        for _ in range(4096):
-            try:
-                self.bytes += next(self.scan)
-            except StopIteration:
-                self.scan = None
-                with contextlib.suppress(OSError, Pressure):
+        try:
+            if self.scan is None:
+                self.scan, self.bytes = _sizes(self.tree), 0
+            # Bound optional observation work independently of successful verification.
+            for _ in range(4096):
+                try:
+                    self.bytes += next(self.scan)
+                except StopIteration:
+                    self.scan = None
                     settle(self.state, self.identifier, self.bytes, running=True)
-                break
+                    break
+        except (OSError, ValueError, Pressure):
+            self.close()
 
     def close(self):
         if self.scan is not None:
@@ -461,22 +484,19 @@ class Monitor:
             self.scan = None
 
     def finish(self):
-        """Account completed output; a cleanup target cannot invalidate a passed verification."""
-        self.close()
-        size = 0
-        with contextlib.closing(_sizes(self.tree)) as inventory:
-            for amount in inventory:
-                size += amount
-        with contextlib.suppress(OSError, Pressure):
-            settle(self.tree.parent.parent, self.tree.name, size)
-        self.final_size = size
+        """Leave complete size accounting to bounded housekeeping, off the success path."""
+        self.settle_idle()
 
     def settle_idle(self):
+        if getattr(self, "idled", False):
+            return
+        self.idled = True
         self.close()
-        size = getattr(self, "final_size", None)
-        if size is None:
-            size = sum(_sizes(self.tree))
-        settle(self.state, self.identifier, size)
+        with contextlib.suppress(OSError, ValueError, Pressure):
+            with ledger() as data:
+                row = data["candidates"].get(key(self.state, self.identifier))
+                if row is not None:
+                    row.update(legacy=True, settled=False, growing=False, compact=False, last_used=time.time())
 
 
 def _builds(tree, work, *, dependencies=True):
@@ -538,7 +558,7 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
             with ledger() as data:
                 data["candidates"].pop(key(state, identifier), None)
             return "absent"
-        if not job or row.get("legacy"):
+        if not job or row.get("legacy") or not row.get("settled"):
             return _measure(state, row, tree, work, compact=not bool(job))
         if _observe_users(tree, work):
             return "active"
@@ -710,7 +730,13 @@ def _measure(state, row, target, work, *, compact=False):
             current = data["candidates"].get(key(state, row["id"]))
             if current is not None:
                 current.update(
-                    reserved=max(FLOOR, size), measured=size, compact=compact, legacy=False, settled=True, growing=False
+                    reserved=max(FLOOR, size),
+                    measured=size,
+                    compact=compact,
+                    legacy=False,
+                    settled=True,
+                    growing=False,
+                    overflow=row.get("kind") != "checkpoint" and size > setting("CANDIDATE_BYTES", 32 * GIB),
                 )
         return "source-retained"
     finally:
@@ -741,21 +767,26 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
         with ledger(write=False) as data:
             rows = list(data["candidates"].items())
         pending_order = []
+        metadata = {}
         other_reclaimable = False
         for identity, row in rows:
             if row.get("kind") == "checkpoint":
                 continue
             pending = read_json(Path(row["state"]) / "verification-pending" / f"{row['id']}.json")
-            if pending.get("status") == "pending" and isinstance(pending.get("priority"), int):
+            if pending.get("status") in {"pending", "blocked-storage-limit"} and isinstance(
+                pending.get("priority"), int
+            ):
                 pending_order.append((pending["priority"], identity))
+            terminal_path = Path(row["state"]) / "verification-jobs" / f"{row['id']}.json"
+            terminal = terminal_path.is_file()
+            last_used = max(row["last_used"], terminal_path.stat().st_mtime) if terminal else row["last_used"]
+            metadata[identity] = terminal, last_used
             if not row.get("compact") and not row.get("reclamation_blocked"):
                 other_reclaimable = True
         protected = min(pending_order)[1] if pending_order else None
         allowed = {str(canonical_state(state)) for state in states}
         rows = [(identity, row) for identity, row in rows if row["state"] in allowed or not Path(row["state"]).exists()]
         try:
-            with ledger(write=False) as data:
-                all_entries = data["candidates"]
             devices = {}
             for _, row in rows:
                 state = Path(row["state"])
@@ -763,16 +794,31 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                     devices[state.stat().st_dev] = state
             for target in devices.values():
                 free_space(target)
-            pressure = sum(
-                row.get("measured", 0) if row.get("legacy") else row["reserved"] for row in all_entries.values()
-            ) > setting("STORAGE_BYTES", 128 * GIB)
+            disk_pressure = False
         except Pressure:
-            pressure = True
-        # Cursor rotation prevents an active or very large oldest candidate starving others.
+            disk_pressure = True
+        # Active work, checkpoints, compacted source-only trees and recent pending progress
+        # cannot relieve a soft target. Do not flush warm caches to compensate for them.
+        reclaimable = sum(
+            observed(row)
+            for identity, row in data["candidates"].items()
+            if identity in metadata
+            and not row.get("compact")
+            and not row.get("growing")
+            and (metadata[identity][0] or now - metadata[identity][1] >= setting("IDLE_CACHE_SECONDS", 21600))
+        )
+        excess = max(0, reclaimable - setting("STORAGE_BYTES", 128 * GIB))
+        # Start each sweep terminal/oldest first, then rotate past blocked owners fairly.
         last = read_json(cursor_path).get("last", "")
         if not isinstance(last, str):
             last = ""
-        rows.sort(key=lambda item: (item[0] <= last, item[0]))
+        rows.sort(
+            key=lambda item: (not metadata.get(item[0], (False, 0))[0], metadata.get(item[0], (False, 0))[1], item[0])
+        )
+        positions = [i for i, item in enumerate(rows) if item[0] == last]
+        if positions:
+            position = positions[0] + 1
+            rows = rows[position:] + rows[:position]
         for identity, row in rows:
             work.charge(entries=1)
             if work.removal_remaining <= 0 or getattr(work, "ownership_probed", False):
@@ -796,7 +842,7 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
             # idle dependency caches from other jobs while keeping the oldest runnable job
             # warm. This avoids both a protected-cache deadlock and self-eviction/rebuild loops.
             drop_dependencies = (
-                pressure
+                disk_pressure
                 and not other_reclaimable
                 and identity != protected
                 and row.get("compact")
@@ -805,14 +851,16 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
             )
             if row.get("compact") and not drop_dependencies:
                 continue
-            terminal_path = state / "verification-jobs" / f"{identifier}.json"
-            terminal = terminal_path.exists()
+            terminal, last_used = metadata[identity]
             ttl = setting("COMPLETED_CACHE_SECONDS", 900) if terminal else setting("IDLE_CACHE_SECONDS", 21600)
-            last_used = max(row["last_used"], terminal_path.stat().st_mtime) if terminal else row["last_used"]
+            early_terminal_cleanup = terminal and (
+                excess > work.removed_bytes or observed(row) > setting("CANDIDATE_BYTES", 32 * GIB)
+            )
             if (
-                not pressure
+                not disk_pressure
                 and not row.get("legacy")
-                and not row.get("overflow")
+                and row.get("settled")
+                and not early_terminal_cleanup
                 and (row.get("compact") or now - last_used < ttl)
             ):
                 continue
@@ -857,18 +905,22 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
     report["work"]["wall_seconds"] = time.monotonic() - wall_started
     with contextlib.suppress(OSError, Pressure):
         with ledger(write=False) as data:
-            report["reserved_bytes"] = sum(row["reserved"] for row in data["candidates"].values())
+            report["reserved_bytes"] = sum(observed(row) for row in data["candidates"].values())
             report["candidate_count"] = len(data["candidates"])
             report["compacted_count"] = sum(bool(row.get("compact")) for row in data["candidates"].values())
             report["measured_bytes"] = sum(row.get("measured", 0) for row in data["candidates"].values())
-            report["observed_bytes"] = sum(
-                row.get("measured", 0) if row.get("legacy") else row["reserved"] for row in data["candidates"].values()
-            )
+            report["observed_bytes"] = report["reserved_bytes"]
             report["unmeasured_count"] = sum(bool(row.get("legacy")) for row in data["candidates"].values())
         report["limit_bytes"] = setting("STORAGE_BYTES", 128 * GIB)
         report["free_bytes"] = shutil.disk_usage(root()).free
         report["target_bytes"] = report["limit_bytes"]  # Preserve older status readers.
         report["admission_limited"] = False
+        report["configuration_warnings"] = [
+            "TAUCETI_VERIFY_" + name + " is invalid; using cleanup default " + str(default)
+            for name, default in _CLEANUP_SETTINGS.items()
+            if "TAUCETI_VERIFY_" + name in os.environ
+            and (not os.environ["TAUCETI_VERIFY_" + name].isdigit() or int(os.environ["TAUCETI_VERIFY_" + name]) <= 0)
+        ]
         if report["observed_bytes"] > report["target_bytes"]:
             report["attention"] = "verification-storage-cleanup-target-exceeded"
             report["next_action"] = (

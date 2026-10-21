@@ -286,26 +286,26 @@ def finish_job(verification):
     path = verification.state / "verification-pending" / f"{job['id']}.json"
     waiting_tools = verification.receipt.get("incomplete_reason") in {"tool-missing", "toolchain"}
     storage_wait = verification.receipt.get("incomplete_reason") == "disk-pressure"
-    storage_limit = verification.receipt.get("incomplete_reason") == "storage-limit"
     resumable = (
-        verification.receipt.get("incomplete_reason") in {"deadline", "signal", "disk-pressure", "storage-limit"}
+        verification.receipt.get("incomplete_reason")
+        in {"deadline", "signal", "disk-pressure", "storage-limit", "verification-busy"}
         or waiting_tools
     )
-    if resumable and not job.get("isolated") and not storage_wait and not storage_limit:
+    if resumable and not job.get("isolated") and not storage_wait:
         try:
             preserve_candidate(verification)
         except (Incomplete, OSError, ValueError, Pressure) as error:
             # Preservation errors retain source/checkpoint artifacts and never become tool failures.
             if isinstance(error, Pressure):
-                storage_limit = error.reason == "limit"
-                storage_wait = not storage_limit
+                storage_wait = True
                 verification.receipt.update(
-                    error=str(error), incomplete_reason="storage-limit" if storage_limit else "disk-pressure"
+                    error=str(error),
+                    incomplete_reason="verification-busy" if error.reason == "busy" else "disk-pressure",
                 )
             else:
                 verification.receipt.update(error=str(error), incomplete_reason="preservation")
                 resumable = False
-    if (storage_wait or storage_limit) and not job.get("isolated"):
+    if storage_wait and not job.get("isolated"):
         # A live or container-only checkout is not an independent continuation workspace.
         # Permit a fresh exact-source invocation after reclamation rather than deduplicating
         # it against a pending job the supervisor cannot safely execute.
@@ -321,26 +321,22 @@ def finish_job(verification):
                 next_action=(
                     "reclaim verification storage and retry verify in this workspace"
                     if storage_wait
-                    else "adjust verification storage limits or inputs, then invoke verify again"
-                    if storage_limit
                     else "repair verification inputs and invoke verify again"
                 ),
             )
     else:
         job.update(
-            status="blocked-storage-limit" if storage_limit else "blocked-tools" if waiting_tools else "pending",
-            next_at=time.time() + (60 if waiting_tools or storage_wait or storage_limit else 5),
+            status="blocked-tools" if waiting_tools else "pending",
+            next_at=time.time() + (60 if waiting_tools or storage_wait else 5),
         )
-        if waiting_tools or storage_limit:
+        if waiting_tools:
             job["tool_readiness"] = tool_readiness(job)
         atomic(path, job)
         verification.receipt.update(
             result_type="pending",
             continuation_job=str(path),
             next_action=(
-                "supervisor: resume after verification storage limits or verifier inputs change"
-                if storage_limit
-                else "supervisor: reclaim idle build caches, then resume verification without a model"
+                "supervisor: reclaim idle build caches, then resume verification without a model"
                 if storage_wait
                 else "supervisor: resume when local toolchain availability changes"
                 if waiting_tools
@@ -400,7 +396,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
 
     if getattr(cfg, "state", None) is None:
         return False
-    from .verification_storage import Limit, Pressure, housekeep, reserve, validate_settings
+    from .verification_storage import Pressure, housekeep, reserve, validate_settings
 
     housekeep((cfg.state, cfg.state / "verification-state"))
     try:
@@ -597,20 +593,6 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                 path.unlink(missing_ok=True)
                             else:
                                 atomic(path, current)
-                    except Limit as error:
-                        job.update(
-                            error=str(error),
-                            status="blocked-storage-limit",
-                            next_at=time.time() + 60,
-                            tool_readiness=tool_readiness(job),
-                        )
-                        if job.get("isolated"):
-                            atomic(path, job)
-                        else:
-                            job["status"] = "incomplete"
-                            atomic(state / "verification-jobs" / path.name, job)
-                            path.unlink(missing_ok=True)
-                        return False
                     except Pressure as error:
                         job.update(error=str(error), status="pending", next_at=time.time() + 60)
                         atomic(path, job)

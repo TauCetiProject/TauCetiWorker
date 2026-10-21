@@ -176,8 +176,8 @@ Default settings (positive integers except the percentage, which permits zero):
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `TAUCETI_VERIFY_STORAGE_BYTES` | 128 GiB | Host/user retained-data target that triggers early idle-cache reclamation |
-| `TAUCETI_VERIFY_CANDIDATE_BYTES` | 32 GiB | Candidate-size target that triggers early reclamation once idle |
+| `TAUCETI_VERIFY_STORAGE_BYTES` | 128 GiB | Host/user target for eligible idle candidate data; triggers completed-cache reclamation |
+| `TAUCETI_VERIFY_CANDIDATE_BYTES` | 32 GiB | Candidate-size target that triggers early completed-cache reclamation |
 | `TAUCETI_VERIFY_OWNERSHIP_SECONDS` | 2 | Separate bound for one process-reference observation per cleanup slice |
 | `TAUCETI_VERIFY_MIN_FREE_BYTES` | 20 GiB | Actual minimum filesystem headroom |
 | `TAUCETI_VERIFY_MIN_FREE_PERCENT` | 10 | Actual percentage headroom; the larger absolute/percentage value applies |
@@ -200,7 +200,11 @@ status includes `target_bytes` and `admission_limited: false`. Newly discovered 
 replace this with measured sizes before their caches are considered for expiry. Historical
 speculative growth estimates are excluded from cleanup pressure, so imaginary reservations cannot
 force needless cache eviction or block verification. A corrupt disposable ledger
-is quarantined and reconstructed locally without deleting source or evidence.
+is quarantined and reconstructed locally without deleting source or evidence. Optional observation
+errors cannot invalidate verification or prevent receipt publication. Successful and interrupted
+invocations mark their actual idle time without a full tree walk on exit; bounded housekeeping
+owns complete size accounting. Invalid cleanup targets/TTLs use defaults and prepared warnings;
+invalid physical-headroom settings still require correction.
 
 The ordinary supervisor, activity preparer and explicit `tauceti cleanup` invoke bounded reclamation.
 At most one collector runs per host, with a ten-second minimum interval; actual cadence depends on
@@ -215,10 +219,15 @@ mounts. Job/receipt/workspace flocks and live process references protect active 
 or mount observations withhold that tree.
 
 Completed candidates can shed their own and dependency build outputs after 15 minutes. Idle pending
-candidates normally shed only their own build outputs after 6 hours, retaining warm dependency builds.
-Exceeding a size target or actual low free space permits earlier cleanup. As a last resort, other idle
-jobs can shed dependency builds while the oldest runnable candidate stays warm, avoiding repeated
-self-eviction/rebuild loops. Before removing a build directory the collector checks for tracked and
+candidates normally shed only their own build outputs after 6 hours, measured from when an attempt
+stops. Logical targets cannot evict recent pending progress seconds before mechanical continuation.
+Completed caches can expire earlier above a size target. Each cleanup sweep starts with completed,
+oldest-idle candidates, rotates past blocked owners, and stops size-triggered eviction once enough
+has been reclaimed. Active candidates, checkpoints, recent pending progress and already compacted
+source-only trees do not consume the reclaimable-data target or force other caches to be flushed.
+Only actual low disk space overrides pending idle protection. As a last resort under that physical
+pressure, other idle jobs can shed dependency builds while the oldest runnable candidate's
+dependencies stay warm, avoiding repeated self-eviction/rebuild loops. Before removing a build directory the collector checks for tracked and
 untracked non-ignored files. Source under `build/`, staged state, dependency edits, Git history,
 checkpoints, receipts and publication/accounting journals remain protected. No unpublished source
 expires merely because it is old. If only active work or protected source remains above a target,
@@ -238,7 +247,8 @@ process group and return `incomplete_reason: disk-pressure`. An independent cand
 for mechanical continuation once space returns, without a model or an attempt charge for admission
 refusal. If preservation itself encounters low disk space, the original workspace remains intact;
 without an independent candidate the CLI reports incomplete with accurate workspace retry guidance.
-Source checkpoint writes also check actual headroom. Samples cannot prevent a fast writer exhausting
+Ownership/cleanup lease contention is separately typed `verification-busy`, never reported as
+logical capacity or actual disk pressure. Source checkpoint writes also check actual headroom. Samples cannot prevent a fast writer exhausting
 space between observations; the targets are not filesystem quotas. This change does not raise
 capacity, restart active rounds or change V0 helper dispatch.
 
