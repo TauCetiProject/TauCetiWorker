@@ -296,8 +296,15 @@ def reserve(state, identifier, *, source_only=False):
     """
     validate_settings()
     target = candidate(state, identifier)
+    if _has_removal(state, identifier):
+        raise Pressure("candidate cache removal is incomplete; supervisor must finish its owned cleanup", reason="busy")
     _register(state, identifier, target, 0, "candidate")
     return setting("CANDIDATE_BYTES", 32 * GIB)
+
+
+def _has_removal(state, identifier):
+    progress = read_json(state / "verification-storage" / f"{identifier}.json")
+    return any(isinstance(value, dict) and "stack" in value for value in progress.values())
 
 
 def reserve_checkpoint(state, identifier, *, amount=None):
@@ -533,7 +540,7 @@ def _observe_users(tree, work):
         wr._WORK.reset(token)
 
 
-def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
+def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evict=False):
     from . import recovery_maintenance as maintenance
     from . import work_recovery as wr
     from .retention import locked, mount_points
@@ -558,7 +565,7 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
             with ledger() as data:
                 data["candidates"].pop(key(state, identifier), None)
             return "absent"
-        if not job or row.get("legacy") or not row.get("settled"):
+        if not job or not evict and (row.get("legacy") or not row.get("settled")):
             return _measure(state, row, tree, work, compact=not bool(job))
         if _observe_users(tree, work):
             return "active"
@@ -598,8 +605,17 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False):
             with ledger() as data:
                 data["candidates"][key(state, identifier)].pop("reclamation_blocked", None)
         progress = read_json(journal)
-        for repo, name in _builds(tree, work, dependencies=bool(terminal) or drop_dependencies):
+        unfinished = {name for name, value in progress.items() if isinstance(value, dict) and "stack" in value}
+        resume_dependencies = any(name.startswith(".lake/packages/") for name in unfinished)
+        for repo, name in _builds(tree, work, dependencies=bool(terminal) or drop_dependencies or resume_dependencies):
             cache = repo / name
+            if (
+                repo != tree
+                and not terminal
+                and not drop_dependencies
+                and str(cache.relative_to(tree)) not in unfinished
+            ):
+                continue
             if cache.is_symlink() or not cache.is_dir():
                 continue
             # Never remove a tracked build directory, nor a symlinked intermediate .lake.
@@ -715,6 +731,9 @@ def _measure_checkpoint(state, row, work):
 
 def _measure(state, row, target, work, *, compact=False):
     identity = (root().resolve(), state, row["id"], row["last_used"])
+    for old in list(_SCANS):
+        if old[:3] == identity[:3] and old != identity:
+            _SCANS.pop(old)[0].close()
     scan, size = _SCANS.get(identity, (None, 0))
     if scan is None:
         if len(_SCANS) >= 4:
@@ -746,6 +765,14 @@ def _measure(state, row, target, work, *, compact=False):
             _SCANS.pop(identity, None)
 
 
+def _prune_scans(entries):
+    directory = root().resolve()
+    generations = {(Path(row["state"]), row["id"]): row["last_used"] for row in entries.values()}
+    for identity in list(_SCANS):
+        if identity[0] != directory or generations.get(identity[1:3]) != identity[3]:
+            _SCANS.pop(identity)[0].close()
+
+
 def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 1024**2, now=None):
     """Ordinary supervisor/activity ticks own cleanup. No timer, model or GitHub reads."""
     from . import work_recovery as wr
@@ -755,6 +782,7 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
     work = wr.Work(seconds=seconds, entries=entries, removal_bytes=removal_bytes)
     report = dict(at=now, candidates={}, errors=[])
     cursor_path, last_processed = root() / "cursor.json", None
+    excess, rows = 0, []
     token = wr._WORK.set(work)
     try:
         for state in states:
@@ -766,13 +794,15 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                 report["errors"].append(str(error)[:300])
         with ledger(write=False) as data:
             rows = list(data["candidates"].items())
+        _prune_scans(data["candidates"])
         pending_order = []
         metadata = {}
         other_reclaimable = False
         for identity, row in rows:
             if row.get("kind") == "checkpoint":
                 continue
-            pending = read_json(Path(row["state"]) / "verification-pending" / f"{row['id']}.json")
+            pending_path = Path(row["state"]) / "verification-pending" / f"{row['id']}.json"
+            pending = read_json(pending_path)
             if pending.get("status") in {"pending", "blocked-storage-limit"} and isinstance(
                 pending.get("priority"), int
             ):
@@ -780,6 +810,8 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
             terminal_path = Path(row["state"]) / "verification-jobs" / f"{row['id']}.json"
             terminal = terminal_path.is_file()
             last_used = max(row["last_used"], terminal_path.stat().st_mtime) if terminal else row["last_used"]
+            if pending and not terminal:
+                last_used = max(last_used, pending_path.stat().st_mtime)
             metadata[identity] = terminal, last_used
             if not row.get("compact") and not row.get("reclamation_blocked"):
                 other_reclaimable = True
@@ -805,11 +837,13 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
             if identity in metadata
             and not row.get("compact")
             and not row.get("growing")
+            and not row.get("reclamation_blocked")
             and (metadata[identity][0] or now - metadata[identity][1] >= setting("IDLE_CACHE_SECONDS", 21600))
         )
         excess = max(0, reclaimable - setting("STORAGE_BYTES", 128 * GIB))
         # Start each sweep terminal/oldest first, then rotate past blocked owners fairly.
-        last = read_json(cursor_path).get("last", "")
+        cursor = read_json(cursor_path)
+        last = cursor.get("last", "")
         if not isinstance(last, str):
             last = ""
         rows.sort(
@@ -819,6 +853,15 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
         if positions:
             position = positions[0] + 1
             rows = rows[position:] + rows[:position]
+        continuing = {identity for identity, row in rows if _has_removal(Path(row["state"]), row["id"])}
+        rows.sort(
+            key=lambda item: (
+                item[0] not in continuing or bool(item[1].get("reclamation_blocked")),
+                metadata.get(item[0], (False, 0))[1]
+                if item[0] in continuing and not item[1].get("reclamation_blocked")
+                else 0,
+            )
+        )
         for identity, row in rows:
             work.charge(entries=1)
             if work.removal_remaining <= 0 or getattr(work, "ownership_probed", False):
@@ -849,23 +892,25 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                 and not row.get("dependency_cache_evicted")
                 and (state / "verification-pending" / f"{identifier}.json").exists()
             )
-            if row.get("compact") and not drop_dependencies:
+            if row.get("compact") and not drop_dependencies and identity not in continuing:
                 continue
             terminal, last_used = metadata[identity]
             ttl = setting("COMPLETED_CACHE_SECONDS", 900) if terminal else setting("IDLE_CACHE_SECONDS", 21600)
             early_terminal_cleanup = terminal and (
                 excess > work.removed_bytes or observed(row) > setting("CANDIDATE_BYTES", 32 * GIB)
             )
+            evict = disk_pressure or early_terminal_cleanup or now - last_used >= ttl or identity in continuing
             if (
-                not disk_pressure
+                not evict
                 and not row.get("legacy")
                 and row.get("settled")
-                and not early_terminal_cleanup
                 and (row.get("compact") or now - last_used < ttl)
             ):
                 continue
             try:
-                result = _compact(state, identifier, work, now=now, row=row, drop_dependencies=drop_dependencies)
+                result = _compact(
+                    state, identifier, work, now=now, row=row, drop_dependencies=drop_dependencies, evict=evict
+                )
                 report["candidates"][identity] = result
                 if result in {"active", "mounted", "unknown-owner", "invalid-owner"}:
                     with ledger() as data:
@@ -874,6 +919,10 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                             current["reclamation_blocked"] = result
             except BlockingIOError:
                 report["candidates"][identity] = "active"
+                with contextlib.suppress(OSError, Pressure):
+                    with ledger() as current_data:
+                        if current := current_data["candidates"].get(identity):
+                            current["reclamation_blocked"] = "active"
             except (OSError, ValueError, wr.RecordError) as error:
                 if isinstance(error, wr.BudgetExhausted):
                     raise
@@ -921,7 +970,8 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
             if "TAUCETI_VERIFY_" + name in os.environ
             and (not os.environ["TAUCETI_VERIFY_" + name].isdigit() or int(os.environ["TAUCETI_VERIFY_" + name]) <= 0)
         ]
-        if report["observed_bytes"] > report["target_bytes"]:
+        report["cleanup_excess_bytes"] = max(0, excess - work.removed_bytes)
+        if report["cleanup_excess_bytes"]:
             report["attention"] = "verification-storage-cleanup-target-exceeded"
             report["next_action"] = (
                 "reclaim idle build caches; retain active work and unpublished source; verification admission continues"

@@ -211,7 +211,11 @@ At most one collector runs per host, with a ten-second minimum interval; actual 
 ordinary activity/round boundaries. The default deletion slice is 0.25 seconds, 2048 metadata entries
 and 256 MiB of removal. One process-reference observation has its separate two-second bound, so
 it cannot repeatedly consume the deletion allowance. Prepared metrics report that overhead and total
-wall time separately. Recursive removal has a durable cursor. Inventories resume within a long-lived
+wall time separately. Recursive removal has a durable journal; partial removal stays with the oldest progressing cache
+until complete, while blocked owners are skipped fairly. Its continuation is recovered even if a
+collector dies before saving the scheduling cursor. Stale inventory generations release their
+bounded scan slots when a candidate restarts or disappears. Eligible terminal or urgent outputs
+can be reclaimed before a complete source-tree size measurement. Inventories resume within a long-lived
 collector and restart safely after process death. They retain no directory descriptors between ticks
 that could masquerade as live workspace users. Cursor rotation prevents a live or large candidate
 starving others. Collection skips compacted rows, never follows symlinks and never crosses observed
@@ -248,7 +252,10 @@ for mechanical continuation once space returns, without a model or an attempt ch
 refusal. If preservation itself encounters low disk space, the original workspace remains intact;
 without an independent candidate the CLI reports incomplete with accurate workspace retry guidance.
 Ownership/cleanup lease contention is separately typed `verification-busy`, never reported as
-logical capacity or actual disk pressure. Source checkpoint writes also check actual headroom. Samples cannot prevent a fast writer exhausting
+logical capacity or actual disk pressure. A workspace with partially removed outputs stays owned
+by mechanical cleanup until that journal is complete; ordinary supervisor ticks finish it without
+a model or an admission-attempt charge. Other candidates remain eligible. Pending checkpoint
+mtime supplements the idle clock after abnormal exit or unavailable optional accounting. Source checkpoint writes also check actual headroom. Samples cannot prevent a fast writer exhausting
 space between observations; the targets are not filesystem quotas. This change does not raise
 capacity, restart active rounds or change V0 helper dispatch.
 

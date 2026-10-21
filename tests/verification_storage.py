@@ -408,13 +408,13 @@ class Storage(Receipts):
         write(small, ".lake/build/small", "x")
         lease = self.state / "verification-jobs" / f"{jobs[0][1]['id']}.lock"
         with locked(lease):
-            for _ in range(8):
+            for _ in range(30):
                 self.collect(removal_bytes=50)
-                if not (small / ".lake/build").exists() and (large / ".lake/build/large").stat().st_size < 1000:
+                if not (small / ".lake/build").exists():
                     break
             self.assertFalse((small / ".lake/build").exists())
             self.assertTrue((first / ".lake/build/keep").exists())
-            self.assertLess((large / ".lake/build/large").stat().st_size, 1000)
+            self.assertFalse((large / ".lake/build/large").exists())
 
     def test_fast_writer_can_succeed_above_cleanup_target(self):
         _, job, tree = self.pending()
@@ -587,6 +587,7 @@ class Storage(Receipts):
         cache = write(tree, ".lake/build/cache", "generated")
         with storage.ledger() as data:
             data["candidates"][storage.key(self.state, job["id"])]["last_used"] = 0
+        os.utime(self.state / "verification-pending" / f"{job['id']}.json", (0, 0))
         v.atomic(storage.root() / "housekeeping.json", dict(next_at=10**20))
         storage.housekeep((self.state,), seconds=10, entries=100000)
         self.assertFalse(cache.exists())
@@ -682,6 +683,131 @@ class Storage(Receipts):
         self.assertEqual(row["last_used"], stopped)
         self.assertFalse(row["growing"])
         self.assertTrue(row["legacy"], "bounded housekeeping owns complete size accounting")
+
+    def test_restarted_bounded_inventories_release_stale_scan_slots_and_finish(self):
+        from tauceti_worker import work_recovery as wr
+
+        identifier = "e" * 32
+        tree = self.state / "verification-candidates" / identifier
+        for index in range(100):
+            write(tree, f"source-{index}.lean", "unpublished")
+        for _ in range(8):
+            storage.reserve(self.state, identifier)
+            row = v.read_json(storage.root() / "candidates.json")["candidates"][storage.key(self.state, identifier)]
+            with self.assertRaises(wr.BudgetExhausted):
+                storage._measure(self.state, row, tree, wr.Work(seconds=10, entries=3), compact=True)
+            current = [key for key in storage._SCANS if key[0] == storage.root().resolve() and key[2] == identifier]
+            self.assertEqual(len(current), 1)
+            self.assertEqual(current[0][3], row["last_used"])
+        self.collect()
+        row = v.read_json(storage.root() / "candidates.json")["candidates"][storage.key(self.state, identifier)]
+        self.assertTrue(row["compact"])
+        self.assertEqual(row["measured"], 100 * len("unpublished"))
+        self.assertTrue((tree / "source-0.lean").exists())
+
+    def test_urgent_completed_cache_is_reclaimed_before_a_large_source_measurement(self):
+        from tauceti_worker import work_recovery as wr
+
+        pending, job, tree = self.pending()
+        cache = write(tree, ".lake/build/reclaim", "finished output")
+        for index in range(100):
+            write(tree, f"retained-{index}.lean", "protected source")
+        v.atomic(self.state / "verification-jobs" / pending.name, {**job, "status": "success"})
+        pending.unlink()
+        storage.Monitor(self.state, job["id"]).settle_idle()
+        row = v.read_json(storage.root() / "candidates.json")["candidates"][storage.key(self.state, job["id"])]
+        work = wr.Work(seconds=10, entries=40)
+        with patch("tauceti_worker.work_recovery.live_users", return_value=[]):
+            with contextlib.suppress(wr.BudgetExhausted):
+                storage._compact(self.state, job["id"], work, now=time.time(), row=row, evict=True)
+        self.assertFalse(cache.exists(), "eligible output must be reclaimed before inventorying 100 source files")
+        self.assertTrue((tree / "retained-0.lean").exists())
+
+    def test_multislice_cleanup_finishes_oldest_cache_before_touching_newer_cache(self):
+        jobs = []
+        now = time.time()
+        for index in range(2):
+            write(self.root, "TauCeti/A.lean", f"candidate {index}")
+            write(self.root, ".lake/build/payload", "x" * 1000)
+            pending, job, tree = self.pending()
+            terminal = self.state / "verification-jobs" / pending.name
+            v.atomic(terminal, {**job, "status": "success"})
+            pending.unlink()
+            idle = now - (300 if index == 0 else 100)
+            os.utime(terminal, (idle, idle))
+            with storage.ledger() as data:
+                data["candidates"][storage.key(self.state, job["id"])]["last_used"] = idle
+            jobs.append((job, tree))
+        with storage.ledger(write=False) as data:
+            total = sum(storage.observed(row) for row in data["candidates"].values())
+        os.environ["TAUCETI_VERIFY_STORAGE_BYTES"] = str(total - 200)
+        for _ in range(30):
+            storage.housekeep((self.state,), seconds=10, entries=100000, removal_bytes=50, now=now)
+            self.assertEqual((jobs[1][1] / ".lake/build/payload").stat().st_size, 1000)
+            if not (jobs[0][1] / ".lake/build/payload").exists():
+                break
+        self.assertFalse((jobs[0][1] / ".lake/build/payload").exists())
+        self.assertTrue((jobs[1][1] / ".lake/build/payload").exists())
+
+    def test_owned_partial_cleanup_defers_only_that_candidate_and_then_resumes(self):
+        pending, job, tree = self.pending()
+        write(tree, ".lake/build/payload", "x" * 1000)
+        self.collect(removal_bytes=50)
+        self.assertTrue((tree / ".lake/build/payload").exists())
+        (storage.root() / "cursor.json").unlink()  # collector died before saving its scheduling hint
+        job["next_at"] = 0
+        v.atomic(pending, job)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        current = v.read_json(pending)
+        self.assertEqual(current["attempts"], 0)
+        self.assertIn("cleanup", current["error"])
+        for _ in range(30):
+            storage.housekeep((self.state,), seconds=10, entries=100000, removal_bytes=50, now=time.time())
+            if not (tree / ".lake/build").exists():
+                break
+        current["next_at"] = 0
+        v.atomic(pending, current)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
+        self.assertEqual(v.read_json(self.state / "verification-jobs" / pending.name)["status"], "success")
+
+    def test_partial_dependency_cleanup_finishes_after_pressure_clears_without_evicting_others(self):
+        from tauceti_worker import work_recovery as wr
+
+        _, job, tree = self.pending()
+        dep = tree / ".lake/packages/mathlib"
+        dep.mkdir(parents=True)
+        git(dep, "init", "-q")
+        git(dep, "config", "user.name", "Fixture")
+        git(dep, "config", "user.email", "fixture@example.org")
+        write(dep, ".gitignore", ".lake/\n")
+        write(dep, "Dependency.lean", "protected dependency source")
+        git(dep, "add", ".")
+        git(dep, "commit", "-qm", "dependency")
+        payload = write(dep, ".lake/build/payload", "x" * 1000)
+        keep = write(tree, ".lake/packages/other/.lake/build/keep", "warm output")
+        storage.settle(self.state, job["id"], 10000, compact=True)
+        row = v.read_json(storage.root() / "candidates.json")["candidates"][storage.key(self.state, job["id"])]
+        with patch("tauceti_worker.work_recovery.live_users", return_value=[]):
+            result = storage._compact(
+                self.state,
+                job["id"],
+                wr.Work(seconds=10, entries=100000, removal_bytes=50),
+                now=time.time(),
+                row=row,
+                drop_dependencies=True,
+                evict=True,
+            )
+            self.assertEqual(result, "resume-cache-removal")
+            for _ in range(30):
+                report = storage.housekeep((self.state,), seconds=10, entries=100000, removal_bytes=50, now=time.time())
+                self.assertFalse(report["errors"], report)
+                if not payload.exists():
+                    break
+        self.assertFalse(payload.exists())
+        self.assertTrue(keep.exists())
+        self.assertEqual((dep / "Dependency.lean").read_text(), "protected dependency source")
 
     def test_soft_pressure_reclaims_oldest_completed_cache_then_stops(self):
         jobs = []

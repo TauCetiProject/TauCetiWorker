@@ -594,7 +594,11 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             else:
                                 atomic(path, current)
                     except Pressure as error:
-                        job.update(error=str(error), status="pending", next_at=time.time() + 60)
+                        job.update(
+                            error=str(error),
+                            status="pending",
+                            next_at=time.time() + (5 if error.reason == "busy" else 60),
+                        )
                         atomic(path, job)
                         report_runtime("verification-pending", detail=str(error), verification_job=job["id"])
                         return False
