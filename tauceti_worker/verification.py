@@ -34,7 +34,7 @@ from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
-from .verification_storage import Limit, Pressure, cache_generation
+from .verification_storage import Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 6
@@ -704,7 +704,7 @@ class Verification:
                     self.storage_lease.__enter__()
                 except BlockingIOError:
                     self.storage_lease = None
-                    raise Pressure("candidate storage is being reclaimed; retry verification") from None
+                    raise Pressure("candidate storage is being reclaimed; retry verification", reason="busy") from None
                 reserve(self.state, self.root.name)
                 self.storage_monitor = Monitor(self.state, self.root.name)
                 # A direct invocation claims this as an editable workspace, not a disposable
@@ -832,10 +832,14 @@ class Verification:
                 if error.reason == "limit"
                 else "storage-configuration"
                 if error.reason == "configuration"
+                else "verification-busy"
+                if error.reason == "busy"
                 else "disk-pressure",
                 result_type="incomplete",
-                next_action="adjust verification storage limits/inputs and invoke verify again"
-                if error.reason in {"limit", "configuration"}
+                next_action="correct filesystem-headroom settings and invoke verify again"
+                if error.reason == "configuration"
+                else "retry after the current verification/cleanup owner finishes"
+                if error.reason == "busy"
                 else "reclaim verification storage and retry verify in this workspace",
             )
         except Incomplete as error:
@@ -930,7 +934,7 @@ class Verification:
     def checkpoint_sources(self, inputs):
         """Preserve pre-verification Bubble edits before its disposable container can disappear."""
         from .retention import locked
-        from .verification_storage import LimitedWriter, release, reserve_checkpoint, settle
+        from .verification_storage import SpaceWriter, release, reserve_checkpoint, settle
 
         key = digest(dict(base=self.base, sources=inputs["sources"]))
         target = self.state / "verification-checkpoints" / key
@@ -940,20 +944,18 @@ class Verification:
                     patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
                     names = sorted(untracked(self.root))
                     size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
-                    # Charge the bounded archive estimate, rather than a whole maximum-sized
-                    # checkpoint for a tiny patch. The writer still enforces the granted bytes.
+                    # Observe the archive estimate without gating preservation on an arbitrary
+                    # logical-byte target. Only actual filesystem headroom may interrupt writes.
                     estimate = size + 16384 + sum(len(name.encode()) * 2 + 8192 for name in names)
-                    limit = reserve_checkpoint(self.state, key, amount=estimate)
+                    reserve_checkpoint(self.state, key, amount=estimate)
                     target.mkdir(mode=0o700, parents=True, exist_ok=True)
                     try:
-                        if size > limit:
-                            raise Limit("source checkpoint exceeds its reserved byte budget; original source retained")
                         with (target / "source.patch").open("wb") as out:
-                            out.write(patch)
+                            SpaceWriter(out, target).write(patch)
                             out.flush()
                             os.fsync(out.fileno())
                         with (target / "untracked.tar").open("wb") as out:
-                            with tarfile.open(fileobj=LimitedWriter(out, limit - len(patch)), mode="w") as archive:
+                            with tarfile.open(fileobj=SpaceWriter(out, target), mode="w") as archive:
                                 for name in names:
                                     archive.add(self.root / name, arcname=name, recursive=False)
                             out.flush()
