@@ -47,6 +47,10 @@ with (
 
     assert tr.shared_read(["open_prs", "org/repo", 100], lambda: "new page") == "new page"
 
+    tr.invalidate(["api", "-X", "PATCH", "repos/org/repo/issues/comments/123", "-f", "body=scoreboard"])
+    assert tr.shared_read(["open_prs", "org/repo", 100], lambda: "wrong") == "new page"
+    assert tr.shared_read(["issue_comments", "org/repo", 8], lambda: "updated comments") == "updated comments"
+
     ctx = multiprocessing.get_context("fork")
     q = ctx.Queue()
     procs = [ctx.Process(target=reserve, args=(q,)) for _ in range(5)]

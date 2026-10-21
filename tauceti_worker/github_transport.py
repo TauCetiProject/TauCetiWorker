@@ -140,6 +140,8 @@ def generation(key=None) -> str:
         if key and len(key) > 1 and isinstance(key[1], str) and "/" in key[1]:
             repo = key[1].lower()
             paths.append(_generation_file([repo]))
+            if key[0] in ("issue_comments", "review_comments", "progress", "review_state"):
+                paths.append(_generation_file([repo, "comments"]))
             paths.append(
                 _generation_file(
                     [
@@ -171,11 +173,16 @@ def invalidate(args=None):
     try:
         endpoint = api_endpoint(args or []) or ""
         match = re.match(r"repos/([^/]+/[^/]+)/(issues|pulls)/(\d+)(/.*)?$", endpoint.split("?")[0])
+        comment = re.fullmatch(
+            r"repos/([^/]+/[^/]+)/(?:issues|pulls)/comments/\d+(?:/reactions)?", endpoint.split("?")[0]
+        )
         repo = None
-        if match:
+        if comment:
+            scopes = [[comment[1].lower(), "comments"]]
+        elif match:
             repo, _, number, suffix = match.groups()
             scopes = [[repo.lower(), number]]
-            if not suffix:
+            if not suffix or suffix.startswith(("/labels", "/assignees", "/requested_reviewers")):
                 scopes.append([repo.lower(), "inventory"])
         else:
             repository = re.match(r"repos/([^/]+/[^/]+)/", endpoint)
@@ -183,9 +190,9 @@ def invalidate(args=None):
                 repo = repository[1]
             elif args:
                 repo = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("--repo", "-R")), None)
-            if repo and len(args) > 2 and args[:1] == ["pr"] and args[2].isdigit():
+            if repo and len(args) > 2 and args[:1] in (["pr"], ["issue"]) and args[2].isdigit():
                 scopes = [[repo.lower(), args[2]]]
-                if args[1] in ("close", "reopen", "merge", "ready"):
+                if args[1] in ("close", "reopen", "merge", "ready", "edit"):
                     scopes.append([repo.lower(), "inventory"])
             else:
                 scopes = [[repo.lower()]] if repo else []
