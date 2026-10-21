@@ -67,6 +67,7 @@ RUN_STDLIB=(
   github_failure_reason.py
   github_ratelimit.py
   github_shared_transport.py
+  github_throughput.py
   github_state.py
   github_state_retention.py
   github_state_rollout.py

@@ -383,6 +383,14 @@ gh: API rate limit exceeded
         except NoProgress as e:
             assert "not charged" in str(e)
 
+    with (
+        patch.object(work_units, "run_to_logfile", return_value=81),
+        patch.object(work_units, "me", return_value="test"),
+        patch.object(work_units, "_sync_review_outbox") as archive,
+    ):
+        assert work_units.do_review(worker, None, candidate, SimpleNamespace(work_model="claude"), False) is None
+        archive.assert_not_called()
+
     # The common stage guard covers failures before the agent (checkout/claim), during the
     # agent, and after it (progress apply/publishing), preserving previously accrued counters.
     values = {}

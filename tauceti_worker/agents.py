@@ -30,6 +30,7 @@ from .constants import (
     CLAUDE_CMD,
     CODEX_AUTHORING_FALLBACK_MODEL,
     CODEX_MODEL_ACCESS_TTL,
+    EX_CLAIM_COLLISION,
     OPENROUTER_MODELS,
     PI_RUN,
     REVIEW,
@@ -1194,6 +1195,11 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     api_env = review_environment()
     if label.startswith("review #"):
         api_env = {**(os.environ if api_env is None else api_env), "TAUCETI_GITHUB_HISTORY_BRIDGE": "1"}
+        if "tauceti-review" in argv:
+            from .github import claims_repo
+            from .paths import CLAIM_SH
+
+            api_env.update(CLAIM_REPO=claims_repo(), TAUCETI_CLAIM_SH=CLAIM_SH)
     env_kwargs = {"env": api_env} if api_env is not None else {}
     if os.environ.get("TAUCETI_STREAM"):
         return run_process(argv, **env_kwargs).returncode
@@ -1201,7 +1207,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
         rc = run_process(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
-    if rc != 0:
+    if rc != 0 and not (rc == EX_CLAIM_COLLISION and label.startswith("review #")):
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
         try:

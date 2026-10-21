@@ -84,7 +84,9 @@ def opts(work_model="codex"):
 
 # Stub the engine (posts fine, rc=0) and the module-level helpers do_review calls on the host path.
 warns = []
-_saved = {k: getattr(wu, k) for k in ("run_to_logfile", "_sync_review_outbox", "warn_red", "me", "gh_run", "log")}
+_saved = {
+    k: getattr(wu, k) for k in ("run_to_logfile", "_sync_review_outbox", "warn_red", "me", "gh_run", "log", "can_push")
+}
 wu.run_to_logfile = lambda argv, logf, label: 0  # the review engine posts successfully
 wu.warn_red = lambda msg: warns.append(msg)
 wu.me = lambda: "kim-em"
@@ -149,7 +151,7 @@ try:
     outbox.mkdir(parents=True)
     (outbox / "record.json").write_text("{}")
     logs = []
-    wu.gh_run = lambda argv: types.SimpleNamespace(returncode=0, stdout="false\n")
+    wu.can_push = lambda repo: False
     wu.log = lambda msg: logs.append(msg)
     w = FakeWorker()
     w.cfg = types.SimpleNamespace(store_dir=external_store, logdir=Path(_tmp.name) / "logs")

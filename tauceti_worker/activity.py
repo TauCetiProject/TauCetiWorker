@@ -229,6 +229,16 @@ def _ingest(db, e):
         )
     if not db.execute("INSERT OR IGNORE INTO events VALUES (?)", (e["id"],)).rowcount:
         return
+    if kind == "review_coordination":
+        row = db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()
+        buckets = json.loads(row[0]) if row else {}
+        hour = str(int(e["at"] // 3600) * 3600)
+        bucket = buckets.setdefault(hour, dict(started=0, marker_failed=0, git_held=0))
+        bucket["started"] += 1
+        bucket["marker_failed"] += not e.get("marker_posted", False)
+        bucket["git_held"] += bool(e.get("git_held"))
+        buckets = {k: v for k, v in buckets.items() if float(k) >= e["at"] - 7 * 86400 - 3600}
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('local_coordination',?)", (json.dumps(buckets),))
     if kind.startswith("round_"):
         rid = e["round_id"]
         db.execute("INSERT OR IGNORE INTO rounds(id,worker,scope,kind) VALUES (?,?,?,'unknown')", (rid, worker, scope))
@@ -421,6 +431,11 @@ def _refresh_prs(db, config, now, errors):
             batch = numbers[offset : offset + 100]
             try:
                 value = observe(url, token, repo, batch)
+                if value.get("review_coordination"):
+                    db.execute(
+                        "INSERT OR REPLACE INTO meta VALUES (?,?)",
+                        ("coordination:" + repo, json.dumps(value["review_coordination"])),
+                    )
                 if value.get("landing_observations", {}).get("error"):
                     observation_errors[repo] = "Stored Bors landing observations unavailable; retaining last-known data"
                 seen = [p["number"] for p in value["prs"]] + value["missing"]
@@ -517,6 +532,16 @@ def _worker_scope(db, worker):
 
 
 def _summary(db, now, column=None, identity=None):
+    local_row = db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()
+    local_buckets = json.loads(local_row[0]) if local_row else {}
+    local_coordination = {}
+    for label, seconds in (("24h", 86400), ("7d", 7 * 86400)):
+        local_coordination[label] = {
+            field: sum(
+                v.get(field, 0) for at, v in local_buckets.items() if float(at) >= (now - seconds) // 3600 * 3600
+            )
+            for field in ("started", "marker_failed", "git_held")
+        }
     where, args = (f"WHERE {column}=?", [identity]) if column else ("", [])
     rounds = {}
     for label, seconds in WINDOWS.items():
@@ -593,6 +618,11 @@ def _summary(db, now, column=None, identity=None):
         )
     return dict(
         prepared_at=now,
+        review_coordination={
+            r[0][len("coordination:") :]: json.loads(r[1])
+            for r in db.execute("SELECT key,value FROM meta WHERE key LIKE 'coordination:%'")
+        },
+        local_coordination=local_coordination,
         source_id=identity if column else "local",
         history_since=since,
         rounds=rounds,

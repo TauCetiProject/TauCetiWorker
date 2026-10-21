@@ -82,7 +82,7 @@ push_cas() {
     local out
     out=$(g push --force-with-lease="$1:$2" origin "$3:$1" 2>&1)
     if [[ $? -eq 0 ]]; then return 0; fi
-    grep -qiE 'rejected|stale info|failed to push' <<<"$out" && return 1
+    grep -qiE 'stale info|cannot lock ref.*expected' <<<"$out" && return 1
     echo "claim: unexpected push error on $1: $out" >&2; return 2
 }
 push_delete() { g push --force-with-lease="$1:$2" origin ":$1" >/dev/null 2>&1; }
