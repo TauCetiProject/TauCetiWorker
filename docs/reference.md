@@ -88,9 +88,12 @@ statement of intent rather than a per-task lock.
 
 Within an area, roadmap workers respect finer-grained claims registered by other
 contributors on the [intentions board](https://github.com/leanprover-community/intentions):
-an open issue in the roadmap repo labelled `intention` + `roadmap/<area>` that
-someone has claimed is treated as theirs, and the worker is told not to author
-it. "You" is your own `gh auth` identity. If you run workers under several
+an open issue in the roadmap repo labelled `intention` that someone has claimed
+is treated as theirs, and the worker is told not to author it. An intention
+belongs to an area when it carries the `roadmap/<area>` label or names the area,
+or one of its sub-roadmaps, in its form's "Roadmap area" answer (in its title or
+body when that answer is missing). "You" is your own `gh auth` identity. If you
+run workers under several
 accounts, or coordinate with someone whose intentions you are fulfilling, list
 those logins with `--roadmap-extra-identities` so the worker does not avoid your
 own side's claims. This is cooperative and fail-open;

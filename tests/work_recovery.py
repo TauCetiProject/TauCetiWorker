@@ -652,13 +652,13 @@ def test_work_paths(root):
     cfg.logdir = root / "paths" / "logs"
     (co / "Draft.lean").write_text("unfinished\n")
     wu = tc.work_units
-    names = ("fetch_ref", "run_agent_host", "roadmap_areas", "ensure_fork", "administrative_hold_avoid_list")
+    names = ("fetch_ref", "run_agent_host", "roadmap_areas", "ensure_fork", "avoid_list")
     saved = {k: getattr(wu, k) for k in names}
     saved_sync = tc.agents.sync_mathlib_pool
     launched = []
     wu.fetch_ref = lambda *a, **k: True
     wu.ensure_fork = lambda: "alice/TauCeti"
-    wu.administrative_hold_avoid_list = lambda *_a: "none"
+    wu.avoid_list = lambda *_a: "none"
     wu.roadmap_areas = lambda gh: ["algebra"]
     wu.run_agent_host = lambda *a, **k: launched.append(a) or 0
     tc.agents.sync_mathlib_pool = lambda cfg: None
