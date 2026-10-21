@@ -827,7 +827,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--online", action="store_true")
     doctor.add_argument("--workflow")
     doctor.add_argument("--field", action="append", default=[])
-    doctor.add_argument("--check")
+    doctor.add_argument("--check", metavar="CHECK_ID", help="Report only this check, with its full repair instructions")
     doctor.add_argument("--fix")
     doctor.add_argument("--apply", action="store_true")
     doctor.add_argument("--json", action="store_true")
