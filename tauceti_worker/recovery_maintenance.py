@@ -993,7 +993,14 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
             except BlockingIOError:
                 return dict(busy=True)
             sweep = _SWEEPS.setdefault(base, Sweep(base))
-            while time.monotonic() - work.started < min(seconds, 0.05):
+            # Reserve most of every budget for inventory and deletion too. A
+            # metadata-only priority scan must not monopolize small test or
+            # operator budgets on every preparation tick.
+            retirement_entries = work.metadata_entries + max(0, work.entries // 4)
+            while (
+                time.monotonic() - work.started < min(seconds / 4, 0.05)
+                and work.metadata_entries + 2 <= retirement_entries
+            ):
                 work.charge(entries=1)
                 try:
                     state, record = next(sweep.retirements)
