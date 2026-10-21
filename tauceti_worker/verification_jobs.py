@@ -67,18 +67,10 @@ def commit_copy(state, identifier):
 def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """Copy exact sources/index and warm build caches without editing the agent's index."""
     from .verification import Incomplete
-    from .verification_storage import CopyBudget, CopyLimit, reserve, settle
+    from .verification_storage import CopyBudget, reserve, settle
 
     try:
-        reduced_for_capacity = False
-        try:
-            amount = reserve(target.parent.parent, target.name)
-        except Pressure as error:
-            if not include_builds or error.reason != "capacity":
-                raise
-            include_builds = False
-            reduced_for_capacity = True
-            amount = reserve(target.parent.parent, target.name, source_only=True)
+        amount = reserve(target.parent.parent, target.name)
         budget = CopyBudget(amount, target)
 
         def copy(source, dest):
@@ -149,17 +141,8 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
-        settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
-    except CopyLimit as error:
-        if not include_builds:
-            if reduced_for_capacity:
-                raise Pressure("source preservation needs more temporarily available candidate capacity") from error
-            raise
-        if target.exists():
-            from .shared_mathlib import remove_tree
-
-            remove_tree(target)  # incomplete snapshot; original source is still intact
-        _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=False)
+        with contextlib.suppress(OSError, Pressure):
+            settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
     except (OSError, subprocess.CalledProcessError) as error:
         raise Incomplete(f"candidate preservation incomplete: {error}", reason="preservation") from error
 
@@ -467,9 +450,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
             continue
         if job.get("next_at", 0) > time.time():
             continue
-        if job.get("status") in {"blocked-tools", "blocked-storage-limit"} and job.get(
-            "tool_readiness"
-        ) == tool_readiness(job):
+        if job.get("status") == "blocked-tools" and job.get("tool_readiness") == tool_readiness(job):
             continue
         # Bubble writes paths in its mounted namespace. Rebase only that known state
         # prefix; ordinary host paths are already absolute.
