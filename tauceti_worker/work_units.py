@@ -1280,11 +1280,15 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         else:
             nrnd = w.rs.review_rounds(pr, w.counters)
             log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
+    logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    result_file = logf.parent / "review-results" / (logf.stem + ".json")
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    # Never accept a result from an earlier invocation, including a same-head retry.
+    result_file.unlink(missing_ok=True)
     try:
         if bubble:
-            rc = review_in_bubble(w, pr, head, reviewers, opts)
+            rc = review_in_bubble(w, pr, head, reviewers, opts, result_file=result_file)
         else:
-            logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
@@ -1322,13 +1326,20 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
         if rc == 0:
-            # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
-            # the "errored without completing a review" streak up front — BEFORE the publish step, which is
-            # a separate machine-wide concern. Otherwise a pre-post error streak (e.g. errkey=2) could
-            # combine with one later engine error to trip the escalation cap a round after a verdict was
-            # in fact posted, contradicting the "errored Nx without completing a review" message.
+            # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
             clear_review_failure(w.cfg.state, pr)
+            try:
+                result = json.loads(result_file.read_text())
+            except (OSError, ValueError):
+                result = None
+            if isinstance(result, dict) and result.get("head_sha") == head and result.get("changed") is False:
+                log(f"  review #{pr}: published verdict unchanged — selecting other work")
+                w.rs.bust(pr)
+                from .activity import select
+
+                select("no-work")
+                return None
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
             # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
@@ -1388,6 +1399,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             )
         return rc
     finally:
+        result_file.unlink(missing_ok=True)
         # Drop the claim: on success the watermark now prevents a re-fire; on failure releasing it lets
         # the contest be retried. A crash before here leaves the 👀 to TTL out (CONTEST_CLAIM_TTL).
         if c.contest and c.contest_reply_id and not w.gh.remove_reaction(c.contest_reply_id):

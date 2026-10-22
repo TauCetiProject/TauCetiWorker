@@ -66,6 +66,7 @@ captured = {}
 def fake_run_in_bubble(w, target, prompt, opts, mounts=None, inner_cmd=None, cred_model=None):
     captured["inner"] = inner_cmd
     captured["cred"] = cred_model
+    captured["mounts"] = mounts
     return 0
 
 
@@ -99,6 +100,14 @@ agents.review_in_bubble(w, 470, "abc123", "kiro", opts)
 check("bubble: Kiro exact model is forwarded", "--kiro-model claude-opus-5" in captured["inner"])
 check("bubble: Kiro reviewer seeds only Kiro creds", captured["cred"] == "kiro")
 check("bubble: Kiro credential bootstrap is present", "kiro-auth.sqlite3" in captured["inner"])
+
+result = tmp / "review-results" / "result.json"
+agents.review_in_bubble(w, 470, "abc123", "codex", opts, result_file=result)
+check("bubble: mounts only result directory", f"{result.parent}:/opt/review-result:rw" in captured["mounts"])
+check(
+    "bubble: passes exact outcome file",
+    "TAUCETI_REVIEW_RESULT_FILE=/opt/review-result/result.json" in captured["inner"],
+)
 
 # --- host: exercise the actual do_review command construction without a provider/network ----------
 host_commands = []
