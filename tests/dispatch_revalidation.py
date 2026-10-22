@@ -123,6 +123,10 @@ for pause in ("hold", "on-hold", "human"):
 
 check("a head a peer now holds is declined", still("review", FakeRS(held=("codex",))), False)
 check("a head reviewed since the survey is declined", still("review", FakeRS(clean_head=HEAD)), False)
+carried = FakeRS(meta=tc.Meta({"head_sha": HEAD, "states": {"reuse": "green"}, "runs": []}, "fresh"))
+carried.ledger_clean_head = lambda pr: tc.ReviewState.ledger_clean_head(carried, pr)
+check("carried verdicts decline dispatch using the real predicate", still("review", carried), False)
+
 
 contest_c = tc.Candidate(1, HEAD, "", contest="reuse", contest_reply_id=7)
 check(
