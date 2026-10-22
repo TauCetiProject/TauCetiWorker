@@ -608,7 +608,9 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
     collect(pool, protect=(key,))
     usage = shutil.disk_usage(pool)
     if usage.free < disk_reserve(usage):
-        raise Unavailable("shared snapshot pool is below its free-space reserve (10%, capped at 20 GiB) and no unused snapshots can be removed")
+        raise Unavailable(
+            "shared snapshot pool is below its free-space reserve (10%, capped at 20 GiB) and no unused snapshots can be removed"
+        )
     staging = pool / "staging"
     staging.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=key + "-", dir=staging) as raw:
@@ -667,7 +669,9 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         collect(pool, protect=(key,))
         usage = shutil.disk_usage(pool)
         if usage.free < disk_reserve(usage):
-            raise Unavailable("snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB); using private builds")
+            raise Unavailable(
+                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB); using private builds"
+            )
         entry.parent.mkdir(parents=True, exist_ok=True)
         os.replace(ready, entry)
         fd = os.open(entry.parent, os.O_RDONLY)
