@@ -31,6 +31,27 @@ from .survey_facts import markers, newest_contest, scoreboard
 META_RE = re.compile(r"<!--tauceti-meta:v1 (.*?)-->", re.S)
 
 
+def completed_review_head(meta: dict) -> str:
+    """Identity with completed verdicts, independently of inference in this invocation."""
+    if meta.get("mode") == "init":
+        return ""
+    states = meta.get("states") or {}
+    if states:
+        # Carried verdicts can complete a head without generating any new runs.
+        completed = {"green", "blocking_request", "blocking_block"}
+        # Adverse findings defer stale approvals; a block also defers absent rubrics.
+        allowed = completed | (
+            {"stale"} if any(v in ("blocking_request", "blocking_block") for v in states.values()) else set()
+        )
+        if "blocking_block" in states.values():
+            allowed.add("absent")
+        return str(meta.get("head_sha") or "") if all(v in allowed for v in states.values()) else ""
+    runs = meta.get("runs") or []
+    if runs and all(r.get("verdict") != "error" for r in runs):
+        return str(meta.get("head_sha") or "")
+    return ""
+
+
 @dataclass
 class Meta:
     data: dict
@@ -273,24 +294,7 @@ class ReviewState:
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
-        meta = self.gh_meta(pr).data
-        if meta.get("mode") == "init":
-            return ""
-        states = meta.get("states") or {}
-        if states:
-            # Carried verdicts can complete a head without generating any new runs.
-            completed = {"green", "blocking_request", "blocking_block"}
-            # Adverse findings defer stale approvals; a block also defers absent rubrics.
-            allowed = completed | (
-                {"stale"} if any(v in ("blocking_request", "blocking_block") for v in states.values()) else set()
-            )
-            if "blocking_block" in states.values():
-                allowed.add("absent")
-            return str(meta.get("head_sha") or "") if all(v in allowed for v in states.values()) else ""
-        runs = meta.get("runs") or []
-        if runs and all(r.get("verdict") != "error" for r in runs):
-            return str(meta.get("head_sha") or "")
-        return ""
+        return completed_review_head(self.gh_meta(pr).data)
 
     def review_rounds(self, pr: int, counters: Counters) -> int:
         # Prefer full_rounds (full review passes; excludes reply/contest rounds) so an author's

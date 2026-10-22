@@ -341,6 +341,40 @@ class GlobalMaintenance(unittest.TestCase):
         self.run_round([row(10, "Other", complete=False)])
         self.assertEqual(self.calls[0][:2], ("review", 10))
 
+    def test_cached_completed_head_is_excluded_without_history_reads(self):
+        completed = row(10, "Other", complete=False)
+        completed["review"]["meta"].update(states={"reuse": "green"}, runs=[])
+        _, _, areas = self.run_round([completed, row(20, "Other", author="peer", blocking=False)])
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("review", 20)])
+        areas.assert_not_called()
+
+    def test_cached_completion_never_hides_new_work(self):
+        for change in ("head", "contest", "init", "error", "incomplete", "adverse"):
+            with self.subTest(change=change):
+                completed = row(10, "Other", complete=False)
+                meta = completed["review"]["meta"]
+                meta.update(states={"reuse": "green"}, runs=[])
+                if change == "head":
+                    completed["pr"]["headRefOid"] = "b" * 40
+                elif change == "contest":
+                    completed["review"]["contest"] = {"id": 123, "rubric": "reuse"}
+                elif change == "init":
+                    meta["mode"] = "init"
+                elif change == "error":
+                    meta["states"]["reuse"] = "error"
+                elif change == "incomplete":
+                    meta["states"]["scope"] = "absent"
+                else:
+                    meta["states"]["reuse"] = "blocking_request"
+                self.run_round([completed])
+                self.assertEqual(self.calls[0][:2], ("review", 10))
+
+    def test_cached_adjudicated_contest_does_not_reopen_completed_head(self):
+        completed = row(10, "Other", complete=False, contest={"id": 123, "rubric": "reuse"})
+        completed["review"]["meta"].update(states={"reuse": "green"}, runs=[], replies_through=123)
+        self.run_round([completed, row(20, "Other", author="peer", blocking=False)])
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("review", 20)])
+
     def test_incomplete_cache_dispatches_author_repair(self):
         pr = row(10, "Other", complete=False)
         pr["pr"]["labels"].append({"name": "awaiting-author"})

@@ -49,7 +49,7 @@ from .constants import (
 )
 from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
 from .github_state import StateQueryError
-from .review_state import Meta, ReviewState
+from .review_state import Meta, ReviewState, completed_review_head
 from .survey_facts import in_scope, roadmap_focuses, target_focuses
 
 # ============================================================================
@@ -941,6 +941,22 @@ def survey(
             )
             continue
         if not history_ready(p):
+            covered = facts.get(p.number, {})
+            meta = covered.get("meta") or {}
+            states = meta.get("states") or {}
+            reply = covered.get("contest")
+            through = meta.get("replies_through")
+            through = through if isinstance(through, int) else 0
+            # Cached completion can exclude unnecessary discovery work without
+            # authorizing a mutation. Keep adverse, unknown, changed-head and
+            # unanswered-contest cases on the existing blind maintenance path.
+            if (
+                states
+                and all(state == "green" for state in states.values())
+                and completed_review_head(meta) == p.head_oid
+                and not (reply and reply["id"] > through)
+            ):
+                continue
             # A partial projection is not an empty history. Let the review engine
             # inspect the selected PR and coordinate its real per-head claim.
             # Author-action PRs are handled by their writer instead.
