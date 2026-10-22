@@ -4,7 +4,6 @@ Host coding rounds can reuse one extracted Mathlib build per dependency/configur
 key. Source files, TauCeti outputs and changes to Mathlib outputs stay private to a
 worker. Reviews retain their existing execution path.
 
-Sharing remains **off during the #364 cutover**. This change does not authorize reactivation.
 Sharing defaults to `off` without an opt-in policy or explicit environment mode.
 An unreadable or invalid policy fails to private mode. `off` uses ordinary private
 cache preparation; `auto` attempts sharing with private fallback. `required` refuses to start inference if sharing is unavailable.
@@ -61,16 +60,16 @@ A shared agent runs inside a rootless bubblewrap mount namespace. It deliberatel
 PID namespace: agents and their tools see ordinary host PIDs and `/proc`, because tools
 that report a PID to a service outside the namespace (systemd, D-Bus) break otherwise.
 The published pool is read-only inside the view and trusted extraction keeps only its staging
-project writable. Ordinary private agents, private cache fetches and verification tools run
-outside this mount view and can write to the pool, so sharing must
-stay off on a host with private writers. OverlayFS combines the shared Mathlib lower with that worker's
+project writable. Ordinary private agents, private cache fetches and verification tools keep their own build
+files; publication rejects hardlink aliases, so those workspaces cannot accidentally
+modify a published artifact through a shared writable inode. OverlayFS combines the shared Mathlib lower with that worker's
 fresh private upper per round; in-place writes copy up. The entire coding process and
 its tools see this view. Networking, credentials and the existing cancellation
 lifecycle are retained. This is build storage isolation, not an additional security
 boundary for untrusted code. Processes outside the view (private agents and tools,
 and pre-deployment active agents), other writable filesystem aliases, and the host
-owner can bypass the mount protection. Keep sharing off on a host
-with such writers; do not terminate paid agents to establish this condition.
+owner can bypass the mount protection. Host operators must treat the published pool as
+immutable. Ordinary private work and gradual rollout can coexist; do not terminate paid agents.
 Lower file modes permit private copy-up writes; changing them to read-only would
 also prohibit ordinary upper writes through OverlayFS.
 
@@ -95,12 +94,12 @@ round containment policy, historical process markers or quiescence proofs. Lock 
 extraction timeout is 20 minutes), then auto falls back privately and required
 mode fails with an actionable reason. Cleanup removes unused snapshots
 after seven days, or oldest unused snapshots under disk pressure, until at least
-10% disk space is free. Leased entries are skipped. An unused entry moves atomically
+the free-space reserve (10% of the filesystem, capped at 20 GiB) is available. Leased entries are skipped. An unused entry moves atomically
 to a synced trash directory before deletion; interrupted deletion cannot leave a
 partial lower in the published namespace. A pool-level collector lock serializes
 trash reclamation and entry selection. Subsequent collection reclaims trash. Unlocked staging trees left by killed builders are
 reclaimed after four hours, before useful snapshots are evicted for disk pressure. Publication refuses to leave
-less than 10% free if no unused entries can be reclaimed.
+less than that reserve if no unused entries can be reclaimed.
 
 The existing activity preparer collects small local preparation receipts. Status
 reads only that prepared summary, including sharing/private modes, cache hits,
@@ -129,31 +128,29 @@ describes the kernel read counter and its scope.
 
 ## Rollout
 
-Sharing stays off throughout the #364 cutover. Any later rollout belongs to the existing
-rollout owner at idle boundaries; the optional procedure below is for that later decision.
-Every private writer on the host, including an `auto` worker that falls back after a capability,
-space or lock failure, can bypass the shared view. Do not activate sharing alongside those writers.
-`auto` provides private fallback, not host-wide write isolation; the inventory detects later
-mutation but cannot protect readers that already hold a lease. Reactivation must account for
-that limitation without relying on the removed global containment policy or status markers.
+Enable sharing at idle round boundaries. Existing private rounds finish normally; new
+rounds use the optional Mathlib overlay view. Published artifacts have no writable
+workspace aliases. `auto` retains ordinary private fallback if the capability or cache
+is unavailable. The optional storage view does not require global process containment.
+Inventory validation detects host-side snapshot damage; it is not protection against
+a hostile operator with the same UID.
 
 Keep funding and worker capacity unchanged. Use only naturally selected work;
 do not trigger CI, run synthetic benchmarks, start paid measurement sessions or
 restart active paid agents. Normal implementation PR checks still apply.
 
-1. Enable one existing worker with pool `policy.json`, mode `auto`, a one-worker
-   `workers` allowlist, `expires_at` set to now + 86400, and `expiry_mode: "off"`.
-   Environment mode/allowlist overrides take precedence during ordinary rollout;
-   inspect them before selecting the worker. Policies are read at natural round
-   boundaries. Off/private remains the rollback path.
-2. After a natural **full work round** completes with verified overlay isolation,
-   no preparation failure and successful cleanup, expand to five existing workers
-   and renew the 24-hour expiry to off.
-3. After five successful natural rounds across that group with no sharing-related
-   failures, allow all current workers, again retaining a 24-hour expiry to off
-   until explicitly accepted. Do not increase the worker ceiling or budget.
+1. Enable the existing fleet with pool `policy.json`, mode `auto`. Environment mode
+   and allowlist overrides take precedence, so inspect those first. Policies are
+   read at natural round boundaries; existing paid work continues unchanged.
+2. Observe preparation and completed natural rounds across the configured fleet.
+   Confirm common lower inode identity through the actual agent namespaces,
+   private copy-up and read-only lower protection, successful cleanup, and healthy
+   cache-read and CI behavior. A mounted view or small canary is not fleet-wide
+   completion evidence.
+3. Retain `auto` private fallback for unsupported capabilities or unavailable
+   artifacts. No worker-count, admission, or spending increase is part of activation.
 
-For each gate retain the shared preparation/result/cleanup receipts, round ID,
+For production validation retain the shared preparation/result/cleanup receipts, round ID,
 audit phase completion, actual storage read bytes and resource stalls, together
 with an existing comparable private run. Use existing local phase/resource logs
 and kernel observations; missing measurements stay unknown. RSS and worker counts

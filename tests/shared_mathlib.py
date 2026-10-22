@@ -139,6 +139,15 @@ class SharedTests(unittest.TestCase):
         with self.assertRaises(s.Unavailable):
             s.signature(self.cwd, self.env)
 
+    def test_large_disk_can_publish_with_abundant_bytes_below_ten_percent(self):
+        gib = 1024**3
+        usage = shutil._ntuple_diskusage(3500 * gib, 3326 * gib, 174 * gib)
+        with patch.object(s.shutil, "disk_usage", return_value=usage):
+            key, spec = s.signature(self.cwd, self.env)
+            entry, hit = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", self.extract)
+        self.assertFalse(hit)
+        self.assertTrue((entry / "ready.json").is_file())
+
     def test_signature_binds_external_lake_config_by_content_and_cache_selection(self):
         config = self.root / "lake.toml"
         config.write_text("[cache]\n")
