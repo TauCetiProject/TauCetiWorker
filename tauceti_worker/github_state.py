@@ -218,9 +218,10 @@ def _renew(state, probe):
     return {**state, "probe_until": time.time() + PROBE_LEASE} if state.get("probe") == probe else state
 
 
-def _recovered(state, started, probe, key):
-    if state.get("failed_at", 0) > started and (probe is None or state.get("probe") != probe):
-        return state  # A request that began before a newer recorded failure is not evidence of recovery.
+def _recovered(state, key):
+    # A complete response accepted now proves the mirror can answer, even if
+    # concurrent requests failed after this one began. Keeping the circuit open
+    # would discard healthy responses and amplify a short timeout burst.
     now = time.time()
     cooling = {k: v for k, v in state.get("coverage_until", {}).items() if k != key and v > now}
     return {
@@ -272,7 +273,6 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     cached_path = base / "responses" / (key + ".json")
     cached = _cached(cached_path, binding)
     probe = None
-    started = time.time()
     # An unsupported repository/auth scope must not poison healthy TauCeti reads.
     circuit = base / "circuits" / (hashlib.sha256(repo.encode()).hexdigest() + ".json")
     try:
@@ -410,7 +410,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                             )
                     except OSError:
                         pass  # A healthy mirror remains usable when the local cache is unavailable.
-                    _circuit_update(circuit, _recovered, started, probe, key)
+                    _circuit_update(circuit, _recovered, key)
                     transport.event(
                         {
                             "kind": "gateway_read",
@@ -470,7 +470,6 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
             "detail": last.detail,
             "status": last.status,
             "since": state.get("since") or now,
-            "failed_at": now,
         }
 
     _circuit_update(circuit, failed)

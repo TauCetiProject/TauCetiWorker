@@ -331,7 +331,7 @@ class StateClient(unittest.TestCase):
         self.assertEqual((peer[1]["circuit"], peer[1]["reason"]), ("open", "http_503"))
         self.assertEqual(self.circuit(), {"failures": 0, "until": 0})
 
-    def test_stale_success_does_not_erase_a_newer_outage(self):
+    def test_complete_success_after_concurrent_failures_recovers_the_circuit(self):
         def outage_during_request(*_a, **_k):
             for _ in range(3):
                 with patch.object(state.urllib.request, "urlopen", side_effect=fails(503)):
@@ -340,8 +340,33 @@ class StateClient(unittest.TestCase):
 
         with patch.object(state.urllib.request, "urlopen", side_effect=outage_during_request):
             self.assertTrue(state.read("org/repo", "issue_comments", number=7)[0])
+        self.assertEqual(self.circuit(), {"failures": 0, "until": 0})
+        with patch.object(state.urllib.request, "urlopen", return_value=Response(page([]))) as request:
+            self.assertEqual(state.read("org/repo", "issue_comments", number=8), (True, []))
+            self.assertEqual(request.call_count, 1)
+        # A continuing outage still opens the circuit and suppresses peers.
+        for _ in range(3):
+            self.fail_with(fails(503))
         self.assertEqual(self.circuit()["failures"], 3)
         self.assertGreater(self.circuit()["until"], time.time())
+        with patch.object(state.urllib.request, "urlopen") as request:
+            self.assertEqual(state.read("org/repo", "issue_comments", number=8), (False, None))
+            request.assert_not_called()
+
+    def test_recovery_preserves_other_queries_coverage_cooldowns(self):
+        now = time.time()
+        recovered = state._recovered(
+            {
+                "failures": 3,
+                "until": now + 30,
+                "coverage_until": {"this": now + 60, "other": now + 60},
+                "coverage_reason": "backfilling",
+            },
+            "this",
+        )
+        self.assertEqual(recovered["failures"], 0)
+        self.assertEqual(recovered["until"], 0)
+        self.assertEqual(recovered["coverage_until"], {"other": now + 60})
 
     def test_backoff_is_bounded_and_jittered(self):
         values = {round(state._backoff(n), 3) for n in range(3, 30) for _ in range(3)}
