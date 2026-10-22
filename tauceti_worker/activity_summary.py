@@ -388,7 +388,19 @@ def display(value, default_kinds=()):
         current += f"; {s['unknown_landings']} merge timestamps pending"
     print(current)
     if s.get("interrupted_unfinished"):
-        print(f"Interrupted without finish receipts: {s['interrupted_unfinished']} (outside finished counts)")
+        detail = s.get("interrupted_unfinished_details")
+        if detail:
+            print(
+                f"Rounds missing finish records (by start time): {detail['started_1h']} in 1h; "
+                f"{detail['started_24h']} in 24h; {s['interrupted_unfinished']} all time"
+            )
+            if latest := detail.get("latest"):
+                started = datetime.fromtimestamp(latest["started"], UTC).isoformat(timespec="seconds")
+                print(f"  Latest affected round started {started}: {latest['worker']}, round {latest['round_id']}")
+        else:
+            print(f"Rounds missing finish records: {s['interrupted_unfinished']} all time; recent timing unavailable")
+        print("  Processes exited without reporting an outcome; excluded from finished counts.")
+        print("  Check worker logs for crashes, forced stops, or OOM kills.")
     # Older summaries only have an all-history minimum, which cannot establish
     # whether unresolved PRs are stale. Never use it as a freshness warning.
     now = time.time()
@@ -453,6 +465,19 @@ def combine(values):
             for key in ("observed_at", "missing_since")
         },
     )
+    # Older hosts cannot supply recent counts. Do not turn partial coverage into
+    # apparently complete fleet totals or claim a fleet-wide latest round.
+    details = [v.get("interrupted_unfinished_details") for v in known]
+    if len(known) == len(values) and all(details):
+        s["interrupted_unfinished_details"] = dict(
+            started_1h=sum(d["started_1h"] for d in details),
+            started_24h=sum(d["started_24h"] for d in details),
+            latest=max(
+                (d["latest"] for d in details if d.get("latest")),
+                key=lambda r: (r["started"], r["round_id"]),
+                default=None,
+            ),
+        )
     for v in known:
         for w, types in v["rounds"].items():
             if w not in report_windows:
