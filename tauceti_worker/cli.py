@@ -60,6 +60,7 @@ from .config import (
     log,
     roadmap_only,
     sanitize_wid,
+    security_audit_problem,
     set_log_file,
     warn_red,
 )
@@ -1230,14 +1231,15 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     if "security-audit" in only:
         from .security_audit import require_admin
 
-        if set(only) - {"security-audit", "bump", "progress"} or prs:
-            raise Die("security-audit may run alone or with bump/progress, without --pr")
-        if agent not in ("auto", "codex", "claude"):
-            raise Die("security-audit supports Codex Luna or Claude Haiku only")
-        if getattr(args, "author_model", None) or getattr(args, "author_effort", None):
-            raise Die("security-audit uses its dedicated Luna/Haiku profile; omit author-model/effort overrides")
-        if getattr(args, "claude_billing", None) == "api" or api_mode():
-            raise Die("security-audit currently uses paced subscription CLI sessions")
+        problem = security_audit_problem(
+            only,
+            agent=agent,
+            prs=prs,
+            author_override=bool(getattr(args, "author_model", None) or getattr(args, "author_effort", None)),
+            api=getattr(args, "claude_billing", None) == "api" or api_mode(),
+        )
+        if problem:
+            raise Die(problem)
         require_admin()  # Before quota/model selection, including on the loop-driver path.
     if one_round and not getattr(args, "dry_run", False):
         from .github_outbox import drain
@@ -1394,7 +1396,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
 
         # Source recovery precedes provider selection/admission and unrelated work. A
         # mechanically valid repair can publish even when all model budgets are closed.
-        if not dry and "security-audit" not in only:
+        # Audit-only workers author nothing; mixed workers recover their other phases' repairs.
+        if not dry and set(only) != {"security-audit"}:
             from .quota import mirror_creds
             from .repair_recovery import recover
             from .work_recovery import guard
