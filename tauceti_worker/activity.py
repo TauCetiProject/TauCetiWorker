@@ -584,6 +584,17 @@ def _summary(db, now, column=None, identity=None):
         for label, seconds in WINDOWS.items()
     }
     native_since = db.execute(f"SELECT MIN(started) FROM rounds {where}", args).fetchone()[0]
+    interrupted_where = f"{where} {'AND' if where else 'WHERE'} outcome='interrupted-unfinished'"
+    interrupted = db.execute(
+        f"SELECT COUNT(*) total, COALESCE(SUM(started BETWEEN ? AND ?),0) started_1h, "
+        f"COALESCE(SUM(started BETWEEN ? AND ?),0) started_24h FROM rounds {interrupted_where}",
+        [now - 3600, now, now - 86400, now, *args],
+    ).fetchone()
+    latest_interrupted = db.execute(
+        f"SELECT id round_id,worker,started FROM rounds {interrupted_where} "
+        "AND started IS NOT NULL ORDER BY started DESC,id DESC LIMIT 1",
+        args,
+    ).fetchone()
     cutoff_row = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     cutoff = cutoff_row[0] if cutoff_row else since
     costs = activity_costs.summarize(db, now, cutoff, column, identity)
@@ -655,9 +666,12 @@ def _summary(db, now, column=None, identity=None):
             if native_since is not None
             else None
         ),
-        interrupted_unfinished=db.execute(
-            f"SELECT COUNT(*) FROM rounds {where} {'AND' if where else 'WHERE'} outcome='interrupted-unfinished'", args
-        ).fetchone()[0],
+        interrupted_unfinished=interrupted["total"],
+        interrupted_unfinished_details=dict(
+            started_1h=interrupted["started_1h"],
+            started_24h=interrupted["started_24h"],
+            latest=dict(latest_interrupted) if latest_interrupted else None,
+        ),
         open_prs=sum(p["state"] == "OPEN" and p["landed"] is None for p in prs),
         unknown_prs=sum(p["state"] is None for p in prs),
         unknown_landings=sum(p["state"] == "MERGED" and p["landed"] is None for p in prs),

@@ -21,8 +21,13 @@ included, with a failure subset (including timeouts). Running rounds and
 processes interrupted without a finish receipt are separate. The current
 "workers working" count is distinct workers with an active work round, excluding
 workers waiting for capacity or budget; it can lag until the next preparation.
-Discovery of an
-interruption never supplies a fabricated finish time.
+Discovery of an interruption never supplies a fabricated finish time. The
+"Rounds missing finish records" diagnostic shows 1-hour and 24-hour counts by
+round **start time**, alongside the total over retained history. It identifies
+the latest affected round's start, worker, and round ID for checking worker logs
+for crashes, forced stops, or OOM kills; it does not infer the cause or time of
+exit. Older prepared summaries show the retained total with recent timing marked
+unavailable. Fleet recent counts require timing details from every host.
 
 PR authorship comes from successful tracked creation, not the entire GitHub
 account's history. Authored counts use creation time; landed counts use landing

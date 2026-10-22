@@ -168,6 +168,75 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
         self.assertEqual(s["unknown_prs"], 1)
 
+    def test_missing_finishes_show_start_windows_latest_round_and_scope(self):
+        # These were all discovered together. Recent counts must use their
+        # recorded starts, never pretend discovery is the interruption time.
+        with contextlib.closing(a._connect()) as db, db:
+            for rid, age, scope in (
+                ("recent", 60, "machine"),
+                ("hour-boundary", 3600, "machine"),
+                ("day-boundary", 86400, "machine"),
+                ("old", 86401, "machine"),
+                ("unknown-start", None, "machine"),
+                ("other-host", 1, "other"),
+            ):
+                db.execute(
+                    "INSERT INTO rounds(id,worker,scope,kind,started,outcome) "
+                    "VALUES (?,'worker',?,'fix',?,'interrupted-unfinished')",
+                    (rid, scope, self.now - age if age is not None else None),
+                )
+        a.prepare(now=self.now)
+        value = a.cached(group="machine")
+        s = value["summary"]
+        self.assertEqual(s["interrupted_unfinished"], 5)
+        self.assertEqual(s["rounds"]["total"], {})
+        self.assertEqual(
+            s["interrupted_unfinished_details"],
+            dict(started_1h=2, started_24h=3, latest=dict(round_id="recent", worker="worker", started=self.now - 60)),
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(value)
+        self.assertIn("Rounds missing finish records (by start time): 2 in 1h; 3 in 24h; 5 all time", output.getvalue())
+        self.assertIn("Latest affected round started", output.getvalue())
+        self.assertIn("worker, round recent", output.getvalue())
+        self.assertIn("excluded from finished counts", output.getvalue())
+        self.assertIn("Check worker logs", output.getvalue())
+
+        # A delayed finish reconciles the round rather than leaving a permanent
+        # interruption warning or counting it in both categories.
+        self.finish(0, kind="fix", rid="recent")
+        a.prepare(now=self.now)
+        s = a.cached(group="machine")["summary"]
+        self.assertEqual(s["interrupted_unfinished"], 4)
+        self.assertEqual(s["interrupted_unfinished_details"]["started_1h"], 1)
+        self.assertEqual(s["interrupted_unfinished_details"]["latest"]["round_id"], "hour-boundary")
+        self.assertEqual(s["rounds"]["total"]["fix"]["finished"], 1)
+
+    def test_missing_finish_fleet_totals_and_older_summaries(self):
+        from tauceti_worker import activity_summary
+
+        a.prepare(now=self.now)
+        one, two = a.cached(), a.cached()
+        for value, count, age, rid in ((one, 3, 20, "one"), (two, 5, 10, "two")):
+            value["summary"]["interrupted_unfinished"] = count
+            value["summary"]["interrupted_unfinished_details"] = dict(
+                started_1h=1, started_24h=2, latest=dict(started=self.now - age, worker=rid, round_id=rid)
+            )
+        combined = activity_summary.combine([one, two])
+        self.assertEqual(combined["summary"]["interrupted_unfinished"], 8)
+        detail = combined["summary"]["interrupted_unfinished_details"]
+        self.assertEqual((detail["started_1h"], detail["started_24h"]), (2, 4))
+        self.assertEqual(detail["latest"]["round_id"], "two")
+
+        del two["summary"]["interrupted_unfinished_details"]
+        for values in ([two], [one, two], [one, dict(available=False)]):
+            value = activity_summary.combine(values)
+            self.assertNotIn("interrupted_unfinished_details", value["summary"])
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertIn("all time; recent timing unavailable", output.getvalue())
+            self.assertNotIn("Latest affected round", output.getvalue())
+
     def test_transport_wait_is_not_counted_as_a_failed_round(self):
         from tauceti_worker.config import Die
 
