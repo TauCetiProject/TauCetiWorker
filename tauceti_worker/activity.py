@@ -483,9 +483,15 @@ def _refresh_prs(db, config, now, errors):
                         )
                     else:
                         db.execute("DELETE FROM pr_loc WHERE repo=? AND number=?", (repo, p["number"]))
-            except Exception:
+            except Exception as error:
+                detail = ""
+                if isinstance(error, urllib.error.HTTPError):
+                    detail = f" (HTTP {error.code}"
+                    if error.code == 403:
+                        detail += "; repository unavailable or access denied"
+                    detail += ")"
                 observation_errors[repo] = (
-                    "Shared PR observations unavailable for " + repo + "; retaining last-known data"
+                    "Shared PR observations unavailable for " + repo + detail + "; retaining last-known data"
                 )
             # Missing resources and failures are observed no more frequently than successful reads.
             db.executemany("UPDATE prs SET checked=? WHERE repo=? AND number=?", [(now, repo, n) for n in batch])
@@ -561,6 +567,9 @@ def _summary(db, now, column=None, identity=None):
         )
         rounds[label] = {r["kind"]: dict(finished=r["n"], failed=r["failures"], unknown=r["unknown"]) for r in rows}
     prs = [dict(r) for r in db.execute(f"SELECT * FROM prs {where}", args)]
+    # Closed and verified landed PRs are settled history. Their observations may
+    # stop updating permanently, so they cannot indicate stale current coverage.
+    unresolved = [p for p in prs if p["landed"] is None and p["state"] != "CLOSED"]
     first_round = db.execute(f"SELECT MIN(COALESCE(started,finished)) FROM rounds {where}", args).fetchone()[0]
     first_pr = min((p["created"] for p in prs), default=None)
     since = min((v for v in (first_round, first_pr) if v is not None), default=None)
@@ -654,6 +663,10 @@ def _summary(db, now, column=None, identity=None):
         unknown_landings=sum(p["state"] == "MERGED" and p["landed"] is None for p in prs),
         pr_observed_at=min((p["observed"] for p in prs if p["observed"]), default=None),
         pr_checked_at=min((p["checked"] for p in prs if p["checked"]), default=None),
+        pr_freshness=dict(
+            observed_at=min((p["observed"] for p in unresolved if p["observed"] is not None), default=None),
+            missing_since=min((p["created"] for p in unresolved if p["observed"] is None), default=None),
+        ),
     )
 
 

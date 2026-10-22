@@ -11,6 +11,9 @@ from decimal import Decimal
 WINDOW_SECONDS = {"1h": 3600, "3h": 10800, "24h": 86400, "7d": 604800, "total": None}
 WINDOWS = tuple(WINDOW_SECONDS)
 COST_WINDOWS = ("24h", "7d", "total")
+# Shared PR inventories reconcile hourly. Allow a missed cycle before warning;
+# the preparer's five-minute reads do not make the underlying evidence younger.
+PR_STALE_SECONDS = 2 * 3600
 RECOVERY_COUNTS = (
     "records",
     "retained",
@@ -386,11 +389,17 @@ def display(value, default_kinds=()):
     print(current)
     if s.get("interrupted_unfinished"):
         print(f"Interrupted without finish receipts: {s['interrupted_unfinished']} (outside finished counts)")
-    observed = s.get("pr_observed_at")
-    print(
-        "PR evidence: "
-        + (f"oldest observation {max(0, int(time.time() - observed))}s ago" if observed else "not yet available")
-    )
+    # Older summaries only have an all-history minimum, which cannot establish
+    # whether unresolved PRs are stale. Never use it as a freshness warning.
+    now = time.time()
+    for key, label in (
+        ("observed_at", "oldest unresolved PR observation"),
+        ("missing_since", "unresolved PR without an observation; created"),
+    ):
+        at = s.get("pr_freshness", {}).get(key)
+        if at is not None and now - at > PR_STALE_SECONDS:
+            minutes = int((now - at) // 60)
+            print(f"PR evidence: {label} {minutes // 60}h {minutes % 60}m ago (stale; expected within 2h)")
     for error in value.get("errors", []):
         print("Activity coverage: " + error)
 
@@ -436,6 +445,13 @@ def combine(values):
         unknown_prs=sum(v["unknown_prs"] for v in known),
         unknown_landings=sum(v["unknown_landings"] for v in known),
         pr_observed_at=min((v["pr_observed_at"] for v in known if v.get("pr_observed_at")), default=None),
+        pr_freshness={
+            key: min(
+                (v["pr_freshness"][key] for v in known if v.get("pr_freshness", {}).get(key) is not None),
+                default=None,
+            )
+            for key in ("observed_at", "missing_since")
+        },
     )
     for v in known:
         for w, types in v["rounds"].items():
