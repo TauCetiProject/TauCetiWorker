@@ -73,6 +73,8 @@ clean_cases = [
     ("carried approvals with no new runs", {"states": {"reuse": "green"}, "runs": []}, HEAD),
     ("completed adverse verdict", {"states": {"reuse": "blocking_request"}, "runs": []}, HEAD),
     ("block defers untouched rubrics", {"states": {"scope": "blocking_block", "reuse": "absent"}}, HEAD),
+    ("request defers stale approvals", {"states": {"reuse": "blocking_request", "scope": "stale"}}, HEAD),
+    ("block defers stale approvals", {"states": {"scope": "blocking_block", "reuse": "stale"}}, HEAD),
     ("stale approval needs review", {"states": {"reuse": "stale"}, "runs": [{"verdict": "approve"}]}, ""),
     ("error needs review", {"states": {"reuse": "error"}}, ""),
     ("unfinished round needs review", {"states": {"reuse": "green", "scope": "absent"}}, ""),
