@@ -274,6 +274,8 @@ class ReviewState:
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
         meta = self.gh_meta(pr).data
+        if meta.get("mode") == "init":
+            return ""
         states = meta.get("states") or {}
         if states:
             # Carried verdicts can complete a head without generating any new runs.

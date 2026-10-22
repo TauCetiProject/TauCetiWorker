@@ -70,6 +70,11 @@ for name, meta, expected in cases:
     fails += not ok
 
 clean_cases = [
+    (
+        "init is not a completed adverse review",
+        {"mode": "init", "states": {"reuse": "blocking_request", "scope": "stale"}, "runs": []},
+        "",
+    ),
     ("carried approvals with no new runs", {"states": {"reuse": "green"}, "runs": []}, HEAD),
     ("completed adverse verdict", {"states": {"reuse": "blocking_request"}, "runs": []}, HEAD),
     ("block defers untouched rubrics", {"states": {"scope": "blocking_block", "reuse": "absent"}}, HEAD),
