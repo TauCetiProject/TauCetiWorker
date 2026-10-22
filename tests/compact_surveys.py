@@ -44,7 +44,9 @@ with tempfile.TemporaryDirectory() as tmp:
                 + json.dumps(
                     {
                         "head_sha": head,
-                        "runs": [] if n == 1 else [{"provider": "claude", "verdict": "request_changes" if n == 3 else "approve"}],
+                        "runs": []
+                        if n == 1
+                        else [{"provider": "claude", "verdict": "request_changes" if n == 3 else "approve"}],
                         "states": {"reuse": "blocking_request" if n == 3 else "green"},
                     }
                 )
