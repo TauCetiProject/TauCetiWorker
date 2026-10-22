@@ -69,5 +69,23 @@ for name, meta, expected in cases:
     print(f"[{'OK ' if ok else 'XX '}] {name}: got={got} want={expected}")
     fails += not ok
 
+clean_cases = [
+    ("carried approvals with no new runs", {"states": {"reuse": "green"}, "runs": []}, HEAD),
+    ("completed adverse verdict", {"states": {"reuse": "blocking_request"}, "runs": []}, HEAD),
+    ("block defers untouched rubrics", {"states": {"scope": "blocking_block", "reuse": "absent"}}, HEAD),
+    ("stale approval needs review", {"states": {"reuse": "stale"}, "runs": [{"verdict": "approve"}]}, ""),
+    ("error needs review", {"states": {"reuse": "error"}}, ""),
+    ("unfinished round needs review", {"states": {"reuse": "green", "scope": "absent"}}, ""),
+    ("skeleton needs review", {"states": {}, "runs": []}, ""),
+    ("unknown state needs review", {"states": {"reuse": "unknown"}}, ""),
+    ("run-only completed verdict", {"runs": [{"verdict": "approve"}]}, HEAD),
+    ("run-only error", {"runs": [{"verdict": "error"}]}, ""),
+]
+for name, meta, expected in clean_cases:
+    got = tc.ReviewState.ledger_clean_head(FakeRS({"head_sha": HEAD, **meta}), 1)
+    ok = got == expected
+    print(f"[{'OK ' if ok else 'XX '}] {name}: got={got!r} want={expected!r}")
+    fails += not ok
+
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

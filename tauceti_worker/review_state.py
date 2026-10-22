@@ -273,9 +273,17 @@ class ReviewState:
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
-        runs = self.gh_meta(pr).data.get("runs") or []
+        meta = self.gh_meta(pr).data
+        states = meta.get("states") or {}
+        if states:
+            # Carried verdicts can complete a head without generating any new runs.
+            completed = {"green", "blocking_request", "blocking_block"}
+            # A block deliberately halts the remaining, absent rubrics until repaired.
+            allowed = completed | ({"absent"} if "blocking_block" in states.values() else set())
+            return str(meta.get("head_sha") or "") if all(v in allowed for v in states.values()) else ""
+        runs = meta.get("runs") or []
         if runs and all(r.get("verdict") != "error" for r in runs):
-            return str(self.gh_meta(pr).data.get("head_sha") or "")
+            return str(meta.get("head_sha") or "")
         return ""
 
     def review_rounds(self, pr: int, counters: Counters) -> int:

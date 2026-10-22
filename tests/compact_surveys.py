@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory() as tmp:
                 + json.dumps(
                     {
                         "head_sha": head,
-                        "runs": [{"provider": "claude", "verdict": "request_changes" if n == 3 else "approve"}],
+                        "runs": [] if n == 1 else [{"provider": "claude", "verdict": "request_changes" if n == 3 else "approve"}],
                         "states": {"reuse": "blocking_request" if n == 3 else "green"},
                     }
                 )
@@ -81,6 +81,7 @@ with tempfile.TemporaryDirectory() as tmp:
         issue_comments=issue,
         review_comments=review,
         rebase_requested=lambda *_: False,
+        fresh_claim_age=lambda *_: None,
     )
     counters = SimpleNamespace(read=lambda _: 0)
     with (
@@ -105,6 +106,24 @@ with tempfile.TemporaryDirectory() as tmp:
             optimized = mod.survey(cfg, gh, rs, counters, stages=["review", "fix", "rebase"])
         assert dataclasses.asdict(optimized) == dataclasses.asdict(direct), "optimized path changed task selection"
         assert not calls and gateway.call_count == 1, "compact survey must eliminate per-PR history requests"
+        assert 1 not in [c.pr for c in optimized.reviewable.actionable], "carried approvals must not re-enter review"
+        # A second worker sees the same complete facts and must also skip the completed head.
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            peer = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
+        assert 1 not in [c.pr for c in peer.reviewable.actionable]
+        compact[0]["review"]["contest"] = {"id": 101, "rubric": "reuse", "created_at": "now"}
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            contested = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
+        assert any(c.pr == 1 and c.contest_reply_id == 101 for c in contested.reviewable.actionable)
+        compact[0]["review"]["meta"]["replies_through"] = 101
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            answered = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
+        assert 1 not in [c.pr for c in answered.reviewable.actionable]
+        compact[0]["pr"]["headRefOid"] = "b" * 40
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            moved = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
+        assert 1 in [c.pr for c in moved.reviewable.actionable], "a new head must still get reviewed"
+        compact[0]["pr"]["headRefOid"] = head
         with patch(
             "tauceti_worker.github_state.read_survey", return_value=(True, SurveyRows(compact, {"author": 5004}))
         ):
