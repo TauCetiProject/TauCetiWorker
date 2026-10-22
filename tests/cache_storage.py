@@ -125,6 +125,19 @@ class Storage(unittest.TestCase):
             storage.admit(cfg)
         self.assertFalse(list(self.pool.glob("critical-*.json")))
 
+    def test_large_disk_recovers_old_latch_with_hundreds_of_gib_free(self):
+        gib = 1024**3
+        marker = self.root / "activity" / f"critical-{self.root.stat().st_dev}.json"
+        atomic_json(marker, dict(active=True))
+        with patch.object(
+            storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(3500 * gib, 3220 * gib, 280 * gib)
+        ):
+            storage.admit(SimpleNamespace(state=self.root))
+        self.assertFalse(marker.exists())
+        self.assertEqual(storage.headroom(3500 * gib, storage.CRITICAL), 20 * gib)
+        self.assertEqual(storage.headroom(3500 * gib, storage.LOW), 40 * gib)
+        self.assertEqual(storage.headroom(3500 * gib, storage.TARGET), 60 * gib)
+
     def test_live_checkout_hardlinks_do_not_flush_pool_or_request_recycle(self):
         entry = self.entry()
         canonical = self.pool / "artifacts/data"

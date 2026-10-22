@@ -148,6 +148,46 @@ class SharedTests(unittest.TestCase):
         self.assertFalse(hit)
         self.assertTrue((entry / "ready.json").is_file())
 
+    def test_host_snapshot_materializes_merged_cache_after_agent_view_exits(self):
+        self.require_overlay()
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(
+                prefix
+                + [
+                    "sh",
+                    "-c",
+                    'printf private > "$1/lib/lean/Mathlib.olean"; rm "$1/lib/lean/Mathlib/Test.olean"',
+                    "sh",
+                    str(build),
+                ],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+        self.assertFalse((build / "lib/lean/Mathlib.ilean").exists())
+        target = self.root / "state/verification-candidates" / ("a" * 32)
+        target.parent.mkdir(parents=True)
+        with patch.dict(os.environ, self.env):
+            snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        copied = target / ".lake/packages/mathlib/.lake"
+        self.assertEqual((copied / "build/lib/lean/Mathlib.olean").read_bytes(), b"private")
+        self.assertEqual((copied / "build/lib/lean/Mathlib.ilean").read_bytes(), b"verified artifact")
+        self.assertFalse((copied / "build/lib/lean/Mathlib/Test.olean").exists())
+        self.assertFalse((copied / "tauceti-overlay-work").exists())
+        self.assertFalse((copied / "tauceti-shared-mathlib.json").exists())
+
+    def test_disposable_overlay_is_volatile_without_leaking_the_mount_helper(self):
+        self.require_overlay()
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            upper = self.mathlib / ".lake/build"
+            code = "import os,sys;from pathlib import Path;assert 'overlay-mount' not in os.environ.get('LD_PRELOAD','');line=next(x for x in Path('/proc/self/mountinfo').read_text().splitlines() if x.split()[4]==sys.argv[1]);assert any(x in ('volatile','fsync=volatile') for x in line.split()[-1].split(','))"
+            subprocess.run(
+                prefix + [sys.executable, "-c", code, str(upper)], check=True, pass_fds=s.lease_fds(self.env)
+            )
+
     def test_signature_binds_external_lake_config_by_content_and_cache_selection(self):
         config = self.root / "lake.toml"
         config.write_text("[cache]\n")

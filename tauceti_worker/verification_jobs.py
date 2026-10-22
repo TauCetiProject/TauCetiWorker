@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -47,6 +48,54 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
     marker = state / "verification-copy-incomplete" / f"{target.name}.json"
     atomic(marker, dict(version=1, source=str(root), source_digest=digest(names)))
     try:
+        # After the agent namespace exits, this host path is only the sparse
+        # upper (possibly with whiteouts), not a usable Mathlib build. Materialize
+        # its merged cache while holding the existing lower's ordinary reader lease.
+        from . import shared_mathlib
+        from .verification import Incomplete
+
+        upper = root / ".lake/packages/mathlib/.lake/build"
+        shared = read_json(upper.parent / "tauceti-shared-mathlib.json")
+        if include_builds and shared and not upper.is_mount():
+            key = shared.get("key", "")
+            if not re.fullmatch("[0-9a-f]{64}", key):
+                raise Incomplete("invalid shared Mathlib snapshot identity", reason="preservation")
+            pool = Path(shared.get("pool") or shared_mathlib.root())
+            with shared_mathlib.key_lock(pool, key, exclusive=False) as lease:
+                lower = pool / "entries" / key / "build"
+                if lower.is_dir():
+                    work = upper.with_name("tauceti-overlay-work")
+                    work.mkdir(exist_ok=True)
+                    payload = dict(
+                        root=str(root),
+                        target=str(target),
+                        names=names,
+                        immutable_packages=str(immutable_packages) if immutable_packages else None,
+                        include_builds=include_builds,
+                    )
+                    code = "import sys,json;sys.path.insert(0,sys.argv[1]);from pathlib import Path;from tauceti_worker.verification_jobs import snapshot;d=json.load(sys.stdin);d.update({k:Path(d[k]) for k in ('root','target')});d['immutable_packages']=Path(d['immutable_packages']) if d['immutable_packages'] else None;snapshot(**d)"
+                    result = subprocess.run(
+                        shared_mathlib.overlay_command(lower, upper, work, upper, pool, lease_fd=lease.fileno())
+                        + [sys.executable, "-c", code, str(Path(__file__).resolve().parent.parent)],
+                        input=json.dumps(payload),
+                        text=True,
+                        capture_output=True,
+                        pass_fds=(lease.fileno(),),
+                    )
+                    if result.returncode:
+                        raise Incomplete(
+                            "merged Mathlib snapshot failed: " + result.stderr[-1000:], reason="preservation"
+                        )
+                    return
+                # A collected lower is a cache miss. Rehydrate normally before
+                # copying; never turn a sparse upper into a cold source build.
+                from .agents import prepare_host_build_caches
+
+                shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
+                try:
+                    prepare_host_build_caches(root, dict(os.environ), state / "verification-cache-prepare")
+                except Exception as error:
+                    raise Incomplete(f"Mathlib cache preparation pending: {error}", reason="preservation") from error
         return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
@@ -127,7 +176,15 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 return [
                     name
                     for name in entries
-                    if name in {"__pycache__", "tauceti-scope"}
+                    if name
+                    in {
+                        "__pycache__",
+                        "tauceti-scope",
+                        "tauceti-overlay-work",
+                        "tauceti-shared-mathlib.json",
+                        "build-before-sharing",
+                        "build-shared-delta",
+                    }
                     or not include_builds
                     and name in {"build", "build-before-sharing"}
                     and Path(directory).name == ".lake"

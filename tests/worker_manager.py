@@ -503,6 +503,41 @@ worker3 — backing off
             runner.kill()
             runner.wait(timeout=10)
 
+    # Twenty slow status reads must not keep control requests queued until the
+    # whole reconciliation finishes. This uses disabled fixture workers only.
+    latency_config = root / "latency-workers.toml"
+    wm.save_worker_specs(latency_config, [wm.WorkerSpec(id=f"slow{n}", enabled=False) for n in range(20)])
+    latency_run, latency_state = root / "latency-run", root / "latency-state"
+    entered = root / "latency-entered"
+    code = """
+import sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from tauceti_worker import worker_manager as w
+def slow(*args,**kwargs):
+    Path(sys.argv[3]).touch()
+    time.sleep(.08)
+    return {}
+w.runner_status=slow
+raise SystemExit(w.run_manager(Path(sys.argv[2]),interval=.05))
+"""
+    probe = subprocess.Popen(
+        [sys.executable, "-c", code, str(REPO), str(latency_config), str(entered)],
+        env=dict(os.environ, TAUCETI_RUNTIME_DIR=str(latency_run), TAUCETI_WORKERS_STATE_DIR=str(latency_state)),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        wait_for(entered.exists)
+        reply = wm._socket_request(latency_run / "manager.sock", {"action": "ping"}, timeout=0.5)
+        assert reply and reply.get("ok"), "control request waited behind a fleet-wide status scan"
+        assert wm._socket_request(latency_run / "manager.sock", {"action": "shutdown"}, timeout=2)
+        probe.wait(5)
+    finally:
+        if probe.poll() is None:
+            probe.terminate()
+            probe.wait(5)
+
     print("worker manager: OK")
 finally:
     if manager is not None and manager.poll() is None:

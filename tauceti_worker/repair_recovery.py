@@ -1156,7 +1156,11 @@ class WorkerBackend:
         )
 
     def verify(self, checkout, m, facts):
-        from .agents import prepare_host_build_caches, scope_policy
+        import sys
+
+        from .agents import host_build_cache_context, scope_policy
+        from .paths import HERE
+        from .processes import run as run_process
         from .verification import Verification
 
         policy = scope_policy(
@@ -1165,37 +1169,67 @@ class WorkerBackend:
         if getattr(self, "record", None):
             (self.record / "cache-evicted.json").unlink(missing_ok=True)
         with environment(**self.verification_environment(checkout)):
-            # Restore ordinary dependency/artifact prerequisites before fingerprinting;
-            # an empty isolated clone must not compile missing Mathlib from scratch.
-            if any((checkout / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
-                prepare_host_build_caches(checkout, dict(os.environ), self.w.cfg.logdir)
-            if getattr(self, "record", None):
-                self.prepare_source(checkout, self.record, m, self.journal)
-            verifier = Verification(
-                checkout,
-                self.w.cfg.state,
-                base=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
-                policy=policy,
-                deadline=self.w.rc.deadline,
-            )
-            j = getattr(self, "journal", {})
-            current = self.verification_fingerprint(checkout, m, facts)
-            if j.get("failed_fingerprint") == current and j.get("failed_recheck_at", 0) > time.time():
-                return j["failed_receipt"]
-            result = verifier.run()
-            if result.get("status") == "failed" and getattr(self, "record", None):
-                failures = j.get("verification_failures", 0) + 1 if j.get("failed_fingerprint") == current else 1
-                write(
-                    self.record,
-                    j,
-                    "resuming",
-                    failed_fingerprint=current,
-                    failed_head=facts["head"],
-                    failed_source=saved.inspect(checkout).fingerprint,
-                    failed_receipt=result,
-                    verification_failures=failures,
-                    failed_recheck_at=time.time() + min(21600, 1800 * 2 ** min(failures - 1, 4)),
+            cache_env = dict(os.environ)
+            with host_build_cache_context(checkout, cache_env, self.w.cfg.logdir) as prefix:
+                if getattr(self, "record", None):
+                    self.prepare_source(checkout, self.record, m, self.journal)
+                base = saved._rev(checkout, f"origin/{BASE_BRANCH}")
+                verifier = Verification(
+                    checkout,
+                    self.w.cfg.state,
+                    base=base,
+                    policy=policy,
+                    deadline=self.w.rc.deadline,
                 )
+                j = getattr(self, "journal", {})
+                current = self.verification_fingerprint(checkout, m, facts)
+                if j.get("failed_fingerprint") == current and j.get("failed_recheck_at", 0) > time.time():
+                    return j["failed_receipt"]
+                if prefix:
+                    # The supervisor is outside the agent's mount namespace. Run
+                    # the existing verifier inside the same merged Mathlib view,
+                    # rather than rehydrating another full private dependency build.
+                    env = dict(cache_env, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy)
+                    if self.w.rc.deadline is not None:
+                        env["TAUCETI_ROUND_DEADLINE"] = str(self.w.rc.deadline)
+                    logpath = self.w.cfg.logdir / "recovery-verification.log"
+                    with logpath.open("a") as output:
+                        checked = run_process(
+                            [
+                                *prefix,
+                                sys.executable,
+                                str(HERE / "scripts/tauceti-verify"),
+                                "--json",
+                                "--base",
+                                base,
+                            ],
+                            cwd=checkout,
+                            env=env,
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=output,
+                        )
+                    try:
+                        result = json.loads(checked.stdout)
+                    except ValueError:
+                        result = dict(
+                            status="incomplete", error=f"verification helper produced no receipt; see {logpath}"
+                        )
+                else:
+                    result = verifier.run()
+                if result.get("status") == "failed" and getattr(self, "record", None):
+                    failures = j.get("verification_failures", 0) + 1 if j.get("failed_fingerprint") == current else 1
+                    write(
+                        self.record,
+                        j,
+                        "resuming",
+                        failed_fingerprint=current,
+                        failed_head=facts["head"],
+                        failed_source=saved.inspect(checkout).fingerprint,
+                        failed_receipt=result,
+                        verification_failures=failures,
+                        failed_recheck_at=time.time() + min(21600, 1800 * 2 ** min(failures - 1, 4)),
+                    )
         return result
 
     def continuation_admission(self, record, m, j):
