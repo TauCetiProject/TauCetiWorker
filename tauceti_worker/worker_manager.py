@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-from .config import positive_integer
+from .config import positive_integer, security_audit_problem
 from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
@@ -363,6 +363,15 @@ class WorkerSpec:
                 raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
         elif spec.budget or spec.anthropic_api_key_file:
             raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
+        # The same static checks `tauceti work` applies, so `apply --check` rejects what a worker would.
+        problem = security_audit_problem(
+            spec.only,
+            agent=spec.agent,
+            author_override=bool(spec.author_model or spec.author_effort),
+            api=spec.claude_billing == "api",
+        )
+        if problem:
+            raise WorkersError(f"workers[{index}]: {problem}")
         return spec
 
     def as_dict(self) -> dict:

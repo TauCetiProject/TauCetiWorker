@@ -31,6 +31,22 @@ def positive_integer(value) -> int:
     return result
 
 
+def security_audit_problem(only, *, agent="auto", prs=(), author_override=False, api=False) -> str | None:
+    """Static constraints on a worker that includes security-audit, shared by CLI and TOML.
+    Other phases may accompany it; admin permission is checked when the worker runs."""
+    if "security-audit" not in only:
+        return None
+    if prs:
+        return "security-audit cannot be combined with --pr"
+    if agent not in ("auto", "codex", "claude"):
+        return "security-audit supports Codex Luna or Claude Haiku only"
+    if author_override:
+        return "security-audit uses its dedicated Luna/Haiku profile; omit author-model/effort overrides"
+    if api:
+        return "security-audit currently uses paced subscription CLI sessions"
+    return None
+
+
 def max_open_prs() -> int:
     return positive_integer(os.environ.get("TAUCETI_MAX_OPEN_PRS", MAX_OPEN_PRS))
 

@@ -378,7 +378,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         try:
             return run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
         except (Die, NoProgress) as exc:
-            log(f"{exc}; continuing bump/progress work without advancing the audit cursor")
+            log(f"{exc}; continuing {', '.join(other_tasks)} work without advancing the audit cursor")
         # The audit runner retains its evidence and blocks. Maintenance cannot
         # clear them or move the cursor; the separate release gate stays enforced.
         opts = replace(opts, only=other_tasks)

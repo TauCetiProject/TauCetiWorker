@@ -172,12 +172,23 @@ try:
         # The whole spec travels as one command-line argument, so an unbounded table becomes E2BIG.
         ({"env": {"BIG": "x" * (16 * 1024 + 1)}}, "oversized table"),
         ({"env": ["A=b"]}, "array instead of a table"),
+        # `apply --check` must reject what `tauceti work` would refuse at launch.
+        ({"only": ["security-audit"], "agent": "kiro"}, "security-audit on an unsupported agent"),
+        (
+            {"only": ["security-audit"], "agent": "codex", "author_model": "gpt"},
+            "security-audit with an authoring override",
+        ),
+        ({"only": ["bump", "security-audit"], "agent": "claude", "claude_billing": "api"}, "security-audit on API"),
     ):
         try:
             wm.WorkerSpec.from_dict({"id": "exp", **bad}, 0)
             raise AssertionError(f"{why} should have been rejected: {bad}")
         except wm.WorkersError:
             pass
+
+    # security-audit may accompany any other phases.
+    mixed = ["bump", "progress", "security-audit", "overlap-scan", "overlap-fix", "review"]
+    assert wm.WorkerSpec.from_dict({"id": "audit", "agent": "codex", "only": mixed}, 0).only == tuple(mixed)
 
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(

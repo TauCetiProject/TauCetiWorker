@@ -137,7 +137,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             from .repair_recovery import due
 
             recovery_only = (
-                "security-audit" not in only
+                set(only) != {"security-audit"}
                 and time.time() >= recovery_probe_at
                 and due(cfg, only=only, prs=prs, sandbox_host=not bubble, agent=agent)
             )

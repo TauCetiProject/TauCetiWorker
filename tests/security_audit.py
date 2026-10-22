@@ -1350,14 +1350,18 @@ class Authority(unittest.TestCase):
         self.assertNotIn("security-audit", cli.resolve_tasks([], ["review"]))
         self.assertEqual(cli.resolve_tasks(["security-audit"], []), ["security-audit"])
 
-    def test_maintenance_combination_still_requires_admin(self):
-        for only in (["security-audit"], ["bump", "progress", "security-audit"]):
+    def test_any_combination_still_requires_admin(self):
+        for only in (
+            ["security-audit"],
+            ["bump", "progress", "security-audit"],
+            ["review", "overlap-scan", "overlap-fix", "security-audit"],
+        ):
             with patch.object(sa, "require_admin", side_effect=Die("not admin")) as admin:
                 with self.assertRaisesRegex(Die, "not admin"):
                     cli.cmd_work(SimpleNamespace(), only=only, agent="claude", one_round=True)
             admin.assert_called_once()
-        with patch.object(sa, "require_admin") as admin, self.assertRaisesRegex(Die, "bump/progress"):
-            cli.cmd_work(SimpleNamespace(), only=["review", "security-audit"], agent="claude", one_round=True)
+        with patch.object(sa, "require_admin") as admin, self.assertRaisesRegex(Die, "--pr"):
+            cli.cmd_work(SimpleNamespace(), only=["review", "security-audit"], agent="claude", one_round=True, prs=(1,))
         admin.assert_not_called()
 
     def test_admin_must_be_literal_true(self):
