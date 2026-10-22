@@ -112,6 +112,33 @@ with (
         "verified_at": 1,
         "data": [{"id": "123", "body": "old-but-newest-available"}],
     }
+    # The real mirror returned a complete 5KB history in 3.58s. The old
+    # 2.4s per-attempt timeout abandoned it twice and opened the shared circuit.
+    clock = [0.0]
+
+    def healthy_slow_read(request, timeout):
+        assert 4.9 <= timeout <= 5.0
+        clock[0] += 3.6
+        return Response(payload)
+
+    with (
+        patch.object(state.time, "monotonic", side_effect=lambda: clock[0]),
+        patch.object(state.urllib.request, "urlopen", side_effect=healthy_slow_read) as fetch,
+    ):
+        assert state.read("org/repo", "issue_comments", number=7)[0]
+        assert fetch.call_count == 1
+
+    def stalled_read(request, timeout):
+        clock[0] += timeout
+        raise TimeoutError("timed out")
+
+    with (
+        patch.object(state.time, "monotonic", side_effect=lambda: clock[0]),
+        patch.object(state.urllib.request, "urlopen", side_effect=stalled_read) as fetch,
+    ):
+        assert state.read("org/repo", "issue_comments", number=7) == (False, None)
+        assert fetch.call_count == 1, "a stalled read must exhaust the same five-second budget"
+        assert clock[0] == 8.6
     with patch.object(state.urllib.request, "urlopen", return_value=Response(payload)) as fetch:
         available, rows = state.read("org/repo", "issue_comments", number=7)
         assert available and rows[0]["id"] == 123 and fetch.call_count == 1
