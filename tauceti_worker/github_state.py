@@ -333,7 +333,11 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 request = urllib.request.Request(url + "/v1/query?" + urllib.parse.urlencode(params), headers=headers)
                 try:
                     with urllib.request.urlopen(
-                        request, timeout=max(0.1, min(2.4, deadline - time.monotonic()))
+                        # A healthy read can take 3–4s while the mirror commits
+                        # webhook updates. Use the remaining five-second budget
+                        # rather than abandoning it early and retrying the work.
+                        request,
+                        timeout=max(0.1, deadline - time.monotonic()),
                     ) as response:
                         try:
                             payload = json.load(response)
