@@ -110,6 +110,17 @@ retains last-known data after a failure and exposes that failure and data age.
 Summaries older than three minutes are labelled stale. Windows end at each
 summary's preparation time.
 
+PR evidence is silent during normal operation. Status warns only when an
+unresolved authored PR's stored observation is more than two hours old, or when
+a PR has waited more than two hours since creation for its first observation.
+This allows for hourly shared-server inventory reconciliation and a missed cycle;
+the preparer's five-minute observation reads do not refresh the underlying facts.
+Closed PRs and PRs with verified landing evidence are excluded because their
+historical observations may stop updating permanently. The original all-history
+observation/check timestamps remain available in JSON. Older summaries without
+unresolved-PR freshness fields do not produce an age warning. Coverage errors
+remain visible independently of these age warnings.
+
 Each worker and fleet group has its own small summary file, so status does not
 load the entire historical inventory. A separate prepared PR identity inventory
 supports deduplicated aggregation: `tauceti activity --inventory` (optionally

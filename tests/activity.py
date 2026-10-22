@@ -210,6 +210,106 @@ class ActivityTests(unittest.TestCase):
                 a.display(a.cached())
         self.assertIn("All time", output.getvalue())
 
+    def test_repository_access_failure_is_explicit_without_github_fallback(self):
+        a.emit("pr_created", repository="org/roadmap", pr=7)
+        env = {
+            "TAUCETI_GITHUB_STATE_URL": "https://state.example",
+            "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock",
+        }
+        error = a.urllib.error.HTTPError("https://state.example/v1/activity", 403, "Forbidden", {}, None)
+        self.addCleanup(error.close)
+        with patch.dict(os.environ, env), patch.object(a, "observe", side_effect=error) as observation:
+            a.prepare(now=self.now + 1)
+            a.prepare(now=self.now + 61)
+        self.assertEqual(observation.call_count, 1)
+        self.assertIn(
+            "Shared PR observations unavailable for org/roadmap (HTTP 403; repository unavailable or access denied); retaining last-known data",
+            a.cached()["errors"],
+        )
+
+    def test_pr_freshness_excludes_settled_history_and_respects_scope(self):
+        old = self.now - 3 * 86400
+        with contextlib.closing(a._connect()) as db, db:
+            for number, state, landed, observed, created, worker, scope in (
+                (1, "CLOSED", None, old, old, "worker", "machine"),
+                (2, "OPEN", old, old, old, "worker", "machine"),
+                (3, "MERGED", old, old, old, "worker", "machine"),
+                (4, "OPEN", None, self.now - 2700, old, "worker", "machine"),
+                (5, None, None, None, self.now - 300, "worker", "machine"),
+                (6, "OPEN", None, old, old, "other", "other-machine"),
+            ):
+                db.execute(
+                    "INSERT INTO prs(repo,number,state,landed,observed,created,worker,scope) VALUES ('org/repo',?,?,?,?,?,?,?)",
+                    (number, state, landed, observed, created, worker, scope),
+                )
+            for column, identity in (("scope", "machine"), ("worker", "worker")):
+                summary = a._summary(db, self.now, column, identity)
+                self.assertEqual(summary["pr_observed_at"], old)  # Raw historical evidence is preserved.
+                self.assertEqual(
+                    summary["pr_freshness"], dict(observed_at=self.now - 2700, missing_since=self.now - 300)
+                )
+                with (
+                    patch.object(a.time, "time", return_value=self.now),
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                ):
+                    a.display(dict(available=True, summary=summary))
+                self.assertNotIn("PR evidence:", out.getvalue())
+            self.assertEqual(a._summary(db, self.now)["pr_freshness"]["observed_at"], old)
+
+    def test_pr_evidence_warns_only_after_two_hours_without_refreshing(self):
+        with contextlib.closing(a._connect()) as db, db:
+            summary = a._summary(db, self.now)
+        summary["pr_observed_at"] = self.now - 3 * 86400
+        summary["pr_checked_at"] = self.now  # A recent read attempt cannot renew stored evidence.
+        for freshness, expected in (
+            (None, None),  # Legacy summaries cannot distinguish current data from history.
+            (dict(observed_at=None, missing_since=None), None),
+            (dict(observed_at=self.now - 7200, missing_since=self.now - 7200), None),
+            (dict(observed_at=self.now - 7201, missing_since=None), "oldest unresolved PR observation 2h 0m"),
+            (dict(observed_at=None, missing_since=self.now - 47 * 3600), "without an observation; created 47h 0m"),
+        ):
+            with self.subTest(freshness=freshness):
+                if freshness is None:
+                    summary.pop("pr_freshness", None)
+                else:
+                    summary["pr_freshness"] = freshness
+                with (
+                    patch.object(a.time, "time", return_value=self.now),
+                    patch.object(a, "_connect", side_effect=AssertionError("SQL on display")),
+                    patch.object(a, "observe", side_effect=AssertionError("network on display")),
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                ):
+                    a.display(dict(available=True, summary=summary))
+                if expected:
+                    self.assertIn(expected, out.getvalue())
+                    self.assertIn("stale; expected within 2h", out.getvalue())
+                else:
+                    self.assertNotIn("PR evidence:", out.getvalue())
+
+    def test_pr_freshness_combines_hosts_without_using_legacy_history(self):
+        with contextlib.closing(a._connect()) as db, db:
+            summary = a._summary(db, self.now)
+        legacy = dict(summary)
+        legacy.pop("pr_freshness")
+        legacy["pr_observed_at"] = self.now - 3 * 86400
+        recent = dict(summary, pr_freshness=dict(observed_at=self.now - 2700, missing_since=None))
+        stale = dict(summary, pr_freshness=dict(observed_at=self.now - 10800, missing_since=self.now - 86400))
+        for hosts, expected in (
+            ([legacy, recent], recent["pr_freshness"]),
+            ([recent, stale, legacy], stale["pr_freshness"]),
+            ([legacy], dict(observed_at=None, missing_since=None)),
+        ):
+            combined = a.activity_summary.combine([dict(available=True, summary=s) for s in hosts])
+            self.assertEqual(combined["summary"]["pr_freshness"], expected)
+        # Age is evaluated when reading the cache, even if it crosses the limit
+        # without another preparation pass.
+        with (
+            patch.object(a.time, "time", return_value=self.now + 7201),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            a.display(a.activity_summary.combine([dict(available=True, summary=recent)]))
+        self.assertIn("oldest unresolved PR observation", out.getvalue())
+
     def test_bors_requires_exact_head_and_verified_main_landing(self):
         a.emit("pr_created", repository="org/repo", pr=7)
         a.prepare(now=self.now)
