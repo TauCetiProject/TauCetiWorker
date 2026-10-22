@@ -279,7 +279,7 @@ class ReviewState:
             # Carried verdicts can complete a head without generating any new runs.
             completed = {"green", "blocking_request", "blocking_block"}
             # Adverse findings defer stale approvals; a block also defers absent rubrics.
-            allowed = completed | ({"stale"} if any(v.startswith("blocking_") for v in states.values()) else set())
+            allowed = completed | ({"stale"} if any(v in ("blocking_request", "blocking_block") for v in states.values()) else set())
             if "blocking_block" in states.values():
                 allowed.add("absent")
             return str(meta.get("head_sha") or "") if all(v in allowed for v in states.values()) else ""
