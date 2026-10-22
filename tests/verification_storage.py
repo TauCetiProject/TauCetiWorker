@@ -24,6 +24,24 @@ from tauceti_worker.verification_jobs import resume_pending
 
 
 class Storage(Receipts):
+    def test_large_filesystem_reserve_uses_bytes_instead_of_hundreds_of_gib(self):
+        gib = 1024**3
+        with (
+            patch.dict(os.environ, TAUCETI_VERIFY_MIN_FREE_PERCENT="10", TAUCETI_VERIFY_MIN_FREE_BYTES=str(20 * gib)),
+            patch.object(
+                storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(3500 * gib, 3220 * gib, 280 * gib)
+            ),
+        ):
+            storage.free_space(self.root)
+        with (
+            patch.dict(os.environ, TAUCETI_VERIFY_MIN_FREE_PERCENT="10", TAUCETI_VERIFY_MIN_FREE_BYTES=str(20 * gib)),
+            patch.object(
+                storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(3500 * gib, 3485 * gib, 15 * gib)
+            ),
+        ):
+            with self.assertRaises(storage.Pressure):
+                storage.free_space(self.root)
+
     def setUp(self):
         super().setUp()
         os.environ.update(

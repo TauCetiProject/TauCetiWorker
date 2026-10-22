@@ -70,6 +70,11 @@ boundary for untrusted code. Processes outside the view (private agents and tool
 and pre-deployment active agents), other writable filesystem aliases, and the host
 owner can bypass the mount protection. Host operators must treat the published pool as
 immutable. Ordinary private work and gradual rollout can coexist; do not terminate paid agents.
+The disposable upper uses OverlayFS `volatile` mode so leaving a view does not
+synchronize the entire host filesystem. Source files and durable published lowers
+remain outside that writable overlay. A small mount helper is compiled once with
+`cc` and cached by its source hash; its preload is removed before running agent
+commands. Without compiler or kernel support, auto mode uses private caches.
 Lower file modes permit private copy-up writes; changing them to read-only would
 also prohibit ordinary upper writes through OverlayFS.
 
@@ -81,7 +86,13 @@ it is removed after a successful invocation. Toolchain/dependency changes made b
 an agent affect private files; the following round selects a new key. Disabling
 sharing moves the sparse private delta aside, starts an empty private build, and
 reconstructs outputs through normal cache preparation. Sparse deltas and whiteouts
-are never reused outside their overlay. Cache warming still runs inside the view
+are never reused outside their overlay. Host-side recovery snapshots copy from a
+short-lived merged view under the same reader lease; enumeration preserves deletions,
+while data copies open the lower or private backing file so XFS reflinks still work.
+Mechanical verification also enters that view before checking artifacts. A pre-reboot
+volatile upper is discarded and cache preparation restores the view before copying.
+Transient storage failures keep their retryable type across the snapshot subprocess.
+Cache warming still runs inside the view
 to prepare other dependencies, skipping already verified Mathlib outputs. A bwrap
 setup failure uses private fallback; a verified artifact missing through the fresh
 overlay stops sharing.
@@ -99,7 +110,11 @@ to a synced trash directory before deletion; interrupted deletion cannot leave a
 partial lower in the published namespace. A pool-level collector lock serializes
 trash reclamation and entry selection. Subsequent collection reclaims trash. Unlocked staging trees left by killed builders are
 reclaimed after four hours, before useful snapshots are evicted for disk pressure. Publication refuses to leave
-less than that reserve if no unused entries can be reclaimed.
+less than that reserve if no unused entries can be reclaimed. General worker
+storage admission pauses below 5% free, capped at 20 GiB, and resumes above 15%,
+capped at 40 GiB. Cleanup targets 20%, capped at 60 GiB, while retaining the
+existing managed-cache size limit. These byte caps keep large fleet disks usable
+without reserving hundreds of GiB for an idle admission threshold.
 
 The existing activity preparer collects small local preparation receipts. Status
 reads only that prepared summary, including sharing/private modes, cache hits,

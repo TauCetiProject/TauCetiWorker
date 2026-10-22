@@ -17,6 +17,12 @@ CRITICAL = 0.05
 MIN_PRIVATE_RECLAIM = 256 * 1024**2
 
 
+def headroom(total, fraction):
+    """Percentage thresholds on small disks, bounded free-byte reserves on fleet disks."""
+    ceiling = {CRITICAL: 20, LOW: 40, TARGET: 60}[fraction] * 1024**3
+    return min(int(total * fraction), ceiling)
+
+
 def initialize(pool):
     """An explicit ownership record is required before collecting a shared directory."""
     if pool.is_symlink():
@@ -111,8 +117,8 @@ def admit(cfg):
         checked.add(device)
         usage = shutil.disk_usage(location)
         marker = activity_root() / f"critical-{location.stat().st_dev}.json"
-        critical = usage.free / usage.total < CRITICAL
-        if usage.free / usage.total < LOW:
+        critical = usage.free < headroom(usage.total, CRITICAL)
+        if usage.free < headroom(usage.total, LOW):
             from .retention import request_cleanup
 
             request_cleanup()
@@ -122,9 +128,9 @@ def admit(cfg):
             with contextlib.suppress(OSError, ValueError):
                 atomic_json(marker, dict(active=True))
         critical = critical or read_json(marker).get("active", False)
-        if critical and usage.free / usage.total < LOW:
+        if critical and usage.free < headroom(usage.total, LOW):
             raise AdmissionUnavailable(
-                f"disk headroom low: {usage.free / 1024**3:.1f} GiB free; new work retries automatically above 15% free",
+                f"disk headroom low: {usage.free / 1024**3:.1f} GiB free; new work retries automatically above {headroom(usage.total, LOW) / 1024**3:.1f} GiB free",
                 state="waiting-storage",
             )
         if critical:
@@ -186,7 +192,7 @@ def collect(configs, *, dry=False, now=None, opened=...):
     pressured = [
         str(dev)
         for dev, row in devices.items()
-        if row["managed_bytes"] > row["limit_bytes"] or row["free_before"] / row["total"] < LOW
+        if row["managed_bytes"] > row["limit_bytes"] or row["free_before"] < headroom(row["total"], LOW)
     ]
     pool_device = pool.stat().st_dev if owned else None
     urgent = str(pool_device) in pressured
@@ -223,7 +229,7 @@ def collect(configs, *, dry=False, now=None, opened=...):
         usage, cap = limits(pool)
         if not urgent and now - stamp((clock, entry, key)) < LIFETIME:
             continue
-        if urgent and not dry and usage.free / usage.total >= TARGET and remaining <= cap:
+        if urgent and not dry and usage.free >= headroom(usage.total, TARGET) and remaining <= cap:
             urgent = False
             if now - stamp((clock, entry, key)) < LIFETIME:
                 continue
@@ -308,7 +314,7 @@ def collect(configs, *, dry=False, now=None, opened=...):
     pressured = [
         str(row["device"])
         for row in report["filesystems"]
-        if row["managed_bytes"] > row["limit_bytes"] or row["free_bytes"] / row["total"] < LOW
+        if row["managed_bytes"] > row["limit_bytes"] or row["free_bytes"] < headroom(row["total"], LOW)
     ]
     report["pressure"] = bool(pressured)
     if not dry:

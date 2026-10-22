@@ -148,6 +148,130 @@ class SharedTests(unittest.TestCase):
         self.assertFalse(hit)
         self.assertTrue((entry / "ready.json").is_file())
 
+    def test_host_snapshot_materializes_merged_cache_after_agent_view_exits(self):
+        self.require_overlay()
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(
+                prefix
+                + [
+                    "sh",
+                    "-c",
+                    'printf private > "$1/lib/lean/Mathlib.olean"; rm "$1/lib/lean/Mathlib/Test.olean"',
+                    "sh",
+                    str(build),
+                ],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+        self.assertFalse((build / "lib/lean/Mathlib.ilean").exists())
+        target = self.root / "state/verification-candidates" / ("a" * 32)
+        target.parent.mkdir(parents=True)
+        with patch.dict(os.environ, self.env):
+            snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        copied = target / ".lake/packages/mathlib/.lake"
+        self.assertEqual((copied / "build/lib/lean/Mathlib.olean").read_bytes(), b"private")
+        self.assertEqual((copied / "build/lib/lean/Mathlib.ilean").read_bytes(), b"verified artifact")
+        self.assertFalse((copied / "build/lib/lean/Mathlib/Test.olean").exists())
+        self.assertFalse((copied / "tauceti-overlay-work").exists())
+        self.assertFalse((copied / "tauceti-shared-mathlib.json").exists())
+
+    def test_disposable_overlay_is_volatile_without_leaking_the_mount_helper(self):
+        self.require_overlay()
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            upper = self.mathlib / ".lake/build"
+            code = "import os,sys;from pathlib import Path;assert 'overlay-mount' not in os.environ.get('LD_PRELOAD','');line=next(x for x in Path('/proc/self/mountinfo').read_text().splitlines() if x.split()[4]==sys.argv[1]);assert any(x in ('volatile','fsync=volatile') for x in line.split()[-1].split(','))"
+            subprocess.run(
+                prefix + [sys.executable, "-c", code, str(upper)], check=True, pass_fds=s.lease_fds(self.env)
+            )
+
+    def test_snapshot_storage_pressure_remains_retryable_across_mount_subprocess(self):
+        self.require_overlay()
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+        from tauceti_worker.verification_storage import Pressure
+
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            pass
+        target = self.root / "state/verification-candidates" / ("b" * 32)
+        target.parent.mkdir(parents=True)
+        with patch.dict(os.environ, {**self.env, "TAUCETI_VERIFY_MIN_FREE_BYTES": str(10**30)}):
+            with self.assertRaises(Pressure) as raised:
+                snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        self.assertEqual(raised.exception.reason, "filesystem-headroom")
+        self.assertFalse(target.exists())
+        self.assertTrue((self.cwd / "lakefile.toml").is_file())
+
+    def test_snapshot_discards_pre_reboot_volatile_cache_and_prepares_fresh_view(self):
+        self.require_overlay()
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(
+                prefix + ["sh", "-c", 'printf torn > "$1/lib/lean/Mathlib.olean"', "sh", str(build)],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+        marker = build.parent / "tauceti-shared-mathlib.json"
+        row = json.loads(marker.read_text())
+        row["boot_id"] = "old-boot"
+        marker.write_text(json.dumps(row))
+
+        @contextlib.contextmanager
+        def prepare(cwd, env, logdir):
+            with s.view(cwd, self.env, logdir, self.extract) as prefix:
+                yield prefix
+
+        target = self.root / "state/verification-candidates" / ("c" * 32)
+        target.parent.mkdir(parents=True)
+        with (
+            patch.dict(os.environ, self.env),
+            patch("tauceti_worker.agents.host_build_cache_context", side_effect=prepare),
+        ):
+            snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        self.assertEqual(
+            (target / ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean").read_bytes(), b"verified artifact"
+        )
+
+    def test_merged_copy_resolves_private_and_lower_backing_files_for_reflink(self):
+        self.require_overlay()
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            lower = self.pool / "entries" / self.env["TAUCETI_SHARED_MATHLIB_KEY"] / "build"
+            code = """import sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from tauceti_worker.verification_jobs import backing_source,copy_file
+build,lower,output=map(Path,sys.argv[2:])
+(build/'lib/lean/Mathlib.olean').write_bytes(b'private')
+for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified artifact')]:
+ source=backing_source(build/'lib/lean'/name,build,lower)
+ assert not source.is_relative_to(build),source
+ copy_file(source,output/name)
+ assert (output/name).read_bytes()==expected
+"""
+            output = self.root / "copied"
+            output.mkdir()
+            subprocess.run(
+                prefix
+                + [
+                    sys.executable,
+                    "-c",
+                    code,
+                    str(Path(__file__).resolve().parents[1]),
+                    str(build),
+                    str(lower),
+                    str(output),
+                ],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+
     def test_signature_binds_external_lake_config_by_content_and_cache_selection(self):
         config = self.root / "lake.toml"
         config.write_text("[cache]\n")

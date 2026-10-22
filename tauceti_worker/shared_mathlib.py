@@ -23,6 +23,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .paths import HERE
 from .processes import run as run_process
 from .runtime_status import atomic_json, read_json
 
@@ -113,13 +114,54 @@ def mode(env):
     return selection(env)[0]
 
 
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def overlay_preload():
+    """Stock bwrap has no overlay-option flag; keep the cache-only shim local."""
+    source = HERE / "scripts/OverlayMount.c"
+    key = hashlib.sha256(source.read_bytes()).hexdigest()
+    cache = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cache/tauceti/overlay-mount"
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = cache / (key + ".so")
+    with (cache / "build.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not target.exists():
+            compiler = shutil.which("cc")
+            if not compiler:
+                raise Unavailable("sharing needs a C compiler once to build the cache overlay helper; install cc")
+            with tempfile.TemporaryDirectory(dir=cache, prefix="build-") as temporary:
+                built = Path(temporary) / "overlay.so"
+                result = subprocess.run(
+                    [compiler, "-shared", "-fPIC", "-O2", str(source), "-o", str(built), "-ldl"],
+                    capture_output=True,
+                    timeout=30,
+                )
+                if result.returncode:
+                    raise Unavailable(
+                        "cannot compile cache overlay helper: " + result.stderr.decode(errors="replace")[-400:]
+                    )
+                os.replace(built, target)
+    return target
+
+
 def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
     """A private mount namespace with the overlay view and a read-only pool.
 
     Deliberately no PID namespace: agents and their tools must see ordinary host PIDs and /proc.
     Tools that report a PID to a service outside the namespace (systemd, D-Bus) break otherwise."""
+    original = os.environ.get("LD_PRELOAD")
+    preload = str(overlay_preload()) + (":" + original if original else "")
+    # Snapshot enumeration uses the merged view, but reflink must open the
+    # backing XFS file rather than an OverlayFS file descriptor (EXDEV).
+    raw_upper = upper.parent / "tauceti-overlay-upper"
+    raw_upper.mkdir(exist_ok=True)
     return [
+        "env",
+        "LD_PRELOAD=" + preload,
         "bwrap",
+        *(["--setenv", "LD_PRELOAD", original] if original else ["--unsetenv", "LD_PRELOAD"]),
         "--die-with-parent",
         "--bind",
         "/",
@@ -130,6 +172,9 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
         "--ro-bind",
         str(pool),
         str(pool),
+        "--ro-bind",
+        str(upper),
+        str(raw_upper),
         *(["--sync-fd", str(lease_fd)] if lease_fd is not None else []),
         "--overlay-src",
         str(lower),
@@ -182,7 +227,7 @@ def capability(directory=None):
                     + "; administrator may need to allow unprivileged user namespaces or provide an OverlayFS-capable filesystem",
                 )
         return True, "rootless OverlayFS works; immutable lower with private copy-on-write builds"
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (Unavailable, OSError, subprocess.TimeoutExpired) as error:
         return (
             False,
             f"rootless OverlayFS unavailable: {error}; use a local OverlayFS-capable filesystem and allow user namespaces",
@@ -839,7 +884,10 @@ def view(cwd, env, logdir, fetch):
                 upper.mkdir(parents=True)
                 if work.exists():
                     remove_tree(work)
-                atomic_json(marker, dict(key=key, activated_at=time.time()))
+                atomic_json(
+                    marker,
+                    dict(key=key, pool=str(pool), boot_id=boot_id(), activated_at=time.time()),
+                )
             work.mkdir(exist_ok=True)
             candidate = overlay_command(entry / "build", upper, work, upper, pool, lease_fd=lease.fileno())
             probe = subprocess.run(

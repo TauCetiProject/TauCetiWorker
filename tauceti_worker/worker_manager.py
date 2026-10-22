@@ -1060,6 +1060,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 except OSError:
                     pass
                 for wid in sorted(known_ids):
+                    # Reconciliation can outlast the control client's deadline on
+                    # busy hosts. Serve commands between workers, not only once
+                    # after scanning the whole fleet.
+                    ready, _, _ = select.select([server], [], [], 0)
+                    if ready:
+                        _serve_one(server, handle)
+                    if exiting:
+                        break
                     spec = wanted.get(wid)
                     live = runner_status(wid, state_dir, runtime_dir)
                     is_live = bool(live.get("alive"))
