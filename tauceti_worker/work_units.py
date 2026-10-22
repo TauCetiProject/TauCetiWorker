@@ -1281,7 +1281,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             nrnd = w.rs.review_rounds(pr, w.counters)
             log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
     logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    result_file = logf.with_suffix(".result.json")
+    result_file = logf.parent / "review-results" / (logf.stem + ".json")
     result_file.parent.mkdir(parents=True, exist_ok=True)
     # Never accept a result from an earlier invocation, including a same-head retry.
     result_file.unlink(missing_ok=True)
@@ -1326,6 +1326,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
         if rc == 0:
+            # Both changed and unchanged success prove the review is published.
+            w.counters.write(errkey, 0)
+            clear_review_failure(w.cfg.state, pr)
             try:
                 result = json.loads(result_file.read_text())
             except (OSError, ValueError):
@@ -1337,13 +1340,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
                 select("no-work")
                 return None
-            # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
-            # the "errored without completing a review" streak up front — BEFORE the publish step, which is
-            # a separate machine-wide concern. Otherwise a pre-post error streak (e.g. errkey=2) could
-            # combine with one later engine error to trip the escalation cap a round after a verdict was
-            # in fact posted, contradicting the "errored Nx without completing a review" message.
-            w.counters.write(errkey, 0)
-            clear_review_failure(w.cfg.state, pr)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
             # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
@@ -1403,6 +1399,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             )
         return rc
     finally:
+        result_file.unlink(missing_ok=True)
         # Drop the claim: on success the watermark now prevents a re-fire; on failure releasing it lets
         # the contest be retried. A crash before here leaves the 👀 to TTL out (CONTEST_CLAIM_TTL).
         if c.contest and c.contest_reply_id and not w.gh.remove_reaction(c.contest_reply_id):

@@ -28,11 +28,12 @@ def drive(directory, result, *, bubble=False):
     )
     c = SimpleNamespace(pr=42, head=HEAD, contest=None)
     opts = SimpleNamespace(work_model="claude")
-    target = directory / "review-42-fixed.result.json"
+    target = directory / "review-results" / "review-42-fixed.json"
+    target.parent.mkdir(exist_ok=True)
     target.write_text(json.dumps({"head_sha": HEAD, "changed": False}))
 
     def engine(*args, **kwargs):
-        path = kwargs["result_file"] if bubble else args[1].with_suffix(".result.json")
+        path = kwargs["result_file"] if bubble else args[1].parent / "review-results" / (args[1].stem + ".json")
         assert path == target and not path.exists(), "stale invocation result was not removed"
         if result is not None:
             path.write_text(json.dumps(result))
@@ -50,6 +51,7 @@ def drive(directory, result, *, bubble=False):
         round.select("review")
         rc = wu.do_review(w, None, c, opts, bubble)
         round.finish(NoProgress("other candidates exhausted") if rc is None else None)
+    assert not target.exists(), "result files must be removed after every invocation"
     return rc, values, busted, synced, events
 
 
@@ -57,7 +59,7 @@ with tempfile.TemporaryDirectory() as tmp:
     directory = Path(tmp)
     for bubble in (False, True):
         rc, values, busted, synced, events = drive(directory, {"head_sha": HEAD, "changed": False}, bubble=bubble)
-        assert rc is None and values["review-err-42"] == 2 and busted == [42] and not synced
+        assert rc is None and values["review-err-42"] == 0 and busted == [42] and not synced
         finish = next(v for k, v in events if k == "round_finished")
         assert finish["round_type"] == "no-work" and finish["outcome"] != "completed"
     for result in ({"head_sha": HEAD, "changed": True}, {"head_sha": "other", "changed": False}, None, []):
@@ -71,5 +73,7 @@ with tempfile.TemporaryDirectory() as tmp:
         patch.dict(os.environ, {"TAUCETI_STREAM": "1"}),
     ):
         agents.run_to_logfile(["engine"], directory / "review.log", "review #42")
-        assert run.call_args.kwargs["env"]["TAUCETI_REVIEW_RESULT_FILE"] == str(directory / "review.result.json")
+        assert run.call_args.kwargs["env"]["TAUCETI_REVIEW_RESULT_FILE"] == str(
+            directory / "review-results" / "review.json"
+        )
 print("PASS: unchanged host/bubble reviews select other work; real and older-engine outcomes still count")

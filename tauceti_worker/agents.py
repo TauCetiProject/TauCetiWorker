@@ -1197,7 +1197,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
         api_env = {
             **(os.environ if api_env is None else api_env),
             "TAUCETI_GITHUB_HISTORY_BRIDGE": "1",
-            "TAUCETI_REVIEW_RESULT_FILE": str(logf.with_suffix(".result.json")),
+            "TAUCETI_REVIEW_RESULT_FILE": str(logf.parent / "review-results" / (logf.stem + ".json")),
         }
         if "tauceti-review" in argv:
             from .github import claims_repo
