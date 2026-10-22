@@ -35,6 +35,29 @@ def copy_file(source, target):
         return shutil.copy2(source, target)
 
 
+def backing_source(source, build, lower):
+    """Merged enumeration owns whiteouts; open real backing files for reflink."""
+    source = Path(source)
+    if not source.is_relative_to(build):
+        return source
+    relative = source.relative_to(build)
+    private = build.parent / "tauceti-overlay-upper" / relative
+    return private if private.is_file() else lower / relative
+
+
+def snapshot_command():
+    """Private subprocess entry; preserve retryable storage failures across IPC."""
+    payload = json.load(sys.stdin)
+    for name in ("root", "target", "immutable_packages"):
+        if payload.get(name) is not None:
+            payload[name] = Path(payload[name])
+    try:
+        snapshot(**payload)
+    except Pressure as error:
+        print(json.dumps(dict(pressure=error.reason, error=str(error))))
+        raise SystemExit(75) from error
+
+
 def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """A failed copy is disposable until the caller durably publishes isolated ownership."""
     from .shared_mathlib import remove_tree
@@ -63,7 +86,7 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
             pool = Path(shared.get("pool") or shared_mathlib.root())
             with shared_mathlib.key_lock(pool, key, exclusive=False) as lease:
                 lower = pool / "entries" / key / "build"
-                if lower.is_dir():
+                if lower.is_dir() and shared.get("boot_id") == shared_mathlib.boot_id():
                     work = upper.with_name("tauceti-overlay-work")
                     work.mkdir(exist_ok=True)
                     payload = dict(
@@ -73,29 +96,38 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
                         immutable_packages=str(immutable_packages) if immutable_packages else None,
                         include_builds=include_builds,
                     )
-                    code = "import sys,json;sys.path.insert(0,sys.argv[1]);from pathlib import Path;from tauceti_worker.verification_jobs import snapshot;d=json.load(sys.stdin);d.update({k:Path(d[k]) for k in ('root','target')});d['immutable_packages']=Path(d['immutable_packages']) if d['immutable_packages'] else None;snapshot(**d)"
+                    env = dict(os.environ)
+                    package = str(Path(__file__).resolve().parent.parent)
+                    env["PYTHONPATH"] = package + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
                     result = subprocess.run(
                         shared_mathlib.overlay_command(lower, upper, work, upper, pool, lease_fd=lease.fileno())
-                        + [sys.executable, "-c", code, str(Path(__file__).resolve().parent.parent)],
+                        + [sys.executable, "-m", "tauceti_worker.verification_jobs"],
                         input=json.dumps(payload),
+                        env=env,
                         text=True,
                         capture_output=True,
                         pass_fds=(lease.fileno(),),
                     )
+                    if result.returncode == 75:
+                        failure = json.loads(result.stdout)
+                        raise Pressure(failure["error"], reason=failure["pressure"])
                     if result.returncode:
                         raise Incomplete(
                             "merged Mathlib snapshot failed: " + result.stderr[-1000:], reason="preservation"
                         )
                     return
-                # A collected lower is a cache miss. Rehydrate normally before
-                # copying; never turn a sparse upper into a cold source build.
-                from .agents import prepare_host_build_caches
+            # A collected lower or pre-reboot disposable upper is a cache
+            # miss. Rehydrate normally, with the normal service config.
+            from .agents import host_build_cache_context
 
-                shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
-                try:
-                    prepare_host_build_caches(root, dict(os.environ), state / "verification-cache-prepare")
-                except Exception as error:
-                    raise Incomplete(f"Mathlib cache preparation pending: {error}", reason="preservation") from error
+            shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
+            try:
+                with host_build_cache_context(root, dict(os.environ), state / "verification-cache-prepare"):
+                    return snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=True)
+            except Pressure:
+                raise
+            except Exception as error:
+                raise Pressure(f"Mathlib cache preparation pending: {error}", reason="cache") from error
         return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
@@ -122,9 +154,18 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
         amount = reserve(target.parent.parent, target.name)
         budget = CopyBudget(amount, target)
 
+        build = root / ".lake/packages/mathlib/.lake/build"
+        shared = read_json(build.parent / "tauceti-shared-mathlib.json")
+        lower = None
+        if shared and build.is_mount():
+            from .shared_mathlib import root as shared_root
+
+            lower = Path(shared.get("pool") or shared_root()) / "entries" / shared["key"] / "build"
+
         def copy(source, dest):
             budget.charge(Path(source))
-            return copy_file(source, dest)
+            actual = backing_source(source, build, lower) if lower is not None else source
+            return copy_file(actual, dest)
 
         index = git(root, "rev-parse", "--git-path", "index").decode().strip()
         index = Path(index) if Path(index).is_absolute() else root / index
@@ -181,6 +222,7 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                         "__pycache__",
                         "tauceti-scope",
                         "tauceti-overlay-work",
+                        "tauceti-overlay-upper",
                         "tauceti-shared-mathlib.json",
                         "build-before-sharing",
                         "build-shared-delta",
@@ -666,3 +708,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         report_runtime("verification-incomplete", detail=str(error), verification_job=job["id"])
                     return True
     return False
+
+
+if __name__ == "__main__":
+    snapshot_command()

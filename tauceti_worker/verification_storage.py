@@ -216,7 +216,11 @@ def free_space(path, *, additional=0):
         raise Configuration("TAUCETI_VERIFY_MIN_FREE_PERCENT must be an integer from 0 through 99") from None
     if not 0 <= percent < 100:
         raise Configuration("TAUCETI_VERIFY_MIN_FREE_PERCENT must be an integer from 0 through 99")
-    reserve = max(setting("MIN_FREE_BYTES", 20 * GIB), usage.total * percent // 100)
+    from .cache_storage import CRITICAL, headroom
+
+    reserve = max(
+        setting("MIN_FREE_BYTES", 20 * GIB), min(usage.total * percent // 100, headroom(usage.total, CRITICAL))
+    )
     if usage.free - additional < reserve:
         raise Pressure(
             f"verification disk reserve: {usage.free} bytes free; need {reserve + additional}",

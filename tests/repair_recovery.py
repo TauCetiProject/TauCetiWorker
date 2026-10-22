@@ -3009,9 +3009,23 @@ class RealVerifierIntegration(unittest.TestCase):
         cfg.logdir.mkdir()
         w = SimpleNamespace(cfg=cfg, rc=SimpleNamespace(deadline=__import__("time").time() + 60))
         backend = rr.WorkerBackend(w, SimpleNamespace())
-        with patch("tauceti_worker.agents.host_build_cache_context") as prepared:
-            prepared.return_value.__enter__.return_value = ["env"]
+        import contextlib
+
+        from tauceti_worker import processes
+
+        @contextlib.contextmanager
+        def prepared(checkout, env, logdir):
+            env["LAKE_CONFIG"] = str(case.home / "throwaway-cache-config.toml")
+            yield ["env"]
+
+        with (
+            patch("tauceti_worker.agents.host_build_cache_context", side_effect=prepared),
+            patch.object(processes, "run", wraps=processes.run) as helper,
+        ):
             result = backend.verify(case.root, dict(authorization={}), dict(labels=[], ref="repair", head=case.base))
+        self.assertEqual(
+            helper.call_args.kwargs["env"]["LAKE_CONFIG"], str(case.root.parent / "verification-lake.toml")
+        )
         self.assertEqual(result["status"], "success", result.get("error"))
         self.assertEqual(result["scope"]["base"], case.base)
 

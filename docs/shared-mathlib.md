@@ -87,8 +87,12 @@ an agent affect private files; the following round selects a new key. Disabling
 sharing moves the sparse private delta aside, starts an empty private build, and
 reconstructs outputs through normal cache preparation. Sparse deltas and whiteouts
 are never reused outside their overlay. Host-side recovery snapshots copy from a
-short-lived merged view under the same reader lease; mechanical verification
-also enters that view before checking artifacts. Cache warming still runs inside the view
+short-lived merged view under the same reader lease; enumeration preserves deletions,
+while data copies open the lower or private backing file so XFS reflinks still work.
+Mechanical verification also enters that view before checking artifacts. A pre-reboot
+volatile upper is discarded and cache preparation restores the view before copying.
+Transient storage failures keep their retryable type across the snapshot subprocess.
+Cache warming still runs inside the view
 to prepare other dependencies, skipping already verified Mathlib outputs. A bwrap
 setup failure uses private fallback; a verified artifact missing through the fresh
 overlay stops sharing.

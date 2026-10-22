@@ -180,7 +180,7 @@ Default settings (positive integers except the percentage, which permits zero):
 | `TAUCETI_VERIFY_CANDIDATE_BYTES` | 32 GiB | Candidate-size target that triggers early completed-cache reclamation |
 | `TAUCETI_VERIFY_OWNERSHIP_SECONDS` | 2 | Separate bound for one process-reference observation per cleanup slice |
 | `TAUCETI_VERIFY_MIN_FREE_BYTES` | 20 GiB | Actual minimum filesystem headroom |
-| `TAUCETI_VERIFY_MIN_FREE_PERCENT` | 10 | Actual percentage headroom; the larger absolute/percentage value applies |
+| `TAUCETI_VERIFY_MIN_FREE_PERCENT` | 10 | Percentage headroom capped at the worker critical reserve (at most 20 GiB); explicit `MIN_FREE_BYTES` remains a minimum |
 | `TAUCETI_VERIFY_COMPLETED_CACHE_SECONDS` | 900 | Completed-job cache grace period (15 minutes) |
 | `TAUCETI_VERIFY_IDLE_CACHE_SECONDS` | 21600 | Idle pending-job cache lifetime (6 hours) |
 | `TAUCETI_VERIFY_STORAGE_DIR` | Host-local state directory | Shared observation root; use private state for tests |

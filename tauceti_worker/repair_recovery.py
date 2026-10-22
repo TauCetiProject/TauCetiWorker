@@ -1174,13 +1174,6 @@ class WorkerBackend:
                 if getattr(self, "record", None):
                     self.prepare_source(checkout, self.record, m, self.journal)
                 base = saved._rev(checkout, f"origin/{BASE_BRANCH}")
-                verifier = Verification(
-                    checkout,
-                    self.w.cfg.state,
-                    base=base,
-                    policy=policy,
-                    deadline=self.w.rc.deadline,
-                )
                 j = getattr(self, "journal", {})
                 current = self.verification_fingerprint(checkout, m, facts)
                 if j.get("failed_fingerprint") == current and j.get("failed_recheck_at", 0) > time.time():
@@ -1190,6 +1183,8 @@ class WorkerBackend:
                     # the existing verifier inside the same merged Mathlib view,
                     # rather than rehydrating another full private dependency build.
                     env = dict(cache_env, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy)
+                    if os.environ.get("LAKE_CONFIG"):
+                        env["LAKE_CONFIG"] = os.environ["LAKE_CONFIG"]
                     if self.w.rc.deadline is not None:
                         env["TAUCETI_ROUND_DEADLINE"] = str(self.w.rc.deadline)
                     logpath = self.w.cfg.logdir / "recovery-verification.log"
@@ -1216,6 +1211,13 @@ class WorkerBackend:
                             status="incomplete", error=f"verification helper produced no receipt; see {logpath}"
                         )
                 else:
+                    verifier = Verification(
+                        checkout,
+                        self.w.cfg.state,
+                        base=base,
+                        policy=policy,
+                        deadline=self.w.rc.deadline,
+                    )
                     result = verifier.run()
                 if result.get("status") == "failed" and getattr(self, "record", None):
                     failures = j.get("verification_failures", 0) + 1 if j.get("failed_fingerprint") == current else 1

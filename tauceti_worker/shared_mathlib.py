@@ -114,6 +114,10 @@ def mode(env):
     return selection(env)[0]
 
 
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
 def overlay_preload():
     """Stock bwrap has no overlay-option flag; keep the cache-only shim local."""
     source = HERE / "scripts/OverlayMount.c"
@@ -149,6 +153,10 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
     Tools that report a PID to a service outside the namespace (systemd, D-Bus) break otherwise."""
     original = os.environ.get("LD_PRELOAD")
     preload = str(overlay_preload()) + (":" + original if original else "")
+    # Snapshot enumeration uses the merged view, but reflink must open the
+    # backing XFS file rather than an OverlayFS file descriptor (EXDEV).
+    raw_upper = upper.parent / "tauceti-overlay-upper"
+    raw_upper.mkdir(exist_ok=True)
     return [
         "env",
         "LD_PRELOAD=" + preload,
@@ -164,6 +172,9 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
         "--ro-bind",
         str(pool),
         str(pool),
+        "--ro-bind",
+        str(upper),
+        str(raw_upper),
         *(["--sync-fd", str(lease_fd)] if lease_fd is not None else []),
         "--overlay-src",
         str(lower),
@@ -873,7 +884,10 @@ def view(cwd, env, logdir, fetch):
                 upper.mkdir(parents=True)
                 if work.exists():
                     remove_tree(work)
-                atomic_json(marker, dict(key=key, pool=str(pool), activated_at=time.time()))
+                atomic_json(
+                    marker,
+                    dict(key=key, pool=str(pool), boot_id=boot_id(), activated_at=time.time()),
+                )
             work.mkdir(exist_ok=True)
             candidate = overlay_command(entry / "build", upper, work, upper, pool, lease_fd=lease.fileno())
             probe = subprocess.run(

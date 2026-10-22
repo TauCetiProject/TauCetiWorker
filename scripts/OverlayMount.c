@@ -26,7 +26,9 @@ int mount(const char *source, const char *target, const char *type,
      * a durability promise to preserve across those sequential mounts. */
     const char *work = strstr((const char *)data, "workdir=/proc/self/fd/");
     int workfd;
-    if (work && sscanf(work, "workdir=/proc/self/fd/%d", &workfd) == 1) {
+    if (!work || sscanf(work, "workdir=/proc/self/fd/%d", &workfd) != 1)
+        return real_mount(source, target, type, flags, data);
+    {
         char marker[128];
         snprintf(marker, sizeof(marker), "/proc/self/fd/%d/work/incompat/volatile/dirty", workfd);
         if (unlink(marker) && errno != ENOENT) return -1;
