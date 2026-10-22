@@ -38,6 +38,13 @@ class IntegrityFailure(Unavailable):
 LOCK_WAIT_SECONDS = 1500  # fresh extraction can take up to 1200 seconds
 
 
+def disk_reserve(usage):
+    # A percentage alone reserves hundreds of GiB on large fleet disks and
+    # disables sharing precisely when removing duplicate builds would help.
+    # Keep the small-filesystem policy, capped at 20 GiB of actual free space.
+    return min(int(usage.total * 0.1), 20 * 1024**3)
+
+
 def root(env=None):
     env = os.environ if env is None else env
     login = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -540,7 +547,7 @@ def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
         if entry.name in protect:
             continue
         usage = shutil.disk_usage(pool)
-        if now - entry.stat().st_mtime < max_age and usage.free / usage.total >= 0.1:
+        if now - entry.stat().st_mtime < max_age and usage.free >= disk_reserve(usage):
             continue
         try:
             with key_lock(pool, entry.name, nonblocking=True, readonly=dry_run):
@@ -600,8 +607,10 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         return entry, True
     collect(pool, protect=(key,))
     usage = shutil.disk_usage(pool)
-    if usage.free / usage.total < 0.1:
-        raise Unavailable("shared snapshot pool has under 10% disk free and no unused snapshots can be removed")
+    if usage.free < disk_reserve(usage):
+        raise Unavailable(
+            "shared snapshot pool is below its free-space reserve (10%, capped at 20 GiB) and no unused snapshots can be removed"
+        )
     staging = pool / "staging"
     staging.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=key + "-", dir=staging) as raw:
@@ -659,8 +668,10 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         )
         collect(pool, protect=(key,))
         usage = shutil.disk_usage(pool)
-        if usage.free / usage.total < 0.1:
-            raise Unavailable("snapshot extraction would leave under 10% disk free; using private builds")
+        if usage.free < disk_reserve(usage):
+            raise Unavailable(
+                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB); using private builds"
+            )
         entry.parent.mkdir(parents=True, exist_ok=True)
         os.replace(ready, entry)
         fd = os.open(entry.parent, os.O_RDONLY)
