@@ -6,6 +6,7 @@ No installation credentials leave the server. Conditional reads always contact i
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import hashlib
 import http.client
@@ -218,25 +219,20 @@ def _renew(state, probe):
     return {**state, "probe_until": time.time() + PROBE_LEASE} if state.get("probe") == probe else state
 
 
-def _recovered(state, key):
+def _recovered(state):
     # A complete response accepted now proves the mirror can answer, even if
     # concurrent requests failed after this one began. Keeping the circuit open
     # would discard healthy responses and amplify a short timeout burst.
-    now = time.time()
-    cooling = {k: v for k, v in state.get("coverage_until", {}).items() if k != key and v > now}
-    return {
-        "failures": 0,
-        "until": 0,
-        **({"coverage_until": cooling, "coverage_reason": state.get("coverage_reason", "")} if cooling else {}),
-    }
+    if not state:
+        return state  # Healthy queries need no persistent circuit file.
+    recovered = {"failures": 0, "until": 0}
+    return state if recovered == state else recovered
 
 
-def _cooldown(state, operation, key, until, reason):
+def _cooldown(state, operation, until, reason):
     if operation != "survey":
         return state
-    now = time.time()
-    active = {k: v for k, v in state.get("coverage_until", {}).items() if v > now}
-    return {**state, "coverage_until": {**active, key: until}, "coverage_reason": reason}
+    return {**state, "coverage_until": until, "coverage_reason": reason}
 
 
 def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=False, _optional=False, **args):
@@ -272,11 +268,31 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     ).hexdigest()
     cached_path = base / "responses" / (key + ".json")
     cached = _cached(cached_path, binding)
-    probe = None
-    # An unsupported repository/auth scope must not poison healthy TauCeti reads.
-    circuit = base / "circuits" / (hashlib.sha256(repo.encode()).hexdigest() + ".json")
+    # Retry-After is an instruction from the service, not one PR's latency.
+    cooldown = base / "retry-after.json"
     try:
-        with transport.locked(circuit.with_suffix(".lock"), timeout=1):
+        limited = json.loads(cooldown.read_text())
+        if limited.get("until", 0) > time.time():
+            return _unavailable(
+                repo,
+                operation,
+                limited["reason"],
+                limited.get("detail", ""),
+                status=limited.get("status"),
+                retry_at=limited["until"],
+                circuit="open",
+                cached=cached,
+            )
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    probe = None
+    # A slow PR history must not suppress healthy reads of every other PR.
+    # Identical queries still share the outage backoff and single recovery probe.
+    circuit = base / "circuits" / (key + ".json")
+    try:
+        with (
+            transport.locked(circuit.with_suffix(".lock"), timeout=1) if circuit.exists() else contextlib.nullcontext()
+        ):
             try:
                 state = json.loads(circuit.read_text())
             except (OSError, ValueError):
@@ -294,14 +310,14 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                     circuit="open",
                     cached=cached,
                 )
-            if operation == "survey" and state.get("coverage_until", {}).get(key, 0) > now:
+            if operation == "survey" and state.get("coverage_until", 0) > now:
                 # The global inventory is backfilling; peers share one cooldown instead of each asking.
                 return _unavailable(
                     repo,
                     operation,
                     "coverage_unavailable",
                     state.get("coverage_reason", ""),
-                    retry_at=state["coverage_until"][key],
+                    retry_at=state["coverage_until"],
                     cached=cached,
                 )
             if state.get("failures", 0) >= 3:
@@ -383,7 +399,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         # The service does not serve this repository to this client: a scope/config fix.
                         return _unavailable(repo, operation, "client_auth_configuration", detail, cached=cached)
                     retry_at = time.time() + 30 * random.uniform(0.8, 1.2)
-                    _circuit_update(circuit, _cooldown, operation, key, retry_at, detail)
+                    _circuit_update(circuit, _cooldown, operation, retry_at, detail)
                     return _unavailable(
                         repo, operation, "coverage_unavailable", detail, retry_at=retry_at, cached=cached
                     )
@@ -410,7 +426,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                             )
                     except OSError:
                         pass  # A healthy mirror remains usable when the local cache is unavailable.
-                    _circuit_update(circuit, _recovered, key)
+                    if circuit.exists():
+                        _circuit_update(circuit, _recovered)
                     transport.event(
                         {
                             "kind": "gateway_read",
@@ -450,7 +467,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
             urllib.error.URLError,
         ) as error:
             last = _classify(error, token)
-            if time.monotonic() >= deadline or last.reason == "client_auth_configuration":
+            if time.monotonic() >= deadline or last.reason == "client_auth_configuration" or last.retry_after:
                 break
     retry_at = time.time() + max(last.retry_after or 0, 5 * random.uniform(0.8, 1.2))
 
@@ -473,6 +490,21 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
         }
 
     _circuit_update(circuit, failed)
+    if last.retry_after:
+        until = time.time() + last.retry_after
+        _circuit_update(
+            cooldown,
+            lambda state: (
+                state
+                if state.get("until", 0) >= until
+                else {
+                    "until": until,
+                    "reason": last.reason,
+                    "detail": last.detail,
+                    "status": last.status,
+                }
+            ),
+        )
     return _unavailable(repo, operation, last.reason, last.detail, status=last.status, retry_at=retry_at, cached=cached)
 
 
