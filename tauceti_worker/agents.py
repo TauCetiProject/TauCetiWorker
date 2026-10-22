@@ -1194,7 +1194,11 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     check_launch_admission()
     api_env = review_environment()
     if label.startswith("review #"):
-        api_env = {**(os.environ if api_env is None else api_env), "TAUCETI_GITHUB_HISTORY_BRIDGE": "1"}
+        api_env = {
+            **(os.environ if api_env is None else api_env),
+            "TAUCETI_GITHUB_HISTORY_BRIDGE": "1",
+            "TAUCETI_REVIEW_RESULT_FILE": str(logf.with_suffix(".result.json")),
+        }
         if "tauceti-review" in argv:
             from .github import claims_repo
             from .paths import CLAIM_SH
@@ -2456,7 +2460,9 @@ def _kiro_review_model(reviewers: str) -> str | None:
     return _validate_kiro_model_pin(model, "$TAUCETI_REVIEW_KIRO_MODEL" if configured else "repository default")
 
 
-def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
+def review_in_bubble(
+    w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
+) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
     model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
@@ -2500,6 +2506,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     store = cfg.store_dir
     store.mkdir(parents=True, exist_ok=True)
     mounts = [f"{engine_dir}:/opt/engine:ro", f"{roadmap_dir}:/opt/roadmap:ro", f"{store}:/opt/review-store:rw"]
+    if result_file is not None:
+        mounts.append(f"{result_file.parent}:/opt/review-result:rw")
     # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview). --no-mathlib for now; wiring
     # --mathlib-dir at the bubble's vendored .lake/packages/mathlib is the reuse-rubric refinement.
     # run_in_bubble prefixes `env PATH=… `, so the inner command must start with an executable, not the
@@ -2520,6 +2528,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )
+    if result_file is not None:
+        inner = f"env TAUCETI_REVIEW_RESULT_FILE=/opt/review-result/{shlex.quote(result_file.name)} " + inner
     if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":
         inner += " --auth api"
     if km:

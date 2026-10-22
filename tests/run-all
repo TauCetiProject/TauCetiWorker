@@ -124,6 +124,7 @@ RUN_STDLIB=(
   review_codex_model.py
   review_diagnostics.py
   review_provider_down.py
+  review_outcomes.py
   review_scheduling.py
   review_state_freshness.py
   review_throttles.py

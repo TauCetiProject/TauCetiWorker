@@ -1280,11 +1280,15 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         else:
             nrnd = w.rs.review_rounds(pr, w.counters)
             log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers}")
+    logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    result_file = logf.with_suffix(".result.json")
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    # Never accept a result from an earlier invocation, including a same-head retry.
+    result_file.unlink(missing_ok=True)
     try:
         if bubble:
-            rc = review_in_bubble(w, pr, head, reviewers, opts)
+            rc = review_in_bubble(w, pr, head, reviewers, opts, result_file=result_file)
         else:
-            logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
@@ -1322,6 +1326,17 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
         if rc == 0:
+            try:
+                result = json.loads(result_file.read_text())
+            except (OSError, ValueError):
+                result = None
+            if isinstance(result, dict) and result.get("head_sha") == head and result.get("changed") is False:
+                log(f"  review #{pr}: published verdict unchanged — selecting other work")
+                w.rs.bust(pr)
+                from .activity import select
+
+                select("no-work")
+                return None
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without completing a review" streak up front — BEFORE the publish step, which is
             # a separate machine-wide concern. Otherwise a pre-post error streak (e.g. errkey=2) could
