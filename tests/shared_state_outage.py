@@ -97,8 +97,11 @@ class StateClient(unittest.TestCase):
         self.assertEqual(failure["dependency"], "github-state")
         return failure
 
-    def circuit(self):
-        (path,) = (self.root / "gateway").glob("*/circuits/*.json")
+    def circuit(self, number=7):
+        key = state.hashlib.sha256(
+            json.dumps(["org/repo", "issue_comments", {"number": number}, False], sort_keys=True).encode()
+        ).hexdigest()
+        (path,) = (self.root / "gateway").glob("*/circuits/" + key + ".json")
         return json.loads(path.read_text())
 
     def test_injected_failures_have_structured_sanitized_reasons(self):
@@ -122,6 +125,8 @@ class StateClient(unittest.TestCase):
                 self.assertEqual(failure["actionable"], reason == "client_auth_configuration")
                 for circuit in (self.root / "gateway").glob("*/circuits/*.json"):
                     circuit.unlink()  # Each case starts with a closed circuit.
+                for cooldown in (self.root / "gateway").glob("*/retry-after.json"):
+                    cooldown.unlink()
         self.assertNotIn(SECRET, (self.root / "requests.jsonl").read_text())
         failure = self.fail_with(fails(503, b'{"error":"Exceeded the maximum database size."}'))
         self.assertEqual((failure["status"], failure["detail"]), (503, "Exceeded the maximum database size."))
@@ -240,11 +245,28 @@ class StateClient(unittest.TestCase):
             with self.subTest(value=value):
                 for _ in range(3):
                     failure = self.fail_with(fails(429, b"", {"Retry-After": value}))
-                until = self.circuit()["until"]
+                until = failure["retry_at"]
                 self.assertTrue(time.time() < until <= time.time() + 360, until)
                 self.assertTrue(time.time() < failure["retry_at"] <= time.time() + 360)
                 for circuit in (self.root / "gateway").glob("*/circuits/*.json"):
                     circuit.unlink()
+                for cooldown in (self.root / "gateway").glob("*/retry-after.json"):
+                    cooldown.unlink()
+
+    def test_retry_after_applies_to_other_queries_without_probing_the_service(self):
+        with patch.object(
+            state.urllib.request, "urlopen", side_effect=fails(429, b"slow down", {"Retry-After": "120"})
+        ) as request:
+            self.assertEqual(state.read("org/repo", "issue_comments", number=7), (False, None))
+            self.assertEqual(request.call_count, 1, "Retry-After also forbids an immediate same-query retry")
+        with patch.object(state.urllib.request, "urlopen") as request:
+            self.assertEqual(state.read("org/repo", "issue_comments", number=8), (False, None))
+            self.assertEqual(state.last_failure()["reason"], "http_429")
+            request.assert_not_called()
+        (cooldown,) = (self.root / "gateway").glob("*/retry-after.json")
+        cooldown.write_text(json.dumps({"until": 0}))
+        with patch.object(state.urllib.request, "urlopen", return_value=Response(page([]))):
+            self.assertEqual(state.read("org/repo", "issue_comments", number=8), (True, []))
 
     def test_unavailable_inventory_shares_a_cooldown(self):
         unavailable = {
@@ -318,7 +340,7 @@ class StateClient(unittest.TestCase):
                 return Response(page([{"id": "1"}], cursor="p1"))
             # Past the initial lease, but within the renewed one.
             peer.append(True)
-            outcome = state.read("org/repo", "issue_comments", number=8)
+            outcome = state.read("org/repo", "issue_comments", number=7)
             peer.append(state.last_failure())
             self.assertEqual(outcome, (False, None))
             return Response(page([{"id": "2"}]))
@@ -335,14 +357,14 @@ class StateClient(unittest.TestCase):
         def outage_during_request(*_a, **_k):
             for _ in range(3):
                 with patch.object(state.urllib.request, "urlopen", side_effect=fails(503)):
-                    state.read("org/repo", "issue_comments", number=8)
+                    state.read("org/repo", "issue_comments", number=7)
             return Response(page([]))
 
         with patch.object(state.urllib.request, "urlopen", side_effect=outage_during_request):
             self.assertTrue(state.read("org/repo", "issue_comments", number=7)[0])
         self.assertEqual(self.circuit(), {"failures": 0, "until": 0})
         with patch.object(state.urllib.request, "urlopen", return_value=Response(page([]))) as request:
-            self.assertEqual(state.read("org/repo", "issue_comments", number=8), (True, []))
+            self.assertEqual(state.read("org/repo", "issue_comments", number=7), (True, []))
             self.assertEqual(request.call_count, 1)
         # A continuing outage still opens the circuit and suppresses peers.
         for _ in range(3):
@@ -350,23 +372,32 @@ class StateClient(unittest.TestCase):
         self.assertEqual(self.circuit()["failures"], 3)
         self.assertGreater(self.circuit()["until"], time.time())
         with patch.object(state.urllib.request, "urlopen") as request:
-            self.assertEqual(state.read("org/repo", "issue_comments", number=8), (False, None))
+            self.assertEqual(state.read("org/repo", "issue_comments", number=7), (False, None))
             request.assert_not_called()
 
-    def test_recovery_preserves_other_queries_coverage_cooldowns(self):
+    def test_one_slow_history_cannot_open_the_circuit_for_other_prs(self):
+        for _ in range(3):
+            self.fail_with(TimeoutError("slow history"))
+        with patch.object(state.urllib.request, "urlopen", return_value=Response(page([]))) as request:
+            self.assertEqual(state.read("org/repo", "issue_comments", number=8), (True, []))
+            self.assertEqual(request.call_count, 1)
+        self.assertEqual(self.circuit()["failures"], 3)
+        self.assertEqual(len(list((self.root / "gateway").glob("*/circuits/*.json"))), 1)
+        self.assertEqual(len(list((self.root / "gateway").glob("*/circuits/*.lock"))), 1)
+
+    def test_recovery_clears_this_queries_coverage_cooldown(self):
         now = time.time()
         recovered = state._recovered(
             {
                 "failures": 3,
                 "until": now + 30,
-                "coverage_until": {"this": now + 60, "other": now + 60},
+                "coverage_until": now + 60,
                 "coverage_reason": "backfilling",
             },
-            "this",
         )
         self.assertEqual(recovered["failures"], 0)
         self.assertEqual(recovered["until"], 0)
-        self.assertEqual(recovered["coverage_until"], {"other": now + 60})
+        self.assertNotIn("coverage_until", recovered)
 
     def test_backoff_is_bounded_and_jittered(self):
         values = {round(state._backoff(n), 3) for n in range(3, 30) for _ in range(3)}
