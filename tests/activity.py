@@ -412,7 +412,6 @@ class ActivityTests(unittest.TestCase):
             at=self.now,
             worker="worker",
             machine_id="machine",
-            marker_posted=False,
             git_held=True,
         )
         journal.write_text(json.dumps(event) + "\n")
@@ -424,9 +423,7 @@ class ActivityTests(unittest.TestCase):
             db.execute("DELETE FROM meta WHERE key='coordination_journal_schema'")
         a.prepare(now=self.now)
         a.prepare(now=self.now)
-        self.assertEqual(
-            a.cached()["summary"]["local_coordination"]["24h"], dict(started=1, marker_failed=1, git_held=1)
-        )
+        self.assertEqual(a.cached()["summary"]["local_coordination"]["24h"], dict(started=1, git_held=1))
 
     def test_backfill_ignores_resource_receipts(self):
         logs = Path(self.tmp.name) / "logs" / "worker"

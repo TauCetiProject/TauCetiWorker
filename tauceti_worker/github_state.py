@@ -554,7 +554,6 @@ def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None, allow_
             if (
                 facts.get("meta") is not None
                 and not isinstance(facts["meta"], dict)
-                or not isinstance(facts.get("markers"), list)
                 or not isinstance(facts.get("rebase_heads"), list)
             ):
                 raise ValueError("invalid survey facts")
@@ -579,14 +578,6 @@ def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None, allow_
                 not isinstance(value, str) for value in pr.get("target_focuses", [])
             ):
                 raise ValueError("invalid survey targets")
-            for marker in facts["markers"]:
-                if (
-                    not isinstance(marker, dict)
-                    or type(marker.get("expires_at")) is not int
-                    or not isinstance(marker.get("providers"), list)
-                    or any(not isinstance(provider, str) for provider in marker["providers"])
-                ):
-                    raise ValueError("invalid survey claim")
         counts = result.get("author_counts")
         if counts is not None and (
             not isinstance(counts, dict) or any(type(count) is not int or count < 0 for count in counts.values())

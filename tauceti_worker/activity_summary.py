@@ -289,18 +289,9 @@ def display(value, default_kinds=()):
 
     table("Finished rounds", headers, rounds, widths)
     table(None, headers, prs, widths)
-    for repo, data in s.get("review_coordination", {}).items():
-        print(f"\nReview coordination — {repo} (observed starts; hourly buckets)")
-        for window in ("24h", "7d"):
-            counts = data.get("windows", {}).get(window, {})
-            dual, legacy = counts.get("dual", 0), counts.get("legacy", 0)
-            fraction = f"{100 * dual / (dual + legacy):.0f}% upgraded" if dual + legacy else "no classified starts"
-            print(
-                f"  {window}: {fraction}; dual {dual}, legacy {legacy}, unknown {counts.get('unknown', 0)}; Git held {counts.get('git_held', 0)}/{dual} dual starts"
-            )
-        local = s.get("local_coordination", {}).get("24h", {})
-        if local.get("started"):
-            print(f"  Local host (24h): {local['started']} starts; {local.get('marker_failed', 0)} marker posts failed")
+    local = s.get("local_coordination", {}).get("24h", {})
+    if local.get("started"):
+        print(f"\nReview Git claims (24h): {local.get('git_held', 0)} held / {local['started']} starts")
     if spending_rows:
         table(spending_title, headers, spending_rows, widths)
     if spending_rows and costs.get("quality") and costs.get("accounting_version", 1) >= 2:
@@ -441,7 +432,7 @@ def combine(values):
         local_coordination={
             w: {
                 field: sum(v.get("local_coordination", {}).get(w, {}).get(field, 0) for v in known)
-                for field in ("started", "marker_failed", "git_held")
+                for field in ("started", "git_held")
             }
             for w in ("24h", "7d")
         },

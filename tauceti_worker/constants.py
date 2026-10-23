@@ -239,7 +239,6 @@ COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its
 # already reviewing BEFORE paying the engine's build+launch cost — and, crucially, without busy-looping
 # on the one PR a peer holds. The marker format is owned by the engine; we parse only the head and the
 # expiry, so the engine's TTL value stays its own concern.
-REVIEW_INPROGRESS_RE = re.compile(r"<!--tauceti-review-in-progress (.*?)-->", re.S)
 
 
 # Agents.
