@@ -9,6 +9,8 @@ Verify once, at the end, scoped to what you actually changed:
   pipe reports the command's status. Never background a build or audit, never wait for one with
   `pgrep`, `pkill`, `ps`, process-name matching or sleep loops, and never end your turn expecting a
   background job to notify or resume you: nothing will.
+- Claude shell commands have a ten-minute limit, or the shorter remaining round deadline.
+  If an incremental `lake build` times out, rerun it in the same checkout; completed modules are kept.
 - **No repeats.** Run `lake exe cache get` once per session, and again only after `lake-manifest.json`
   or `lean-toolchain` changes. Do not rerun a check that already passed unless its inputs (source,
   pins, or the integrated main) changed since. While iterating on a failure, rerun only the failing

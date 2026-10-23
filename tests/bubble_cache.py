@@ -216,7 +216,8 @@ try:
         "work preliminary build uses receipt verification",
         "tauceti-verify" in work_argv and "--stage build" in work_argv,
     )
-    check("work configures long foreground tool timeouts", "BASH_MAX_TIMEOUT_MS=" in work_argv)
+    check("work disables background tasks", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in work_argv)
+    check("work bounds foreground commands", "BASH_MAX_TIMEOUT_MS=600000" in work_argv)
     with (
         patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"),
         patch("tauceti_worker.verification.cache_root", side_effect=PermissionError("unavailable cache")),
@@ -246,6 +247,7 @@ try:
             "V0 does not require helper or base resolution",
             "TAUCETI_VERIFY_BASE=" not in legacy.getvalue() and "/opt/verification-cache" not in legacy.getvalue(),
         )
+        check("V0 also keeps commands foreground", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in legacy.getvalue())
     cache_grant = (
         f"--lake-cache-service {tc.TAUCETI_CACHE_SERVICE} "
         f"{tc.TAUCETI_CACHE_ARTIFACT_URL} {tc.TAUCETI_CACHE_REVISION_URL}"
@@ -263,6 +265,7 @@ try:
     check("review/probe has no verification cache dependency", "/opt/verification-cache" not in review_argv)
     check("review/probe does not add a cache capability", "--lake-cache-service" not in review_argv)
     check("review/probe command is not wrapped in a build", "lake exe cache get" not in review_argv)
+    check("review/probe keeps its own shell policy", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=" not in review_argv)
 finally:
     os.environ.pop("TAUCETI_AGENT_ECHO", None)
     tc.agents.ensure_bubble_home = saved_home
