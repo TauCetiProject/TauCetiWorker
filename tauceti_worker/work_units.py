@@ -1571,10 +1571,10 @@ def _do_fixlike(
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
 
-    def decline_foreign_repair():
+    def decline_repair():
         # Dispatch can immediately try another candidate. Stop/release only the
         # claim captured above, before its heartbeat/held fields can be replaced.
-        if w.claims.held == held:
+        if held and w.claims.held == held:
             w.claims.stop_heartbeat()
             w.claims.release()
         for key in charged:
@@ -1586,7 +1586,7 @@ def _do_fixlike(
         # started; the current-at-launch option may cheaply select main once here.
         base = authorize(w.gh, pr, head, p.head_ref, f"{p.head_owner}/{p.head_repo}")
         if not base or (base != foreign and not reselect_before_launch()):
-            return decline_foreign_repair()
+            return decline_repair()
         foreign = c.foreign_repair_base = base
     if label == "bump" and getattr(c, "bump_integration_failure", False):
         batch = w.gh.bump_repair_requested(pr, head)
@@ -1695,7 +1695,7 @@ def _do_fixlike(
 
         scope = target()
         if not scope or (scope.pr, scope.head) != (pr, head):
-            return decline_foreign_repair()
+            return decline_repair()
         # Existing counter storage supplies fsync + atomic replace. The receipt
         # blocks a restart on preparation failure; a typed pre-inference refusal
         # restores this launch allowance without removing existing checkpoints.
@@ -1731,14 +1731,13 @@ def _do_fixlike(
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         checked = rev.stdout.strip() or head
-        if (label == "rebase" or label == "bump" and getattr(c, "bump_integration_failure", False)) and (
+        # A newer CI-retry commit has no failure to repair yet. Re-survey it
+        # instead of launching a paid repair selected for the previous head.
+        if (label in {"rebase", "fix-ci"} or label == "bump" and getattr(c, "bump_integration_failure", False)) and (
             rev.returncode or checked != head
         ):
-            if foreign:
-                return decline_foreign_repair()
-            for key in charged:
-                w.counters.write(key, max(0, w.counters.read(key) - 1))
-            return None
+            log(f"  {label} #{pr}: checkout no longer matches the selected head — selecting other work")
+            return decline_repair()
         if foreign:
             os.environ["TAUCETI_VERIFY_BASE"] = foreign
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
@@ -1815,7 +1814,7 @@ def _do_fixlike(
                 prompt += retained
             except (OSError, RuntimeError, RecoveryWait, RecoveryRecordError) as error:
                 log(f"  #{pr}: source handoff deferred without model launch: {error}")
-                return decline_foreign_repair()
+                return decline_repair()
         agent_rc = None
         from .config import AdmissionUnavailable
 
