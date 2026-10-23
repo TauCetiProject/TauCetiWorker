@@ -563,14 +563,24 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--lint-modules", result.stdout)
 
-    def test_host_wrapper_uses_worker_python_and_long_timeout(self):
+    def test_host_wrapper_keeps_shell_work_foreground_and_bounds_each_command(self):
         from tauceti_worker.agents import host_agent_argv, local_verification
 
         with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() + 1800)):
             _, env = host_agent_argv("fixture prompt", "claude")
         self.assertEqual(env["TAUCETI_VERIFY_PYTHON"], sys.executable)
-        self.assertGreater(int(env["BASH_MAX_TIMEOUT_MS"]), 1000000)
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
         self.assertIn(sys.executable, local_verification("ordinary"))
+
+        with (
+            patch("tauceti_worker.agents.time.time", return_value=1000),
+            patch.dict(os.environ, TAUCETI_ROUND_DEADLINE="1030"),
+        ):
+            _, env = host_agent_argv("fixture prompt", "claude")
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "30000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "30000")
 
     def test_installed_wrapper_permission(self):
         from tauceti_worker import cli

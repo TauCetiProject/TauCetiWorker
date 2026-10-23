@@ -504,7 +504,8 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
-        "Use a tool timeout covering the remaining round; Claude Bash timeouts are set by the worker. "
+        "Claude shell commands run in the foreground with a ten-minute limit, or the shorter remaining round. "
+        "If an interrupted helper hands verification to a supervisor continuation, let it finish there. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
         "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
@@ -779,15 +780,23 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
+def _foreground_shell_env(deadline: float) -> dict[str, str]:
+    # A shell command is not a whole round. Background tasks can retain the CLI
+    # after its final answer and overlap later builds in the same checkout.
+    remaining_ms = max(1000, int((deadline - time.time()) * 1000))
+    return {
+        "BASH_DEFAULT_TIMEOUT_MS": str(min(600000, remaining_ms)),
+        "BASH_MAX_TIMEOUT_MS": str(min(600000, remaining_ms)),
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    }
+
+
 def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
-    remaining_ms = str(
-        max(1000, int((float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200) - time.time()) * 1000))
-    )
-    env.update(BASH_DEFAULT_TIMEOUT_MS=remaining_ms, BASH_MAX_TIMEOUT_MS=remaining_ms)
+    env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
     if profile.provider == "codex":
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
@@ -2258,6 +2267,11 @@ def run_in_bubble(
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache"
+    if inner_cmd is None:
+        for key, value in _foreground_shell_env(
+            getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)
+        ).items():
+            tcenv += f" {key}={shlex.quote(value)}"
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
@@ -2281,12 +2295,6 @@ def run_in_bubble(
             "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
             "TAUCETI_VERIFY_PYTHON": "/usr/bin/python3",
             "TAUCETI_VERIFY_BUBBLE": "1",
-            "BASH_DEFAULT_TIMEOUT_MS": str(
-                max(1000, int((getattr(getattr(w, "rc", None), "deadline", time.time() + 7200) - time.time()) * 1000))
-            ),
-            "BASH_MAX_TIMEOUT_MS": str(
-                max(1000, int((getattr(getattr(w, "rc", None), "deadline", time.time() + 7200) - time.time()) * 1000))
-            ),
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
         for name in (
