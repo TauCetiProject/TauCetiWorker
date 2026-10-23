@@ -237,9 +237,8 @@ def _ingest(db, e):
         row = db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()
         buckets = json.loads(row[0]) if row else {}
         hour = str(int(e["at"] // 3600) * 3600)
-        bucket = buckets.setdefault(hour, dict(started=0, marker_failed=0, git_held=0))
+        bucket = buckets.setdefault(hour, dict(started=0, git_held=0))
         bucket["started"] += 1
-        bucket["marker_failed"] += not e.get("marker_posted", False)
         bucket["git_held"] += bool(e.get("git_held"))
         buckets = {k: v for k, v in buckets.items() if float(k) >= e["at"] - 7 * 86400 - 3600}
         db.execute("INSERT OR REPLACE INTO meta VALUES ('local_coordination',?)", (json.dumps(buckets),))
@@ -554,7 +553,7 @@ def _summary(db, now, column=None, identity=None):
             field: sum(
                 v.get(field, 0) for at, v in local_buckets.items() if float(at) >= (now - seconds) // 3600 * 3600
             )
-            for field in ("started", "marker_failed", "git_held")
+            for field in ("started", "git_held")
         }
     where, args = (f"WHERE {column}=?", [identity]) if column else ("", [])
     rounds = {}

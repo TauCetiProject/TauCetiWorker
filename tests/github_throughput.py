@@ -133,14 +133,12 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_ACTI
         id="nonce",
         at=time.time(),
         worker="one",
-        marker_posted=False,
         git_held=True,
     )
     activity._ingest(db, event)
     activity._ingest(db, event)
     buckets = json.loads(db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()[0])
     assert sum(b["started"] for b in buckets.values()) == 1
-    assert sum(b["marker_failed"] for b in buckets.values()) == 1
     db.close()
 print("PASS: targeted cache invalidation, shared pacing, recovery probe, both throttles and stable state")
 
@@ -154,7 +152,6 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_ACTI
             id="journal-review",
             at=time.time(),
             worker="one",
-            marker_posted=False,
             git_held=True,
         )
         journal.write_text(json.dumps(event) + "\n")
@@ -172,7 +169,6 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_ACTI
         activity.backfill(db)
         buckets = json.loads(db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()[0])
         assert sum(b["started"] for b in buckets.values()) == 1
-        assert sum(b["marker_failed"] for b in buckets.values()) == 1
         assert sum(b["git_held"] for b in buckets.values()) == 1
         db.close()
 print("PASS: coordination journal import and one-time cursor replay are idempotent")

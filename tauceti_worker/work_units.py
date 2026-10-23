@@ -293,7 +293,7 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
     joined rather than raced: the first one printed is not necessarily the only reason, and hiding
     the rest would send the operator to fix the wrong thing.
 
-    A stage's `suppressed` list, `review_inflight` / `review_stuck` and
+    A stage's `suppressed` list, `review_stuck` and
     `fix_waiting` are the survey's own vocabulary for "considered and passed over"; anything left
     over is either not an open PR at all, a draft, or open with genuinely nothing to do.
     """
@@ -306,7 +306,6 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
             if c.pr == pr:
                 spent = f" ({c.attempts}/{c.budget} attempts spent)" if c.budget else ""
                 notes.append(f"{stage} suppressed: {c.reason}{spent}")
-    notes += [f"review: a peer reviewer ({who}) holds this head" for n, who in sv.review_inflight if n == pr]
     if pr in sv.review_stuck:
         notes.append("review keeps erroring without completing a review — needs infrastructure repair")
     notes += [f"fix: {why}" for n, why in sv.fix_waiting if n == pr]
@@ -440,11 +439,6 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
 
     def in_scope(pr: int) -> bool:
         return not targets or pr in targets
-
-    for pr, providers in sv.review_inflight:
-        if not in_scope(pr):
-            continue
-        log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
 
     # Explain why a fix-focused worker has nothing to fix: for each of the contributor's own PRs that is
     # not an actionable fix candidate, say why (awaiting first review, head moved, all green, attempts
@@ -814,8 +808,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
 
     The survey triages on cached comment reads keyed to each PR's `updatedAt` (see
     ReviewState.observe), which is what keeps a round's cost proportional to what CHANGED rather than
-    to how many PRs are open. That key is a strong signal but not a promise: a deleted scoreboard or a
-    deleted in-progress marker moves nothing, so a cached answer can be wrong in a way nothing
+    to how many PRs are open. That key is a strong signal but not a promise: a deleted scoreboard moves nothing, so a cached answer can be wrong in a way nothing
     announces. A round spends on exactly ONE candidate, so this re-reads that one from GitHub, where
     the cost is a couple of calls rather than one per open PR.
 
@@ -917,12 +910,6 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
             return False
         return True
-    held = w.rs.inflight_review(c.pr, c.head, force=True)
-    if held:
-        # Closer to launch than the survey's read was, so this de-contends BETTER than before: the
-        # window in which a peer can claim the head without us noticing is now the launch itself.
-        log(f"  review #{c.pr}: a peer reviewer ({','.join(sorted(held))}) holds this head — skipping")
-        return False
     if c.contest:
         reply = w.rs.newest_contest_reply(c.pr, force=True)
         if not reply or reply.get("id") != c.contest_reply_id:

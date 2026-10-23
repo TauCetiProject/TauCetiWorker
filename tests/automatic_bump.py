@@ -51,9 +51,6 @@ class Reviews:
     def ledger_blocking(self, *args):
         return True
 
-    def inflight_review(self, *args, **kwargs):
-        return set()
-
     def newest_contest_reply(self, *args, **kwargs):
         return self.contest
 

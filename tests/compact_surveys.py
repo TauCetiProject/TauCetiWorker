@@ -140,9 +140,6 @@ with tempfile.TemporaryDirectory() as tmp:
             targeted = mod.survey(cfg, gh, rs, counters, stages=[], numbers=(5,))
         assert [p.number for p in targeted.open_prs] == [5], "explicit targets override roadmap skips"
         rs.seed_survey(compact)
-        with patch("tauceti_worker.review_state.time.time", return_value=9999999999):
-            assert not rs.inflight_review(4, head), "expiry is checked on the worker clock, not frozen at projection"
-        assert not rs.inflight_review(4, "b" * 40), "claims must match the exact head"
         rs.gh_meta(3, force=True)
         assert calls == [("issue", 3)] and 3 not in rs._survey_facts, (
             "selected-target revalidation cannot reuse an older snapshot"
@@ -159,7 +156,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
 with patch("tauceti_worker.github_state.read", return_value=(True, {"contract": "future", "data": []})):
     assert read_survey("org/repo") == (False, None), "incompatible empty snapshots must fall back too"
-for bad in ({"contest": "invalid"}, {"markers": [None]}, {"pr": {"number": 1, "labels": [None]}}):
+for bad in ({"contest": "invalid"}, {"pr": {"number": 1, "labels": [None]}}):
     row = {
         "contract": CONTRACT,
         "pr": pr(1),

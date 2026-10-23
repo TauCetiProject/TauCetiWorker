@@ -2,7 +2,6 @@
   "id": "tauceti-survey-facts/v1",
   "scoreboard": "<!--tauceti-scoreboard-->",
   "meta_pattern": "<!--tauceti-meta:v1 ([\\s\\S]*?)-->",
-  "claim_pattern": "<!--tauceti-review-in-progress ([\\s\\S]*?)-->",
   "rubric_pattern": "tauceti-rubric:([a-z][a-z-]*?)\\s*-->",
   "target_pattern": "<!--tauceti-target:v1 (\\{[^}]*\\})-->",
   "meta_fields": ["head_sha", "states", "runs", "submitted_by", "round", "full_rounds", "replies_through"],

@@ -19,7 +19,7 @@ from .config import Config
 from .constants import COMMENTS_MEMO_S, SBCACHE_BACKSTOP_S, SBCACHE_TTL
 from .github import GitHub
 from .github_transport import cache_hit, invalidate, read_context
-from .survey_facts import markers, newest_contest, scoreboard
+from .survey_facts import newest_contest, scoreboard
 
 # ============================================================================
 # ReviewState — the PR scoreboard comment is the multi-agent source of truth; a
@@ -136,12 +136,7 @@ class ReviewState:
             pass  # a cache we cannot write is a slow round, not a wrong one
 
     def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
-        """A PR's issue comments, memoized briefly so the two readers in one survey pass — the scoreboard
-        meta and the in-flight review marker — share ONE fetch (a cold meta read plus a marker check
-        would otherwise double-read the same paginated endpoint). The window is a few seconds: long
-        enough to coalesce within a pass, far short of the round/dashboard cadence, so each pass still
-        reads fresh markers (the loop-breaking guarantee). None (a fetch failure) is memoized too, so a
-        blip isn't retried twice in one pass."""
+        """Memoize PR comment reads briefly within a survey pass, including failures."""
         hit = None if force else self._comments.get(pr)
         if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
             return hit[1]
@@ -150,28 +145,6 @@ class ReviewState:
             self._shared_issue_hit[pr] = cache_hit()
         self._comments[pr] = (time.time(), cs)
         return cs
-
-    def inflight_review(self, pr: int, head: str, *, force: bool = False) -> set[str]:
-        """Providers holding this EXACT head via an unexpired in-progress marker — the engine's
-        de-contention, read worker-side so a held head is skipped before the engine is launched. Shares
-        the memoized comment fetch with gh_meta so the survey reads each PR's comments at most once.
-
-        Markers are served from the sidecar when the PR has not moved, with their `expires_at` kept
-        intact and re-checked against the clock here, so a cached marker still self-clears on time
-        rather than freezing a holder in place. What the cache cannot see is a marker DELETED without
-        another change to the PR, which would read as held until the backstop; that is why dispatch()
-        re-reads this live for the one candidate it is about to spend on, where it also lands closer to
-        launch than a survey-time read does."""
-        sc = None if force else self._sidecar(self._key_path(pr), pr)
-        markers = sc.get("markers") if sc else None
-        if isinstance(markers, list):
-            return providers_from_markers(markers, head, int(time.time()))
-        if force:
-            self._survey_facts.pop(pr, None)
-        facts = self._survey_facts.get(pr)
-        if facts and facts.get("issue_complete"):
-            return providers_from_markers(facts["markers"], head, int(time.time()))
-        return inflight_review_providers(self._issue_comments(pr, force=force), head, int(time.time()))
 
     def gh_meta(self, pr: int, *, force: bool = False) -> Meta:
         """Newest scoreboard's <!--tauceti-meta:v1 {...}--> JSON, identified by the <!--tauceti-scoreboard-->
@@ -234,12 +207,10 @@ class ReviewState:
                 # A confirmed absence is worth caching: without it, every pass re-reads every PR that
                 # has no scoreboard yet, which is most of a healthy queue. Drop the payload with it —
                 # left behind, the TTL path would keep serving a board we just confirmed is gone.
-                self._write_sidecar(self._key_path(pr), pr, {"status": "missing", "markers": distil_markers(comments)})
+                self._write_sidecar(self._key_path(pr), pr, {"status": "missing"})
                 cache.unlink(missing_ok=True)
             return Meta({}, "fetch_failed" if fetch_failed else "missing")
-        self._write_sidecar(
-            self._key_path(pr), pr, {"status": "present", "meta": data, "markers": distil_markers(comments)}
-        )
+        self._write_sidecar(self._key_path(pr), pr, {"status": "present", "meta": data})
         try:  # the legacy copy: the stale-on-failure fallback reads it, nothing entitled does
             self.sbcache.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(data) + "\n")
@@ -351,33 +322,3 @@ class ReviewState:
             return any(v not in ("green", "stale") for v in states.values())
         runs = m.get("runs") or []
         return any(r.get("verdict") not in ("approve", "error") for r in runs)
-
-
-def inflight_review_providers(comments: list[dict] | None, head: str, now: int) -> set[str]:
-    """Providers named by any UNEXPIRED in-progress review marker on this EXACT head (a new push is a
-    new unit, so the head must match). Mirrors the review engine's de-contention read so the worker can
-    skip a head a peer already holds before launching the engine. Empty set when none apply; a fetch
-    failure (comments is None) is treated as 'not held' and proceeds — fail-open, matching the engine
-    (a rare duplicate review at worst, the engine's own claim still being the backstop)."""
-    return providers_from_markers(distil_markers(comments), head, now)
-
-
-def distil_markers(comments: list[dict] | None) -> list[dict]:
-    """Every in-progress marker a PR's comments carry, as {head, expires_at, providers}.
-
-    Kept separate from the expiry decision so a marker can be CACHED without freezing time with it: the
-    expiry travels with the marker and is judged against the clock at read time, so a cached marker
-    expires on its own schedule exactly as a freshly read one does."""
-    return markers(comments)
-
-
-def providers_from_markers(markers: list[dict], head: str, now: int) -> set[str]:
-    """The providers holding `head` right now, per markers already distilled by distil_markers."""
-    cov: set[str] = set()
-    for d in markers:
-        if not isinstance(d, dict) or not isinstance(d.get("expires_at"), int) or d["expires_at"] <= now:
-            continue
-        if d.get("head") != head:  # exact: a new push is a new unit, not covered by an old marker
-            continue
-        cov.update(p for p in (d.get("providers") or []) if isinstance(p, str))
-    return cov
