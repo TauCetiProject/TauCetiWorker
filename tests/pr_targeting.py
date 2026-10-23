@@ -234,8 +234,13 @@ check("nothing to fix yet", reason(sv, Opts(prs=[1]), 1), "fix: reviews at head 
 # Several reasons can be true at once, and reporting only the first would send the operator after the
 # wrong one.
 sv = survey_with(suppressed={"fix": [1]})
+sv.fix_waiting.append((1, "awaiting first review"))
 got = reason(sv, Opts(prs=[1]), 1)
-check("every reason is reported, not just the first", ("attempts spent" in got, "peer reviewer" in got), (True, False))
+check(
+    "every reason is reported, not just the first",
+    ("attempts spent" in got, "awaiting first review" in got),
+    (True, True),
+)
 
 
 def pr_info(number, *, draft=False, green_since=None):

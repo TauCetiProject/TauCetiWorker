@@ -808,8 +808,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
 
     The survey triages on cached comment reads keyed to each PR's `updatedAt` (see
     ReviewState.observe), which is what keeps a round's cost proportional to what CHANGED rather than
-    to how many PRs are open. That key is a strong signal but not a promise: a deleted scoreboard or a
-    deleted in-progress marker moves nothing, so a cached answer can be wrong in a way nothing
+    to how many PRs are open. That key is a strong signal but not a promise: a deleted scoreboard moves nothing, so a cached answer can be wrong in a way nothing
     announces. A round spends on exactly ONE candidate, so this re-reads that one from GitHub, where
     the cost is a couple of calls rather than one per open PR.
 

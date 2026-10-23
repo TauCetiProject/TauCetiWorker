@@ -339,9 +339,6 @@ class Survey:
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
     # escalates — a loud warning + a tracking issue — rather than stranding them silently.
     review_stuck: list[int] = field(default_factory=list)
-    # Heads a peer reviewer is actively reviewing right now (an unexpired in-progress marker on the
-    # exact head). Skipped this round so the worker neither pays the engine's launch cost just to have
-    # it skip nor busy-loops on the one PR a peer holds. (pr, providers) for a one-line status note.
     # Tended PRs that are NOT actionable for `fix`, each with a one-line reason (awaiting first review,
     # head moved since review, reviews all green, fix attempts spent, or a transient fetch failure). A
     # fix-focused worker logs these so it explains its idleness instead of sitting on a bare "no eligible
@@ -440,14 +437,11 @@ def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str]) -> int:
 
 
 def spread_candidates(candidates: list, rng=random) -> list:
-    """Return a stage's candidates in a randomized order so several workers starting together don't all
-    converge on the same (lowest-numbered) PR and collide. The survey has already dropped work a peer is
-    KNOWN to hold; this only varies which of the remaining, apparently-free PRs each worker tries first —
-    turning systematic collisions (every worker picks the lowest, discovers the clash, repeats) into rare,
-    self-correcting ones. Pure WORKER-side work-allocation: the real de-contention is unchanged — the
-    review engine's in-progress marker for reviews, the branch claim for fix/fix-ci/rebase — this just
-    spreads the first pick. Each worker is its own process with independent RNG state, so concurrent
-    workers shuffle differently. Returns a new list."""
+    """Shuffle candidates so concurrent workers spread their first picks.
+
+    The review engine's Git lease and authoring branch claims decide contention.
+    Returns a new list; independent worker processes use independent RNG state.
+    """
     out = list(candidates)
     rng.shuffle(out)
     return out

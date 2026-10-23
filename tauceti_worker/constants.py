@@ -230,17 +230,6 @@ SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
-# (scoreboard meta + in-flight marker share one read); << the round/dashboard cadence
-
-# In-flight review de-contention. The review engine (TauCetiReview) posts a PR comment marking a head
-# as under review and embeds an `expires_at` so a crashed reviewer self-clears. De-contention is on the
-# head ALONE (a commit is reviewed once, regardless of model), and the engine's coordinate() remains the
-# authoritative claim. The worker reads the SAME marker during the survey so it can skip a head a peer is
-# already reviewing BEFORE paying the engine's build+launch cost — and, crucially, without busy-looping
-# on the one PR a peer holds. The marker format is owned by the engine; we parse only the head and the
-# expiry, so the engine's TTL value stays its own concern.
-
-
 # Agents.
 OPENROUTER_MODELS = {
     "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek/deepseek-v4-pro"),

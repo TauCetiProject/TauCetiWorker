@@ -77,3 +77,30 @@ with tempfile.TemporaryDirectory() as tmp:
             directory / "review-results" / "review.json"
         )
 print("PASS: unchanged host/bubble reviews select other work; real and older-engine outcomes still count")
+
+
+# Bubble's repo-scoped proxy cannot reach the claims repository. Own the same
+# lease host-side before starting the container, and retain it through posting.
+for code in (0, 1, 2):
+    lease = SimpleNamespace(acquire=lambda code=code: code, start_heartbeat=lambda: None, release=lambda: None)
+    from unittest.mock import Mock
+
+    lease.start_heartbeat = Mock()
+    lease.release = Mock()
+    with (
+        patch("tauceti_tools.claims.GitClaim", return_value=lease) as claim,
+        patch("tauceti_tools.claims.record_review_start", side_effect=TypeError("reporting unavailable")),
+        patch("tauceti_worker.github.claims_repo", return_value="org/claims"),
+        patch.object(agents, "_review_in_bubble", return_value=0) as engine,
+    ):
+        w = SimpleNamespace(cfg=SimpleNamespace(wid="worker"))
+        rc = agents.review_in_bubble(w, 42, HEAD, "claude", SimpleNamespace())
+        assert claim.call_args.args[1] == f"review/{agents.TAUCETI.lower()}/42/{HEAD}"
+        if code == 1:
+            assert rc == agents.EX_CLAIM_COLLISION
+            engine.assert_not_called()
+        else:
+            assert rc == 0
+            engine.assert_called_once()
+        assert lease.start_heartbeat.call_count == lease.release.call_count == (1 if code == 0 else 0)
+print("PASS: bubble claims run on host; collisions avoid container launch; outage and reporting failures progress")

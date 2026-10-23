@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -2471,6 +2472,34 @@ def _kiro_review_model(reviewers: str) -> str | None:
 def review_in_bubble(
     w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
 ) -> int:
+    """Hold the review lease outside the repo-scoped container, through publication."""
+    from tauceti_tools.claims import GitClaim, record_review_start
+
+    from .github import claims_repo
+
+    nonce = uuid.uuid4().hex
+    claim = GitClaim(claims_repo(), f"review/{TAUCETI.lower()}/{pr}/{head}", f"{w.cfg.wid}-{nonce}")
+    rc = claim.acquire()
+    if rc == 1:
+        return EX_CLAIM_COLLISION
+    if rc == 0:
+        claim.start_heartbeat()
+    else:
+        log("Git review claim unavailable; proceeding (a concurrent duplicate review is possible)")
+    try:
+        try:
+            record_review_start(TAUCETI, pr, head, nonce, git_held=rc == 0)
+        except Exception:
+            pass  # Reporting must not prevent useful work.
+        return _review_in_bubble(w, pr, head, reviewers, opts, result_file=result_file)
+    finally:
+        if rc == 0:
+            claim.release()
+
+
+def _review_in_bubble(
+    w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
+) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
     model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
@@ -2532,7 +2561,7 @@ def review_in_bubble(
     inner = (
         "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine:/opt/tools python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
-        f"--no-mathlib --no-sync --store /opt/review-store --post "
+        f"--no-mathlib --no-sync --no-coordinate --store /opt/review-store --post "
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )
