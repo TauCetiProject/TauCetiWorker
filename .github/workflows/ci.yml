@@ -12,9 +12,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Reuse existing Namespace profiles. Leaving priority unspecified keeps these
+# checks behind Bors control (priority 0) and compilation (priority 1).
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Storage fixtures require native, consistent inode/device metadata.
+    runs-on: ubuntu-24.04
     env:
       # The worker is stdlib-only (bar the TUI's rich/textual), so test on one interpreter — the
       # latest uv ships — rather than a per-version matrix. requires-python >=3.11 is a declaration.
@@ -29,7 +32,9 @@ jobs:
         run: ./tests/run-all
 
   prices:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out the review engine's price table
@@ -50,7 +55,9 @@ jobs:
           fi
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -70,7 +77,9 @@ jobs:
         run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint tests/*.sh tests/run-all
 
   build:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -100,7 +109,9 @@ jobs:
           PY
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
