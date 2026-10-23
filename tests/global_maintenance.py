@@ -316,6 +316,55 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(self.counter_values, {"per-head": 0, "per-pr": 1})
 
+    def test_ci_repair_reselects_when_checkout_has_a_new_head(self):
+        import subprocess
+
+        self.w.cfg.checkout = Path(self.tmp.name) / "checkout"
+        self.w.cfg.logdir = Path(self.tmp.name) / "logs"
+        self.w.claims = SimpleNamespace(
+            held=("branch/10", "org/claims"),
+            begin_branch_work=lambda *args: True,
+            stop_heartbeat=Mock(),
+            release=Mock(),
+        )
+        self.w.counters.write = lambda key, value: self.counter_values.update({key: value})
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        for code, checked in ((0, "b" * 40), (1, "")):
+            with self.subTest(code=code, checked=checked):
+                self.counter_values.update({"per-head": 1, "per-pr": 2})
+                self.w.claims.stop_heartbeat.reset_mock()
+                self.w.claims.release.reset_mock()
+
+                def checkout(command, code=code, checked=checked, **kwargs):
+                    if command[:3] == ["gh", "pr", "checkout"]:
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    if command == ["git", "-C", str(self.w.cfg.checkout), "rev-parse", "HEAD"]:
+                        return subprocess.CompletedProcess(command, code, checked, "")
+                    self.fail(f"stale repair continued preparing a model run: {command}")
+
+                with (
+                    patch.object(work, "prepare_checkout", return_value=True),
+                    patch.object(work.subprocess, "run", side_effect=checkout) as commands,
+                    patch.object(work, "run_agent_host") as model,
+                ):
+                    result = work._do_fixlike(
+                        self.w,
+                        sv,
+                        work.Candidate(10, HEAD),
+                        self.opts,
+                        False,
+                        prompt_file="fix-ci.md",
+                        label="fix-ci",
+                        charged=("per-head", "per-pr"),
+                    )
+                self.assertIsNone(result)
+                model.assert_not_called()
+                self.assertEqual(commands.call_count, 2)
+                self.w.claims.stop_heartbeat.assert_called_once_with()
+                self.w.claims.release.assert_called_once_with()
+                self.assertEqual(self.counter_values, {"per-head": 0, "per-pr": 1})
+
     def test_global_review_before_area_choice(self):
         _, _, areas = self.run_round([row(40, "Other", author="peer", blocking=False)])
         self.assertEqual(self.calls[0][:2], ("review", 40))
