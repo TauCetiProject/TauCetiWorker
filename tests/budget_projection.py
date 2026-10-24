@@ -1,7 +1,9 @@
 """Incremental projection preserves financial evidence across process/crash boundaries."""
 
 import concurrent.futures
+import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -75,6 +77,39 @@ class ProjectionTests(unittest.TestCase):
         replacement.replace(self.budget.ledger)
         self.equal_replay()
         self.assertEqual(old, self.budget.ledger.read_bytes())
+
+    def test_query_failure_uses_ledger_immediately_and_next_operation_rebuilds(self):
+        self.budget.admit("a", "w", "opus", "fix")
+        self.budget.settle("a", 7)
+        with self.budget.locked():
+            state = self.budget.current()
+            state["sessions"].db.close()  # Query error after load has already succeeded.
+            self.assertEqual(self.budget.estimate(state, "opus", "fix")[1], Decimal(7))
+            self.assertEqual(state["sessions"]["a"]["cost"], "7")
+            self.assertFalse((self.root / "projection.sqlite").exists())
+        self.equal_replay()
+        self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 93)
+
+    def test_lost_cached_session_during_tail_rebuilds_without_blocking_admission(self):
+        self.budget.admit("a", "w", "opus", "fix")
+        self.budget.snapshot()
+        with sqlite3.connect(self.root / "projection.sqlite") as db:
+            db.execute("DELETE FROM sessions WHERE id='a'")
+        with self.budget.locked():
+            state = self.budget.replay()
+            self.budget.append(state, [dict(type="settle", id="a", cost="7", outcome="done")])
+        self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 93)
+        self.equal_replay()
+
+    def test_invalid_cached_amount_rebuilds_from_ledger(self):
+        for value in ["broken", "NaN"]:
+            self.budget.snapshot()
+            with sqlite3.connect(self.root / "projection.sqlite") as db:
+                metadata = json.loads(db.execute("SELECT data FROM meta").fetchone()[0])
+                metadata["state"]["balance"] = value
+                db.execute("UPDATE meta SET data=?", (json.dumps(metadata),))
+            self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 100)
+            self.equal_replay()
 
     def test_cached_projection_does_not_hide_corruption_or_torn_tail(self):
         self.budget.snapshot()

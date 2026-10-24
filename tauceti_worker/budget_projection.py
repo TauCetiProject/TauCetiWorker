@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import os
 import sqlite3
 from collections.abc import Mapping
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+
+
+def projected_read(function):
+    @functools.wraps(function)
+    def read(self, *args, **kwargs):
+        try:
+            return function(self, *args, **kwargs)
+        except (sqlite3.DatabaseError, ValueError, TypeError):
+            self.owner.discard()
+            self.fallback = self.owner.budget.replay()["sessions"]
+            return function(self, *args, **kwargs)
+
+    return read
 
 
 class Sessions(Mapping):
@@ -16,8 +30,12 @@ class Sessions(Mapping):
         self.db = db
         self.owner = owner
         self.changed = {}
+        self.fallback = None
 
+    @projected_read
     def __getitem__(self, key):
+        if self.fallback is not None:
+            return self.fallback[key]
         if key not in self.changed:
             row = self.db.execute("SELECT data FROM sessions WHERE id=?", (key,)).fetchone()
             if row is None:
@@ -28,14 +46,38 @@ class Sessions(Mapping):
     def __setitem__(self, key, value):
         self.changed[key] = value
 
+    @projected_read
     def __iter__(self):
-        return iter(row[0] for row in self.db.execute("SELECT id FROM sessions ORDER BY ordinal"))
+        if self.fallback is not None:
+            return iter(self.fallback)
+        return iter([row[0] for row in self.db.execute("SELECT id FROM sessions ORDER BY ordinal")])
 
+    @projected_read
     def __len__(self):
+        if self.fallback is not None:
+            return len(self.fallback)
         return self.db.execute("SELECT count(*) FROM sessions").fetchone()[0]
 
-    def select(self, *, active=False, model=None, phase=None, settled=False, positive=False, limit=None):
+    @projected_read
+    def select(
+        self, *, active=False, model=None, phase=None, settled=False, positive=False, estimated=False, limit=None
+    ):
+        if self.fallback is not None:
+            return self.owner.budget.sessions(
+                {"sessions": self.fallback},
+                active=active,
+                model=model,
+                phase=phase,
+                settled=settled,
+                positive=positive,
+                estimated=estimated,
+                limit=limit,
+            )
         clauses, args = [], []
+        if estimated:
+            clauses.append(
+                "json_extract(data,'$.cost_provenance') IN ('token-priced','historical-estimate','prelaunch-estimate')"
+            )
         if active:
             clauses.append("status != 'settled'")
         if settled:
@@ -55,7 +97,10 @@ class Sessions(Mapping):
         rows = [json.loads(row[0]) for row in self.db.execute(query, args)]
         return rows[::-1] if limit is not None else rows
 
+    @projected_read
     def related(self, providers, *, include=None):
+        if self.fallback is not None:
+            return self.owner.budget.related({"sessions": self.fallback}, providers, include)
         providers = list(providers)
         placeholders = ",".join("?" for _ in providers)
         # Resumes without a receipt also matter for liveness/evidence boundaries.
@@ -97,7 +142,6 @@ class Projection:
             fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
             os.close(fd)
             self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
-            self.db.execute("PRAGMA synchronous=NORMAL")
             self.db.executescript("""
                 CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, ordinal INTEGER, status TEXT, model TEXT, phase TEXT, resume TEXT, cost TEXT, positive_cost INTEGER, data TEXT);
@@ -105,6 +149,7 @@ class Projection:
                 CREATE INDEX IF NOT EXISTS active ON sessions(ordinal) WHERE status != 'settled';
                 CREATE INDEX IF NOT EXISTS costs ON sessions(model,phase,status,positive_cost,ordinal);
                 CREATE INDEX IF NOT EXISTS recent ON sessions(status,ordinal);
+                CREATE INDEX IF NOT EXISTS model_costs ON sessions(model,status,positive_cost,ordinal);
                 CREATE INDEX IF NOT EXISTS resumes ON sessions(resume,ordinal);
                 CREATE TABLE IF NOT EXISTS providers (provider TEXT, session TEXT, PRIMARY KEY(provider,session));
                 CREATE INDEX IF NOT EXISTS provider_session ON providers(session);
@@ -114,7 +159,7 @@ class Projection:
     def load(self):
         try:
             return self._load()
-        except (sqlite3.DatabaseError, json.JSONDecodeError, KeyError, TypeError):
+        except (sqlite3.DatabaseError, ValueError, InvalidOperation, KeyError, TypeError):
             # This file holds no unique financial evidence. Rebuild only it.
             if self.db is not None:
                 self.db.close()
@@ -152,6 +197,8 @@ class Projection:
             state = self.budget.replay([], _state=None) if not scalar else dict(scalar)
             for key in ("balance", "rate", "spent", "watermark"):
                 state[key] = Decimal(state[key])
+                if not state[key].is_finite():
+                    raise ValueError("invalid cached amount")
             state["sessions"] = Sessions(db, self)
             state["samples"] = {}
             offset = saved["offset"]
@@ -195,6 +242,11 @@ class Projection:
                 raise
             state["sessions"] = Sessions(db, self)
             return state
+
+    def discard(self):
+        self.close()
+        self.path.unlink(missing_ok=True)
+        self.path.with_name(self.path.name + "-journal").unlink(missing_ok=True)
 
     def __del__(self):
         self.close()

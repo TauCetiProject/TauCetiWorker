@@ -255,10 +255,15 @@ class Budget:
 
         from .budget_projection import Projection
 
+        projection = Projection(self)
         try:
-            return Projection(self).load()
-        except (sqlite3.Error, OSError):
+            return projection.load()
+        except (sqlite3.Error, OSError, BudgetError):
             # A disposable optimization must never become a funding outage.
+            try:
+                projection.discard()
+            except OSError:
+                pass
             return self.replay()
 
     @staticmethod
@@ -274,6 +279,8 @@ class Budget:
                 rows = [s for s in rows if s["status"] == "settled"]
             elif name in ("model", "phase") and value is not None:
                 rows = [s for s in rows if s[name] == value]
+            elif name == "estimated" and value:
+                rows = [s for s in rows if s.get("cost_provenance") in ESTIMATE_PROVENANCES]
             elif name == "positive" and value:
                 rows = [s for s in rows if money(s.get("cost", "0")) > 0]
         return rows[-filters["limit"] :] if filters.get("limit") is not None else rows
@@ -288,6 +295,25 @@ class Budget:
             for s in sessions.values()
             if s["id"] == include or set(s.get("totals", {})) & set(providers) or s.get("resume") in providers
         ]
+
+    def evidence_sessions(self, state, invocation):
+        """Copy the small provider-linked history before releasing the file lock."""
+        session = state["sessions"].get(invocation)
+        if not session:
+            return {}
+        providers = set(session.get("totals", {})) | set(session.get("lower_bound_totals", {}))
+        if session.get("resume"):
+            providers.add(session["resume"])
+        if session.get("bridge"):
+            from .claude_api import safe_message
+
+            try:
+                receipt = safe_message(Path(session["bridge"]) / "inbox" / (invocation + ".receipt"))
+                if isinstance(receipt, dict) and receipt.get("id") == invocation:
+                    providers.update(receipt.get("lower_bound_totals", {}))
+            except (OSError, ValueError, TypeError):
+                pass
+        return {s["id"]: s for s in self.related(state, providers, include=invocation)}
 
     def accrue(self, state):
         now = max(state["watermark"], money(self.clock()))
@@ -941,7 +967,7 @@ class Budget:
             )
 
         with self.locked():
-            sessions = self.current()["sessions"]
+            sessions = self.evidence_sessions(self.current(), invocation)
         session = sessions.get(invocation)
         if not session or session["status"] == "settled" or live(session):
             return None

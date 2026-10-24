@@ -215,7 +215,7 @@ def reserve_unknown_usage(budget, value, stamp):
     from .budget_usage import evidence
 
     with budget.locked():
-        sessions = budget.current()["sessions"]
+        sessions = budget.evidence_sessions(budget.current(), value["id"])
     session = sessions.get(value["id"])
     if not session or session["status"] == "settled":
         return
@@ -284,8 +284,16 @@ def tick(budget, cache=None, stop=None):
     ledger_stamp = stat_stamp(budget.ledger)
     if cache.get("ledger_stamp") != ledger_stamp or "sessions" not in cache:
         with budget.locked():
-            sessions = budget.current()["sessions"]
-        for session in budget.sessions({"sessions": sessions}, active=True):
+            state = budget.current()
+            rows = budget.sessions(state, active=True)
+            if "sessions" not in cache:
+                rows += budget.sessions(state, settled=True, estimated=True)
+            sessions = {session["id"]: session for session in rows}
+            for path in (budget.directory / "lifecycles").glob("*.json"):
+                value = state["sessions"].get(path.stem)
+                if value:
+                    sessions.setdefault(path.stem, value)
+        for session in rows:
             if session.get("lifecycle"):
                 register(budget.directory, session["lifecycle"])
         cache.update(ledger_stamp=ledger_stamp, sessions=sessions)
