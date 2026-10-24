@@ -17,7 +17,15 @@ def evidence(directory, session, sessions, *, checkpoints=None):
     # A resumed CLI can replay old responses. Charge each provider response once,
     # to the first admitted invocation which recorded it.
     seen = set()
-    previous = sessions.values() if session.get("resume") else ()
+    previous = (
+        (
+            sessions.related([session["resume"]], include=session["id"])
+            if hasattr(sessions, "related")
+            else sessions.values()
+        )
+        if session.get("resume")
+        else ()
+    )
     for prior in previous:
         if prior["id"] == session["id"]:
             break
@@ -102,7 +110,7 @@ def linked_transcript(directory, session, sessions=None):
             resume_before = None
             # Identity is receipt-linked. A later recorded resume bounds which
             # invocation owns responses without guessing a provider from time overlap.
-            for later in (sessions or {}).values():
+            for later in sessions.related([provider]) if hasattr(sessions, "related") else (sessions or {}).values():
                 if later.get("resume") == provider and later["started"] > session["started"]:
                     resume_before = min(resume_before, later["started"]) if resume_before else later["started"]
             matches = {

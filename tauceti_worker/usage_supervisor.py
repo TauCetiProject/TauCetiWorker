@@ -215,7 +215,7 @@ def reserve_unknown_usage(budget, value, stamp):
     from .budget_usage import evidence
 
     with budget.locked():
-        sessions = budget.replay()["sessions"]
+        sessions = budget.evidence_sessions(budget.current(), value["id"])
     session = sessions.get(value["id"])
     if not session or session["status"] == "settled":
         return
@@ -223,7 +223,7 @@ def reserve_unknown_usage(budget, value, stamp):
     if not saved:
         return
     with budget.locked():
-        state = budget.replay()
+        state = budget.current()
         session = state["sessions"][value["id"]]
         if session["status"] == "settled":
             return
@@ -284,8 +284,16 @@ def tick(budget, cache=None, stop=None):
     ledger_stamp = stat_stamp(budget.ledger)
     if cache.get("ledger_stamp") != ledger_stamp or "sessions" not in cache:
         with budget.locked():
-            sessions = budget.replay()["sessions"]
-        for session in sessions.values():
+            state = budget.current()
+            rows = budget.sessions(state, active=True)
+            if "sessions" not in cache:
+                rows += budget.sessions(state, settled=True, estimated=True)
+            sessions = {session["id"]: session for session in rows}
+            for path in (budget.directory / "lifecycles").glob("*.json"):
+                value = state["sessions"].get(path.stem)
+                if value:
+                    sessions.setdefault(path.stem, value)
+        for session in rows:
             if session.get("lifecycle"):
                 register(budget.directory, session["lifecycle"])
         cache.update(ledger_stamp=ledger_stamp, sessions=sessions)
@@ -459,7 +467,7 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     # Missing evidence also retains the admission reserve. Do not keep
     # appending unresolved events on every supervisor pass.
     with budget.locked():
-        session = budget.replay()["sessions"].get(invocation)
+        session = budget.current()["sessions"].get(invocation)
     if session and session["status"] == "active":
         budget.settle(invocation, None, "stopped; missing usage evidence")
     value["recovery_stamp"] = stamp

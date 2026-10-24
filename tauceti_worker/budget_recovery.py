@@ -117,6 +117,9 @@ class Projection(Budget):
         # sessions so prior snapshots remain valid for candidate rollback.
         return dict(self.state)
 
+    def current(self):
+        return self.replay()
+
     def append(self, state, events):
         for event in events:
             if event["type"] == "settle" and event.get("cost_provenance") == "native-reported":

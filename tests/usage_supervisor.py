@@ -60,6 +60,17 @@ class SupervisorTests(unittest.TestCase):
         register(self.root, self.lifecycle)
         self.journal = UsageJournal(self.root / "usage" / self.bridge.name, self.id, model=MODEL)
 
+    def test_first_tick_restores_missing_lifecycle_for_estimated_settlement(self):
+        self.budget.settle(self.id, 2, provenance="token-priced")
+        path = lifecycle_path(self.root, self.id)
+        path.unlink()
+        cache = {}
+        with patch("tauceti_worker.usage_supervisor.recover_invocation"):
+            tick(self.budget, cache)
+        self.assertTrue(path.exists())
+        self.assertIsInstance(cache["sessions"], dict)
+        self.assertEqual(cache["sessions"][self.id]["status"], "settled")
+
     def ensure_supervisor(self, **kwargs):
         ensure_supervisor(self.root, **kwargs)
         owner = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
