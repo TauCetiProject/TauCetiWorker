@@ -265,7 +265,10 @@ with (
     bundle = b"retained compressed facts"
     digest = hashlib.sha256(bundle).hexdigest()
     name = f"plan.json.facts-{digest}.json.gz"
-    pages = {**plan, "documentation": {"mode": "pages", "facts_sha256": digest, "bundle_file": name}}
+    pages = {**plan, "documentation": {"facts_sha256": digest}}
+    (work / "plan.json").write_text(json.dumps(pages))
+    assert publication.facts_bundle(work / "plan.json") is None
+    pages["documentation"]["bundle_file"] = name
     (work / "plan.json").write_text(json.dumps(pages))
     (work / name).write_bytes(bundle)
     assert publication.facts_bundle(work / "plan.json", verify=True).read_bytes() == bundle
