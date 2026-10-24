@@ -99,7 +99,14 @@ launches. All participants must resolve the same directory; different OS users
 need an explicitly shared directory and suitable permissions.
 
 `events.jsonl` is the authoritative append-only ledger. `budget.lock` serializes
-transactions with `flock`; a snapshot may accelerate replay but is disposable.
+transactions with `flock`. `projection.sqlite` is a disposable indexed projection: it
+records the processed byte offset and sequence and replays only the appended tail.
+Current sessions, recent cost samples and cumulative provider baselines are indexed;
+routine admission and settlement do not load every historical session. A lost,
+corrupt or replaced projection rebuilds automatically from the ledger. A client
+using the older JSONL-only implementation may still append under the same lock;
+the next reader incorporates its events. If projection storage is unavailable,
+operations fall back to full authoritative replay.
 Create private directories/files by default. No API key, prompt, or response
 content belongs in this ledger. Routine operations never rewrite, truncate,
 rotate, or delete history. An adjustment or correction appends a new event.
@@ -112,7 +119,7 @@ unresolved. Session events carry invocation ID, worker ID, phase, model,
 provider session ID when available, estimate/cost, and outcome. Settlements
 have idempotency keys so reprocessing cannot debit the same invocation twice.
 
-Under the lock, replay the ledger, accrue elapsed credits, validate the requested
+Under the lock, catch the projection up with the ledger, accrue elapsed credits, validate the requested
 operation against current state, append the complete transaction, and `fsync`
 before allowing a paid process to start. An optional snapshot is written only
 after the ledger commits and never overrides ledger history. Use decimal money

@@ -140,7 +140,7 @@ class Budget:
             fcntl.flock(lock, fcntl.LOCK_EX)
             yield
 
-    def records(self, data: bytes | None = None) -> list[dict]:
+    def records(self, data: bytes | None = None, *, start=0) -> list[dict]:
         if data is None:
             try:
                 data = self.ledger.read_bytes()
@@ -149,7 +149,7 @@ class Budget:
         if data and not data.endswith(b"\n"):
             raise BudgetError(f"torn ledger write: {self.ledger}; preserve it and use budget --repair-ledger")
         records = []
-        for i, line in enumerate(data.splitlines(), 1):
+        for i, line in enumerate(data.splitlines(), start + 1):
             try:
                 rec = json.loads(line)
                 if rec["version"] != 1 or rec["seq"] != i or not isinstance(rec["events"], list):
@@ -159,7 +159,7 @@ class Budget:
                 raise BudgetError(f"invalid ledger record {i}: {self.ledger}") from None
         return records
 
-    def replay(self, records: list[dict] | None = None, *, _state=None):
+    def replay(self, records: list[dict] | None = None, *, _state=None, _samples=True):
         state = (
             _state
             if _state is not None
@@ -219,8 +219,6 @@ class Budget:
                         cost = money(event["cost"])
                         state["balance"] -= cost
                         state["spent"] += cost
-                        key = session["model"] + ":" + session["phase"]
-                        state["samples"].setdefault(key, []).append(cost)
                     elif kind == "unresolved":
                         session = state["sessions"][event["id"]]
                         session["status"] = "provisional" if event.get("provisional") else "unresolved"
@@ -242,12 +240,54 @@ class Budget:
                         raise BudgetError(f"unknown ledger event {kind}")
         except (KeyError, TypeError, InvalidOperation) as exc:
             raise BudgetError(f"invalid accounting event in {self.ledger}: {exc}") from None
+        if not _samples:
+            return state
         state["samples"] = {}
         for session in state["sessions"].values():
             if session["status"] == "settled":
                 key = session["model"] + ":" + session["phase"]
                 state["samples"].setdefault(key, []).append(money(session["cost"]))
         return state
+
+    def current(self):
+        """Read indexed state under locked(); the JSONL ledger remains authoritative."""
+        import sqlite3
+
+        from .budget_projection import Projection
+
+        try:
+            return Projection(self).load()
+        except (sqlite3.Error, OSError):
+            # A disposable optimization must never become a funding outage.
+            return self.replay()
+
+    @staticmethod
+    def sessions(state, **filters):
+        sessions = state["sessions"]
+        if hasattr(sessions, "select"):
+            return sessions.select(**filters)
+        rows = list(sessions.values())
+        for name, value in filters.items():
+            if name == "active" and value:
+                rows = [s for s in rows if s["status"] != "settled"]
+            elif name == "settled" and value:
+                rows = [s for s in rows if s["status"] == "settled"]
+            elif name in ("model", "phase") and value is not None:
+                rows = [s for s in rows if s[name] == value]
+            elif name == "positive" and value:
+                rows = [s for s in rows if money(s.get("cost", "0")) > 0]
+        return rows[-filters["limit"] :] if filters.get("limit") is not None else rows
+
+    @staticmethod
+    def related(state, providers, include=None):
+        sessions = state["sessions"]
+        if hasattr(sessions, "related"):
+            return sessions.related(providers, include=include)
+        return [
+            s
+            for s in sessions.values()
+            if s["id"] == include or set(s.get("totals", {})) & set(providers) or s.get("resume") in providers
+        ]
 
     def accrue(self, state):
         now = max(state["watermark"], money(self.clock()))
@@ -302,7 +342,7 @@ class Budget:
         if rate is not None and rate < 0:
             raise BudgetError("--grant-rate must be nonnegative")
         with self.locked():
-            state = self.replay()
+            state = self.current()
             events = [self.accrue(state)]
             if grant is not None:
                 events.append(dict(type="grant", delta=str(grant)))
@@ -339,7 +379,7 @@ class Budget:
 
     def refresh_waiter(self, worker):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             queue = self.waiting_state(state)
             if worker in queue and self.clock() - queue[worker].get("seen", 0) < 120:
                 queue[worker]["seen"] = self.clock()
@@ -350,7 +390,7 @@ class Budget:
 
     def wait_for_admission(self, worker, model, phase, reason):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             queue = self.waiting_state(state)
             previous = queue.get(worker, {})
             now = self.clock()
@@ -370,30 +410,42 @@ class Budget:
             self.save_waiting(queue)
 
     def estimate(self, state, model, phase=None, *, include_pending=True):
-        costs = [c for c in state["samples"].get(model + ":" + phase, []) if c > 0] if phase else []
+        costs = (
+            [
+                money(s["cost"])
+                for s in self.sessions(state, model=model, phase=phase, settled=True, positive=True, limit=20)
+            ]
+            if phase
+            else []
+        )
         costs = costs or [
-            money(s["cost"])
-            for s in state["sessions"].values()
-            if s["model"] == model and s["status"] == "settled" and money(s["cost"]) > 0
+            money(s["cost"]) for s in self.sessions(state, model=model, settled=True, positive=True, limit=20)
         ]
         if not costs and include_pending:
             costs = [
                 money(s["reserve"])
-                for s in state["sessions"].values()
-                if s["model"] == model and s["status"] != "settled" and money(s.get("reserve", "0")) > 0
+                for s in self.sessions(state, model=model, active=True)
+                if money(s.get("reserve", "0")) > 0
             ]
         costs = sorted(costs[-20:])
         if costs:
             return costs, costs[math.ceil(len(costs) * 0.75) - 1]
-        recent = [money(s["cost"]) for s in state["sessions"].values() if s["status"] == "settled"][-20:]
+        recent = [money(s["cost"]) for s in self.sessions(state, settled=True, limit=20)]
         return costs, max([Decimal(1), *recent])
 
     def snapshot(self, *, worker=None, model=None, phase=None):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             self.accrue(state)
             state["waiting"] = self.waiting_state(state)
-        active = [s for s in state["sessions"].values() if s["status"] != "settled"]
+            active = self.sessions(state, active=True)
+            estimate = self.estimate(state, model, phase)[1] if model else Decimal(0)
+            now = self.clock()
+            calibrating = [
+                name
+                for name in {s["model"] for s in active if s["status"] == "active" and not orphaned_bridge(s, now)}
+                if not self.estimate(state, name)[0]
+            ]
         pending = sum((money(s.get("reserve", s["estimate"])) for s in active), Decimal(0))
         now = self.clock()
         available = state["balance"] - pending
@@ -411,7 +463,7 @@ class Budget:
             if previous:
                 threshold = money(previous["estimate"])
             elif model:
-                threshold = self.estimate(state, model, phase)[1]
+                threshold = estimate
         funding_at = None
         if worker is not None and state["rate"] > 0 and available < max(threshold, Decimal("0.000000001")):
             funding_at = now + float((max(threshold, Decimal("0.000000001")) - available) * 3600 / state["rate"])
@@ -435,21 +487,17 @@ class Budget:
             clock_backwards=money(now) < state["watermark"],
             ledger=str(self.ledger),
             cooldowns=state["cooldowns"],
-            calibrating_models=[
-                name
-                for name in {s["model"] for s in active if s["status"] == "active" and not orphaned_bridge(s, now)}
-                if not self.estimate(state, name)[0]
-            ],
+            calibrating_models=calibrating,
         )
 
     def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             if invocation in state["sessions"]:
                 raise BudgetError("an invocation ID cannot be launched twice")
             events = [self.accrue(state)]
-            active = [s for s in state["sessions"].values() if s["status"] != "settled"]
-            if resume and not any(resume in s.get("totals", {}) for s in state["sessions"].values()):
+            active = self.sessions(state, active=True)
+            if resume and not any(resume in s.get("totals", {}) for s in self.related(state, [resume])):
                 raise BudgetError("resuming requires a recorded cost baseline for that provider session ID")
             for session in active:
                 if orphaned_bridge(session, self.clock()):
@@ -545,7 +593,7 @@ class Budget:
         if value is not None and value < 0:
             raise BudgetError("session cost cannot be negative")
         with self.locked():
-            state = self.replay()
+            state = self.current()
             if invocation not in state["sessions"]:
                 raise BudgetError("unknown invocation")
             session = state["sessions"][invocation]
@@ -593,7 +641,7 @@ class Budget:
         if value < 0:
             raise BudgetError("cost cannot be negative")
         with self.locked():
-            state = self.replay()
+            state = self.current()
             session = state["sessions"].get(invocation)
             if not session:
                 raise BudgetError("unknown invocation")
@@ -667,7 +715,7 @@ class Budget:
                 raise BudgetError("receipt totals cannot be negative")
         cost = None
         with self.locked():
-            state = self.replay()
+            state = self.current()
             session = state["sessions"].get(receipt["id"])
             if not session:
                 raise BudgetError("receipt has no recorded admission")
@@ -699,10 +747,10 @@ class Budget:
                 or money(finished) > money(self.clock())
             ):
                 raise BudgetError("invalid receipt finish time")
-            ordered = list(state["sessions"].values())
+            ordered = self.related(state, set(totals or {}) | set(lower or {}), include=receipt["id"])
             position = next(i for i, entry in enumerate(ordered) if entry["id"] == receipt["id"])
             baseline = {}
-            for prior in state["sessions"].values():
+            for prior in ordered:
                 if prior["id"] == receipt["id"]:
                     break
                 for provider_id, value in prior.get("totals", {}).items():
@@ -893,7 +941,7 @@ class Budget:
             )
 
         with self.locked():
-            sessions = self.replay()["sessions"]
+            sessions = self.current()["sessions"]
         session = sessions.get(invocation)
         if not session or session["status"] == "settled" or live(session):
             return None
@@ -901,7 +949,7 @@ class Budget:
         if not saved or not saved["items"]:
             return None
         with self.locked():
-            state = self.replay()
+            state = self.current()
             session = state["sessions"].get(invocation)
             if not session or session["status"] == "settled" or live(session):
                 return None
@@ -953,7 +1001,7 @@ class Budget:
                 totals = {}
                 if primary and primary != "unknown":
                     baseline = Decimal(0)
-                    for prior in state["sessions"].values():
+                    for prior in self.related(state, [primary], include=invocation):
                         if prior["id"] == invocation:
                             break
                         baseline = max(baseline, money(prior.get("totals", {}).get(primary, "0")))
@@ -1004,7 +1052,7 @@ class Budget:
 
     def cooldown(self, model, seconds):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             until = max(state["cooldowns"].get(model, 0), self.clock() + max(0, seconds))
             self.append(state, [self.accrue(state), dict(type="cooldown", model=model, until=until)])
 

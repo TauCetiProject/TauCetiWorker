@@ -376,7 +376,7 @@ class ClaudeAPIContext:
         if self.enabled:
             try:
                 with self.budget.locked():
-                    sessions = self.budget.replay()["sessions"]
+                    sessions = self.budget.current()["sessions"]
                 for invocation in self.invocations:
                     if sessions[invocation]["status"] != "settled":
                         recovered = self.budget.recover_usage(invocation, allow_live_owner=True)
