@@ -2497,6 +2497,53 @@ def review_in_bubble(
             claim.release()
 
 
+def _review_mathlib_source(cfg: Config) -> Path | None:
+    """Mathlib source at the revision TauCeti main pins, for the reviewers' greps. Staged host-side
+    because the bubble's repo-scoped proxy cannot reach mathlib4; one snapshot per revision, the
+    two newest kept. None leaves the review without it."""
+    from .github import gh_run
+
+    got = gh_run(["gh", "api", f"repos/{TAUCETI}/contents/lake-manifest.json",
+                  "-H", "Accept: application/vnd.github.raw"])
+    try:
+        packages = json.loads(got.stdout).get("packages", []) if got.returncode == 0 else []
+        rev = next(p["rev"] for p in packages if p.get("name") == "mathlib")
+    except (ValueError, StopIteration, KeyError, AttributeError, TypeError):
+        return None
+    if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
+        return None
+    base = cfg.state / "refs"
+    src = base / f"mathlib-src-{rev}"
+    if (src / "Mathlib.lean").is_file():
+        return src
+    base.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="mathlib-src-tmp-", dir=base))
+    steps = (
+        ["git", "init", "-q", str(tmp)],
+        ["git", "-C", str(tmp), "fetch", "-q", "--depth", "1",
+         "https://github.com/leanprover-community/mathlib4", rev],
+        ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
+    )
+    try:
+        failed = any(subprocess.run(step, timeout=600).returncode for step in steps)
+    except subprocess.TimeoutExpired:
+        failed = True
+    if failed:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    shutil.rmtree(tmp / ".git", ignore_errors=True)
+    try:
+        tmp.rename(src)
+    except OSError:  # a concurrent worker staged the same revision first
+        shutil.rmtree(tmp, ignore_errors=True)
+    snapshots = sorted((p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
+                       key=lambda p: p.stat().st_mtime)
+    for old in snapshots[:-2]:
+        if old != src:
+            shutil.rmtree(old, ignore_errors=True)
+    return src if (src / "Mathlib.lean").is_file() else None
+
+
 def _review_in_bubble(
     w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
 ) -> int:
@@ -2545,8 +2592,13 @@ def _review_in_bubble(
     mounts = [f"{engine_dir}:/opt/engine:ro", f"{roadmap_dir}:/opt/roadmap:ro", f"{store}:/opt/review-store:rw"]
     if result_file is not None:
         mounts.append(f"{result_file.parent}:/opt/review-result:rw")
-    # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview). --no-mathlib for now; wiring
-    # --mathlib-dir at the bubble's vendored .lake/packages/mathlib is the reuse-rubric refinement.
+    # The reuse rubric greps Mathlib, and the merge gate does not count an approval whose judge
+    # says Mathlib was missing from its checkout.
+    mathlib = _review_mathlib_source(cfg)
+    if mathlib is not None:
+        mounts.append(f"{mathlib}:/opt/mathlib:ro")
+    mathlib_flag = "--mathlib-dir /opt/mathlib" if mathlib is not None else "--no-mathlib"
+    # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview).
     # run_in_bubble prefixes `env PATH=… `, so the inner command must start with an executable, not the
     # `cd` shell builtin — carry the engine on PYTHONPATH instead of cwd (cwd is irrelevant: the engine
     # uses --repo-dir for its files and an absolute temp workdir).
@@ -2561,7 +2613,7 @@ def _review_in_bubble(
     inner = (
         "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine:/opt/tools python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
-        f"--no-mathlib --no-sync --no-coordinate --store /opt/review-store --post "
+        f"{mathlib_flag} --no-sync --no-coordinate --store /opt/review-store --post "
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )
