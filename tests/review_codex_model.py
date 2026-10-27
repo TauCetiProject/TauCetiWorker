@@ -73,7 +73,7 @@ def fake_run_in_bubble(w, target, prompt, opts, mounts=None, inner_cmd=None, cre
 agents.run_in_bubble = fake_run_in_bubble
 agents.fetch_ref = lambda repo, d: True  # no network
 agents.me = lambda: "tester"  # no gh call
-agents._review_mathlib_source = lambda cfg: None  # no network
+agents._review_mathlib_source = lambda cfg, head: None  # no dependency in this fixture
 
 tmp = Path(tempfile.mkdtemp())
 os.environ["TAUCETI_REVIEW_ENGINE_DIR"] = str(tmp / "engine")  # skip the engine fetch
@@ -111,12 +111,14 @@ check(
 )
 
 check("bubble: no Mathlib snapshot -> --no-mathlib", "--no-mathlib" in captured["inner"])
-agents._review_mathlib_source = lambda cfg: tmp / "mathlib-src-x"
+agents._review_mathlib_source = lambda cfg, head: tmp / "mathlib-src-x"
 agents._review_in_bubble(w, 470, "abc123", "claude", opts)
 check("bubble: Mathlib snapshot is mounted read-only", f"{tmp / 'mathlib-src-x'}:/opt/mathlib:ro" in captured["mounts"])
-check("bubble: engine greps the mounted Mathlib", "--mathlib-dir /opt/mathlib" in captured["inner"]
-      and "--no-mathlib" not in captured["inner"])
-agents._review_mathlib_source = lambda cfg: None
+check(
+    "bubble: engine greps the mounted Mathlib",
+    "--mathlib-dir /opt/mathlib" in captured["inner"] and "--no-mathlib" not in captured["inner"],
+)
+agents._review_mathlib_source = lambda cfg, head: None
 
 # --- host: exercise the actual do_review command construction without a provider/network ----------
 host_commands = []

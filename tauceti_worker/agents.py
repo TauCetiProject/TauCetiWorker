@@ -2497,21 +2497,36 @@ def review_in_bubble(
             claim.release()
 
 
-def _review_mathlib_source(cfg: Config) -> Path | None:
-    """Mathlib source at the revision TauCeti main pins, for the reviewers' greps. Staged host-side
+def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
+    """Mathlib source at the reviewed head's pin, for the reviewers' greps. Staged host-side
     because the bubble's repo-scoped proxy cannot reach mathlib4; one snapshot per revision, the
-    two newest kept. None leaves the review without it."""
+    two newest kept. None means the manifest declares no Mathlib dependency; staging failures
+    stop the round before a reviewer can run without required sources."""
     from .github import gh_run
 
-    got = gh_run(["gh", "api", f"repos/{TAUCETI}/contents/lake-manifest.json",
-                  "-H", "Accept: application/vnd.github.raw"])
+    got = gh_run(
+        [
+            "gh",
+            "api",
+            f"repos/{TAUCETI}/contents/lake-manifest.json?ref={head}",
+            "-H",
+            "Accept: application/vnd.github.raw",
+        ]
+    )
+    if got.returncode:
+        raise NoProgress("review: could not read the exact-head dependency manifest; no review started")
     try:
-        packages = json.loads(got.stdout).get("packages", []) if got.returncode == 0 else []
-        rev = next(p["rev"] for p in packages if p.get("name") == "mathlib")
-    except (ValueError, StopIteration, KeyError, AttributeError, TypeError):
-        return None
+        packages = json.loads(got.stdout)["packages"]
+        if not isinstance(packages, list) or not all(isinstance(p, dict) for p in packages):
+            raise ValueError("invalid package list")
+        mathlib = next((p for p in packages if p.get("name") == "mathlib"), None)
+        if mathlib is None:
+            return None
+        rev = mathlib["rev"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise NoProgress("review: invalid exact-head dependency manifest; no review started") from error
     if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
-        return None
+        raise NoProgress("review: Mathlib revision is not pinned to a commit; no review started")
     base = cfg.state / "refs"
     src = base / f"mathlib-src-{rev}"
     if (src / "Mathlib.lean").is_file():
@@ -2520,28 +2535,31 @@ def _review_mathlib_source(cfg: Config) -> Path | None:
     tmp = Path(tempfile.mkdtemp(prefix="mathlib-src-tmp-", dir=base))
     steps = (
         ["git", "init", "-q", str(tmp)],
-        ["git", "-C", str(tmp), "fetch", "-q", "--depth", "1",
-         "https://github.com/leanprover-community/mathlib4", rev],
+        ["git", "-C", str(tmp), "fetch", "-q", "--depth", "1", "https://github.com/leanprover-community/mathlib4", rev],
         ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
     )
     try:
         failed = any(subprocess.run(step, timeout=600).returncode for step in steps)
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         failed = True
     if failed:
         shutil.rmtree(tmp, ignore_errors=True)
-        return None
+        raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
     shutil.rmtree(tmp / ".git", ignore_errors=True)
     try:
         tmp.rename(src)
     except OSError:  # a concurrent worker staged the same revision first
         shutil.rmtree(tmp, ignore_errors=True)
-    snapshots = sorted((p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
-                       key=lambda p: p.stat().st_mtime)
+    snapshots = sorted(
+        (p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
+        key=lambda p: p.stat().st_mtime,
+    )
     for old in snapshots[:-2]:
         if old != src:
             shutil.rmtree(old, ignore_errors=True)
-    return src if (src / "Mathlib.lean").is_file() else None
+    if not (src / "Mathlib.lean").is_file():
+        raise NoProgress("review: the pinned Mathlib source snapshot is incomplete; no review started")
+    return src
 
 
 def _review_in_bubble(
@@ -2594,7 +2612,7 @@ def _review_in_bubble(
         mounts.append(f"{result_file.parent}:/opt/review-result:rw")
     # The reuse rubric greps Mathlib, and the merge gate does not count an approval whose judge
     # says Mathlib was missing from its checkout.
-    mathlib = _review_mathlib_source(cfg)
+    mathlib = _review_mathlib_source(cfg, head)
     if mathlib is not None:
         mounts.append(f"{mathlib}:/opt/mathlib:ro")
     mathlib_flag = "--mathlib-dir /opt/mathlib" if mathlib is not None else "--no-mathlib"
