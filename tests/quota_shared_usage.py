@@ -142,6 +142,17 @@ def test_headerless_backoff_and_recovery(root):
         assert q._cooldown("claude", "account")[0] == first
 
 
+def test_read_only_credentials_keep_shared_caching(root):
+    qa, qb = worker(root, "one"), worker(root, "two")
+    (root / "source" / quota.CLAUDE_QUOTA_DIRNAME).write_text("cannot create a cache here")
+    with patch.object(quota, "_http_get_json", return_value=(200, payload(time.time()), None)) as http:
+        assert qa._claude_pass("fp", "token", refresh=True, account="account")[0].available
+        assert qb._claude_pass("fp", "token", refresh=True, account="account")[0].available
+        assert http.call_count == 1
+    assert qa._usage_dir("claude") == qb._usage_dir("claude")
+    assert qa._usage_dir("claude").is_relative_to(root / ".quota-usage")
+
+
 if __name__ == "__main__":
     with patch.dict(os.environ):
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -154,6 +165,7 @@ if __name__ == "__main__":
             test_shared_recent_read_and_429_fallback,
             test_account_separation_and_reset,
             test_headerless_backoff_and_recovery,
+            test_read_only_credentials_keep_shared_caching,
         ):
             with tempfile.TemporaryDirectory() as directory:
                 test(Path(directory))

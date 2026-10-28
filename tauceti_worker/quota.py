@@ -1168,7 +1168,9 @@ class Quota:
         if provider == "claude" and getattr(self, "cfg", None) is not None:
             # The existing credential-source marker follows isolation back to the login user's
             # source. It works across worker ids, checkouts and projects without a service or setup.
-            return self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME / "usage"
+            return getattr(self, "_claude_usage_directory", None) or (
+                self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME / "usage"
+            )
         return self.cache_dir
 
     def _raw_path(self, provider: str, fp: str | None = None) -> Path:
@@ -1187,6 +1189,17 @@ class Quota:
             fd = os.open(directory / f"fetch-{self._fingerprint(account)}.lock", os.O_CREAT | os.O_WRONLY, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError:
+            if fd is not None:
+                os.close(fd)
+                fd = None
+            if getattr(self, "cfg", None) is not None and not hasattr(self, "_claude_usage_directory"):
+                # Container credentials are commonly mounted read-only. Use the shared worker-state
+                # root in that case, rather than losing caching or requiring a writable credential.
+                source = self._fingerprint(str(self._claude_creds_source()))
+                self._claude_usage_directory = self.cache_dir.parent.parent / ".quota-usage" / source
+                with self._usage_lock(account):
+                    yield
+                return
             # Keep the in-process cooldown and any readable cache when sharing is unavailable.
             # Failure to write diagnostics must not prevent a usable provider from running.
             pass

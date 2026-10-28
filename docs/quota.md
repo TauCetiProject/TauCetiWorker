@@ -22,6 +22,8 @@ Isolated workers follow their credential-source marker back to that same locatio
 including across projects and checkouts. This is built into Tau Ceti and requires
 no external usage script, service, or account setup. Different credential-source
 directories remain independent; this does not coordinate across machines.
+If the credential directory is read-only, as in the Docker deployment, the shared
+worker-state root holds these records instead. Credentials need no write access.
 
 A loop refresh reuses a reading less than 20 minutes old. The lock allows only
 one worker to fetch when that reading ages out; other workers use its result.
