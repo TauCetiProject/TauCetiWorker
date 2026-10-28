@@ -151,7 +151,7 @@ environment (flags win; full reference linked below):
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
   TAUCETI_OVERLAP_BATCH_COMMITS  commits per scan session (default 160)
-  TAUCETI_MAX_OPEN_PRS   open PR authoring cutoff (default 8)
+  TAUCETI_MAX_OPEN_PRS   open PR authoring cutoff (default 32)
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
   CODEX_HOME             Codex config/credential source; point it at a private directory to give
@@ -184,7 +184,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--max-open-prs",
         type=positive_integer,
         default=None,
-        help="open roadmap PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 8)",
+        help="open roadmap PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 32)",
     )
     p.add_argument(
         "--overlap-batch-commits",

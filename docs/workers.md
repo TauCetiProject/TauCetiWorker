@@ -157,7 +157,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
 | `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token |
-| `max_open_prs` | positive integer | `8` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
+| `max_open_prs` | positive integer | `32` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
 | `github_state_url` | string | unset | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
 | `github_state_token_file` | string | unset | Private client-token file for the service; installation credentials stay on the server. |
 | `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`, `lint-repair`, `overlap-scan`, `overlap-fix`. Empty means the automatic cascade. Set `TAUCETI_OVERLAP_BATCH_COMMITS` through `env` to override the calibrated 160-commit scan batch. |

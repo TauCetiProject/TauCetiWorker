@@ -121,7 +121,7 @@ LINT_REPAIR_HEAD_PREFIX = "lint-repair/"
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
 # are open.
-MAX_OPEN_PRS = 8
+MAX_OPEN_PRS = 32
 
 # The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
 # The survey counts open PRs into these buckets for the per-round "open PRs" line, in lifecycle order
