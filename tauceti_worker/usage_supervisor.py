@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, bridge_owner_alive, money
+from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, LedgerError, bridge_owner_alive, money
 from .claude_api import safe_message
 from .usage_accounting import session_usage, usage_path
 from .usage_lifecycle import alive, durable, identity, resolve
@@ -294,10 +294,13 @@ def tick(budget, cache=None, stop=None):
                     value = state["sessions"].get(path.stem)
                     if value:
                         sessions.setdefault(path.stem, value)
-        except ACCOUNTING_ERRORS:
+            cache["ledger_available"] = True
+        except ACCOUNTING_ERRORS as error:
             # Launch supervision must keep running while ledger reads recover.
             rows, sessions = [], cache.get("sessions", {})
-            ledger_stamp = None  # Retry accounting on the next pass.
+            cache["ledger_available"] = False
+            if not isinstance(error, LedgerError):
+                ledger_stamp = None  # Retry transient storage errors, not unchanged corrupt bytes.
         for session in rows:
             if session.get("lifecycle"):
                 register(budget.directory, session["lifecycle"])
@@ -433,6 +436,8 @@ def recover_invocation(budget, path, *, cache=None, session=None):
             changed = True
     if changed:
         durable(path, value)
+    if cache is not None and not cache.get("ledger_available", True):
+        return  # Supervision above still runs; defer ledger work until it is readable.
     if not stopped or not value["budgeted"]:
         if value["budgeted"] and value.get("external") and mode == "auto":
             prior_stamp = value.get("unknown_reserve_stamp")
@@ -444,6 +449,8 @@ def recover_invocation(budget, path, *, cache=None, session=None):
         return
     if mode == "record-only":
         return
+    if value.get("unrecorded_admit"):
+        budget.restore_admission(value["unrecorded_admit"])
     receipt_path = inbox / (invocation + ".receipt")
     if value.get("recovery_stamp") == stamp or (cache is not None and cache.get(invocation) == stamp):
         return

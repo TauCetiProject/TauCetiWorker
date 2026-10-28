@@ -12,7 +12,7 @@ import sys
 import time
 
 from .agents import resolve_authoring_profile
-from .budget import Budget, BudgetError, admission_pause
+from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, admission_pause
 from .claude_api import api_mode
 from .config import Config, NoProgress, log
 from .constants import (
@@ -142,15 +142,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 and due(cfg, only=only, prs=prs, sandbox_host=not bubble, agent=agent)
             )
             if not recovery_only and api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
-                try:
-                    snapshot = Budget().runtime_snapshot(worker=cfg.wid)
-                    reason = admission_pause(snapshot, worker=cfg.wid) if snapshot else None
-                    blocked = reason is not None
-                    if blocked:
+                snapshot = Budget().runtime_snapshot(worker=cfg.wid)
+                reason = admission_pause(snapshot, worker=cfg.wid) if snapshot else None
+                blocked = reason is not None
+                if blocked:
+                    with contextlib.suppress(*ACCOUNTING_ERRORS):
                         Budget().refresh_waiter(cfg.wid)
-                except (BudgetError, OSError) as error:
-                    log(f"budget bookkeeping unavailable; continuing work ({error})")
-                    blocked, reason, snapshot = False, None, {}
                 if blocked:
                     wake = snapshot.get("funding_at")
                     if reason == "API throughput cooldown":

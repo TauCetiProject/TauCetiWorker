@@ -679,7 +679,7 @@ is at least $1, or the largest of the last 20 recorded costs across all models i
 zero-cost launch failures do not establish a spending estimate. If that session
 loses its receipt, another calibration session can run; missing costs never
 pause the fleet merely because reconciliation is outstanding. Resuming the same
-provider session waits while a previous resume is unsettled; unrelated sessions
+provider session waits while a previous resume is still running; unrelated sessions
 can run. Recovering the cumulative receipt restores accurate accounting across
 resumes; a missing baseline does not prevent runtime work. A cost-only manual
 reconciliation does not restore that baseline. No local budget amount is passed as

@@ -117,10 +117,14 @@ class ProjectionTests(unittest.TestCase):
         self.budget.ledger.write_bytes(good + b'{"seq":')
         self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 100)
         self.assertEqual(self.budget.ledger.read_bytes(), good)
+        cache = self.root / "projection.sqlite"
+        inode = cache.stat().st_ino
         self.budget.ledger.write_bytes(good + b'{"version":1,"seq":99,"events":[]}\n')
-        with self.assertRaises(BudgetError):
-            self.budget.snapshot()
-        self.assertIsNone(self.budget.runtime_snapshot())
+        with patch.object(self.budget, "replay", side_effect=AssertionError("unnecessary full replay")):
+            with self.assertRaises(BudgetError):
+                self.budget.snapshot()
+            self.assertIsNone(self.budget.runtime_snapshot())
+        self.assertEqual(cache.stat().st_ino, inode)
         self.budget.ledger.write_bytes(good.replace(b'"version":1', b'"version":9'))
         with self.assertRaises(BudgetError):
             self.budget.snapshot()

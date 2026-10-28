@@ -161,16 +161,18 @@ class Budget:
             if stream.read(1) == b"\n":
                 return
             offset = end
-            suffix = b""
+            chunks = []
             while offset:
                 size = min(offset, 8192)
                 offset -= size
                 stream.seek(offset)
-                suffix = stream.read(size) + suffix
-                if (newline := suffix.rfind(b"\n")) >= 0:
+                chunk = stream.read(size)
+                if (newline := chunk.rfind(b"\n")) >= 0:
                     offset += newline + 1
-                    suffix = suffix[newline + 1 :]
+                    chunks.append(chunk[newline + 1 :])
                     break
+                chunks.append(chunk)
+            suffix = b"".join(reversed(chunks))
             # A complete transaction missing only its newline can be retained.
             try:
                 record = json.loads(suffix)
@@ -289,6 +291,10 @@ class Budget:
                     else:
                         raise LedgerError(f"unknown ledger event {kind}")
         except (KeyError, TypeError, InvalidOperation, BudgetError) as exc:
+            if isinstance(exc, KeyError) and _state is not None and hasattr(state["sessions"], "db"):
+                # A missing indexed session is cache damage. Rebuild that cache
+                # before deciding that the underlying history is unreadable.
+                raise BudgetError(f"incomplete projected accounting state: {exc}") from None
             raise LedgerError(f"invalid accounting event in {self.ledger}: {exc}") from None
         if not _samples:
             return state
@@ -308,6 +314,8 @@ class Budget:
         projection = Projection(self)
         try:
             return projection.load()
+        except LedgerError:
+            raise
         except (sqlite3.Error, OSError, BudgetError):
             # A disposable optimization must never become a funding outage.
             try:
@@ -394,26 +402,30 @@ class Budget:
         data = self.record_bytes(state, events)
         transaction = json.loads(data)["transaction"]
         fd = os.open(self.ledger, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
-        offset = os.lseek(fd, 0, os.SEEK_END)
+        before = None
         try:
+            before = os.fstat(fd)
             while data:
                 written = os.write(fd, data)
                 if written <= 0:
                     raise OSError("ledger write made no progress")
                 data = data[written:]
-            os.fsync(fd)
         except OSError:
-            if data:
+            if data and before is not None:
                 # A failed short write must not poison every later reader.
                 # A complete write whose fsync failed remains available to replay.
                 with contextlib.suppress(OSError):
-                    os.ftruncate(fd, offset)
-                    os.fsync(fd)
+                    os.ftruncate(fd, before.st_size)
+                    os.utime(fd, ns=(before.st_atime_ns, before.st_mtime_ns))
             raise
         finally:
+            # Write durability is best effort; complete records remain usable.
+            with contextlib.suppress(OSError):
+                os.fsync(fd)
             os.close(fd)
         # Persist a newly created ledger's directory entry as well as its contents.
-        self.sync_directory()
+        with contextlib.suppress(OSError):
+            self.sync_directory()
         return dict(transaction=transaction, ledger_sequence=state["seq"] + 1)
 
     def configure(self, *, grant=None, set_grant=None, rate=None):
@@ -587,7 +599,26 @@ class Budget:
         try:
             return self.admit(*args, **kwargs)
         except ACCOUNTING_ERRORS as error:
-            return dict(allowed=True, recorded=False, accounting_error=str(error))
+            invocation, worker, model, phase = args
+            event = dict(
+                type="admit",
+                id=invocation,
+                worker=worker,
+                model=model,
+                phase=phase,
+                estimate="0",
+                status="active",
+                started=self.clock(),
+                **{key: value for key, value in kwargs.items() if key != "lifecycle"},
+            )
+            return dict(allowed=True, recorded=False, accounting_error=str(error), unrecorded_admit=event)
+
+    def restore_admission(self, event):
+        """Record work that already ran during an outage, without a new funding decision."""
+        with self.locked():
+            state = self.current()
+            if event["id"] not in state["sessions"]:
+                self.append(state, [self.accrue(state), event])
 
     def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None):
         with self.locked():
@@ -596,8 +627,6 @@ class Budget:
                 raise BudgetError("an invocation ID cannot be launched twice")
             events = [self.accrue(state)]
             active = [s for s in self.sessions(state, active=True) if not s.get("archive")]
-            if resume and not any(resume in s.get("totals", {}) for s in self.related(state, [resume])):
-                raise LedgerError("recorded cost baseline unavailable for that provider session ID")
             for session in active:
                 if orphaned_bridge(session, self.clock()):
                     session["status"] = "unresolved"
@@ -623,12 +652,8 @@ class Budget:
                 default=None,
             )
             reason = None
-            if resume and any(s.get("resume") == resume for s in active):
-                reason = (
-                    "provider session already being resumed"
-                    if any(s.get("resume") == resume for s in live)
-                    else "provider session cost baseline unresolved"
-                )
+            if resume and any(s.get("resume") == resume for s in live):
+                reason = "provider session already being resumed"
             elif state["cooldowns"].get(model, 0) > now:
                 reason = "API throughput cooldown"
             elif not costs and any(s["model"] == model for s in live):
@@ -673,7 +698,8 @@ class Budget:
             )
             self.append(state, events)
             queue.pop(worker, None)
-            self.save_waiting(queue)
+            with contextlib.suppress(OSError):
+                self.save_waiting(queue)
             return dict(allowed=True, estimate=str(estimate))
 
     def settle(

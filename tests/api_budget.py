@@ -349,23 +349,21 @@ class BudgetTests(unittest.TestCase):
         self.budget.configure(grant=10)
         self.assertFalse(self.budget.admit("second", "second", "opus", "fix")["allowed"])
         self.assertTrue(self.budget.admit("first", "first", "opus", "fix", resume="provider-session")["allowed"])
-        with self.assertRaises(BudgetError):
-            self.budget.admit("unknown", "unknown", "opus", "fix", resume="no-history")
+        self.budget.configure(grant=100)
+        self.assertTrue(self.budget.admit("unknown", "second", "opus", "fix", resume="no-history")["allowed"])
+        self.budget.settle_receipt({"id": "unknown", "totals": {"no-history": "7"}, "outcome": "completed"})
+        self.assertEqual(self.budget.replay()["sessions"]["unknown"]["cost"], "7")
 
-    def test_unresolved_resume_only_holds_its_own_provider_until_receipt_recovery(self):
+    def test_stopped_resume_with_missing_cost_does_not_require_manual_recovery(self):
         self.budget.configure(grant=100)
         self.budget.admit("seed", "seed", "opus", "fix")
         self.budget.settle("seed", 10, totals={"provider-session": "10"})
         self.budget.admit("lost", "worker", "opus", "fix", resume="provider-session")
         self.budget.settle("lost", None, "reboot")
-        self.assertEqual(
-            self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["reason"],
-            "provider session cost baseline unresolved",
-        )
+        self.assertTrue(self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["allowed"])
         self.assertTrue(self.budget.admit("unrelated", "other", "opus", "fix")["allowed"])
         self.budget.settle("unrelated", 2)
         self.budget.settle_receipt({"id": "lost", "totals": {"provider-session": "20"}, "outcome": "recovered"})
-        self.assertTrue(self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["allowed"])
         self.assertEqual(
             self.budget.admit("concurrent", "other", "opus", "fix", resume="provider-session")["reason"],
             "provider session already being resumed",
@@ -953,6 +951,9 @@ with ClaudeAPIContext("crash-fixture", "fix"):
 
         def interrupted(fd, data):
             nonlocal count
+            target, actual = self.budget.ledger.stat(), os.fstat(fd)
+            if (target.st_dev, target.st_ino) != (actual.st_dev, actual.st_ino):
+                return real_write(fd, data)
             count += 1
             if count == 1:
                 return real_write(fd, data[:40])
@@ -964,12 +965,23 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         ):
             result = self.run_claude()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.budget.ledger.read_bytes(), good)
+        self.assertGreaterEqual(count, 2, "exercise both a short ledger write and its failure")
+        self.assertTrue(self.budget.ledger.read_bytes().startswith(good))
+        deadline = time.monotonic() + 3
+        while Decimal(self.budget.snapshot()["spent"]) < 20 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 20)
+        good = self.budget.ledger.read_bytes()
         # A persistent read error must not stop the supervisor issuing the launch.
         self.budget.ledger.write_bytes(good + b"unreadable bookkeeping record\n")
         with ClaudeAPIContext("worker3", "fix", model="opus"):
             result = self.run_claude()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.budget.ledger.write_bytes(good)
+        deadline = time.monotonic() + 3
+        while Decimal(self.budget.snapshot()["spent"]) < 30 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 30)
         args = build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--budget", "--loop"])
         with (
             patch.object(Budget, "snapshot", side_effect=OSError("ledger unavailable")),

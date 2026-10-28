@@ -129,6 +129,7 @@ class ClaudeAPIContext:
         self.launch_failures = set()
         self.admission_ids = {}
         self.models = {}
+        self.deferred_admissions = {}
         self.blocked_reason = None
         self.wait_state = None
         self.previous_path = os.environ.get("PATH", "")
@@ -276,7 +277,8 @@ class ClaudeAPIContext:
             if answer["allowed"]:
                 if answer.get("recorded") is False:
                     # Keep process supervision working even without a ledger row.
-                    lifecycle["budgeted"] = False
+                    lifecycle["unrecorded_admit"] = answer["unrecorded_admit"]
+                    self.deferred_admissions[invocation] = answer["unrecorded_admit"]
                     self.errors.append("ledger write unavailable; work continued: " + answer["accounting_error"])
                 register(self.budget.directory, lifecycle)
                 self.invocations.add(invocation)
@@ -315,6 +317,9 @@ class ClaudeAPIContext:
             self.blocked_reason = "native Claude launch failed before spending"
         if not self.enabled:
             return
+        if receipt["id"] in self.deferred_admissions:
+            self.budget.restore_admission(self.deferred_admissions[receipt["id"]])
+            self.deferred_admissions.pop(receipt["id"])
         self.budget.settle_receipt(receipt)
 
     def heartbeat(self):

@@ -11,6 +11,8 @@ import sqlite3
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 
+from .budget import LedgerError
+
 
 def projected_read(function):
     @functools.wraps(function)
@@ -159,6 +161,8 @@ class Projection:
     def load(self):
         try:
             return self._load()
+        except LedgerError:
+            raise  # Valid indexed history need not be rebuilt for a damaged ledger tail.
         except (sqlite3.DatabaseError, ValueError, InvalidOperation, KeyError, TypeError):
             # This file holds no unique financial evidence. Rebuild only it.
             if self.db is not None:

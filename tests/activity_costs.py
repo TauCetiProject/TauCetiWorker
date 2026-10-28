@@ -531,7 +531,7 @@ class CostTests(unittest.TestCase):
         self.assertEqual(self.summary()["costs"]["windows"]["total"]["usd_per_loc"], "Infinity")
         self.assertEqual(activity_summary.loc_estimate(dict(estimated_usd="0"))["usd_per_loc"], "0")
         p = self.root / "budget/events.jsonl"
-        p.write_text(p.read_text() + '{"torn":')
+        p.write_text(p.read_text() + '{"invalid":true}\n')
         s = self.summary()
         self.assertIsNone(s["costs"]["windows"]["total"]["spent_usd"])
         self.assertTrue(all(r["usd_per_hour"] is None for r in s["costs"]["spending"].values()))
