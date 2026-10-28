@@ -332,13 +332,13 @@ waiting_cases = [
         3600,
     ),
     (
-        "an alternative's HTTP 429 Retry-After is honored",
+        "an alternative's HTTP 429 Retry-After is capped at fifteen minutes",
         "auto",
         {
             "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
             "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=1200),
         },
-        1200,
+        900,
     ),
     (
         "a short HTTP 429 Retry-After is still respected",
@@ -383,7 +383,7 @@ waiting_cases = [
             "codex": tc.Provider("codex", False, None, error="usage HTTP 503", retry_after=3600),
             "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600),
         },
-        3600,
+        900,
     ),
 ]
 wait_ok = True
@@ -396,10 +396,10 @@ try:
     tc.loop.report_runtime = lambda *_a, **_k: None
     for label, agent, snap, expected in waiting_cases + [
         (
-            "an --ignore-quota Claude worker honors HTTP 429 Retry-After",
+            "an --ignore-quota Claude worker caps HTTP 429 Retry-After at fifteen minutes",
             "claude",
             {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600)},
-            3600,
+            900,
         )
     ]:
         sleeps = []
@@ -423,7 +423,7 @@ finally:
     tc.loop.time.time = saved_clock
     tc.loop.report_runtime = saved_report
 
-# A long polling interval does not shorten the endpoint's Retry-After.
+# The fifteen-minute recheck cap also holds with a longer polling interval.
 saved_poll = tc.loop.POLL
 try:
     tc.loop.POLL = 1800
@@ -432,7 +432,7 @@ try:
     slow_other = tc.loop._recheck_in(tc.Provider("codex", False, None), wait_at)
 finally:
     tc.loop.POLL = saved_poll
-poll_ok = (long_poll, slow_other) == (3600, 1800)
+poll_ok = (long_poll, slow_other) == (900, 1800)
 print(f"[{'OK ' if poll_ok else 'XX '}] a long POLL does not stretch a 429 recheck: got={(long_poll, slow_other)!r}")
 
 
@@ -570,9 +570,7 @@ finally:
 saved_loop_poll = tc.loop.POLL
 try:
     tc.loop.POLL = 1800
-    cool_checks["a headerless 429 waits for its bounded backoff"] = (
-        1800 <= tc.loop._recheck_in(bare_first, wait_at) <= tc.RATE_LIMIT_RECHECK_MAX_S
-    )
+    cool_checks["a headerless 429 waits for its bounded backoff"] = tc.loop._recheck_in(bare_first, wait_at) == 900
 finally:
     tc.loop.POLL = saved_loop_poll
 

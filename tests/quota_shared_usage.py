@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Workers share Claude observations and Retry-After without external services or scripts."""
 
+import fcntl
 import multiprocessing
 import os
 import sys
@@ -79,7 +80,7 @@ def test_shared_recent_read_and_429_fallback(root):
     clock = [time.time()]
     observed = clock[0]
     calls = []
-    responses = [(200, payload(observed), None), (429, {}, 3600)]
+    responses = [(200, payload(observed), None), (429, {}, 3600), (429, {}, 600)]
 
     def http(*_args, **_kwargs):
         calls.append(clock[0])
@@ -96,12 +97,40 @@ def test_shared_recent_read_and_429_fallback(root):
         quota._COOLDOWNS.clear()  # another process sees only the persisted state
         p, _ = qa._claude_pass("fp", "token", refresh=True, account="account")
         assert p.available and p.rate_limited and len(calls) == 2
-        assert qa._cooldown("claude", "account")[0] > 3500
+        assert qa._cooldown("claude", "account")[0] > 890
         p, _ = qa._claude_pass("renewed-fp", "renewed-token", refresh=True, account="account")
         assert p.rate_limited and len(calls) == 2  # token rotation never resets the cooldown
         clock[0] = observed + quota.QUOTA_TTL["claude"] + 1
         p, _ = qa._claude_pass("fp", "token", refresh=True, account="account")
-        assert not p.available and p.rate_limited and len(calls) == 2
+        assert not p.available and p.rate_limited and len(calls) == 3
+
+
+def test_pace_recovery_refreshes_before_twenty_minutes(root):
+    q = worker(root, "one")
+    start = time.time()
+    data = payload(start, used=27, reset_in=10800)  # 27% used, pace budget 26.67%
+    data["seven_day"]["utilization"] = 1
+    q._store_raw("claude", data, "fp", start + 10800, start)
+    with (
+        patch.object(quota.time, "time", return_value=start + 300),
+        patch.object(quota, "_http_get_json", return_value=(200, data, None)) as http,
+    ):
+        p, _ = q._claude_pass("fp", "token", refresh=True, account="account")
+        assert p.available and http.call_count == 1
+
+
+def test_busy_fetch_does_not_block_existing_headroom(root):
+    q = worker(root, "one")
+    now = time.time()
+    q._store_raw("claude", payload(now), "fp", now + 7200, now - 1300)
+
+    def busy(_fd, flags):
+        assert flags & fcntl.LOCK_NB, "must not wait on the lock with usable headroom"
+        raise BlockingIOError
+
+    with patch.object(quota.fcntl, "flock", busy), patch.object(quota, "_http_get_json") as http:
+        p, _ = q._claude_pass("fp", "token", refresh=True, account="account")
+        assert p.available and http.call_count == 0
 
 
 def test_account_separation_and_reset(root):
@@ -166,6 +195,8 @@ if __name__ == "__main__":
             test_account_separation_and_reset,
             test_headerless_backoff_and_recovery,
             test_read_only_credentials_keep_shared_caching,
+            test_pace_recovery_refreshes_before_twenty_minutes,
+            test_busy_fetch_does_not_block_existing_headroom,
         ):
             with tempfile.TemporaryDirectory() as directory:
                 test(Path(directory))

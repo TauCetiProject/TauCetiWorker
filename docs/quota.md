@@ -25,8 +25,10 @@ directories remain independent; this does not coordinate across machines.
 If the credential directory is read-only, as in the Docker deployment, the shared
 worker-state root holds these records instead. Credentials need no write access.
 
-A loop refresh reuses a reading less than 20 minutes old. The lock allows only
-one worker to fetch when that reading ages out; other workers use its result.
+A loop refresh reuses headroom measured less than 20 minutes ago. A pace-blocked
+reading is refreshed when its expected recovery time arrives. The lock allows
+only one worker to fetch; other workers use its result, or return their existing
+valid reading immediately while a sibling refreshes it.
 During a transient network failure or usage-endpoint HTTP 429, a still-valid
 reading can supply headroom for up to one hour. Samples never survive a quota
 window reset or cross to a different credential. Pacing uses the sample's original
@@ -34,10 +36,12 @@ observation time, so an old over-budget reading cannot become permission to run
 merely because time passed. Actual provider limits still apply to model sessions.
 
 An HTTP 429 throttles the usage endpoint; it does not by itself mean the model
-quota is exhausted. All workers sharing that source honor its `Retry-After`, up
-to one hour, including after token renewal. Without that header, consecutive
-failures use exponential backoff with jitter up to one hour. A successful usage
-read clears that backoff. When no usable reading remains, the worker waits for
+quota is exhausted. All workers sharing that source share its `Retry-After`,
+bounded to fifteen minutes, including after token renewal. This keeps an old
+telemetry error from hiding headroom for an hour after a sample expires or its
+window resets. Without that header, consecutive failures use exponential backoff
+with jitter up to fifteen minutes. A successful usage read clears that backoff.
+When no usable reading remains, the worker waits for
 telemetry rather than inventing a quota value. Stored records contain usage and
 credential fingerprints, never access or refresh tokens.
 

@@ -44,8 +44,9 @@ QUOTA_TTL = {"codex": 600, "claude": 3600}
 # "refresh if older than this", shared across workers, rather than once per round.
 CLAUDE_USAGE_REFRESH_S = 20 * 60
 
-# Honor the endpoint's Retry-After up to the same one-hour bound as the HTTP parser.
-RATE_LIMIT_RECHECK_MAX_S = 3600
+# Bound telemetry rechecks to fifteen minutes so a long Retry-After cannot hide renewed model
+# headroom after the cached sample expires. Shared polling bounds the account-wide request count.
+RATE_LIMIT_RECHECK_MAX_S = 15 * 60
 
 # The longest any usage endpoint's Retry-After is honored (_parse_retry_after caps at this too).
 RETRY_AFTER_MAX_S = 3600
@@ -1181,13 +1182,20 @@ class Quota:
         return directory / f"quota-{provider}{suffix}.json"
 
     @contextmanager
-    def _usage_lock(self, account: str):
+    def _usage_lock(self, account: str, fp: str | None = None):
         directory = self._usage_dir("claude")
         fd = None
+        acquired = True
         try:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd = os.open(directory / f"fetch-{self._fingerprint(account)}.lock", os.O_CREAT | os.O_WRONLY, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if self._cached_claude(fp) is not None:
+                    acquired = False  # use existing headroom while the sibling refreshes
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError:
             if fd is not None:
                 os.close(fd)
@@ -1197,14 +1205,14 @@ class Quota:
                 # root in that case, rather than losing caching or requiring a writable credential.
                 source = self._fingerprint(str(self._claude_creds_source()))
                 self._claude_usage_directory = self.cache_dir.parent.parent / ".quota-usage" / source
-                with self._usage_lock(account):
-                    yield
+                with self._usage_lock(account, fp) as acquired:
+                    yield acquired
                 return
             # Keep the in-process cooldown and any readable cache when sharing is unavailable.
             # Failure to write diagnostics must not prevent a usable provider from running.
             pass
         try:
-            yield
+            yield acquired
         finally:
             if fd is not None:
                 os.close(fd)
@@ -1914,7 +1922,13 @@ class Quota:
     ) -> tuple[Provider, list[Reading] | None]:
         # Re-read under the fetch lock: a sibling may have fetched or received a Retry-After while
         # we waited. The lock covers the network call as well as the cache/cooldown publication.
-        with self._usage_lock(account or fp or "none"):
+        with self._usage_lock(account or fp or "none", fp) as acquired:
+            if not acquired:
+                cached = self._cached_claude(fp)
+                if cached is not None:
+                    prov, readings = self._from_cached_claude(cached)
+                    return replace(prov, rate_limited=self._cooldown("claude", account or fp)[1] == 429), readings
+                return Provider("claude", False, None, error="claude usage refresh in progress", retry_after=POLL), None
             return self._claude_pass_locked(fp, tok, refresh=refresh, account=account)
 
     def _claude_pass_locked(
@@ -1933,10 +1947,12 @@ class Quota:
         account = account or fp
         cached = self._cached_claude(fp)
         left, cooled_by = self._cooldown("claude", account)
-        recent = cached is not None and time.time() - cached[1] < CLAUDE_USAGE_REFRESH_S
-        if cached is not None and (left or not refresh or recent):
+        if cached is not None:
             prov, readings = self._from_cached_claude(cached)
-            return replace(prov, rate_limited=cooled_by == 429), readings
+            recent = time.time() - cached[1] < CLAUDE_USAGE_REFRESH_S
+            reusable = recent and (prov.available or (prov.next_eligible or 0) > time.time())
+            if left or not refresh or reusable:
+                return replace(prov, rate_limited=cooled_by == 429), readings
         if left:
             return self._cooling_provider("claude", left, cooled_by), None
         if not tok:
