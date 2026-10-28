@@ -14,6 +14,40 @@ Reading quota never spends anything, with the one exception described under
 "window bootstrap" below. `tauceti status`, the dashboard, and an auto selection
 that lands on Codex make no model request at all.
 
+## Sharing Claude usage and backing off
+
+Workers using the same Claude credential source share usage observations, a fetch
+lock, and rate-limit cooldowns under `<claude-config>/.tauceti-quota/usage/`.
+Isolated workers follow their credential-source marker back to that same location,
+including across projects and checkouts. This is built into Tau Ceti and requires
+no external usage script, service, or account setup. Different credential-source
+directories remain independent; this does not coordinate across machines.
+If the credential directory is read-only, as in the Docker deployment, the shared
+worker-state root holds these records instead. This fallback is shared within the
+project's state root, rather than across separate project volumes. Credentials
+need no write access.
+
+A loop refresh reuses headroom measured less than 20 minutes ago. A pace-blocked
+reading is refreshed when its expected recovery time arrives. The lock allows
+only one worker to fetch; other workers use its result, or return a recent reading
+immediately while a sibling refreshes it. Once an old refusal reaches its recovery
+time, callers wait for that shared refresh instead of returning the old refusal.
+During a transient network failure or usage-endpoint HTTP 429, a still-valid
+reading can supply headroom for up to one hour. Samples never survive a quota
+window reset or cross to a different credential. Pacing uses the sample's original
+observation time, so an old over-budget reading cannot become permission to run
+merely because time passed. Actual provider limits still apply to model sessions.
+
+An HTTP 429 throttles the usage endpoint; it does not by itself mean the model
+quota is exhausted. All workers sharing that source share its `Retry-After`,
+bounded to fifteen minutes, including after token renewal. This keeps an old
+telemetry error from hiding headroom for an hour after a sample expires or its
+window resets. Without that header, consecutive failures use exponential backoff
+with jitter up to fifteen minutes. A successful usage read clears that backoff.
+When no usable reading remains, the worker waits for
+telemetry rather than inventing a quota value. Stored records contain usage and
+credential fingerprints, never access or refresh tokens.
+
 ## Keeping the Claude token alive: `--auto-refresh`
 
 By default the worker never rotates a refresh token. When the Claude access token

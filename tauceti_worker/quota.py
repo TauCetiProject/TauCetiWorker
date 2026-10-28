@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shlex
 import shutil
 import subprocess
@@ -39,8 +40,12 @@ WEEK_WINDOW_S = 7 * 24 * 3600
 
 QUOTA_TTL = {"codex": 600, "claude": 3600}
 
-# The longest a usage endpoint's HTTP 429 keeps us from asking again. Its Retry-After often asks for an
-# hour, which idled workers that still had quota; a fetch every 15 minutes costs the endpoint little.
+# Poll Claude's usage endpoint independently of model requests. A loop's request to refresh means
+# "refresh if older than this", shared across workers, rather than once per round.
+CLAUDE_USAGE_REFRESH_S = 20 * 60
+
+# Bound telemetry rechecks to fifteen minutes so a long Retry-After cannot hide renewed model
+# headroom after the cached sample expires. Shared polling bounds the account-wide request count.
 RATE_LIMIT_RECHECK_MAX_S = 15 * 60
 
 # The longest any usage endpoint's Retry-After is honored (_parse_retry_after caps at this too).
@@ -1160,12 +1165,74 @@ class Quota:
         raw = "|".join(p for p in parts if p)
         return hashlib.sha256(raw.encode()).hexdigest()[:16] if raw else None
 
+    def _usage_dir(self, provider: str) -> Path:
+        if provider == "claude" and getattr(self, "cfg", None) is not None:
+            # The existing credential-source marker follows isolation back to the login user's
+            # source. It works across worker ids, checkouts and projects without a service or setup.
+            return getattr(self, "_claude_usage_directory", None) or (
+                self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME / "usage"
+            )
+        return self.cache_dir
+
+    def _raw_path(self, provider: str, fp: str | None = None) -> Path:
+        directory = self._usage_dir(provider)
+        # Keep accounts separate when the operator switches the active credential. Only a hash,
+        # never a credential, is included in the filename or the cached payload.
+        suffix = f"-{self._fingerprint(fp) or 'none'}" if directory != self.cache_dir else ""
+        return directory / f"quota-{provider}{suffix}.json"
+
+    @contextmanager
+    def _usage_lock(self, account: str, fp: str | None = None):
+        directory = self._usage_dir("claude")
+        fd = None
+        acquired = True
+        try:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(directory / f"fetch-{self._fingerprint(account)}.lock", os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                cached = self._cached_claude(fp)
+                reusable = False
+                if cached is not None:
+                    prov, _ = self._from_cached_claude(cached)
+                    now = time.time()
+                    reusable = now - cached[1] < CLAUDE_USAGE_REFRESH_S and (
+                        prov.available or (prov.next_eligible or 0) > now
+                    )
+                if reusable:
+                    acquired = False  # use existing headroom while the sibling refreshes
+                else:
+                    # At the pace-recovery boundary, wait for the sibling's fresh verdict.
+                    # Returning the old refusal would put every lock loser back to sleep.
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+                fd = None
+            if getattr(self, "cfg", None) is not None and not hasattr(self, "_claude_usage_directory"):
+                # Container credentials are commonly mounted read-only. Use the shared worker-state
+                # root in that case, rather than losing caching or requiring a writable credential.
+                source = self._fingerprint(str(self._claude_creds_source()))
+                self._claude_usage_directory = self.cache_dir.parent.parent / ".quota-usage" / source
+                with self._usage_lock(account, fp) as acquired:
+                    yield acquired
+                return
+            # Keep the in-process cooldown and any readable cache when sharing is unavailable.
+            # Failure to write diagnostics must not prevent a usable provider from running.
+            pass
+        try:
+            yield acquired
+        finally:
+            if fd is not None:
+                os.close(fd)
+
     def _cached_entry(self, provider: str, fp: str | None) -> dict | None:
         """The whole validated cache entry — {payload, fetched_at, ...} — for a caller that needs to know
         WHEN the payload was true, not just what it says. See _cached_raw for the payload alone."""
-        p = self.cache_dir / f"quota-{provider}.json"
+        p = self._raw_path(provider, fp)
         d = _read_json_file(p)
-        if not d:
+        if not isinstance(d, dict):
             return None
         # A cache entry is only valid for the SAME account it was fetched under. When the operator rotates
         # to a different account (or an external refresh swaps the token), fp changes ⇒ the stale entry is
@@ -1205,14 +1272,18 @@ class Quota:
     ) -> None:
         # `fetched_at` is the instant the caller OBSERVED this payload, kept whole (not truncated to the
         # second) so that re-reading the entry reproduces the verdict the caller already acted on.
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        path = self._raw_path(provider, fp)
         entry = {"fetched_at": time.time() if fetched_at is None else fetched_at, "fp": fp, "payload": payload}
         if valid_until is not None:
             entry["valid_until"] = valid_until
-        (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _write_json_atomic(path, entry)
+        except OSError:
+            pass  # the successfully fetched reading is still usable by this caller
 
     def _cooldown_path(self, provider: str, key: str | None) -> Path:
-        return self.cache_dir / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"
+        return self._usage_dir(provider) / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"
 
     def _cooldown(self, provider: str, key: str | None) -> tuple[float, int | None]:
         """(seconds until this account's usage endpoint may be asked again, the HTTP status that started
@@ -1221,12 +1292,12 @@ class Quota:
         Kept on disk beside the cache, one record per account, so it binds every caller sharing this
         cache: an `auto` loop re-reads both providers before each round, and without this a healthy
         codex kept the loop busy while it re-asked a rate-limited Claude endpoint after every round."""
-        memory = _cooldown_left(_COOLDOWNS.get((str(self.cache_dir), provider, key or "")))
+        memory = _cooldown_left(_COOLDOWNS.get((str(self._usage_dir(provider)), provider, key or "")))
         disk = _cooldown_left(_read_json_file(self._cooldown_path(provider, key)))
         return max(memory, disk, key=lambda left_code: left_code[0])
 
     def _start_cooldown(self, provider: str, key: str | None, code: int, retry_after: float | None) -> None:
-        """Hold off after an HTTP 429 for its Retry-After (else one poll), at most
+        """Hold off after an HTTP 429 for its Retry-After (else exponential backoff), at most
         RATE_LIMIT_RECHECK_MAX_S; after any other status that sent a Retry-After, for that long.
         Never shortens a longer cooldown already running.
 
@@ -1234,22 +1305,26 @@ class Quota:
         let a cached reading taken under the rejected credential answer for it again."""
         if code == 401:
             return
+        path = self._cooldown_path(provider, key)
+        mem = (str(self._usage_dir(provider)), provider, key or "")
+        prior = _read_json_file(path) or _COOLDOWNS.get(mem) or {}
+        failures = prior.get("failures", 0) if isinstance(prior, dict) else 0
+        failures = min(failures, 6) if isinstance(failures, int) and failures >= 0 else 0
         if code == 429:
-            wait = min(retry_after or POLL, RATE_LIMIT_RECHECK_MAX_S)
+            default = max(60, POLL) * 2**failures * random.uniform(1.0, 1.1)
+            wait = min(retry_after or default, RATE_LIMIT_RECHECK_MAX_S)
         elif retry_after:
             wait = min(retry_after, RETRY_AFTER_MAX_S)
         else:
             return
         if wait <= 0:
             return
-        record = {"until": time.time() + wait, "wait": wait, "code": code}
-        mem = (str(self.cache_dir), provider, key or "")
+        record = {"until": time.time() + wait, "wait": wait, "code": code, "failures": failures + 1}
         if not _outlasts(_COOLDOWNS.get(mem), record["until"]):
             _COOLDOWNS[mem] = record
-        path = self._cooldown_path(provider, key)
         fd = None
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             # Re-check and write under a lock, so two callers answering at once cannot replace a longer
             # cooldown with a shorter one; write-then-rename, so a reader never sees a truncated record.
             fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
@@ -1279,11 +1354,20 @@ class Quota:
             err += " (cooling down)"
         return Provider(provider, False, None, error=err, retry_after=left, rate_limited=code == 429)
 
+    def _clear_cooldown(self, provider: str, key: str | None) -> None:
+        _COOLDOWNS.pop((str(self._usage_dir(provider)), provider, key or ""), None)
+        try:
+            self._cooldown_path(provider, key).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _forget_raw(self, provider: str) -> None:
         """Drop a provider's cached payload so the next read must go to the network. Used after a
         bootstrap request: whatever we hold predates the request that was meant to change it."""
         try:
-            (self.cache_dir / f"quota-{provider}.json").unlink()
+            oauth, _ = self._claude_creds() if provider == "claude" else (None, False)
+            fp = self._fingerprint((oauth or {}).get("accessToken"))
+            self._raw_path(provider, fp).unlink()
         except OSError:
             pass
 
@@ -1604,6 +1688,7 @@ class Quota:
                 return replace(self._codex_from_payload(*still), rate_limited=code == 429)
             err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
             return Provider("codex", False, None, error=err, retry_after=retry_after, rate_limited=code == 429)
+        self._clear_cooldown("codex", fp)
         # Cache ONLY a payload whose windows say when they roll, and only until the first of those. The
         # endpoint reports time REMAINING, so re-reading an entry later would otherwise re-anchor every
         # window to the new present: the reset slides away, and past its real reset the entry describes a
@@ -1845,6 +1930,20 @@ class Quota:
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
     ) -> tuple[Provider, list[Reading] | None]:
+        # Re-read under the fetch lock: a sibling may have fetched or received a Retry-After while
+        # we waited. The lock covers the network call as well as the cache/cooldown publication.
+        with self._usage_lock(account or fp or "none", fp) as acquired:
+            if not acquired:
+                cached = self._cached_claude(fp)
+                if cached is not None:
+                    prov, readings = self._from_cached_claude(cached)
+                    return replace(prov, rate_limited=self._cooldown("claude", account or fp)[1] == 429), readings
+                return Provider("claude", False, None, error="claude usage refresh in progress", retry_after=POLL), None
+            return self._claude_pass_locked(fp, tok, refresh=refresh, account=account)
+
+    def _claude_pass_locked(
+        self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
+    ) -> tuple[Provider, list[Reading] | None]:
         """One read of the usage endpoint (cache-aware) turned into a Provider. Returns readings=None
         when no payload was obtained at all, so the caller can tell "the endpoint would not answer"
         from "the endpoint answered something we could not use".
@@ -1858,9 +1957,12 @@ class Quota:
         account = account or fp
         cached = self._cached_claude(fp)
         left, cooled_by = self._cooldown("claude", account)
-        if cached is not None and (left or not refresh):
+        if cached is not None:
             prov, readings = self._from_cached_claude(cached)
-            return replace(prov, rate_limited=cooled_by == 429), readings
+            recent = time.time() - cached[1] < CLAUDE_USAGE_REFRESH_S
+            reusable = recent and (prov.available or (prov.next_eligible or 0) > time.time())
+            if left or not refresh or reusable:
+                return replace(prov, rate_limited=cooled_by == 429), readings
         if left:
             return self._cooling_provider("claude", left, cooled_by), None
         if not tok:
@@ -1884,6 +1986,12 @@ class Quota:
         # server error are different problems with different fixes, and none of them is "usage unknown".
         if code != 200 or not payload:
             self._start_cooldown("claude", account, code, retry_after)
+            if code == 401:
+                # A rejected token must not get its old permissive sample back on the next read.
+                try:
+                    self._raw_path("claude", fp).unlink(missing_ok=True)
+                except OSError:
+                    pass
             still = self._cached_claude(fp) if code != 401 else None
             if still is not None:
                 prov, readings = self._from_cached_claude(still)
@@ -1902,6 +2010,8 @@ class Quota:
         if problem:
             return Provider("claude", False, None, error=problem, retry_after=retry_after), None
         readings = _claude_readings(payload, observed_at)
+        # Successful telemetry ends the failure streak. It does not change the quota windows.
+        self._clear_cooldown("claude", account)
         # Cache ONLY a payload that is fully resolved, and only until the first reset it describes.
         # An idle/absent/malformed payload is never pinned: re-reading it is the only thing that can
         # resolve it, and one extra fetch per poll is the cheapest part of this system.
@@ -1919,8 +2029,8 @@ class Quota:
         What this does NOT do is re-examine a verdict that was already permissive: an entry that was under
         pace when fetched still reads that way, even though its usage figure is only a lower bound and a
         sibling worker may have spent since. That is the deliberate availability trade behind the cache —
-        an endpoint blip should not stop a fleet — and it is bounded by the TTL and by the loop forcing a
-        read every cycle. The rule here is narrower and absolute: time alone never buys permission."""
+        an endpoint blip should not stop a fleet — bounded by the TTL, reset boundaries and the shared
+        refresh interval. Time alone never turns an over-budget reading into permission."""
         payload, at = cached
         readings = _claude_readings(payload, at)
         notes, bootstrap_recorded = self._idle_notes(readings)
