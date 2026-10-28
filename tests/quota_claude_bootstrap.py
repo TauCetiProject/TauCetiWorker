@@ -376,7 +376,7 @@ tc.quota._http_get_json = ep
 q = make_quota()
 p1, p2 = q.claude(), q.claude()
 check("a resolved payload is cached ⇒ one HTTP call", (p1.available, ep.calls), (True, 1))
-entry = tc.json.loads((q.cache_dir / "quota-claude.json").read_text())
+entry = tc.json.loads(q._raw_path("claude", FP).read_text())
 check(
     "the entry expires at the EARLIEST reset it represents",
     round(entry["valid_until"] - time.time()) in range(2 * 3600 - 2, 2 * 3600 + 1),
@@ -388,12 +388,10 @@ q = make_quota()
 crossed = {"five_hour": {"utilization": 95, "resets_at": iso(-600)}, "seven_day": weekly()}
 q._store_raw("claude", crossed, FP, time.time() - 600)
 check("a complete response past its reset ⇒ not served", q._cached_raw("claude", FP), None)
-(q.cache_dir / "quota-claude.json").write_text(
-    tc.json.dumps({"fetched_at": int(time.time()), "fp": FP, "payload": crossed})
-)
+q._raw_path("claude", FP).write_text(tc.json.dumps({"fetched_at": int(time.time()), "fp": FP, "payload": crossed}))
 check("a legacy entry with no stored expiry is revalidated", q._cached_claude(FP), None)
 check("...though the raw TTL layer would have served it", q._cached_raw("claude", FP) is not None, True)
-(q.cache_dir / "quota-claude.json").write_text(
+q._raw_path("claude", FP).write_text(
     tc.json.dumps({"fetched_at": int(time.time()), "fp": FP, "payload": ["not", "an", "object"]})
 )
 check("a cached non-object body is discarded, not parsed", q._cached_claude(FP), None)

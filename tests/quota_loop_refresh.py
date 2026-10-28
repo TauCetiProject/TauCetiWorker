@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Loop pacing bypasses the raw quota cache before every round.
+"""Loop pacing requests refreshed telemetry without polling once per round.
 
-The cache is useful for dashboard/status reads, but a productive round can materially
-change usage. Reusing the pre-round reading let loop mode launch round after round until
-Claude was exhausted. This pins the integration point without network access.
+Claude shares a twenty-minute sample between rounds/workers, and valid samples survive a
+transient endpoint failure for up to the cache TTL. This pins the integration without network.
 """
 
 import json
@@ -49,8 +48,8 @@ want = [("claude", True, True), (None, False, False), ("claude", False, True), (
 ok = calls == want
 print(f"[{'OK ' if ok else 'XX '}] loop refresh/renew vs ordinary cached read: got={calls!r} want={want!r}")
 
-# Pin the semantic behind the plumbing: a forced read must contact the endpoint even with a valid
-# cache, refresh that cache on success, and retain the valid cached verdict across a transient error.
+# A loop refresh reuses a recent sample, refreshes an older one, and retains a still-valid
+# cached verdict across a transient error.
 reset_session = (datetime.now(UTC) + timedelta(hours=4)).isoformat()
 reset_weekly = (datetime.now(UTC) + timedelta(days=6)).isoformat()
 payload = {
@@ -59,7 +58,7 @@ payload = {
 }
 q = tc.Quota.__new__(tc.Quota)
 q.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-stub-"))
-q._cached_claude = lambda _fp: (payload, time.time())
+q._cached_claude = lambda _fp: (payload, time.time() - tc.CLAUDE_USAGE_REFRESH_S - 1)
 q._idle_notes = lambda _readings: ({}, False)
 stores = []
 q._store_raw = lambda *args: stores.append(args)
@@ -132,7 +131,7 @@ def serving(entries):
 
 
 tc.quota._http_get_json = offline
-q._cached_claude = serving([(payload, time.time()), None])
+q._cached_claude = serving([(payload, time.time() - tc.CLAUDE_USAGE_REFRESH_S - 1), None])
 expired_mid_flight, _ = q._claude_pass("fp", "token", refresh=True)
 q._cached_claude = serving([None, (payload, time.time())])  # the other order: a concurrent writer filled it
 appeared_mid_flight, _ = q._claude_pass("fp", "token", refresh=True)
@@ -333,13 +332,13 @@ waiting_cases = [
         3600,
     ),
     (
-        "an alternative's HTTP 429 Retry-After is capped at 15 minutes",
+        "an alternative's HTTP 429 Retry-After is honored",
         "auto",
         {
             "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
             "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=1200),
         },
-        900,
+        1200,
     ),
     (
         "a short HTTP 429 Retry-After is still respected",
@@ -384,7 +383,7 @@ waiting_cases = [
             "codex": tc.Provider("codex", False, None, error="usage HTTP 503", retry_after=3600),
             "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600),
         },
-        900,
+        3600,
     ),
 ]
 wait_ok = True
@@ -397,10 +396,10 @@ try:
     tc.loop.report_runtime = lambda *_a, **_k: None
     for label, agent, snap, expected in waiting_cases + [
         (
-            "an --ignore-quota Claude worker caps HTTP 429 Retry-After at 15 minutes",
+            "an --ignore-quota Claude worker honors HTTP 429 Retry-After",
             "claude",
             {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600)},
-            900,
+            3600,
         )
     ]:
         sleeps = []
@@ -424,7 +423,7 @@ finally:
     tc.loop.time.time = saved_clock
     tc.loop.report_runtime = saved_report
 
-# The 15-minute cap on a 429 recheck holds even when the operator polls less often than that.
+# A long polling interval does not shorten the endpoint's Retry-After.
 saved_poll = tc.loop.POLL
 try:
     tc.loop.POLL = 1800
@@ -433,7 +432,7 @@ try:
     slow_other = tc.loop._recheck_in(tc.Provider("codex", False, None), wait_at)
 finally:
     tc.loop.POLL = saved_poll
-poll_ok = (long_poll, slow_other) == (900, 1800)
+poll_ok = (long_poll, slow_other) == (3600, 1800)
 print(f"[{'OK ' if poll_ok else 'XX '}] a long POLL does not stretch a 429 recheck: got={(long_poll, slow_other)!r}")
 
 
@@ -550,7 +549,7 @@ try:
     cool_checks["a concurrent writer cannot pull a later deadline earlier"] = on_disk["until"] == 180.0
 
     rejected = cooldown_quota("401")
-    rejected._store_raw("claude", payload, "t", time.time() + 7200, time.time())
+    rejected._store_raw("claude", payload, "t", time.time() + 7200, time.time() - tc.CLAUDE_USAGE_REFRESH_S - 1)
     responses[:] = [(401, {}, 600), (200, payload, None)]
     denied, _ = rejected._claude_pass("t", "token", refresh=True, account="acct")
     again, _ = rejected._claude_pass("t", "token", refresh=True, account="acct")
@@ -571,8 +570,8 @@ finally:
 saved_loop_poll = tc.loop.POLL
 try:
     tc.loop.POLL = 1800
-    cool_checks["a long POLL does not stretch a headerless 429 recheck"] = (
-        tc.loop._recheck_in(bare_first, wait_at) == 900
+    cool_checks["a headerless 429 waits for its bounded backoff"] = (
+        1800 <= tc.loop._recheck_in(bare_first, wait_at) <= tc.RATE_LIMIT_RECHECK_MAX_S
     )
 finally:
     tc.loop.POLL = saved_loop_poll

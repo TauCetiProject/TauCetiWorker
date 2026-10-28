@@ -14,6 +14,31 @@ Reading quota never spends anything, with the one exception described under
 "window bootstrap" below. `tauceti status`, the dashboard, and an auto selection
 that lands on Codex make no model request at all.
 
+## Sharing Claude usage and backing off
+
+Workers using the same Claude credential source share usage observations, a fetch
+lock, and rate-limit cooldowns under `<claude-config>/.tauceti-quota/usage/`.
+Isolated workers follow their credential-source marker back to that same location,
+including across projects and checkouts. This is built into Tau Ceti and requires
+no external usage script, service, or account setup. Different credential-source
+directories remain independent; this does not coordinate across machines.
+
+A loop refresh reuses a reading less than 20 minutes old. The lock allows only
+one worker to fetch when that reading ages out; other workers use its result.
+During a transient network failure or usage-endpoint HTTP 429, a still-valid
+reading can supply headroom for up to one hour. Samples never survive a quota
+window reset or cross to a different credential. Pacing uses the sample's original
+observation time, so an old over-budget reading cannot become permission to run
+merely because time passed. Actual provider limits still apply to model sessions.
+
+An HTTP 429 throttles the usage endpoint; it does not by itself mean the model
+quota is exhausted. All workers sharing that source honor its `Retry-After`, up
+to one hour, including after token renewal. Without that header, consecutive
+failures use exponential backoff with jitter up to one hour. A successful usage
+read clears that backoff. When no usable reading remains, the worker waits for
+telemetry rather than inventing a quota value. Stored records contain usage and
+credential fingerprints, never access or refresh tokens.
+
 ## Keeping the Claude token alive: `--auto-refresh`
 
 By default the worker never rotates a refresh token. When the Claude access token

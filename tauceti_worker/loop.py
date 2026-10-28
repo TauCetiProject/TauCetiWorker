@@ -43,9 +43,8 @@ class _LoopTerminated(KeyboardInterrupt):
 def _recheck_in(prov: Provider | None, now: float) -> int:
     """How long until it is worth reading this provider's usage again, while waiting for quota.
 
-    A rate-limited endpoint (HTTP 429): its Retry-After, capped at RATE_LIMIT_RECHECK_MAX_S, and that
-    cap beats even a longer POLL. Any other Retry-After is honored as given. Otherwise the moment a
-    blocking window frees (hourly at most, so sibling workers and operator activity are still
+    A rate-limited endpoint (HTTP 429): its Retry-After, bounded to one hour. Any other Retry-After
+    is honored as given. Otherwise the moment a blocking window frees (hourly at most, so activity is
     observed), else the next poll. Never sooner than POLL: the next read would only re-trip a limit."""
     if prov is None:
         return POLL
