@@ -192,25 +192,19 @@ class BudgetTests(unittest.TestCase):
         self.budget.settle("replacement", 7)
         self.assertEqual(self.budget.admit("new-model", "second", "sonnet", "fix")["estimate"], "7")
 
-    def test_corruption_and_audited_torn_recovery(self):
+    def test_torn_tail_recovers_without_an_accounting_wait(self):
         self.budget.configure(grant=100)
         original = self.budget.ledger.read_bytes()
         with self.budget.ledger.open("ab") as file:
             file.write(b'{"seq":2')
-        damaged = self.budget.ledger.read_bytes()
-        with self.assertRaises(BudgetError):
-            self.budget.admit("a", "a", "opus", "fix")
-        snapshot = self.budget.repair("power loss; investigate outstanding costs")
-        archive = next(self.directory.glob("events.damaged-*"))
-        self.assertEqual(archive.read_bytes(), damaged)
-        self.assertTrue(self.budget.ledger.read_bytes().startswith(original))
-        self.assertEqual(len(snapshot["unresolved"]), 1)
-        self.assertTrue(snapshot["ledger_repair_required"])
-        self.assertEqual(
-            self.budget.admit("next", "next", "opus", "fix")["reason"], "ledger repair requires reconciliation"
-        )
-        self.budget.reconcile(snapshot["unresolved"][0], 0, "verified archived partial write was not a paid session")
+        snapshot = self.budget.snapshot()
+        self.assertEqual(self.budget.ledger.read_bytes(), original)
+        self.assertEqual(next(self.directory.glob("events.discarded-*")).read_bytes(), b'{"seq":2')
+        self.assertEqual(snapshot["unresolved"], [])
         self.assertFalse(self.budget.snapshot()["ledger_repair_required"])
+        self.budget.ledger.write_bytes(original.rstrip(b"\n"))
+        self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 100)
+        self.assertEqual(self.budget.ledger.read_bytes(), original)
         self.assertTrue(self.budget.admit("next", "next", "opus", "fix")["allowed"])
 
     def test_provisional_reservation_preserves_grants_and_peer_admission(self):
@@ -271,19 +265,20 @@ class BudgetTests(unittest.TestCase):
         self.budget.settle_receipt(dict(id="a", totals={"provider": "23"}, outcome="exit:0"))
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 23)
 
-    def test_interrupted_repair_preserves_authoritative_damaged_ledger(self):
+    def test_torn_tail_recovery_does_not_depend_on_archiving(self):
         self.budget.configure(grant=100)
         with self.budget.ledger.open("ab") as file:
             file.write(b'{"seq":2')
-        damaged = self.budget.ledger.read_bytes()
-        with patch("tauceti_worker.budget.os.replace", side_effect=OSError("power loss")):
-            with self.assertRaises(BudgetError):
-                self.budget.repair("failed replacement")
-        self.assertEqual(self.budget.ledger.read_bytes(), damaged)
-        self.assertEqual(next(self.directory.glob("events.damaged-*")).read_bytes(), damaged)
-        with self.assertRaises(BudgetError):
-            self.budget.admit("a", "a", "opus", "fix")
-        self.assertEqual(len(self.budget.repair("retry audited repair")["unresolved"]), 1)
+        real_open = os.open
+
+        def no_archive(path, *args, **kwargs):
+            if "events.discarded-" in str(path):
+                raise OSError("disk full")
+            return real_open(path, *args, **kwargs)
+
+        with patch("tauceti_worker.budget.os.open", side_effect=no_archive):
+            self.assertTrue(self.budget.admit("a", "a", "opus", "fix")["allowed"])
+        self.assertEqual(list(self.directory.glob("events.discarded-*")), [])
 
     def test_calibration_cooldown_and_orphan(self):
         self.budget.configure(grant=100)
@@ -354,23 +349,21 @@ class BudgetTests(unittest.TestCase):
         self.budget.configure(grant=10)
         self.assertFalse(self.budget.admit("second", "second", "opus", "fix")["allowed"])
         self.assertTrue(self.budget.admit("first", "first", "opus", "fix", resume="provider-session")["allowed"])
-        with self.assertRaises(BudgetError):
-            self.budget.admit("unknown", "unknown", "opus", "fix", resume="no-history")
+        self.budget.configure(grant=100)
+        self.assertTrue(self.budget.admit("unknown", "second", "opus", "fix", resume="no-history")["allowed"])
+        self.budget.settle_receipt({"id": "unknown", "totals": {"no-history": "7"}, "outcome": "completed"})
+        self.assertEqual(self.budget.replay()["sessions"]["unknown"]["cost"], "7")
 
-    def test_unresolved_resume_only_holds_its_own_provider_until_receipt_recovery(self):
+    def test_stopped_resume_with_missing_cost_does_not_require_manual_recovery(self):
         self.budget.configure(grant=100)
         self.budget.admit("seed", "seed", "opus", "fix")
         self.budget.settle("seed", 10, totals={"provider-session": "10"})
         self.budget.admit("lost", "worker", "opus", "fix", resume="provider-session")
         self.budget.settle("lost", None, "reboot")
-        self.assertEqual(
-            self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["reason"],
-            "provider session cost baseline unresolved",
-        )
+        self.assertTrue(self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["allowed"])
         self.assertTrue(self.budget.admit("unrelated", "other", "opus", "fix")["allowed"])
         self.budget.settle("unrelated", 2)
         self.budget.settle_receipt({"id": "lost", "totals": {"provider-session": "20"}, "outcome": "recovered"})
-        self.assertTrue(self.budget.admit("next", "worker", "opus", "fix", resume="provider-session")["allowed"])
         self.assertEqual(
             self.budget.admit("concurrent", "other", "opus", "fix", resume="provider-session")["reason"],
             "provider session already being resumed",
@@ -946,22 +939,57 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         self.assertEqual(self.budget.snapshot()["unresolved"], ["lost"])
         self.assertEqual(Decimal(self.budget.snapshot()["pending"]), 10)
 
-    def test_stage_and_loop_still_pause_for_ledger_repair(self):
+    def test_stage_and_loop_continue_through_ledger_damage_and_write_failure(self):
         with self.budget.ledger.open("ab") as file:
             file.write(b'{"seq":2')
-        self.budget.repair("audit torn transaction")
+        with ClaudeAPIContext("worker1", "fix", model="opus"):
+            result = self.run_claude()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        good = self.budget.ledger.read_bytes()
+        real_write = os.write
+        count = 0
+
+        def interrupted(fd, data):
+            nonlocal count
+            target, actual = self.budget.ledger.stat(), os.fstat(fd)
+            if (target.st_dev, target.st_ino) != (actual.st_dev, actual.st_ino):
+                return real_write(fd, data)
+            count += 1
+            if count == 1:
+                return real_write(fd, data[:40])
+            raise OSError("disk full")
+
         with (
-            self.assertRaisesRegex(AdmissionUnavailable, "ledger repair"),
-            ClaudeAPIContext("worker1", "fix", model="opus"),
+            ClaudeAPIContext("worker2", "fix", model="opus"),
+            patch("tauceti_worker.budget.os.write", side_effect=interrupted),
         ):
-            self.fail("stage started before ledger audit")
+            result = self.run_claude()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(count, 2, "exercise both a short ledger write and its failure")
+        self.assertTrue(self.budget.ledger.read_bytes().startswith(good))
+        deadline = time.monotonic() + 3
+        while Decimal(self.budget.snapshot()["spent"]) < 20 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 20)
+        good = self.budget.ledger.read_bytes()
+        # A persistent read error must not stop the supervisor issuing the launch.
+        self.budget.ledger.write_bytes(good + b"unreadable bookkeeping record\n")
+        with ClaudeAPIContext("worker3", "fix", model="opus"):
+            result = self.run_claude()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.budget.ledger.write_bytes(good)
+        deadline = time.monotonic() + 3
+        while Decimal(self.budget.snapshot()["spent"]) < 30 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 30)
         args = build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--budget", "--loop"])
         with (
-            patch.object(loop, "run_round_subprocess") as round_mock,
-            patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+            patch.object(Budget, "snapshot", side_effect=OSError("ledger unavailable")),
+            patch.object(loop, "run_round_subprocess", side_effect=KeyboardInterrupt) as round_mock,
+            patch.object(loop, "github_budget", return_value={}),
         ):
             loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude")
-        round_mock.assert_not_called()
+        round_mock.assert_called_once()
 
     def test_cumulative_results_and_separate_session_segments(self):
         events = [

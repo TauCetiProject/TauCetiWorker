@@ -17,7 +17,9 @@ def add_budget_parser(sub):
     parser.add_argument("--reconcile", metavar="INVOCATION", help="record or correct a session's cost")
     parser.add_argument("--cost", metavar="USD", help="reconciled cost")
     parser.add_argument("--note", default="", help="explanation required for reconciliation or ledger repair")
-    parser.add_argument("--repair-ledger", action="store_true", help="archive a torn write and audit recovery")
+    parser.add_argument(
+        "--repair-ledger", action="store_true", help="recover an interrupted final write (also automatic)"
+    )
     parser.add_argument("--dry-run", action="store_true", help="preview --recover without changing the ledger")
     parser.add_argument("--plan", metavar="MANIFEST", help="apply only if a reviewed dry-run manifest still matches")
     parser.add_argument(

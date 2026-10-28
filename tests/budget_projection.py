@@ -111,13 +111,26 @@ class ProjectionTests(unittest.TestCase):
             self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 100)
             self.equal_replay()
 
-    def test_cached_projection_does_not_hide_corruption_or_torn_tail(self):
+    def test_cached_projection_recovers_torn_tail_but_does_not_hide_corruption(self):
         self.budget.snapshot()
         good = self.budget.ledger.read_bytes()
-        for tail in [b'{"seq":', b'{"version":1,"seq":99,"events":[]}\n']:
-            self.budget.ledger.write_bytes(good + tail)
+        self.budget.ledger.write_bytes(good + b'{"seq":')
+        self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 100)
+        self.assertEqual(self.budget.ledger.read_bytes(), good)
+        cache = self.root / "projection.sqlite"
+        inode = cache.stat().st_ino
+        self.budget.ledger.write_bytes(good + b'{"version":1,"seq":99,"events":[]}\n')
+        with patch.object(self.budget, "replay", side_effect=AssertionError("unnecessary full replay")):
             with self.assertRaises(BudgetError):
-                self.budget.admit("must-not-start", "w", "opus", "fix")
+                self.budget.snapshot()
+            self.assertIsNone(self.budget.runtime_snapshot())
+        self.assertEqual(cache.stat().st_ino, inode)
+        self.budget.ledger.write_bytes(good + b'{"version":1,"seq":2,"events":[{"type":"settle","id":"missing"}]}\n')
+        with self.assertRaises(BudgetError):
+            self.budget.snapshot()
+        self.assertEqual(cache.stat().st_ino, inode)
+        with patch.object(self.budget, "replay", side_effect=AssertionError("repeated failed replay")):
+            self.assertIsNone(self.budget.runtime_snapshot())
         self.budget.ledger.write_bytes(good.replace(b'"version":1', b'"version":9'))
         with self.assertRaises(BudgetError):
             self.budget.snapshot()
