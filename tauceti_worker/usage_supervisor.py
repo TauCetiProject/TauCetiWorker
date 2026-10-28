@@ -449,11 +449,11 @@ def recover_invocation(budget, path, *, cache=None, session=None):
         return
     if mode == "record-only":
         return
-    if value.get("unrecorded_admit"):
-        budget.restore_admission(value["unrecorded_admit"])
     receipt_path = inbox / (invocation + ".receipt")
     if value.get("recovery_stamp") == stamp or (cache is not None and cache.get(invocation) == stamp):
         return
+    if value.get("unrecorded_admit"):
+        budget.restore_admission(value["unrecorded_admit"])
     if session and session["status"] == "settled" and session.get("cost_provenance") == "native-reported":
         value["recovery_stamp"] = stamp
         durable(path, value)
@@ -497,7 +497,9 @@ def ensure_supervisor(directory, *, refresh=False):
     try:
         value = safe_message(ready)
         same_source = value.get("source") == str(Path(__file__).resolve())
-        if alive(value["owner"]) and (refresh or same_source and value.get("code_version") != version):
+        if alive(value["owner"]) and (
+            refresh or not value.get("ledger_optional") or same_source and value.get("code_version") != version
+        ):
             durable(directory / "usage-supervisor-retire.json", dict(owner=value["owner"], at=time.time()))
             deadline = time.monotonic() + 10
             while alive(value["owner"]) and time.monotonic() < deadline:
@@ -523,7 +525,12 @@ def ensure_supervisor(directory, *, refresh=False):
     while time.monotonic() < deadline:
         try:
             value = safe_message(ready)
-            if alive(value["owner"]) and value.get("protocol") == 1 and time.time() - value["heartbeat"] < 10:
+            if (
+                alive(value["owner"])
+                and value.get("protocol") == 1
+                and value.get("ledger_optional")
+                and time.time() - value["heartbeat"] < 10
+            ):
                 # Reap duplicate starters which lost the singleton lock.
                 threading.Thread(target=process.wait, daemon=True).start()
                 return
@@ -570,6 +577,7 @@ def run(directory):
                             heartbeat=time.time(),
                             code_version=version,
                             protocol=1,
+                            ledger_optional=True,
                             source=str(Path(__file__).resolve()),
                         ),
                     )

@@ -137,6 +137,7 @@ class Budget:
         self.directory = directory or budget_dir()
         self.ledger = self.directory / "events.jsonl"
         self.clock = clock
+        self._ledger_failure = None
 
     @contextlib.contextmanager
     def locked(self):
@@ -291,10 +292,6 @@ class Budget:
                     else:
                         raise LedgerError(f"unknown ledger event {kind}")
         except (KeyError, TypeError, InvalidOperation, BudgetError) as exc:
-            if isinstance(exc, KeyError) and _state is not None and hasattr(state["sessions"], "db"):
-                # A missing indexed session is cache damage. Rebuild that cache
-                # before deciding that the underlying history is unreadable.
-                raise BudgetError(f"incomplete projected accounting state: {exc}") from None
             raise LedgerError(f"invalid accounting event in {self.ledger}: {exc}") from None
         if not _samples:
             return state
@@ -311,10 +308,16 @@ class Budget:
 
         from .budget_projection import Projection
 
+        if self._ledger_failure:
+            stamp, error = self._ledger_failure
+            if self.ledger_stamp() == stamp:
+                raise LedgerError(error)
+            self._ledger_failure = None
         projection = Projection(self)
         try:
             return projection.load()
-        except LedgerError:
+        except LedgerError as error:
+            self._ledger_failure = (self.ledger_stamp(), str(error))
             raise
         except (sqlite3.Error, OSError, BudgetError):
             # A disposable optimization must never become a funding outage.
@@ -322,7 +325,18 @@ class Budget:
                 projection.discard()
             except OSError:
                 pass
-            return self.replay()
+            try:
+                return self.replay()
+            except LedgerError as error:
+                self._ledger_failure = (self.ledger_stamp(), str(error))
+                raise
+
+    def ledger_stamp(self):
+        try:
+            info = self.ledger.stat()
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+        except FileNotFoundError:
+            return None
 
     @staticmethod
     def sessions(state, **filters):

@@ -352,8 +352,10 @@ and recovery, outside both the round process group and any agent sandbox. It sta
 round boundaries. Restarting it replays the local evidence automatically; it does
 not poll providers or GitHub. Recovery progress is persisted, and a separate
 heartbeat remains responsive during ledger recovery. Admission checks restart a
-lost supervisor; source updates retire it at an invocation boundary. Only registered
-new invocations participate in this automatic recovery; historical cleanup remains
+lost supervisor; source updates retire it at an invocation boundary. Supervisors
+without ledger-independent processing are replaced automatically, while the existing
+protocol remains compatible with older workers. Only registered new invocations
+participate in this automatic recovery; historical cleanup remains
 separate. Reconciled native receipts are archived under `lifecycles/done/`;
 unchanged provisional journals are checked by file stamp without reparsing them.
 

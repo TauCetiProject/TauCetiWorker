@@ -125,6 +125,12 @@ class ProjectionTests(unittest.TestCase):
                 self.budget.snapshot()
             self.assertIsNone(self.budget.runtime_snapshot())
         self.assertEqual(cache.stat().st_ino, inode)
+        self.budget.ledger.write_bytes(good + b'{"version":1,"seq":2,"events":[{"type":"settle","id":"missing"}]}\n')
+        with self.assertRaises(BudgetError):
+            self.budget.snapshot()
+        self.assertEqual(cache.stat().st_ino, inode)
+        with patch.object(self.budget, "replay", side_effect=AssertionError("repeated failed replay")):
+            self.assertIsNone(self.budget.runtime_snapshot())
         self.budget.ledger.write_bytes(good.replace(b'"version":1', b'"version":9'))
         with self.assertRaises(BudgetError):
             self.budget.snapshot()

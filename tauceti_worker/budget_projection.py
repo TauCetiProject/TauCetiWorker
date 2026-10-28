@@ -214,7 +214,13 @@ class Projection:
                     raw = b""
                 records = self.budget.records(raw, start=state["seq"])
                 for record in records:
-                    self.budget.replay([record], _state=state, _samples=False)
+                    try:
+                        self.budget.replay([record], _state=state, _samples=False)
+                    except LedgerError:
+                        # Only a successful full replay establishes that the
+                        # cache, rather than the ledger, needs rebuilding.
+                        self.budget.replay()
+                        raise ValueError("invalid projected accounting state") from None
                     state["sessions"].save(record["seq"])
                 if raw or not valid:
                     offset += len(raw)

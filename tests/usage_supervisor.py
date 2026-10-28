@@ -552,6 +552,7 @@ class SupervisorTests(unittest.TestCase):
                 owner=identity(),
                 heartbeat=time.time(),
                 protocol=1,
+                ledger_optional=True,
                 source="/another/install/usage_supervisor.py",
                 code_version="other",
             ),
@@ -567,6 +568,27 @@ class SupervisorTests(unittest.TestCase):
         second = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
         self.assertFalse(alive(first))
         self.assertNotEqual(first, second)
+
+    def test_old_supervisor_from_another_install_is_upgraded_automatically(self):
+        from tauceti_worker import usage_supervisor
+
+        self.ensure_supervisor()
+        first = json.loads((self.root / "usage-supervisor.json").read_text())["owner"]
+        read = usage_supervisor.safe_message
+
+        def legacy_ready(path):
+            value = read(path)
+            if path.name == "usage-supervisor.json" and value.get("owner") == first:
+                value.pop("ledger_optional", None)
+                value["source"] = "/older/install/usage_supervisor.py"
+            return value
+
+        with patch.object(usage_supervisor, "safe_message", side_effect=legacy_ready):
+            self.ensure_supervisor()
+        second = json.loads((self.root / "usage-supervisor.json").read_text())
+        self.assertFalse(alive(first))
+        self.assertTrue(second["ledger_optional"])
+        self.assertNotEqual(first, second["owner"])
 
     def test_round_end_reporting_failure_preserves_round_returncode(self):
         from types import SimpleNamespace
