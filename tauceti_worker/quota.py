@@ -1192,9 +1192,19 @@ class Quota:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                if self._cached_claude(fp) is not None:
+                cached = self._cached_claude(fp)
+                reusable = False
+                if cached is not None:
+                    prov, _ = self._from_cached_claude(cached)
+                    now = time.time()
+                    reusable = now - cached[1] < CLAUDE_USAGE_REFRESH_S and (
+                        prov.available or (prov.next_eligible or 0) > now
+                    )
+                if reusable:
                     acquired = False  # use existing headroom while the sibling refreshes
                 else:
+                    # At the pace-recovery boundary, wait for the sibling's fresh verdict.
+                    # Returning the old refusal would put every lock loser back to sleep.
                     fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError:
             if fd is not None:

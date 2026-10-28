@@ -49,7 +49,15 @@ def run_concurrent(root, wid, start, calls, results, code):
         results.put((p.available, p.rate_limited))
 
 
-def test_concurrent_workers_fetch_once(root, code):
+def test_concurrent_workers_fetch_once(root, code, *, recovering=False):
+    if recovering:
+        q = worker(root, "seed")
+        observed = time.time() - 300
+        data = payload(observed, used=27, reset_in=10800)
+        data["seven_day"]["utilization"] = 1
+        q._store_raw("claude", data, "fp", observed + 10800, observed)
+        old, _ = q._from_cached_claude(q._cached_claude("fp"))
+        assert not old.available and old.next_eligible < time.time()
     ctx = multiprocessing.get_context("fork")
     start, calls, results = ctx.Event(), ctx.Value("i", 0), ctx.Queue()
     processes = [
@@ -122,7 +130,7 @@ def test_pace_recovery_refreshes_before_twenty_minutes(root):
 def test_busy_fetch_does_not_block_existing_headroom(root):
     q = worker(root, "one")
     now = time.time()
-    q._store_raw("claude", payload(now), "fp", now + 7200, now - 1300)
+    q._store_raw("claude", payload(now), "fp", now + 7200, now - 300)
 
     def busy(_fd, flags):
         assert flags & fcntl.LOCK_NB, "must not wait on the lock with usable headroom"
@@ -190,6 +198,9 @@ if __name__ == "__main__":
             with tempfile.TemporaryDirectory() as directory:
                 test_concurrent_workers_fetch_once(Path(directory), code)
                 print(f"PASS concurrent workers share HTTP {code}")
+        with tempfile.TemporaryDirectory() as directory:
+            test_concurrent_workers_fetch_once(Path(directory), 200, recovering=True)
+            print("PASS concurrent workers all resume after pace recovery")
         for test in (
             test_shared_recent_read_and_429_fallback,
             test_account_separation_and_reset,
