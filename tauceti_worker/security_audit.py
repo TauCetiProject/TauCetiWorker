@@ -57,13 +57,22 @@ a later revert does not make an earlier dangerous commit safe. All changed libra
 files have complete before/after contents and their diff. Scope is TauCeti/ and
 TauCeti.lean only. Human-reviewed scripts, workflows, pins and infrastructure are
 deliberately absent; do not request or evaluate them.
-Flag code doing IO (file/environment/network/process access), custom elaborators,
+Flag code doing IO (file/environment/network/process access), locally defined elaborators,
 executable initialization, unsafe/foreign code, or executable metaprogramming beyond
 macros and notation. Inspect macro/notation implementations for those behaviors too.
 Pay particular attention to #eval, run_cmd, run_tac, run_elab, include_str,
 @[extern], @[implemented_by], initialize and builtin_initialize, and indirect IO.
-Ordinary mathematics, standard Mathlib tactics and declarative registration commands
-(such as initialize_simps_projections) are permitted. Do not judge proof correctness,
+Ordinary mathematics, standard Lean/Mathlib tactics, term elaborators and notation,
+and declarative registration commands (such as initialize_simps_projections) are
+permitted. The pinned Lean/Mathlib dependencies are the trusted baseline: ordinary
+use of their existing proof and instance construction tools does not introduce a
+custom metaprogram into TauCeti. Do not require their implementations to appear in
+this changed-source bundle merely because elaboration runs metaprogramming code.
+Inspect new or changed local implementations, shadowing/redefinitions and supplied
+callbacks for executable behavior. This trust does not permit explicit IO/code
+execution facilities listed above, or unsafe behavior hidden in their arguments.
+If a construct's origin or its use is genuinely uncertain, return incomplete.
+Do not judge proof correctness,
 readability or mathematical scope. Be conservative about suspicious indirection:
 if supplied context cannot establish safety, return incomplete, never guess pass.
 Return ONLY JSON with input_digest, commits (all SHA strings in order), verdict
