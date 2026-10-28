@@ -663,6 +663,10 @@ The append-only ledger lives at
 and an explicit `TAUCETI_BUDGET_DIR` override. Grants, rate changes, balance
 adjustments, session admissions, and cost settlements remain auditable. Unknown
 costs remain visible for reconciliation and retain their pending estimates.
+An interrupted final ledger record is discarded automatically under the shared
+lock; preserving its fragment is best effort. Ledger read/write failures do not
+stop worker progress: work continues with incomplete accounting until storage
+recovers. Funding and provider cooldown decisions still apply when readable.
 Workers continue whenever available funds cover the next admission; API
 throttling is handled separately from funding. Local accounting uses Claude's reported cost estimates
 and does not represent the actual credit balance in Anthropic Console.
@@ -676,8 +680,9 @@ zero-cost launch failures do not establish a spending estimate. If that session
 loses its receipt, another calibration session can run; missing costs never
 pause the fleet merely because reconciliation is outstanding. Resuming the same
 provider session waits while a previous resume is unsettled; unrelated sessions
-can run. Recover the cumulative receipt before resuming that provider session;
-a cost-only manual reconciliation does not restore its cumulative baseline. No local budget amount is passed as
+can run. Recovering the cumulative receipt restores accurate accounting across
+resumes; a missing baseline does not prevent runtime work. A cost-only manual
+reconciliation does not restore that baseline. No local budget amount is passed as
 Claude's `--max-budget-usd`. After a crashed worker, first try
 `tauceti budget --recover --note "worker crash"` to recover its durable receipts
 and remove stale staged keys. Costs without a receipt still require reconciliation.

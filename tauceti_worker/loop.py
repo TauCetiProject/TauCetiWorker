@@ -143,13 +143,14 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             )
             if not recovery_only and api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
-                    snapshot = Budget().snapshot(worker=cfg.wid)
-                    reason = admission_pause(snapshot, worker=cfg.wid)
+                    snapshot = Budget().runtime_snapshot(worker=cfg.wid)
+                    reason = admission_pause(snapshot, worker=cfg.wid) if snapshot else None
                     blocked = reason is not None
                     if blocked:
                         Budget().refresh_waiter(cfg.wid)
                 except (BudgetError, OSError) as error:
-                    blocked, reason, snapshot = True, str(error), {}
+                    log(f"budget bookkeeping unavailable; continuing work ({error})")
+                    blocked, reason, snapshot = False, None, {}
                 if blocked:
                     wake = snapshot.get("funding_at")
                     if reason == "API throughput cooldown":

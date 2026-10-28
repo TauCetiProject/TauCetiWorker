@@ -14,7 +14,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from .budget import Budget, BudgetError, admission_pause, budget_dir, process_identity
+from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, admission_pause, budget_dir, process_identity
 from .claude_api_client import api_environment, atomic, authenticate, warning
 from .runtime_status import report_runtime
 
@@ -161,11 +161,12 @@ class ClaudeAPIContext:
         if reason := fleet_admission_reason(self.worker):
             raise admission_failure(reason, state="waiting-capacity")
         if self.enabled:
-            snapshot = self.budget.snapshot(worker=self.worker, model=self.model, phase=self.phase)
-            reason = admission_pause(snapshot, worker=self.worker, model=self.model)
+            snapshot = self.budget.runtime_snapshot(worker=self.worker, model=self.model, phase=self.phase)
+            reason = admission_pause(snapshot, worker=self.worker, model=self.model) if snapshot else None
             if reason:
                 if self.model:
-                    self.budget.wait_for_admission(self.worker, self.model, self.phase, reason)
+                    with contextlib.suppress(*ACCOUNTING_ERRORS):
+                        self.budget.wait_for_admission(self.worker, self.model, self.phase, reason)
                 report_runtime("waiting-budget", detail=reason, budget=snapshot)
                 raise admission_failure(reason, state="waiting-budget")
         from .usage_supervisor import ensure_supervisor
@@ -260,7 +261,7 @@ class ClaudeAPIContext:
                 else None,
             )
             if self.enabled:
-                answer = self.budget.admit(
+                answer = self.budget.admit_work(
                     invocation,
                     self.worker,
                     request["model"],
@@ -273,6 +274,10 @@ class ClaudeAPIContext:
             else:
                 answer = dict(allowed=True)
             if answer["allowed"]:
+                if answer.get("recorded") is False:
+                    # Keep process supervision working even without a ledger row.
+                    lifecycle["budgeted"] = False
+                    self.errors.append("ledger write unavailable; work continued: " + answer["accounting_error"])
                 register(self.budget.directory, lifecycle)
                 self.invocations.add(invocation)
                 self.models[invocation] = request["model"]
@@ -284,12 +289,12 @@ class ClaudeAPIContext:
                     phase=self.phase,
                     claude_billing="api",
                     detail="Claude API session running",
-                    **({"budget": self.budget.snapshot()} if self.enabled else {}),
+                    **({"budget": self.budget.runtime_snapshot() or {}} if self.enabled else {}),
                 )
             else:
                 self.blocked_reason = answer["reason"]
                 self.wait_state = "waiting-budget"
-                report_runtime("waiting-budget", detail=answer["reason"], budget=self.budget.snapshot())
+                report_runtime("waiting-budget", detail=answer["reason"], budget=self.budget.runtime_snapshot() or {})
             return answer
         if action == "settle":
             self.record(request)
@@ -377,8 +382,14 @@ class ClaudeAPIContext:
             try:
                 with self.budget.locked():
                     state = self.budget.current()
-                    sessions = {invocation: state["sessions"][invocation] for invocation in self.invocations}
+                    sessions = {
+                        invocation: state["sessions"][invocation]
+                        for invocation in self.invocations
+                        if invocation in state["sessions"]
+                    }
                 for invocation in self.invocations:
+                    if invocation not in sessions:
+                        continue
                     if sessions[invocation]["status"] != "settled":
                         recovered = self.budget.recover_usage(invocation, allow_live_owner=True)
                         if not recovered and sessions[invocation]["status"] == "active":

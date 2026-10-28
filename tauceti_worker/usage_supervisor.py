@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .budget import Budget, BudgetError, bridge_owner_alive, money
+from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, bridge_owner_alive, money
 from .claude_api import safe_message
 from .usage_accounting import session_usage, usage_path
 from .usage_lifecycle import alive, durable, identity, resolve
@@ -283,16 +283,21 @@ def tick(budget, cache=None, stop=None):
     cache = {} if cache is None else cache
     ledger_stamp = stat_stamp(budget.ledger)
     if cache.get("ledger_stamp") != ledger_stamp or "sessions" not in cache:
-        with budget.locked():
-            state = budget.current()
-            rows = budget.sessions(state, active=True)
-            if "sessions" not in cache:
-                rows += budget.sessions(state, settled=True, estimated=True)
-            sessions = {session["id"]: session for session in rows}
-            for path in (budget.directory / "lifecycles").glob("*.json"):
-                value = state["sessions"].get(path.stem)
-                if value:
-                    sessions.setdefault(path.stem, value)
+        try:
+            with budget.locked():
+                state = budget.current()
+                rows = budget.sessions(state, active=True)
+                if "sessions" not in cache:
+                    rows += budget.sessions(state, settled=True, estimated=True)
+                sessions = {session["id"]: session for session in rows}
+                for path in (budget.directory / "lifecycles").glob("*.json"):
+                    value = state["sessions"].get(path.stem)
+                    if value:
+                        sessions.setdefault(path.stem, value)
+        except ACCOUNTING_ERRORS:
+            # Launch supervision must keep running while ledger reads recover.
+            rows, sessions = [], cache.get("sessions", {})
+            ledger_stamp = None  # Retry accounting on the next pass.
         for session in rows:
             if session.get("lifecycle"):
                 register(budget.directory, session["lifecycle"])

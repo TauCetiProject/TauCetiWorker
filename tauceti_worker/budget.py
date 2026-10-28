@@ -7,6 +7,7 @@ import fcntl
 import json
 import math
 import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -20,6 +21,13 @@ class BudgetError(ValueError):
     pass
 
 
+class LedgerError(BudgetError):
+    """Unavailable accounting history; runtime work may continue without it."""
+
+
+ACCOUNTING_ERRORS = (LedgerError, OSError, sqlite3.Error)
+
+
 def admission_pause(snapshot, *, worker=None, model=None, now=None):
     """Cheap preflight; invocation admission remains the authoritative atomic check."""
     now = time.time() if now is None else now
@@ -27,8 +35,6 @@ def admission_pause(snapshot, *, worker=None, model=None, now=None):
     if model is None and worker is not None:
         previous = next((item for item in waiting if item["worker"] == worker), None)
         model = previous.get("model") if previous else None
-    if snapshot.get("ledger_repair_required"):
-        return "ledger repair requires reconciliation"
     if model and snapshot.get("cooldowns", {}).get(model, 0) > now:
         return "API throughput cooldown"
     if model and model in snapshot.get("calibrating_models", []):
@@ -138,7 +144,51 @@ class Budget:
         fd = os.open(self.directory / "budget.lock", os.O_CREAT | os.O_RDWR, 0o600)
         with os.fdopen(fd, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            self.recover_tail()
             yield
+
+    def recover_tail(self):
+        """Discard an interrupted append under budget.lock; archives are best effort."""
+        try:
+            stream = self.ledger.open("r+b")
+        except FileNotFoundError:
+            return
+        with stream:
+            end = stream.seek(0, os.SEEK_END)
+            if not end:
+                return
+            stream.seek(end - 1)
+            if stream.read(1) == b"\n":
+                return
+            offset = end
+            suffix = b""
+            while offset:
+                size = min(offset, 8192)
+                offset -= size
+                stream.seek(offset)
+                suffix = stream.read(size) + suffix
+                if (newline := suffix.rfind(b"\n")) >= 0:
+                    offset += newline + 1
+                    suffix = suffix[newline + 1 :]
+                    break
+            # A complete transaction missing only its newline can be retained.
+            try:
+                record = json.loads(suffix)
+                complete = record["version"] == 1 and isinstance(record["events"], list)
+            except (ValueError, KeyError, TypeError):
+                complete = False
+            if complete:
+                stream.seek(end)
+                stream.write(b"\n")
+                stream.flush()
+            else:
+                archive = self.directory / f"events.discarded-{uuid.uuid4().hex}.json"
+                with contextlib.suppress(OSError):
+                    fd = os.open(archive, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    with os.fdopen(fd, "wb") as out:
+                        out.write(suffix)
+                stream.truncate(offset)
+            os.fsync(stream.fileno())
 
     def records(self, data: bytes | None = None, *, start=0) -> list[dict]:
         if data is None:
@@ -147,7 +197,7 @@ class Budget:
             except FileNotFoundError:
                 return []
         if data and not data.endswith(b"\n"):
-            raise BudgetError(f"torn ledger write: {self.ledger}; preserve it and use budget --repair-ledger")
+            raise LedgerError(f"incomplete ledger tail: {self.ledger}")
         records = []
         for i, line in enumerate(data.splitlines(), start + 1):
             try:
@@ -156,7 +206,7 @@ class Budget:
                     raise ValueError("invalid sequence or schema")
                 records.append(rec)
             except (ValueError, KeyError, TypeError):
-                raise BudgetError(f"invalid ledger record {i}: {self.ledger}") from None
+                raise LedgerError(f"invalid ledger record {i}: {self.ledger}") from None
         return records
 
     def replay(self, records: list[dict] | None = None, *, _state=None, _samples=True):
@@ -237,9 +287,9 @@ class Budget:
                     elif kind == "cooldown":
                         state["cooldowns"][event["model"]] = event["until"]
                     else:
-                        raise BudgetError(f"unknown ledger event {kind}")
-        except (KeyError, TypeError, InvalidOperation) as exc:
-            raise BudgetError(f"invalid accounting event in {self.ledger}: {exc}") from None
+                        raise LedgerError(f"unknown ledger event {kind}")
+        except (KeyError, TypeError, InvalidOperation, BudgetError) as exc:
+            raise LedgerError(f"invalid accounting event in {self.ledger}: {exc}") from None
         if not _samples:
             return state
         state["samples"] = {}
@@ -344,6 +394,7 @@ class Budget:
         data = self.record_bytes(state, events)
         transaction = json.loads(data)["transaction"]
         fd = os.open(self.ledger, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        offset = os.lseek(fd, 0, os.SEEK_END)
         try:
             while data:
                 written = os.write(fd, data)
@@ -351,6 +402,14 @@ class Budget:
                     raise OSError("ledger write made no progress")
                 data = data[written:]
             os.fsync(fd)
+        except OSError:
+            if data:
+                # A failed short write must not poison every later reader.
+                # A complete write whose fsync failed remains available to replay.
+                with contextlib.suppress(OSError):
+                    os.ftruncate(fd, offset)
+                    os.fsync(fd)
+            raise
         finally:
             os.close(fd)
         # Persist a newly created ledger's directory entry as well as its contents.
@@ -464,7 +523,7 @@ class Budget:
             state = self.current()
             self.accrue(state)
             state["waiting"] = self.waiting_state(state)
-            active = self.sessions(state, active=True)
+            active = [s for s in self.sessions(state, active=True) if not s.get("archive")]
             estimate = self.estimate(state, model, phase)[1] if model else Decimal(0)
             now = self.clock()
             calibrating = [
@@ -501,7 +560,7 @@ class Budget:
             available=str(available),
             active_sessions=active,
             unresolved=[s["id"] for s in active if s["status"] == "unresolved"],
-            ledger_repair_required=any(s.get("archive") for s in active),
+            ledger_repair_required=False,
             provisional=[s["id"] for s in active if s["status"] == "provisional"],
             provisional_lower_bound_usd=str(
                 sum((money(s["lower_bound_cost"]) for s in active if s["status"] == "provisional"), Decimal(0))
@@ -516,15 +575,29 @@ class Budget:
             calibrating_models=calibrating,
         )
 
+    def runtime_snapshot(self, **kwargs):
+        """Accounting outages are not an instruction to stop worker progress."""
+        try:
+            return self.snapshot(**kwargs)
+        except ACCOUNTING_ERRORS:
+            return None
+
+    def admit_work(self, *args, **kwargs):
+        """Apply available budget policy; allow work when bookkeeping is unavailable."""
+        try:
+            return self.admit(*args, **kwargs)
+        except ACCOUNTING_ERRORS as error:
+            return dict(allowed=True, recorded=False, accounting_error=str(error))
+
     def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None):
         with self.locked():
             state = self.current()
             if invocation in state["sessions"]:
                 raise BudgetError("an invocation ID cannot be launched twice")
             events = [self.accrue(state)]
-            active = self.sessions(state, active=True)
+            active = [s for s in self.sessions(state, active=True) if not s.get("archive")]
             if resume and not any(resume in s.get("totals", {}) for s in self.related(state, [resume])):
-                raise BudgetError("resuming requires a recorded cost baseline for that provider session ID")
+                raise LedgerError("recorded cost baseline unavailable for that provider session ID")
             for session in active:
                 if orphaned_bridge(session, self.clock()):
                     session["status"] = "unresolved"
@@ -550,9 +623,7 @@ class Budget:
                 default=None,
             )
             reason = None
-            if any(s.get("archive") for s in active):
-                reason = "ledger repair requires reconciliation"
-            elif resume and any(s.get("resume") == resume for s in active):
+            if resume and any(s.get("resume") == resume for s in active):
                 reason = (
                     "provider session already being resumed"
                     if any(s.get("resume") == resume for s in live)
@@ -578,10 +649,11 @@ class Budget:
                     estimate=str(estimate),
                 )
                 queue[worker] = wait
-                self.save_waiting(queue)
-                if previous.get("reason") != reason or len(events) > 1:
-                    events.append(wait)
-                    self.append(state, events)
+                with contextlib.suppress(OSError):
+                    self.save_waiting(queue)
+                    if previous.get("reason") != reason or len(events) > 1:
+                        events.append(wait)
+                        self.append(state, events)
                 return dict(allowed=False, reason=reason, estimate=str(estimate), balance=str(state["balance"]))
             events.append(
                 dict(
@@ -1083,51 +1155,7 @@ class Budget:
             self.append(state, [self.accrue(state), dict(type="cooldown", model=model, until=until)])
 
     def repair(self, note):
-        """Archive exact damaged bytes and start a new ledger by replaying only the verified prefix."""
+        """Compatibility command: normal locked access already repairs interrupted appends."""
         if not note.strip():
             raise BudgetError("ledger repair requires --note")
-        with self.locked():
-            raw = self.ledger.read_bytes()
-            # Only a torn final line is repairable automatically. Complete invalid records require investigation.
-            if raw.endswith(b"\n"):
-                raise BudgetError("only a torn final write can be repaired automatically")
-            prefix = raw[: raw.rfind(b"\n") + 1]
-            state = self.replay(self.records(prefix))
-            archive = self.directory / f"events.damaged-{uuid.uuid4().hex}.jsonl"
-            replacement = self.directory / f"events.repair-{uuid.uuid4().hex}.tmp"
-            try:
-                fd = os.open(archive, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(fd, "wb") as out:
-                    out.write(raw)
-                    out.flush()
-                    os.fsync(out.fileno())
-                self.sync_directory()
-                # A torn suffix may represent a paid launch or a settlement. Freeze admissions until audited.
-                events = [
-                    self.accrue(state),
-                    dict(
-                        type="admit",
-                        id="repair-" + uuid.uuid4().hex,
-                        worker="ledger-repair",
-                        model="unknown",
-                        phase="repair",
-                        estimate="0",
-                        status="unresolved",
-                        started=self.clock(),
-                        archive=str(archive),
-                        note=note,
-                    ),
-                ]
-                fd = os.open(replacement, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(fd, "wb") as out:
-                    out.write(prefix + self.record_bytes(state, events))
-                    out.flush()
-                    os.fsync(out.fileno())
-                # The authoritative path is always either the damaged original (which fails closed)
-                # or a complete replacement containing the unresolved repair marker.
-                os.replace(replacement, self.ledger)
-                self.sync_directory()
-            except BaseException:
-                # Preserve both files on failure; never silently restore a discarded suffix.
-                raise BudgetError(f"repair incomplete; original bytes preserved at {archive}") from None
         return self.snapshot()
