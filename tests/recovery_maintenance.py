@@ -130,6 +130,7 @@ class RecoveryMaintenance(unittest.TestCase):
         source = self.cfg.state / "recovery/unfinished/source"
         source.parent.mkdir(parents=True)
         source.write_text("unpublished")
+        (garbage / "source-link").symlink_to(source.parent, target_is_directory=True)
         with patch.object(wr, "inspect", side_effect=AssertionError("trash needs no source archival")):
             for _ in range(10):
                 maintenance.collect_discarded(self.cfg.state.parent, removal_bytes=8192)

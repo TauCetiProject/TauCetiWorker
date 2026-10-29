@@ -987,8 +987,9 @@ def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 10
                 work.charge(entries=1)
                 if state.is_symlink() or not state.is_dir():
                     continue
-                directory = state / "recovery-cleanup" / "discarded"
-                if directory.is_symlink() or not directory.is_dir():
+                parent = state / "recovery-cleanup"
+                directory = parent / "discarded"
+                if parent.is_symlink() or directory.is_symlink() or not directory.is_dir():
                     continue
                 for path in directory.iterdir():
                     work.charge(entries=1)
