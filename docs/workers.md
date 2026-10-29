@@ -272,7 +272,8 @@ directory deletions. The same background collector drains already-retired recove
 with a separate 30-second, 32-GiB deletion slice and the existing recovery lock/cursors.
 It never archives or deletes unpublished recovery records in that pass. Retained caches
 can be reclaimed while source preservation waits. Directed pressure requests prefer private
-artifact archives and skip workers whose round or verification locks prevent reclamation.
+artifact archives and prefer workers without active rounds or verification continuations.
+If every worker is busy, one is still selected for reclamation at its next safe boundary.
 Ordinary pressure preserves young build trees. At critical headroom, workers retain their
 independent emergency reclamation at safe round boundaries, including throughout the existing
 recovery hysteresis band; a missing collector or damaged request cannot suppress that path.

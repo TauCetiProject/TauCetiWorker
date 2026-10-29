@@ -180,6 +180,11 @@ class Storage(unittest.TestCase):
             ):
                 self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "3")
                 self.assertEqual(storage.collect(configs, opened=None)["private_reclamation_worker"], "1")
+                with (
+                    retention.locked(configs[1].state / "round.lock"),
+                    retention.locked(configs[2].state / "round.lock"),
+                ):
+                    self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "1")
             first = storage.collect(configs)
             self.assertEqual(first["private_reclamation_worker"], "1")
             atomic_json(configs[0].state / "cache-generation.json", dict(started_at=1, last_pressure_at=time.time()))

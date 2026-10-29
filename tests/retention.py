@@ -158,10 +158,10 @@ class Retention(unittest.TestCase):
         private.write_text("artifact")
         atomic_json(
             activity.root() / "cache-pressure.json",
-            dict(requested_at=self.clock + 1, until=self.clock + 200, workers=[self.cfg.wid]),
+            dict(requested_at=self.clock + 1, until=self.clock + 200, workers=[]),
         )
         with patch.object(retention.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 900, 100)):
-            retention.recycle(self.cfg, now=self.clock + 20)
+            retention.recycle(self.cfg, now=self.clock + 301)
         self.assertFalse(private.exists())
         self.assertFalse(cache.exists())
         # Deferral released the round lock, and does not need an activity/paid round.

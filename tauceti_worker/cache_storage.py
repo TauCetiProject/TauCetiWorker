@@ -318,7 +318,7 @@ def collect(configs, *, dry=False, now=None, opened=...):
     ]
     report["pressure"] = bool(pressured)
     if not dry:
-        available = []
+        busy_workers = set()
         for cfg in configs if pressured else ():
             try:
                 # Reuse the open-file observation without taking work locks: even a
@@ -329,21 +329,19 @@ def collect(configs, *, dry=False, now=None, opened=...):
                     for state in (cfg.state, cfg.state / "verification-state")
                     for path in (state / "verification-jobs").glob("*.lock")
                 ]
-                busy = False
                 for path in paths if opened is not None else ():
                     try:
                         info = path.stat()
                     except FileNotFoundError:
                         continue
                     if (info.st_dev, info.st_ino) in opened:
-                        busy = True
+                        busy_workers.add(cfg.wid)
                         break
-                if not busy:
-                    available.append(cfg)
             except OSError:
+                busy_workers.add(cfg.wid)
                 note(report, "protected", str(cfg.state))
         candidates = []
-        for cfg in available:
+        for cfg in configs:
             generation = read_json(cfg.state / "cache-generation.json")
             last = generation.get("last_pressure_at", 0)
             if now - last < 12 * 3600:
@@ -354,8 +352,8 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 if worker == cfg.wid and str(dev) in pressured
             )
             if potential >= MIN_PRIVATE_RECLAIM:
-                candidates.append((generation.get("started_at", 0), cfg.wid))
-        selected = min(candidates)[1] if candidates else None
+                candidates.append((cfg.wid in busy_workers, generation.get("started_at", 0), cfg.wid))
+        selected = min(candidates)[-1] if candidates else None
         # Request only one useful reclamation, after pool GC has had its chance.
         # Held working sets/unrelated disk use must not flush the fleet every hour.
         atomic_json(
