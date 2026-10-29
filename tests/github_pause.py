@@ -56,9 +56,16 @@ class GitHubPauseTests(unittest.TestCase):
             work_units._check_stage_read_quota("fix")
         with (
             patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
-            patch.object(transport, "observed_budget", return_value={"core": (0, 2000), "graphql": (0, 2000)}),
+            patch.object(transport, "observed_budget", return_value={"core": (1, 2000), "graphql": (0, 2000)}),
         ):
             work_units._check_stage_read_quota("review")
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
+            patch.object(transport, "observed_budget", return_value={"core": (0, 2000), "graphql": (5000, 2000)}),
+            self.assertRaises(GitHubUnavailable) as waiting,
+        ):
+            work_units._check_stage_read_quota("review")
+        self.assertEqual(waiting.exception.retry_at, 2000)
 
     def test_post_write_progress_bypasses_webhook_lag(self):
         gh = SimpleNamespace(
