@@ -179,6 +179,15 @@ class Storage(unittest.TestCase):
             atomic_json(configs[0].state / "cache-generation.json", dict(started_at=1, last_pressure_at=time.time()))
             second = storage.collect(configs)
         self.assertEqual(second["private_reclamation_worker"], "2")
+        for cfg in configs:
+            shutil.rmtree(cfg.state / "home/.cache/lake")
+            build = cfg.checkout / ".lake"
+            build.mkdir(parents=True)
+            (build / "payload").write_bytes(b"warm")
+        with patch.object(storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 960, 40)):
+            fallback = storage.collect(configs)
+        self.assertEqual(fallback["private_reclamation_worker"], "2")
+        self.assertTrue(all((cfg.checkout / ".lake/payload").exists() for cfg in configs))
 
     def test_private_pressure_collection_works_without_shared_cache(self):
         shutil.rmtree(self.pool)

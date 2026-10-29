@@ -997,13 +997,17 @@ def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 10
                         continue
                     cursor = path.with_name(path.name + ".json")
                     job = read_json(cursor)
-                    if not job:
+                    if (
+                        not isinstance(job.get("tree_identity"), list)
+                        or len(job["tree_identity"]) != 2
+                        or not isinstance(job.get("stack", []), list)
+                    ):
                         info = path.stat()
                         job = dict(tree_identity=[info.st_dev, info.st_ino])
                     try:
                         if _remove(path, job, work):
                             cursor.unlink(missing_ok=True)
-                    except (OSError, ValueError) as error:
+                    except (OSError, ValueError, TypeError, KeyError) as error:
                         errors.append(str(error)[:200])
                     finally:
                         if path.exists():

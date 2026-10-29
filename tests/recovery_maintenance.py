@@ -131,6 +131,7 @@ class RecoveryMaintenance(unittest.TestCase):
         source.parent.mkdir(parents=True)
         source.write_text("unpublished")
         (garbage / "source-link").symlink_to(source.parent, target_is_directory=True)
+        maintenance.atomic_json(garbage.with_name(garbage.name + ".json"), dict(stack=None))
         with patch.object(wr, "inspect", side_effect=AssertionError("trash needs no source archival")):
             for _ in range(10):
                 maintenance.collect_discarded(self.cfg.state.parent, removal_bytes=8192)

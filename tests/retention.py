@@ -119,7 +119,6 @@ class Retention(unittest.TestCase):
         private = self.cfg.state / "home/.cache/lake/payload"
         private.parent.mkdir(parents=True)
         private.write_text("old artifact")
-        retention.recycle(self.cfg, now=self.clock)
         atomic_json(
             activity.root() / "cache-pressure.json",
             dict(requested_at=self.clock + 10, until=self.clock + 200, workers=[self.cfg.wid]),
@@ -132,7 +131,7 @@ class Retention(unittest.TestCase):
         retention.recycle(self.cfg, now=self.clock + 30)
         self.assertTrue(private.exists())
 
-    def test_pressure_reclaims_selected_private_cache_through_recovery_without_cold_builds(self):
+    def test_critical_space_reclaims_only_the_selected_worker_through_recovery(self):
         self.clock = time.time()
         cache = self.cache()
         self.cfg.state.mkdir(parents=True, exist_ok=True)
@@ -157,7 +156,7 @@ class Retention(unittest.TestCase):
         with patch.object(retention.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 900, 100)):
             retention.recycle(self.cfg, now=self.clock + 20)
         self.assertFalse(private.exists())
-        self.assertTrue(cache.exists())
+        self.assertFalse(cache.exists())
         # Deferral released the round lock, and does not need an activity/paid round.
         with retention.locked(self.cfg.state / "round.lock"):
             pass
