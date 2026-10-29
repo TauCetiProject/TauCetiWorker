@@ -158,12 +158,16 @@ def _backoff(failures: int) -> float:
     return min(300.0, 30.0 * (1 << min(max(failures - 3, 0), 4))) * random.uniform(0.8, 1.2)
 
 
-def _url() -> str | None:
+def _configured_url() -> str:
     # Explicit empty configuration disables the service, including downstream
     # projects whose manifest selects mode=off. Unconfigured Tau Ceti workers
     # share the public mirror without a credential on each machine.
     default = DEFAULT_URL if os.environ.get("TAUCETI_REPO", PUBLIC_REPOSITORY) == PUBLIC_REPOSITORY else ""
-    value = os.environ.get("TAUCETI_GITHUB_STATE_URL", default).rstrip("/")
+    return os.environ.get("TAUCETI_GITHUB_STATE_URL", default).rstrip("/")
+
+
+def _url() -> str | None:
+    value = _configured_url()
     if not value:
         return None
     parsed = urllib.parse.urlsplit(value)
@@ -174,6 +178,11 @@ def _url() -> str | None:
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise StateQueryError("GitHub state URL must not contain credentials, query or fragment")
     return value
+
+
+def enabled() -> bool:
+    """Whether this worker uses a configured or default GitHub state service."""
+    return bool(_configured_url()) and not transport.direct_reads()
 
 
 def _wire(data, operation):
@@ -255,6 +264,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
         return False, None
     url = _url()
     if not url:
+        return False, None
+    if url == DEFAULT_URL and repo != PUBLIC_REPOSITORY and "TAUCETI_GITHUB_STATE_TOKEN_FILE" not in os.environ:
         return False, None
     ensure_ssl_cert_file()
     token = ""
@@ -386,7 +397,9 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         ) from None
                     elif error.code in (401, 403):
                         raise _Failure(
-                            "client_auth_configuration", _classify(error, token).detail, status=error.code
+                            "client_auth_configuration" if token else "public_read_unavailable",
+                            _classify(error, token).detail,
+                            status=error.code,
                         ) from None
                     else:
                         raise _classify(error, token) from None

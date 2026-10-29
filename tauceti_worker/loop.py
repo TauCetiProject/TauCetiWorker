@@ -31,6 +31,7 @@ from .constants import (
 )
 from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
+from .github_state import enabled as github_state_enabled
 from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
@@ -239,7 +240,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # A configured mirror owns an independent read installation. Its callers must not
             # be parked because the direct credential's unrelated read pool is running low.
             # Publication is durable and actual rejections are handled by the transport/outbox.
-            gb = None if os.environ.get("TAUCETI_GITHUB_STATE_URL") else github_budget()
+            gb = None if github_state_enabled() else github_budget()
             # Focused overlap scans publish through REST and do no PR authoring;
             # unrelated GraphQL exhaustion must not park that queue.
             buckets = ("core",) if set(only) == {"overlap-scan"} else ("core", "graphql")

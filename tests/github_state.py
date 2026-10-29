@@ -76,6 +76,11 @@ class Response(io.BytesIO):
 with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp}):
     for key in ("TAUCETI_GITHUB_STATE_URL", "TAUCETI_GITHUB_STATE_TOKEN_FILE", "TAUCETI_REPO"):
         os.environ.pop(key, None)
+    assert state.enabled()
+    from tauceti_worker import work_units
+
+    with patch("tauceti_worker.github_transport.observed_budget", return_value={"graphql": (0, 9999999999)}):
+        work_units._check_stage_read_quota("review")
     public = {
         "version": 1,
         "repository": state.PUBLIC_REPOSITORY,
@@ -99,6 +104,7 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
         patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": ""}),
         patch.object(state.urllib.request, "urlopen") as fetch,
     ):
+        assert not state.enabled()
         assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
         fetch.assert_not_called()
     with (
@@ -107,6 +113,15 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
     ):
         assert state.read("other/private", "issue_comments", number=7) == (False, None)
         fetch.assert_not_called()
+    with patch.object(
+        state.urllib.request,
+        "urlopen",
+        side_effect=urllib.error.HTTPError(state.DEFAULT_URL, 401, "unavailable", {}, io.BytesIO(b"{}")),
+    ):
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=8) == (False, None)
+        assert state.last_failure()["reason"] == "public_read_unavailable"
+    assert state.read("other/private", "issue_comments", number=7) == (False, None)
+    assert state.last_failure() is None
     with (
         patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://custom.test"}),
         patch.object(state.urllib.request, "urlopen") as fetch,

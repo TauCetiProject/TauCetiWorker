@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .github_state import enabled as github_state_enabled
+
 if TYPE_CHECKING:  # annotation only; survey is a higher layer
     from .survey import Counters
 
@@ -104,7 +106,7 @@ class ReviewState:
         keep two processes sharing a worker id (a round and the dashboard) off each other's half."""
         # The shared service can observe deletions and reactions without a PR updatedAt change.
         # Let it answer each pass instead of hiding those changes behind this local age cache.
-        if os.environ.get("TAUCETI_GITHUB_STATE_URL"):
+        if github_state_enabled():
             return None
         key = self._observed.get(pr)
         if not key:
@@ -179,12 +181,7 @@ class ReviewState:
                 return Meta(sc["meta"], "assumed")
             if sc.get("status") == "missing":
                 return Meta({}, "missing")
-        if (
-            not force
-            and not os.environ.get("TAUCETI_GITHUB_STATE_URL")
-            and not self._observed.get(pr)
-            and cache.exists()
-        ):
+        if not force and not github_state_enabled() and not self._observed.get(pr) and cache.exists():
             # No clock to compare against (a caller outside a survey pass): the plain TTL, as before.
             # `assumed`, not `fresh` — it was not read from GitHub during this pass, and `fresh` is the
             # word the mutating path trusts.
