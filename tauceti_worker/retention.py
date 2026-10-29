@@ -279,17 +279,11 @@ def recycle(cfg, *, now=None, dry=False):
         "workers" not in request or cfg.wid in request["workers"]
     )
     last_pressure = row.get("last_pressure_at", 0)
-    critical = False
-    for location in (cfg.state, cfg.checkout):
-        while not location.exists():
-            location = location.parent
-        usage = shutil.disk_usage(location)
-        from .cache_storage import CRITICAL, headroom
-
-        critical = critical or usage.free < headroom(usage.total, CRITICAL)
+    # The collector directs pressure reclamation to one useful worker at a time.
+    # Low headroom must not make every worker discard and rebuild its warm tree.
     forced = (
         applicable and request.get("until", 0) > now and (not valid or request.get("requested_at", 0) > last_pressure)
-    ) or (critical and (not valid or now - last_pressure > 300))
+    )
     if valid and not forced and now - born < LIFETIME and not pending:
         return report
     with contextlib.ExitStack() as stack:
@@ -322,7 +316,7 @@ def recycle(cfg, *, now=None, dry=False):
         if not forced and now - born < LIFETIME:
             return report
         cache_result = fresh_report(now)
-        private_only = forced and not critical and valid and now - born < LIFETIME
+        private_only = forced and (not valid or now - born < LIFETIME)
         if private_only:
             # Drop old private artifact-store references, retaining the warm build tree.
             for path, anchor in cache_roots(cfg):
@@ -405,6 +399,12 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     mounts = mount_points()
     configs = list(worker_configs())
     if not diagnostics_only:
+        from . import recovery_maintenance
+
+        # Already-retired data needs no source archival. Use the existing collector
+        # and deletion cursors instead of the activity preparer's tiny foreground slice.
+        if not dry:
+            report["recovery_trash"] = recovery_maintenance.collect_discarded(worker_state_root().resolve())
         from .cache_storage import collect
 
         try:
