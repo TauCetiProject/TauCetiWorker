@@ -318,8 +318,32 @@ def collect(configs, *, dry=False, now=None, opened=...):
     ]
     report["pressure"] = bool(pressured)
     if not dry:
+        available = []
+        for cfg in configs if pressured else ():
+            try:
+                # Reuse the open-file observation without taking work locks: even a
+                # brief probe could make a concurrently starting round lose its lock.
+                paths = [cfg.state / "round.lock"]
+                paths += [
+                    path
+                    for state in (cfg.state, cfg.state / "verification-state")
+                    for path in (state / "verification-jobs").glob("*.lock")
+                ]
+                busy = False
+                for path in paths if opened is not None else ():
+                    try:
+                        info = path.stat()
+                    except FileNotFoundError:
+                        continue
+                    if (info.st_dev, info.st_ino) in opened:
+                        busy = True
+                        break
+                if not busy:
+                    available.append(cfg)
+            except OSError:
+                note(report, "protected", str(cfg.state))
         candidates = []
-        for cfg in configs:
+        for cfg in available:
             generation = read_json(cfg.state / "cache-generation.json")
             last = generation.get("last_pressure_at", 0)
             if now - last < 12 * 3600:
@@ -332,25 +356,6 @@ def collect(configs, *, dry=False, now=None, opened=...):
             if potential >= MIN_PRIVATE_RECLAIM:
                 candidates.append((generation.get("started_at", 0), cfg.wid))
         selected = min(candidates)[1] if candidates else None
-        if selected is None:
-            # A critical latch must recover even if only build trees occupy space.
-            # The selected worker evicts at its own safe round boundary; no active
-            # build is interrupted and the fleet never flushes all working sets.
-            fallback = []
-            for cfg in configs:
-                generation = read_json(cfg.state / "cache-generation.json")
-                if now - generation.get("last_pressure_at", 0) < 300:
-                    continue
-                path = cfg.checkout
-                while not path.exists():
-                    path = path.parent
-                usage = shutil.disk_usage(path)
-                latched = read_json(activity_root() / f"critical-{path.stat().st_dev}.json").get("active", False)
-                if (
-                    usage.free < headroom(usage.total, CRITICAL) or latched and usage.free < headroom(usage.total, LOW)
-                ) and any((cfg.checkout / name).is_dir() for name in (".lake", "lake-packages", "build")):
-                    fallback.append((generation.get("started_at", 0), cfg.wid))
-            selected = min(fallback)[1] if fallback else None
         # Request only one useful reclamation, after pool GC has had its chance.
         # Held working sets/unrelated disk use must not flush the fleet every hour.
         atomic_json(

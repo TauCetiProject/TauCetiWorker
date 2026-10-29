@@ -275,10 +275,9 @@ def recycle(cfg, *, now=None, dry=False):
     devices = {str(cfg.state.stat().st_dev)}
     with contextlib.suppress(OSError):
         devices.add(str(cfg.checkout.stat().st_dev))
-    applicable = (not request.get("devices") or bool(devices.intersection(request["devices"]))) and (
-        "workers" not in request or cfg.wid in request["workers"]
-    )
     last_pressure = row.get("last_pressure_at", 0)
+    if not isinstance(last_pressure, (float, int)) or not math.isfinite(last_pressure) or last_pressure > now:
+        last_pressure = 0
     from .cache_storage import CRITICAL, LOW, headroom
 
     critical = False
@@ -290,10 +289,13 @@ def recycle(cfg, *, now=None, dry=False):
         critical |= usage.free < headroom(usage.total, CRITICAL) or (
             latched and usage.free < headroom(usage.total, LOW)
         )
-    # The collector directs pressure reclamation to one useful worker at a time.
-    # Low headroom must not make every worker discard and rebuild its warm tree.
-    forced = (
-        applicable and request.get("until", 0) > now and (not valid or request.get("requested_at", 0) > last_pressure)
+    # Emergency reclamation must not depend on collector availability or its records.
+    # Ordinary pressure still targets one worker and preserves young build trees.
+    forced = (critical and (not valid or now - last_pressure > 300)) or (
+        (not request.get("devices") or bool(devices.intersection(request["devices"])))
+        and ("workers" not in request or cfg.wid in request["workers"])
+        and request.get("until", 0) > now
+        and (not valid or request.get("requested_at", 0) > last_pressure)
     )
     if valid and not forced and now - born < LIFETIME and not pending:
         return report

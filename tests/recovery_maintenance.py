@@ -133,10 +133,15 @@ class RecoveryMaintenance(unittest.TestCase):
         (garbage / "source-link").symlink_to(source.parent, target_is_directory=True)
         maintenance.atomic_json(garbage.with_name(garbage.name + ".json"), dict(stack=None))
         with patch.object(wr, "inspect", side_effect=AssertionError("trash needs no source archival")):
-            for _ in range(10):
+            for step in range(10):
                 maintenance.collect_discarded(self.cfg.state.parent, removal_bytes=8192)
                 if not garbage.exists():
                     break
+                if step == 0:
+                    # A copied/restored trash directory has new inode metadata.
+                    maintenance.atomic_json(
+                        garbage.with_name(garbage.name + ".json"), dict(tree_identity=[0, 0], stack=[""])
+                    )
         self.assertFalse(garbage.exists())
         self.assertEqual(source.read_text(), "unpublished")
 

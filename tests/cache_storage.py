@@ -163,7 +163,7 @@ class Storage(unittest.TestCase):
 
     def test_pressure_requests_one_old_worker_and_obeys_cooldown(self):
         configs = []
-        for index in (1, 2):
+        for index in (1, 2, 3):
             state = self.root / str(index)
             private = state / "home/.cache/lake"
             private.mkdir(parents=True)
@@ -174,20 +174,17 @@ class Storage(unittest.TestCase):
             patch.dict(os.environ, {"TAUCETI_CACHE_MAX_GIB": "0.000001"}),
             patch.object(storage, "MIN_PRIVATE_RECLAIM", 4096),
         ):
+            with (
+                retention.locked(configs[0].state / "round.lock"),
+                retention.locked(configs[1].state / "verification-jobs/held.lock"),
+            ):
+                self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "3")
+                self.assertEqual(storage.collect(configs, opened=None)["private_reclamation_worker"], "1")
             first = storage.collect(configs)
             self.assertEqual(first["private_reclamation_worker"], "1")
             atomic_json(configs[0].state / "cache-generation.json", dict(started_at=1, last_pressure_at=time.time()))
             second = storage.collect(configs)
         self.assertEqual(second["private_reclamation_worker"], "2")
-        for cfg in configs:
-            shutil.rmtree(cfg.state / "home/.cache/lake")
-            build = cfg.checkout / ".lake"
-            build.mkdir(parents=True)
-            (build / "payload").write_bytes(b"warm")
-        with patch.object(storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 960, 40)):
-            fallback = storage.collect(configs)
-        self.assertEqual(fallback["private_reclamation_worker"], "2")
-        self.assertTrue(all((cfg.checkout / ".lake/payload").exists() for cfg in configs))
 
     def test_private_pressure_collection_works_without_shared_cache(self):
         shutil.rmtree(self.pool)
