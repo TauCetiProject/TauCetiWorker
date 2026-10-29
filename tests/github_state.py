@@ -9,6 +9,7 @@ import sys
 import tempfile
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -81,6 +82,38 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
 
     with patch("tauceti_worker.github_transport.observed_budget", return_value={"graphql": (0, 9999999999)}):
         work_units._check_stage_read_quota("review")
+    # Mirrored workers continue with unknown quota or a low direct read pool,
+    # but recorded REST exhaustion stops a paid launch until the existing reset.
+    from tauceti_worker import loop
+    from tauceti_worker.config import GitHubUnavailable
+
+    for budget, expected_launch in [
+        ({}, True),
+        ({"graphql": (0, 9999999999)}, True),
+        ({"core": (1, 9999999999)}, True),
+        ({"core": (0, 9999999999)}, False),
+    ]:
+        with (
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("codex", {})),
+            patch.object(loop, "github_budget", side_effect=AssertionError("no quota probe needed")),
+            patch("tauceti_worker.github_transport.observed_budget", return_value=budget),
+            patch.object(loop, "run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
+            patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            loop.cmd_loop(
+                SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None),
+                SimpleNamespace(wid="default-state-test"),
+                only=["review"],
+                agent="codex",
+            )
+            assert launch.called is expected_launch
+            try:
+                work_units._check_stage_read_quota("review")
+            except GitHubUnavailable as error:
+                assert not expected_launch and error.retry_at == 9999999999
+            else:
+                assert expected_launch
     public = {
         "version": 1,
         "repository": state.PUBLIC_REPOSITORY,

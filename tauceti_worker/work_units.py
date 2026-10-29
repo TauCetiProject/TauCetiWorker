@@ -1031,11 +1031,10 @@ def _check_stage_read_quota(stage):
     from .config import GitHubUnavailable
     from .github_transport import observed_budget
 
-    if github_state_enabled() or stage in ("overlap-scan", "overlap-fix"):
+    if stage in ("overlap-scan", "overlap-fix"):
         return
-    exhausted = {
-        k: reset for k, (remaining, reset) in observed_budget().items() if k in ("core", "graphql") and remaining == 0
-    }
+    buckets = ("core",) if github_state_enabled() else ("core", "graphql")
+    exhausted = {k: reset for k, (remaining, reset) in observed_budget().items() if k in buckets and remaining == 0}
     if exhausted:
         raise GitHubUnavailable("GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()))
 
