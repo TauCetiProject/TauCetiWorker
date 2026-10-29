@@ -491,7 +491,11 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
             urllib.error.URLError,
         ) as error:
             last = _classify(error, token)
-            if time.monotonic() >= deadline or last.reason == "client_auth_configuration" or last.retry_after:
+            if (
+                time.monotonic() >= deadline
+                or last.reason in ("client_auth_configuration", "public_read_unavailable")
+                or last.retry_after
+            ):
                 break
     retry_at = time.time() + max(last.retry_after or 0, 5 * random.uniform(0.8, 1.2))
 

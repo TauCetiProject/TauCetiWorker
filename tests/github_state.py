@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,9 +151,10 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
         state.urllib.request,
         "urlopen",
         side_effect=urllib.error.HTTPError(state.DEFAULT_URL, 401, "unavailable", {}, io.BytesIO(b"{}")),
-    ):
+    ) as rejected:
         assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=8) == (False, None)
         assert state.last_failure()["reason"] == "public_read_unavailable"
+        assert rejected.call_count == 1
     assert state.read("other/private", "issue_comments", number=7) == (False, None)
     assert state.last_failure() is None
     with (
@@ -169,6 +171,24 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
         assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
         assert state.last_failure()["reason"] == "client_auth_configuration"
         fetch.assert_not_called()
+
+    # A public 429 is shared across operations, then expires without an operator.
+    with tempfile.TemporaryDirectory() as limited, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": limited}):
+        now = time.time()
+        rejected = urllib.error.HTTPError(state.DEFAULT_URL, 429, "limited", {"Retry-After": "60"}, io.BytesIO(b"{}"))
+        with patch.object(state.urllib.request, "urlopen", side_effect=rejected) as fetch:
+            assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=9) == (False, None)
+            assert not fetch.call_args.args[0].has_header("Authorization")
+            assert state.read(state.PUBLIC_REPOSITORY, "pr", number=9) == (False, None)
+            assert fetch.call_count == 1
+            assert state.last_failure()["actionable"] is False
+        with (
+            patch.object(state.time, "time", return_value=now + 61),
+            patch.object(state.urllib.request, "urlopen", return_value=Response(public)) as fetch,
+        ):
+            assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=9)[0]
+            assert fetch.call_count == 1
+            assert state.last_failure() is None
 
 
 with (

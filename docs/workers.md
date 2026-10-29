@@ -419,8 +419,11 @@ without URL flags, token files, or per-worker configuration. The service publish
 read-only data for that public repository; GitHub writes still use the worker's
 own authenticated account. Installation credentials remain on the server.
 
-Explicit CLI, environment and worker settings override the default. An empty
-`github_state_url` (or `TAUCETI_GITHUB_STATE_URL=`) selects direct reads. Downstream
+Explicit CLI and worker settings override the project configuration and default.
+Use `--github-state-url ""`, `github_state_url = ""`, or project
+`services.github_state.mode = "off"` to select direct reads. Without a project
+manifest, `TAUCETI_GITHUB_STATE_URL=` also disables the default; project bootstrap
+sets service environment bindings from the manifest. Downstream
 projects retain their configured service and explicit `mode = "off"` policy;
 other repositories are never implicitly sent to the Tau Ceti mirror. Custom and
 private services still require their scoped client-token file. If a token file
