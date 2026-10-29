@@ -163,8 +163,16 @@ full reference:
 
 
 def add_github_account_flag(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--github-state-url", default=argparse.SUPPRESS, help="shared GitHub state service URL")
-    p.add_argument("--github-state-token-file", default=argparse.SUPPRESS, help="private service client token file")
+    p.add_argument(
+        "--github-state-url",
+        default=argparse.SUPPRESS,
+        help="shared GitHub state service URL (Tau Ceti public mirror by default; empty disables)",
+    )
+    p.add_argument(
+        "--github-state-token-file",
+        default=argparse.SUPPRESS,
+        help="private service client token file (not needed for the public Tau Ceti mirror)",
+    )
     p.add_argument(
         "--github-account",
         default=argparse.SUPPRESS,

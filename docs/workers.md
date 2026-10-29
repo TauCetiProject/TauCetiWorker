@@ -158,7 +158,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
 | `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token |
 | `max_open_prs` | positive integer | `32` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
-| `github_state_url` | string | unset | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
+| `github_state_url` | string | public Tau Ceti mirror | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
 | `github_state_token_file` | string | unset | Private client-token file for the service; installation credentials stay on the server. |
 | `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`, `lint-repair`, `overlap-scan`, `overlap-fix`. Empty means the automatic cascade. Set `TAUCETI_OVERLAP_BATCH_COMMITS` through `env` to override the calibrated 160-commit scan batch. |
 | `claude_billing` | string | `"subscription"` | `"api"` requires `agent = "claude"`; API mode bypasses subscription quota polling |
@@ -410,6 +410,25 @@ cannot silently disable fallback discovery.
 
 The reconciler and the worker control sockets are portable Unix code. No Linux
 `/proc` interface is required.
+
+## Shared GitHub state by default
+
+Workers targeting `TauCetiProject/TauCeti` use
+`https://github-state.taucetiproject.org` for surveys and mirrored GitHub reads
+without URL flags, token files, or per-worker configuration. The service publishes
+read-only data for that public repository; GitHub writes still use the worker's
+own authenticated account. Installation credentials remain on the server.
+
+Explicit CLI, environment and worker settings override the default. An empty
+`github_state_url` (or `TAUCETI_GITHUB_STATE_URL=`) selects direct reads. Downstream
+projects retain their configured service and explicit `mode = "off"` policy;
+other repositories are never implicitly sent to the Tau Ceti mirror. Custom and
+private services still require their scoped client-token file. If a token file
+is explicitly configured but unreadable, the client reports the configuration
+failure rather than silently switching identities.
+
+Unavailable mirror coverage or transport retains the existing direct fallback.
+Fresh dispatch checks and GitHub mutations keep their existing behavior.
 
 ## Worker ids and credential isolation
 

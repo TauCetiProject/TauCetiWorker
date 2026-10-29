@@ -32,6 +32,8 @@ class StateQueryError(ValueError):
 
 
 DEPENDENCY = "github-state"
+DEFAULT_URL = "https://github-state.taucetiproject.org"
+PUBLIC_REPOSITORY = "TauCetiProject/TauCeti"
 # Reasons a caller can act on. Authentication/configuration needs an operator; the rest recover.
 ACTIONABLE = frozenset({"client_auth_configuration"})
 _last_failure: contextvars.ContextVar[dict | None] = contextvars.ContextVar("github_state_failure", default=None)
@@ -157,7 +159,11 @@ def _backoff(failures: int) -> float:
 
 
 def _url() -> str | None:
-    value = os.environ.get("TAUCETI_GITHUB_STATE_URL", "").rstrip("/")
+    # Explicit empty configuration disables the service, including downstream
+    # projects whose manifest selects mode=off. Unconfigured Tau Ceti workers
+    # share the public mirror without a credential on each machine.
+    default = DEFAULT_URL if os.environ.get("TAUCETI_REPO", PUBLIC_REPOSITORY) == PUBLIC_REPOSITORY else ""
+    value = os.environ.get("TAUCETI_GITHUB_STATE_URL", default).rstrip("/")
     if not value:
         return None
     parsed = urllib.parse.urlsplit(value)
@@ -251,13 +257,17 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     if not url:
         return False, None
     ensure_ssl_cert_file()
-    try:
-        token = Path(os.environ["TAUCETI_GITHUB_STATE_TOKEN_FILE"]).read_text().strip()
-        if not token:
-            raise ValueError("empty client token")
-    except (KeyError, OSError, ValueError) as error:
-        detail = "TAUCETI_GITHUB_STATE_TOKEN_FILE is not set" if isinstance(error, KeyError) else type(error).__name__
-        return _unavailable(repo, operation, "client_auth_configuration", detail)
+    token = ""
+    token_file = os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
+    if token_file is not None:
+        try:
+            token = Path(token_file).expanduser().read_text().strip()
+            if not token:
+                raise ValueError("empty client token")
+        except (OSError, ValueError) as error:
+            return _unavailable(repo, operation, "client_auth_configuration", type(error).__name__)
+    elif url != DEFAULT_URL or repo != PUBLIC_REPOSITORY:
+        return _unavailable(repo, operation, "client_auth_configuration", "TAUCETI_GITHUB_STATE_TOKEN_FILE is not set")
     identity = hashlib.sha256((url + "\0" + token).encode()).hexdigest()
     base = transport.root() / "gateway" / identity
     binding = {"identity": identity, "repository": repo, "operation": operation, "args": args}
@@ -340,10 +350,11 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 if cursor:
                     params["cursor"] = cursor
                 headers = {
-                    "Authorization": "Bearer " + token,
                     "Accept": "application/json",
                     "User-Agent": "TauCetiWorker/1.0 (+https://github.com/TauCetiProject/TauCetiWorker)",
                 }
+                if token:
+                    headers["Authorization"] = "Bearer " + token
                 if cached and not cursor:
                     headers["If-None-Match"] = cached.get("etag", "")
                 request = urllib.request.Request(url + "/v1/query?" + urllib.parse.urlencode(params), headers=headers)

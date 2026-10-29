@@ -72,6 +72,57 @@ class Response(io.BytesIO):
         self.headers = {"ETag": etag}
 
 
+# Unconfigured Tau Ceti workers read the public mirror without a per-machine secret.
+with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp}):
+    for key in ("TAUCETI_GITHUB_STATE_URL", "TAUCETI_GITHUB_STATE_TOKEN_FILE", "TAUCETI_REPO"):
+        os.environ.pop(key, None)
+    public = {
+        "version": 1,
+        "repository": state.PUBLIC_REPOSITORY,
+        "operation": "issue_comments",
+        "status": "ok",
+        "complete": True,
+        "revision": 1,
+        "observed_at": 1,
+        "verified_at": 1,
+        "data": [{"id": "123", "body": "mirrored"}],
+    }
+    with patch.object(state.urllib.request, "urlopen", return_value=Response(public)) as fetch:
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (
+            True,
+            [{"id": 123, "body": "mirrored"}],
+        )
+        request = fetch.call_args.args[0]
+        assert request.full_url.startswith(state.DEFAULT_URL + "/v1/query?")
+        assert not request.has_header("Authorization")
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": ""}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
+        fetch.assert_not_called()
+    with (
+        patch.dict(os.environ, {"TAUCETI_REPO": "other/private"}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert state.read("other/private", "issue_comments", number=7) == (False, None)
+        fetch.assert_not_called()
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://custom.test"}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
+        assert state.last_failure()["reason"] == "client_auth_configuration"
+        fetch.assert_not_called()
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_TOKEN_FILE": tmp + "/missing"}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+    ):
+        assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
+        assert state.last_failure()["reason"] == "client_auth_configuration"
+        fetch.assert_not_called()
+
+
 with (
     tempfile.TemporaryDirectory() as tmp,
     patch.dict(
