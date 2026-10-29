@@ -115,7 +115,7 @@ def display(value, default_kinds=()):
             f"Storage cleanup: {cleanup.get('removed_count', len(cleanup.get('removed', [])))} paths removed; "
             f"{cleanup.get('protected_count', len(cleanup.get('protected', [])))} protected; "
             f"{cleanup.get('errors_count', len(cleanup.get('errors', [])))} errors; "
-            f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB free"
+            f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB free at last cleanup"
         )
         if "managed_bytes" in cleanup:
             age = max(0, int(time.time() - cleanup.get("at", time.time())))
