@@ -268,7 +268,12 @@ from worker configuration files. There is no macOS cleanup schedule in this chan
 private cache generations still recycle at round boundaries there. Installing the Linux
 worker service installs this timer too; existing services can install it separately
 without restarting workers. Cleanup uses one collector lock and resumes interrupted
-directory deletions. A concrete out-of-space error during cache preparation also
+directory deletions. The same background collector drains already-retired recovery trash
+with a separate 30-second, 32-GiB deletion slice and the existing recovery lock/cursors.
+It never archives or deletes unpublished recovery records in that pass. Retained caches
+can be reclaimed while source preservation waits; directed pressure requests drop private
+artifact archives while retaining warm builds until their ordinary generation expires.
+A concrete out-of-space error during cache preparation also
 unlinks closed diagnostics before the existing single retry, without synchronously
 archiving source or recursively collecting other workers' workspaces. Further failures follow normal
 worker backoff. Byte and free-space thresholds also trigger collection before the age limit.
