@@ -597,6 +597,25 @@ def test_pending_hint_survives_transient_prepare_failure():
         assert f.clock.mono <= 30
 
 
+def test_pending_attempt_survives_two_failed_reads():
+    with fixture(agent="claude") as f:
+        select(f, "claude")
+        (f.source / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "B", "accountUuid": "new"}})
+        )
+        f.wait.wait()
+        with (
+            patch.object(quota_wait, "observe", return_value=None),
+            patch.object(quota, "_http_get_json", return_value=(200, {}, None)) as http,
+        ):
+            assert select(f, "claude")[0] is None
+        assert http.call_count == 1
+        f.wait.wait()
+        with patch.object(quota, "_http_get_json", side_effect=AssertionError("duplicate early request")) as http:
+            assert select(f, "claude")[0] is None
+        http.assert_not_called()
+
+
 if __name__ == "__main__":
     for test in (
         test_original_deadline_and_no_side_effects,
@@ -626,6 +645,7 @@ if __name__ == "__main__":
         test_empty_bootstrap_period_is_not_a_change,
         test_pending_hint_survives_transient_prepare_failure,
         lambda: test_outer_loop_reaches_launch(stop_wait=True),
+        test_pending_attempt_survives_two_failed_reads,
     ):
         test()
         print("PASS", test.__name__)

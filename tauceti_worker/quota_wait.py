@@ -42,6 +42,8 @@ def _read(path: Path):
 class Observation:
     signature: str
     identity: str
+    # Compared with the previous observation so expiry is a local wake hint.
+    # Only the provider's actual verdict can advance its HTTP refresh deadline.
     release_at: float | None
     headroom: bool = field(default=False, compare=False)
     cached: bool = field(default=False, compare=False)
@@ -269,7 +271,7 @@ class QuotaWait:
                 if p in getattr(quota, "_usage_attempted", set()):
                     measured = getattr(quota, "_usage_token_fps", {}).get(p)
                     self.measured[p] = measured
-                    for value in (baseline.get(p), after.get(p)):
+                    for value in (baseline.get(p), after.get(p), self.pending_observations.get(p)):
                         if value is not None and measured == value.credential:
                             self.attempted.add((p, value.identity))
                     if after.get(p) and measured == after[p].credential and not after[p].headroom:
