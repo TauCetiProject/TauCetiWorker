@@ -799,7 +799,16 @@ def start_collector(config):
     stopping = threading.Event()
 
     def run():
+        from . import worker_scopes
+
+        oom_since = time.time() - 300
         while not stopping.is_set():
+            observed_at = time.time()
+            try:
+                if worker_scopes.collect_oom_events(config, oom_since):
+                    oom_since = observed_at
+            except Exception:
+                pass
             try:
                 prepare(config)
             except Exception as error:

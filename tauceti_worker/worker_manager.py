@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
+from . import worker_scopes
 from .config import positive_integer, security_audit_problem
 from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
@@ -733,6 +734,7 @@ def cmd_managed_runner(args) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 73
+        isolation = worker_scopes.enter(spec.id, runtime_dir)
         server = _bind_socket(sock_path)
         stopping = False
         child: subprocess.Popen | None = None
@@ -807,6 +809,7 @@ def cmd_managed_runner(args) -> int:
                 restart_count=restart_count,
                 exit_code=None,
                 stopped_at=None,
+                **isolation,
             )
             test_command = os.environ.get("TAUCETI_MANAGER_TEST_COMMAND")
             child_argv = shlex.split(test_command) if test_command else spec.work_argv()
@@ -968,13 +971,28 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
         child_generations: dict[str, str] = {}
         exit_outcomes: dict[str, tuple[str, int]] = {}
         launch_failures: dict[str, tuple[str, int, float]] = {}
+        stopping_workers: dict[str, float] = {}
+        observed_workers: dict[str, dict] = {}
+        scopes = worker_scopes.Scopes(runtime_dir)
         last_good: list[WorkerSpec] | None = None
         last_error: str | None = None
 
         def stop(signum=None, frame=None) -> None:
             nonlocal exiting, stop_workers
             exiting = True
-            stop_workers = True
+            # Fleet's manager service is replaceable independently of its scopes.
+            # Explicit shutdown RPC still selects whether workers should stop.
+            stop_workers = stop_workers or not worker_scopes.enabled()
+
+        def unreported_exit(wid: str, fingerprint: str) -> None:
+            previous = launch_failures.get(wid)
+            failures = previous[1] + 1 if previous and previous[0] == fingerprint else 1
+            delay = min(5 * (2 ** min(failures - 1, 6)), 300)
+            launch_failures[wid] = (fingerprint, failures, time.time() + delay)
+            print(
+                f"tauceti workers: wrapper {wid} exited before publishing terminal state; failure backoff {delay}s",
+                file=sys.stderr,
+            )
 
         old_term = signal.signal(signal.SIGTERM, stop)
         old_int = signal.signal(signal.SIGINT, stop)
@@ -989,6 +1007,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 if not isinstance(wid, str):
                     return {"ok": False, "error": "restart requires id"}
                 restart_ids.add(wid)
+                launch_failures.pop(wid, None)
                 return {"ok": True}
             if action == "enable":
                 wid = req.get("id")
@@ -1045,20 +1064,13 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         if not terminal and process.returncode != 0:
                             spec = wanted.get(wid)
                             fingerprint = spec.fingerprint() if spec else "removed"
-                            previous = launch_failures.get(wid)
-                            failures = previous[1] + 1 if previous and previous[0] == fingerprint else 1
-                            delay = min(5 * (2 ** min(failures - 1, 6)), 300)
-                            launch_failures[wid] = (fingerprint, failures, time.time() + delay)
-                            print(
-                                f"tauceti workers: wrapper {wid} exited before publishing terminal state; "
-                                f"retrying in {delay}s",
-                                file=sys.stderr,
-                            )
+                            unreported_exit(wid, fingerprint)
                 known_ids = set(wanted)
                 try:
                     known_ids.update(path.stem for path in state_dir.glob("*.json"))
                 except OSError:
                     pass
+                scopes.cleanup_unknown(known_ids)
                 for wid in sorted(known_ids):
                     # Reconciliation can outlast the control client's deadline on
                     # busy hosts. Serve commands between workers, not only once
@@ -1071,6 +1083,13 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     spec = wanted.get(wid)
                     live = runner_status(wid, state_dir, runtime_dir)
                     is_live = bool(live.get("alive"))
+                    observed = observed_workers.pop(wid, None)
+                    if is_live:
+                        observed_workers[wid] = {**(observed or {}), **live}
+                    if not is_live:
+                        stopping_workers.pop(wid, None)
+                        if wid not in children:
+                            scopes.cleanup(wid)
                     should_run = bool(spec and spec.enabled)
                     if is_live or not should_run:
                         enable_ids.discard(wid)
@@ -1088,7 +1107,11 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         launch_failures.pop(wid, None)
                     if is_live and (not should_run or changed or wid in restart_ids):
                         _stop_runner(wid, runtime_dir)
+                        began = stopping_workers.setdefault(wid, time.monotonic())
+                        if time.monotonic() - began >= 25:
+                            scopes.cleanup(wid, force=True)
                         continue
+                    stopping_workers.pop(wid, None)
                     if is_live or not should_run or wid in children:
                         if not is_live and spec is None and live.get("managed"):
                             for stale in (
@@ -1101,13 +1124,28 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                                     pass
                         continue
                     prior = read_json(status_path(wid, state_dir))
+                    if observed and (
+                        prior.get("wrapper_pid") != observed.get("wrapper_pid") or prior.get("stopped_at") is None
+                    ):
+                        prior = observed
                     forced = wid in restart_ids or wid in enable_ids
+                    # Adopted wrappers are not Popen children. A missing terminal
+                    # receipt must still honor their restart policy and backoff.
+                    if (
+                        wid not in exit_outcomes
+                        and prior.get("wrapper_pid")
+                        and prior.get("spec_hash") == spec.fingerprint()
+                        and prior.get("stopped_at") is None
+                    ):
+                        exit_outcomes[wid] = (spec.fingerprint(), 1)
+                        unreported_exit(wid, spec.fingerprint())
                     outcome = exit_outcomes.get(wid)
                     if not forced and outcome and outcome[0] == spec.fingerprint():
                         if spec.restart == "never" or spec.restart == "on-failure" and outcome[1] == 0:
                             continue  # Parent-observed exits remain authoritative if reporting fails.
                     if (
                         not forced
+                        and not (outcome and outcome[0] == spec.fingerprint())
                         and spec.restart == "never"
                         and prior.get("spec_hash") == spec.fingerprint()
                         and prior.get("stopped_at")
@@ -1120,6 +1158,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     # could never be reconfigured without an explicit restart.
                     if (
                         not forced
+                        and not (outcome and outcome[0] == spec.fingerprint())
                         and spec.restart == "on-failure"
                         and prior.get("spec_hash") == spec.fingerprint()
                         and prior.get("exit_code") == 0
@@ -1131,9 +1170,16 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     manager_retry_at = (
                         manager_failure[2] if manager_failure and manager_failure[0] == spec.fingerprint() else 0
                     )
-                    if not forced and max(float(prior.get("stopped_at") or 0) + delay, manager_retry_at) > time.time():
+                    if manager_retry_at > time.time() or (
+                        not forced and float(prior.get("stopped_at") or 0) + delay > time.time()
+                    ):
                         continue
-                    children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    try:
+                        children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    except OSError as exc:
+                        print(f"tauceti workers: cannot launch {wid}: {exc}", file=sys.stderr)
+                        unreported_exit(wid, spec.fingerprint())
+                        continue
                     child_generations[wid] = spec.fingerprint()
                     exit_outcomes.pop(wid, None)
                     restart_ids.discard(wid)
@@ -1150,6 +1196,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     runner_status(wid, state_dir, runtime_dir).get("alive") for wid in live_ids
                 ):
                     time.sleep(0.1)
+                for wid in live_ids:
+                    scopes.cleanup(wid, force=True)
             return 0
         finally:
             activity_stopping.set()

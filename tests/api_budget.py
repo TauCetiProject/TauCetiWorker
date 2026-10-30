@@ -28,7 +28,7 @@ from tauceti_worker.cli import build_parser
 from tauceti_worker.config import AdmissionUnavailable
 from tauceti_worker.constants import PROGRESS_ERROR_KEY
 from tauceti_worker.survey import Counters
-from tauceti_worker.usage_lifecycle import identity
+from tauceti_worker.usage_lifecycle import alive, durable, identity
 from tauceti_worker.usage_supervisor import read_lifecycle
 from tauceti_worker.worker_manager import WorkersError, WorkerSpec
 
@@ -470,6 +470,16 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
         self.budget.configure(grant=100)
 
     def tearDown(self):
+        # This fixture starts a detached singleton. Retire it before deleting
+        # its files, otherwise its heartbeat can race TemporaryDirectory cleanup.
+        ready = self.root / "budget/usage-supervisor.json"
+        if ready.exists():
+            owner = json.loads(ready.read_text())["owner"]
+            durable(ready.with_name("usage-supervisor-retire.json"), dict(owner=owner, at=time.time()))
+            deadline = time.monotonic() + 5
+            while alive(owner) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(alive(owner), "test usage supervisor did not retire")
         self.env.stop()
         self.tmp.cleanup()
 

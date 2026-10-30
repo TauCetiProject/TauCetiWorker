@@ -23,6 +23,16 @@ Fleet installers can query `_fleet-protocol` to verify this integration before
 starting workers. The response is local, contains no credentials, and launches
 no agents.
 
+On Linux, Fleet sets `TAUCETI_WORKER_SLICE` to keep each worker's entire process
+tree in an independent systemd scope, sharing the existing pool's memory and CPU
+limits. A manager-service restart preserves these workers and adopts them again.
+Explicit Fleet updates stop the worker slice, including surviving scopes; a
+manager-service stop alone is not a whole-fleet stop. `manager-stop` still stops
+workers unless `--leave-workers` is selected. Scope setup errors are reported as
+degraded isolation and work continues in the same wrapper process. Journal and
+status storage are never required for recovery. Standalone and macOS managers
+retain their existing launch and shutdown behavior.
+
 Persistent workers are declarative. You describe the workers you want in
 `workers.toml`, and a manager process reconciles reality against that file:
 starting missing workers, stopping removed ones, restarting changed ones, and
