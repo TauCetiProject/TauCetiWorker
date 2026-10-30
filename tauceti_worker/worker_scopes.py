@@ -156,10 +156,10 @@ class Scopes:
         self.kill([p for p in self.units() if not p.name.startswith(known)])
 
 
-def collect_oom_events(config: Path, since: float) -> None:
+def collect_oom_events(config: Path, since: float) -> bool:
     """Bounded observations on the existing activity thread, never the supervisor loop."""
     if not enabled():
-        return
+        return True
     from . import activity, worker_manager
     from .runtime_status import atomic_json, read_json
 
@@ -174,7 +174,7 @@ def collect_oom_events(config: Path, since: float) -> None:
             [
                 "journalctl",
                 "--unit=systemd-oomd.service",
-                f"--since=@{since:.6f}",
+                f"--since=@{max(since, time.time() - 300):.6f}",
                 "--lines=128",
                 "--output=json",
                 "--no-pager",
@@ -184,6 +184,8 @@ def collect_oom_events(config: Path, since: float) -> None:
             timeout=2,
             check=True,
         )
+        if result.stderr.strip():
+            raise OSError("System journal coverage unavailable: " + result.stderr.strip()[-500:])
         for line in result.stdout.splitlines():
             record = json.loads(line)
             message = record.get("MESSAGE", "")
@@ -192,11 +194,9 @@ def collect_oom_events(config: Path, since: float) -> None:
             if " for killing due to " not in message or not message.startswith("Marked "):
                 continue
             victim, _, reason = message.removeprefix("Marked ").partition(" for killing due to ")
-            if os.environ[SLICE_ENV] not in victim.split("/"):
-                continue
             unit = victim.rsplit("/", 1)[-1]
             affected = [s.id for s in specs if unit.startswith(prefix(runtime, s.id))]
-            if unit == "tauceti-fleet-workers.service":
+            if cgroup().is_relative_to(Path("/sys/fs/cgroup") / victim.lstrip("/")):
                 affected = [s.id for s in specs]
             ancestor = reason.removeprefix("memory pressure for ").partition(" being ")[0]
             identity = record["__CURSOR"]
@@ -207,6 +207,7 @@ def collect_oom_events(config: Path, since: float) -> None:
                 workers=affected,
                 ancestor=ancestor,
                 evidence=message,
+                role="workers" if affected else ("ci" if unit.startswith("tauceti-fleet-vm-") else "other"),
             )
             events[identity] = event
             activity.emit("worker_oom_kill", key=identity, **{k: v for k, v in event.items() if k != "id"})
@@ -219,9 +220,11 @@ def collect_oom_events(config: Path, since: float) -> None:
                 for wid in event["workers"]
             }
         atomic_json(target, dict(observed_at=time.time(), events=recent, error=None))
+        return True
     except Exception as exc:
         # No journal or diagnostics failure may influence recovery or admission.
         try:
             atomic_json(target, {**prior, "observed_at": time.time(), "error": type(exc).__name__})
         except OSError:
             pass
+        return False

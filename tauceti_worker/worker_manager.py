@@ -734,6 +734,7 @@ def cmd_managed_runner(args) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 73
+        isolation = worker_scopes.enter(spec.id, runtime_dir)
         server = _bind_socket(sock_path)
         stopping = False
         child: subprocess.Popen | None = None
@@ -753,7 +754,6 @@ def cmd_managed_runner(args) -> int:
         old_term = signal.signal(signal.SIGTERM, stop)
         old_int = signal.signal(signal.SIGINT, stop)
         try:
-            isolation = worker_scopes.enter(spec.id, runtime_dir)
             # Per-worker configuration goes UNDER self_env, not over it: self_env derives PYTHONPATH
             # and the CA bundle from what it is given, so a configured NIX_SSL_CERT_FILE takes part in
             # that discovery while the PYTHONPATH the child needs to import itself is still prepended
@@ -982,7 +982,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             exiting = True
             # Fleet's manager service is replaceable independently of its scopes.
             # Explicit shutdown RPC still selects whether workers should stop.
-            stop_workers = not worker_scopes.enabled()
+            stop_workers = stop_workers or not worker_scopes.enabled()
 
         def unreported_exit(wid: str, fingerprint: str) -> None:
             previous = launch_failures.get(wid)
@@ -990,7 +990,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             delay = min(5 * (2 ** min(failures - 1, 6)), 300)
             launch_failures[wid] = (fingerprint, failures, time.time() + delay)
             print(
-                f"tauceti workers: wrapper {wid} exited before publishing terminal state; retrying in {delay}s",
+                f"tauceti workers: wrapper {wid} exited before publishing terminal state; failure backoff {delay}s",
                 file=sys.stderr,
             )
 
@@ -1085,10 +1085,11 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     is_live = bool(live.get("alive"))
                     observed = observed_workers.pop(wid, None)
                     if is_live:
-                        observed_workers[wid] = live
+                        observed_workers[wid] = {**(observed or {}), **live}
                     if not is_live:
                         stopping_workers.pop(wid, None)
-                        scopes.cleanup(wid)
+                        if wid not in children:
+                            scopes.cleanup(wid)
                     should_run = bool(spec and spec.enabled)
                     if is_live or not should_run:
                         enable_ids.discard(wid)

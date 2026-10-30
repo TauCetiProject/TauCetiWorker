@@ -2,6 +2,7 @@
 """Two disposable workers exercise native containment; no API calls or memory pressure."""
 
 import dataclasses
+import json
 import os
 import shlex
 import shutil
@@ -12,9 +13,11 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tauceti_worker import activity
 from tauceti_worker import worker_manager as wm
 from tauceti_worker import worker_scopes as scopes
 
@@ -44,6 +47,36 @@ def grandchild_pid(wid):
         return int(Path(str(wm.status_path(wid)) + ".grandchild").read_text())
     except (FileNotFoundError, ValueError):
         return None
+
+
+# A CI victim must remain visible, and missing journal permissions must not be
+# reported as a healthy zero-kill observation or escape into supervision.
+with tempfile.TemporaryDirectory(prefix="tauceti-oom-observation-") as raw:
+    state = Path(raw)
+    record = dict(
+        __CURSOR="native-ci-event",
+        __REALTIME_TIMESTAMP="1793340000000000",
+        MESSAGE="Marked /user.slice/user-1003.slice/user@1003.service/tauceti.slice/"
+        "tauceti-fleet.slice/tauceti-fleet-ci.slice/tauceti-fleet-vm-example.service for killing due to "
+        "memory pressure for /user.slice being 90.24% > 80.00% for > 30s with reclaim activity",
+    )
+    result = subprocess.CompletedProcess([], 0, stdout=json.dumps(record), stderr="")
+    with (
+        patch.object(scopes, "enabled", return_value=True),
+        patch.object(scopes, "cgroup", return_value=Path("/sys/fs/cgroup/worker.service")),
+        patch.object(wm, "workers_state_dir", return_value=state),
+        patch.object(wm, "workers_runtime_dir", return_value=state),
+        patch.object(wm, "load_worker_specs", return_value=[wm.WorkerSpec(id="a")]),
+        patch.object(activity, "emit"),
+        patch.object(scopes.subprocess, "run", return_value=result),
+    ):
+        assert scopes.collect_oom_events(state / "config", time.time() - 60)
+        observation = wm.read_json(state / "diagnostics/isolation.json")
+        assert observation["events"][0]["role"] == "ci"
+        assert observation["events"][0]["workers"] == []
+        result.stderr = "Hint: You are currently not seeing messages from other users and the system."
+        assert not scopes.collect_oom_events(state / "config", time.time() - 60)
+        assert wm.read_json(state / "diagnostics/isolation.json")["error"] == "OSError"
 
 
 if (
@@ -93,6 +126,7 @@ with tempfile.TemporaryDirectory(prefix="tauceti-scopes-") as raw:
         "TimeoutStopSec=5",
         "--setenv=PYTHONPATH=" + str(Path(__file__).resolve().parent.parent),
         "--setenv=TAUCETI_MANAGER_TEST_COMMAND=" + test_command,
+        "--setenv=TAUCETI_GITHUB_STATE_URL=",
     ]
     for key in ("TAUCETI_WORKERS_STATE_DIR", "TAUCETI_RUNTIME_DIR", "TAUCETI_ACTIVITY_DIR", scopes.SLICE_ENV):
         argv += ["--setenv=" + key + "=" + os.environ[key]]
@@ -149,6 +183,7 @@ with tempfile.TemporaryDirectory(prefix="tauceti-scopes-") as raw:
         # The slice stop is the primitive used by Fleet update and rollback.
         run("systemctl", "--user", "stop", slice_name)
         wait(lambda: not wm.runner_status("a").get("alive"))
+        wait(lambda: not pool.units())
 
         # Scope setup failure keeps this same wrapper PID running in its old group.
         os.environ[scopes.SLICE_ENV] = "invalid slice"
