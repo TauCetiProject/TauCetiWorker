@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -175,6 +176,58 @@ def acquire_error_fails_open():
         assert os.environ["TAUCETI_PUSH_EXPECT"] == "abc"
 
 
+def simultaneous_claim_creates_select_one_worker():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        remote, barrier = root / "remote.git", root / "barrier"
+        subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+        barrier.mkdir()
+        hook = remote / "hooks/pre-receive"
+        # Both receive processes advertise the absent ref before either can
+        # create it, reproducing Git's "reference already exists" rejection.
+        hook.write_text(
+            "#!/usr/bin/env python3\nimport os,pathlib,time,sys\n"
+            "p=pathlib.Path(os.environ['RACE_BARRIER']);(p/str(os.getpid())).touch()\n"
+            "until=time.monotonic()+10\n"
+            "while len(list(p.iterdir()))<2:\n"
+            " if time.monotonic()>until:sys.exit(1)\n"
+            " time.sleep(.01)\n"
+        )
+        hook.chmod(0o755)
+        env = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": f"url.{remote}.insteadOf",
+            "GIT_CONFIG_VALUE_0": "https://github.com/fixture/claims",
+            "GIT_CONFIG_KEY_1": "protocol.file.allow",
+            "GIT_CONFIG_VALUE_1": "always",
+            "RACE_BARRIER": str(barrier),
+            "CLAIM_REPO": "fixture/claims",
+        }
+
+        def acquire(worker, key="branch/123"):
+            return subprocess.run(
+                [REPO / "scripts/claim.sh", "acquire", key, "1500"],
+                env={**env, "TAUCETI_WORKER_ID": worker, "CLAIM_GITDIR": str(root / f"{worker}.git")},
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(acquire, ("first", "second")))
+        assert sorted(result.returncode for result in results) == [0, 1], [
+            (result.returncode, result.stderr) for result in results
+        ]
+        # A rejected write without a live peer is still an infrastructure error;
+        # the existing worker path remains free to proceed unclaimed.
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        rejected = acquire("third", "branch/456")
+        assert rejected.returncode == 2, rejected.stderr
+
+
 def heartbeat_child_uses_selected_repo():
     captured = {}
     real_popen = round_mod.subprocess.Popen
@@ -239,6 +292,7 @@ fails = sum(
         ("explicit CLAIM_REPO remains authoritative", explicit_override),
         ("a skipped candidate cannot leak into the next candidate", skipped_candidate_does_not_leak),
         ("claim errors still proceed unclaimed under branch CAS", acquire_error_fails_open),
+        ("simultaneous claim creation has one winner and one collision", simultaneous_claim_creates_select_one_worker),
         ("heartbeat child inherits the selected repository", heartbeat_child_uses_selected_repo),
         ("git-safe-push scopes its lease check to the selected repository", safe_push_scopes_claim_repo),
     )

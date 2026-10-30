@@ -79,10 +79,22 @@ payload() {
 
 # push_cas REF EXPECTED NEWOID — CAS push (EXPECTED="" ⇒ create-only). 0 win, 1 lost/rejected.
 push_cas() {
-    local out
+    local out cur js owner exp
     out=$(g push --force-with-lease="$1:$2" origin "$3:$1" 2>&1)
     if [[ $? -eq 0 ]]; then return 0; fi
     grep -qiE 'stale info|cannot lock ref.*expected' <<<"$out" && return 1
+    # Concurrent creates can be rejected as "reference already exists". Read
+    # the actual lease instead of treating every unfamiliar Git error as an
+    # outage: a live peer means ordinary contention, so select other work.
+    cur=$(remote_oid "$1")
+    if [[ -n "$cur" ]]; then
+        js=$(lease_json "$cur" "$1")
+        owner=$(jq -r '.owner | select(type == "string")' <<<"$js" 2>/dev/null)
+        exp=$(jq -r '.expires_at // 0' <<<"$js" 2>/dev/null)
+        if [[ -n "$owner" && "$owner" != "$WID" && "$exp" =~ ^[0-9]+$ && "$exp" -gt "$(now)" ]]; then
+            return 1
+        fi
+    fi
     echo "claim: unexpected push error on $1: $out" >&2; return 2
 }
 push_delete() { g push --force-with-lease="$1:$2" origin ":$1" >/dev/null 2>&1; }
