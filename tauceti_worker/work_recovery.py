@@ -1113,7 +1113,12 @@ def referenced_users(repo: Path, references, *, session=None) -> list[str]:
 
 def live_users(repo: Path, *, session=None) -> list[str]:
     """Fresh process references for ordinary callers; no cached negative liveness evidence."""
-    return referenced_users(repo, process_references(), session=session)
+    import sys
+
+    references = process_references()
+    if references is None and sys.platform != "linux":
+        return []  # Preserve ordinary non-Linux preparation; procfs was never its liveness API.
+    return referenced_users(repo, references, session=session)
 
 
 # Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks

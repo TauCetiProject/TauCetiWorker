@@ -215,6 +215,11 @@ class RecoveryMaintenance(unittest.TestCase):
         trees = [self.cfg.state / "recovery" / name / "checkout" for name in ("first", "last")]
         for tree in trees:
             tree.mkdir(parents=True)
+            wr.atomic_json(tree.parent / "cache-use.json", dict(generation="stopped-use"))
+            wr.atomic_json(
+                self.cfg.state / "recovery-cleanup/cache-roots" / f"{maintenance._name(tree.parent)}.json",
+                dict(generation=dict(cache_use="stopped-use"), owner=dict(process={})),
+            )
         checks = maintenance.Checks(self.cfg.state.parent)
         real_read = Path.read_text
 
@@ -252,6 +257,8 @@ class RecoveryMaintenance(unittest.TestCase):
             discovery.assert_called_once()
         with patch.object(wr, "process_references", return_value=None):
             self.assertTrue(wr.live_users(tree))
+            with patch.object(sys, "platform", "darwin"):
+                self.assertEqual(wr.live_users(tree), [])
         with patch.object(wr, "process_references", return_value=[]):
             self.assertEqual(wr.live_users(tree), [])
 
