@@ -521,7 +521,7 @@ def _evict_caches(tree, job, work, *, batch_seconds=None):
 
     with completed_check():
         top = wr._git(tree, "rev-parse", "--show-toplevel", text=True).strip()
-    if os.path.realpath(top) != os.path.realpath(tree):
+    if canonical_candidate(top) != canonical_candidate(tree):
         raise wr.RecordError("cache candidate is not its own Git checkout")
     for name in sorted(wr.CACHE_DIRS | wr.CACHE_TOP):
         work.charge(entries=1)
@@ -665,7 +665,7 @@ def _cleanup(state, tree, root, work, observation=None):
                 try:
                     with completed_check():
                         top = wr._git(tree, "rev-parse", "--show-toplevel", text=True).strip()
-                    valid = os.path.realpath(top) == os.path.realpath(tree)
+                    valid = canonical_candidate(top) == canonical_candidate(tree)
                 except wr.BudgetExhausted:
                     raise
                 except (OSError, wr.RecordError, subprocess.SubprocessError):

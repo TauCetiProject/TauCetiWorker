@@ -1191,7 +1191,10 @@ def process_references():
 def referenced_users(repo: Path, references, *, session=None) -> list[str]:
     if references is None:
         return ["process observations unavailable"]
-    target = str(canonical_candidate(repo))
+    try:
+        target = str(canonical_candidate(repo))
+    except OSError:
+        return ["candidate path unavailable"]
     prefix = target.rstrip("/") + "/"
     found = []
     for pid, process_session, label, paths in references:

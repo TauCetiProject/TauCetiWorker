@@ -373,6 +373,8 @@ class RecoveryMaintenance(unittest.TestCase):
                 patch.object(maintenance.retention, "mount_points", return_value=[kernel_path / ".lake"]),
             ):
                 self.assertEqual(maintenance._safe(self.cfg.state, self.co, {"process": {}}), "await-mount-lease")
+            with patch.object(fcntl, "fcntl", side_effect=OSError("fixture unavailable candidate descriptor")):
+                self.assertEqual(wr.referenced_users(self.co, references), ["candidate path unavailable"])
 
     def test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot(self):
         owner = dict(pid=123, session=123, start="1:2", boot="fixture boot")
