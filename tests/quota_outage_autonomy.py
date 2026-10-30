@@ -154,8 +154,8 @@ def test_known_blocks_survive_telemetry_failure(root):
     q = worker(root / "forbidden-auth")
     with patch.object(quota, "_http_get_json", side_effect=[(403, {}, 7200), (429, {}, 7200)]) as http:
         refused, _ = q._claude_pass("old-fp", "old-token", refresh=True, account="account")
-        assert not refused.telemetry_unavailable and q._cooldown("claude", "account")[0] == 0
-        assert refused.retry_after is None
+        assert not refused.telemetry_unavailable and 7190 < q._cooldown("claude", "account")[0] <= 7200
+        assert refused.retry_after == 7200
         renewed, _ = worker(q.cfg.home)._claude_pass("new-fp", "new-token", refresh=True, account="account")
         assert renewed.telemetry_unavailable and http.call_count == 2
 
@@ -184,6 +184,47 @@ def test_loop_attempts_work_then_backs_off(root):
     assert run.call_count == 1
     assert sleeps == [min(loop.BACKOFF_BASE * 2, loop.BACKOFF_MAX)]
     assert any(state == "backoff" and "provider unavailable" in details["detail"] for state, details in events)
+
+
+def test_forbidden_telemetry_preserves_headroom_and_serializes_retries(root):
+    now = time.time()
+    payload = {
+        "five_hour": {"utilization": 1, "resets_at": datetime.fromtimestamp(now + 7200, UTC).isoformat()},
+        "seven_day": {"utilization": 1, "resets_at": datetime.fromtimestamp(now + 3 * 86400, UTC).isoformat()},
+    }
+    q = worker(root)
+    q._store_raw("claude", payload, "fp", now + 7200, now - quota.CLAUDE_USAGE_REFRESH_S - 1)
+    with patch.object(quota, "_http_get_json", return_value=(403, {}, 7200)) as http:
+        for _ in range(3):
+            status, _ = worker(root)._claude_pass("fp", "token", refresh=True, account="account")
+            assert status.available
+        assert http.call_count == 1
+    with (
+        patch.object(quota.time, "time", return_value=now + quota.QUOTA_TTL["claude"] + 1),
+        patch.object(quota, "_http_get_json") as http,
+    ):
+        blocked, _ = worker(root)._claude_pass("fp", "token", refresh=True, account="account")
+        assert not blocked.available and not blocked.telemetry_unavailable and "403" in blocked.error
+        assert loop._ignore_quota_verdict(None, blocked) == "wait"
+        http.assert_not_called()
+    # Codex's ordinary refresh also retains a usable observation after an edge challenge.
+    q = worker(root / "codex")
+    q._codex_credentials_store = lambda: None
+    q._codex_creds = lambda: {"tokens": {"access_token": "token", "account_id": "account"}}
+    codex = {
+        "rate_limit": {
+            "primary_window": {"used_percent": 1, "reset_after_seconds": 600, "limit_window_seconds": 18000},
+            "limit_reached": False,
+        }
+    }
+    q._store_raw("codex", codex, "account", now + 600, now)
+    with (
+        patch.object(quota, "mirror_creds"),
+        patch.object(quota, "_http_get_json", return_value=(403, {}, 7200)) as http,
+    ):
+        assert q.codex(refresh=True).available
+        assert q.codex(refresh=True).available
+        assert http.call_count == 1
 
 
 def test_loop_handoff_preserves_operator_choice(root):
@@ -352,6 +393,7 @@ def test_cli_preserves_soft_handoff_without_granting_outage_permission(root):
             else:
                 assert cli.cmd_work(args, only=["security-audit"], agent="claude", one_round=True) == 0
                 assert mocks["run_round"].call_args.args[1].ignore_quota == ignored
+                assert mocks["run_round"].call_args.args[1].loop_paced
 
 
 def test_real_model_refusal_is_scoped_bounded_and_recoverable(root):
@@ -477,6 +519,7 @@ if __name__ == "__main__":
         test_only_transient_failures_are_overridden,
         test_known_blocks_survive_telemetry_failure,
         test_loop_attempts_work_then_backs_off,
+        test_forbidden_telemetry_preserves_headroom_and_serializes_retries,
         test_loop_handoff_preserves_operator_choice,
         test_transient_failures_share_backoff,
         test_failed_bootstrap_stops_before_another_telemetry_read,

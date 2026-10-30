@@ -417,7 +417,14 @@ def recover(cfg, opts, previous: dict) -> bool:
         raise NoProgress("security-audit: retained operational recovery is waiting for its cooldown")
     from .loop import resolve_work_model
 
-    resolve_work_model(cfg, "codex", dry=False, ignore_quota=getattr(opts, "ignore_quota", False), fresh=True)
+    resolve_work_model(
+        cfg,
+        "codex",
+        dry=False,
+        ignore_quota=getattr(opts, "ignore_quota", False),
+        fresh=True,
+        **({"already_paced": True} if getattr(opts, "loop_paced", False) else {}),
+    )
     attempts = entry.get("attempts", 0) + 1
     state[key] = {"attempts": attempts, "retry_at": time.time() + min(3600, 300 * 2 ** min(attempts - 1, 4))}
     save(state_path, state)  # Reserve the budget before launch; a restart cannot reset it.

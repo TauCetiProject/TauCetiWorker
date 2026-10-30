@@ -189,6 +189,7 @@ class RoundOpts:
     # Preserve the operator's pacing override for fresh launch-stage quota checks.
     # This never waives hard exhaustion or unreadable provider usage.
     ignore_quota: bool = False
+    loop_paced: bool = False  # soft pacing handoff; never permits telemetry-outage work
 
     @property
     def agent_name(self) -> str:

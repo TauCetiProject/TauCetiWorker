@@ -811,12 +811,7 @@ def _cooldown_left(record: object) -> tuple[float, int | None]:
     until, wait, code = record.get("until"), record.get("wait"), record.get("code")
     if not (_finite_num(until) and _finite_num(wait) and 0 < wait <= USAGE_RETRY_AFTER_SANITY_S):
         return 0.0, None  # corrupt: never let it park us
-    if (
-        not isinstance(code, int)
-        or isinstance(code, bool)
-        or code in (401, 403)
-        or not (code == 0 or 100 <= code <= 599)
-    ):
+    if not isinstance(code, int) or isinstance(code, bool) or code == 401 or not (code == 0 or 100 <= code <= 599):
         return 0.0, None
     # A wall clock stepped backwards makes the remainder look longer than the wait itself; that is still
     # a cooldown, just one we can only bound by its own length.
@@ -1285,10 +1280,9 @@ class Quota:
         # A subsequent telemetry outage must not erase a known credential rejection.
         refusal = self._auth_refusal_path(provider, fp)
         try:
-            if code in (401, 403):
-                if code == 401:  # a bare 403 can be an edge challenge, not a credential verdict
-                    refusal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    _write_json_atomic(refusal, {"code": code})
+            if code == 401:
+                refusal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _write_json_atomic(refusal, {"code": code})
                 self._raw_path(provider, fp).unlink(missing_ok=True)
             elif code == 200:
                 refusal.unlink(missing_ok=True)
@@ -1551,7 +1545,11 @@ class Quota:
         specific = (0.0, None)
         if provider == "claude" and str(key).startswith("creds:") and fp:
             specific = self._cooldown(provider, f"{key}|credential:{fp}")
-        return max(memory, disk, specific, key=lambda left_code: left_code[0])
+        forbidden = (0.0, None)
+        credential = getattr(self, "_usage_token_fps", {}).get(provider)
+        if credential and not str(key).startswith("forbidden:"):
+            forbidden = self._cooldown(provider, f"forbidden:{credential}")
+        return max(memory, disk, specific, forbidden, key=lambda left_code: left_code[0])
 
     def _start_cooldown(
         self, provider: str, key: str | None, code: int, retry_after: float | None, fp: str | None = None
@@ -1559,9 +1557,16 @@ class Quota:
         """Honor a plausible Retry-After; headerless transient failures use bounded backoff.
         Never shortens a longer cooldown already running.
 
-        Never after a 401/403: that rejects the credential, which a wait does not fix, and a cooldown would
+        Never after a 401: that rejects the credential, which a wait does not fix, and a cooldown would
         let a cached reading taken under the rejected credential answer for it again."""
-        if code in (401, 403):
+        if code == 401:
+            return
+        if code == 403 and not str(key).startswith("forbidden:"):
+            # An edge challenge's Retry-After still binds these requests, but must
+            # not transfer a forbidden token's pause to a newly selected credential.
+            credential = getattr(self, "_usage_token_fps", {}).get(provider)
+            if credential:
+                self._start_cooldown(provider, f"forbidden:{credential}", code, retry_after)
             return
         if provider == "claude" and str(key).startswith("creds:") and fp:
             # Keep the original credential's complete deadline even if another account
@@ -1964,9 +1969,9 @@ class Quota:
         if code != 200 or not payload:
             self._start_cooldown("codex", fp, code, retry_after)
             retry_after = retry_after or self._cooldown("codex", fp)[0] or None
-            if code in (401, 403):
+            if code == 401:
                 retry_after = None
-            still = self._cached_codex(fp) if code not in (401, 403) else None
+            still = self._cached_codex(fp) if code != 401 else None
             if still is not None:
                 return replace(self._codex_from_payload(*still), rate_limited=code == 429)
             err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
@@ -2288,15 +2293,15 @@ class Quota:
         if code != 200 or not payload:
             self._start_cooldown("claude", account, code, retry_after, fp)
             retry_after = retry_after or self._cooldown("claude", account, fp)[0] or None
-            if code in (401, 403):
+            if code == 401:
                 retry_after = None
-            if code in (401, 403):
+            if code == 401:
                 # A rejected token must not get its old permissive sample back on the next read.
                 try:
                     self._raw_path("claude", fp).unlink(missing_ok=True)
                 except OSError:
                     pass
-            still = self._cached_claude(fp) if code not in (401, 403) else None
+            still = self._cached_claude(fp) if code != 401 else None
             if still is not None:
                 prov, readings = self._from_cached_claude(still)
                 return replace(prov, rate_limited=code == 429), readings

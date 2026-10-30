@@ -62,8 +62,10 @@ even after the sample's ordinary TTL, scoped to the credential that supplied the
 A changed credential may represent a different account and cannot inherit another
 credential's quota observation. HTTP 401 credential rejections remain blocking for
 that token until a successful usage response; a new token has its own identity.
-An HTTP 403 blocks its current attempt but does not establish a durable
-authentication verdict without evidence distinguishing an edge challenge.
+An HTTP 403 does not establish a durable authentication verdict without evidence
+distinguishing an edge challenge. A still-valid cached reading can supply headroom;
+otherwise it blocks launches. Its `Retry-After` is honored for that credential,
+without preventing a newly selected credential from recovering.
 Missing credentials, malformed responses, and other HTTP errors still block.
 Actual model refusals stop the round and use the loop's existing escalating
 backoff. A subscription-limit refusal from an authoring agent also records a

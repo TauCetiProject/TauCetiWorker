@@ -640,6 +640,23 @@ class WorkerBoundJudgments(unittest.TestCase):
             self.assertTrue(recovery.recover(self.cfg, opts, self.block))
         quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=True, fresh=True)
 
+    def test_recovery_preserves_parent_soft_pacing_without_outage_permission(self):
+        opts = wu.RoundOpts(
+            only=["security-audit"],
+            agent="claude",
+            work_model="claude",
+            sandbox_host=True,
+            dry_run=False,
+            loop_paced=True,
+        )
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)) as quota,
+            patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
+            patch.object(sa, "advance", return_value="b" * 40),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, opts, self.block))
+        quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=False, fresh=True, already_paced=True)
+
     def replace_answer(self, value):
         native = self.original / "model-rollout-0.jsonl"
         rows = [json.loads(line) for line in native.read_text().splitlines()]
