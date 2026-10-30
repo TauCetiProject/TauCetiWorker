@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""--ignore-quota overrides PACING, not AVAILABILITY.
+"""--ignore-quota still respects known hard blocks and unclassified failures.
 
-A worker pinned to `--agent claude --ignore-quota` is meant to skip the burn-pace throttle, not to fire
-review rounds into a provider that is actually out. So the loop still reads the usage endpoint and treats
-a HARD block — a window at 100% (exhausted), usage it cannot read (fail-closed), or the endpoint itself
-refusing to answer (its own 429 / a network error, which leaves the Provider with no windows) — as a
-reason to wait. Only a SOFT over-pace block (real quota left, merely ahead of pace) is run through.
-
-Regression for the loop that repeatedly re-reviewed the same green PRs during a subscription
-rate-limit, burning a clone + engine launch each round to post an all-error scoreboard. Dependency-free.
+Explicitly classified transient telemetry failures are covered by quota_outage_autonomy.py.
+Exhaustion, auth errors, malformed windows and missing snapshots must stay blocking.
 """
 
 import sys
@@ -61,7 +55,7 @@ cases = [
         "wait",
     ),
     (
-        "usage endpoint refused to answer (429, no windows) → wait",
+        "an unclassified endpoint failure remains blocking",
         None,
         prov(error="claude usage HTTP 429", retry_after=580),
         "wait",
@@ -133,7 +127,7 @@ result, calls = resolve(None, dead)
 case("exhausted → the round refuses", ("hard-blocked" in result, bool(calls)), (True, True))
 case("...naming the condition", "exhausted" in result, True)
 result, _ = resolve(None, prov(error="claude usage HTTP 429", retry_after=580))
-case("an endpoint that will not answer → the round refuses", "hard-blocked" in result, True)
+case("an unclassified endpoint failure → the round refuses", "hard-blocked" in result, True)
 case("...naming that too", "429" in result, True)
 case(
     "an unopened window is the one hard block a round may still clear",

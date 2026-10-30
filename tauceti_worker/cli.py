@@ -361,10 +361,10 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--ignore-quota",
         dest="ignore_quota",
         action="store_true",
-        help="ignore the quota PACER (run the requested --agent even when ahead of the burn pace); "
-        "a HARD block — a window at 100%%, unreadable usage, or the usage endpoint refusing to answer — "
-        "still backs off (needs an explicit paced --agent codex|claude — 'auto' can't choose without the pacer)",
+        help="ignore pacing and allow work through transient usage-telemetry outages; known exhaustion, "
+        "credential rejection and malformed usage still block (needs an explicit --agent codex|claude)",
     )
+    p.add_argument("--loop-paced", action="store_true", help=argparse.SUPPRESS)
     # Internal: the loop sets this on a round it selected while a Claude window was reset-but-unopened.
     # It authorizes the round's launch stage to spend ONE small claude request to open that window,
     # once it has actually found work; it is not a way to bypass pacing (see Quota.authorize_claude_launch).
@@ -1458,7 +1458,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             work_model, pending_init = "claude", False
         else:
             work_model, pending_init = resolve_work_model(
-                cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd, fresh=not one_round
+                cfg,
+                agent,
+                dry=dry,
+                ignore_quota=ignore_quota,
+                quota_cmd=quota_cmd,
+                fresh=not one_round,
+                **({"already_paced": True} if getattr(args, "loop_paced", False) else {}),
             )
         authoring_profile = None
         if work_model != "auto":

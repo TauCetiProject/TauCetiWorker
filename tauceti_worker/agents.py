@@ -1006,6 +1006,13 @@ def classify_agent_failure(text: str) -> str | None:
         return f"provider returned {status}" if status in _TRANSIENT_STATUSES else None
     if _TRANSPORT_RE.search(hay):
         return "could not reach the provider"
+    if re.search(
+        r"^(?:you(?:'ve| have) hit your (?:session|weekly|monthly|usage) limit\b|"
+        r"claude ai usage limit reached\b)",
+        lines[-1],
+        re.I,
+    ):
+        return "provider subscription limit reached"
     return None
 
 

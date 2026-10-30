@@ -39,14 +39,38 @@ observation time, so an old over-budget reading cannot become permission to run
 merely because time passed. Actual provider limits still apply to model sessions.
 
 An HTTP 429 throttles the usage endpoint; it does not by itself mean the model
-quota is exhausted. All workers sharing that source share its `Retry-After`,
-bounded to fifteen minutes, including after token renewal. This keeps an old
-telemetry error from hiding headroom for an hour after a sample expires or its
-window resets. Without that header, consecutive failures use exponential backoff
-with jitter up to fifteen minutes. A successful usage read clears that backoff.
-When no usable reading remains, the worker waits for
-telemetry rather than inventing a quota value. Stored records contain usage and
-credential fingerprints, never access or refresh tokens.
+quota is exhausted. All workers sharing that source honor its finite `Retry-After`
+up to 24 hours, including after token renewal. Invalid or larger values are logged
+and ignored so corrupt data cannot park unattended workers indefinitely.
+Without that header, transient HTTP and connection failures use shared
+exponential backoff with jitter up to fifteen minutes. A successful usage read
+clears that backoff. The loop wakes at a cooldown's deadline, rounded up to the
+next second, rather than adding another full poll interval. It revisits long
+waits hourly without making an early HTTP request.
+
+Without a usable reading, normally paced workers wait for telemetry. An explicit
+`--agent claude --ignore-quota` or `--agent codex --ignore-quota` may attempt useful
+work through a transient telemetry outage: HTTP 408, 429, 500, 502, 503, 504, 529,
+or a connection failure. This does not invent a quota value or make an expired
+positive sample usable. Known exhausted windows remain blocking until they reset,
+even after the sample's ordinary TTL, scoped to the credential that supplied them.
+A changed credential may represent a different account and cannot inherit another
+credential's quota observation. Credential rejections remain blocking for
+that token until a successful usage response; a new token has its own identity.
+Missing credentials, malformed responses, and other HTTP errors still block.
+Actual model refusals stop the round and use the loop's existing escalating
+backoff. A review-engine provider refusal posts nothing and does not charge the
+PR's review-error budget.
+
+Actual usage HTTP attempts are recorded separately from cached status reads under
+`<worker-state-root>/quota-requests/requests.jsonl`. Each attempt has a `request`
+record and, if it completes, a matching `response` record. Fields include worker,
+provider, timestamps, duration, HTTP status, raw and parsed `Retry-After`, server
+request ID, and cache age. No request headers, response bodies, or tokens are
+recorded. One active file and two backups retain about 6 MiB. Recording is best
+effort: a busy lock or unavailable disk never prevents a request or launch.
+These are TauCeti's records only; they do not count other clients' requests or
+integrate with external usage scripts or services.
 
 ## Keeping the Claude token alive: `--auto-refresh`
 

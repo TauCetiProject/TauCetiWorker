@@ -21,12 +21,15 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 from pathlib import Path
+from uuid import uuid4
 
 from . import oauth as credential_refresh
 from .config import Config, log
 from .constants import AUTHORING_DEFAULTS, CLAUDE_CMD, POLL
-from .github import GitHubError, _parse_retry_after
+from .github import GitHubError
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
@@ -44,12 +47,13 @@ QUOTA_TTL = {"codex": 600, "claude": 3600}
 # "refresh if older than this", shared across workers, rather than once per round.
 CLAUDE_USAGE_REFRESH_S = 20 * 60
 
-# Bound telemetry rechecks to fifteen minutes so a long Retry-After cannot hide renewed model
-# headroom after the cached sample expires. Shared polling bounds the account-wide request count.
+# Headerless failures use bounded backoff. An explicit Retry-After is authoritative for
+# telemetry requests; it does not prohibit model work under --ignore-quota.
 RATE_LIMIT_RECHECK_MAX_S = 15 * 60
-
-# The longest any usage endpoint's Retry-After is honored (_parse_retry_after caps at this too).
-RETRY_AFTER_MAX_S = 3600
+_TRANSIENT_USAGE_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
+# An implausible header or corrupt local deadline must not park unattended workers
+# indefinitely. Real usage-endpoint cooldowns up to one day are honored in full.
+USAGE_RETRY_AFTER_SANITY_S = 24 * 3600
 
 # This process's copy of every cooldown it started, keyed (cache dir, provider, account key) and holding
 # {until, wait, code}. The on-disk record is what other callers see; this keeps the protection when the
@@ -390,6 +394,9 @@ class Provider:
     # The usage endpoint answered HTTP 429 (or we are still in the cooldown one started). Set whether the
     # verdict came from a cached reading or not, so the latest fetch's outcome is never lost to the cache.
     rate_limited: bool = False
+    # A transient telemetry failure, not evidence that the model cannot serve work.
+    # Only --ignore-quota may proceed without a usable reading.
+    telemetry_unavailable: bool = False
 
 
 def _finite_num(x: object) -> bool:
@@ -736,21 +743,62 @@ def _tail_detail(out: str | None, limit: int = 120) -> str:
     return ": " + (tail if len(tail) <= limit else tail[: limit - 1] + "…")
 
 
-def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict, float | None]:
+class UsageTransportError(GitHubError):
+    """The usage service could not be reached; no quota or authentication verdict."""
+
+
+@dataclass
+class _UsageResponse:
+    code: int
+    payload: dict
+    retry_after: float | None
+    retry_after_raw: str | None = None
+    request_id: str | None = None
+
+    def __iter__(self):
+        # Preserve the three-value interface used by quota readers and endpoint fixtures.
+        return iter((self.code, self.payload, self.retry_after))
+
+
+def _usage_retry_after(raw: str | None) -> float | None:
+    """Unlike GitHub's retry policy, do not shorten a usage server's requested pause."""
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(raw).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) and seconds <= USAGE_RETRY_AFTER_SANITY_S else None
+
+
+def _usage_response(code: int, payload: dict, headers) -> _UsageResponse:
+    raw = headers.get("Retry-After")
+    request_id = headers.get("request-id") or headers.get("x-request-id")
+    return _UsageResponse(
+        code, payload, _usage_retry_after(raw), (raw or "")[:256] or None, (request_id or "")[:256] or None
+    )
+
+
+def _http_get_json(url: str, headers: dict, timeout: int = 15) -> _UsageResponse:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode()), None
+            return _usage_response(r.status, json.loads(r.read().decode()), r.headers)
     except urllib.error.HTTPError as e:
-        return e.code, {}, _parse_retry_after(e.headers.get("Retry-After"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
-        raise GitHubError(f"usage fetch failed: {e}") from e
+        return _usage_response(e.code, {}, e.headers)
+    except (urllib.error.URLError, TimeoutError, OSError, HTTPException) as e:
+        raise UsageTransportError(f"usage fetch failed: {e}") from e
+    except (json.JSONDecodeError, UnicodeError) as e:
+        raise GitHubError("usage response is not valid JSON") from e
 
 
 def _read_json_file(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeError):
         return None
 
 
@@ -760,8 +808,15 @@ def _cooldown_left(record: object) -> tuple[float, int | None]:
     if not isinstance(record, dict):
         return 0.0, None
     until, wait, code = record.get("until"), record.get("wait"), record.get("code")
-    if not (_finite_num(until) and _finite_num(wait) and 0 < wait <= RETRY_AFTER_MAX_S):
+    if not (_finite_num(until) and _finite_num(wait) and 0 < wait <= USAGE_RETRY_AFTER_SANITY_S):
         return 0.0, None  # corrupt: never let it park us
+    if (
+        not isinstance(code, int)
+        or isinstance(code, bool)
+        or code in (401, 403)
+        or not (code == 0 or 100 <= code <= 599)
+    ):
+        return 0.0, None
     # A wall clock stepped backwards makes the remainder look longer than the wait itself; that is still
     # a cooldown, just one we can only bound by its own length.
     left = min(until - time.time(), wait)
@@ -1181,6 +1236,102 @@ class Quota:
         suffix = f"-{self._fingerprint(fp) or 'none'}" if directory != self.cache_dir else ""
         return directory / f"quota-{provider}{suffix}.json"
 
+    def _fetch_usage(self, provider: str, url: str, headers: dict, fp: str | None):
+        from .quota_audit import record
+
+        self._usage_token_fps = getattr(self, "_usage_token_fps", {})
+        self._usage_token_fps[provider] = self._fingerprint(headers.get("Authorization", "").removeprefix("Bearer "))
+        cfg = getattr(self, "cfg", None)
+        state = getattr(cfg, "state", None)
+        directory = (Path(state).parent if state is not None else self.cache_dir) / "quota-requests"
+        entry = _read_json_file(self._raw_path(provider, fp))
+        at = entry.get("fetched_at") if isinstance(entry, dict) else None
+        metadata = dict(
+            request=uuid4().hex,
+            worker=getattr(cfg, "wid", None),
+            provider=provider,
+            credential_fp=self._fingerprint(fp),
+            cache_age_s=max(0, time.time() - at) if _finite_num(at) else None,
+        )
+        # These are actual attempts, not status reads. A killed request can retain a start
+        # without a finish. No raw URL, credential, request headers, or response body is recorded.
+        record(directory, event="request", **metadata)
+        start = time.monotonic()
+        try:
+            response = _http_get_json(url, headers)
+        except GitHubError as error:
+            record(
+                directory,
+                event="response",
+                duration_s=time.monotonic() - start,
+                error_type=type(error).__name__,
+                **metadata,
+            )
+            raise
+        code, _payload, retry_after = response
+        if getattr(response, "retry_after_raw", None) and retry_after is None:
+            log(f"{provider} quota: ignoring invalid or excessive Retry-After (over 24 hours); using bounded backoff")
+        record(
+            directory,
+            event="response",
+            duration_s=time.monotonic() - start,
+            status=code,
+            retry_after_s=retry_after,
+            retry_after_raw=getattr(response, "retry_after_raw", None),
+            server_request_id=getattr(response, "request_id", None),
+            **metadata,
+        )
+        # A subsequent telemetry outage must not erase a known credential rejection.
+        refusal = self._auth_refusal_path(provider, fp)
+        try:
+            if code in (401, 403):
+                refusal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _write_json_atomic(refusal, {"code": code})
+                self._raw_path(provider, fp).unlink(missing_ok=True)
+            elif code == 200:
+                refusal.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return response
+
+    def _auth_refusal_path(self, provider: str, fp: str | None) -> Path:
+        credential = getattr(self, "_usage_token_fps", {}).get(provider, fp)
+        return self._usage_dir(provider) / f"auth-refusal-{provider}-{self._fingerprint(credential) or 'none'}.json"
+
+    def _telemetry_failure(self, provider: str, fp: str | None, error: str, *, code=None, retry_after=None) -> Provider:
+        rejection = _read_json_file(self._auth_refusal_path(provider, fp))
+        if isinstance(rejection, dict) and rejection.get("code") in (401, 403):
+            return Provider(
+                provider, False, None, error=f"{provider} usage HTTP {rejection['code']} (credential rejected)"
+            )
+        # Old positive readings never authorize launches after expiry. An observed exhaustion
+        # remains a negative fact until THAT window resets, even if the ordinary TTL expired.
+        exhausted = []
+        entry = _read_json_file(self._raw_path(provider, fp))
+        if isinstance(entry, dict) and entry.get("fp") == fp:
+            at, payload = entry.get("fetched_at"), entry.get("payload")
+            if _finite_num(at) and at <= time.time() and isinstance(payload, dict):
+                if provider == "claude":
+                    previous, _ = self._from_cached_claude((payload, at))
+                else:
+                    previous = self._codex_from_payload(payload, at)
+                exhausted = [
+                    w
+                    for w in previous.windows
+                    if w.status == "exhausted" and _finite_num(w.resets_at) and w.resets_at > time.time()
+                ]
+        return Provider(
+            provider,
+            False,
+            None,
+            windows=exhausted,
+            error=error,
+            next_eligible=min((w.resets_at for w in exhausted), default=None),
+            retry_after=retry_after,
+            rate_limited=code == 429,
+            telemetry_unavailable=True,
+        )
+
     @contextmanager
     def _usage_lock(self, account: str, fp: str | None = None):
         directory = self._usage_dir("claude")
@@ -1297,24 +1448,27 @@ class Quota:
         return max(memory, disk, key=lambda left_code: left_code[0])
 
     def _start_cooldown(self, provider: str, key: str | None, code: int, retry_after: float | None) -> None:
-        """Hold off after an HTTP 429 for its Retry-After (else exponential backoff), at most
-        RATE_LIMIT_RECHECK_MAX_S; after any other status that sent a Retry-After, for that long.
+        """Honor a plausible Retry-After; headerless transient failures use bounded backoff.
         Never shortens a longer cooldown already running.
 
-        Never after a 401: that rejects the credential, which a wait does not fix, and a cooldown would
+        Never after a 401/403: that rejects the credential, which a wait does not fix, and a cooldown would
         let a cached reading taken under the rejected credential answer for it again."""
-        if code == 401:
+        if code in (401, 403):
             return
         path = self._cooldown_path(provider, key)
         mem = (str(self._usage_dir(provider)), provider, key or "")
         prior = _read_json_file(path) or _COOLDOWNS.get(mem) or {}
         failures = prior.get("failures", 0) if isinstance(prior, dict) else 0
         failures = min(failures, 6) if isinstance(failures, int) and failures >= 0 else 0
-        if code == 429:
+        if code in _TRANSIENT_USAGE_STATUSES or code == 0:  # 0 is a transport failure, not an HTTP status
             default = max(60, POLL) * 2**failures * random.uniform(1.0, 1.1)
-            wait = min(retry_after or default, RATE_LIMIT_RECHECK_MAX_S)
-        elif retry_after:
-            wait = min(retry_after, RETRY_AFTER_MAX_S)
+            wait = (
+                retry_after
+                if _finite_num(retry_after) and 0 < retry_after <= USAGE_RETRY_AFTER_SANITY_S
+                else min(default, RATE_LIMIT_RECHECK_MAX_S)
+            )
+        elif _finite_num(retry_after) and 0 < retry_after <= USAGE_RETRY_AFTER_SANITY_S:
+            wait = retry_after
         else:
             return
         if wait <= 0:
@@ -1344,14 +1498,16 @@ class Quota:
                 except OSError:
                     pass
 
-    def _cooling_provider(self, provider: str, left: float, code: int | None) -> Provider:
+    def _cooling_provider(self, provider: str, left: float, code: int | None, fp: str | None = None) -> Provider:
         """The verdict while a cooldown holds and no usable cached reading exists: the status that
         started it, and how long remains."""
-        err = f"{provider} usage HTTP {code or 429}"
+        err = f"{provider} usage HTTP {code or 429}" if code != 0 else f"{provider} usage service unreachable"
         if code == 429 and provider == "claude":
             err += " (usage endpoint rate-limited; cooling down)"
         else:
             err += " (cooling down)"
+        if code in _TRANSIENT_USAGE_STATUSES or code == 0:
+            return self._telemetry_failure(provider, fp, err, code=code, retry_after=left)
         return Provider(provider, False, None, error=err, retry_after=left, rate_limited=code == 429)
 
     def _clear_cooldown(self, provider: str, key: str | None) -> None:
@@ -1650,12 +1806,14 @@ class Quota:
         # Prefer the stable account id so a same-account token refresh keeps the cache; fall back to the
         # token itself when no id is available.
         fp = self._codex_account_id(auth) or self._fingerprint((auth.get("tokens") or {}).get("access_token"))
+        self._usage_token_fps = getattr(self, "_usage_token_fps", {})
+        self._usage_token_fps["codex"] = self._fingerprint((auth.get("tokens") or {}).get("access_token"))
         cached = self._cached_codex(fp)
         left, cooled_by = self._cooldown("codex", fp)
         if cached is not None and (left or not refresh):
             return replace(self._codex_from_payload(*cached), rate_limited=cooled_by == 429)
         if left:
-            return self._cooling_provider("codex", left, cooled_by)
+            return self._cooling_provider("codex", left, cooled_by, fp)
         tok = (auth.get("tokens") or {}).get("access_token")
         if not tok:
             return Provider("codex", False, None, error="no codex access_token")
@@ -1669,24 +1827,31 @@ class Quota:
         # the same expiry bug in miniature. Anchoring early can only expire the entry sooner than it must.
         observed_at = time.time()
         try:
-            code, payload, retry_after = _http_get_json(CODEX_USAGE_URL, headers)
+            code, payload, retry_after = self._fetch_usage("codex", CODEX_USAGE_URL, headers, fp)
         except GitHubError as e:
+            if isinstance(e, UsageTransportError):
+                self._start_cooldown("codex", fp, 0, None)
             # Re-read the entry rather than reusing the tuple from before the request: a usage fetch can
             # block for its whole timeout, and an entry that was live when we set out may have passed its
             # window's reset while we waited.
             still = self._cached_codex(fp)
             if still is not None:
                 return self._codex_from_payload(*still)
+            if isinstance(e, UsageTransportError):
+                return self._telemetry_failure("codex", fp, str(e), retry_after=self._cooldown("codex", fp)[0])
             return Provider("codex", False, None, error=str(e))
         # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
         # access token simply reads as unavailable until the operator's external refresher rotates it
         # and mirror_creds picks it up next cycle.
         if code != 200 or not payload:
             self._start_cooldown("codex", fp, code, retry_after)
-            still = self._cached_codex(fp) if code != 401 else None
+            retry_after = retry_after or self._cooldown("codex", fp)[0] or None
+            still = self._cached_codex(fp) if code not in (401, 403) else None
             if still is not None:
                 return replace(self._codex_from_payload(*still), rate_limited=code == 429)
             err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
+            if code in _TRANSIENT_USAGE_STATUSES:
+                return self._telemetry_failure("codex", fp, err, code=code, retry_after=retry_after)
             return Provider("codex", False, None, error=err, retry_after=retry_after, rate_limited=code == 429)
         self._clear_cooldown("codex", fp)
         # Cache ONLY a payload whose windows say when they roll, and only until the first of those. The
@@ -1925,11 +2090,14 @@ class Quota:
         self._forget_raw("claude")  # whatever we cached predates the request meant to change it
         if not ok:
             log(f"claude quota: bootstrap request failed ({detail}) — claude stays unavailable")
+            return self._reannotate(prov, windows, f"bootstrap failed: {detail}")
         return self.claude(renew=True)  # the fresh telemetry decides, including whether there is headroom to spend
 
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
     ) -> tuple[Provider, list[Reading] | None]:
+        self._usage_token_fps = getattr(self, "_usage_token_fps", {})
+        self._usage_token_fps["claude"] = self._fingerprint(tok)
         # Re-read under the fetch lock: a sibling may have fetched or received a Retry-After while
         # we waited. The lock covers the network call as well as the cache/cooldown publication.
         with self._usage_lock(account or fp or "none", fp) as acquired:
@@ -1964,20 +2132,26 @@ class Quota:
             if left or not refresh or reusable:
                 return replace(prov, rate_limited=cooled_by == 429), readings
         if left:
-            return self._cooling_provider("claude", left, cooled_by), None
+            return self._cooling_provider("claude", left, cooled_by, fp), None
         if not tok:
             return Provider("claude", False, None, error="no claude accessToken"), None
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
         try:
-            code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
+            code, payload, retry_after = self._fetch_usage("claude", CLAUDE_USAGE_URL, headers, fp)
             observed_at = time.time()  # ONE instant for this response: parsed, paced and stored against it
         except GitHubError as e:
+            if isinstance(e, UsageTransportError):
+                self._start_cooldown("claude", account, 0, None)
             # Re-read rather than reusing the tuple from before the request: a usage fetch can block for
             # its whole timeout, and an entry that was live when we set out may have passed a reset it
             # describes while we waited.
             still = self._cached_claude(fp)
             if still is not None:
                 return self._from_cached_claude(still)
+            if isinstance(e, UsageTransportError):
+                return self._telemetry_failure(
+                    "claude", fp, str(e), retry_after=self._cooldown("claude", account)[0]
+                ), None
             return Provider("claude", False, None, error=str(e)), None
         # A 401 here is the endpoint refusing the access token. `claude()` answers it by rotating the
         # credential once and re-reading, where the token is this worker's to rotate — see
@@ -1986,13 +2160,14 @@ class Quota:
         # server error are different problems with different fixes, and none of them is "usage unknown".
         if code != 200 or not payload:
             self._start_cooldown("claude", account, code, retry_after)
-            if code == 401:
+            retry_after = retry_after or self._cooldown("claude", account)[0] or None
+            if code in (401, 403):
                 # A rejected token must not get its old permissive sample back on the next read.
                 try:
                     self._raw_path("claude", fp).unlink(missing_ok=True)
                 except OSError:
                     pass
-            still = self._cached_claude(fp) if code != 401 else None
+            still = self._cached_claude(fp) if code not in (401, 403) else None
             if still is not None:
                 prov, readings = self._from_cached_claude(still)
                 return replace(prov, rate_limited=code == 429), readings
@@ -2003,6 +2178,8 @@ class Quota:
                 err += " (usage endpoint rate-limited)"
             elif code == 200:
                 err = "claude usage response empty"
+            if code in _TRANSIENT_USAGE_STATUSES:
+                return self._telemetry_failure("claude", fp, err, code=code, retry_after=retry_after), None
             return Provider("claude", False, None, error=err, retry_after=retry_after, rate_limited=code == 429), None
         # A response that is not a JSON object is not a quota verdict — and .get() on it would raise
         # inside the pacer. Name it and fail closed.

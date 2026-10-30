@@ -1133,7 +1133,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if opts.claude_bootstrap and opts.work_model == "claude":
         prov = Quota(w.cfg).authorize_claude_launch()
         if not prov.available:
-            raise NoProgress(f"claude: {prov.error or _unavail_reason(prov)[1]} — not launching this round")
+            from .loop import _ignore_quota_verdict
+
+            if not (opts.ignore_quota and _ignore_quota_verdict(None, prov) == "telemetry-unavailable"):
+                raise NoProgress(f"claude: {prov.error or _unavail_reason(prov)[1]} — not launching this round")
     fn = {
         "review": do_review,
         "fix": do_fix,
