@@ -819,12 +819,17 @@ class Retention(unittest.TestCase):
     def test_same_device_bind_mount_and_unavailable_mount_evidence_are_protected(self):
         cache = self.cache()
         root = self.checkout / ".lake"
-        for mounts in ([root / "build"], None):
-            report = retention.fresh_report()
-            with patch.object(retention, "mount_points", return_value=mounts):
-                retention.remove(root, self.checkout.parent.parent, report)
-            self.assertTrue(cache.exists())
-            self.assertTrue(report["protected"])
+        for platform in ("linux", "darwin"):
+            for mounts in ([root / "build"], None):
+                report = retention.fresh_report()
+                with (
+                    patch.object(sys, "platform", platform),
+                    patch.object(work_recovery, "live_users", return_value=[]),
+                    patch.object(retention, "mount_points", return_value=mounts),
+                ):
+                    retention.remove(root, self.checkout.parent.parent, report)
+                self.assertTrue(cache.exists())
+                self.assertTrue(report["protected"])
 
     def test_replacement_does_not_bypass_protection_on_existing_deletion(self):
         cache = self.cache()
@@ -926,7 +931,11 @@ class Retention(unittest.TestCase):
         login_cache = self.cfg.home / ".cache/lake/operator-artifact"
         login_cache.parent.mkdir(parents=True)
         login_cache.write_text("operator cache")
-        with patch.object(sys, "platform", "darwin"):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(work_recovery, "_darwin_process_references", return_value=[]),
+            patch.object(retention, "mount_points", return_value=[Path("/")]),
+        ):
             retention.recycle(self.cfg, now=self.clock)
         self.assertFalse(cache.exists())
         self.assertEqual(credentials.read_text(), "credentials")

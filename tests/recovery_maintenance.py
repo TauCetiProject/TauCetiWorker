@@ -14,12 +14,14 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from work_recovery import allow_cleanup, fixture, git, reconstruct, snapshot_tree
 
 from tauceti_worker import recovery_index as index
 from tauceti_worker import recovery_maintenance as maintenance
+from tauceti_worker import usage_lifecycle
 from tauceti_worker import work_recovery as wr
 
 
@@ -258,9 +260,200 @@ class RecoveryMaintenance(unittest.TestCase):
         with patch.object(wr, "process_references", return_value=None):
             self.assertTrue(wr.live_users(tree))
             with patch.object(sys, "platform", "darwin"):
-                self.assertEqual(wr.live_users(tree), [])
+                self.assertTrue(wr.live_users(tree))
         with patch.object(wr, "process_references", return_value=[]):
             self.assertEqual(wr.live_users(tree), [])
+
+    def test_darwin_process_references_protect_cwd_files_and_session(self):
+        class ProcessError(Exception):
+            pass
+
+        class Gone(ProcessError):
+            pass
+
+        def process(pid, cwd="/", files=()):
+            value = Mock(pid=pid)
+            value.status.return_value = "running"
+            value.uids.return_value = SimpleNamespace(real=os.getuid(), effective=os.geteuid())
+            value.cwd.return_value = cwd
+            value.open_files.return_value = [SimpleNamespace(path=path) for path in files]
+            return value
+
+        tree = self.root / "retained"
+        own = process(os.getpid(), str(tree))
+        own.parents.return_value = [SimpleNamespace(pid=101)]
+        parent = process(101, str(tree))
+        cwd = process(102, str(tree / "nested"))
+        opened = process(103, "/", [str(tree / "Draft.lean")])
+        member = process(104)
+        sibling = process(105, str(tree) + "-other")
+        foreign = process(106)
+        foreign.uids.return_value = SimpleNamespace(real=os.getuid() + 1, effective=os.geteuid() + 1)
+        zombie = process(107, str(tree))
+        zombie.status.return_value = "zombie"
+        procs = {p.pid: p for p in (own, parent, cwd, opened, member, sibling, foreign, zombie)}
+
+        def lookup(pid=None):
+            if pid == 108:
+                raise Gone()
+            return procs[os.getpid() if pid is None else pid]
+
+        api = SimpleNamespace(
+            Process=Mock(side_effect=lookup),
+            pids=lambda: [*procs, 108],
+            Error=ProcessError,
+            NoSuchProcess=Gone,
+            STATUS_ZOMBIE="zombie",
+            STATUS_DEAD="dead",
+        )
+        with (
+            patch.dict(sys.modules, psutil=api),
+            patch.object(sys, "platform", "darwin"),
+            patch.object(os, "geteuid", return_value=501),
+            patch.object(os, "getuid", return_value=501),
+            patch.object(os, "getsid", side_effect=lambda pid: 104 if pid == 104 else 1),
+            patch.object(Path, "read_text", side_effect=AssertionError("Darwin must not read procfs")),
+        ):
+            # Fixture UIDs were initialized before the host UID mocks.
+            for p in (cwd, opened, member, sibling):
+                p.uids.return_value = SimpleNamespace(real=501, effective=501)
+            foreign.uids.return_value = SimpleNamespace(real=502, effective=502)
+            refs = wr.process_references()
+            self.assertEqual(wr.referenced_users(tree, refs), ["102 (process)", "103 (process)"])
+            self.assertIn("104 (owner session)", wr.referenced_users(tree, refs, session=104))
+            parent.cwd.assert_not_called()
+            foreign.cwd.assert_not_called()
+            cwd.open_files.side_effect = ProcessError("fixture inaccessible own process")
+            self.assertIsNone(wr.process_references())
+            self.assertTrue(wr.live_users(tree))
+
+    def test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot(self):
+        owner = dict(pid=123, session=123, start="1:2", boot="fixture boot")
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "darwin_boot", return_value=owner["boot"]),
+            patch.object(usage_lifecycle, "darwin_process", side_effect=ProcessLookupError),
+        ):
+            self.assertEqual(wr.owner_session(owner), 123)
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "darwin_boot", return_value=owner["boot"]),
+            patch.object(usage_lifecycle, "darwin_process", return_value=(dict(owner, start="3:4"), 2)),
+            patch.object(os, "getsid", return_value=123),
+        ):
+            self.assertIsNone(wr.owner_session(owner))
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "darwin_boot", return_value="new boot"),
+        ):
+            self.assertIsNone(wr.owner_session(owner))
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "alive", return_value=True) as alive,
+        ):
+            self.assertFalse(wr.owner_stopped(owner))
+            alive.assert_called_once_with({key: owner[key] for key in ("pid", "start", "boot")})
+
+    def test_darwin_cleanup_and_record_retirement_without_procfs(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(tree)], check=True)
+        cache = tree / ".lake/generated"
+        cache.parent.mkdir()
+        cache.write_text("disposable cache")
+        wr.atomic_json(record / "cache-use.json", dict(generation="fixture stopped use"))
+        maintenance.defer_caches(self.cfg.state, record)
+        api = SimpleNamespace(disk_partitions=Mock(return_value=[SimpleNamespace(mountpoint="/")]))
+        read_text = Path.read_text
+
+        def read_without_procfs(path, *args, **kwargs):
+            if path.is_relative_to("/proc"):
+                raise AssertionError("Darwin must not read procfs")
+            return read_text(path, *args, **kwargs)
+
+        with (
+            patch.dict(sys.modules, psutil=api),
+            patch.object(sys, "platform", "darwin"),
+            patch.object(wr, "owner_stopped", return_value=True),
+            patch.object(wr, "_darwin_process_references", return_value=[]),
+            patch.object(Path, "read_text", read_without_procfs),
+        ):
+            checks = maintenance.Checks(self.cfg.state.parent)
+            self.assertEqual(checks.users(tree, None, locked=True), ([], True))
+            token = maintenance._CHECKS.set(checks)
+            try:
+                self.assertIsNone(maintenance._safe(self.cfg.state, tree, {"process": {}}, locked=True))
+            finally:
+                maintenance._CHECKS.reset(token)
+        # Exercise real cache eviction and the separate terminal-record path.
+        with (
+            patch.dict(sys.modules, psutil=api),
+            patch.object(sys, "platform", "darwin"),
+            patch.object(wr, "owner_stopped", return_value=True),
+            patch.object(wr, "_darwin_process_references", return_value=[]),
+        ):
+            self.tick()
+            self.assertFalse(cache.exists())
+            maintenance.atomic_json(record / "recovery.json", dict(state="obsolete"))
+            api.disk_partitions.return_value = [SimpleNamespace(mountpoint=str(tree / "mounted"))]
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+            api.disk_partitions.side_effect = OSError("fixture unavailable mounts")
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+            api.disk_partitions.side_effect = None
+            api.disk_partitions.return_value = [SimpleNamespace(mountpoint="/")]
+
+            # A native process scan slower than the slice must finish, rather
+            # than restarting retirement forever at its next charged operation.
+            def slow_scan():
+                time.sleep(0.15)
+                return []
+
+            token = wr._WORK.set(wr.Work(seconds=0.1))
+            try:
+                with patch.object(wr, "_darwin_process_references", slow_scan):
+                    self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            finally:
+                wr._WORK.reset(token)
+        api.disk_partitions.assert_called_with(all=True)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS process observations")
+    def test_native_darwin_process_references_and_owner_birth(self):
+        import select
+
+        import psutil
+
+        tree = self.root / "native-checkout"
+        tree.mkdir()
+        source = tree / "Draft.lean"
+        source.write_text("keep live source")
+        code = (
+            "import json, sys, time; from tauceti_worker.work_recovery import process_owner; "
+            "held = open(sys.argv[1]); print(json.dumps(process_owner()), flush=True); time.sleep(30)"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", code, str(source)],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        ) as child:
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0], "fixture child did not start")
+                owner = json.loads(child.stdout.readline())
+                self.assertEqual(owner["session"], child.pid)
+                self.assertFalse(wr.owner_stopped(owner))
+                # Constrain discovery to this fixture; use real native calls for it.
+                with patch.object(psutil, "pids", return_value=[child.pid]):
+                    self.assertTrue(wr.live_users(tree))  # Only its open file is inside the tree.
+                    self.assertEqual(wr.owner_session(owner), child.pid)
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+        self.assertTrue(wr.owner_stopped(owner))
+        with patch.object(psutil, "pids", return_value=[child.pid]):
+            self.assertEqual(wr.live_users(tree), [])
+        self.assertTrue(maintenance.retention.mount_points())
 
     def test_cache_reuse_during_discovery_withholds_only_that_eviction(self):
         self.dirty()

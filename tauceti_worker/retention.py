@@ -101,15 +101,24 @@ def remove(path, root, report, **kwargs):
 
 
 def mount_points():
+    """All visible mounts, including pseudo filesystems; None means unavailable evidence."""
     try:
+        if sys.platform == "darwin":
+            import psutil
+
+            return [Path(item.mountpoint) for item in psutil.disk_partitions(all=True)] or None
+        if sys.platform != "linux":
+            return None
 
         def unescape(value):
             for escaped, literal in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
                 value = value.replace(escaped, literal)
             return value
 
-        return [Path(unescape(line.split()[4])) for line in Path("/proc/self/mountinfo").read_text().splitlines()]
-    except OSError:
+        return [
+            Path(unescape(line.split()[4])) for line in Path("/proc/self/mountinfo").read_text().splitlines()
+        ] or None
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -123,9 +132,7 @@ def _remove(path, root, report, *, dry=False, check_users=True, opened=None, mou
     in_use = ((info.st_dev, info.st_ino) in opened) if opened is not None else check_users and live_users(path)
     if mounts is ...:
         mounts = mount_points()
-    mounted = (mounts is None and sys.platform == "linux") or any(
-        point == path or point.is_relative_to(path) for point in mounts or ()
-    )
+    mounted = mounts is None or any(point == path or point.is_relative_to(path) for point in mounts or ())
     if mounted or path.is_mount() or in_use:
         note(report, "protected", str(path))
         return

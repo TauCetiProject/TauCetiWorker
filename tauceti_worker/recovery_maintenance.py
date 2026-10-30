@@ -12,7 +12,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
@@ -22,7 +21,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import recovery_index
+from . import recovery_index, retention
 from .runtime_status import atomic_json, read_json
 
 CONSUMER_STATES = (
@@ -108,7 +107,7 @@ class Checks:
         with contextlib.suppress(OSError):
             self.references = wr.process_references()
         with contextlib.suppress(OSError):
-            self.mounts = Path("/proc/self/mountinfo").read_text()
+            self.mounts = retention.mount_points()
 
     def users(self, tree, session, *, locked=False):
         from . import work_recovery as wr
@@ -294,22 +293,10 @@ def _safe_once(state, tree, owner, *, locked=False):
         return "await-owner"
     if _referenced(state, tree):
         return "await-verification-reference"
-    session = birth.get("session")
-    if session is not None:
-        if not isinstance(session, int) or session <= 0:
-            return "await-owner"
-        try:
-            if birth["boot"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
-                session = None
-            else:
-                try:
-                    fields = Path(f"/proc/{session}/stat").read_text().rsplit(")", 1)[1].split()
-                    if int(fields[3]) == session and fields[19] != birth["start"]:
-                        session = None  # a new session reused the old leader's PID
-                except (FileNotFoundError, ProcessLookupError):
-                    pass
-        except (OSError, ValueError, IndexError):
-            return "await-owner"
+    try:
+        session = wr.owner_session(birth)
+    except (OSError, ValueError, KeyError, IndexError):
+        return "await-owner"
     if tree.is_symlink():
         return "await-live-users"
     checks = _CHECKS.get()
@@ -323,14 +310,13 @@ def _safe_once(state, tree, owner, *, locked=False):
     # Protect visible mounts, including bind mounts on the same device. An unavailable
     # mount table withholds this candidate, without affecting work admission.
     try:
-        raw = checks.mounts if shared else Path("/proc/self/mountinfo").read_text()
-        if raw is None:
+        mounts = checks.mounts if shared else retention.mount_points()
+        if mounts is None:
             return "await-mount-evidence"
-        wr._charge(read=len(raw))
-        target = os.path.realpath(tree)
-        for line in raw.splitlines():
-            mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
-            if mount == target or mount.startswith(target + "/"):
+        wr._charge(entries=len(mounts))
+        target = Path(os.path.realpath(tree))
+        for mount in mounts:
+            if mount == target or mount.is_relative_to(target):
                 return "await-mount-lease"
     except (OSError, IndexError):
         return "await-mount-evidence"
@@ -1328,20 +1314,22 @@ def discard_record(state, record):
             return False
         # An already-running verifier may still use this tree after the consumer
         # finishes. It can finish; the next activity tick retries disposal.
-        if (record / "checkout").is_dir() and wr.live_users(record / "checkout"):
-            return False
-        # Same-device bind mounts need protection too; the bounded remover cannot
-        # distinguish them from ordinary directories using inode/device alone.
-        try:
-            mounts = Path("/proc/self/mountinfo").read_text()
-            wr._charge(read=len(mounts))
-            target = str(record.resolve())
-            for line in mounts.splitlines():
-                mount = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), line.split()[4])
-                if mount == target or mount.startswith(target + "/"):
+        with completed_check():
+            if (record / "checkout").is_dir() and wr.live_users(record / "checkout"):
+                return False
+            # Same-device bind mounts need protection too; the bounded remover cannot
+            # distinguish them from ordinary directories using inode/device alone.
+            try:
+                mounts = retention.mount_points()
+                if mounts is None:
                     return False
-        except (OSError, IndexError):
-            return False
+                wr._charge(entries=len(mounts))
+                target = record.resolve()
+                for mount in mounts:
+                    if mount == target or mount.is_relative_to(target):
+                        return False
+            except (OSError, IndexError):
+                return False
         manifest = _metadata(record / "manifest.json")
         directory = state / "recovery-cleanup" / "discarded"
         directory.mkdir(parents=True, exist_ok=True)
