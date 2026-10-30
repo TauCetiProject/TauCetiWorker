@@ -155,6 +155,67 @@ class RecoveryMaintenance(unittest.TestCase):
         allow_cleanup(self.cfg, self.co)
         return tree
 
+    def test_slow_safety_finishes_and_reclaims_cache_before_yielding(self):
+        self.dirty()
+        cache = self.co / ".lake" / "generated"
+        cache.parent.mkdir()
+        cache.write_bytes(b"artifact" * 100)
+        tree = self.retained()
+
+        def slow_users(*args, **kwargs):
+            time.sleep(0.3)  # Longer than the actual production scheduling slice.
+            return []
+
+        with patch.object(wr, "live_users", slow_users), patch.object(wr, "process_references", return_value=[]):
+            report = wr.housekeep(self.cfg.state.parent)
+        self.assertGreater(report["removed_bytes"], 0)
+        self.assertFalse((tree / ".lake").exists())
+        self.assertGreater(report["safety_seconds"], 0.25)
+
+    def test_shared_discovery_respects_busy_users_and_changed_generation(self):
+        state = self.cfg.state
+        trees = []
+        for name in ("first", "busy", "last"):
+            record = state / "recovery" / name
+            checkout = record / "checkout"
+            checkout.mkdir(parents=True)
+            wr.atomic_json(record / "cache-use.json", dict(generation="old"))
+            trees.append(checkout)
+        checks = maintenance.Checks(state.parent)
+        references = [("123", None, "123 (verifier)", [str(trees[1])])]
+        with patch.object(wr, "process_references", return_value=references) as discovery:
+            self.assertEqual(checks.users(trees[0], None, locked=True), ([], True))
+            self.assertTrue(checks.users(trees[1], None, locked=True)[0])
+            self.assertEqual(checks.users(trees[2], None, locked=True), ([], True))
+            self.assertEqual(discovery.call_count, 1)
+        wr.atomic_json(trees[2].parent / "cache-use.json", dict(generation="new invocation"))
+        with patch.object(wr, "live_users", return_value=["new verifier"]) as fresh:
+            users, shared = checks.users(trees[2], None, locked=True)
+        self.assertEqual(users, ["new verifier"])
+        self.assertFalse(shared)
+        fresh.assert_called_once()
+
+    def test_cache_reuse_during_discovery_withholds_only_that_eviction(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(tree)], check=True)
+        (tree / ".lake").mkdir()
+        (tree / ".lake/generated").write_text("keep new invocation cache")
+        maintenance.defer_caches(self.cfg.state, record)
+        path = next((self.cfg.state / "recovery-cleanup/cache-roots").glob("*.json"))
+        registry = wr.read_json(path) | {"registry": str(path)}
+
+        def reuse(*args, **kwargs):
+            wr.atomic_json(record / "cache-use.json", dict(generation="new invocation"))
+            return None
+
+        observation = {}
+        with patch.object(maintenance, "_safe", reuse):
+            maintenance._cleanup_cache_tree(self.cfg.state, tree, registry, wr.Work(), observation)
+        self.assertEqual(observation["next_action"], "retry-changed-cache")
+        self.assertTrue((tree / ".lake/generated").exists())
+
     def test_warm_lookup_independent_of_history(self):
         self.dirty()
         # First make a valid historical descriptor with a relatively large archive.

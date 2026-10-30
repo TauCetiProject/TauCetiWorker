@@ -574,8 +574,8 @@ class Retention(unittest.TestCase):
         atomic_json(sidecar, dict(pr=42, round_id="old-round", work="fix", process=dead))
         os.utime(retained, (0, 0))
         retention.sweep(now=self.clock)
-        self.assertTrue(retained.exists())  # storage timer only registers the retained root
-        work_recovery.housekeep(self.state.parent, seconds=5, entries=50000)
+        # The existing collector now owns retained work too, without waiting for
+        # the activity preparer's small foreground allowance.
         self.assertFalse(retained.exists())
         self.assertFalse(sidecar.exists())
         [record] = list(work_recovery.records(self.state.parent))

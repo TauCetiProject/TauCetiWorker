@@ -418,6 +418,18 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
         # and deletion cursors instead of the activity preparer's tiny foreground slice.
         if not dry:
             try:
+                # Retained trees need the existing background collector too;
+                # activity preparation only inventories and requests this work.
+                report["retained_cleanup"] = recovery_maintenance.prepare(
+                    worker_state_root().resolve(),
+                    seconds=30,
+                    entries=262144,
+                    bytes=1024**3,
+                    removal_bytes=32 * 1024**3,
+                )
+            except Exception as error:
+                note(report, "errors", f"retained cache cleanup: {error}")
+            try:
                 trash = recovery_maintenance.collect_discarded(worker_state_root().resolve())
                 report["recovery_trash"] = trash
                 for error in trash.get("errors", []):
