@@ -356,6 +356,9 @@ def test_cli_preserves_soft_handoff_without_granting_outage_permission(root):
         with (
             patch("tauceti_worker.security_audit.require_admin"),
             patch("tauceti_worker.github_outbox.drain", return_value=[]),
+            # This fixture mocks the round; installed agent CLIs are unrelated
+            # to whether the CLI preserves the operator's pacing permission.
+            patch.object(cli, "_have", return_value=True),
             patch.object(cli, "api_mode", return_value=False),
             patch.object(loop, "choose_model", return_value=(None, {"claude": status})),
             patch.dict(

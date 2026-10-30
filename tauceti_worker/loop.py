@@ -33,6 +33,7 @@ from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
 from .github_state import enabled as github_state_enabled
 from .quota import Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
+from .quota_wait import QuotaWait
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
@@ -117,6 +118,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     recovery_probe_at = 0.0
     collision_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
+    quota_wait = QuotaWait(cfg, agent)
 
     def terminate(_signum, _frame) -> None:
         # run_round_subprocess catches KeyboardInterrupt and tears down the round's process
@@ -186,7 +188,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 # model refusals stop the round and use the existing no-progress backoff.
                 if agent == "auto":
                     raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
-                _chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True)
+                _chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True, _wait=quota_wait)
                 prov = snap.get(agent)
                 verdict = _ignore_quota_verdict(_chosen, prov)
                 # An unopened window is the one hard block --ignore-quota may still clear, because the
@@ -196,6 +198,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 if verdict == "wait":
                     why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
                     nap = _recheck_in(prov, time.time())
+                    if quota_wait.deadlines:
+                        nap = max(0, math.ceil(quota_wait.recheck_at() - time.time()))
                     # A loop DOES wait this out, so the wording stays — but a rejected credential is not
                     # something waiting fixes, and an unattended loop can poll on one indefinitely, so
                     # name the command that ends it here too.
@@ -204,7 +208,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                         f"block; sleeping {nap}s{_credential_hint(agent, prov)}"
                     )
                     report_runtime("waiting-quota", detail=why, next_action_at=time.time() + nap)
-                    time.sleep(nap)
+                    _wait_for_quota(quota_wait, nap, quota_cmd)
                     continue
                 if verdict == "over-pace":
                     log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
@@ -212,7 +216,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     log(f"quota: {agent} usage telemetry temporarily unavailable; --ignore-quota set — attempting work")
                 model = agent
             else:
-                model, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True)
+                model, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True, _wait=quota_wait)
                 if model is None and claude_pending_init(snap):
                     model, pending_init = "claude", True
                 if model is None:
@@ -225,14 +229,17 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     # well before its reset, so a long wait sleeps to the line, not past it.
                     now = time.time()
                     nap = min((_recheck_in(p, now) for p in snap.values()), default=POLL)
+                    if quota_wait.deadlines:
+                        nap = max(0, math.ceil(quota_wait.recheck_at() - now))
                     # Neither destination renders Rich markup: log() writes to stderr and a file, and a
                     # runtime-status detail is read back as data.
                     waiting = _wait_quota_line(snap, markup=False)
                     log(f"quota: {waiting} — sleeping {nap}s")
                     report_runtime("waiting-quota", detail=waiting, next_action_at=time.time() + nap)
-                    time.sleep(nap)
+                    _wait_for_quota(quota_wait, nap, quota_cmd)
                     continue
 
+            quota_wait.reset()
             # Mirrored discovery owns a separate read quota. Only a recorded
             # exhaustion of direct REST should pause a mirrored worker: fresh
             # dispatch reads and publication still need that credential. Unknown
@@ -475,7 +482,13 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
 
 
 def choose_model(
-    cfg: Config, agent: str, quota_cmd: str | None, *, refresh: bool = False, renew: bool = False
+    cfg: Config,
+    agent: str,
+    quota_cmd: str | None,
+    *,
+    refresh: bool = False,
+    renew: bool = False,
+    _wait: QuotaWait | None = None,
 ) -> tuple[str | None, dict]:
     """Decide which model to run now. With --quota-cmd / TAUCETI_QUOTA_CMD set, consult that external
     command instead of the built-in pacer (the escape hatch for e.g. a multi-account scheme): run
@@ -494,7 +507,21 @@ def choose_model(
         out = (r.stdout or "").split()
         model = out[0] if (r.returncode == 0 and out) else None
         return (model or None), {"quota-cmd": Provider("quota-cmd", bool(model), model)}
-    return Quota(cfg).choose(None if agent == "auto" else agent, refresh=refresh, renew=renew)
+    quota = Quota(cfg)
+    baseline, options = _wait.prepare(quota) if _wait else ({}, {})
+    result = quota.choose(None if agent == "auto" else agent, refresh=refresh, renew=renew, **options)
+    if _wait:
+        _wait.selected(quota, result[1], baseline, _recheck_in)
+    return result
+
+
+def _wait_for_quota(wait: QuotaWait, nap: float, quota_cmd: str | None):
+    if quota_cmd or not wait.deadlines:
+        time.sleep(nap)
+    else:
+        # Keep the manager's actual retry timestamp; local checks do not move it.
+        report_runtime(next_action_at=wait.recheck_at())
+        wait.wait()
 
 
 def _credential_hint(agent: str, prov: Provider | None) -> str:

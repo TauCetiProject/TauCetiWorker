@@ -117,6 +117,7 @@ RUN_STDLIB=(
   quota_auto_refresh.py
   quota_cache_fp.py
   quota_loop_refresh.py
+  quota_wakeups.py
   quota_shared_usage.py
   rebase_handoff.py
   scoped_repair_route.py

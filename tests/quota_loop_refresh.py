@@ -220,7 +220,7 @@ saved_round = tc.loop.run_round_subprocess
 saved_sleep = tc.loop.time.sleep
 
 
-def choose(_cfg, agent, _cmd, *, refresh=False, renew=False):
+def choose(_cfg, agent, _cmd, *, refresh=False, renew=False, _wait=None):
     driver_calls.append((agent, refresh, renew))
     return "claude", {"claude": tc.Provider("claude", True, "opus")}
 
