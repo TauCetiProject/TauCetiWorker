@@ -73,7 +73,7 @@ class Checks:
     """Pass-local discovery; negative evidence is reused only under existing recovery ownership."""
 
     def __init__(self, base):
-        self.base = base
+        self.base = base.resolve()
         self.references = None
         self.mounts = None
         self.generations = {}
@@ -91,6 +91,13 @@ class Checks:
                     if record.is_symlink() or not record.is_dir():
                         continue
                     generation = read_json(record / "cache-use.json")
+                    if not isinstance(generation.get("generation"), str) or not generation["generation"]:
+                        continue  # missing/unreadable generation requires the ordinary fresh check
+                    registry = read_json(state / "recovery-cleanup/cache-roots" / f"{_name(record)}.json")
+                    if registry.get("generation", {}).get("cache_use") != generation[
+                        "generation"
+                    ] or not wr.owner_stopped(registry.get("owner", {}).get("process")):
+                        continue  # a run active during discovery can still spawn late children
                     for tree in record.iterdir():
                         if tree.name == "checkout" or tree.name.startswith(("restore-", "interrupted-restore-")):
                             info = tree.lstat()
@@ -223,7 +230,7 @@ def _cleanup_cache_tree(state, tree, registry, work, observation):
         ]:
             job["next_action"] = "retry-changed-cache"
             return
-        if _evict_caches(tree, job, work):
+        if _evict_caches(tree, job, work, batch_seconds=0.25):
             root.setdefault("completed", {})[tree.name] = identity
             atomic_json(path, root)
             job_path.unlink(missing_ok=True)
@@ -520,7 +527,7 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
         reader.close()
 
 
-def _evict_caches(tree, job, work):
+def _evict_caches(tree, job, work, *, batch_seconds=None):
     """Only known top-level, untracked caches. Unknown Git metadata never permits eviction."""
     from . import work_recovery as wr
 
@@ -540,7 +547,21 @@ def _evict_caches(tree, job, work):
         jobs = job.setdefault("caches", {})
         info = cache.stat()
         subjob = jobs.setdefault(name, dict(tree_identity=[info.st_dev, info.st_ino], stack=[""]))
-        if _remove(cache, subjob, work):
+        deadline = work.deadline
+        started = time.monotonic()
+        if batch_seconds is not None:
+            work.deadline = min(deadline, started + max(0, batch_seconds))
+        try:
+            removed = _remove(cache, subjob, work)
+        except wr.BudgetExhausted:
+            if batch_seconds is None:
+                raise
+            return False  # release recovery.lock; the durable cursor resumes next pass
+        finally:
+            work.deadline = deadline
+            if batch_seconds is not None:
+                batch_seconds -= time.monotonic() - started
+        if removed:
             jobs.pop(name, None)
         else:
             return False
@@ -549,9 +570,11 @@ def _evict_caches(tree, job, work):
 
 def _promote(job, work):
     """One occasionally larger source candidate, with persisted backoff and hard ceilings."""
+    if time.time() < job.get("retry_at", 0):
+        return False
     if not work.adaptive or not job.get("allowance_level"):
         return True
-    if time.time() < job.get("retry_at", 0) or work.promoted:
+    if work.promoted:
         return False
     level = min(job["allowance_level"], 6)
     work.seconds = time.monotonic() - work.started + min(30, 0.25 * 4**level)
@@ -766,9 +789,7 @@ def _cleanup(state, tree, root, work, observation=None):
             _park(job, tree, sidecar)
             return
         if isinstance(error, wr.BudgetExhausted):
-            if work.adaptive and (
-                saving_source or validating_source or (job["phase"] == "save" and not work.removed_bytes)
-            ):
+            if saving_source or validating_source or (job["phase"] == "save" and not work.removed_bytes):
                 job["allowance_level"] = min(6, job.get("allowance_level", 0) + 1)
                 job["retry_at"] = time.time() + min(1800, 60 * 2 ** (job["allowance_level"] - 1))
             raise
@@ -840,7 +861,8 @@ class Sweep:
     @staticmethod
     def tree_attempt(state, entry, category):
         directory = "cache-jobs" if category == "cache" else "jobs"
-        path = state / "recovery-cleanup" / directory / f"{_name(Path(entry.path))}.json"
+        tree = Path(entry.path.removesuffix(".deleting")) if category != "cache" else Path(entry.path)
+        path = state / "recovery-cleanup" / directory / f"{_name(tree)}.json"
         try:
             return path.stat().st_mtime_ns
         except OSError:
@@ -911,11 +933,11 @@ class Sweep:
         from . import work_recovery as wr
 
         row = self.rows[state]
-        if not self.cleanup and kind in {"discarded", "tree", "cache", "cache-entry", "retained-entry"}:
+        if not self.cleanup and kind == "discarded":
             if path.is_dir() and not path.is_symlink():
                 self.cleanup_pending = True
                 row["cleanup_backlog"] += 1
-                job = _read_job(_job_path(state, path)) if kind in {"tree", "retained-entry"} else {}
+                job = {}
                 action = job.get("next_action", "queued-for-collector")
                 row["cleanup_actions"][action] = row["cleanup_actions"].get(action, 0) + 1
                 oldest = job.get("created_at", path.stat().st_mtime)
@@ -980,6 +1002,19 @@ class Sweep:
                 kind = "cache"
             else:
                 kind = "tree"
+        if not self.cleanup and kind in {"tree", "cache"}:
+            info = path.stat()
+            if kind == "cache" and root.get("completed", {}).get(path.name) == [info.st_dev, info.st_ino]:
+                return
+            self.cleanup_pending = True
+            row["cleanup_backlog"] += 1
+            original = path.with_name(path.name.removesuffix(".deleting"))
+            job = _read_job(_job_path(state, original)) if kind == "tree" else {}
+            action = job.get("next_action", "queued-for-collector")
+            row["cleanup_actions"][action] = row["cleanup_actions"].get(action, 0) + 1
+            oldest = job.get("created_at", info.st_mtime)
+            row["cleanup_oldest_at"] = min(row["cleanup_oldest_at"] or oldest, oldest)
+            return
         if kind == "cleanup-finished":
             previous = read_json(state / "recovery-prepared.json")
             previous.update({key: value for key, value in row.items() if key.startswith("cleanup_")})

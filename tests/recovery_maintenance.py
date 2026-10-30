@@ -180,10 +180,17 @@ class RecoveryMaintenance(unittest.TestCase):
             checkout = record / "checkout"
             checkout.mkdir(parents=True)
             wr.atomic_json(record / "cache-use.json", dict(generation="old"))
+            wr.atomic_json(
+                state / "recovery-cleanup/cache-roots" / f"{maintenance._name(record)}.json",
+                dict(generation=dict(cache_use="old"), owner=dict(process={})),
+            )
             trees.append(checkout)
         checks = maintenance.Checks(state.parent)
         references = [("123", None, "123 (verifier)", [str(trees[1])])]
-        with patch.object(wr, "process_references", return_value=references) as discovery:
+        with (
+            patch.object(wr, "owner_stopped", return_value=True),
+            patch.object(wr, "process_references", return_value=references) as discovery,
+        ):
             self.assertEqual(checks.users(trees[0], None, locked=True), ([], True))
             self.assertTrue(checks.users(trees[1], None, locked=True)[0])
             self.assertEqual(checks.users(trees[2], None, locked=True), ([], True))
@@ -194,6 +201,15 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertEqual(users, ["new verifier"])
         self.assertFalse(shared)
         fresh.assert_called_once()
+        # A run active while discovery happened can spawn a survivor afterward.
+        with (
+            patch.object(wr, "owner_stopped", return_value=False),
+            patch.object(wr, "process_references", return_value=[]),
+            patch.object(wr, "live_users", return_value=["late child"]),
+        ):
+            users, shared = maintenance.Checks(state.parent).users(trees[0], None, locked=True)
+        self.assertEqual(users, ["late child"])
+        self.assertFalse(shared)
 
     def test_unavailable_mount_snapshot_withholds_each_candidate_without_aborting(self):
         trees = [self.cfg.state / "recovery" / name / "checkout" for name in ("first", "last")]
@@ -278,6 +294,52 @@ class RecoveryMaintenance(unittest.TestCase):
             maintenance._SWEEPS.clear()  # a new native timer process
             self.tick()
         self.assertEqual(attempted, ["a", "z"])
+
+    def test_inventory_skips_finished_cache_trees_and_unrelated_directories(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        tree.mkdir()
+        (record / "source-outcomes").mkdir()
+        (record / "handoff-sources").mkdir()
+        maintenance.defer_caches(self.cfg.state, record)
+        path = next((self.cfg.state / "recovery-cleanup/cache-roots").glob("*.json"))
+        registry = wr.read_json(path)
+        registry["completed"] = dict(checkout=[tree.stat().st_dev, tree.stat().st_ino])
+        wr.atomic_json(path, registry)
+        report = self.tick(cleanup=False)
+        self.assertFalse(report["cleanup_pending"])
+        self.assertEqual(wr.summary(self.cfg.state.parent)["cleanup_backlog"], 0)
+
+    def test_cache_eviction_yields_its_record_lock_with_resumable_progress(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(tree)], check=True)
+        cache = tree / ".lake"
+        cache.mkdir()
+        for i in range(40):
+            (cache / f"artifact-{i}").write_text("generated")
+        maintenance.defer_caches(self.cfg.state, record)
+        path = next((self.cfg.state / "recovery-cleanup/cache-roots").glob("*.json"))
+        registry = wr.read_json(path) | {"registry": str(path)}
+        unlink = os.unlink
+
+        def slow_unlink(name, *args, **kwargs):
+            if str(name).startswith("artifact-"):
+                time.sleep(0.02)
+            return unlink(name, *args, **kwargs)
+
+        observation = {}
+        with patch.object(maintenance, "_safe", return_value=None), patch.object(os, "unlink", slow_unlink):
+            maintenance._cleanup_cache_tree(self.cfg.state, tree, registry, wr.Work(seconds=30), observation)
+        self.assertEqual(observation["next_action"], "resume-cache-removal")
+        self.assertGreater(len(list(cache.iterdir())), 0)
+        self.assertLess(len(list(cache.iterdir())), 40)
+        with patch.object(maintenance, "_safe", return_value=None):
+            maintenance._cleanup_cache_tree(self.cfg.state, tree, registry, wr.Work(seconds=30), {})
+        self.assertFalse(cache.exists())
+        self.assertTrue((tree / "A.lean").exists())
 
     def test_warm_lookup_independent_of_history(self):
         self.dirty()

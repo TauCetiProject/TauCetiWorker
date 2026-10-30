@@ -1087,7 +1087,9 @@ def process_references():
             for link in links:
                 _charge()
                 with contextlib.suppress(OSError):
-                    paths.append(os.readlink(link))
+                    where = os.readlink(link)
+                    if where.startswith("/"):
+                        paths.append(where)
         result.append((entry.name, session, entry.name, paths))
     return result
 
