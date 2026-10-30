@@ -18,6 +18,7 @@ import stat
 import subprocess
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +47,87 @@ COUNTS = (
     "errors",
 ) + tuple("recovery_" + state for state in CONSUMER_STATES)
 _SWEEPS = {}
+_CHECKS = ContextVar("cleanup_checks", default=None)
+
+
+@contextlib.contextmanager
+def completed_check():
+    """A scheduling yield must not restart an indivisible safety check forever."""
+    from . import work_recovery as wr
+
+    work = wr._WORK.get()
+    token = wr._WORK.set(None)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        elapsed = time.monotonic() - started
+        wr._WORK.reset(token)
+        if work is not None:
+            work.seconds += elapsed
+        if checks := _CHECKS.get():
+            checks.seconds += elapsed
+
+
+class Checks:
+    """Pass-local discovery; negative evidence is reused only under existing recovery ownership."""
+
+    def __init__(self, base):
+        self.base = base.resolve()
+        self.references = None
+        self.mounts = None
+        self.generations = {}
+        self.scans = 0
+        self.seconds = 0
+
+    def capture(self):
+        from . import work_recovery as wr
+
+        # Capture generations BEFORE process discovery. A consumer that starts
+        # afterward changes cache-use.json under recovery.lock, invalidating reuse.
+        for state in self.base.iterdir():
+            for record in (state / "recovery").glob("*"):
+                with contextlib.suppress(OSError):
+                    if record.is_symlink() or not record.is_dir():
+                        continue
+                    generation = read_json(record / "cache-use.json")
+                    if not isinstance(generation.get("generation"), str) or not generation["generation"]:
+                        continue  # missing/unreadable generation requires the ordinary fresh check
+                    registry = read_json(state / "recovery-cleanup/cache-roots" / f"{_name(record)}.json")
+                    if registry.get("generation", {}).get("cache_use") != generation[
+                        "generation"
+                    ] or not wr.owner_stopped(registry.get("owner", {}).get("process")):
+                        continue  # a run active during discovery can still spawn late children
+                    for tree in record.iterdir():
+                        if tree.name == "checkout" or tree.name.startswith(("restore-", "interrupted-restore-")):
+                            info = tree.lstat()
+                            self.generations[tree] = (generation, info.st_dev, info.st_ino)
+        self.scans += 1
+        # Unsupported/unreadable observations withhold deletion, rather than
+        # aborting inventory or discarding the rest of this cleanup pass.
+        with contextlib.suppress(OSError):
+            self.references = wr.process_references()
+        with contextlib.suppress(OSError):
+            self.mounts = Path("/proc/self/mountinfo").read_text()
+
+    def users(self, tree, session, *, locked=False):
+        from . import work_recovery as wr
+
+        if self.scans == 0:
+            self.capture()
+        if self.references is None:
+            return ["process observations unavailable"], False
+        found = wr.referenced_users(tree, self.references, session=session)
+        if found:
+            return found, False
+        info = tree.lstat()
+        current = (read_json(tree.parent / "cache-use.json"), info.st_dev, info.st_ino)
+        if locked and self.generations.get(tree) == current:
+            return [], True
+        # Retained legacy trees have no reuse-excluding lease. A pass snapshot
+        # may reject them, but cannot authorize deletion: keep their fresh check.
+        self.scans += 1
+        return wr.live_users(tree, session=session), False
 
 
 def _metadata(path, limit=256 * 1024):
@@ -137,10 +219,18 @@ def _cleanup_cache_tree(state, tree, registry, work, observation):
         job = dict(generation=generation)
     job.setdefault("created_at", root.get("created_at", time.time()))
     try:
-        if reason := _safe(state, tree, root.get("owner", {})):
+        if reason := _safe(state, tree, root.get("owner", {}), locked=True):
             job["next_action"] = reason
             return
-        if _evict_caches(tree, job, work):
+        # Recheck after discovery while holding the consumer's recovery.lock.
+        # A changed generation or replaced tree invalidates this eviction only.
+        if generation.get("cache_use") != _metadata(tree.parent / "cache-use.json").get("generation") or identity != [
+            tree.stat().st_dev,
+            tree.stat().st_ino,
+        ]:
+            job["next_action"] = "retry-changed-cache"
+            return
+        if _evict_caches(tree, job, work, batch_seconds=0.25):
             root.setdefault("completed", {})[tree.name] = identity
             atomic_json(path, root)
             job_path.unlink(missing_ok=True)
@@ -190,7 +280,12 @@ def _referenced(state, tree):
     return False
 
 
-def _safe(state, tree, owner):
+def _safe(state, tree, owner, *, locked=False):
+    with completed_check():
+        return _safe_once(state, tree, owner, locked=locked)
+
+
+def _safe_once(state, tree, owner, *, locked=False):
     """Ordinary stopped-owner and live-reference checks; uncertainty skips only this tree."""
     from . import work_recovery as wr
 
@@ -215,12 +310,22 @@ def _safe(state, tree, owner):
                     pass
         except (OSError, ValueError, IndexError):
             return "await-owner"
-    if tree.is_symlink() or wr.live_users(tree, session=session):
+    if tree.is_symlink():
+        return "await-live-users"
+    checks = _CHECKS.get()
+    shared = False
+    if checks:
+        users, shared = checks.users(tree, session, locked=locked)
+    else:
+        users = wr.live_users(tree, session=session)
+    if users:
         return "await-live-users"
     # Protect visible mounts, including bind mounts on the same device. An unavailable
     # mount table withholds this candidate, without affecting work admission.
     try:
-        raw = Path("/proc/self/mountinfo").read_text()
+        raw = checks.mounts if shared else Path("/proc/self/mountinfo").read_text()
+        if raw is None:
+            return "await-mount-evidence"
         wr._charge(read=len(raw))
         target = os.path.realpath(tree)
         for line in raw.splitlines():
@@ -422,11 +527,12 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
         reader.close()
 
 
-def _evict_caches(tree, job, work):
+def _evict_caches(tree, job, work, *, batch_seconds=None):
     """Only known top-level, untracked caches. Unknown Git metadata never permits eviction."""
     from . import work_recovery as wr
 
-    top = wr._git(tree, "rev-parse", "--show-toplevel", text=True).strip()
+    with completed_check():
+        top = wr._git(tree, "rev-parse", "--show-toplevel", text=True).strip()
     if os.path.realpath(top) != os.path.realpath(tree):
         raise wr.RecordError("cache candidate is not its own Git checkout")
     for name in sorted(wr.CACHE_DIRS | wr.CACHE_TOP):
@@ -434,12 +540,28 @@ def _evict_caches(tree, job, work):
         cache = tree / name
         if cache.is_symlink() or not cache.is_dir():
             continue
-        if wr._git(tree, "ls-files", "-z", "--", name):
+        with completed_check():
+            tracked = wr._git(tree, "ls-files", "-z", "--", name)
+        if tracked:
             continue  # tracked bytes remain source regardless of their directory's name
         jobs = job.setdefault("caches", {})
         info = cache.stat()
         subjob = jobs.setdefault(name, dict(tree_identity=[info.st_dev, info.st_ino], stack=[""]))
-        if _remove(cache, subjob, work):
+        deadline = work.deadline
+        started = time.monotonic()
+        if batch_seconds is not None:
+            work.deadline = min(deadline, started + max(0, batch_seconds))
+        try:
+            removed = _remove(cache, subjob, work)
+        except wr.BudgetExhausted:
+            if batch_seconds is None:
+                raise
+            return False  # release recovery.lock; the durable cursor resumes next pass
+        finally:
+            work.deadline = deadline
+            if batch_seconds is not None:
+                batch_seconds -= time.monotonic() - started
+        if removed:
             jobs.pop(name, None)
         else:
             return False
@@ -448,9 +570,11 @@ def _evict_caches(tree, job, work):
 
 def _promote(job, work):
     """One occasionally larger source candidate, with persisted backoff and hard ceilings."""
+    if time.time() < job.get("retry_at", 0):
+        return False
     if not work.adaptive or not job.get("allowance_level"):
         return True
-    if time.time() < job.get("retry_at", 0) or work.promoted:
+    if work.promoted:
         return False
     level = min(job["allowance_level"], 6)
     work.seconds = time.monotonic() - work.started + min(30, 0.25 * 4**level)
@@ -551,7 +675,8 @@ def _cleanup(state, tree, root, work, observation=None):
             valid = (tree / ".git").is_dir() and not (tree / ".git").is_symlink()
             if valid:
                 try:
-                    top = wr._git(tree, "rev-parse", "--show-toplevel", text=True).strip()
+                    with completed_check():
+                        top = wr._git(tree, "rev-parse", "--show-toplevel", text=True).strip()
                     valid = os.path.realpath(top) == os.path.realpath(tree)
                 except wr.BudgetExhausted:
                     raise
@@ -664,9 +789,7 @@ def _cleanup(state, tree, root, work, observation=None):
             _park(job, tree, sidecar)
             return
         if isinstance(error, wr.BudgetExhausted):
-            if work.adaptive and (
-                saving_source or validating_source or (job["phase"] == "save" and not work.removed_bytes)
-            ):
+            if saving_source or validating_source or (job["phase"] == "save" and not work.removed_bytes):
                 job["allowance_level"] = min(6, job.get("allowance_level", 0) + 1)
                 job["retry_at"] = time.time() + min(1800, 60 * 2 ** (job["allowance_level"] - 1))
             raise
@@ -678,8 +801,10 @@ def _cleanup(state, tree, root, work, observation=None):
 
 
 class Sweep:
-    def __init__(self, base):
+    def __init__(self, base, *, cleanup=True):
         self.base = base
+        self.cleanup = cleanup
+        self.cleanup_pending = False
         self.rows = {}
         self.items = self.scan()
         self.pending = None
@@ -706,7 +831,13 @@ class Sweep:
         if not self.base.is_dir():
             return
         with os.scandir(self.base) as workers:
-            for entry in workers:
+            entries = list(workers)
+            if self.cleanup:
+                # Native timer invocations are fresh processes. Existing job
+                # mtimes make attempted workers yield to untouched workers on
+                # the next invocation, without another durable cursor or gate.
+                entries.sort(key=lambda entry: self.last_attempt(Path(entry.path)))
+            for entry in entries:
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         yield from self.scan_worker(Path(entry.path))
@@ -717,6 +848,25 @@ class Sweep:
                     with contextlib.suppress(OSError):
                         atomic_json(Path(entry.path) / "recovery-prepared.json", previous)
                     continue  # one unreadable worker must not starve later workers
+
+    @staticmethod
+    def last_attempt(state):
+        stamps = [0]
+        for category in ("jobs", "cache-jobs"):
+            for path in (state / "recovery-cleanup" / category).glob("*.json"):
+                with contextlib.suppress(OSError):
+                    stamps.append(path.stat().st_mtime_ns)
+        return max(stamps)
+
+    @staticmethod
+    def tree_attempt(state, entry, category):
+        directory = "cache-jobs" if category == "cache" else "jobs"
+        tree = Path(entry.path.removesuffix(".deleting")) if category != "cache" else Path(entry.path)
+        path = state / "recovery-cleanup" / directory / f"{_name(tree)}.json"
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return 0
 
     def scan_worker(self, state):
         legacy_parent = self.base.parent / "checkouts" / state.name / "retained-checkouts"
@@ -761,7 +911,10 @@ class Sweep:
                         parent = Path(registry["record"] if category == "cache" else registry["parent"])
                         with contextlib.suppress(OSError):
                             with os.scandir(parent) as trees:
-                                for tree in trees:
+                                entries = list(trees)
+                                if self.cleanup:
+                                    entries.sort(key=lambda entry: self.tree_attempt(state, entry, category))
+                                for tree in entries:
                                     yield state, category + "-entry", Path(tree.path), registry
         jobs = state / "recovery-cleanup" / "jobs"
         if jobs.is_dir():
@@ -780,6 +933,16 @@ class Sweep:
         from . import work_recovery as wr
 
         row = self.rows[state]
+        if not self.cleanup and kind == "discarded":
+            if path.is_dir() and not path.is_symlink():
+                self.cleanup_pending = True
+                row["cleanup_backlog"] += 1
+                job = {}
+                action = job.get("next_action", "queued-for-collector")
+                row["cleanup_actions"][action] = row["cleanup_actions"].get(action, 0) + 1
+                oldest = job.get("created_at", path.stat().st_mtime)
+                row["cleanup_oldest_at"] = min(row["cleanup_oldest_at"] or oldest, oldest)
+            return
         if kind == "discarded":
             if not path.is_dir() or path.is_symlink():
                 return
@@ -839,6 +1002,19 @@ class Sweep:
                 kind = "cache"
             else:
                 kind = "tree"
+        if not self.cleanup and kind in {"tree", "cache"}:
+            info = path.stat()
+            if kind == "cache" and root.get("completed", {}).get(path.name) == [info.st_dev, info.st_ino]:
+                return
+            self.cleanup_pending = True
+            row["cleanup_backlog"] += 1
+            original = path.with_name(path.name.removesuffix(".deleting"))
+            job = _read_job(_job_path(state, original)) if kind == "tree" else {}
+            action = job.get("next_action", "queued-for-collector")
+            row["cleanup_actions"][action] = row["cleanup_actions"].get(action, 0) + 1
+            oldest = job.get("created_at", info.st_mtime)
+            row["cleanup_oldest_at"] = min(row["cleanup_oldest_at"] or oldest, oldest)
+            return
         if kind == "cleanup-finished":
             previous = read_json(state / "recovery-prepared.json")
             previous.update({key: value for key, value in row.items() if key.startswith("cleanup_")})
@@ -850,6 +1026,8 @@ class Sweep:
             atomic_json(state / "recovery-prepared.json", row)
             return
         if kind == "job":
+            if not self.cleanup:
+                return
             job = _read_job(path)
             original = Path(job.get("tree", "."))
             if (
@@ -908,7 +1086,9 @@ class Sweep:
                     # Migrate old infrastructure pauses to ordinary automatic retries.
                     write(path, consumer, "eligible")
                 else:
-                    discard_record(state, path)
+                    self.cleanup_pending = True
+                    if self.cleanup:
+                        discard_record(state, path)
                     return  # Done records never remain in the operator's task inventory.
             manifest = wr._complete(path, digests=False)
             if manifest is None:
@@ -1021,7 +1201,7 @@ def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 10
     return dict(work.report(), errors=errors[:10])
 
 
-def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
+def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup=True, removal_bytes=None):
     from . import work_recovery as wr
 
     if os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() == "off":
@@ -1032,10 +1212,13 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
         entries=entries,
         bytes=bytes,
         adaptive=adaptive,
-        removal_bytes=256 * 1024 * 1024 if adaptive else None,
+        removal_bytes=removal_bytes if removal_bytes is not None else (256 * 1024 * 1024 if adaptive else None),
     )
     token = wr._WORK.set(work)
     base = Path(base)
+    checks = Checks(base)
+    checks_token = _CHECKS.set(checks if cleanup else None)
+    sweep = None
     try:
         base.mkdir(parents=True, exist_ok=True)
         if adaptive:
@@ -1048,7 +1231,8 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return dict(busy=True)
-            sweep = _SWEEPS.setdefault(base, Sweep(base))
+            key = base if cleanup else (base, "inventory")
+            sweep = _SWEEPS.setdefault(key, Sweep(base, cleanup=cleanup))
             # Reserve most of every budget for inventory and deletion too. A
             # metadata-only priority scan must not monopolize small test or
             # operator budgets on every preparation tick.
@@ -1073,14 +1257,20 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
                     and not handed_off
                     and code not in RETRYABLE
                 ):
-                    discard_record(state, record)
+                    sweep.cleanup_pending = True
+                    if cleanup:
+                        discard_record(state, record)
             while True:
+                # Scheduling yields happen between candidates. A slow check is
+                # allowed to finish together with one useful deletion batch.
+                if time.monotonic() - work.started >= seconds and sweep.pending is None:
+                    break
                 work.charge(entries=1)
                 try:
                     item = sweep.pending or next(sweep.items)
                     sweep.pending = item
                 except StopIteration:
-                    _SWEEPS.pop(base, None)
+                    _SWEEPS.pop(key, None)
                     break
                 try:
                     sweep.process(*item, work)
@@ -1103,12 +1293,17 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):
     except wr.BudgetExhausted:
         pass
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, wr.RecordError):
-        _SWEEPS.pop(base, None)  # retry automatically; no marker-removal/operator action
+        _SWEEPS.pop(base if cleanup else (base, "inventory"), None)
     finally:
         wr._WORK.reset(token)
+        _CHECKS.reset(checks_token)
     report = work.report()
+    report.update(
+        safety_seconds=checks.seconds, process_scans=checks.scans, cleanup_pending=bool(sweep and sweep.cleanup_pending)
+    )
     with contextlib.suppress(OSError):
-        atomic_json(base / ".recovery-housekeeping.json", dict(at=time.time(), **report))
+        name = ".recovery-housekeeping.json" if cleanup else ".recovery-inventory.json"
+        atomic_json(base / name, dict(at=time.time(), **report))
     return report
 
 

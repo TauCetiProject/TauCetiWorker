@@ -721,7 +721,12 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             from . import expanded_cache, shared_mathlib, work_recovery
 
             try:
-                work_recovery.housekeep()
+                collector_installed = read_json(root() / "cleanup-service.json").get("installed")
+                housekeeping = work_recovery.housekeep(cleanup=not collector_installed)
+                if collector_installed and housekeeping.get("cleanup_pending"):
+                    from .retention import request_cleanup
+
+                    request_cleanup()
             except Exception as error:
                 errors.append(f"Recovery housekeeping deferred ({type(error).__name__}); retryable jobs retained")
             from . import verification_storage

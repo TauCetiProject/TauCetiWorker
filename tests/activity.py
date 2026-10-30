@@ -105,6 +105,19 @@ class ActivityTests(unittest.TestCase):
         self.assertTrue(a.cached()["available"])
         self.assertTrue(any("Recovery housekeeping deferred" in error for error in value["errors"]))
 
+    def test_installed_collector_keeps_destructive_cleanup_out_of_reporting(self):
+        from tauceti_worker import retention, work_recovery
+
+        a.atomic_json(a.root() / "cleanup-service.json", dict(installed=True))
+        with (
+            patch.object(work_recovery, "housekeep", return_value=dict(cleanup_pending=True)) as inventory,
+            patch.object(retention, "request_cleanup") as request,
+        ):
+            a.prepare(now=self.now)
+        inventory.assert_called_once_with(cleanup=False)
+        request.assert_called_once()
+        self.assertTrue(a.cached()["available"])
+
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
         with contextlib.closing(a._connect()) as db, db:

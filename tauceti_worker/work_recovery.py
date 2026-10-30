@@ -1054,53 +1054,71 @@ def _set_status(record: Path, state: str, reason: str = "") -> bool:
     return True
 
 
-def live_users(repo: Path, *, session=None) -> list[str]:
-    """Processes whose cwd, root, or open files lie inside the checkout (Linux /proc; read-only).
-    Detached descendants without a live reference are outside this best-effort observation."""
+def process_references():
+    """One read-only process inventory, reusable within a cleanup pass only."""
     proc = Path("/proc")
     if not (proc / "self").exists():
-        return []
-    target = os.path.realpath(repo)
-    prefix = target.rstrip("/") + "/"
+        return None
     skip = set()
     pid = os.getpid()
-    while pid > 1:  # never report ourselves or the supervisors that started this round
+    while pid > 1:
         skip.add(pid)
         try:
             pid = int((proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
             break
-    found = []
+    result = []
     for entry in proc.iterdir():
-        _charge()  # deadline also bounds ownership observation during housekeeping
+        _charge()
         if not entry.name.isdigit():
             continue
-        if session is not None:
-            try:
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                if int(fields[3]) == session and fields[0] not in {"Z", "X"}:
-                    found.append(f"{entry.name} (owner session)")
-                    continue
-            except (OSError, ValueError, IndexError):
-                pass
-        if int(entry.name) in skip:
-            continue
-        links = [entry / "cwd", entry / "root"]
-        with contextlib.suppress(OSError):
-            links += list((entry / "fd").iterdir())
-        for link in links:
-            _charge()
-            try:
-                where = os.readlink(link)
-            except OSError:
-                continue
-            if where == target or where.startswith(prefix):
-                try:
-                    found.append(f"{entry.name} ({(entry / 'comm').read_text().strip()})")
-                except OSError:
-                    found.append(entry.name)
-                break
+        session = None
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] not in {"Z", "X"}:
+                session = int(fields[3])
+        except (OSError, ValueError, IndexError):
+            pass
+        paths = []
+        if int(entry.name) not in skip:
+            links = [entry / "cwd", entry / "root"]
+            with contextlib.suppress(OSError):
+                links += list((entry / "fd").iterdir())
+            for link in links:
+                _charge()
+                with contextlib.suppress(OSError):
+                    where = os.readlink(link)
+                    if where.startswith("/"):
+                        paths.append(where)
+        result.append((entry.name, session, entry.name, paths))
+    return result
+
+
+def referenced_users(repo: Path, references, *, session=None) -> list[str]:
+    if references is None:
+        return ["process observations unavailable"]
+    target = os.path.realpath(repo)
+    prefix = target.rstrip("/") + "/"
+    found = []
+    for pid, process_session, label, paths in references:
+        if session is not None and process_session == session:
+            found.append(f"{pid} (owner session)")
+        elif any(where == target or where.startswith(prefix) for where in paths):
+            if label == pid:
+                with contextlib.suppress(OSError):
+                    label = f"{pid} ({(Path('/proc') / pid / 'comm').read_text().strip()})"
+            found.append(label)
     return found
+
+
+def live_users(repo: Path, *, session=None) -> list[str]:
+    """Fresh process references for ordinary callers; no cached negative liveness evidence."""
+    import sys
+
+    references = process_references()
+    if references is None and sys.platform != "linux":
+        return []  # Preserve ordinary non-Linux preparation; procfs was never its liveness API.
+    return referenced_users(repo, references, session=session)
 
 
 # Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks
