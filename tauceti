@@ -1,12 +1,12 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@fdacc19c0326065c44c4283b6f8b700c1f1e6700", "rich", "textual>=8,<9"]  # used ONLY by the TUI/status render; every other path is stdlib.
+# dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@fdacc19c0326065c44c4283b6f8b700c1f1e6700", "rich", "textual>=8,<9", "psutil>=7; sys_platform == 'darwin'"]
 # ///
 """./tauceti — source-checkout entry point.
 
 The worker is the `tauceti_worker/` package; this is a thin PEP 723 shim so `./tauceti …` keeps
-working from a clone (uv resolves rich/textual, then runs the package). An installed wheel exposes
+working from a clone (uv resolves the CLI dependencies and macOS process observations, then runs the package). An installed wheel exposes
 the same CLI as the `tauceti` console script (tauceti_worker.cli:cli_main); this file is not part
 of the wheel. `uv run --script` puts this file's directory on sys.path, so the sibling
 tauceti_worker package imports cleanly; the explicit insert keeps that true regardless of cwd."""

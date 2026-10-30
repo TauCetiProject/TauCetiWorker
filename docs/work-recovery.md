@@ -119,6 +119,12 @@ stop a worker. Preparation always saves first and then always continues:
   process inventories withhold deletion. Individual private cwd/open-file fields
   remain best effort on both platforms; an unreadable field never erases visible
   references or a recorded session membership.
+  Only the managed candidate path is canonicalized: kernel-reported process and
+  mount paths are compared without probing unrelated mounted filesystems.
+  Both installed workers and the source-checkout launcher declare psutil on macOS;
+  a missing installation leaves observations unavailable and defers deletion.
+  Automatic process observations support Linux and macOS; other platforms retain
+  checkouts instead of treating unavailable observations as evidence of no live users.
   Process birth checks do not require PID namespace APIs. Repair-cache cleanup takes
   the consumer's existing per-record recovery lock and checks its actual-use generation. No cleanup takes
   the worker round lock. Unknown or unreadable ownership or mount information skips

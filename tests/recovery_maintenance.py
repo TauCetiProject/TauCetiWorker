@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -295,7 +296,7 @@ class RecoveryMaintenance(unittest.TestCase):
         own.parents.return_value = [SimpleNamespace(pid=101)]
         parent = process(101, str(tree))
         cwd = process(102, str(tree / "nested"))
-        opened = process(103, "/", [str(alias / "Draft.lean")])
+        opened = process(103, "/", [str(tree / "Draft.lean")])
         member = process(104)
         sibling = process(105, str(tree) + "-other")
         foreign = process(106)
@@ -330,19 +331,31 @@ class RecoveryMaintenance(unittest.TestCase):
             for p in (cwd, opened, member, sibling):
                 p.uids.return_value = SimpleNamespace(real=501, effective=501)
             foreign.uids.return_value = SimpleNamespace(real=502, effective=502)
-            refs = wr.process_references()
-            self.assertEqual(wr.referenced_users(tree, refs), ["102 (process)", "103 (process)"])
+            with patch.object(os.path, "realpath", side_effect=AssertionError("do not resolve observed paths")):
+                refs = wr.process_references()
+            self.assertEqual(wr.referenced_users(alias, refs), ["102 (process)", "103 (process)"])
             self.assertIn("104 (owner session)", wr.referenced_users(tree, refs, session=104))
             parent.cwd.assert_not_called()
             foreign.cwd.assert_not_called()
-            cwd.open_files.side_effect = Denied("fixture inaccessible private descriptors")
+            cwd.open_files.side_effect = OSError("fixture unreadable private descriptors")
             self.assertIn("102 (process)", wr.referenced_users(tree, wr.process_references()))
-            member.cwd.side_effect = Denied("fixture inaccessible private cwd")
+            member.cwd.side_effect = ProcessError("fixture unreadable private cwd")
             member.open_files.side_effect = Denied("fixture inaccessible private descriptors")
             self.assertIn("104 (owner session)", wr.referenced_users(tree, wr.process_references(), session=104))
             api.pids = Mock(side_effect=ProcessError("fixture unavailable inventory"))
             self.assertIsNone(wr.process_references())
             self.assertTrue(wr.live_users(tree))
+
+    def test_darwin_missing_psutil_defers_cleanup_and_launchers_declare_it(self):
+        repo = Path(__file__).resolve().parents[1]
+        header = (repo / "tauceti").read_text().split("# /// script\n", 1)[1].split("# ///", 1)[0]
+        shim = tomllib.loads("\n".join(line.removeprefix("# ") for line in header.splitlines()))
+        project = tomllib.loads((repo / "pyproject.toml").read_text())["project"]
+        for metadata in (shim, project):
+            self.assertIn("psutil>=7; sys_platform == 'darwin'", metadata["dependencies"])
+        with patch.dict(sys.modules, psutil=None), patch.object(sys, "platform", "darwin"):
+            self.assertTrue(wr.live_users(self.co))
+            self.assertIsNone(maintenance.retention.mount_points())
 
     def test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot(self):
         owner = dict(pid=123, session=123, start="1:2", boot="fixture boot")
@@ -379,8 +392,9 @@ class RecoveryMaintenance(unittest.TestCase):
         cache = tree / ".lake/generated"
         cache.parent.mkdir()
         cache.write_text("disposable cache")
-        alias = self.root / "mounted-checkout-alias"
-        alias.symlink_to(tree, target_is_directory=True)
+        alias = self.root / "state-alias"
+        alias.symlink_to(self.cfg.state, target_is_directory=True)
+        alias_record = alias / "recovery" / record.name
         wr.atomic_json(record / "cache-use.json", dict(generation="fixture stopped use"))
         maintenance.defer_caches(self.cfg.state, record)
         api = SimpleNamespace(disk_partitions=Mock(return_value=[SimpleNamespace(mountpoint="/")]))
@@ -415,8 +429,10 @@ class RecoveryMaintenance(unittest.TestCase):
             self.tick()
             self.assertFalse(cache.exists())
             maintenance.atomic_json(record / "recovery.json", dict(state="obsolete"))
-            api.disk_partitions.return_value = [SimpleNamespace(mountpoint=str(alias / "mounted"))]
-            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+            api.disk_partitions.return_value = [SimpleNamespace(mountpoint=str(tree / "mounted"))]
+            with patch.object(Path, "resolve", side_effect=AssertionError("do not resolve observed mounts")):
+                self.assertEqual(maintenance.retention.mount_points(), [tree / "mounted"])
+            self.assertFalse(maintenance.discard_record(alias, alias_record))
             api.disk_partitions.side_effect = OSError("fixture unavailable mounts")
             self.assertFalse(maintenance.discard_record(self.cfg.state, record))
             api.disk_partitions.side_effect = None
@@ -473,6 +489,65 @@ class RecoveryMaintenance(unittest.TestCase):
         with patch.object(psutil, "pids", return_value=[child.pid]):
             self.assertEqual(wr.live_users(tree), [])
         self.assertTrue(maintenance.retention.mount_points())
+
+        alias = self.root / "native-checkout-alias"
+        alias.symlink_to(tree, target_is_directory=True)
+        with subprocess.Popen(["sleep", "30"], cwd=alias) as child:
+            try:
+                with patch.object(psutil, "pids", return_value=[child.pid]):
+                    self.assertTrue(wr.live_users(alias))  # Kernel cwd is physical; the candidate is aliased.
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS session observations")
+    def test_native_darwin_session_survives_leader_exit(self):
+        import select
+
+        import psutil
+
+        tree = self.root / "unused-checkout"
+        tree.mkdir()
+        code = """import json, os, time
+from tauceti_worker.work_recovery import process_owner
+owner = process_owner()
+child = os.fork()
+if child == 0:
+    os.close(1)
+    time.sleep(60)
+    os._exit(0)
+print(json.dumps(dict(owner=owner, child=child)), flush=True)
+"""
+        with subprocess.Popen(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        ) as leader:
+            child_pid = None
+            try:
+                self.assertTrue(select.select([leader.stdout], [], [], 5)[0], "fixture session did not start")
+                result = json.loads(leader.stdout.readline())
+                child_pid = result["child"]
+                owner = result["owner"]
+                self.assertEqual(leader.wait(timeout=5), 0)
+                self.assertTrue(wr.owner_stopped(owner))
+                self.assertEqual(wr.owner_session(owner), leader.pid)
+                with patch.object(psutil, "pids", return_value=[child_pid]):
+                    refs = wr.process_references()
+                    self.assertEqual(wr.referenced_users(tree, refs), [])
+                    self.assertEqual(
+                        wr.referenced_users(tree, refs, session=leader.pid), [f"{child_pid} (owner session)"]
+                    )
+            finally:
+                # Only this disposable fixture's newly created session/group.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(leader.pid, signal.SIGTERM)
+                leader.wait(timeout=5)
+                if child_pid is not None:
+                    with contextlib.suppress(psutil.NoSuchProcess):
+                        psutil.Process(child_pid).wait(timeout=5)
 
     def test_cache_reuse_during_discovery_withholds_only_that_eviction(self):
         self.dirty()

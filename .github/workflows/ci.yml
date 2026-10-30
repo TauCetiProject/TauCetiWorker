@@ -19,8 +19,8 @@ jobs:
     # Storage fixtures require native, consistent inode/device metadata.
     runs-on: ubuntu-24.04
     env:
-      # The worker is stdlib-only (bar the TUI's rich/textual), so test on one interpreter — the
-      # latest uv ships — rather than a per-version matrix. requires-python >=3.11 is a declaration.
+      # Test on the latest interpreter uv ships; macOS observations have their own native job.
+      # requires-python >=3.11 is a declaration rather than a per-version matrix.
       UV_PYTHON: "3.14"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,13 +36,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Check the source-checkout launcher environment
+        run: ./tauceti --help
       - name: Check native macOS recovery observations and cleanup
         run: >-
           uv run python tests/recovery_maintenance.py
           RecoveryMaintenance.test_darwin_process_references_protect_cwd_files_and_session
+          RecoveryMaintenance.test_darwin_missing_psutil_defers_cleanup_and_launchers_declare_it
           RecoveryMaintenance.test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot
           RecoveryMaintenance.test_darwin_cleanup_and_record_retirement_without_procfs
           RecoveryMaintenance.test_native_darwin_process_references_and_owner_birth
+          RecoveryMaintenance.test_native_darwin_session_survives_leader_exit
 
   prices:
     runs-on:

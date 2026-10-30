@@ -271,12 +271,16 @@ class Storage(Receipts):
         self.assertEqual((tree / "build/Tracked.lean").read_text(), "tracked source")
 
     def test_mount_or_missing_mount_evidence_withholds_only_affected_candidate(self):
-        _, _, tree = self.pending()
+        _, job, tree = self.pending()
         cache = write(tree, ".lake/build/keep", "mounted")
-        for mounts in (None, [tree / ".lake/build"]):
-            with patch("tauceti_worker.retention.mount_points", return_value=mounts):
-                self.collect()
-                self.assertTrue(cache.exists())
+        alias = self.home / "state-alias"
+        alias.symlink_to(self.state, target_is_directory=True)
+        with patch.object(self, "state", alias):
+            for mounts in (None, [tree / ".lake/build"]):
+                with patch("tauceti_worker.retention.mount_points", return_value=mounts):
+                    self.collect()
+                    self.assertTrue(cache.exists())
+            self.assertEqual(storage.candidate(alias, job["id"]), tree.resolve())
         self.collect()
         self.assertFalse(cache.exists())
 

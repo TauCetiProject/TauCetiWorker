@@ -106,7 +106,8 @@ def mount_points():
         if sys.platform == "darwin":
             import psutil
 
-            return [Path(item.mountpoint).resolve() for item in psutil.disk_partitions(all=True)] or None
+            # getfsstat supplies kernel paths without touching each mounted filesystem.
+            return [Path(item.mountpoint) for item in psutil.disk_partitions(all=True)] or None
         if sys.platform != "linux":
             return None
 
@@ -118,7 +119,7 @@ def mount_points():
         return [
             Path(unescape(line.split()[4])) for line in Path("/proc/self/mountinfo").read_text().splitlines()
         ] or None
-    except (OSError, IndexError, ValueError):
+    except (ImportError, OSError, IndexError, ValueError):
         return None
 
 
