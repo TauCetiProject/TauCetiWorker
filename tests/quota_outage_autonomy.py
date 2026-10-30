@@ -379,6 +379,7 @@ def test_cli_preserves_soft_handoff_without_granting_outage_permission(root):
                 set_log_file=DEFAULT,
                 configure_api=DEFAULT,
                 run_round=DEFAULT,
+                preflight=DEFAULT,
             ) as mocks,
         ):
             mocks["run_round"].return_value = 0
