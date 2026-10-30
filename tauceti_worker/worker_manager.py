@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import worker_scopes
-from .config import positive_integer, security_audit_problem, validate_extra_prompt
+from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
 from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
@@ -59,7 +59,7 @@ _WORKER_KEYS = {
     "roadmap_skip",
     "roadmap_extra_identities",
     "respect_claims",
-    "extra_prompt",
+    "extra_roadmap_prompt",
     "source",
     "author_model",
     "author_effort",
@@ -191,14 +191,14 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _extra_prompt(value, where: str) -> str | None:
+def _extra_roadmap_prompt(value, where: str) -> str | None:
     """Operator guidance for roadmap rounds, checked at the configuration boundary like `pace`: a blank
     or oversized value is a bad line in workers.toml, not a worker that dies on launch."""
     text = _string(value, where, optional=True)
     if text is None:
         return None
     try:
-        return validate_extra_prompt(text)
+        return validate_extra_roadmap_prompt(text)
     except ValueError as e:
         raise WorkersError(f"{where}: {e}") from None
 
@@ -284,7 +284,7 @@ class WorkerSpec:
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
-    extra_prompt: str | None = None
+    extra_roadmap_prompt: str | None = None
     source: str | None = None
     author_model: str | None = None
     author_effort: str | None = None
@@ -353,7 +353,9 @@ class WorkerSpec:
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
-            extra_prompt=_extra_prompt(raw.get("extra_prompt"), f"workers[{index}].extra_prompt"),
+            extra_roadmap_prompt=_extra_roadmap_prompt(
+                raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
+            ),
             source=_string(raw.get("source"), f"workers[{index}].source", optional=True),
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
@@ -423,7 +425,7 @@ class WorkerSpec:
             "conf",
             "github_state_url",
             "github_state_token_file",
-            "extra_prompt",
+            "extra_roadmap_prompt",
             "source",
             "author_model",
             "author_effort",
@@ -481,7 +483,7 @@ class WorkerSpec:
             (self.github_account, "--github-account"),
             (self.github_state_url, "--github-state-url"),
             (self.github_state_token_file, "--github-state-token-file"),
-            (self.extra_prompt, "--extra-prompt"),
+            (self.extra_roadmap_prompt, "--extra-roadmap-prompt"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -1450,8 +1452,11 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         if spec.get("respect_claims", True) is False:
             roadmap_values.append("claims: ignored")
         lines.extend(_status_field("roadmap", roadmap_values, width))
-        if spec.get("extra_prompt"):
-            lines.extend(_status_field("guidance", [" ".join(str(spec["extra_prompt"]).split())], width))
+    if spec.get("extra_roadmap_prompt"):
+        guidance = " ".join(str(spec["extra_roadmap_prompt"]).split())
+        if "roadmap" not in phases:
+            guidance += " (unused: the roadmap phase is not enabled)"
+        lines.extend(_status_field("guidance", [guidance], width))
 
     if spec.get("source"):
         lines.extend(_status_field("source", [str(spec["source"])], width))
@@ -1939,7 +1944,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
                 "--roadmap-extra-identities": "roadmap_extra_identities",
-                "--extra-prompt": "extra_prompt",
+                "--extra-roadmap-prompt": "extra_roadmap_prompt",
                 "--source": "source",
                 "--author-model": "author_model",
                 "--author-effort": "author_effort",
@@ -2022,7 +2027,7 @@ def add_workers_parser(subparsers) -> None:
     )
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
-    add.add_argument("--extra-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
+    add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
     add.add_argument("--source", help="source repository; requires roadmap in --only and one pinned roadmap area")
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
@@ -2120,7 +2125,7 @@ def cmd_workers(args) -> int:
                     "github_state_url",
                     "github_state_token_file",
                     "roadmap_only",
-                    "extra_prompt",
+                    "extra_roadmap_prompt",
                     "source",
                     "author_model",
                     "author_effort",

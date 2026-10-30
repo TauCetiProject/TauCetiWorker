@@ -46,7 +46,7 @@ from .config import (
     Die,
     NoProgress,
     SharedStateUnavailable,
-    extra_prompt,
+    extra_roadmap_prompt,
     is_git_url,
     log,
     one_line,
@@ -2712,7 +2712,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
   If the PR derives any content from it, name the source repository, commit, and license in the PR
   body, and do not migrate material whose license does not permit it.
 """
-    guidance = extra_prompt()
+    guidance = extra_roadmap_prompt()
     extra_guidance = ""
     if guidance is not None:
         # Operator steering, rendered as its own section. fill_prompt makes ONE pass over the template,
@@ -2754,7 +2754,7 @@ other contributors' claims, or the hard rules of the repo.
                     else "/opt/review/rubrics (read every .md file in it)"
                 ),
                 SOURCE_GUIDANCE=source_guidance,
-                EXTRA_PROMPT=extra_guidance,
+                EXTRA_ROADMAP_PROMPT=extra_guidance,
                 LOCAL_VERIFICATION=local_verification("ordinary", bubble),
                 BIN=wrapper_bin(bubble=True),
             ),
@@ -2778,7 +2778,7 @@ other contributors' claims, or the hard rules of the repo.
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
-        EXTRA_PROMPT=extra_guidance,
+        EXTRA_ROADMAP_PROMPT=extra_guidance,
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )

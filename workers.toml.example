@@ -17,7 +17,7 @@ id = "worker3"
 enabled = true
 only = ["roadmap", "fix", "fix-ci"]
 roadmap_only = "RepresentationTheory"
-extra_prompt = "Work on the material relevant to Higher Topos Theory"
+extra_roadmap_prompt = "Work on the material relevant to Higher Topos Theory"
 source = "https://github.com/FormalFrontier/Etingof-RepresentationTheory-draft1"
 
 # Claude API worker sharing the local grant ledger:
