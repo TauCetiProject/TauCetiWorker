@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import recovery_index, retention
+from .paths import canonical_candidate
 from .runtime_status import atomic_json, read_json
 
 CONSUMER_STATES = (
@@ -315,7 +316,7 @@ def _safe_once(state, tree, owner, *, locked=False):
         if mounts is None:
             return "await-mount-evidence"
         wr._charge(entries=len(mounts))
-        target = Path(os.path.realpath(tree))
+        target = canonical_candidate(tree)
         for mount in mounts:
             if mount == target or mount.is_relative_to(target):
                 return "await-mount-lease"
@@ -1325,7 +1326,7 @@ def discard_record(state, record):
                 if mounts is None:
                     return False
                 wr._charge(entries=len(mounts))
-                target = record.resolve()
+                target = canonical_candidate(record)
                 for mount in mounts:
                     if mount == target or mount.is_relative_to(target):
                         return False

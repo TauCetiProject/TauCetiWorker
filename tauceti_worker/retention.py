@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from .config import Config, Die, legacy_project, log, worker_state_root
-from .paths import HERE, self_env
+from .paths import HERE, canonical_candidate, self_env
 from .runtime_status import atomic_json, read_json
 
 LIFETIME = 3 * 86400
@@ -133,7 +133,7 @@ def _remove(path, root, report, *, dry=False, check_users=True, opened=None, mou
     in_use = ((info.st_dev, info.st_ino) in opened) if opened is not None else check_users and live_users(path)
     if mounts is ...:
         mounts = mount_points()
-    target = path.resolve()
+    target = canonical_candidate(path)
     mounted = mounts is None or any(point == target or point.is_relative_to(target) for point in mounts or ())
     if mounted or path.is_mount() or in_use:
         note(report, "protected", str(path))

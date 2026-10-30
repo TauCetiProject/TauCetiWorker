@@ -119,7 +119,8 @@ stop a worker. Preparation always saves first and then always continues:
   process inventories withhold deletion. Individual private cwd/open-file fields
   remain best effort on both platforms; an unreadable field never erases visible
   references or a recorded session membership.
-  Only the managed candidate path is canonicalized: kernel-reported process and
+  Only the managed candidate path is canonicalized, using Darwin's kernel spelling
+  to handle case-insensitive volume aliases: kernel-reported process and
   mount paths are compared without probing unrelated mounted filesystems.
   Both installed workers and the source-checkout launcher declare psutil on macOS;
   a missing installation leaves observations unavailable and defers deletion.

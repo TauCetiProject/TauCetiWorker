@@ -52,7 +52,7 @@ from pathlib import Path
 from . import recovery_index
 from .config import log
 from .constants import ROADMAP, TAUCETI
-from .paths import HERE
+from .paths import HERE, canonical_candidate
 from .runtime_status import atomic_json, read_json
 
 SCHEMA = "tauceti-work-recovery/v1"
@@ -1191,7 +1191,7 @@ def process_references():
 def referenced_users(repo: Path, references, *, session=None) -> list[str]:
     if references is None:
         return ["process observations unavailable"]
-    target = os.path.realpath(repo)
+    target = str(canonical_candidate(repo))
     prefix = target.rstrip("/") + "/"
     found = []
     for pid, process_session, label, paths in references:

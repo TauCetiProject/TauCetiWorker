@@ -43,6 +43,7 @@ jobs:
           uv run python tests/recovery_maintenance.py
           RecoveryMaintenance.test_darwin_process_references_protect_cwd_files_and_session
           RecoveryMaintenance.test_darwin_missing_psutil_defers_cleanup_and_launchers_declare_it
+          RecoveryMaintenance.test_darwin_candidate_uses_kernel_spelling_for_live_references_and_mounts
           RecoveryMaintenance.test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot
           RecoveryMaintenance.test_darwin_cleanup_and_record_retirement_without_procfs
           RecoveryMaintenance.test_native_darwin_process_references_and_owner_birth

@@ -3,6 +3,7 @@
 
 import contextlib
 import errno
+import fcntl
 import json
 import os
 import shutil
@@ -357,6 +358,22 @@ class RecoveryMaintenance(unittest.TestCase):
             self.assertTrue(wr.live_users(self.co))
             self.assertIsNone(maintenance.retention.mount_points())
 
+    def test_darwin_candidate_uses_kernel_spelling_for_live_references_and_mounts(self):
+        kernel_path = self.co.with_name("TAUCETI")
+        references = [("123", None, "123 (process)", [str(kernel_path / "Draft.lean")])]
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(fcntl, "F_GETPATH", 50, create=True),
+            patch.object(fcntl, "fcntl", return_value=os.fsencode(kernel_path) + b"\0"),
+        ):
+            self.assertEqual(wr.referenced_users(self.co, references), ["123 (process)"])
+            with (
+                patch.object(wr, "owner_stopped", return_value=True),
+                patch.object(wr, "live_users", return_value=[]),
+                patch.object(maintenance.retention, "mount_points", return_value=[kernel_path / ".lake"]),
+            ):
+                self.assertEqual(maintenance._safe(self.cfg.state, self.co, {"process": {}}), "await-mount-lease")
+
     def test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot(self):
         owner = dict(pid=123, session=123, start="1:2", boot="fixture boot")
         with (
@@ -480,7 +497,7 @@ class RecoveryMaintenance(unittest.TestCase):
                 self.assertFalse(wr.owner_stopped(owner))
                 # Constrain discovery to this fixture; use real native calls for it.
                 with patch.object(psutil, "pids", return_value=[child.pid]):
-                    self.assertTrue(wr.live_users(tree))  # Only its open file is inside the tree.
+                    self.assertEqual(wr.live_users(tree), [f"{child.pid} (process)"])
                     self.assertEqual(wr.owner_session(owner), child.pid)
             finally:
                 child.terminate()
@@ -495,7 +512,10 @@ class RecoveryMaintenance(unittest.TestCase):
         with subprocess.Popen(["sleep", "30"], cwd=alias) as child:
             try:
                 with patch.object(psutil, "pids", return_value=[child.pid]):
-                    self.assertTrue(wr.live_users(alias))  # Kernel cwd is physical; the candidate is aliased.
+                    self.assertEqual(wr.live_users(alias), [f"{child.pid} (process)"])
+                    other_case = tree.with_name(tree.name.upper())
+                    if other_case.exists():  # Exercise case-insensitive APFS without assuming volume settings.
+                        self.assertEqual(wr.live_users(other_case), [f"{child.pid} (process)"])
             finally:
                 child.terminate()
                 child.wait(timeout=5)
