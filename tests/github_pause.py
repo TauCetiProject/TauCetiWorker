@@ -155,6 +155,7 @@ class GitHubPauseTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"TAUCETI_USE_BUDGET": "0", "TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
             patch.object(loop, "api_mode", return_value=True),
+            patch.object(loop, "github_budget", return_value={}),
             patch.object(loop, "run_round_subprocess", side_effect=codes),
             patch.object(loop, "runtime_snapshot", return_value={"next_action_at": retry_at, "detail": "quota reset"}),
             patch.object(loop, "report_runtime", side_effect=lambda state=None, **kw: statuses.append((state, kw))),
