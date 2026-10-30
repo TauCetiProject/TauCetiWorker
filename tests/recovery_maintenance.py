@@ -195,6 +195,50 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertFalse(shared)
         fresh.assert_called_once()
 
+    def test_unavailable_mount_snapshot_withholds_each_candidate_without_aborting(self):
+        trees = [self.cfg.state / "recovery" / name / "checkout" for name in ("first", "last")]
+        for tree in trees:
+            tree.mkdir(parents=True)
+        checks = maintenance.Checks(self.cfg.state.parent)
+        real_read = Path.read_text
+
+        def unavailable(path, *args, **kwargs):
+            if str(path) == "/proc/self/mountinfo":
+                raise FileNotFoundError("fixture host without procfs")
+            return real_read(path, *args, **kwargs)
+
+        token = maintenance._CHECKS.set(checks)
+        try:
+            with (
+                patch.object(Path, "read_text", unavailable),
+                patch.object(wr, "owner_stopped", return_value=True),
+                patch.object(wr, "process_references", return_value=[]) as discovery,
+            ):
+                for tree in trees:
+                    self.assertEqual(
+                        maintenance._safe(self.cfg.state, tree, {"process": {}}, locked=True),
+                        "await-mount-evidence",
+                    )
+                discovery.assert_called_once()
+        finally:
+            maintenance._CHECKS.reset(token)
+        self.assertTrue(all(tree.exists() for tree in trees))
+
+    def test_unavailable_process_discovery_never_authorizes_deletion(self):
+        tree = self.cfg.state / "recovery" / "fixture" / "checkout"
+        tree.mkdir(parents=True)
+        checks = maintenance.Checks(self.cfg.state.parent)
+        with patch.object(wr, "process_references", side_effect=OSError("fixture unavailable")) as discovery:
+            for _ in range(2):
+                users, shared = checks.users(tree, None, locked=True)
+                self.assertTrue(users)
+                self.assertFalse(shared)
+            discovery.assert_called_once()
+        with patch.object(wr, "process_references", return_value=None):
+            self.assertTrue(wr.live_users(tree))
+        with patch.object(wr, "process_references", return_value=[]):
+            self.assertEqual(wr.live_users(tree), [])
+
     def test_cache_reuse_during_discovery_withholds_only_that_eviction(self):
         self.dirty()
         record = wr.guard(self.cfg, self.co).record

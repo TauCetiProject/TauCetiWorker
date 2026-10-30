@@ -1093,10 +1093,12 @@ def process_references():
 
 
 def referenced_users(repo: Path, references, *, session=None) -> list[str]:
+    if references is None:
+        return ["process observations unavailable"]
     target = os.path.realpath(repo)
     prefix = target.rstrip("/") + "/"
     found = []
-    for pid, process_session, label, paths in references or ():
+    for pid, process_session, label, paths in references:
         if session is not None and process_session == session:
             found.append(f"{pid} (owner session)")
         elif any(where == target or where.startswith(prefix) for where in paths):

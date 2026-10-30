@@ -95,9 +95,13 @@ class Checks:
                         if tree.name == "checkout" or tree.name.startswith(("restore-", "interrupted-restore-")):
                             info = tree.lstat()
                             self.generations[tree] = (generation, info.st_dev, info.st_ino)
-        self.references = wr.process_references()
         self.scans += 1
-        self.mounts = Path("/proc/self/mountinfo").read_text()
+        # Unsupported/unreadable observations withhold deletion, rather than
+        # aborting inventory or discarding the rest of this cleanup pass.
+        with contextlib.suppress(OSError):
+            self.references = wr.process_references()
+        with contextlib.suppress(OSError):
+            self.mounts = Path("/proc/self/mountinfo").read_text()
 
     def users(self, tree, session, *, locked=False):
         from . import work_recovery as wr
@@ -313,6 +317,8 @@ def _safe_once(state, tree, owner, *, locked=False):
     # mount table withholds this candidate, without affecting work admission.
     try:
         raw = checks.mounts if shared else Path("/proc/self/mountinfo").read_text()
+        if raw is None:
+            return "await-mount-evidence"
         wr._charge(read=len(raw))
         target = os.path.realpath(tree)
         for line in raw.splitlines():
