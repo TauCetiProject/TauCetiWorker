@@ -275,21 +275,28 @@ def recycle(cfg, *, now=None, dry=False):
     devices = {str(cfg.state.stat().st_dev)}
     with contextlib.suppress(OSError):
         devices.add(str(cfg.checkout.stat().st_dev))
-    applicable = (not request.get("devices") or bool(devices.intersection(request["devices"]))) and (
-        "workers" not in request or cfg.wid in request["workers"]
-    )
     last_pressure = row.get("last_pressure_at", 0)
+    if not isinstance(last_pressure, (float, int)) or not math.isfinite(last_pressure) or last_pressure > now:
+        last_pressure = 0
+    from .cache_storage import CRITICAL, LOW, headroom
+
     critical = False
     for location in (cfg.state, cfg.checkout):
         while not location.exists():
             location = location.parent
         usage = shutil.disk_usage(location)
-        from .cache_storage import CRITICAL, headroom
-
-        critical = critical or usage.free < headroom(usage.total, CRITICAL)
-    forced = (
-        applicable and request.get("until", 0) > now and (not valid or request.get("requested_at", 0) > last_pressure)
-    ) or (critical and (not valid or now - last_pressure > 300))
+        latched = read_json(activity_root() / f"critical-{location.stat().st_dev}.json").get("active", False)
+        critical |= usage.free < headroom(usage.total, CRITICAL) or (
+            latched and usage.free < headroom(usage.total, LOW)
+        )
+    # Emergency reclamation must not depend on collector availability or its records.
+    # Ordinary pressure still targets one worker and preserves young build trees.
+    forced = (critical and (not valid or now - last_pressure > 300)) or (
+        (not request.get("devices") or bool(devices.intersection(request["devices"])))
+        and ("workers" not in request or cfg.wid in request["workers"])
+        and request.get("until", 0) > now
+        and (not valid or request.get("requested_at", 0) > last_pressure)
+    )
     if valid and not forced and now - born < LIFETIME and not pending:
         return report
     with contextlib.ExitStack() as stack:
@@ -322,7 +329,7 @@ def recycle(cfg, *, now=None, dry=False):
         if not forced and now - born < LIFETIME:
             return report
         cache_result = fresh_report(now)
-        private_only = forced and not critical and valid and now - born < LIFETIME
+        private_only = forced and not critical and (not valid or now - born < LIFETIME)
         if private_only:
             # Drop old private artifact-store references, retaining the warm build tree.
             for path, anchor in cache_roots(cfg):
@@ -337,7 +344,7 @@ def recycle(cfg, *, now=None, dry=False):
             atomic_json(
                 marker,
                 dict(
-                    started_at=born if private_only else now,
+                    started_at=born if valid and private_only else now,
                     last_pressure_at=now if forced else row.get("last_pressure_at", 0),
                 ),
             )
@@ -405,6 +412,18 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     mounts = mount_points()
     configs = list(worker_configs())
     if not diagnostics_only:
+        from . import recovery_maintenance
+
+        # Already-retired data needs no source archival. Use the existing collector
+        # and deletion cursors instead of the activity preparer's tiny foreground slice.
+        if not dry:
+            try:
+                trash = recovery_maintenance.collect_discarded(worker_state_root().resolve())
+                report["recovery_trash"] = trash
+                for error in trash.get("errors", []):
+                    note(report, "errors", "recovery trash: " + error)
+            except Exception as error:
+                note(report, "errors", f"recovery trash cleanup: {error}")
         from .cache_storage import collect
 
         try:

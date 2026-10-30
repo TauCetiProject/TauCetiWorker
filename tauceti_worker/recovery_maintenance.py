@@ -564,15 +564,17 @@ def _cleanup(state, tree, root, work, observation=None):
         if reason:
             job["next_action"] = reason
             return
-        if not _promote(job, work):
-            job["next_action"] = "await-preservation-allowance"
-            return
         just_saved = False
         if job["phase"] == "save":
-            cfg = SimpleNamespace(state=state, wid=state.name)
+            # Disposable caches do not depend on permission to archive source.
             if not _evict_caches(tree, job, work):
                 job["next_action"] = "resume-cache-removal"
                 return
+        if not _promote(job, work):
+            job["next_action"] = "await-preservation-allowance"
+            return
+        if job["phase"] == "save":
+            cfg = SimpleNamespace(state=state, wid=state.name)
             saving_source = True
             snap = wr.inspect(tree, history=True)
             if snap.published:
@@ -963,6 +965,60 @@ class Sweep:
                 row["cleanup_oldest_at"] = min(row["cleanup_oldest_at"] or oldest, oldest)
                 action = job.get("next_action", "retry-cleanup")
                 row["cleanup_actions"][action] = row["cleanup_actions"].get(action, 0) + 1
+
+
+def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 1024**3):
+    """The low-priority collector drains retired trash, independently of source recovery."""
+    from . import work_recovery as wr
+
+    base = Path(base)
+    work = wr.Work(seconds=seconds, entries=entries, bytes=16 * 1024**2, removal_bytes=removal_bytes)
+    token = wr._WORK.set(work)
+    errors = []
+    try:
+        if not base.is_dir():
+            return dict(removed_bytes=0, errors=[])
+        with (base / ".recovery-housekeeping.lock").open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return dict(busy=True)
+            for state in base.iterdir():
+                work.charge(entries=1)
+                if state.is_symlink() or not state.is_dir():
+                    continue
+                parent = state / "recovery-cleanup"
+                directory = parent / "discarded"
+                if parent.is_symlink() or directory.is_symlink() or not directory.is_dir():
+                    continue
+                for path in directory.iterdir():
+                    work.charge(entries=1)
+                    if path.is_symlink() or not path.is_dir():
+                        continue
+                    cursor = path.with_name(path.name + ".json")
+                    job = read_json(cursor)
+                    info = path.stat()
+                    if (
+                        job.get("tree_identity") != [info.st_dev, info.st_ino]
+                        or not isinstance(job.get("stack", []), list)
+                        or any(not isinstance(part, str) for part in job.get("stack", []))
+                    ):
+                        job = dict(tree_identity=[info.st_dev, info.st_ino])
+                    try:
+                        if _remove(path, job, work):
+                            cursor.unlink(missing_ok=True)
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        errors.append(str(error)[:200])
+                    finally:
+                        if path.exists():
+                            atomic_json(cursor, job)
+    except wr.BudgetExhausted:
+        pass
+    except OSError as error:
+        errors.append(str(error)[:200])
+    finally:
+        wr._WORK.reset(token)
+    return dict(work.report(), errors=errors[:10])
 
 
 def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024):

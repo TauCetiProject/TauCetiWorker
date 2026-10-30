@@ -123,6 +123,28 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertTrue(garbage.exists())
         self.assertEqual(wr.summary(self.cfg.state.parent)["recovery_obsolete"], 0)
 
+    def test_collector_drains_only_retired_trash_and_resumes_its_cursor(self):
+        garbage = self.cfg.state / "recovery-cleanup/discarded/large"
+        garbage.mkdir(parents=True)
+        (garbage / "payload").write_bytes(b"x" * 32768)
+        source = self.cfg.state / "recovery/unfinished/source"
+        source.parent.mkdir(parents=True)
+        source.write_text("unpublished")
+        (garbage / "source-link").symlink_to(source.parent, target_is_directory=True)
+        maintenance.atomic_json(garbage.with_name(garbage.name + ".json"), dict(stack=None))
+        with patch.object(wr, "inspect", side_effect=AssertionError("trash needs no source archival")):
+            for step in range(10):
+                maintenance.collect_discarded(self.cfg.state.parent, removal_bytes=8192)
+                if not garbage.exists():
+                    break
+                if step == 0:
+                    # A copied/restored trash directory has new inode metadata.
+                    maintenance.atomic_json(
+                        garbage.with_name(garbage.name + ".json"), dict(tree_identity=[0, 0], stack=[""])
+                    )
+        self.assertFalse(garbage.exists())
+        self.assertEqual(source.read_text(), "unpublished")
+
     def restored(self, record, expected):
         dest = self.root / f"restore-{len(list(self.root.glob('restore-*')))}"
         clone = reconstruct(self.origin, record, self.root, dest.name)

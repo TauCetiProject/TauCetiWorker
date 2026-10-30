@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -118,7 +119,6 @@ class Retention(unittest.TestCase):
         private = self.cfg.state / "home/.cache/lake/payload"
         private.parent.mkdir(parents=True)
         private.write_text("old artifact")
-        retention.recycle(self.cfg, now=self.clock)
         atomic_json(
             activity.root() / "cache-pressure.json",
             dict(requested_at=self.clock + 10, until=self.clock + 200, workers=[self.cfg.wid]),
@@ -131,9 +131,18 @@ class Retention(unittest.TestCase):
         retention.recycle(self.cfg, now=self.clock + 30)
         self.assertTrue(private.exists())
 
-    def test_critical_space_reclaims_idle_private_cache_before_admission(self):
+    def test_critical_space_recovers_independently_and_through_hysteresis(self):
+        self.clock = time.time()
         cache = self.cache()
         self.cfg.state.mkdir(parents=True, exist_ok=True)
+        atomic_json(self.cfg.state / "cache-generation.json", dict(started_at=self.clock))
+        private = self.cfg.state / "home/.cache/lake/payload"
+        private.parent.mkdir(parents=True)
+        private.write_text("artifact")
+        atomic_json(
+            activity.root() / "cache-pressure.json",
+            dict(requested_at=self.clock, until=0, workers=[]),
+        )
         usage = shutil._ntuple_diskusage(1000, 960, 40)
         with (
             patch.object(retention.shutil, "disk_usage", return_value=usage),
@@ -143,9 +152,33 @@ class Retention(unittest.TestCase):
                 with round_.RoundContext(self.cfg):
                     self.fail("critical storage must defer new work")
         self.assertFalse(cache.exists())
+        self.assertFalse(private.exists())
+        cache = self.cache()
+        private.parent.mkdir(parents=True, exist_ok=True)
+        private.write_text("artifact")
+        atomic_json(
+            activity.root() / "cache-pressure.json",
+            dict(requested_at=self.clock + 1, until=self.clock + 200, workers=[]),
+        )
+        with patch.object(retention.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 900, 100)):
+            retention.recycle(self.cfg, now=self.clock + 301)
+        self.assertFalse(private.exists())
+        self.assertFalse(cache.exists())
         # Deferral released the round lock, and does not need an activity/paid round.
         with retention.locked(self.cfg.state / "round.lock"):
             pass
+
+    def test_critical_recovery_does_not_require_a_healthy_collector(self):
+        for request in ({}, {"requested_at": self.clock - 7201}, {"devices": 1, "until": "damaged"}):
+            with self.subTest(request=request):
+                cache = self.cache()
+                atomic_json(
+                    self.cfg.state / "cache-generation.json", dict(started_at=self.clock, last_pressure_at="damaged")
+                )
+                atomic_json(activity.root() / "cache-pressure.json", request)
+                with patch.object(retention.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 960, 40)):
+                    retention.recycle(self.cfg, now=self.clock + 1)
+                self.assertFalse(cache.exists())
 
     def test_short_rounds_do_not_renew_generation(self):
         cache = self.cache()

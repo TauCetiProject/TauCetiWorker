@@ -163,7 +163,7 @@ class Storage(unittest.TestCase):
 
     def test_pressure_requests_one_old_worker_and_obeys_cooldown(self):
         configs = []
-        for index in (1, 2):
+        for index in (1, 2, 3):
             state = self.root / str(index)
             private = state / "home/.cache/lake"
             private.mkdir(parents=True)
@@ -174,6 +174,17 @@ class Storage(unittest.TestCase):
             patch.dict(os.environ, {"TAUCETI_CACHE_MAX_GIB": "0.000001"}),
             patch.object(storage, "MIN_PRIVATE_RECLAIM", 4096),
         ):
+            with (
+                retention.locked(configs[0].state / "round.lock"),
+                retention.locked(configs[1].state / "verification-jobs/held.lock"),
+            ):
+                self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "3")
+                self.assertEqual(storage.collect(configs, opened=None)["private_reclamation_worker"], "1")
+                with (
+                    retention.locked(configs[1].state / "round.lock"),
+                    retention.locked(configs[2].state / "round.lock"),
+                ):
+                    self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "1")
             first = storage.collect(configs)
             self.assertEqual(first["private_reclamation_worker"], "1")
             atomic_json(configs[0].state / "cache-generation.json", dict(started_at=1, last_pressure_at=time.time()))
