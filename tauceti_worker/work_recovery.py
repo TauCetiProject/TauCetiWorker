@@ -680,6 +680,8 @@ def owner_session(owner):
     """Retain a dead leader's session until reboot or positive evidence of PID reuse."""
     import sys
 
+    if not isinstance(owner, dict):
+        raise ValueError("missing owner identity")
     session = owner.get("session")
     if session is None:
         return None
@@ -1092,7 +1094,7 @@ def _set_status(record: Path, state: str, reason: str = "") -> bool:
 
 
 def _darwin_process_references():
-    """Read accessible processes; unreadable same-user references withhold cleanup."""
+    """Read visible references, with the same per-process permission limits as Linux procfs."""
     import psutil
 
     result = []
@@ -1104,23 +1106,33 @@ def _darwin_process_references():
                 continue
             try:
                 process = psutil.Process(pid)
-                if process.status() in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}:
-                    continue
-                session = os.getsid(pid)
+                with contextlib.suppress(psutil.AccessDenied):
+                    if process.status() in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}:
+                        continue
+                session = None
+                with contextlib.suppress(PermissionError):
+                    session = os.getsid(pid)
                 paths = []
                 if pid not in skip:
-                    uids = process.uids()
+                    visible = False
+                    with contextlib.suppress(psutil.AccessDenied):
+                        uids = process.uids()
+                        visible = os.geteuid() == 0 or uids.real == os.getuid() or uids.effective == os.geteuid()
                     # Like Linux procfs, another user's private references are
                     # outside this best-effort observation. Inspect all as root.
-                    if os.geteuid() == 0 or uids.real == os.getuid() or uids.effective == os.geteuid():
-                        paths = [process.cwd()]
-                        files = process.open_files()
-                        _charge(entries=len(files))
-                        paths.extend(item.path for item in files)
+                    if visible:
+                        with contextlib.suppress(psutil.AccessDenied):
+                            paths.append(process.cwd())
+                        with contextlib.suppress(psutil.AccessDenied):
+                            files = process.open_files()
+                            _charge(entries=len(files))
+                            paths.extend(item.path for item in files)
                         paths = [os.path.realpath(where) for where in paths if where]
                 result.append((str(pid), session, f"{pid} (process)", paths))
             except (psutil.NoSuchProcess, ProcessLookupError):
                 continue  # Exits during observation are ordinary.
+            except psutil.AccessDenied:
+                continue  # Even constructing a private process identity may be denied.
     except (psutil.Error, OSError):
         return None
     return result

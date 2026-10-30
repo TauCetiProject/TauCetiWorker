@@ -116,7 +116,9 @@ stop a worker. Preparation always saves first and then always continues:
   boot/start identities protect recorded sessions without procfs
   across leader exit, PID reuse and reboot. Mount discovery uses all visible
   psutil partitions on macOS and the kernel mount table on Linux. Unavailable
-  process evidence, including unreadable same-user macOS processes, withholds deletion.
+  process inventories withhold deletion. Individual private cwd/open-file fields
+  remain best effort on both platforms; an unreadable field never erases visible
+  references or a recorded session membership.
   Process birth checks do not require PID namespace APIs. Repair-cache cleanup takes
   the consumer's existing per-record recovery lock and checks its actual-use generation. No cleanup takes
   the worker round lock. Unknown or unreadable ownership or mount information skips

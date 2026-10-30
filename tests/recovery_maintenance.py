@@ -276,6 +276,9 @@ class RecoveryMaintenance(unittest.TestCase):
         class Gone(ProcessError):
             pass
 
+        class Denied(ProcessError):
+            pass
+
         def process(pid, cwd="/", files=()):
             value = Mock(pid=pid)
             value.status.return_value = "running"
@@ -311,6 +314,7 @@ class RecoveryMaintenance(unittest.TestCase):
             pids=lambda: [*procs, 108],
             Error=ProcessError,
             NoSuchProcess=Gone,
+            AccessDenied=Denied,
             STATUS_ZOMBIE="zombie",
             STATUS_DEAD="dead",
         )
@@ -331,7 +335,12 @@ class RecoveryMaintenance(unittest.TestCase):
             self.assertIn("104 (owner session)", wr.referenced_users(tree, refs, session=104))
             parent.cwd.assert_not_called()
             foreign.cwd.assert_not_called()
-            cwd.open_files.side_effect = ProcessError("fixture inaccessible own process")
+            cwd.open_files.side_effect = Denied("fixture inaccessible private descriptors")
+            self.assertIn("102 (process)", wr.referenced_users(tree, wr.process_references()))
+            member.cwd.side_effect = Denied("fixture inaccessible private cwd")
+            member.open_files.side_effect = Denied("fixture inaccessible private descriptors")
+            self.assertIn("104 (owner session)", wr.referenced_users(tree, wr.process_references(), session=104))
+            api.pids = Mock(side_effect=ProcessError("fixture unavailable inventory"))
             self.assertIsNone(wr.process_references())
             self.assertTrue(wr.live_users(tree))
 
