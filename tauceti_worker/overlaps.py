@@ -499,6 +499,7 @@ def do_scan(w, sv, c, opts, bubble):
                 logdir=work,
                 label="conversation",
                 provider=profile.provider,
+                quota_cfg=w.cfg,
                 cancel_event=lease.lost,
             )
             if rc:

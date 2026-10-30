@@ -434,6 +434,29 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["provider_refunds"], 1)
         self.assertEqual(self.values["fix-10-head"], 0)
 
+    def test_subscription_refusal_preserves_recovery_at_the_infra_cap(self):
+        from tauceti_worker.constants import MAX_INFRA_REFUNDS
+
+        FakeVerification.failures = 100
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", return_value=1),
+            patch(
+                "tauceti_worker.agents.take_last_agent_infra_failure",
+                return_value="provider subscription limit reached",
+            ),
+        ):
+            self.assertFalse(self.run_recovery())
+            j = self.journal()
+            j["provider_refunds"] = MAX_INFRA_REFUNDS
+            rr.write(self.record, j, j["state"])
+            self.retry_now()
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.journal()["provider_refunds"], MAX_INFRA_REFUNDS)
+        self.assertNotEqual(self.journal()["state"], "content-failed")
+
     def test_post_launch_file_error_does_not_refund_content(self):
         FakeVerification.failures = 1
         with (

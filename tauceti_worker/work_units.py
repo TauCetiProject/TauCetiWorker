@@ -1495,7 +1495,11 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     reason = take_last_agent_infra_failure()
     if not reason:
         return
-    refunds = w.counters.incr(f"infra-{label}-{c.pr}")
+    refunds = (
+        w.counters.read(f"infra-{label}-{c.pr}")
+        if reason == "provider subscription limit reached"
+        else w.counters.incr(f"infra-{label}-{c.pr}")
+    )
     if refunds > MAX_INFRA_REFUNDS and reason != "provider subscription limit reached":
         warn_red(
             f"  {label} #{c.pr}: {reason}, but this head has already been refunded "

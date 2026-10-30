@@ -1071,8 +1071,11 @@ def run_agent_proc(
     ):
         from .quota import Quota
 
-        quota_reader = Quota(quota_cfg)
-        launch_credential = quota_reader.launch_credential(provider)
+        try:
+            quota_reader = Quota(quota_cfg)
+            launch_credential = quota_reader.launch_credential(provider)
+        except Exception:
+            quota_reader = None  # optional failure evidence must never become a launch dependency
     tail: deque[str] = deque(maxlen=20)
 
     def write_rendered(destination, rendered: str) -> None:

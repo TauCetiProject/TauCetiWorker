@@ -1292,11 +1292,16 @@ class Quota:
                 self._raw_path(provider, fp).unlink(missing_ok=True)
             elif code == 200:
                 refusal.unlink(missing_ok=True)
-                credential = getattr(self, "_usage_token_fps", {}).get(provider)
-                if credential:
-                    self._model_refusal_path(provider, credential).unlink(missing_ok=True)
         except OSError:
             pass
+        if code == 200:
+            credential = getattr(self, "_usage_token_fps", {}).get(provider)
+            if credential:
+                for path in self._model_refusal_paths(provider, credential):
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         return response
 
     def _auth_refusal_path(self, provider: str, fp: str | None) -> Path:
@@ -1312,41 +1317,67 @@ class Quota:
             else:
                 token = ((self._codex_creds() or {}).get("tokens") or {}).get("access_token")
             return self._fingerprint(token)
-        except (OSError, AttributeError, GitHubError):
+        except Exception:
             return None  # unavailable identity must never prevent a launch
 
     def _model_refusal_path(self, provider: str, credential: str) -> Path:
         return self._usage_dir(provider) / f"model-refusal-{provider}-{self._fingerprint(credential)}.json"
 
+    def _claude_usage_fallback(self) -> Path:
+        source = self._fingerprint(str(self._claude_creds_source()))
+        return self.cache_dir.parent.parent / ".quota-usage" / source
+
+    def _model_refusal_paths(self, provider: str, credential: str) -> list[Path]:
+        primary = self._model_refusal_path(provider, credential)
+        paths = [primary]
+        if provider == "claude" and getattr(self, "cfg", None) is not None:
+            paths += [
+                self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME / "usage" / primary.name,
+                self._claude_usage_fallback() / primary.name,
+            ]
+        return list(dict.fromkeys(paths))
+
     def note_model_refusal(self, provider: str, credential: str | None) -> None:
         if not credential:
             return
         at = time.time()
-        path = self._model_refusal_path(provider, credential)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            _write_json_atomic(path, {"at": at, "until": at + RATE_LIMIT_RECHECK_MAX_S})
-        except OSError:
-            pass  # the round still stops and backs off if its evidence cannot be persisted
+        for path in self._model_refusal_paths(provider, credential):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _write_json_atomic(path, {"at": at, "until": at + RATE_LIMIT_RECHECK_MAX_S})
+                return
+            except OSError:
+                pass  # try the same state fallback as the pacer, without acquiring its fetch lock
 
     def _model_refusal(self, provider: str) -> Provider | None:
         credential = getattr(self, "_usage_token_fps", {}).get(provider)
         if not credential:
             return None
-        record = _read_json_file(self._model_refusal_path(provider, credential))
-        if not isinstance(record, dict):
-            return None
-        at, until, now = record.get("at"), record.get("until"), time.time()
-        if not (_finite_num(at) and _finite_num(until) and at <= now < until <= at + RATE_LIMIT_RECHECK_MAX_S):
+        now, left = time.time(), 0
+        for path in self._model_refusal_paths(provider, credential):
+            record = _read_json_file(path)
+            if not isinstance(record, dict):
+                continue
+            at, until = record.get("at"), record.get("until")
+            if _finite_num(at) and _finite_num(until) and at <= now < until <= at + RATE_LIMIT_RECHECK_MAX_S:
+                left = max(left, until - now)
+        if not left:
             return None
         return Provider(
             provider,
             False,
             None,
             error=f"{provider} model reported a subscription limit; retrying later",
-            retry_after=until - now,
+            retry_after=left,
             model_refusal=True,
         )
+
+    def _with_model_refusal(self, provider: str, result: Provider) -> Provider:
+        # Preserve stronger evidence and authentication recovery, rather than hiding
+        # a real 401 or an exhausted quota window behind the short model retry.
+        if result.available or result.telemetry_unavailable or _unavail_reason(result)[0]:
+            return self._model_refusal(provider) or result
+        return result
 
     def _telemetry_failure(self, provider: str, fp: str | None, error: str, *, code=None, retry_after=None) -> Provider:
         rejection = _read_json_file(self._auth_refusal_path(provider, fp))
@@ -1414,8 +1445,7 @@ class Quota:
             if getattr(self, "cfg", None) is not None and not hasattr(self, "_claude_usage_directory"):
                 # Container credentials are commonly mounted read-only. Use the shared worker-state
                 # root in that case, rather than losing caching or requiring a writable credential.
-                source = self._fingerprint(str(self._claude_creds_source()))
-                self._claude_usage_directory = self.cache_dir.parent.parent / ".quota-usage" / source
+                self._claude_usage_directory = self._claude_usage_fallback()
                 with self._usage_lock(account, fp) as acquired:
                     yield acquired
                 return
@@ -1871,7 +1901,7 @@ class Quota:
 
     def codex(self, *, refresh: bool = False) -> Provider:
         result = self._codex_pass(refresh=refresh)
-        return self._model_refusal("codex") or result
+        return self._with_model_refusal("codex", result)
 
     def _codex_pass(self, *, refresh: bool = False) -> Provider:
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
@@ -2187,8 +2217,8 @@ class Quota:
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
     ) -> tuple[Provider, list[Reading] | None]:
         result = self._claude_usage(fp, tok, refresh=refresh, account=account)
-        refusal = self._model_refusal("claude")
-        return (refusal, None) if refusal else result
+        verdict = self._with_model_refusal("claude", result[0])
+        return (verdict, None) if verdict.model_refusal else result
 
     def _claude_usage(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None

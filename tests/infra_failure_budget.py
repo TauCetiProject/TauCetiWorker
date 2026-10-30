@@ -188,6 +188,16 @@ with tempfile.TemporaryDirectory() as state:
         else:
             check("subscription refusal always stops the round", False, True)
     check("repeated subscription refusals cannot exhaust a PR's allowance", w.counters.read(KEYS[0]), 0)
+    check(
+        "subscription refusals leave the ambiguous-refund allowance intact", w.counters.read(f"infra-fix-{CAND.pr}"), 0
+    )
+    w.counters.write(KEYS[0], 1)
+    agents._LAST_AGENT_FAILURE = "provider returned 529"
+    try:
+        wu._refund_infra_failure(w, CAND, "fix", KEYS)
+    except NoProgress:
+        pass
+    check("a later genuine 529 still gets its refund", w.counters.read(KEYS[0]), 0)
 
 agents._LAST_AGENT_FAILURE = None
 print("\nFAIL" if fails else "\nall infra-failure budget checks passed")

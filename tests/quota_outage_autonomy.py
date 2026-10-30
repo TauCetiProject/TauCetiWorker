@@ -404,6 +404,48 @@ def test_real_model_refusal_is_scoped_bounded_and_recoverable(root):
     assert not q._model_refusal_path("claude", quota.Quota._fingerprint("launch-token")).exists()
 
 
+def test_readonly_credentials_share_model_refusals(root):
+    q = worker(root)
+    source = root / ".claude"
+    source.mkdir()
+    (source / quota.CLAUDE_QUOTA_DIRNAME).write_text("read-only credential mount")
+    credential = quota.Quota._fingerprint("token")
+    q.note_model_refusal("claude", credential)
+    sibling = worker(root)
+    with patch.object(quota, "_http_get_json", return_value=(429, {}, 7200)):
+        status, _ = sibling._claude_pass("fp", "token", refresh=True, account="account")
+    assert status.model_refusal
+    rejected = quota.Provider("claude", False, None, error="claude usage HTTP 401")
+    assert sibling._with_model_refusal("claude", rejected) is rejected
+    exhausted = quota.Provider(
+        "claude", False, None, [quota.Window("session", 100, 50, time.time() + 7200, "exhausted")]
+    )
+    assert sibling._with_model_refusal("claude", exhausted) is exhausted
+    with (
+        patch.object(quota.time, "time", return_value=time.time() + 7201),
+        patch.object(quota, "_http_get_json", return_value=(200, {"five_hour": None}, None)),
+    ):
+        sibling._claude_pass("fp", "token", refresh=True, account="account")
+    assert all(
+        not p.exists()
+        for p in sibling._model_refusal_paths("claude", credential)
+        if p.parent != source / quota.CLAUDE_QUOTA_DIRNAME / "usage"
+    )
+    with patch.object(q, "_claude_creds", return_value=({"accessToken": 99}, False)):
+        assert q.launch_credential("claude") is None
+    assert (
+        agents.run_agent_proc(
+            [sys.executable, "-c", "print('ok')"],
+            env=dict(os.environ),
+            logdir=root / "logs",
+            label="agent-claude",
+            provider="claude",
+            quota_cfg=object(),
+        )
+        == 0
+    )
+
+
 def test_diagnostics_never_gate_requests(root):
     q = worker(root)
     directory = root / "state/quota-requests"
@@ -441,6 +483,7 @@ if __name__ == "__main__":
         test_changed_unknown_account_does_not_inherit_long_wait,
         test_cli_preserves_soft_handoff_without_granting_outage_permission,
         test_real_model_refusal_is_scoped_bounded_and_recoverable,
+        test_readonly_credentials_share_model_refusals,
         test_diagnostics_never_gate_requests,
     ):
         with tempfile.TemporaryDirectory() as directory:
