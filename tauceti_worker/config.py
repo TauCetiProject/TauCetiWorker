@@ -91,6 +91,8 @@ def validate_extra_roadmap_prompt(value: str) -> str:
     text = value.strip()
     if not text:
         raise ValueError("extra roadmap prompt must not be empty")
+    if "\0" in text:
+        raise ValueError("extra roadmap prompt must not contain a NUL byte")
     if len(text) > EXTRA_ROADMAP_PROMPT_MAX_CHARS:
         raise ValueError(
             f"extra roadmap prompt is {len(text)} characters; the limit is {EXTRA_ROADMAP_PROMPT_MAX_CHARS}"

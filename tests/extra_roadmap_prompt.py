@@ -41,6 +41,7 @@ try:
     # ---- the validator and the live accessor -------------------------------------------------
     check("validator strips surrounding whitespace", tc.validate_extra_roadmap_prompt(f"  {GUIDANCE}\n") == GUIDANCE)
     rejects("blank guidance is rejected", lambda: tc.validate_extra_roadmap_prompt("   \n"), "must not be empty")
+    rejects("NUL bytes are rejected", lambda: tc.validate_extra_roadmap_prompt("a\0b"), "NUL byte")
     rejects(
         "oversized guidance is rejected",
         lambda: tc.validate_extra_roadmap_prompt("x" * (tc.EXTRA_ROADMAP_PROMPT_MAX_CHARS + 1)),
@@ -117,10 +118,17 @@ try:
     check("spec normalises the guidance", spec.extra_roadmap_prompt == GUIDANCE)
     check("spec serialises the guidance", spec.as_dict()["extra_roadmap_prompt"] == GUIDANCE)
     argv = spec.work_argv()
+    check("spec passes --extra-roadmap-prompt to the worker", f"--extra-roadmap-prompt={GUIDANCE}" in argv)
+    dashed = wm.WorkerSpec(id="w", only=("roadmap",), extra_roadmap_prompt="--Topology first, then Algebra")
+    parsed = tc.build_parser().parse_args(dashed.work_argv()[3:])
     check(
-        "spec passes --extra-roadmap-prompt to the worker", argv[argv.index("--extra-roadmap-prompt") + 1] == GUIDANCE
+        "guidance that starts with a dash survives the work argv",
+        parsed.extra_roadmap_prompt == "--Topology first, then Algebra",
     )
-    check("a plain spec passes no flag", "--extra-roadmap-prompt" not in wm.WorkerSpec(id="plain").work_argv())
+    check(
+        "a plain spec passes no flag",
+        not any(a.startswith("--extra-roadmap-prompt") for a in wm.WorkerSpec(id="plain").work_argv()),
+    )
     check("unset field stays unset", wm.WorkerSpec.from_dict({"id": "w"}, 0).extra_roadmap_prompt is None)
     check(
         "guidance changes the fingerprint (restarts the worker)",
@@ -163,6 +171,48 @@ try:
     check(
         "legacy argv import maps --extra-roadmap-prompt",
         wm.parse_legacy_config(legacy)[0].extra_roadmap_prompt == GUIDANCE,
+    )
+    legacy.write_text(f'./tauceti work --loop --worker-id worker9 --only roadmap "--extra-roadmap-prompt={GUIDANCE}"\n')
+    check(
+        "legacy argv import accepts the = form work_argv emits",
+        wm.parse_legacy_config(legacy)[0].extra_roadmap_prompt == GUIDANCE,
+    )
+    legacy.write_text('./tauceti work --loop --worker-id worker9 --extra-roadmap-prompt "first line\nsecond line"\n')
+    rejects(
+        "a value spanning lines is a located config error, not a crash",
+        lambda: wm.parse_legacy_config(legacy),
+        "workers.sh:1:",
+    )
+
+    from tauceti_worker import tui
+
+    cmd = tui.launch_cmd("roadmap", "auto", False, True, "Topology", None, extra_roadmap_prompt="--Topology first")
+    check(
+        "dashboard launch command carries the guidance as one argument",
+        "--extra-roadmap-prompt=--Topology first" in cmd,
+    )
+    check(
+        "dashboard launch command without guidance omits the flag",
+        not any(a.startswith("--extra-roadmap-prompt") for a in tui.launch_cmd(None, "auto", False, False, None, None)),
+    )
+    saved_mgr = wm.ensure_manager
+    wm.ensure_manager = lambda config: None
+    try:
+        added = wm.add_dashboard_worker(
+            tmp / "dash.toml",
+            only="roadmap",
+            agent="auto",
+            bubble=False,
+            roadmap_only="Topology",
+            roadmap_skip=None,
+            extra_roadmap_prompt=GUIDANCE,
+        )
+    finally:
+        wm.ensure_manager = saved_mgr
+    check(
+        "dashboard-added worker keeps the guidance",
+        wm.load_worker_specs(tmp / "dash.toml")[0].extra_roadmap_prompt == GUIDANCE
+        and added.extra_roadmap_prompt == GUIDANCE,
     )
 
     status = "\n".join(

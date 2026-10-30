@@ -340,7 +340,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         metavar="TEXT",
         help="for roadmap rounds, extra guidance appended to the agent's prompt — e.g. "
         '--extra-roadmap-prompt "Work on the material relevant to Higher Topos Theory". It steers the '
-        "choice of target (and of area, when none is pinned) within the designated roadmap; it "
+        'choice of target within the designated roadmap (and of area under --roadmap-only ""); it '
         "cannot override --roadmap-skip, other contributors' claims, or the repository's rules. "
         f"At most {EXTRA_ROADMAP_PROMPT_MAX_CHARS} characters. Overrides $TAUCETI_EXTRA_ROADMAP_PROMPT for this run",
     )

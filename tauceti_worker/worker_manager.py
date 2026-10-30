@@ -483,7 +483,6 @@ class WorkerSpec:
             (self.github_account, "--github-account"),
             (self.github_state_url, "--github-state-url"),
             (self.github_state_token_file, "--github-state-token-file"),
-            (self.extra_roadmap_prompt, "--extra-roadmap-prompt"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -491,6 +490,9 @@ class WorkerSpec:
         ):
             if field is not None:
                 argv += [flag, field]
+        if self.extra_roadmap_prompt is not None:
+            # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
+            argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
         if self.stream:
             argv.append("--stream")
         if self.isolate_home:
@@ -1616,6 +1618,7 @@ def add_dashboard_worker(
     roadmap_only: str | None,
     roadmap_skip: str | None,
     github_account: str | None = None,
+    extra_roadmap_prompt: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1632,6 +1635,7 @@ def add_dashboard_worker(
             sandbox="bubble" if bubble else "host",
             roadmap_only=roadmap_only,
             roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
+            extra_roadmap_prompt=extra_roadmap_prompt,
         )
         _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)
@@ -1907,7 +1911,10 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        argv = shlex.split(line)
+        try:
+            argv = shlex.split(line)
+        except ValueError as exc:
+            raise WorkersError(f"{path}:{number}: {exc} (a value spanning several lines cannot be imported)") from None
         if len(argv) < 3 or Path(argv[0]).name != "tauceti" or argv[1] != "work" or "--loop" not in argv:
             raise WorkersError(f"{path}:{number}: expected a `tauceti work --loop` command")
         values: dict = {"only": []}
@@ -1929,10 +1936,13 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             if token == "--ignore-claims":
                 values["respect_claims"] = False
                 continue
-            try:
-                value = next(flags)
-            except StopIteration:
-                raise WorkersError(f"{path}:{number}: {token} needs a value") from None
+            if token.startswith("--") and "=" in token:
+                token, value = token.split("=", 1)
+            else:
+                try:
+                    value = next(flags)
+                except StopIteration:
+                    raise WorkersError(f"{path}:{number}: {token} needs a value") from None
             key = {
                 "--worker-id": "id",
                 "--agent": "agent",
