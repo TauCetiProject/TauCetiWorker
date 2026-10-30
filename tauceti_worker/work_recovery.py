@@ -1117,6 +1117,7 @@ def _darwin_process_references():
                         files = process.open_files()
                         _charge(entries=len(files))
                         paths.extend(item.path for item in files)
+                        paths = [os.path.realpath(where) for where in paths if where]
                 result.append((str(pid), session, f"{pid} (process)", paths))
             except (psutil.NoSuchProcess, ProcessLookupError):
                 continue  # Exits during observation are ordinary.

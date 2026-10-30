@@ -33,7 +33,7 @@ class RecoveryMaintenance(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.env = patch.dict(
             os.environ,
             {
@@ -196,6 +196,11 @@ class RecoveryMaintenance(unittest.TestCase):
             self.assertEqual(checks.users(trees[0], None, locked=True), ([], True))
             self.assertTrue(checks.users(trees[1], None, locked=True)[0])
             self.assertEqual(checks.users(trees[2], None, locked=True), ([], True))
+            alias = self.root / "state-alias"
+            alias.symlink_to(state.parent, target_is_directory=True)
+            self.assertEqual(
+                checks.users(alias / state.name / "recovery/first/checkout", None, locked=True), ([], True)
+            )
             self.assertEqual(discovery.call_count, 1)
         wr.atomic_json(trees[2].parent / "cache-use.json", dict(generation="new invocation"))
         with patch.object(wr, "live_users", return_value=["new verifier"]) as fresh:
@@ -280,11 +285,14 @@ class RecoveryMaintenance(unittest.TestCase):
             return value
 
         tree = self.root / "retained"
+        tree.mkdir()
+        alias = self.root / "retained-alias"
+        alias.symlink_to(tree, target_is_directory=True)
         own = process(os.getpid(), str(tree))
         own.parents.return_value = [SimpleNamespace(pid=101)]
         parent = process(101, str(tree))
         cwd = process(102, str(tree / "nested"))
-        opened = process(103, "/", [str(tree / "Draft.lean")])
+        opened = process(103, "/", [str(alias / "Draft.lean")])
         member = process(104)
         sibling = process(105, str(tree) + "-other")
         foreign = process(106)
@@ -362,6 +370,8 @@ class RecoveryMaintenance(unittest.TestCase):
         cache = tree / ".lake/generated"
         cache.parent.mkdir()
         cache.write_text("disposable cache")
+        alias = self.root / "mounted-checkout-alias"
+        alias.symlink_to(tree, target_is_directory=True)
         wr.atomic_json(record / "cache-use.json", dict(generation="fixture stopped use"))
         maintenance.defer_caches(self.cfg.state, record)
         api = SimpleNamespace(disk_partitions=Mock(return_value=[SimpleNamespace(mountpoint="/")]))
@@ -396,7 +406,7 @@ class RecoveryMaintenance(unittest.TestCase):
             self.tick()
             self.assertFalse(cache.exists())
             maintenance.atomic_json(record / "recovery.json", dict(state="obsolete"))
-            api.disk_partitions.return_value = [SimpleNamespace(mountpoint=str(tree / "mounted"))]
+            api.disk_partitions.return_value = [SimpleNamespace(mountpoint=str(alias / "mounted"))]
             self.assertFalse(maintenance.discard_record(self.cfg.state, record))
             api.disk_partitions.side_effect = OSError("fixture unavailable mounts")
             self.assertFalse(maintenance.discard_record(self.cfg.state, record))

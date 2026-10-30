@@ -112,6 +112,7 @@ class Checks:
     def users(self, tree, session, *, locked=False):
         from . import work_recovery as wr
 
+        tree = tree.resolve()  # Match capture's canonical base, including macOS /var aliases.
         if self.scans == 0:
             self.capture()
         if self.references is None:
