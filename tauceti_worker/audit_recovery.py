@@ -417,6 +417,10 @@ def recover(cfg, opts, previous: dict) -> bool:
         raise NoProgress("security-audit: retained operational recovery is waiting for its cooldown")
     from .loop import resolve_work_model
 
+    # Loop-launched operational recovery retains its soft-pacing exemption even
+    # when the audit used Claude and recovery uses Codex. This lets retained work
+    # repair itself without waiting on a second provider's burn curve. The handoff
+    # never waives exhaustion/auth failures or grants telemetry-outage permission.
     resolve_work_model(
         cfg,
         "codex",

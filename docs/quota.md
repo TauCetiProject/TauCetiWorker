@@ -75,6 +75,11 @@ credential. A subscription refusal never consumes a PR's infrastructure-refund
 allowance. A review-engine provider refusal posts nothing and does not charge the
 PR's review-error budget.
 
+Loop-launched operational audit recovery retains its exemption from soft pacing,
+including when its Codex recovery provider differs from the audit provider.
+This allows retained audit work to repair itself without an additional burn-curve
+wait. Known hard blocks and normally paced telemetry requirements still apply.
+
 Actual usage HTTP attempts are recorded separately from cached status reads under
 `<worker-state-root>/quota-requests/requests.jsonl`. Each attempt has a `request`
 record and, if it completes, a matching `response` record. Fields include worker,
