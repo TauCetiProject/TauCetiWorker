@@ -80,6 +80,32 @@ def roadmap_skip() -> list[str]:
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
 
 
+EXTRA_PROMPT_MAX_CHARS = 4096
+
+
+def validate_extra_prompt(value: str) -> str:
+    """Normalise an operator's extra prompt, or raise ValueError. Shared by the `--extra-prompt` flag
+    and the `extra_prompt` workers.toml field so a bad value fails at the configuration boundary
+    rather than inside a round. Blank text is rejected (unset is the way to have none); the cap keeps
+    a pasted file from crowding out the task prompt itself."""
+    text = value.strip()
+    if not text:
+        raise ValueError("extra prompt must not be empty")
+    if len(text) > EXTRA_PROMPT_MAX_CHARS:
+        raise ValueError(f"extra prompt is {len(text)} characters; the limit is {EXTRA_PROMPT_MAX_CHARS}")
+    return text
+
+
+def extra_prompt() -> str | None:
+    """Operator-supplied guidance for roadmap rounds, read live from TAUCETI_EXTRA_PROMPT so loop
+    children and dashboard-launched rounds inherit it. Rendered into the roadmap prompt as a block of
+    steering text: it refines the choice of target within the designated roadmap but never overrides
+    the skip list, other contributors' claims, or the repository's hard rules. None when unset or
+    blank."""
+    raw = os.environ.get("TAUCETI_EXTRA_PROMPT", "")
+    return raw.strip() or None
+
+
 def roadmap_extra_identities() -> list[str]:
     """Additional GitHub logins, beyond the worker's own `gh auth` identity, whose registered
     intentions this worker should treat as its own (so it won't avoid targets they've claimed).

@@ -47,6 +47,7 @@ from .budget import BudgetError
 from .budget_cli import add_budget_parser, cmd_budget
 from .claude_api import api_mode, configure_api
 from .config import (
+    EXTRA_PROMPT_MAX_CHARS,
     AdmissionUnavailable,
     ClaimCollision,
     Config,
@@ -62,6 +63,7 @@ from .config import (
     sanitize_wid,
     security_audit_problem,
     set_log_file,
+    validate_extra_prompt,
     warn_red,
 )
 from .constants import (
@@ -127,6 +129,7 @@ examples:
   tauceti work --pr 412,415 --only review,fix   only those two PRs, only those two units
   tauceti work --only roadmap --roadmap-only ReductiveGroups
   tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
+  tauceti work --only roadmap --extra-prompt "Work on the material relevant to Higher Topos Theory"
   tauceti work --only review --agent claude --bubble
                                         review with Opus inside the Bubble sandbox
   tauceti work --dry-run                show what it WOULD do; act on nothing
@@ -141,6 +144,7 @@ environment (flags win; full reference linked below):
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
+  TAUCETI_EXTRA_PROMPT   extra guidance for roadmap rounds; default for --extra-prompt
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
@@ -327,6 +331,17 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
         "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
         "$TAUCETI_ROADMAP_SKIP for this run",
+    )
+    p.add_argument(
+        "--extra-prompt",
+        dest="extra_prompt",
+        default=None,
+        metavar="TEXT",
+        help="for roadmap rounds, extra guidance appended to the agent's prompt — e.g. "
+        '--extra-prompt "Work on the material relevant to Higher Topos Theory". It steers the '
+        "choice of target (and of area, when none is pinned) within the designated roadmap; it "
+        "cannot override --roadmap-skip, other contributors' claims, or the repository's rules. "
+        f"At most {EXTRA_PROMPT_MAX_CHARS} characters. Overrides $TAUCETI_EXTRA_PROMPT for this run",
     )
     p.add_argument(
         "--roadmap-extra-identities",
@@ -1289,6 +1304,18 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # --extra-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
+    # extra_prompt() so loop children see it without a flag of their own.
+    if getattr(args, "extra_prompt", None) is not None:
+        try:
+            os.environ["TAUCETI_EXTRA_PROMPT"] = validate_extra_prompt(args.extra_prompt)
+        except ValueError as e:
+            raise Die(f"--extra-prompt: {e}") from None
+    elif os.environ.get("TAUCETI_EXTRA_PROMPT") is not None:
+        try:
+            validate_extra_prompt(os.environ["TAUCETI_EXTRA_PROMPT"])
+        except ValueError as e:
+            raise Die(f"$TAUCETI_EXTRA_PROMPT: {e}") from None
     # --roadmap-extra-identities and --ignore-claims override the env and are inherited by loop
     # children (read live via roadmap_extra_identities() / respect_claims()).
     if getattr(args, "roadmap_extra_identities", None) is not None:

@@ -118,6 +118,7 @@ try:
         roadmap_skip=("Algebra",),
         roadmap_extra_identities=("Maintainer",),
         respect_claims=False,
+        extra_prompt="Work on the material relevant to Higher Topos Theory",
         source="https://example.invalid/source",
         author_model="gpt-5",
         author_effort="high",
@@ -255,6 +256,7 @@ try:
                         "roadmap_skip": ["Algebra"],
                         "roadmap_extra_identities": ["maintainer"],
                         "respect_claims": False,
+                        "extra_prompt": "Work on the material relevant to Higher Topos Theory",
                         "source": "https://example.invalid/source",
                         "author_model": "claude-opus-5",
                         "author_effort": "high",
@@ -304,6 +306,7 @@ worker3 — backing off
             skip: Algebra
             also treat as self: maintainer
             claims: ignored
+  guidance: Work on the material relevant to Higher Topos Theory
   source:   https://example.invalid/source
   author:   model claude-opus-5 · high effort
   options:  stream output

@@ -149,6 +149,7 @@ RUN_STDLIB=(
   shared_build_caches.py
   shared_repositories.py
   source_argument.py
+  extra_prompt.py
   spread_candidates.py
   ssl_cert_file.py
   status_labels.py
