@@ -132,13 +132,16 @@ def observe(
                 if cached is not None:
                     has_cache = True
                     headroom |= q._codex_from_payload(*cached).available
+        model_releases = []
         for path in q._model_refusal_paths(provider, token_fp):
             refusal = record(path)
             records.append(refusal)
             if isinstance(refusal, dict):
                 at, until = refusal.get("at"), refusal.get("until")
                 if _finite_num(at) and _finite_num(until) and at <= now < until <= at + RATE_LIMIT_RECHECK_MAX_S:
-                    releases.append(until)
+                    model_releases.append(until)
+        if model_releases:
+            releases.append(max(model_releases))
         if provider == "claude":
             # Bootstrap annotations can change without any new usage sample.
             ledger = record(q._bootstrap_paths()[0]) or {}
@@ -146,8 +149,8 @@ def observe(
             for window in ("session", "weekly"):
                 key = q._episode_key(window)
                 reservation = ledger.get(key)
-                active[key] = reservation
                 if isinstance(reservation, dict):
+                    active[key] = reservation
                     at = reservation.get("at")
                     duration = (
                         CLAUDE_BOOTSTRAP_TIMEOUT_S + CLAUDE_BOOTSTRAP_STALE_MARGIN_S
@@ -190,9 +193,11 @@ class QuotaWait:
         self.seen = {}
         self.attempted = set()
         self.measured = {}
+        self.selected_credentials = {}
         self.previous = {}
         self.context = {}
         self.pending = None
+        self.pending_observations = {}
         self.last_selection = -math.inf
 
     def observations(self):
@@ -216,7 +221,10 @@ class QuotaWait:
             }
             self.pending = due, changed
             inspect = due | changed
-            fetch = due | {p for p in changed if baseline.get(p) and (p, baseline[p].identity) not in self.attempted}
+            hints = {p: baseline.get(p) or self.pending_observations.get(p) for p in changed}
+            fetch = due | {
+                p for p, value in hints.items() if value is not None and (p, value.identity) not in self.attempted
+            }
             options = dict(inspect=inspect, fetch=fetch, previous=self.previous, refresh_providers=due)
             if self.context.get("directory") is not None:
                 quota._wait_cache_directory = self.context["directory"]
@@ -233,6 +241,10 @@ class QuotaWait:
         changed = self.pending[1] if self.pending is not None else set()
         inspected = due | changed
         self.identities.update(getattr(quota, "_wait_identities", {}))
+        self.selected_credentials.update(getattr(quota, "_usage_token_fps", {}))
+        for p, value in getattr(quota, "_wait_identities", {}).items():
+            if value is None:
+                self.selected_credentials[p] = None
         if "claude" in inspected:
             self.context["directory"] = getattr(quota, "_claude_usage_directory", None)
         after = self.observations()
@@ -247,33 +259,26 @@ class QuotaWait:
             elif p in changed and not (verdict.error or "").startswith("local usage unavailable"):
                 self.deadlines[p] = min(self.deadlines[p], now + recheck(verdict, now))
                 self.monotonic_deadlines[p] = min(self.monotonic_deadlines[p], mono + recheck(verdict, now))
-                if baseline.get(p) and baseline[p].release_at is not None:
-                    release = baseline[p].release_at
-                    self.deadlines[p] = min(self.deadlines[p], release)
-                    self.monotonic_deadlines[p] = min(self.monotonic_deadlines[p], mono + max(0, release - now))
             if p in inspected:
                 if baseline.get(p):
                     self.seen[p] = baseline[p]
                 elif after.get(p):
                     # First successful observation establishes a baseline. A
                     # failed initial read is never itself a recovery event.
-                    self.seen[p] = after[p]
+                    self.seen[p] = self._first_observation(p, after[p])
                 if p in getattr(quota, "_usage_attempted", set()):
                     measured = getattr(quota, "_usage_token_fps", {}).get(p)
                     self.measured[p] = measured
                     for value in (baseline.get(p), after.get(p)):
                         if value is not None and measured == value.credential:
                             self.attempted.add((p, value.identity))
-                    if (
-                        after.get(p)
-                        and (not baseline.get(p) or after[p].identity == baseline[p].identity)
-                        and not after[p].headroom
-                    ):
+                    if after.get(p) and measured == after[p].credential and not after[p].headroom:
                         # The selection just published its own refusal/blocked
                         # cache. Do not treat that publication as peer recovery.
                         self.seen[p] = after[p]
         self.previous = snap
         self.pending = None
+        self.pending_observations = {}
         self.last_selection = mono
 
     def wait(self):
@@ -287,11 +292,12 @@ class QuotaWait:
             due = {p for p in self.deadlines if now >= self.deadlines[p] or mono >= self.monotonic_deadlines[p]}
             if due:
                 self.pending = due, set()
+                self.pending_observations = {}
                 return
             current = self.observations()
             for p, value in current.items():
                 if value is not None and p not in self.seen:
-                    self.seen[p] = value
+                    self.seen[p] = self._first_observation(p, value)
                     if self.measured.get(p) == value.credential:
                         self.attempted.add((p, value.identity))
             changed = {p for p, value in current.items() if value is not None and value != self.seen.get(p)}
@@ -301,15 +307,9 @@ class QuotaWait:
                 if any(not current[p].cached and (p, current[p].identity) not in self.attempted for p in changed):
                     self.sleep(random.uniform(0.01, 5))
                 self.pending = set(), changed
+                self.pending_observations = current
                 log("quota: local observation changed for " + ", ".join(sorted(changed)) + "; rechecking selection")
                 return
-            for p in changed:
-                value = current[p]
-                if value.release_at is not None:
-                    self.deadlines[p] = min(self.deadlines[p], value.release_at)
-                    self.monotonic_deadlines[p] = min(
-                        self.monotonic_deadlines[p], mono + max(0, value.release_at - now)
-                    )
             until = min(
                 max(0, LOCAL_CHECK_SECONDS - (self.monotonic() - tick_started)),
                 min(max(0, d - now) for d in self.deadlines.values()),
@@ -324,3 +324,11 @@ class QuotaWait:
             min(max(0, d - mono) for d in self.monotonic_deadlines.values()),
         )
         return now + remaining
+
+    def _first_observation(self, provider, value):
+        if provider in self.selected_credentials and self.selected_credentials[provider] != value.credential:
+            # Even if the observer missed the initial read, normal selection
+            # established which credential it measured (or that it was absent).
+            # A different subsequent credential is a real recovery hint.
+            return Observation("", "selected credential", None)
+        return value

@@ -262,7 +262,7 @@ def test_keychain_and_custom_command():
         sleep.assert_called_once_with(3600)
 
 
-def test_outer_loop_reaches_launch(*, ignore=False):
+def test_outer_loop_reaches_launch(*, ignore=False, stop_wait=False):
     from tauceti_worker import config, repair_recovery, verification_jobs
 
     with fixture(agent="claude" if ignore else "auto") as f, ExitStack() as stack:
@@ -282,7 +282,9 @@ def test_outer_loop_reaches_launch(*, ignore=False):
             (loop, "github_budget", {}),
         ):
             stack.enter_context(patch.object(module, name, return_value=result))
-        stack.enter_context(patch.object(loop.time, "sleep", side_effect=f.clock.sleep))
+        stack.enter_context(
+            patch.object(loop.time, "sleep", side_effect=loop._LoopTerminated if stop_wait else f.clock.sleep)
+        )
         launched = []
 
         def launch(tail):
@@ -296,6 +298,9 @@ def test_outer_loop_reaches_launch(*, ignore=False):
             only=["review"],
             agent="claude" if ignore else "auto",
         )
+        if stop_wait:
+            assert result == 143 and not launched
+            return
         assert result == 130
         assert 100 <= f.clock.mono <= 130, f.clock.mono
         assert len(launched) == 1
@@ -370,7 +375,12 @@ def test_first_failed_observation_and_macos_selection():
         assert len(f.calls) == 2
     with fixture(agent="claude") as f:
         select(f, "claude")
+        known = dict(f.wait.identities)
         f.wait.reset()
+        assert f.wait.identities == known
+        f.wait = quota_wait.QuotaWait(
+            f.cfg, "claude", wall=lambda: f.clock.now, monotonic=lambda: f.clock.mono, sleep=f.clock.sleep
+        )
         with (
             patch.object(quota_wait.sys, "platform", "darwin"),
             patch.object(quota.Quota, "_claude_creds", return_value=({"accessToken": "A"}, True)),
@@ -534,6 +544,59 @@ def test_conflicting_stores_keep_effective_authority():
         assert len(f.calls) == 2
 
 
+def test_failed_baseline_still_notices_real_credential_race():
+    with fixture(agent="claude") as f:
+        original_observe = quota_wait.observe
+        calls = [0]
+
+        def observe(*args, **kwargs):
+            calls[0] += 1
+            return None if calls[0] == 1 else original_observe(*args, **kwargs)
+
+        def http(*_args):
+            f.calls.append(("claude", f.clock.mono))
+            publish(f)
+            return 429, {}, 3600
+
+        with (
+            patch.object(quota_wait, "observe", side_effect=observe),
+            patch.object(quota, "_http_get_json", side_effect=http),
+        ):
+            assert select(f, "claude")[0] is None
+        f.wait.wait()
+        assert f.clock.mono <= 30
+        assert select(f, "claude")[0] == "claude"
+        assert len(f.calls) == 1
+
+
+def test_empty_bootstrap_period_is_not_a_change():
+    with fixture(agent="claude") as f:
+        f.clock.now += 17900
+        select(f, "claude")
+        f.wait.wait()
+        assert f.clock.mono == 3600
+        assert len(f.calls) == 1
+
+
+def test_pending_hint_survives_transient_prepare_failure():
+    with fixture(agent="claude") as f:
+        select(f, "claude")
+        (f.source / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "B", "accountUuid": "new"}})
+        )
+        f.wait.wait()
+        original_observe, count = quota_wait.observe, [0]
+
+        def observe(*args, **kwargs):
+            count[0] += 1
+            return None if count[0] == 1 else original_observe(*args, **kwargs)
+
+        with patch.object(quota_wait, "observe", side_effect=observe):
+            assert select(f, "claude")[0] == "claude"
+        assert len(f.calls) == 2
+        assert f.clock.mono <= 30
+
+
 if __name__ == "__main__":
     for test in (
         test_original_deadline_and_no_side_effects,
@@ -559,6 +622,10 @@ if __name__ == "__main__":
         test_concurrent_recovery_attempt_counts,
         lambda: test_concurrent_recovery_attempt_counts(cacheable=False),
         test_conflicting_stores_keep_effective_authority,
+        test_failed_baseline_still_notices_real_credential_race,
+        test_empty_bootstrap_period_is_not_a_change,
+        test_pending_hint_survives_transient_prepare_failure,
+        lambda: test_outer_loop_reaches_launch(stop_wait=True),
     ):
         test()
         print("PASS", test.__name__)
