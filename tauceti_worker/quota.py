@@ -397,6 +397,7 @@ class Provider:
     # A transient telemetry failure, not evidence that the model cannot serve work.
     # Only --ignore-quota may proceed without a usable reading.
     telemetry_unavailable: bool = False
+    model_refusal: bool = False  # actual model refusal; bounded retry independent of usage polling
 
 
 def _finite_num(x: object) -> bool:
@@ -1285,11 +1286,15 @@ class Quota:
         refusal = self._auth_refusal_path(provider, fp)
         try:
             if code in (401, 403):
-                refusal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                _write_json_atomic(refusal, {"code": code})
+                if code == 401:  # a bare 403 can be an edge challenge, not a credential verdict
+                    refusal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    _write_json_atomic(refusal, {"code": code})
                 self._raw_path(provider, fp).unlink(missing_ok=True)
             elif code == 200:
                 refusal.unlink(missing_ok=True)
+                credential = getattr(self, "_usage_token_fps", {}).get(provider)
+                if credential:
+                    self._model_refusal_path(provider, credential).unlink(missing_ok=True)
         except OSError:
             pass
         return response
@@ -1298,9 +1303,54 @@ class Quota:
         credential = getattr(self, "_usage_token_fps", {}).get(provider, fp)
         return self._usage_dir(provider) / f"auth-refusal-{provider}-{self._fingerprint(credential) or 'none'}.json"
 
+    def launch_credential(self, provider: str) -> str | None:
+        """Freeze identity BEFORE launch, so a later account switch cannot receive its refusal."""
+        try:
+            if provider == "claude":
+                oauth, _ = self._claude_creds()
+                token = (oauth or {}).get("accessToken")
+            else:
+                token = ((self._codex_creds() or {}).get("tokens") or {}).get("access_token")
+            return self._fingerprint(token)
+        except (OSError, AttributeError, GitHubError):
+            return None  # unavailable identity must never prevent a launch
+
+    def _model_refusal_path(self, provider: str, credential: str) -> Path:
+        return self._usage_dir(provider) / f"model-refusal-{provider}-{self._fingerprint(credential)}.json"
+
+    def note_model_refusal(self, provider: str, credential: str | None) -> None:
+        if not credential:
+            return
+        at = time.time()
+        path = self._model_refusal_path(provider, credential)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _write_json_atomic(path, {"at": at, "until": at + RATE_LIMIT_RECHECK_MAX_S})
+        except OSError:
+            pass  # the round still stops and backs off if its evidence cannot be persisted
+
+    def _model_refusal(self, provider: str) -> Provider | None:
+        credential = getattr(self, "_usage_token_fps", {}).get(provider)
+        if not credential:
+            return None
+        record = _read_json_file(self._model_refusal_path(provider, credential))
+        if not isinstance(record, dict):
+            return None
+        at, until, now = record.get("at"), record.get("until"), time.time()
+        if not (_finite_num(at) and _finite_num(until) and at <= now < until <= at + RATE_LIMIT_RECHECK_MAX_S):
+            return None
+        return Provider(
+            provider,
+            False,
+            None,
+            error=f"{provider} model reported a subscription limit; retrying later",
+            retry_after=until - now,
+            model_refusal=True,
+        )
+
     def _telemetry_failure(self, provider: str, fp: str | None, error: str, *, code=None, retry_after=None) -> Provider:
         rejection = _read_json_file(self._auth_refusal_path(provider, fp))
-        if isinstance(rejection, dict) and rejection.get("code") in (401, 403):
+        if isinstance(rejection, dict) and rejection.get("code") == 401:
             return Provider(
                 provider, False, None, error=f"{provider} usage HTTP {rejection['code']} (credential rejected)"
             )
@@ -1436,18 +1486,46 @@ class Quota:
     def _cooldown_path(self, provider: str, key: str | None) -> Path:
         return self._usage_dir(provider) / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"
 
-    def _cooldown(self, provider: str, key: str | None) -> tuple[float, int | None]:
+    def _scope_cooldown(self, record, provider, key, fp):
+        if (
+            provider == "claude"
+            and str(key).startswith("creds:")
+            and fp
+            and isinstance(record, dict)
+            and record.get("fp") != fp
+        ):
+            # A path cannot prove a changed token belongs to the same account. Keep an
+            # anti-storm pause from the ORIGINAL refusal without transferring an hours-long ban.
+            until, wait = record.get("until"), record.get("wait")
+            if _finite_num(until) and _finite_num(wait) and 0 < wait <= USAGE_RETRY_AFTER_SANITY_S:
+                record = {
+                    **record,
+                    "until": min(until, until - wait + RATE_LIMIT_RECHECK_MAX_S),
+                    "wait": min(wait, RATE_LIMIT_RECHECK_MAX_S),
+                }
+        return record
+
+    def _cooldown(self, provider: str, key: str | None, fp: str | None = None) -> tuple[float, int | None]:
         """(seconds until this account's usage endpoint may be asked again, the HTTP status that started
         the wait), or (0, None) when nothing holds it back.
 
         Kept on disk beside the cache, one record per account, so it binds every caller sharing this
         cache: an `auto` loop re-reads both providers before each round, and without this a healthy
         codex kept the loop busy while it re-asked a rate-limited Claude endpoint after every round."""
-        memory = _cooldown_left(_COOLDOWNS.get((str(self._usage_dir(provider)), provider, key or "")))
-        disk = _cooldown_left(_read_json_file(self._cooldown_path(provider, key)))
-        return max(memory, disk, key=lambda left_code: left_code[0])
 
-    def _start_cooldown(self, provider: str, key: str | None, code: int, retry_after: float | None) -> None:
+        memory = self._scope_cooldown(
+            _COOLDOWNS.get((str(self._usage_dir(provider)), provider, key or "")), provider, key, fp
+        )
+        disk = self._scope_cooldown(_read_json_file(self._cooldown_path(provider, key)), provider, key, fp)
+        memory, disk = _cooldown_left(memory), _cooldown_left(disk)
+        specific = (0.0, None)
+        if provider == "claude" and str(key).startswith("creds:") and fp:
+            specific = self._cooldown(provider, f"{key}|credential:{fp}")
+        return max(memory, disk, specific, key=lambda left_code: left_code[0])
+
+    def _start_cooldown(
+        self, provider: str, key: str | None, code: int, retry_after: float | None, fp: str | None = None
+    ) -> None:
         """Honor a plausible Retry-After; headerless transient failures use bounded backoff.
         Never shortens a longer cooldown already running.
 
@@ -1455,6 +1533,10 @@ class Quota:
         let a cached reading taken under the rejected credential answer for it again."""
         if code in (401, 403):
             return
+        if provider == "claude" and str(key).startswith("creds:") and fp:
+            # Keep the original credential's complete deadline even if another account
+            # subsequently replaces the source-wide anti-storm record.
+            self._start_cooldown(provider, f"{key}|credential:{fp}", code, retry_after)
         path = self._cooldown_path(provider, key)
         mem = (str(self._usage_dir(provider)), provider, key or "")
         prior = _read_json_file(path) or _COOLDOWNS.get(mem) or {}
@@ -1473,8 +1555,8 @@ class Quota:
             return
         if wait <= 0:
             return
-        record = {"until": time.time() + wait, "wait": wait, "code": code, "failures": failures + 1}
-        if not _outlasts(_COOLDOWNS.get(mem), record["until"]):
+        record = {"until": time.time() + wait, "wait": wait, "code": code, "failures": failures + 1, "fp": fp}
+        if not _outlasts(self._scope_cooldown(_COOLDOWNS.get(mem), provider, key, fp), record["until"]):
             _COOLDOWNS[mem] = record
         fd = None
         try:
@@ -1483,7 +1565,7 @@ class Quota:
             # cooldown with a shorter one; write-then-rename, so a reader never sees a truncated record.
             fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
-            if _outlasts(_read_json_file(path), record["until"]):
+            if _outlasts(self._scope_cooldown(_read_json_file(path), provider, key, fp), record["until"]):
                 return
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(record))
@@ -1510,7 +1592,9 @@ class Quota:
             return self._telemetry_failure(provider, fp, err, code=code, retry_after=left)
         return Provider(provider, False, None, error=err, retry_after=left, rate_limited=code == 429)
 
-    def _clear_cooldown(self, provider: str, key: str | None) -> None:
+    def _clear_cooldown(self, provider: str, key: str | None, fp: str | None = None) -> None:
+        if provider == "claude" and str(key).startswith("creds:") and fp:
+            self._clear_cooldown(provider, f"{key}|credential:{fp}")
         _COOLDOWNS.pop((str(self._usage_dir(provider)), provider, key or ""), None)
         try:
             self._cooldown_path(provider, key).unlink(missing_ok=True)
@@ -1786,6 +1870,10 @@ class Quota:
         return self._fingerprint(self._codex_account_id(auth) or tok.get("access_token"))
 
     def codex(self, *, refresh: bool = False) -> Provider:
+        result = self._codex_pass(refresh=refresh)
+        return self._model_refusal("codex") or result
+
+    def _codex_pass(self, *, refresh: bool = False) -> Provider:
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         # The pacer reads auth.json for the token it measures usage with, so it inherits the same
         # assumption --account does: that auth.json is the credential codex uses. Under a non-file
@@ -1846,6 +1934,8 @@ class Quota:
         if code != 200 or not payload:
             self._start_cooldown("codex", fp, code, retry_after)
             retry_after = retry_after or self._cooldown("codex", fp)[0] or None
+            if code in (401, 403):
+                retry_after = None
             still = self._cached_codex(fp) if code not in (401, 403) else None
             if still is not None:
                 return replace(self._codex_from_payload(*still), rate_limited=code == 429)
@@ -2096,6 +2186,13 @@ class Quota:
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
     ) -> tuple[Provider, list[Reading] | None]:
+        result = self._claude_usage(fp, tok, refresh=refresh, account=account)
+        refusal = self._model_refusal("claude")
+        return (refusal, None) if refusal else result
+
+    def _claude_usage(
+        self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
+    ) -> tuple[Provider, list[Reading] | None]:
         self._usage_token_fps = getattr(self, "_usage_token_fps", {})
         self._usage_token_fps["claude"] = self._fingerprint(tok)
         # Re-read under the fetch lock: a sibling may have fetched or received a Retry-After while
@@ -2105,7 +2202,7 @@ class Quota:
                 cached = self._cached_claude(fp)
                 if cached is not None:
                     prov, readings = self._from_cached_claude(cached)
-                    return replace(prov, rate_limited=self._cooldown("claude", account or fp)[1] == 429), readings
+                    return replace(prov, rate_limited=self._cooldown("claude", account or fp, fp)[1] == 429), readings
                 return Provider("claude", False, None, error="claude usage refresh in progress", retry_after=POLL), None
             return self._claude_pass_locked(fp, tok, refresh=refresh, account=account)
 
@@ -2124,7 +2221,7 @@ class Quota:
         # by: renewing the token must not license asking a rate-limited endpoint again.
         account = account or fp
         cached = self._cached_claude(fp)
-        left, cooled_by = self._cooldown("claude", account)
+        left, cooled_by = self._cooldown("claude", account, fp)
         if cached is not None:
             prov, readings = self._from_cached_claude(cached)
             recent = time.time() - cached[1] < CLAUDE_USAGE_REFRESH_S
@@ -2141,7 +2238,7 @@ class Quota:
             observed_at = time.time()  # ONE instant for this response: parsed, paced and stored against it
         except GitHubError as e:
             if isinstance(e, UsageTransportError):
-                self._start_cooldown("claude", account, 0, None)
+                self._start_cooldown("claude", account, 0, None, fp)
             # Re-read rather than reusing the tuple from before the request: a usage fetch can block for
             # its whole timeout, and an entry that was live when we set out may have passed a reset it
             # describes while we waited.
@@ -2150,7 +2247,7 @@ class Quota:
                 return self._from_cached_claude(still)
             if isinstance(e, UsageTransportError):
                 return self._telemetry_failure(
-                    "claude", fp, str(e), retry_after=self._cooldown("claude", account)[0]
+                    "claude", fp, str(e), retry_after=self._cooldown("claude", account, fp)[0]
                 ), None
             return Provider("claude", False, None, error=str(e)), None
         # A 401 here is the endpoint refusing the access token. `claude()` answers it by rotating the
@@ -2159,8 +2256,10 @@ class Quota:
         # survives into. Always name the status code: an auth failure, a rate-limited endpoint and a
         # server error are different problems with different fixes, and none of them is "usage unknown".
         if code != 200 or not payload:
-            self._start_cooldown("claude", account, code, retry_after)
-            retry_after = retry_after or self._cooldown("claude", account)[0] or None
+            self._start_cooldown("claude", account, code, retry_after, fp)
+            retry_after = retry_after or self._cooldown("claude", account, fp)[0] or None
+            if code in (401, 403):
+                retry_after = None
             if code in (401, 403):
                 # A rejected token must not get its old permissive sample back on the next read.
                 try:
@@ -2188,7 +2287,7 @@ class Quota:
             return Provider("claude", False, None, error=problem, retry_after=retry_after), None
         readings = _claude_readings(payload, observed_at)
         # Successful telemetry ends the failure streak. It does not change the quota windows.
-        self._clear_cooldown("claude", account)
+        self._clear_cooldown("claude", account, fp)
         # Cache ONLY a payload that is fully resolved, and only until the first reset it describes.
         # An idle/absent/malformed payload is never pinned: re-reading it is the only thing that can
         # resolve it, and one extra fetch per poll is the cheapest part of this system.

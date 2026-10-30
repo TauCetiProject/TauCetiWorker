@@ -1464,7 +1464,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                 ignore_quota=ignore_quota,
                 quota_cmd=quota_cmd,
                 fresh=not one_round,
-                **({"already_paced": True} if getattr(args, "loop_paced", False) else {}),
+                **({"already_paced": True} if one_round and getattr(args, "loop_paced", False) else {}),
             )
         authoring_profile = None
         if work_model != "auto":

@@ -577,6 +577,7 @@ def do_fix(w, sv, c, opts, bubble):
                     _effective_authoring_profile(opts),
                     w.cfg.logdir,
                     cancel_event=getattr(lease, "lost", None),
+                    quota_cfg=w.cfg,
                 )
         if rc:
             return rc

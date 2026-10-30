@@ -13,10 +13,10 @@ from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tauceti_worker import cli, loop, quota, quota_audit
+from tauceti_worker import agents, cli, loop, quota, quota_audit
 
 
 def worker(root):
@@ -53,8 +53,19 @@ def test_request_records_and_deadlines(root):
     assert records[1]["duration_s"] >= 0 and records[1]["worker"] == "worker1"
     assert "private-token" not in audit.read_text() and "private response" not in audit.read_text()
     assert os.stat(audit).st_mode & 0o777 == 0o600
-    assert loop._recheck_in(quota.Provider("claude", False, None, retry_after=0.2), time.time()) == 1
-    assert loop._recheck_in(quota.Provider("claude", False, None, retry_after=300.2), time.time()) == 301
+    assert (
+        loop._recheck_in(
+            quota.Provider("claude", False, None, retry_after=0.2, telemetry_unavailable=True), time.time()
+        )
+        == 1
+    )
+    assert (
+        loop._recheck_in(
+            quota.Provider("claude", False, None, retry_after=300.2, telemetry_unavailable=True), time.time()
+        )
+        == 301
+    )
+    assert loop._recheck_in(quota.Provider("claude", False, None, retry_after=1), time.time()) == loop.POLL
     assert quota._usage_retry_after("Infinity") is None
     assert quota._usage_retry_after("NaN") is None
     assert quota._usage_retry_after("1000000000") is None
@@ -122,7 +133,11 @@ def test_known_blocks_survive_telemetry_failure(root):
             q._claude_pass("fp", "token", refresh=True, account="account")
         with patch.object(quota, "_http_get_json", return_value=(503, {}, None)):
             p, _ = q._claude_pass("fp", "token", refresh=True, account="account")
-        assert not p.telemetry_unavailable and str(code) in p.error
+        if code == 401:
+            assert not p.telemetry_unavailable and str(code) in p.error
+        else:
+            assert p.telemetry_unavailable  # a previous bare 403 did not prove credential rejection
+    q = worker(root / "auth-401")
     with (
         patch.object(quota, "_http_get_json", return_value=(200, payload, None)),
         patch.object(quota.time, "time", return_value=time.time() + 901),
@@ -140,6 +155,7 @@ def test_known_blocks_survive_telemetry_failure(root):
     with patch.object(quota, "_http_get_json", side_effect=[(403, {}, 7200), (429, {}, 7200)]) as http:
         refused, _ = q._claude_pass("old-fp", "old-token", refresh=True, account="account")
         assert not refused.telemetry_unavailable and q._cooldown("claude", "account")[0] == 0
+        assert refused.retry_after is None
         renewed, _ = worker(q.cfg.home)._claude_pass("new-fp", "new-token", refresh=True, account="account")
         assert renewed.telemetry_unavailable and http.call_count == 2
 
@@ -235,6 +251,159 @@ def test_failed_bootstrap_stops_before_another_telemetry_read(root):
     assert "bootstrap failed: model refused" in result.windows[0].detail
 
 
+def test_changed_unknown_account_does_not_inherit_long_wait(root):
+    q = worker(root)
+    now = time.time()
+    payload = {
+        "five_hour": {"utilization": 1, "resets_at": datetime.fromtimestamp(now + 7200, UTC).isoformat()},
+        "seven_day": {"utilization": 1, "resets_at": datetime.fromtimestamp(now + 3 * 86400, UTC).isoformat()},
+    }
+    with (
+        patch.object(quota.time, "time", return_value=now),
+        patch.object(quota, "_http_get_json", return_value=(429, {}, 7200)),
+    ):
+        q._claude_pass("old", "old-token", refresh=True, account="creds:/source")
+    with (
+        patch.object(quota.time, "time", return_value=now + 901),
+        patch.object(quota, "_http_get_json", return_value=(200, payload, None)) as http,
+    ):
+        old, _ = q._claude_pass("old", "old-token", refresh=True, account="creds:/source")
+        assert not old.available and http.call_count == 0  # same token still honors its whole ban
+        changed, _ = q._claude_pass("new", "new-token", refresh=True, account="creds:/source")
+        assert changed.available and http.call_count == 1
+        old, _ = q._claude_pass("old", "old-token", refresh=True, account="creds:/source")
+        assert not old.available and http.call_count == 1  # switching back preserves its original ban
+    q = worker(root / "short-new-ban")
+    with (
+        patch.object(quota.time, "time", return_value=now),
+        patch.object(quota, "_http_get_json", return_value=(429, {}, 7200)),
+    ):
+        q._claude_pass("old", "old-token", refresh=True, account="creds:/source")
+    with (
+        patch.object(quota.time, "time", return_value=now + 901),
+        patch.object(quota, "_http_get_json", return_value=(429, {}, 60)) as http,
+    ):
+        for _ in range(2):
+            p, _ = q._claude_pass("new", "new-token", refresh=True, account="creds:/source")
+            assert p.telemetry_unavailable and 0 < p.retry_after <= 60
+        assert http.call_count == 1
+
+    with (
+        patch.object(quota.time, "time", return_value=now + 962),
+        patch.object(quota, "_http_get_json", return_value=(200, payload, None)) as http,
+    ):
+        assert q._claude_pass("new", "new-token", refresh=True, account="creds:/source")[0].available
+        assert not q._claude_pass("old", "old-token", refresh=True, account="creds:/source")[0].available
+        assert http.call_count == 1
+
+
+def test_cli_preserves_soft_handoff_without_granting_outage_permission(root):
+    outage = quota.Provider("claude", False, None, error="usage unavailable", telemetry_unavailable=True)
+    paced = quota.Provider("claude", False, None, [quota.Window("session", 20, 1, None, "over-pace")])
+    for ignored, status in ((False, outage), (True, outage), (False, paced)):
+        args = cli.build_parser().parse_args(
+            [
+                "_round",
+                "--worker-id",
+                "default",
+                "--agent",
+                "claude",
+                "--loop-paced",
+                *(["--ignore-quota"] if ignored else []),
+            ]
+        )
+        with (
+            patch("tauceti_worker.security_audit.require_admin"),
+            patch("tauceti_worker.github_outbox.drain", return_value=[]),
+            patch.object(cli, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=(None, {"claude": status})),
+            patch.dict(
+                os.environ,
+                {
+                    "TAUCETI_ACTIVITY_DIR": str(root / "activity"),
+                    "TAUCETI_TEST_SLEEP": "",
+                    "TAUCETI_TEST_HOLD": "",
+                    "TAUCETI_TEST_HEARTBEAT": "",
+                },
+            ),
+            patch.multiple(
+                cli,
+                Config=DEFAULT,
+                RoundContext=DEFAULT,
+                Worker=DEFAULT,
+                GitHub=DEFAULT,
+                ReviewState=DEFAULT,
+                Counters=DEFAULT,
+                Claims=DEFAULT,
+                set_log_file=DEFAULT,
+                configure_api=DEFAULT,
+                run_round=DEFAULT,
+            ) as mocks,
+        ):
+            mocks["run_round"].return_value = 0
+            if not ignored and status is outage:
+                try:
+                    cli.cmd_work(args, only=["security-audit"], agent="claude", one_round=True)
+                except loop.NoProgress:
+                    pass
+                else:
+                    raise AssertionError("normal loop child must not gain outage permission")
+                mocks["run_round"].assert_not_called()
+            else:
+                assert cli.cmd_work(args, only=["security-audit"], agent="claude", one_round=True) == 0
+                assert mocks["run_round"].call_args.args[1].ignore_quota == ignored
+
+
+def test_real_model_refusal_is_scoped_bounded_and_recoverable(root):
+    q = worker(root)
+    credentials = root / ".claude/.credentials.json"
+    credentials.parent.mkdir()
+    credentials.write_text(json.dumps({"claudeAiOauth": {"accessToken": "launch-token"}}))
+    event = {
+        "type": "result",
+        "is_error": True,
+        "subtype": "error_during_execution",
+        "result": "You've hit your session limit · resets 9:30pm (UTC)",
+    }
+    script = (
+        "import json,sys,os; from pathlib import Path; "
+        "(Path(os.environ['CLAUDE_CONFIG_DIR'])/'.credentials.json').write_text("
+        "json.dumps({'claudeAiOauth':{'accessToken':'different-token'}})); "
+        "print(json.dumps(" + repr(event) + ")); sys.exit(1)"
+    )
+    env = {
+        **os.environ,
+        "HOME": str(root),
+        "CLAUDE_CONFIG_DIR": str(credentials.parent),
+        "TAUCETI_CLAUDE_BILLING": "subscription",
+    }
+    with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(credentials.parent)}):
+        rc = agents.run_agent_proc(
+            [sys.executable, "-c", script],
+            env=env,
+            logdir=root / "logs",
+            label="agent-claude",
+            provider="claude",
+            quota_cfg=q.cfg,
+        )
+    assert rc == 1 and agents.take_last_agent_infra_failure() == "provider subscription limit reached"
+    with patch.object(quota, "_http_get_json", return_value=(429, {}, 7200)):
+        refused, _ = q._claude_pass("old", "launch-token", refresh=True, account="account")
+        assert refused.model_refusal and loop._ignore_quota_verdict(None, refused) == "wait"
+        changed, _ = q._claude_pass("new", "different-token", refresh=True, account="account")
+        assert changed.telemetry_unavailable and not changed.model_refusal
+    with patch.object(quota.time, "time", return_value=time.time() + 901):
+        retried, _ = q._claude_pass("old", "launch-token", refresh=True, account="account")
+        assert retried.telemetry_unavailable and not retried.model_refusal
+    q.note_model_refusal("claude", quota.Quota._fingerprint("launch-token"))
+    with (
+        patch.object(quota.time, "time", return_value=time.time() + 7201),
+        patch.object(quota, "_http_get_json", return_value=(200, {"five_hour": None}, None)),
+    ):
+        q._claude_pass("old", "launch-token", refresh=True, account="account")
+    assert not q._model_refusal_path("claude", quota.Quota._fingerprint("launch-token")).exists()
+
+
 def test_diagnostics_never_gate_requests(root):
     q = worker(root)
     directory = root / "state/quota-requests"
@@ -269,6 +438,9 @@ if __name__ == "__main__":
         test_loop_handoff_preserves_operator_choice,
         test_transient_failures_share_backoff,
         test_failed_bootstrap_stops_before_another_telemetry_read,
+        test_changed_unknown_account_does_not_inherit_long_wait,
+        test_cli_preserves_soft_handoff_without_granting_outage_permission,
+        test_real_model_refusal_is_scoped_bounded_and_recoverable,
         test_diagnostics_never_gate_requests,
     ):
         with tempfile.TemporaryDirectory() as directory:

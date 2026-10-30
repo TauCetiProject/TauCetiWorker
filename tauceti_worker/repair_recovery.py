@@ -1383,6 +1383,7 @@ class WorkerBackend:
                             session_path=record / "continuation-session.json",
                             session_actor=auth.get("actor"),
                             session_scope=scope,
+                            quota_cfg=self.w.cfg,
                         )
                     except BuildCacheUnavailable as error:
                         refund_content(known_no_launch=True)

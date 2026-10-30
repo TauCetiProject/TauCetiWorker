@@ -40,13 +40,18 @@ merely because time passed. Actual provider limits still apply to model sessions
 
 An HTTP 429 throttles the usage endpoint; it does not by itself mean the model
 quota is exhausted. All workers sharing that source honor its finite `Retry-After`
-up to 24 hours, including after token renewal. Invalid or larger values are logged
+up to 24 hours for the same credential or a verified account identity. Invalid or larger values are logged
 and ignored so corrupt data cannot park unattended workers indefinitely.
 Without that header, transient HTTP and connection failures use shared
 exponential backoff with jitter up to fifteen minutes. A successful usage read
 clears that backoff. The loop wakes at a cooldown's deadline, rounded up to the
 next second, rather than adding another full poll interval. It revisits long
 waits hourly without making an early HTTP request.
+
+When the only account identity is a credential-source path, a changed token may
+represent a different account. Its inherited cooldown is limited to fifteen
+minutes from the original refusal, allowing fresh discovery without a token-change
+request storm. The original credential still honors its complete server deadline.
 
 Without a usable reading, normally paced workers wait for telemetry. An explicit
 `--agent claude --ignore-quota` or `--agent codex --ignore-quota` may attempt useful
@@ -55,11 +60,17 @@ or a connection failure. This does not invent a quota value or make an expired
 positive sample usable. Known exhausted windows remain blocking until they reset,
 even after the sample's ordinary TTL, scoped to the credential that supplied them.
 A changed credential may represent a different account and cannot inherit another
-credential's quota observation. Credential rejections remain blocking for
+credential's quota observation. HTTP 401 credential rejections remain blocking for
 that token until a successful usage response; a new token has its own identity.
+An HTTP 403 blocks its current attempt but does not establish a durable
+authentication verdict without evidence distinguishing an edge challenge.
 Missing credentials, malformed responses, and other HTTP errors still block.
 Actual model refusals stop the round and use the loop's existing escalating
-backoff. A review-engine provider refusal posts nothing and does not charge the
+backoff. A subscription-limit refusal from an authoring agent also records a
+bounded fifteen-minute retry against its frozen launch credential. It expires
+automatically, clears on a successful usage read, and cannot block a newly selected
+credential. A subscription refusal never consumes a PR's infrastructure-refund
+allowance. A review-engine provider refusal posts nothing and does not charge the
 PR's review-error budget.
 
 Actual usage HTTP attempts are recorded separately from cached status reads under

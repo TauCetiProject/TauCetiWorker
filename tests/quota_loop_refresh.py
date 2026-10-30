@@ -396,7 +396,7 @@ try:
     tc.loop.report_runtime = lambda *_a, **_k: None
     for label, agent, snap, expected in waiting_cases + [
         (
-            "an unclassified refusal retains its Retry-After",
+            "an --ignore-quota worker's unclassified refusal retains its Retry-After",
             "claude",
             {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600)},
             3600,

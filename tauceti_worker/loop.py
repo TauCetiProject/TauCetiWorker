@@ -57,7 +57,8 @@ def _recheck_in(prov: Provider | None, now: float) -> int:
             deadline = min(deadline, math.ceil(prov.retry_after))
         return max(1, min(deadline, 3600))
     if prov.retry_after and math.isfinite(prov.retry_after) and prov.retry_after > 0:
-        return max(1, min(math.ceil(prov.retry_after), 3600))
+        floor = 1 if prov.telemetry_unavailable or prov.rate_limited or prov.model_refusal else POLL
+        return max(floor, min(math.ceil(prov.retry_after), 3600))
     if prov.next_eligible:
         return max(POLL, min(int(prov.next_eligible - now) + 5, 3600))
     return POLL
