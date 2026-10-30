@@ -31,6 +31,11 @@ from .config import Config, log
 from .constants import AUTHORING_DEFAULTS, CLAUDE_CMD, POLL
 from .github import GitHubError
 
+
+class LocalUsageUnavailable(Exception):
+    """An explicitly cache-only selection needs its ordinary scheduled refresh."""
+
+
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -970,8 +975,10 @@ def _write_json_atomic(path: Path, data: dict) -> None:
 
 def _read_marker(p: Path) -> str | None:
     try:
-        return p.read_text().strip() or None
-    except OSError:
+        with p.open() as stream:
+            value = stream.read(4097).strip()
+        return value if value and len(value) <= 4096 else None
+    except (OSError, UnicodeError):
         return None
 
 
@@ -1233,6 +1240,9 @@ class Quota:
         return directory / f"quota-{provider}{suffix}.json"
 
     def _fetch_usage(self, provider: str, url: str, headers: dict, fp: str | None):
+        if getattr(self, "_cache_only", False):
+            raise LocalUsageUnavailable
+        self._usage_attempted = getattr(self, "_usage_attempted", set()) | {provider}
         from .quota_audit import record
 
         self._usage_token_fps = getattr(self, "_usage_token_fps", {})
@@ -1313,6 +1323,24 @@ class Quota:
             return self._fingerprint(token)
         except Exception:
             return None  # unavailable identity must never prevent a launch
+
+    def local_credentials(self, provider: str, reader, known: dict):
+        """Canonical source for local wake hints, without mirroring or Keychain calls.
+
+        The reader supplies bounded JSON reads. Normal launch accessors still
+        own credential synchronization and verification of the identity used.
+        """
+        if provider == "claude":
+            source = self._claude_creds_source()
+            value = (
+                known.get(provider)
+                if sys.platform == "darwin"
+                else _as_dict(reader(source / ".credentials.json")).get("claudeAiOauth")
+            )
+        else:
+            source = self._codex_creds_source()
+            value = reader(source / "auth.json")
+        return source, value
 
     def _model_refusal_path(self, provider: str, credential: str) -> Path:
         return self._usage_dir(provider) / f"model-refusal-{provider}-{self._fingerprint(credential)}.json"
@@ -1456,7 +1484,7 @@ class Quota:
         """The whole validated cache entry — {payload, fetched_at, ...} — for a caller that needs to know
         WHEN the payload was true, not just what it says. See _cached_raw for the payload alone."""
         p = self._raw_path(provider, fp)
-        d = _read_json_file(p)
+        d = getattr(self, "_cache_reader", _read_json_file)(p)
         if not isinstance(d, dict):
             return None
         # A cache entry is only valid for the SAME account it was fetched under. When the operator rotates
@@ -1909,7 +1937,8 @@ class Quota:
         return self._with_model_refusal("codex", result)
 
     def _codex_pass(self, *, refresh: bool = False) -> Provider:
-        mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
+        if not getattr(self, "_cache_only", False):
+            mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         # The pacer reads auth.json for the token it measures usage with, so it inherits the same
         # assumption --account does: that auth.json is the credential codex uses. Under a non-file
         # store it is not, and a leftover file would have us fetch and CACHE one account's usage while
@@ -1924,6 +1953,7 @@ class Quota:
                 error=f"codex credential store is not verifiably the file TauCeti paces against ({store})",
             )
         auth = self._codex_creds()
+        self._wait_identities = getattr(self, "_wait_identities", {}) | {"codex": auth}
         if not auth:
             return Provider("codex", False, None, error="no ~/.codex/auth.json")
         # Prefer the stable account id so a same-account token refresh keeps the cache; fall back to the
@@ -2154,10 +2184,12 @@ class Quota:
         """
         # Renew before reading, then mirror, so a rotation reaches an isolated worker's copy in the same
         # call that performed it.
-        if renew:
+        if renew and not getattr(self, "_cache_only", False):
             self._refresh_claude_credential()
-        mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
+        if not getattr(self, "_cache_only", False):
+            mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         oauth, _from_keychain = self._claude_creds()
+        self._wait_identities = getattr(self, "_wait_identities", {}) | {"claude": oauth}
         if not oauth:
             err = f"no {claude_dir(self.cfg.home) / '.credentials.json'}"
             if sys.platform == "darwin":
@@ -2230,6 +2262,8 @@ class Quota:
     ) -> tuple[Provider, list[Reading] | None]:
         self._usage_token_fps = getattr(self, "_usage_token_fps", {})
         self._usage_token_fps["claude"] = self._fingerprint(tok)
+        if getattr(self, "_cache_only", False):
+            return self._claude_pass_locked(fp, tok, refresh=False, account=account)
         # Re-read under the fetch lock: a sibling may have fetched or received a Retry-After while
         # we waited. The lock covers the network call as well as the cache/cooldown publication.
         with self._usage_lock(account or fp or "none", fp) as acquired:
@@ -2687,7 +2721,17 @@ class Quota:
         return min(blocked) if blocked else None
 
     # --- selection ---------------------------------------------------------
-    def choose(self, forced: str | None, *, refresh: bool = False, renew: bool = False) -> tuple[str | None, dict]:
+    def choose(
+        self,
+        forced: str | None,
+        *,
+        refresh: bool = False,
+        renew: bool = False,
+        inspect: set[str] | None = None,
+        fetch: set[str] | None = None,
+        previous: dict | None = None,
+        refresh_providers: set[str] | None = None,
+    ) -> tuple[str | None, dict]:
         """Return (agent_to_run_now or None, {codex: Provider, claude: Provider}).
 
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
@@ -2695,12 +2739,46 @@ class Quota:
 
         `renew` is passed through to Quota.claude: a caller that is about to act on the answer may
         renew an expiring access token, an inspection command may not.
+
+        The loop's wait episode can inspect only changed/due providers, permit
+        HTTP only for `fetch`, and force refresh only for `refresh_providers`.
+        Uninspected siblings retain blocked verdicts from `previous`. A cache-only
+        miss is unknown, never a synthetic telemetry outage that grants autonomy.
+        Other callers retain the ordinary selection behaviour.
         """
         snap = {}
-        if forced in (None, "auto", "codex"):
-            snap["codex"] = self.codex(refresh=refresh)
-        if forced in (None, "auto", "claude"):
-            snap["claude"] = self.claude(refresh=refresh, renew=renew)
+        for provider in ("codex", "claude") if forced in (None, "auto") else (forced,):
+            if provider not in ("codex", "claude"):
+                continue
+            if inspect is not None and provider not in inspect:
+                # A wait starts with blocked verdicts only. Reusing a restriction
+                # cannot manufacture headroom when the sibling's cache expires.
+                old = (previous or {}).get(provider)
+                snap[provider] = (
+                    old
+                    if old is not None and not old.available
+                    else Provider(provider, False, None, error="local usage unavailable; awaiting scheduled refresh")
+                )
+                continue
+            self._cache_only = fetch is not None and provider not in fetch
+            force = refresh and (refresh_providers is None or provider in refresh_providers)
+            if provider == "claude":
+                if not self._cache_only and fetch is not None:
+                    self.__dict__.pop("_claude_usage_directory", None)
+                elif hasattr(self, "_wait_cache_directory"):
+                    self._claude_usage_directory = self._wait_cache_directory
+            try:
+                snap[provider] = (
+                    self.codex(refresh=force)
+                    if provider == "codex"
+                    else self.claude(refresh=force, renew=renew and not self._cache_only)
+                )
+            except LocalUsageUnavailable:
+                snap[provider] = Provider(
+                    provider, False, None, error="local usage unavailable; awaiting scheduled refresh"
+                )
+            finally:
+                self._cache_only = False
         codex_ok = snap.get("codex") and snap["codex"].available
         opus_ok = snap.get("claude") and snap["claude"].available
         if forced == "codex":

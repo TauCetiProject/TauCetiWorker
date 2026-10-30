@@ -90,6 +90,37 @@ effort: a busy lock or unavailable disk never prevents a request or launch.
 These are TauCeti's records only; they do not count other clients' requests or
 integrate with external usage scripts or services.
 
+## Local checks during quota waits
+
+Subscription loops check local credential and TauCeti usage records every 25
+seconds during a quota wait. They can notice a changed file-backed credential or
+a new shared Claude observation without waiting out an old, hour-long sleep.
+An early network attempt can be staggered by up to five seconds; cached recovery
+has no additional delay. These local checks make no HTTP requests, run no
+subprocesses, acquire no fetch locks, and do not renew or mirror credentials.
+They use existing TauCeti-owned records, including the read-only-mount fallback;
+they do not coordinate with personal usage tools.
+
+An early wake returns through normal provider selection and launch checks.
+Each provider retains its own scheduled refresh deadline: a Claude change does
+not refresh an unchanged Codex provider, even when Codex's cache has expired.
+Repeated local updates cannot postpone the original normal recheck. A newly
+applicable earlier cooldown expiry is also checked without needing another file
+change. Actual HTTP retries still honor the current identity's persisted
+cooldowns. Extra early attempts are bounded within the wait; ordinary due
+refreshes and authorized launches remain unaffected.
+
+Observation errors retain the normal scheduled retry. Isolated workers observe
+their canonical credential source and use the existing mirror synchronization
+when selection resumes. Keychain-only changes on macOS are discovered at the
+normal credential lookup, avoiding additional Keychain prompts or subprocess
+polling. Custom `--quota-cmd` commands retain their existing schedule.
+
+Runtime status keeps `next_action_at` as the normal quota recheck, with the local
+check cadence in `quota_local_check_seconds` and that recheck deadline in
+`quota_refresh_at`. Local checks do not write status or log a heartbeat on every
+tick. GitHub quota waits and no-progress backoff retain their separate schedules.
+
 ## Keeping the Claude token alive: `--auto-refresh`
 
 By default the worker never rotates a refresh token. When the Claude access token
