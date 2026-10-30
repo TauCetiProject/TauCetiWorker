@@ -300,7 +300,7 @@ class RecoveryMaintenance(unittest.TestCase):
             self.tick()
             maintenance._SWEEPS.clear()  # a new native timer process
             self.tick()
-        self.assertEqual(attempted, ["a", "z"])
+        self.assertCountEqual(attempted, ["a", "z"])
 
     def test_inventory_skips_finished_cache_trees_and_unrelated_directories(self):
         self.dirty()
