@@ -31,6 +31,7 @@ from .constants import (
 )
 from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
+from .github_state import enabled as github_state_enabled
 from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
@@ -229,27 +230,29 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     time.sleep(nap)
                     continue
 
-            # 1b) GitHub budget preflight. A round does many gh calls AND launches the review engine,
-            # whose own diff fetch 403s when GitHub is rate-limited — throwing away the agent's work.
-            # The loop has no hard timeout, so this is where we wait out an hourly primary reset rather
-            # than launching expensive work that a mid-round 403 would discard. We watch BOTH buckets a
-            # round spends (REST core and the progress-guard graphql); either being low blocks launch
-            # until the later of their resets. The rate_limit probe is itself exempt, so this is free
-            # when we are flush.
-            # A configured mirror owns an independent read installation. Its callers must not
-            # be parked because the direct credential's unrelated read pool is running low.
-            # Publication is durable and actual rejections are handled by the transport/outbox.
-            gb = None if os.environ.get("TAUCETI_GITHUB_STATE_URL") else github_budget()
-            # Focused overlap scans publish through REST and do no PR authoring;
-            # unrelated GraphQL exhaustion must not park that queue.
-            buckets = ("core",) if set(only) == {"overlap-scan"} else ("core", "graphql")
-            low = {k: v for k, v in (gb or {}).items() if k in buckets and v[0] < GH_MIN_BUDGET}
+            # Mirrored discovery owns a separate read quota. Only a recorded
+            # exhaustion of direct REST should pause a mirrored worker: fresh
+            # dispatch reads and publication still need that credential. Unknown
+            # quota and a low direct GraphQL pool must not block the mirror.
+            mirrored = github_state_enabled()
+            if mirrored:
+                from .github_transport import observed_budget, scope
+
+                # gh's credential store has no transport identity to persist
+                # observations under. Retain its existing preflight probe;
+                # a failed probe remains unknown and never prevents launch.
+                gb = observed_budget() if scope() else github_budget()
+            else:
+                gb = github_budget()
+            buckets = ("core",) if mirrored or set(only) == {"overlap-scan"} else ("core", "graphql")
+            minimum = 1 if mirrored else GH_MIN_BUDGET
+            low = {k: v for k, v in (gb or {}).items() if k in buckets and v[0] < minimum}
             if low:
                 reset = max(v[1] for v in low.values())
                 nap = max(POLL, min(reset - int(time.time()) + 5, 3600))
                 detail = ", ".join(f"{k}={gb[k][0]}" for k in low)
                 log(
-                    f"github: REST budget low ({detail} remaining < {GH_MIN_BUDGET}) — "
+                    f"github: REST budget low ({detail} remaining < {minimum}) — "
                     f"waiting {nap}s for the reset before launching a round"
                 )
                 report_runtime("waiting-github", detail=detail, next_action_at=time.time() + nap)

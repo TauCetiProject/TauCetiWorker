@@ -481,6 +481,12 @@ class RoundBoundary(unittest.TestCase):
 
         return unavailable
 
+    def test_default_mirror_outage_avoids_per_pr_history_reads(self):
+        with patch.dict(os.environ):
+            os.environ.pop("TAUCETI_GITHUB_STATE_URL", None)
+            os.environ.pop("TAUCETI_REPO", None)
+            self.test_cold_outage_keeps_selecting_maintenance_without_per_pr_history_reads()
+
     def test_cold_outage_keeps_selecting_maintenance_without_per_pr_history_reads(self):
         failure = {
             "dependency": "github-state",

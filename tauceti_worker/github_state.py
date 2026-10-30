@@ -32,6 +32,8 @@ class StateQueryError(ValueError):
 
 
 DEPENDENCY = "github-state"
+DEFAULT_URL = "https://github-state.taucetiproject.org"
+PUBLIC_REPOSITORY = "TauCetiProject/TauCeti"
 # Reasons a caller can act on. Authentication/configuration needs an operator; the rest recover.
 ACTIONABLE = frozenset({"client_auth_configuration"})
 _last_failure: contextvars.ContextVar[dict | None] = contextvars.ContextVar("github_state_failure", default=None)
@@ -156,8 +158,16 @@ def _backoff(failures: int) -> float:
     return min(300.0, 30.0 * (1 << min(max(failures - 3, 0), 4))) * random.uniform(0.8, 1.2)
 
 
+def _configured_url() -> str:
+    # Explicit empty configuration disables the service, including downstream
+    # projects whose manifest selects mode=off. Unconfigured Tau Ceti workers
+    # share the public mirror without a credential on each machine.
+    default = DEFAULT_URL if os.environ.get("TAUCETI_REPO", PUBLIC_REPOSITORY) == PUBLIC_REPOSITORY else ""
+    return os.environ.get("TAUCETI_GITHUB_STATE_URL", default).rstrip("/")
+
+
 def _url() -> str | None:
-    value = os.environ.get("TAUCETI_GITHUB_STATE_URL", "").rstrip("/")
+    value = _configured_url()
     if not value:
         return None
     parsed = urllib.parse.urlsplit(value)
@@ -168,6 +178,11 @@ def _url() -> str | None:
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise StateQueryError("GitHub state URL must not contain credentials, query or fragment")
     return value
+
+
+def enabled() -> bool:
+    """Whether this worker uses a configured or default GitHub state service."""
+    return bool(_configured_url()) and not transport.direct_reads()
 
 
 def _wire(data, operation):
@@ -250,14 +265,20 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     url = _url()
     if not url:
         return False, None
+    if url == DEFAULT_URL and repo != PUBLIC_REPOSITORY and "TAUCETI_GITHUB_STATE_TOKEN_FILE" not in os.environ:
+        return False, None
     ensure_ssl_cert_file()
-    try:
-        token = Path(os.environ["TAUCETI_GITHUB_STATE_TOKEN_FILE"]).read_text().strip()
-        if not token:
-            raise ValueError("empty client token")
-    except (KeyError, OSError, ValueError) as error:
-        detail = "TAUCETI_GITHUB_STATE_TOKEN_FILE is not set" if isinstance(error, KeyError) else type(error).__name__
-        return _unavailable(repo, operation, "client_auth_configuration", detail)
+    token = ""
+    token_file = os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
+    if token_file is not None:
+        try:
+            token = Path(token_file).expanduser().read_text().strip()
+            if not token:
+                raise ValueError("empty client token")
+        except (OSError, ValueError) as error:
+            return _unavailable(repo, operation, "client_auth_configuration", type(error).__name__)
+    elif url != DEFAULT_URL or repo != PUBLIC_REPOSITORY:
+        return _unavailable(repo, operation, "client_auth_configuration", "TAUCETI_GITHUB_STATE_TOKEN_FILE is not set")
     identity = hashlib.sha256((url + "\0" + token).encode()).hexdigest()
     base = transport.root() / "gateway" / identity
     binding = {"identity": identity, "repository": repo, "operation": operation, "args": args}
@@ -340,10 +361,11 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 if cursor:
                     params["cursor"] = cursor
                 headers = {
-                    "Authorization": "Bearer " + token,
                     "Accept": "application/json",
                     "User-Agent": "TauCetiWorker/1.0 (+https://github.com/TauCetiProject/TauCetiWorker)",
                 }
+                if token:
+                    headers["Authorization"] = "Bearer " + token
                 if cached and not cursor:
                     headers["If-None-Match"] = cached.get("etag", "")
                 request = urllib.request.Request(url + "/v1/query?" + urllib.parse.urlencode(params), headers=headers)
@@ -375,7 +397,9 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         ) from None
                     elif error.code in (401, 403):
                         raise _Failure(
-                            "client_auth_configuration", _classify(error, token).detail, status=error.code
+                            "client_auth_configuration" if token else "public_read_unavailable",
+                            _classify(error, token).detail,
+                            status=error.code,
                         ) from None
                     else:
                         raise _classify(error, token) from None
@@ -467,7 +491,11 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
             urllib.error.URLError,
         ) as error:
             last = _classify(error, token)
-            if time.monotonic() >= deadline or last.reason == "client_auth_configuration" or last.retry_after:
+            if (
+                time.monotonic() >= deadline
+                or last.reason in ("client_auth_configuration", "public_read_unavailable")
+                or last.retry_after
+            ):
                 break
     retry_at = time.time() + max(last.retry_after or 0, 5 * random.uniform(0.8, 1.2))
 

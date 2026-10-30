@@ -276,6 +276,12 @@ read as predictions.
 
 ## GitHub request accounting and shared reads
 
+Tau Ceti workers use the public GitHub state mirror by default, without a URL or
+client token. Complete surveys and mirrored histories come from that service;
+unavailable coverage retains direct fallback. `--github-state-url` overrides the
+service, and an empty URL explicitly selects direct reads. Custom and private
+services use `--github-state-token-file`; downstream project policies take precedence.
+
 Workers account for actual `gh` HTTP requests, including pagination and retries, in
 `state/github-shared/requests.jsonl`. Records contain worker, phase, endpoint, method, status,
 and rate-limit headers; tokens, query parameters, bodies and raw debug traces are excluded.

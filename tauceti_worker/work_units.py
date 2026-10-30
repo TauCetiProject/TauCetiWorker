@@ -81,6 +81,7 @@ from .constants import (
     TAUCETI,
 )
 from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_run, me
+from .github_state import enabled as github_state_enabled
 from .intentions import avoid_list
 from .paths import CLAIM_SH, HERE
 from .quota import Quota, _unavail_reason, mirror_creds
@@ -415,7 +416,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             count_all_roadmaps=global_pick,
             # An expanded scan must not create per-PR hydration demand or
             # silently fall back to thousands of direct comment requests.
-            cached_only=global_pick and bool(os.environ.get("TAUCETI_GITHUB_STATE_URL")),
+            cached_only=global_pick and github_state_enabled(),
         )
     if sv.dependency_wait:
         # Unknown global coverage is neither an empty backlog nor a failed round. Nothing is selected,
@@ -1030,11 +1031,10 @@ def _check_stage_read_quota(stage):
     from .config import GitHubUnavailable
     from .github_transport import observed_budget
 
-    if os.environ.get("TAUCETI_GITHUB_STATE_URL") or stage in ("overlap-scan", "overlap-fix"):
+    if stage in ("overlap-scan", "overlap-fix"):
         return
-    exhausted = {
-        k: reset for k, (remaining, reset) in observed_budget().items() if k in ("core", "graphql") and remaining == 0
-    }
+    buckets = ("core",) if github_state_enabled() else ("core", "graphql")
+    exhausted = {k: reset for k, (remaining, reset) in observed_budget().items() if k in buckets and remaining == 0}
     if exhausted:
         raise GitHubUnavailable("GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()))
 
