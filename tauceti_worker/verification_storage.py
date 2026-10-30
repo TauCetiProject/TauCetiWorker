@@ -552,6 +552,7 @@ def _observe_users(tree, work):
 def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evict=False):
     from . import recovery_maintenance as maintenance
     from . import work_recovery as wr
+    from .paths import canonical_candidate
     from .retention import locked, mount_points
 
     tree = candidate(state, identifier)
@@ -580,7 +581,8 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
         if _observe_users(tree, work):
             return "active"
         mounts = mount_points()
-        if mounts is None or any(point == tree or point.is_relative_to(tree) for point in mounts):
+        target = canonical_candidate(tree)
+        if mounts is None or any(point == target or point.is_relative_to(target) for point in mounts):
             return "mounted"
         copy_marker = state / "verification-copy-incomplete" / f"{identifier}.json"
         construction = read_json(copy_marker)
