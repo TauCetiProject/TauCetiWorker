@@ -236,9 +236,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # quota and a low direct GraphQL pool must not block the mirror.
             mirrored = github_state_enabled()
             if mirrored:
-                from .github_transport import observed_budget
+                from .github_transport import observed_budget, scope
 
-                gb = observed_budget()
+                # gh's credential store has no transport identity to persist
+                # observations under. Retain its existing preflight probe;
+                # a failed probe remains unknown and never prevents launch.
+                gb = observed_budget() if scope() else github_budget()
             else:
                 gb = github_budget()
             buckets = ("core",) if mirrored or set(only) == {"overlap-scan"} else ("core", "graphql")

@@ -98,6 +98,7 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
             patch.object(loop, "api_mode", return_value=False),
             patch.object(loop, "choose_model", return_value=("codex", {})),
             patch.object(loop, "github_budget", side_effect=AssertionError("no quota probe needed")),
+            patch("tauceti_worker.github_transport.scope", return_value="fixture"),
             patch("tauceti_worker.github_transport.observed_budget", return_value=budget),
             patch.object(loop, "run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
             patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
@@ -115,6 +116,29 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
                 assert not expected_launch and error.retry_at == 9999999999
             else:
                 assert expected_launch
+    # Plain gh-auth workers retain their pre-existing probe because no token
+    # identity is available for local observations. Failure stays nonblocking.
+    for budget, expected_launch in [
+        (None, True),
+        ({"core": (1, 9999999999), "graphql": (0, 9999999999)}, True),
+        ({"core": (0, 9999999999)}, False),
+    ]:
+        with (
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("codex", {})),
+            patch("tauceti_worker.github_transport.scope", return_value=None),
+            patch.object(loop, "github_budget", return_value=budget) as probe,
+            patch.object(loop, "run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
+            patch.object(loop.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            loop.cmd_loop(
+                SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None),
+                SimpleNamespace(wid="unconfigured-account-test"),
+                only=["review"],
+                agent="codex",
+            )
+            probe.assert_called_once()
+            assert launch.called is expected_launch
     public = {
         "version": 1,
         "repository": state.PUBLIC_REPOSITORY,
