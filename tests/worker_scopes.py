@@ -39,6 +39,13 @@ def gone(pid):
         return True
 
 
+def grandchild_pid(wid):
+    try:
+        return int(Path(str(wm.status_path(wid)) + ".grandchild").read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
 if (
     sys.platform != "linux"
     or not shutil.which("systemctl")
@@ -114,7 +121,7 @@ with tempfile.TemporaryDirectory(prefix="tauceti-scopes-") as raw:
         pool.root = scopes.cgroup(a["wrapper_pid"]).parent
         pool.cleanup("a")  # A live wrapper's lock excludes it from orphan cleanup.
         assert ready("a")["wrapper_pid"] == a["wrapper_pid"]
-        grandchild = int(Path(str(wm.status_path("a")) + ".grandchild").read_text())
+        grandchild = wait(lambda: grandchild_pid("a"))
         run("systemctl", "--user", "kill", "--signal=KILL", a["scope_unit"])
         a2 = wait(lambda: (s := ready("a")) and s["wrapper_pid"] != a["wrapper_pid"] and s)
         assert ready("b")["wrapper_pid"] == b["wrapper_pid"]
@@ -135,7 +142,7 @@ with tempfile.TemporaryDirectory(prefix="tauceti-scopes-") as raw:
         time.sleep(1)
         assert not wm.runner_status("a").get("alive")
         wait(lambda: ready("a"))
-        grandchild = int(Path(str(wm.status_path("b")) + ".grandchild").read_text())
+        grandchild = wait(lambda: grandchild_pid("b"))
         wm.save_worker_specs(config, [specs[0], dataclasses.replace(specs[1], enabled=False)])
         wait(lambda: not wm.runner_status("b").get("alive") and gone(grandchild))
 
