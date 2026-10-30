@@ -105,12 +105,12 @@ def test_shared_recent_read_and_429_fallback(root):
         quota._COOLDOWNS.clear()  # another process sees only the persisted state
         p, _ = qa._claude_pass("fp", "token", refresh=True, account="account")
         assert p.available and p.rate_limited and len(calls) == 2
-        assert qa._cooldown("claude", "account")[0] > 890
+        assert qa._cooldown("claude", "account")[0] > 3590
         p, _ = qa._claude_pass("renewed-fp", "renewed-token", refresh=True, account="account")
         assert p.rate_limited and len(calls) == 2  # token rotation never resets the cooldown
         clock[0] = observed + quota.QUOTA_TTL["claude"] + 1
         p, _ = qa._claude_pass("fp", "token", refresh=True, account="account")
-        assert not p.available and p.rate_limited and len(calls) == 3
+        assert not p.available and p.rate_limited and len(calls) == 2
 
 
 def test_pace_recovery_refreshes_before_twenty_minutes(root):

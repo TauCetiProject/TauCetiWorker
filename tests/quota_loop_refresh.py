@@ -332,13 +332,13 @@ waiting_cases = [
         3600,
     ),
     (
-        "an alternative's HTTP 429 Retry-After is capped at fifteen minutes",
+        "an alternative's HTTP 429 Retry-After is honored",
         "auto",
         {
             "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
             "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=1200),
         },
-        900,
+        1200,
     ),
     (
         "a short HTTP 429 Retry-After is still respected",
@@ -377,13 +377,13 @@ waiting_cases = [
         tc.POLL,
     ),
     (
-        "another provider's long Retry-After does not delay a rate-limited recheck",
+        "equal Retry-After deadlines are honored",
         "auto",
         {
             "codex": tc.Provider("codex", False, None, error="usage HTTP 503", retry_after=3600),
             "claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600),
         },
-        900,
+        3600,
     ),
 ]
 wait_ok = True
@@ -396,10 +396,10 @@ try:
     tc.loop.report_runtime = lambda *_a, **_k: None
     for label, agent, snap, expected in waiting_cases + [
         (
-            "an --ignore-quota Claude worker caps HTTP 429 Retry-After at fifteen minutes",
+            "an --ignore-quota worker's unclassified refusal retains its Retry-After",
             "claude",
             {"claude": tc.Provider("claude", False, None, error="usage HTTP 429", rate_limited=True, retry_after=3600)},
-            900,
+            3600,
         )
     ]:
         sleeps = []
@@ -423,7 +423,7 @@ finally:
     tc.loop.time.time = saved_clock
     tc.loop.report_runtime = saved_report
 
-# The fifteen-minute recheck cap also holds with a longer polling interval.
+# An explicit deadline is independent of the ordinary polling interval.
 saved_poll = tc.loop.POLL
 try:
     tc.loop.POLL = 1800
@@ -432,8 +432,10 @@ try:
     slow_other = tc.loop._recheck_in(tc.Provider("codex", False, None), wait_at)
 finally:
     tc.loop.POLL = saved_poll
-poll_ok = (long_poll, slow_other) == (900, 1800)
-print(f"[{'OK ' if poll_ok else 'XX '}] a long POLL does not stretch a 429 recheck: got={(long_poll, slow_other)!r}")
+poll_ok = (long_poll, slow_other) == (3600, 1800)
+print(
+    f"[{'OK ' if poll_ok else 'XX '}] a long POLL does not shorten a server deadline: got={(long_poll, slow_other)!r}"
+)
 
 
 # A 429 starts a cooldown on disk: until it ends, a forced read does not ask the endpoint again. It
@@ -462,7 +464,7 @@ try:
         and first.rate_limited
         and second.rate_limited
         and second.error is not None
-        and 0 < second.retry_after <= tc.RATE_LIMIT_RECHECK_MAX_S
+        and 3590 < second.retry_after <= 3600
     )
     cool_checks["renewing the token does not end the account's cooldown"] = (
         renewed.rate_limited and len(cool_fetches) == 1
@@ -485,7 +487,9 @@ try:
     )
 
     odd = cooldown_quota("corrupt")
-    odd._cooldown_path("claude", "x").write_text(json.dumps({"until": time.time() + 86400, "wait": 86400, "code": 429}))
+    odd._cooldown_path("claude", "x").write_text(
+        json.dumps({"until": time.time() + 86400, "wait": "invalid", "code": 429})
+    )
     odd._cooldown_path("claude", "y").write_text(json.dumps([1]))
     odd._cooldown_path("claude", "z").write_text(json.dumps({"until": time.time() + 901, "wait": 900, "code": 429}))
     cool_checks["a corrupt record is ignored, a clock stepped back is bounded"] = (
@@ -597,7 +601,7 @@ codex_cooldown_ok = (
     cx_fetches == ["fetch"]
     and cx_first.rate_limited
     and cx_second.rate_limited
-    and 0 < cx_second.retry_after <= tc.RATE_LIMIT_RECHECK_MAX_S
+    and 1190 < cx_second.retry_after <= 1200
 )
 print(
     f"[{'OK ' if codex_cooldown_ok else 'XX '}] codex's 429 cooldown stops re-asking too: fetches={cx_fetches!r} "

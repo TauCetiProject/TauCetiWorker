@@ -86,6 +86,7 @@ RUN_STDLIB=(
   host_agent_preflight.py
   host_build_cache.py
   ignore_quota_hardblock.py
+  quota_outage_autonomy.py
   infra_failure_budget.py
   isolate_home_macos.py
   isolate_home_paths.py

@@ -414,7 +414,11 @@ for code, want, ra in (
     tc.quota._http_get_json = Endpoint({}, code=code, retry_after=ra)
     p = make_quota().authorize_claude_launch()
     check(f"HTTP {code} names the status code", (p.available, p.error), (False, want))
-    check(f"HTTP {code} makes no bootstrap request", (boot.calls, p.retry_after), (0, ra))
+    check(f"HTTP {code} makes no bootstrap request", boot.calls, 0)
+    if code == 503:
+        check("headerless server failures back off", 0 < p.retry_after <= tc.RATE_LIMIT_RECHECK_MAX_S, True)
+    else:
+        check(f"HTTP {code} preserves Retry-After", p.retry_after, ra)
 
 # A 200 whose body is not a JSON object is an informative hard error, not an AttributeError. (An empty
 # body — [], "", 0 — is caught one step earlier as "response empty", which is equally informative.)

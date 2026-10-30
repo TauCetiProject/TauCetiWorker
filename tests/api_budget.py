@@ -1250,7 +1250,7 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         round_mock.assert_not_called()
         gh_mock.assert_not_called()
 
-    def test_loop_propagates_api_flags_and_internal_ignore_quota(self):
+    def test_loop_propagates_api_flags_and_internal_pacing_handoff(self):
         keyfile = self.root / "operator-key"
         keyfile.write_text("fake-api-key")
         parser = build_parser()
@@ -1283,7 +1283,8 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         self.assertTrue(child.budget)
         self.assertEqual(child.claude_billing, "api")
         self.assertEqual(child.anthropic_api_key_file, str(keyfile))
-        self.assertTrue(child.ignore_quota)
+        self.assertTrue(child.loop_paced)
+        self.assertFalse(child.ignore_quota)
         configure_api(child, "claude")
 
     def test_local_admission_wait_does_not_escalate_no_progress_backoff(self):

@@ -617,7 +617,7 @@ current usage and why a provider is waiting.
 | _(default)_ | The curve `60:40`: 40% of the quota by 60% of the window, then a ramp to the full quota by the reset. Holds a reserve for work that arrives late in a window |
 | `--pace 0:10,50:70,90:90` | Use a different piecewise-linear `time%:budget%` curve: 10% allowed immediately, ramping to 70% by halfway and 90% at 90% of the window, interpolated between points. Usage must remain strictly below the current budget. Budgets ≥ 100 mean no soft cap; a window at 100% used still backs off |
 | `--pace 0:0,100:100` | Spend at clock rate: the plain `used% < elapsed%` rule, which was the default before |
-| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex` or `--agent claude`; hard limits still apply |
+| `--ignore-quota` | Ignore pacing and transient usage-telemetry outages for an explicit `--agent codex` or `--agent claude`; known hard limits still apply |
 | `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: the first stdout token is the model to run; empty output means wait |
 
 `TAUCETI_PACE` and `TAUCETI_QUOTA_CMD` set the corresponding controls by

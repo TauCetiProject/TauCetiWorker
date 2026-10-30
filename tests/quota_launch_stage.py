@@ -197,6 +197,28 @@ except tc.NoProgress as e:
 check("...before the model runs", ran, [])
 check("...having asked exactly once", authorized["n"], 1)
 
+
+# A transient telemetry outage at this final boundary follows the same explicit override
+# as the loop and round; it is not a reason to reintroduce the launch prohibition.
+def unavailable_telemetry(_self):
+    return tc.Provider("claude", False, None, error="claude usage HTTP 429", telemetry_unavailable=True)
+
+
+tc.quota.Quota.authorize_claude_launch = unavailable_telemetry
+opts.ignore_quota = True
+ran.clear()
+tc.work_units.dispatch("review", w, tc.Survey(worker_id=cfg.wid), tc.Candidate(1, "head", ""), opts)
+check("an explicit override survives a launch-stage telemetry outage", ran, ["review"])
+opts.ignore_quota = False
+ran.clear()
+try:
+    tc.work_units.dispatch("review", w, tc.Survey(worker_id=cfg.wid), tc.Candidate(1, "head", ""), opts)
+except tc.NoProgress:
+    pass
+else:
+    check("ordinary pacing still requires launch-stage telemetry", False, True)
+check("ordinary pacing spends no model request on a telemetry outage", ran, [])
+
 # A round that was NOT given the authorization never asks, even on claude.
 authorized["n"] = 0
 plain = tc.RoundOpts(only=["review"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)

@@ -32,7 +32,7 @@ from .constants import (
 from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
 from .github_state import enabled as github_state_enabled
-from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
+from .quota import Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
@@ -44,16 +44,21 @@ class _LoopTerminated(KeyboardInterrupt):
 def _recheck_in(prov: Provider | None, now: float) -> int:
     """How long until it is worth reading this provider's usage again, while waiting for quota.
 
-    A rate-limited endpoint (HTTP 429): its Retry-After, bounded to fifteen minutes. Any other Retry-After
-    is honored as given. Otherwise the moment a blocking window frees (hourly at most, so activity is
-    observed), else the next poll. Never sooner than POLL: the next read would only re-trip a limit."""
+    Wake at a known telemetry deadline, rounded UP so an early wake cannot turn a
+    remaining fraction of a second into another full poll interval. Long waits are
+    revisited hourly without bypassing the fetcher's persisted cooldown."""
     if prov is None:
         return POLL
-    if prov.rate_limited and prov.error:  # no usable reading; a cached one waits on its own clock below
-        cap = RATE_LIMIT_RECHECK_MAX_S
-        return int(max(min(POLL, cap), min(prov.retry_after or POLL, cap)))
-    if prov.retry_after:
-        return int(max(POLL, prov.retry_after))
+    if prov.telemetry_unavailable and prov.next_eligible:
+        # An observed exhaustion may reset before the telemetry endpoint permits a
+        # retry. Re-evaluate it then; --ignore-quota can resume without another fetch.
+        deadline = math.ceil(prov.next_eligible - now)
+        if prov.retry_after and math.isfinite(prov.retry_after) and prov.retry_after > 0:
+            deadline = min(deadline, math.ceil(prov.retry_after))
+        return max(1, min(deadline, 3600))
+    if prov.retry_after and math.isfinite(prov.retry_after) and prov.retry_after > 0:
+        floor = 1 if prov.telemetry_unavailable or prov.rate_limited or prov.model_refusal else POLL
+        return max(floor, min(math.ceil(prov.retry_after), 3600))
     if prov.next_eligible:
         return max(POLL, min(int(prov.next_eligible - now) + 5, 3600))
     return POLL
@@ -176,13 +181,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             elif unpaced:
                 model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
-                # --ignore-quota overrides PACING (the soft over-pace throttle), not AVAILABILITY. We
-                # still read the usage endpoint and wait out a HARD block: a window at 100% (exhausted),
-                # usage we cannot read (fail-closed), or the endpoint itself refusing to answer (its own
-                # 429 / a network failure). Only a soft over-pace block — real quota left, merely ahead of
-                # the burn line — runs through here. Without this a pinned `--agent claude` worker re-fires
-                # every green PR into a rate-limited subscription, burning a clone + engine launch each
-                # round to post an all-error scoreboard.
+                # An explicit pacing override may run through a transient telemetry outage.
+                # Known exhaustion, auth failures and malformed readings still block. Actual
+                # model refusals stop the round and use the existing no-progress backoff.
                 if agent == "auto":
                     raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
                 _chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True)
@@ -207,6 +208,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     continue
                 if verdict == "over-pace":
                     log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
+                elif verdict == "telemetry-unavailable":
+                    log(f"quota: {agent} usage telemetry temporarily unavailable; --ignore-quota set — attempting work")
                 model = agent
             else:
                 model, snap = choose_model(cfg, agent, quota_cmd, refresh=True, renew=True)
@@ -282,7 +285,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if recovery_only:
                 tail += ["--recovery-only", "--agent", agent]
             elif model:
-                tail += ["--agent", model, "--ignore-quota"]  # loop already paced; child must not re-pace
+                tail += ["--agent", model, "--loop-paced"]  # soft pacing already decided by the parent
+                if ignore_quota:
+                    tail.append("--ignore-quota")  # only the operator grants outage permission
             if recovery_only:
                 if getattr(args, "author_model", None):
                     tail += ["--author-model", args.author_model]
@@ -454,17 +459,17 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
     """What --ignore-quota does with the pacer snapshot for its pinned agent — applied both by the loop
     between rounds and by the round deciding what it will launch.
 
-    --ignore-quota overrides PACING, not AVAILABILITY:
+    --ignore-quota overrides pacing and transient telemetry outages:
       "run"       — the provider is available (under pace), launch as usual.
       "over-pace" — a SOFT block: real quota remains, we are only ahead of the burn line. This is the
                     block --ignore-quota exists to override, so launch anyway.
-      "wait"      — a HARD block: a window at 100% (exhausted), usage we cannot read (fail-closed), or
-                    the usage endpoint refusing to answer (its own 429 / a network error leaves `prov`
-                    with no windows). Firing here only hits a dead provider, so back off even under
-                    --ignore-quota.
+      "telemetry-unavailable" — explicitly classified transient failure; try useful work.
+      "wait"      — exhaustion, auth/configuration failures, or an unreadable quota response.
     """
     if chosen is not None:
         return "run"
+    if prov is not None and prov.telemetry_unavailable and not any(w.status == "exhausted" for w in prov.windows):
+        return "telemetry-unavailable"
     soft = prov is not None and _unavail_reason(prov)[0]
     return "over-pace" if soft else "wait"
 
@@ -543,7 +548,14 @@ def claude_pending_init(snap: dict) -> bool:
 
 
 def resolve_work_model(
-    cfg: Config, agent: str, *, dry: bool, ignore_quota: bool, quota_cmd: str | None = None, fresh: bool = False
+    cfg: Config,
+    agent: str,
+    *,
+    dry: bool,
+    ignore_quota: bool,
+    quota_cmd: str | None = None,
+    fresh: bool = False,
+    already_paced: bool = False,
 ) -> tuple[str, bool]:
     """Turn the --agent dial into (concrete model, needs-launch-stage-bootstrap). 'auto' consults the
     pacer (or --quota-cmd); codex preferred, opus fallback. Kiro and OpenRouter agents are explicit
@@ -556,9 +568,9 @@ def resolve_work_model(
     on an hour-old verdict. A `_round` child leaves it off: the loop driver refreshed seconds ago, and
     re-fetching would only ask the same question twice.
 
-    --ignore-quota still reads usage. It overrides the soft burn-pace throttle, not availability, so the
-    read is what tells a pinned agent apart from a dead one; only --quota-cmd replaces the pacer
-    outright."""
+    --ignore-quota still reads usage and respects known hard blocks. A transient
+    telemetry outage alone does not prevent an explicitly unpaced attempt.
+    `already_paced` carries only the parent's soft pacing decision, never outage permission."""
     if dry:
         return agent, False
     if agent in OPENROUTER_MODELS or agent == "kiro":
@@ -569,11 +581,11 @@ def resolve_work_model(
         )
     # The round is deciding what it will actually launch, so the token it hands the agent must be live.
     chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=fresh, renew=True)
-    if ignore_quota and not quota_cmd:
-        # --ignore-quota overrides PACING, not AVAILABILITY — the same rule the loop applies between
-        # rounds (see cmd_loop). Reading usage costs no quota, and firing a round at an exhausted or
-        # unreadable provider only buys a clone, an engine launch, and a scoreboard full of errors.
+    if (ignore_quota or already_paced) and not quota_cmd:
+        # Match the loop's decision, including telemetry-only failures.
         verdict = _ignore_quota_verdict(chosen, snap.get(agent))
+        if verdict == "telemetry-unavailable" and not ignore_quota:
+            verdict = "wait"
         if verdict == "wait" and agent == "claude" and claude_pending_init(snap):
             return "claude", True  # the one hard block a bounded, pace-respecting request may clear
         if verdict == "wait":
@@ -585,12 +597,16 @@ def resolve_work_model(
             # skipped the read, launched, and the agent CLI renewed on its way up. It no longer does, so
             # the message has to hand the recovery back.
             fix = _credential_hint(agent, prov)
+            override = "--ignore-quota" if ignore_quota else "loop pacing handoff"
             raise NoProgress(
-                f"{agent} hard-blocked ({why}) — --ignore-quota overrides pacing, not availability; "
+                f"{agent} hard-blocked ({why}) — {override} overrides pacing, not availability; "
                 f"not launching this round{fix or _retry_hint(prov)}"
             )
         if verdict == "over-pace":
-            log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
+            why = "--ignore-quota set" if ignore_quota else "loop already paced this round"
+            log(f"quota: {agent} over-pace; {why} — running anyway")
+        elif verdict == "telemetry-unavailable":
+            log(f"quota: {agent} usage telemetry temporarily unavailable; --ignore-quota set — attempting work")
         return agent, False
     if chosen is None and claude_pending_init(snap):
         return "claude", True

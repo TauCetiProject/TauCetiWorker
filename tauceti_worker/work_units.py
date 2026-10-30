@@ -189,6 +189,7 @@ class RoundOpts:
     # Preserve the operator's pacing override for fresh launch-stage quota checks.
     # This never waives hard exhaustion or unreadable provider usage.
     ignore_quota: bool = False
+    loop_paced: bool = False  # soft pacing handoff; never permits telemetry-outage work
 
     @property
     def agent_name(self) -> str:
@@ -1133,7 +1134,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if opts.claude_bootstrap and opts.work_model == "claude":
         prov = Quota(w.cfg).authorize_claude_launch()
         if not prov.available:
-            raise NoProgress(f"claude: {prov.error or _unavail_reason(prov)[1]} — not launching this round")
+            from .loop import _ignore_quota_verdict
+
+            if not (opts.ignore_quota and _ignore_quota_verdict(None, prov) == "telemetry-unavailable"):
+                raise NoProgress(f"claude: {prov.error or _unavail_reason(prov)[1]} — not launching this round")
     fn = {
         "review": do_review,
         "fix": do_fix,
@@ -1471,7 +1475,8 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
 
     The counters are charged UP FRONT on purpose (an un-checkout-able PR must not loop), so a refund
     rather than a late charge is what keeps both properties. MAX_INFRA_REFUNDS bounds it in case a
-    persistent PR-specific failure ever matches the transient patterns.
+    persistent PR-specific failure ever matches the transient patterns. Confirmed
+    subscription-limit refusals are independent of the PR and do not consume that allowance.
 
     That bound is keyed on the PR, NOT the head. Some of the counters refunded here are per-PR and
     lifetime or progress-scoped (`ci-pr-`, `bump-pr-`, rebase budgets), so a head-keyed allowance would reset on every
@@ -1491,8 +1496,12 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     reason = take_last_agent_infra_failure()
     if not reason:
         return
-    refunds = w.counters.incr(f"infra-{label}-{c.pr}")
-    if refunds > MAX_INFRA_REFUNDS:
+    refunds = (
+        w.counters.read(f"infra-{label}-{c.pr}")
+        if reason == "provider subscription limit reached"
+        else w.counters.incr(f"infra-{label}-{c.pr}")
+    )
+    if refunds > MAX_INFRA_REFUNDS and reason != "provider subscription limit reached":
         warn_red(
             f"  {label} #{c.pr}: {reason}, but this head has already been refunded "
             f"{MAX_INFRA_REFUNDS} times — charging the attempt. If the provider really is down this "
@@ -1501,9 +1510,14 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
         return
     for key in charged:
         w.counters.write(key, max(0, w.counters.read(key) - 1))
+    detail = (
+        "subscription-limit refusal"
+        if reason == "provider subscription limit reached"
+        else f"refund {refunds}/{MAX_INFRA_REFUNDS}"
+    )
     log(
         f"  {label} #{c.pr}: {reason} — the agent never ran, so this attempt is not charged "
-        f"(refund {refunds}/{MAX_INFRA_REFUNDS}); backing off and retrying later"
+        f"({detail}); backing off and retrying later"
     )
     raise NoProgress(f"{label} #{c.pr}: {reason} — not charged to the PR, will retry after back-off")
 
@@ -1818,6 +1832,7 @@ def _do_fixlike(
                     session_path=conversation_path,
                     session_actor=getattr(sv, "me_login", ""),
                     session_scope=conversation_scope,
+                    quota_cfg=w.cfg,
                 )
             agent_rc = rc
         except BuildCacheUnavailable:
@@ -2505,7 +2520,7 @@ def _do_progress_inner(w, opts) -> int | None:
         _progress_deadline_wait(w)
     w.counters.write("progress-mechanical-retry-at", 0)
     w.counters.write("progress-attempt-ts", int(time.time()))
-    rc = run_agent_host(writing, prompt, opts.work_model, w.cfg.logdir)
+    rc = run_agent_host(writing, prompt, opts.work_model, w.cfg.logdir, quota_cfg=w.cfg)
     if rc != 0:
         from .claude_api import blocked_failure
 
@@ -2747,4 +2762,4 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )
-    return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+    return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg)

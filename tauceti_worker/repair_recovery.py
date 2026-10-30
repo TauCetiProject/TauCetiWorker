@@ -1383,6 +1383,7 @@ class WorkerBackend:
                             session_path=record / "continuation-session.json",
                             session_actor=auth.get("actor"),
                             session_scope=scope,
+                            quota_cfg=self.w.cfg,
                         )
                     except BuildCacheUnavailable as error:
                         refund_content(known_no_launch=True)
@@ -1421,10 +1422,16 @@ class WorkerBackend:
                 infra
                 and not infra.startswith("local API admission")
                 and not (api and api.blocked_reason)
-                and j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS
+                and (infra == "provider subscription limit reached" or j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS)
             ):
                 refund_content(known_no_launch=True)
-                write(record, j, "resuming", provider_refunds=j.get("provider_refunds", 0) + 1)
+                write(
+                    record,
+                    j,
+                    "resuming",
+                    provider_refunds=j.get("provider_refunds", 0)
+                    + (0 if infra == "provider subscription limit reached" else 1),
+                )
                 raise RuntimeError(f"Provider failed before structured work: {infra}")
             raise ContentFailure(
                 "continuation-source-failed",

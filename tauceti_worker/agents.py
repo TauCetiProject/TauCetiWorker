@@ -850,6 +850,7 @@ def run_agent_host(
     session_path=None,
     session_actor=None,
     session_scope=None,
+    quota_cfg=None,
 ) -> int:
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
@@ -927,6 +928,7 @@ def run_agent_host(
             provider=profile.provider,
             cancel_event=cancel_event,
             session_path=session_path,
+            quota_cfg=quota_cfg,
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
@@ -1006,6 +1008,16 @@ def classify_agent_failure(text: str) -> str | None:
         return f"provider returned {status}" if status in _TRANSIENT_STATUSES else None
     if _TRANSPORT_RE.search(hay):
         return "could not reach the provider"
+    if any(
+        re.search(
+            r"^(?:you(?:'ve| have) hit your (?:session|weekly|monthly|usage) limit\b|"
+            r"claude ai usage limit reached\b)",
+            line,
+            re.I,
+        )
+        for line in lines
+    ):
+        return "provider subscription limit reached"
     return None
 
 
@@ -1035,6 +1047,7 @@ def run_agent_proc(
     cwd: Path | None = None,
     cancel_event=None,
     session_path=None,
+    quota_cfg=None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -1050,6 +1063,19 @@ def run_agent_proc(
     # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
     # Codex then treats it as additional prompt input and waits forever for EOF.
     renderer = AgentTranscriptRenderer(provider)
+    quota_reader, launch_credential = None, None
+    if (
+        quota_cfg is not None
+        and provider in {"claude", "codex"}
+        and (provider != "claude" or env.get("TAUCETI_CLAUDE_BILLING") != "api")
+    ):
+        from .quota import Quota
+
+        try:
+            quota_reader = Quota(quota_cfg)
+            launch_credential = quota_reader.launch_credential(provider)
+        except Exception:
+            quota_reader = None  # optional failure evidence must never become a launch dependency
     tail: deque[str] = deque(maxlen=20)
 
     def write_rendered(destination, rendered: str) -> None:
@@ -1166,7 +1192,10 @@ def run_agent_proc(
         classification_text = "\n".join(tail)
         if renderer.terminal_failure_final and renderer.terminal_failure_text:
             classification_text = renderer.terminal_failure_text
-        return classify_agent_failure(classification_text)
+        reason = classify_agent_failure(classification_text)
+        if reason == "provider subscription limit reached" and quota_reader is not None:
+            quota_reader.note_model_refusal(provider, launch_credential)
+        return reason
 
     if os.environ.get("TAUCETI_STREAM"):
         rc = run_rendered(sys.stdout)
@@ -2426,6 +2455,7 @@ def run_in_bubble(
                 env=env,
                 logdir=cfg.logdir,
                 label=f"agent-{wm}",
+                quota_cfg=cfg,
                 provider=profile.provider,
                 cancel_event=cancel_event,
             )

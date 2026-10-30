@@ -362,7 +362,7 @@ class GenerationRetryTests(unittest.TestCase):
             self.calls.append(stage)
             return subprocess.CompletedProcess(args, 0, "writer prompt", "prompt stderr")
 
-        def writer(*_args):
+        def writer(*_args, **_kwargs):
             self.calls.append("writer")
             self.assertEqual(json.loads((self.work / "plan.json").read_text())["to_sha"], NEW)
             self.assertEqual(json.loads((self.work / "facts.json").read_text())["docs_sha"], NEW)

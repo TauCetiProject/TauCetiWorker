@@ -239,7 +239,7 @@ def test_roadmap():
     host_cap = {}
     tc.work_units.fetch_git_source = fake_fetch_source
     tc.work_units.prepare_checkout = lambda cfg, **_: True
-    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir: host_cap.update(prompt=prompt) or 0
+    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir, **_kwargs: host_cap.update(prompt=prompt) or 0
     opts.source = str(source)
     tc.work_units.do_roadmap(w, None, c, opts, bubble=False)
     host_prompt = host_cap.get("prompt", "")

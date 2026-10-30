@@ -1389,7 +1389,13 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
 
                 status = Quota(cfg).authorize_claude_launch()
                 if not status.available:
-                    raise NoProgress("security-audit: Claude quota unavailable")
+                    from .loop import _ignore_quota_verdict
+
+                    if not (
+                        getattr(opts, "ignore_quota", False)
+                        and _ignore_quota_verdict(None, status) == "telemetry-unavailable"
+                    ):
+                        raise NoProgress("security-audit: Claude quota unavailable")
             verdict = inspect(batch, provider, attempt)
         else:
             verdict = {

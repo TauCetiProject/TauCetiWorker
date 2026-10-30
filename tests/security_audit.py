@@ -23,6 +23,7 @@ from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
+from tauceti_worker.quota import Provider, Window
 from tauceti_worker.work_units import want
 
 
@@ -638,6 +639,23 @@ class WorkerBoundJudgments(unittest.TestCase):
         ):
             self.assertTrue(recovery.recover(self.cfg, opts, self.block))
         quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=True, fresh=True)
+
+    def test_recovery_preserves_parent_soft_pacing_without_outage_permission(self):
+        opts = wu.RoundOpts(
+            only=["security-audit"],
+            agent="claude",
+            work_model="claude",
+            sandbox_host=True,
+            dry_run=False,
+            loop_paced=True,
+        )
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)) as quota,
+            patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
+            patch.object(sa, "advance", return_value="b" * 40),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, opts, self.block))
+        quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=False, fresh=True, already_paced=True)
 
     def replace_answer(self, value):
         native = self.original / "model-rollout-0.jsonl"
@@ -2146,6 +2164,27 @@ class Run(unittest.TestCase):
             mock = patch.object(sa, name, **kwargs)
             mock.start()
             self.addCleanup(mock.stop)
+
+    def test_launch_telemetry_failure_requires_explicit_override(self):
+        for ignored, exhausted in ((False, False), (True, False), (True, True)):
+            opts = SimpleNamespace(dry_run=False, work_model="claude", claude_bootstrap=True, ignore_quota=ignored)
+            status = Provider("claude", False, None, error="claude usage HTTP 429", telemetry_unavailable=True)
+            if exhausted:
+                status.windows = [Window("session", 100, 50, None, "exhausted")]
+            with (
+                self.subTest(ignored=ignored, exhausted=exhausted),
+                patch("tauceti_worker.quota.Quota") as quota,
+                patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
+                patch.object(sa, "advance", return_value=self.target),
+            ):
+                quota.return_value.authorize_claude_launch.return_value = status
+                if ignored and not exhausted:
+                    self.assertEqual(sa.run(SimpleNamespace(state=self.state), opts), 0)
+                    model.assert_called_once()
+                else:
+                    with self.assertRaisesRegex(NoProgress, "quota unavailable"):
+                        sa.run(SimpleNamespace(state=self.state), opts)
+                    model.assert_not_called()
 
     def test_pending_threshold_skips_all_model_and_planning_work(self):
         for count in (0, 1, 19):

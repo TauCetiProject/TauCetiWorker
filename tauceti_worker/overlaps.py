@@ -499,6 +499,7 @@ def do_scan(w, sv, c, opts, bubble):
                 logdir=work,
                 label="conversation",
                 provider=profile.provider,
+                quota_cfg=w.cfg,
                 cancel_event=lease.lost,
             )
             if rc:
@@ -577,6 +578,7 @@ def do_fix(w, sv, c, opts, bubble):
                     _effective_authoring_profile(opts),
                     w.cfg.logdir,
                     cancel_event=getattr(lease, "lost", None),
+                    quota_cfg=w.cfg,
                 )
         if rc:
             return rc
