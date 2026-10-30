@@ -1088,11 +1088,7 @@ def process_references():
                 _charge()
                 with contextlib.suppress(OSError):
                     paths.append(os.readlink(link))
-        try:
-            label = f"{entry.name} ({(entry / 'comm').read_text().strip()})"
-        except OSError:
-            label = entry.name
-        result.append((entry.name, session, label, paths))
+        result.append((entry.name, session, entry.name, paths))
     return result
 
 
@@ -1104,6 +1100,9 @@ def referenced_users(repo: Path, references, *, session=None) -> list[str]:
         if session is not None and process_session == session:
             found.append(f"{pid} (owner session)")
         elif any(where == target or where.startswith(prefix) for where in paths):
+            if label == pid:
+                with contextlib.suppress(OSError):
+                    label = f"{pid} ({(Path('/proc') / pid / 'comm').read_text().strip()})"
             found.append(label)
     return found
 

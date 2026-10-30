@@ -244,9 +244,10 @@ is open and never takes that lock itself. Independent verification job leases an
 references protect their caches and source too. An inactive checkout can be removed in full only after source recovery
 succeeds and its remaining Git state can be safely discarded. Failed source
 preservation retains source while recognized build caches can still be reclaimed.
-The hourly collector registers retained checkout roots using metadata only. Ordinary
-activity housekeeping owns their resumable deletion under time, entry and byte
-budgets; uncertain candidates are skipped while unrelated work continues. It
+The existing cleanup service also processes retained checkout roots, using
+resumable deletion batches. Safety checks finish before scheduling yields;
+activity reporting only inventories and requests that background work when the
+timer is installed. Uncertain candidates are skipped while unrelated work continues. It
 archives extra commit/reflog tips in existing v1 bundles. Stashes, notes, native
 Git operations and credential-like files keep their original checkout when the
 recovery format cannot capture them. This is generated

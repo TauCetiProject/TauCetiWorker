@@ -88,10 +88,15 @@ stop a worker. Preparation always saves first and then always continues:
   `<checkout parent>/retained-checkouts/<name>-<time>-<id>`, a same-directory rename that
   needs no free space, and preparation clones a fresh checkout. Any process
   still working in the old one keeps working there.
-- **Retained checkouts clean themselves up in activity housekeeping**. Work-start
-  preparation never walks or removes historical trees. The ordinary activity
-  collector normally uses a shared 250 ms, 4,096-entry, 16 MiB read and 256 MiB
-  removal budget per tick. Low free space raises removal to 1 GiB and 8,192 entries.
+- **The existing cleanup service reclaims retained checkouts**. Work-start
+  preparation never walks or removes historical trees. With the cleanup timer
+  installed, activity preparation only inventories local metadata and requests the
+  collector asynchronously. The collector gives retained work a 30-second scheduling
+  slice, 262,144 entries, 1 GiB of reads and 32 GiB of removal. It yields between
+  candidates or resumable deletion batches. Individual ownership/reference checks
+  finish even when they exceed a scheduling slice; their elapsed time and process
+  scan count are reported separately. Installations without the timer retain their
+  existing activity-driven housekeeping, including the completed-check behavior.
   A source candidate that exhausts its allowance gets persisted backoff (60–1,800
   seconds) and a capped allowance on a later tick: at most 30 seconds, 262,144
   entries and 1 GiB of reads. Effective limits are included in prepared timing
@@ -113,6 +118,10 @@ stop a worker. Preparation always saves first and then always continues:
   that candidate and leaves a retryable next action while other work continues.
   Old containment markers and proofs are ignored. Housekeeping neither creates
   nor maintains them.
+  A pass-local process/mount observation is reused for recovery caches only while
+  holding that record lock and checking its unchanged actual-use generation and
+  tree identity. Changed candidates and legacy retained trees receive fresh checks;
+  a shared observation's absence of references alone never permits their deletion.
   Traversal never follows symlinks or crosses filesystems. A deletion marker alone
   never authorizes destruction. Known untracked top-level caches can be reclaimed
   incrementally; tracked cache-named paths remain source. Before removing source,

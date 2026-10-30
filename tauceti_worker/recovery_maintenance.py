@@ -804,7 +804,13 @@ class Sweep:
         if not self.base.is_dir():
             return
         with os.scandir(self.base) as workers:
-            for entry in workers:
+            entries = list(workers)
+            if self.cleanup:
+                # Native timer invocations are fresh processes. Existing job
+                # mtimes make attempted workers yield to untouched workers on
+                # the next invocation, without another durable cursor or gate.
+                entries.sort(key=lambda entry: self.last_attempt(Path(entry.path)))
+            for entry in entries:
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         yield from self.scan_worker(Path(entry.path))
@@ -815,6 +821,24 @@ class Sweep:
                     with contextlib.suppress(OSError):
                         atomic_json(Path(entry.path) / "recovery-prepared.json", previous)
                     continue  # one unreadable worker must not starve later workers
+
+    @staticmethod
+    def last_attempt(state):
+        stamps = [0]
+        for category in ("jobs", "cache-jobs"):
+            for path in (state / "recovery-cleanup" / category).glob("*.json"):
+                with contextlib.suppress(OSError):
+                    stamps.append(path.stat().st_mtime_ns)
+        return max(stamps)
+
+    @staticmethod
+    def tree_attempt(state, entry, category):
+        directory = "cache-jobs" if category == "cache" else "jobs"
+        path = state / "recovery-cleanup" / directory / f"{_name(Path(entry.path))}.json"
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return 0
 
     def scan_worker(self, state):
         legacy_parent = self.base.parent / "checkouts" / state.name / "retained-checkouts"
@@ -859,7 +883,10 @@ class Sweep:
                         parent = Path(registry["record"] if category == "cache" else registry["parent"])
                         with contextlib.suppress(OSError):
                             with os.scandir(parent) as trees:
-                                for tree in trees:
+                                entries = list(trees)
+                                if self.cleanup:
+                                    entries.sort(key=lambda entry: self.tree_attempt(state, entry, category))
+                                for tree in entries:
                                     yield state, category + "-entry", Path(tree.path), registry
         jobs = state / "recovery-cleanup" / "jobs"
         if jobs.is_dir():

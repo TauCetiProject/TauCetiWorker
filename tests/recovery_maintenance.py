@@ -216,6 +216,25 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertEqual(observation["next_action"], "retry-changed-cache")
         self.assertTrue((tree / ".lake/generated").exists())
 
+    def test_fresh_collector_invocations_rotate_after_an_expensive_candidate(self):
+        for worker in ("a", "z"):
+            state = self.cfg.state.parent / worker
+            parent = self.root / "checkouts" / worker / "retained-checkouts"
+            (parent / "tree").mkdir(parents=True)
+            maintenance.register(state, parent, "TauCeti", "fixture/repo")
+        attempted = []
+
+        def expensive(state, tree, root, work, observation):
+            attempted.append(state.name)
+            maintenance._write_job(maintenance._job_path(state, tree), dict(tree=str(tree), phase="save", stack=[""]))
+            raise wr.BudgetExhausted("fixture expensive source preservation")
+
+        with patch.object(maintenance, "_cleanup", expensive):
+            self.tick()
+            maintenance._SWEEPS.clear()  # a new native timer process
+            self.tick()
+        self.assertEqual(attempted, ["a", "z"])
+
     def test_warm_lookup_independent_of_history(self):
         self.dirty()
         # First make a valid historical descriptor with a relatively large archive.
