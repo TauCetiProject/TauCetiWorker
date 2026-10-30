@@ -31,7 +31,7 @@ def facts_bundle(plan_file, *, verify=False):
     """
     plan = json.loads(plan_file.read_text())
     pin = plan.get("documentation") if isinstance(plan, dict) else None
-    if not isinstance(pin, dict) or pin.get("mode") != "pages":
+    if not isinstance(pin, dict) or "bundle_file" not in pin:
         return None
     digest = pin.get("facts_sha256")
     name = pin.get("bundle_file")

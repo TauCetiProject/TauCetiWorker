@@ -2212,89 +2212,87 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
         output.mkdir()
         plan_file, facts_file = output / "plan.json", output / "facts.json"
         plan = {}
-        # Shared within an attempt, isolated from all other attempts and the global disk cache.
-        with tempfile.TemporaryDirectory(prefix="docs-", dir=output) as cache:
-            for stage, args in (
+        for stage, args in (
+            (
+                "plan",
                 (
-                    "plan",
-                    (
-                        "--roadmap-dir",
-                        str(roadmap_dir),
-                        "--code-dir",
-                        str(w.cfg.checkout),
-                        "--min-prs",
-                        "25",
-                        "--out",
-                        str(plan_file),
-                    ),
+                    "--roadmap-dir",
+                    str(roadmap_dir),
+                    "--code-dir",
+                    str(w.cfg.checkout),
+                    "--min-prs",
+                    "25",
+                    "--out",
+                    str(plan_file),
                 ),
-                ("facts", ("--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file))),
-            ):
-                proc = run_tool(stage, *args, capture=True, docs_cache=cache)
-                if stage == "plan" and proc.returncode == EX_NOPROGRESS:
-                    log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
+            ),
+            ("facts", ("--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file))),
+        ):
+            proc = run_tool(stage, *args, capture=True)
+            if stage == "plan" and proc.returncode == EX_NOPROGRESS:
+                log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
+                w.counters.write("progress-docs-waits", 0)
+                w.counters.write("progress-docs-retry-at", 0)
+                _progress_mechanical_delay(w)
+                return None
+            if proc.returncode:
+                reason = _progress_tool_failed(w, stage, proc)
+                if proc.returncode == 78:
+                    recovery = True
+                    if stage == "plan":
+                        _progress_documentation_wait(w, reason, recovery=True)
+                    invalid_plan = plan_identity(plan)
+                if _progress_generation_changed(stage, proc) or proc.returncode == 78:
+                    log(f"progress: documentation requires replanning on mechanical attempt {attempt + 1}/3")
+                    break
+                if proc.returncode == 77:
+                    _progress_documentation_wait(w, reason)
+                _progress_mechanical_failed(w, reason)
+            if stage == "plan":
+                try:
+                    plan = json.loads(plan_file.read_text())
+                    if not isinstance(plan, dict) or not all(
+                        plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "prs")
+                    ):
+                        raise ValueError("plan is missing its roadmap/window/PR identity")
+                except (OSError, ValueError) as exc:
+                    _progress_mechanical_failed(w, f"progress: invalid plan artifact: {exc}")
+                if invalid_plan == plan_identity(plan):
+                    _progress_documentation_wait(
+                        w, f"replanning selected the same invalid facts identity; {reason}", recovery=True
+                    )
+                if saved := publication.parked_window(w.cfg, plan):
+                    log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
                     w.counters.write("progress-docs-waits", 0)
                     w.counters.write("progress-docs-retry-at", 0)
-                    _progress_mechanical_delay(w)
+                    _progress_mechanical_delay(w, PROGRESS_ATTEMPT_GAP)
                     return None
-                if proc.returncode:
-                    reason = _progress_tool_failed(w, stage, proc)
-                    if proc.returncode == 78:
-                        recovery = True
-                        if stage == "plan":
-                            _progress_documentation_wait(w, reason, recovery=True)
-                        invalid_plan = plan_identity(plan)
-                    if _progress_generation_changed(stage, proc) or proc.returncode == 78:
-                        log(f"progress: documentation requires replanning on mechanical attempt {attempt + 1}/3")
-                        break
-                    if proc.returncode == 77:
-                        _progress_documentation_wait(w, reason)
-                    _progress_mechanical_failed(w, reason)
-                if stage == "plan":
-                    try:
-                        plan = json.loads(plan_file.read_text())
-                        if not isinstance(plan, dict) or not all(
-                            plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "prs")
-                        ):
-                            raise ValueError("plan is missing its roadmap/window/PR identity")
-                    except (OSError, ValueError) as exc:
-                        _progress_mechanical_failed(w, f"progress: invalid plan artifact: {exc}")
-                    if invalid_plan == plan_identity(plan):
-                        _progress_documentation_wait(
-                            w, f"replanning selected the same invalid facts identity; {reason}", recovery=True
-                        )
-                    if saved := publication.parked_window(w.cfg, plan):
-                        log(f"progress: this exact window is retained at {saved}; selecting unrelated work")
-                        w.counters.write("progress-docs-waits", 0)
-                        w.counters.write("progress-docs-retry-at", 0)
-                        _progress_mechanical_delay(w, PROGRESS_ATTEMPT_GAP)
-                        return None
+        else:
+            try:
+                facts = json.loads(facts_file.read_text())
+                if not all(
+                    isinstance(facts.get(k), str) and re.fullmatch(r"[0-9a-f]{40}", facts[k])
+                    for k in ("docs_sha", "to_sha")
+                ):
+                    raise ValueError("facts must contain full docs_sha and to_sha commit IDs")
+            except (OSError, ValueError, AttributeError) as exc:
+                _progress_mechanical_failed(w, f"progress: invalid facts artifact: {exc}")
+            if (
+                facts["docs_sha"] != plan["to_sha"]
+                or facts["to_sha"] != plan["to_sha"]
+                or facts.get("documentation") != plan.get("documentation")
+            ):
+                reason = (
+                    f"successful facts name docs={facts['docs_sha']} to={facts['to_sha']}, "
+                    f"expected={plan['to_sha']} or documentation pin differs; replanning"
+                )
+                log(f"progress: {reason}")
             else:
                 try:
-                    facts = json.loads(facts_file.read_text())
-                    if not all(
-                        isinstance(facts.get(k), str) and re.fullmatch(r"[0-9a-f]{40}", facts[k])
-                        for k in ("docs_sha", "to_sha")
-                    ):
-                        raise ValueError("facts must contain full docs_sha and to_sha commit IDs")
-                except (OSError, ValueError, AttributeError) as exc:
-                    _progress_mechanical_failed(w, f"progress: invalid facts artifact: {exc}")
-                if (
-                    facts["docs_sha"] != plan["to_sha"]
-                    or facts["to_sha"] != plan["to_sha"]
-                    or facts.get("documentation") != plan.get("documentation")
-                ):
-                    reason = (
-                        f"successful facts name docs={facts['docs_sha']} to={facts['to_sha']}, "
-                        f"expected={plan['to_sha']} or documentation pin differs; replanning"
-                    )
-                    log(f"progress: {reason}")
-                else:
-                    try:
-                        publication.facts_bundle(plan_file, verify=True)
-                    except (OSError, ValueError) as exc:
-                        _progress_documentation_wait(w, f"pinned facts bundle unavailable: {exc}", recovery=True)
-                    return plan_file, facts_file
+                    publication.facts_bundle(plan_file, verify=True)
+                except (OSError, ValueError) as exc:
+                    _progress_documentation_wait(w, f"pinned facts bundle unavailable: {exc}", recovery=True)
+                return plan_file, facts_file
     # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
     # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
     _progress_documentation_wait(w, f"generation kept changing after 3 attempts; {reason}", recovery=recovery)
@@ -2395,7 +2393,7 @@ def _do_progress_inner(w, opts) -> int | None:
 
     deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or time.time() + ROUND_TIMEOUT)
 
-    def run_tool(*args: str, capture: bool = False, docs_cache=None):
+    def run_tool(*args: str, capture: bool = False):
         # `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid
         # byte raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to
         # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
@@ -2415,7 +2413,6 @@ def _do_progress_inner(w, opts) -> int | None:
                     **os.environ,
                     "TAUCETI_FACTS_CACHE": os.environ.get("TAUCETI_FACTS_CACHE")
                     or str(w.cfg.state / "progress/facts-cache"),
-                    **({"TAUCETI_DOCS_CACHE": docs_cache} if docs_cache else {}),
                 },
             )
         except (OSError, subprocess.SubprocessError) as exc:
