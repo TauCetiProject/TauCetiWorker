@@ -154,6 +154,7 @@ RUN_STDLIB=(
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
+  worker_scopes.py
   recovery_maintenance.py
   work_recovery.py
   repair_recovery.py
