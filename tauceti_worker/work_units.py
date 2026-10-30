@@ -96,11 +96,13 @@ from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
 from .survey import (
+    LOST_BUILD_REASON,
     TARGET_MARKER_RE,
     Candidate,
     Counters,
     Survey,
     bust_progress_cache,
+    confirm_lost_build,
     fix_disposition,
     prioritize_review_candidates,
     progress_argv,
@@ -818,12 +820,19 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     the next candidate" path — the same one a peer's branch claim and progress's fresh re-check use.
 
     Only the stages whose actionability comes from REVIEW state need this: rebase reads `mergeable`,
-    fix-ci and bump read the build, and roadmap/progress have no PR to re-read.
+    fix-ci and bump read the build, and roadmap/progress have no PR to re-read. The exception is a
+    fix-ci candidate whose build never reported: the survey found it from a cached verdict without
+    reading dispatched builds, so it is confirmed live too (confirm_lost_build).
 
     Every read here is FORCED past the cache rather than arranged by busting it first. Busting and then
     reading normally looks equivalent and is not: the cache directory is shared with `status` and the
     dashboard, either of which can republish an entitled record in the gap, and the read would come
     back `assumed` from a fetch that happened before whatever prompted this re-check."""
+    if stage == "fix-ci" and c.reason == LOST_BUILD_REASON:
+        if confirm_lost_build(w.gh, c.pr, c.head, time.time()):
+            return True
+        log(f"  fix-ci #{c.pr}: its build is not lost on a fresh read (moved, reported, rerun or replaced) — skipping")
+        return False
     if stage == "rebase":
         if getattr(c, "foreign_repair_base", ""):
             from .repair_route import authorize, reselect_before_launch
