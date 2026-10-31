@@ -15,7 +15,9 @@ import json
 import os
 import pwd
 import re
+import resource
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -174,40 +176,94 @@ def descriptions(data):
     return result
 
 
-def entries(download):
-    # A fresh download directory has no locally compiled output mappings. Every .ltar
-    # mapping here came from the existing trusted CI service during this preparation.
-    for path in (download / "outputs/TauCeti").glob("*.json"):
-        if not HASH.fullmatch(path.stem):
-            continue
-        data = read_json(path).get("data")
+def clock():
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return time.monotonic(), own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
+
+
+def record_phase(report, name, started):
+    if report is not None:
+        wall, cpu = clock()
+        row = report.setdefault("phases", {}).setdefault(name, dict(seconds=0, cpu_seconds=0))
+        row["seconds"] = round(row["seconds"] + wall - started[0], 6)
+        row["cpu_seconds"] = round(row["cpu_seconds"] + cpu - started[1], 6)
+
+
+@contextlib.contextmanager
+def measured(report, name):
+    started = clock()
+    try:
+        yield
+    finally:
+        record_phase(report, name, started)
+
+
+def mappings(download):
+    # This download directory contains only fresh native CI metadata, never a
+    # worker's locally compiled output mappings. Keep it in memory for this pass.
+    try:
+        return {
+            path.stem: read_json(path)
+            for path in (download / "outputs/TauCeti").glob("*.json")
+            if HASH.fullmatch(path.stem)
+        }
+    except OSError as error:
+        log(f"expanded cache metadata unavailable; retaining private fallback ({error})")
+        return {}
+
+
+def revision_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except FileNotFoundError:
+        return 0  # Another preparation trimmed this optional revision hint.
+
+
+def entries(download, manifest=None):
+    for key, row in (mappings(download) if manifest is None else manifest).items():
+        data = row.get("data")
         if isinstance(data, str) and ARTIFACT.fullmatch(data) and data.endswith(".ltar"):
-            yield path.stem, data
+            yield key, data
 
 
-def hydrate(entry, private, input_hash):
+def private_mapping(private, key, known):
+    if key not in known:
+        known[key] = read_json(private / "outputs/TauCeti" / (key + ".json"))
+    return known[key]
+
+
+def hydrate(entry, private, input_hash, *, private_mappings=None, report=None):
     row = read_json(entry / "entry.json")
-    names = descriptions(row["data"])
-    if not all((entry / name).is_file() and not (entry / name).is_symlink() for name in names):
-        raise ValueError("incomplete expanded entry")
+    names = list(dict.fromkeys(descriptions(row["data"])))
+    try:
+        if not all(stat.S_ISREG((entry / name).lstat().st_mode) for name in names):
+            raise ValueError("incomplete expanded entry")
+    except FileNotFoundError:
+        raise ValueError("incomplete expanded entry") from None
     desired = dict(schemaVersion=SCHEMA, service=None, data=row["data"])
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
-    if not (
-        all(read_json(private / "outputs/TauCeti" / (key + ".json")) == desired for key in keys)
-        and all((private / "artifacts" / name).is_file() for name in names)
-    ):
-        for name in names:
-            link(entry / name, private / "artifacts" / name)
-        for key in keys:
-            atomic_json(private / "outputs/TauCeti" / (key + ".json"), desired)
+    known = {} if private_mappings is None else private_mappings
+    changed = [key for key in keys if private_mapping(private, key, known) != desired]
+    missing = [name for name in names if not (private / "artifacts" / name).is_file()]
+    started = clock()
+    for name in missing:
+        link(entry / name, private / "artifacts" / name)
+    for key in changed:
+        atomic_json(private / "outputs/TauCeti" / (key + ".json"), desired)
+        known[key] = desired
+    if report is not None:
+        report["installed_artifacts"] = report.get("installed_artifacts", 0) + len(missing)
+        report["written_mappings"] = report.get("written_mappings", 0) + len(changed)
+        record_phase(report, "install", started)
     # Explicit reuse timestamp: archive mtimes and filesystem atime are not LRU.
     if time.time() - (entry / "entry.json").stat().st_mtime > 60:
         os.utime(entry / "entry.json", None)
 
 
-def expand(download, private, cwd, env, pool, report):
+def expand(download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None):
     grouped = {}
-    for input_hash, archive in entries(download):
+    for input_hash, archive in entries(download, manifest):
         grouped.setdefault(archive, []).append(input_hash)
     pending = [(inputs, archive) for archive, inputs in grouped.items()]
     if not pending:
@@ -228,7 +284,7 @@ def expand(download, private, cwd, env, pool, report):
                 entry = pool / "entries" / key
                 try:
                     if (entry / "entry.json").is_file():
-                        hydrate(entry, private, input_hash)
+                        hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report)
                         report["hits"] += 1
                     else:
                         missing.append((input_hash, archive, entry))
@@ -307,42 +363,56 @@ def expand(download, private, cwd, env, pool, report):
                     atomic_json(publication / "entry.json", dict(data=data))
                     entry.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(publication, entry)
-                    hydrate(entry, private, input_hash)
+                    hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report)
                     report["expanded"] += 1
 
 
-def transfer(download, private, seeded=()):
+def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None):
     """Preserve downloads on unsupported toolchains, without linking mutable metadata."""
+    manifest = mappings(download) if manifest is None else manifest
+    known = {} if private_mappings is None else private_mappings
     try:
-        wanted = {name for _, name in entries(download)}
-        for mapping in (download / "outputs/TauCeti").glob("*.json"):
-            data = read_json(mapping).get("data")
-            if isinstance(data, dict):
+        wanted = {name for _, name in entries(download, manifest)}
+        for row in manifest.values():
+            if isinstance(row.get("data"), dict):
                 with contextlib.suppress(ValueError):
-                    wanted.update(descriptions(data))
+                    wanted.update(descriptions(row["data"]))
         for directory in ("artifacts", "outputs", "revisions"):
             for source in (download / directory).rglob("*"):
-                if source.is_file() and not source.is_symlink():
-                    target = private / directory / source.relative_to(download / directory)
-                    if directory == "artifacts":
-                        if source.name in wanted or source.name not in seeded:
-                            link(source, target)
-                    else:
-                        if directory == "outputs" and isinstance(read_json(target).get("data"), dict):
-                            continue  # Preserve this worker's already expanded native mapping.
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        if source.suffix == ".json":
-                            data = json.loads(source.read_text())
-                            if read_json(target) != data:
-                                atomic_json(target, data)
-                        else:
-                            shutil.copyfile(source, target)
+                if directory == "artifacts" and source.name not in wanted and source.name in seeded:
+                    continue
+                if source.is_symlink() or not source.is_file():
+                    continue
+                target = private / directory / source.relative_to(download / directory)
+                if directory == "artifacts":
+                    link(source, target)
+                    continue
+                if source.suffix != ".json":
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                    continue
+                key = source.stem if source.parent == download / "outputs/TauCeti" else None
+                before = private_mapping(private, key, known) if key in manifest else read_json(target)
+                if directory == "outputs" and isinstance(before.get("data"), dict):
+                    try:
+                        descriptions(before["data"])
+                        continue  # Preserve this worker's valid expanded native mapping.
+                    except ValueError:
+                        pass  # Repair malformed private mappings using the fresh download.
+                target.parent.mkdir(parents=True, exist_ok=True)
+                data = manifest[key] if key in manifest else read_json(source)
+                if not data:
+                    continue  # Interrupted/malformed fresh metadata must not replace good private state.
+                if before != data:
+                    atomic_json(target, data)
+                if key in manifest:
+                    known[key] = data
     except (OSError, ValueError) as error:
         log(f"expanded cache: retaining private fallback after transfer error: {error}")
 
 
 @contextlib.contextmanager
-def preparation(cwd, env, *, refetch=None):
+def preparation(cwd, env, *, refetch=None, report=None):
     """Use fresh CI metadata, reusing existing archive bytes without trusting agent mappings."""
     if env.get("TAUCETI_SHARED_ARTIFACTS", "1") == "0" or not env.get("LAKE_CACHE_DIR"):
         yield env
@@ -361,7 +431,8 @@ def preparation(cwd, env, *, refetch=None):
         yield env
         return
     started = time.monotonic()
-    report = dict(hits=0, expanded=0)
+    report = {} if report is None else report
+    report.update(hits=0, expanded=0)
     with temporary as tmp, contextlib.ExitStack() as leases:
         try:
             leases.enter_context(locked(pool, "download-" + Path(tmp).name))
@@ -372,53 +443,93 @@ def preparation(cwd, env, *, refetch=None):
         # Pool contains only previously verified CI artifacts; private .ltars are also
         # candidates, but the native verifier checks their hash before publication.
         seeded = set()
+        seed_started = clock()
         try:
             for source in (pool / "archives", private / "artifacts"):
                 for path in source.glob("*.ltar"):
-                    if ARTIFACT.fullmatch(path.name) and not path.is_symlink():
-                        link(path, download / "artifacts" / path.name)
-                        seeded.add(path.name)
+                    if path.name in seeded:
+                        continue
+                    try:
+                        if ARTIFACT.fullmatch(path.name) and not path.is_symlink():
+                            link(path, download / "artifacts" / path.name)
+                            seeded.add(path.name)
+                    except FileNotFoundError:
+                        continue  # Pool GC won the race; native Lake can fetch this file.
             # Reuse only the host-owned immutable revision maps, never agent-created metadata.
             revisions = pool / "revisions/TauCeti"
-            recent = sorted(revisions.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:64]
+            recent = sorted(revisions.glob("*.jsonl"), key=revision_mtime, reverse=True)[:64]
             for path in recent:
-                link(path, download / "revisions/TauCeti" / path.name)
+                with contextlib.suppress(FileNotFoundError):
+                    link(path, download / "revisions/TauCeti" / path.name)
         except (OSError, ValueError) as error:
             log(f"expanded cache setup unavailable; using private cache ({error})")
             yield env
             return
+        record_phase(report, "seed", seed_started)
+        report["seeded_artifacts"] = len(seeded)
         warm_env = dict(env, LAKE_CACHE_DIR=str(download))
         ready = False
         try:
-            yield warm_env
+            with measured(report, "native_fetch"):
+                yield warm_env
             ready = True
         finally:
             # Even failed/unsupported expansion retains the ordinary verified downloads.
             # Copy mutable metadata, never hard-link it to something Lake may rewrite.
-            transfer(download, private, seeded)
+            with measured(report, "manifest"):
+                manifest = mappings(download)
+                report["mappings"] = len(manifest)
+            private_mappings = {}
+            with measured(report, "transfer"):
+                transfer(download, private, seeded, manifest=manifest, private_mappings=private_mappings)
             if ready:
                 with contextlib.suppress(OSError):
                     for path in (download / "revisions/TauCeti").glob("*.jsonl"):
                         if not path.is_symlink():
                             link(path, pool / "revisions/TauCeti" / path.name)
-                    revisions = sorted(
-                        (pool / "revisions/TauCeti").glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
-                    )
+                    revisions = sorted((pool / "revisions/TauCeti").glob("*.jsonl"), key=revision_mtime, reverse=True)
                     for old in revisions[64:]:
                         old.unlink(missing_ok=True)
             if ready and env.get("LAKE_ARTIFACT_CACHE", "1").lower() not in ("0", "false", "off"):
                 try:
                     try:
-                        expand(download, private, cwd, warm_env, pool, report)
+                        with measured(report, "expand_hydrate"):
+                            expand(
+                                download,
+                                private,
+                                cwd,
+                                warm_env,
+                                pool,
+                                report,
+                                manifest=manifest,
+                                private_mappings=private_mappings,
+                            )
                     except CorruptArchive as error:
                         # A stale local .ltar must not poison every future round. Detach
                         # the known-bad candidate and let the existing downloader repair it.
                         (download / "artifacts" / error.name).unlink(missing_ok=True)
                         (private / "artifacts" / error.name).unlink(missing_ok=True)
                         if refetch is not None:
-                            refetch(warm_env)
-                            transfer(download, private, seeded)
-                            expand(download, private, cwd, warm_env, pool, report)
+                            with measured(report, "refetch"):
+                                refetch(warm_env)
+                            with measured(report, "manifest"):
+                                manifest = mappings(download)
+                                report["mappings"] = len(manifest)
+                            with measured(report, "transfer"):
+                                transfer(
+                                    download, private, seeded, manifest=manifest, private_mappings=private_mappings
+                                )
+                            with measured(report, "expand_hydrate"):
+                                expand(
+                                    download,
+                                    private,
+                                    cwd,
+                                    warm_env,
+                                    pool,
+                                    report,
+                                    manifest=manifest,
+                                    private_mappings=private_mappings,
+                                )
                 except Exception as error:
                     # Sharing is an optimization; report its failure without spending a
                     # PR attempt or replacing the original host-preparation outcome.

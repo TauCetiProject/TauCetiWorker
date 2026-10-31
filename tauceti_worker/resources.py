@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import resource
-import subprocess
 import sys
 import threading
 import time
@@ -24,72 +23,82 @@ def read_bytes(pid: int) -> int | None:
         return None
 
 
-def host_pressure() -> dict:
-    """Host-wide PSI totals; these include co-tenants and are not worker attribution."""
+def pressure(directory: Path) -> dict:
+    """Cumulative stall counters for this scope, including its descendants."""
     result = {}
-    for resource_name in ("cpu", "memory", "io"):
+    for name in ("cpu", "memory", "io"):
         try:
-            rows = {}
-            for line in Path(f"/proc/pressure/{resource_name}").read_text().splitlines():
-                category, *fields = line.split()
-                rows[category] = int(dict(field.split("=", 1) for field in fields)["total"])
-            result[resource_name] = rows
+            result[name] = {
+                category: int(dict(field.split("=", 1) for field in fields)["total"])
+                for category, *fields in (
+                    line.split() for line in (directory / f"{name}.pressure").read_text().splitlines()
+                )
+            }
         except (OSError, ValueError, KeyError):
             pass
     return result
 
 
-def process_table() -> dict[int, dict]:
-    """Read process identities, resident memory, and CPU time without command lines or credentials."""
-    ticks = os.sysconf("SC_CLK_TCK")
-    page = os.sysconf("SC_PAGE_SIZE")
-    result = {}
-    if sys.platform.startswith("linux"):
-        for path in Path("/proc").iterdir():
-            if not path.name.isdecimal():
-                continue
-            try:
-                fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
-                result[int(path.name)] = dict(
-                    ppid=int(fields[1]),
-                    identity=int(fields[19]),
-                    cpu_seconds=sum(int(fields[i]) for i in (11, 12, 13, 14)) / ticks,
-                    rss_bytes=max(0, int(fields[21])) * page,
-                )
-            except (OSError, ValueError, IndexError):
-                continue  # A process can exit while the snapshot is being read.
-    else:
-        # ps reports CPU for live processes only; the final rusage reading also covers reaped children.
-        proc = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,time="], capture_output=True, text=True, timeout=5)
-        for line in proc.stdout.splitlines():
-            try:
-                pid, parent, rss, cpu = line.split()
-                days, sep, cpu = cpu.rpartition("-")
-                day_seconds = int(days) * 86400 if sep else 0
-                seconds = 0.0
-                for part in cpu.split(":"):
-                    seconds = seconds * 60 + float(part)
-                seconds += day_seconds
-                result[int(pid)] = dict(ppid=int(parent), identity=None, cpu_seconds=seconds, rss_bytes=int(rss) * 1024)
-            except ValueError:
-                continue
-    return result
+def scope_directory(cfg) -> Path | None:
+    """An unavailable dedicated scope degrades telemetry, never worker execution."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        from .worker_manager import workers_runtime_dir
+        from .worker_scopes import cgroup, prefix
+
+        directory = cgroup()
+        if not directory.name.startswith("tauceti-worker-") or not directory.name.endswith(".scope"):
+            return None
+        if directory.name.startswith(prefix(workers_runtime_dir(), cfg.wid)) and directory.name.endswith(".scope"):
+            return directory
+    except Exception:
+        pass
+    return None
 
 
-def process_tree(table: dict[int, dict], root: int) -> dict[int, dict]:
-    """Select descendants; unrelated workers and processes are excluded."""
-    children: dict[int, list[int]] = {}
-    for pid, value in table.items():
-        children.setdefault(value["ppid"], []).append(pid)
-    selected = {}
-    pending = [root]
-    while pending:
-        pid = pending.pop()
-        if pid in selected or pid not in table:
-            continue
-        selected[pid] = table[pid]
-        pending.extend(children.get(pid, ()))
-    return selected
+def values(path: Path) -> dict:
+    try:
+        return {name: int(value) for name, value in (line.split() for line in path.read_text().splitlines())}
+    except (OSError, ValueError):
+        return {}
+
+
+def number(path: Path) -> int | None:
+    try:
+        return int(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def scope_usage(directory: Path) -> dict:
+    cpu = values(directory / "cpu.stat").get("usage_usec")
+    memory = values(directory / "memory.stat")
+    io = None
+    try:
+        # Keep devices separate: adding stacked-device accounting can double count I/O.
+        io = {
+            device: {name: int(value) for name, value in (field.split("=", 1) for field in fields)}
+            for device, *fields in (line.split() for line in (directory / "io.stat").read_text().splitlines())
+        }
+    except (OSError, ValueError):
+        pass
+    return dict(
+        unit=directory.name,
+        cgroup=str(directory),
+        observed_at=time.time(),
+        scope="worker wrapper, loop, coding rounds and background verification; cumulative since scope creation",
+        cpu_seconds=cpu / 1_000_000 if cpu is not None else None,
+        memory_anon_bytes=memory.get("anon"),
+        memory_file_bytes=memory.get("file"),
+        memory_kernel_bytes=memory.get("kernel"),
+        memory_charged_bytes=number(directory / "memory.current"),
+        memory_peak_bytes=number(directory / "memory.peak"),
+        memory_peak_scope="scope lifetime; charged memory including file cache and kernel memory, not RSS",
+        task_count=number(directory / "pids.current"),
+        io=io,
+        pressure_stall_us=pressure(directory),
+    )
 
 
 def usage() -> tuple[float, int]:
@@ -102,17 +111,17 @@ def usage() -> tuple[float, int]:
 
 
 class RoundResources:
-    """Sample summed tree RSS, preserve kernel CPU accounting, and publish cumulative worker totals.
+    """Keep round CPU accounting separate from inexpensive worker-scope observations.
 
-    100% CPU means one logical core. RSS sums can double-count shared pages; they are not PSS.
-    The tree peak is sampled, whereas max_process_rss_bytes is the kernel's single-process high water.
+    A worker scope also contains sibling verification jobs. Its counters must not
+    be accumulated into round CPU totals or presented as round RSS.
     """
 
-    def __init__(self, cfg, *, interval: float = 2.0, publish_interval: float = 60.0):
+    def __init__(self, cfg, *, publish_interval: float = 60.0):
         from .activity import current_round_id
 
         self.cfg = cfg
-        self.interval = interval
+        self.interval = publish_interval
         self.publish_interval = publish_interval
         self.root = os.getpid()
         self.id = uuid.uuid4().hex
@@ -121,8 +130,7 @@ class RoundResources:
         self.started = time.monotonic()
         self.baseline_cpu = usage()[0]
         self.baseline_reads = read_bytes(self.root)
-        self.baseline_pressure = host_pressure()
-        self.peak_rss = 0
+        self.directory = scope_directory(cfg)
         self.cpu = 0.0
         self.sample_count = 0
         self.error = None
@@ -137,16 +145,10 @@ class RoundResources:
 
     def sample(self) -> dict:
         kernel_cpu, max_rss = usage()
-        tree = process_tree(process_table(), self.root)
         elapsed = time.monotonic() - self.started
-        rss = sum(p["rss_bytes"] for p in tree.values())
-        # The parent's waited-child counters retain CPU from processes that disappeared between samples.
-        live_children_cpu = sum(p["cpu_seconds"] for pid, p in tree.items() if pid != self.root)
-        self.cpu = max(self.cpu, kernel_cpu - self.baseline_cpu + live_children_cpu)
-        self.peak_rss = max(self.peak_rss, rss)
+        self.cpu = max(self.cpu, kernel_cpu - self.baseline_cpu)
         self.sample_count += 1
         reads = read_bytes(self.root)
-        pressure = host_pressure()
         return dict(
             id=self.id,
             activity_id=self.activity_id,
@@ -155,27 +157,16 @@ class RoundResources:
             elapsed_seconds=round(elapsed, 3),
             cpu_seconds=round(self.cpu, 3),
             average_cpu_percent=round(100 * self.cpu / elapsed, 2) if elapsed > 0 else 0,
-            rss_bytes=rss,
-            peak_tree_rss_bytes=self.peak_rss,
             max_process_rss_bytes=max_rss,
-            process_count=len(tree),
             sample_count=self.sample_count,
             sample_interval_seconds=self.interval,
-            scope="host process tree",
+            scope="round process and reaped descendants; live unreaped children excluded from CPU",
+            cpu_complete=False,
             read_bytes=max(0, reads - self.baseline_reads)
             if reads is not None and self.baseline_reads is not None
             else None,
             read_bytes_scope="supervisor and reaped children; excludes live or unreaped descendants",
-            host_pressure_stall_us={
-                name: {
-                    category: max(0, value - self.baseline_pressure[name][category])
-                    for category, value in rows.items()
-                    if category in self.baseline_pressure[name]
-                }
-                for name, rows in pressure.items()
-                if name in self.baseline_pressure
-            },
-            pressure_scope="host-wide, includes other workers and co-tenants",
+            worker_scope=scope_usage(self.directory) if self.directory else None,
         )
 
     def publish(self, current: dict, *, complete: bool = False) -> dict:
@@ -190,11 +181,16 @@ class RoundResources:
             measured_seconds=round(measured, 3),
             cpu_seconds=round(cpu, 3),
             average_cpu_percent=round(cpu / max(0.001, now - first) * 100, 2),
-            peak_tree_rss_bytes=max(old.get("peak_tree_rss_bytes", 0), current["peak_tree_rss_bytes"]),
             max_process_rss_bytes=max(old.get("max_process_rss_bytes", 0), current["max_process_rss_bytes"]),
             completed_rounds=old.get("completed_rounds", 0) + int(complete),
         )
-        value = dict(worker=total, round={**current, "complete": complete}, sampled_at=now, sampling_error=self.error)
+        value = dict(
+            worker=total,
+            round={**{key: value for key, value in current.items() if key != "worker_scope"}, "complete": complete},
+            worker_scope=current["worker_scope"],
+            sampled_at=now,
+            sampling_error=self.error,
+        )
         report_runtime(resources=value)
         # Only completed rounds advance persistent totals, so a live sample is never counted twice.
         if complete:
@@ -204,17 +200,16 @@ class RoundResources:
                 file.write(json.dumps({"worker_id": self.cfg.wid, **value}) + "\n")
         return value
 
+    def _publish_sample(self):
+        try:
+            self.publish(self.sample())
+        except Exception as error:
+            self.error = f"{type(error).__name__}: {error}"
+
     def _run(self):
-        last_publish = 0.0
-        while not self.stop_event.is_set():
-            try:
-                current = self.sample()
-                if time.monotonic() - last_publish >= self.publish_interval:
-                    self.publish(current)
-                    last_publish = time.monotonic()
-            except Exception as error:
-                self.error = f"{type(error).__name__}: {error}"
-            self.stop_event.wait(self.interval)
+        self._publish_sample()
+        while not self.stop_event.wait(self.publish_interval):
+            self._publish_sample()
 
     def finish(self):
         from .config import log
@@ -226,18 +221,17 @@ class RoundResources:
             return
         try:
             current = self.sample()
-            # Use the kernel's accounting at exit, not a maximum live estimate: a process exiting
-            # during /proc traversal can transiently appear in both live and waited-child counters.
-            # Deliberately orphaned, unreaped children are not included in this final CPU reading.
+            # Keep the existing round CPU meaning: sibling background verification
+            # belongs only to worker_scope. Unreaped or orphaned children are excluded.
             current["cpu_seconds"] = round(max(0, usage()[0] - self.baseline_cpu), 3)
             current["average_cpu_percent"] = round(
                 100 * current["cpu_seconds"] / max(0.001, current["elapsed_seconds"]), 2
             )
+            current["cpu_complete"] = True
             self.publish(current, complete=True)
             log(
                 f"resources: {current['elapsed_seconds']:.1f}s wall, {current['cpu_seconds']:.1f}s CPU "
                 f"({current['average_cpu_percent']:.1f}% average; 100%=one core), "
-                f"peak tree RSS {current['peak_tree_rss_bytes'] / 2**20:.1f} MiB (sampled), "
                 f"max process RSS {current['max_process_rss_bytes'] / 2**20:.1f} MiB"
             )
             if self.error:
