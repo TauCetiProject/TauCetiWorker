@@ -139,6 +139,7 @@ def test_fixlike():
     w = types.SimpleNamespace(
         claims=types.SimpleNamespace(begin_branch_work=lambda *a: True),
         rs=types.SimpleNamespace(bust=lambda *a: None),
+        gh=types.SimpleNamespace(pr_progress_state=lambda _: None, pr_view=lambda *_: None),
     )
     tc.work_units._do_fixlike(w, sv, c, opts, True, prompt_file="fix.md", label="fix")
     check("fixlike: fork head -> allow_push=owner/repo", cap.get("allow_push") == "alice/TauCeti")

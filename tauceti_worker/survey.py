@@ -283,6 +283,9 @@ class Candidate:
     bump_integration_failure: bool = False
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
+    progress: dict | None = field(
+        default=None, repr=False, compare=False
+    )  # current claimed-PR baseline; never persisted
 
 
 @dataclass

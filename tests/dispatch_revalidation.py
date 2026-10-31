@@ -184,7 +184,11 @@ for label, gh in (
     ("a PR we could not re-read at all", FakeGH(view=False)),
 ):
     for stage in ("review", "fix"):
-        check(f"{label} declines the {stage} candidate", still(stage, FakeRS(), gh=gh), False)
+        check(
+            f"{label} revalidates the {stage} candidate",
+            still(stage, FakeRS(), gh=gh),
+            None if stage == "fix" and not gh.view else False,
+        )
 
 
 # --- fix ------------------------------------------------------------------------------------------
@@ -221,7 +225,7 @@ for provenance in ("stale", "fetch_failed"):
         check(
             f"a {provenance} re-read declines the {stage} candidate",
             still(stage, FakeRS(meta=tc.Meta({"head_sha": HEAD}, provenance))),
-            False,
+            None if stage == "fix" else False,
         )
 
 # --- stages that do not read review state are not charged for a re-read ---------------------------

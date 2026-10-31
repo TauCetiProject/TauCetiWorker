@@ -20,7 +20,9 @@ def emit(kind, *, key=None, **fields):
     path = os.environ.get("TAUCETI_FLEET_EVENTS")
     machine = os.environ.get("TAUCETI_FLEET_MACHINE_ID")
     # Use the same identity in native receipts and the compatibility journal.
-    fields = {k: v for k, v in fields.items() if k in {"repository", "pr", "head_sha", "activity"}}
+    fields = {k: v for k, v in fields.items() if k in {"repository", "pr", "head_sha", "activity", "publication"}}
+    if round_id := os.environ.get("TAUCETI_ACTIVITY_ROUND_ID"):
+        fields["round_id"] = round_id
     event = dict(
         version=1,
         machine_id=machine,
@@ -64,12 +66,35 @@ def mutation(value, result):
 
     repository, pr = target(value)
     if repository and pr:
+        publication = None
+        if args[:2] == ["pr", "close"]:
+            publication = "closure"
+        elif args[:2] == ["pr", "comment"] or any(
+            re.fullmatch(r"/?repos/[^/]+/[^/]+/(?:issues|pulls)/(?:\d+/)?comments(?:/\d+)?", a.split("?", 1)[0])
+            for a in args
+        ):
+            publication = "reply"
+        elif args[:2] == ["api", "graphql"]:
+            query = " ".join(a for a in args if a.startswith("query="))
+            if any(
+                name in query
+                for name in (
+                    "addPullRequestReviewThreadReply",
+                    "addComment",
+                    "updateIssueComment",
+                    "updatePullRequestReviewComment",
+                )
+            ):
+                publication = "reply"
+            elif "closePullRequest" in query:
+                publication = "closure"
         emit(
             "pr_activity",
             key=value.get("created", "").__str__(),
             repository=repository,
             pr=pr,
             activity="github_mutation",
+            publication=publication,
         )
 
 

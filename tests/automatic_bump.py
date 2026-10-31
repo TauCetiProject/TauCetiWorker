@@ -104,6 +104,7 @@ assert w._still_actionable("fix", worker, sv, sv.needs_fix.actionable[0])
 worker.claims = SimpleNamespace(begin_branch_work=lambda *args: True)
 worker.rc = SimpleNamespace(deadline=1123)
 worker.rs.bust = lambda *args: None
+worker.gh.pr_progress_state = lambda _: None
 with patch.object(w, "run_in_bubble", return_value=0) as launch:
     assert (
         w._do_fixlike(
@@ -127,9 +128,11 @@ with patch.object(w, "run_in_bubble", return_value=0) as launch:
 worker.gh.pr_progress_state = lambda _: {"head": HEAD, "ncomments": 2}
 pre = {"head": HEAD, "ncomments": 1, "require_push": True}
 assert not w._progressed_direct(worker, sv.needs_fix.actionable[0], pre)
-assert w._progressed_direct(worker, sv.needs_fix.actionable[0], pre | {"require_push": False})
+with patch.object(w, "_round_mutated", return_value="reply"):
+    assert w._progressed_direct(worker, sv.needs_fix.actionable[0], pre | {"require_push": False})
 worker.gh.pr_progress_state = lambda _: {"head": "b" * 40, "ncomments": 2}
-assert w._progressed_direct(worker, sv.needs_fix.actionable[0], pre)
+assert w._progressed_direct(worker, sv.needs_fix.actionable[0], pre) is None
+assert w._progressed_direct(worker, sv.needs_fix.actionable[0], pre | {"published": "b" * 40})
 
 # Deadline begins before preparation, and uses the actual timeout selected by the loop.
 with patch.object(r.time, "time", return_value=1000), patch.object(r.subprocess, "Popen") as spawn:

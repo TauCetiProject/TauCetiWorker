@@ -71,8 +71,13 @@ class GitHubPauseTests(unittest.TestCase):
         gh = SimpleNamespace(
             pr_progress_state=lambda _: {"head": "new" if transport.direct_reads() else "old", "ncomments": 0}
         )
-        self.assertTrue(
+        self.assertIsNone(
             work_units._progressed(SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0})
+        )
+        self.assertTrue(
+            work_units._progressed(
+                SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0, "published": "new"}
+            )
         )
         self.assertFalse(transport.direct_reads())
 

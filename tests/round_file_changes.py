@@ -194,10 +194,11 @@ def main():
                 pr_progress_state=lambda _, after=after: {"head": head, "ncomments": 0, "state": after}
             )
             pre = {"head": head, "ncomments": 0, "state": before}
-            check(
-                "PR transition " + before + " -> " + after,
-                tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
-            )
+            with patch.object(tc.work_units, "_round_mutated", return_value="closure" if expected else None):
+                check(
+                    "PR transition " + before + " -> " + after,
+                    tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+                )
 
         for state, changed_head, expected in (("OPEN", head, False), ("CLOSED", head, True), ("OPEN", "b" * 40, True)):
             gh = types.SimpleNamespace(
@@ -208,10 +209,68 @@ def main():
                 }
             )
             pre = {"head": head, "ncomments": 0, "state": "OPEN", "require_push": True}
-            check(
-                "final resolution requires push or closure: " + state,
-                tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+            if changed_head != head:
+                pre["published"] = changed_head
+            with patch.object(
+                tc.work_units, "_round_mutated", return_value="closure" if state == "CLOSED" else "reply"
+            ):
+                check(
+                    "final resolution requires push or closure: " + state,
+                    tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+                )
+
+        from tauceti_worker import github_transport as transport
+
+        gh = types.SimpleNamespace(
+            pr_progress_state=lambda _: {
+                "head": "b" * 40 if transport.direct_reads() else head,
+                "ncomments": 0,
+                "state": "OPEN",
+            }
+        )
+        baseline = tc.work_units._progress_snapshot(types.SimpleNamespace(gh=gh), candidate)
+        check("baseline bypasses the stale mirror", baseline["head"] == "b" * 40)
+        check(
+            "an earlier push is not this round's progress",
+            tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, baseline) is False,
+        )
+        check(
+            "an unattributed head change stays unknown",
+            tc.work_units._progressed(
+                types.SimpleNamespace(gh=gh), candidate, {"head": head, "ncomments": 0, "state": "OPEN"}
             )
+            is None,
+        )
+        journal = root / "mutations.jsonl"
+        journal.write_text("")
+        with patch.dict(os.environ, TAUCETI_FLEET_EVENTS=str(journal), TAUCETI_FLEET_MACHINE_ID="test"):
+            baseline = {
+                "head": "b" * 40,
+                "ncomments": 0,
+                "state": "OPEN",
+                "round_id": "this-round",
+                "mutation_cursor": tc.work_units._mutation_cursor(),
+            }
+            from tauceti_worker import fleet_events
+
+            command = {"argv": ["pr", "comment", "1", "--repo", "TauCetiProject/TauCeti"], "created": 1}
+            with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="other-round"):
+                fleet_events.mutation(command, types.SimpleNamespace(stdout=""))
+            check("a peer's reply is not attributed", tc.work_units._round_mutated(candidate, baseline) is None)
+            with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="this-round"):
+                fleet_events.mutation(command | {"created": 2}, types.SimpleNamespace(stdout=""))
+            check("this round's reply is attributed", tc.work_units._round_mutated(candidate, baseline) == "reply")
+            check(
+                "a confirmed reply remains useful",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, baseline) is True,
+            )
+            journal.unlink()
+            check(
+                "missing journal leaves observation unknown", tc.work_units._round_mutated(candidate, baseline) is None
+            )
+            journal.write_text("[]\n")
+            baseline["mutation_cursor"] = (str(journal), journal.stat().st_ino, 0)
+            check("malformed journal stays nonblocking", tc.work_units._round_mutated(candidate, baseline) is None)
 
         # 4) a round that changed nothing is silent.
         check("a clean round logs nothing", run(repo, head) == "")

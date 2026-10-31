@@ -1110,7 +1110,7 @@ class GitHub:
         owner, _, name = self.repo.partition("/")
         q = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
-            "pullRequest(number:$pr){headRefOid state comments{totalCount}"
+            "pullRequest(number:$pr){headRefOid state isDraft labels(first:100){nodes{name}} comments{totalCount}"
             "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
         )
         p = self._gh(
@@ -1127,7 +1127,16 @@ class GitHub:
             if threads["totalCount"] > 100:  # beyond one page — get the exact count via REST
                 return self._pr_progress_state_rest(pr, d["headRefOid"], d.get("state"))
             nc = d["comments"]["totalCount"] + sum(t["comments"]["totalCount"] for t in threads["nodes"])
-            return {"head": d["headRefOid"], "ncomments": nc, "state": d.get("state")}
+            return {
+                "head": d["headRefOid"],
+                "ncomments": nc,
+                "state": d.get("state"),
+                **(
+                    {"isDraft": d["isDraft"], "labels": d["labels"]["nodes"]}
+                    if "isDraft" in d and "labels" in d
+                    else {}
+                ),
+            }
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
 
