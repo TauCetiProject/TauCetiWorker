@@ -328,6 +328,7 @@ class GlobalMaintenance(unittest.TestCase):
             release=Mock(),
         )
         self.w.counters.write = lambda key, value: self.counter_values.update({key: value})
+        self.w.gh.pr_view = lambda *_: dict(headRefOid=HEAD, isDraft=False, state="OPEN", labels=[])
         sv = work.Survey(worker_id="test", me_login="science")
         sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
         for label, code, checked in (("fix-ci", 0, "b" * 40), ("fix-ci", 1, ""), ("fix", 0, "b" * 40)):
@@ -472,15 +473,33 @@ class GlobalMaintenance(unittest.TestCase):
         model.assert_not_called()
         self.w.claims.release.assert_called_once()
         self.assertEqual(self.counter_values["attempt"], 0)
-        self.assertEqual(sv.open_prs[0].head_oid, "b" * 40)
+        self.assertEqual(sv.open_prs[0].head_oid, HEAD)
         # Unknown optional observations must reach normal preparation, not a wait.
         with (
             patch.object(work, "_progress_snapshot", return_value=None),
-            patch.object(work, "_still_actionable", return_value=None),
+            patch.object(self.w.gh, "pr_view", return_value=None, create=True),
             patch.object(work, "scope_policy", side_effect=RuntimeError("normal preparation")),
             self.assertRaisesRegex(RuntimeError, "normal preparation"),
         ):
             work._do_fixlike(self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label="fix")
+
+    def test_stale_fix_never_reaches_paid_provider_probes(self):
+        self.opts.work_model = "claude"
+        self.w.gh.pr_view = lambda *_: dict(headRefOid="b" * 40, isDraft=False, state="OPEN", labels=[])
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        with (
+            patch("tauceti_worker.github_outbox.pending_for", return_value=False),
+            patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
+            patch.object(work, "_host_agent_binary", return_value=None),
+            patch.object(work, "resolve_codex_model_access") as entitlement,
+            patch.object(work.Quota, "authorize_claude_launch") as bootstrap,
+            patch("tauceti_worker.fleet_capacity.admission_reason") as admission,
+        ):
+            self.assertIsNone(work.dispatch("fix", self.w, sv, work.Candidate(10, HEAD), self.opts))
+        entitlement.assert_not_called()
+        bootstrap.assert_not_called()
+        admission.assert_not_called()
 
     def test_partial_fix_sees_current_reply_instead_of_repeating_it(self):
         from tauceti_worker import github_transport as transport
@@ -499,14 +518,15 @@ class GlobalMaintenance(unittest.TestCase):
             patch.object(self.w.rs, "newest_contest_reply", return_value={"id": 2}),
         ):
             self.assertFalse(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD, partial_history=True)))
-        self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = 2
         sv.open_prs = [PRInfo.from_json(row(10, "Other", author="peer")["pr"])]
         with (
             patch.object(self.w.rs, "gh_meta", side_effect=meta),
             patch.object(self.w.rs, "ledger_blocking", return_value=True),
             patch.object(self.w.rs, "newest_contest_reply", return_value=None),
         ):
-            self.assertTrue(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD), attempt_charged=True))
+            self.assertTrue(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD)))
+            self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
             self.assertFalse(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD)))
 
     def test_cold_service_outage_uses_only_shared_inventory_not_per_pr_histories(self):

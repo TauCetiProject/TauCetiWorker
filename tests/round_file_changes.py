@@ -258,7 +258,21 @@ def main():
                 fleet_events.mutation(command, types.SimpleNamespace(stdout=""))
             check("a peer's reply is not attributed", tc.work_units._round_mutated(candidate, baseline) is None)
             with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="this-round"):
-                fleet_events.mutation(command | {"created": 2}, types.SimpleNamespace(stdout=""))
+                fleet_events.mutation(
+                    command
+                    | {
+                        "created": 2,
+                        "argv": [
+                            "api",
+                            "-X",
+                            "POST",
+                            "repos/TauCetiProject/TauCeti/pulls/1/comments/42/replies",
+                            "--repo",
+                            "TauCetiProject/TauCeti",
+                        ],
+                    },
+                    types.SimpleNamespace(stdout=""),
+                )
             check("this round's reply is attributed", tc.work_units._round_mutated(candidate, baseline) == "reply")
             check(
                 "a confirmed reply remains useful",
@@ -271,6 +285,15 @@ def main():
             journal.write_text("[]\n")
             baseline["mutation_cursor"] = (str(journal), journal.stat().st_ino, 0)
             check("malformed journal stays nonblocking", tc.work_units._round_mutated(candidate, baseline) is None)
+        check(
+            "claimed bubble uses its current direct baseline",
+            tc.work_units._progressed(
+                types.SimpleNamespace(gh=gh),
+                candidate,
+                {"head": head, "ncomments": 0, "state": "OPEN", "claimed_bubble": True},
+            )
+            is True,
+        )
 
         # 4) a round that changed nothing is silent.
         check("a clean round logs nothing", run(repo, head) == "")

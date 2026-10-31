@@ -665,6 +665,11 @@ class GitHub:
         if not readonly:
             transport.invalidate(args)
         try:
+            if readonly and transport.direct_reads():
+                # Optional current-state checks must not park the round in an
+                # in-place retry sleep. The caller can select other work or
+                # continue its existing investigation on an unavailable read.
+                return gh_run(["gh", *args], max_wait=0)
             return gh_run(["gh", *args])
         finally:
             if not readonly:

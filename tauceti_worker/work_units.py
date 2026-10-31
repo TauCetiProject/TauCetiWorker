@@ -101,7 +101,6 @@ from .survey import (
     TARGET_MARKER_RE,
     Candidate,
     Counters,
-    PRInfo,
     Survey,
     bust_progress_cache,
     fix_disposition,
@@ -824,8 +823,9 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
         if pre.get("require_push") and (st["head"] or "") == pre["head"] and not closed:
             return False
         if (st["head"] or "") != pre["head"] or closed or st["ncomments"] > pre["ncomments"]:
-            # Without this round's publication evidence, another actor may have changed the PR.
-            return None
+            # Bubble has no host-visible push markers. Its current baseline is
+            # taken after the branch claim; unclaimed work stays unattributed.
+            return True if pre.get("claimed_bubble") else None
         return False
     now = _open_pr_numbers(w)
     if now is None:
@@ -877,14 +877,27 @@ def raise_on_account_mismatch(cfg: Config, account: str | None, work_model: str,
         raise Die(f"{where}: {problem}")
 
 
-def _still_actionable(
-    stage: str, w: Worker, sv: Survey, c: Candidate, *, live=None, attempt_charged=False
-) -> bool | None:
+def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
+    if live is None:
+        return None
+    if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
+        log(
+            f"  {stage} #{c.pr}: selected {c.head[:12]}, current {(live.get('headRefOid') or '')[:12]} — selecting other work"
+        )
+        return False
+    paused = {"hold", "wip", "human", "on-hold"}
+    if stage != "review":
+        paused |= {"keep", "do-not-close"}
+    return not ({str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused)
+
+
+def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
     from .github_transport import read_context
 
     try:
-        with read_context(fresh=True, direct=True):
-            return _still_actionable_direct(stage, w, sv, c, live=live, attempt_charged=attempt_charged)
+        # Fix selection must be current; unrelated discovery retains its existing mirror/cache policy.
+        with read_context(fresh=True, direct=True) if stage == "fix" else contextlib.nullcontext():
+            return _still_actionable_direct(stage, w, sv, c)
     except (GitHubError, GitHubUnavailable, OSError):
         if stage != "fix":
             raise
@@ -892,9 +905,7 @@ def _still_actionable(
         return None
 
 
-def _still_actionable_direct(
-    stage: str, w: Worker, sv: Survey, c: Candidate, *, live=None, attempt_charged=False
-) -> bool | None:
+def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
     """Re-read THIS PR's review state live and confirm the candidate the survey chose still stands.
 
     The survey triages on cached comment reads keyed to each PR's `updatedAt` (see
@@ -947,30 +958,10 @@ def _still_actionable_direct(
         return True
     # The head the survey saw. A contributor pushing since then makes every verdict below describe a
     # commit that is no longer there, and _do_fixlike would check the NEW head out and work on it.
-    live = live if live is not None else w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels"])
-    if live is None:
-        log(f"  {stage} #{c.pr}: current PR read unavailable")
-        return None if stage == "fix" else False
-    if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
-        log(
-            f"  {stage} #{c.pr}: selected {c.head[:12]}, current {(live.get('headRefOid') or '')[:12]} — selecting other work"
-        )
-        sv.open_prs = [
-            replace(
-                p,
-                head_oid=live.get("headRefOid") or p.head_oid,
-                labels=tuple(label.get("name", "") for label in live.get("labels", [])),
-            )
-            if isinstance(p, PRInfo) and p.number == c.pr
-            else p
-            for p in getattr(sv, "open_prs", ())
-        ]
-        return False
-    paused = {"hold", "wip", "human", "on-hold"}
-    if stage != "review":
-        paused |= {"keep", "do-not-close"}
-    if {str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused:
-        return False
+    live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels"])
+    matches = _selected_pr_matches(stage, c, live)
+    if matches is not True:
+        return matches if stage == "fix" else False
     if stage == "review" and getattr(c, "partial_history", False):
         # The agent/engine can inspect this selected PR. Unknown comment coverage
         # must not turn into another pre-launch dependency wait. Ordinary branch
@@ -998,7 +989,7 @@ def _still_actionable_direct(
             through = meta.data.get("replies_through")
             through = through if isinstance(through, int) else 0
             pending_contest = bool(reply and reply["id"] > through)
-        attempts = max(0, w.counters.read(f"fix-{c.pr}-{c.head[:12]}") - int(attempt_charged))
+        attempts = w.counters.read(f"fix-{c.pr}-{c.head[:12]}")
         disp, why = fix_disposition(
             meta,
             c.head,
@@ -1211,7 +1202,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # Last free check before anything that spends — the entitlement probe and the Claude bootstrap
     # below both cost a provider request. Everything above this line is local (a binary on PATH, the
     # configured account), so it stays ahead of a network read that only matters if we get this far.
-    if stage != "fix" and not _still_actionable(stage, w, sv, c):
+    actionable = _still_actionable(stage, w, sv, c)
+    if actionable is False:
         return None
     from .claude_api import admission_failure
     from .fleet_capacity import admission_reason
@@ -1278,7 +1270,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
     select(stage)
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
-    pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED and stage != "fix" else None
+    claimed_baseline = stage == "fix" or bubble and c.pr and stage in FILE_CHANGE_STAGES
+    pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED and not claimed_baseline else None
     c.progress = pre
     if pre is not None:
         pre["require_push"] = getattr(c, "final_resolution", False) or any(
@@ -1698,15 +1691,25 @@ def _do_fixlike(
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
 
-    if label == "fix":
+    if label == "fix" or bubble:
         c.progress = _progress_snapshot(w, c)
         live = None
         if c.progress and all(key in c.progress for key in ("isDraft", "labels", "state")):
             live = {**c.progress, "headRefOid": c.progress["head"]}
-        # Only positive evidence retires an assignment. Unavailable optional
-        # reads leave the existing checkout/agent path running, never waiting.
-        if _still_actionable(label, w, sv, c, live=live, attempt_charged=bool(charged)) is False:
+        else:
+            from .github_transport import read_context
+
+            try:
+                with read_context(fresh=True, direct=True):
+                    live = w.gh.pr_view(pr, ["headRefOid", "isDraft", "state", "labels"])
+            except (GitHubError, GitHubUnavailable, OSError):
+                pass
+        # Unknown optional reads keep the checkout/agent path running. Known
+        # changes release ownership immediately, before caches or model calls.
+        if _selected_pr_matches(label, c, live) is False:
             return decline_repair()
+        if bubble and c.progress is not None:
+            c.progress["claimed_bubble"] = bool(held)
 
     if foreign:
         # The last fresh authorization follows the real claim. Nothing paid has

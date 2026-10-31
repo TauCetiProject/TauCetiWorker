@@ -67,11 +67,18 @@ def mutation(value, result):
     repository, pr = target(value)
     if repository and pr:
         publication = None
+        method = next((args[i + 1] for i, arg in enumerate(args[:-1]) if arg in ("-X", "--method")), "")
+        method = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--method=")), method).upper()
         if args[:2] == ["pr", "close"]:
             publication = "closure"
-        elif args[:2] == ["pr", "comment"] or any(
-            re.fullmatch(r"/?repos/[^/]+/[^/]+/(?:issues|pulls)/(?:\d+/)?comments(?:/\d+)?", a.split("?", 1)[0])
-            for a in args
+        elif method != "DELETE" and (
+            args[:2] == ["pr", "comment"]
+            or any(
+                re.fullmatch(
+                    r"/?repos/[^/]+/[^/]+/(?:issues|pulls)/(?:\d+/)?comments(?:/\d+(?:/replies)?)?", a.split("?", 1)[0]
+                )
+                for a in args
+            )
         ):
             publication = "reply"
         elif args[:2] == ["api", "graphql"]:
