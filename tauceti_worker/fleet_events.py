@@ -71,8 +71,9 @@ def mutation(value, result):
         method = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--method=")), method).upper()
         if args[:2] == ["pr", "close"]:
             publication = "closure"
-        elif method != "DELETE" and (
+        elif method in ("", "POST") and (
             args[:2] == ["pr", "comment"]
+            and not {"--edit-last", "--delete-last"}.intersection(args)
             or any(
                 re.fullmatch(
                     r"/?repos/[^/]+/[^/]+/(?:issues|pulls)/(?:\d+/)?comments(?:/\d+(?:/replies)?)?", a.split("?", 1)[0]
@@ -88,8 +89,6 @@ def mutation(value, result):
                 for name in (
                     "addPullRequestReviewThreadReply",
                     "addComment",
-                    "updateIssueComment",
-                    "updatePullRequestReviewComment",
                 )
             ):
                 publication = "reply"

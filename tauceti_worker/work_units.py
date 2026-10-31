@@ -731,7 +731,7 @@ def _progress_snapshot_direct(w: Worker, c: Candidate) -> dict | None:
     """Capture a current baseline; unavailable observations never prevent work."""
     from .github_transport import read_context
 
-    with read_context(fresh=True, direct=True):
+    with read_context(fresh=True, direct=True, retry=False):
         if c.pr:
             st = w.gh.pr_progress_state(c.pr)
             if st is None:
@@ -799,7 +799,7 @@ def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
     from .github_transport import read_context
 
     try:
-        with read_context(fresh=True, direct=True):
+        with read_context(fresh=True, direct=True, retry=False):
             return _progressed_direct(w, c, pre)
     except (GitHubError, GitHubUnavailable, OSError):
         return None
@@ -896,7 +896,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool |
 
     try:
         # Fix selection must be current; unrelated discovery retains its existing mirror/cache policy.
-        with read_context(fresh=True, direct=True) if stage == "fix" else contextlib.nullcontext():
+        with read_context(fresh=True, direct=True, retry=False) if stage == "fix" else contextlib.nullcontext():
             return _still_actionable_direct(stage, w, sv, c)
     except (GitHubError, GitHubUnavailable, OSError):
         if stage != "fix":
@@ -1700,7 +1700,7 @@ def _do_fixlike(
             from .github_transport import read_context
 
             try:
-                with read_context(fresh=True, direct=True):
+                with read_context(fresh=True, direct=True, retry=False):
                     live = w.gh.pr_view(pr, ["headRefOid", "isDraft", "state", "labels"])
             except (GitHubError, GitHubUnavailable, OSError):
                 pass

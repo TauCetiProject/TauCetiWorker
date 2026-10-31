@@ -278,6 +278,25 @@ def main():
                 "a confirmed reply remains useful",
                 tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, baseline) is True,
             )
+            baseline["mutation_cursor"] = tc.work_units._mutation_cursor()
+            for method in ("DELETE", "PATCH"):
+                with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="this-round"):
+                    fleet_events.mutation(
+                        command
+                        | {
+                            "created": method,
+                            "argv": [
+                                "api",
+                                "-X",
+                                method,
+                                "repos/TauCetiProject/TauCeti/pulls/1/comments/42",
+                                "--repo",
+                                "TauCetiProject/TauCeti",
+                            ],
+                        },
+                        types.SimpleNamespace(stdout=""),
+                    )
+                check(method + " is not a new reply", tc.work_units._round_mutated(candidate, baseline) is None)
             journal.unlink()
             check(
                 "missing journal leaves observation unknown", tc.work_units._round_mutated(candidate, baseline) is None
