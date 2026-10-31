@@ -132,11 +132,13 @@ stale per-worker preparation from counting another worker's lease as its own.
 Receipts include upper file count/bytes and stop-write outcome.
 Unregistered and pre-deployment writers still require operator verification.
 
-Existing `resources.jsonl` round receipts now include `read_bytes` deltas from
-`/proc/self/io` for the supervisor and reaped children, and host-wide CPU, memory
-and I/O PSI totals as `host_pressure_stall_us`. Live/unreaped descendants are not
-included in storage-read accounting; host pressure includes co-tenants. Fields
-are unknown when unavailable. Join resource `activity_id`, shared receipt
+Existing `resources.jsonl` receipts include round `read_bytes` deltas from
+`/proc/self/io` for the supervisor and reaped children. Live/unreaped descendants
+are not included in this storage-read accounting. Separately, `worker_scope`
+reports optional per-device I/O and `pressure_stall_us` totals for the worker's
+scope, including background verification. These are cumulative scope readings,
+not round deltas or host-wide/co-tenant measurements. Fields are unknown when
+unavailable. Join resource `activity_id`, shared receipt
 `round_id`, and existing audit/round phase completion before comparing runs.
 The [Linux I/O accounting manual](https://man7.org/linux/man-pages/man5/proc_pid_io.5.html)
 describes the kernel read counter and its scope.

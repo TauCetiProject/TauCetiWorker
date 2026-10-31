@@ -33,14 +33,14 @@ class Cache(unittest.TestCase):
         warm_env = dict(env, LAKE_CACHE_DIR=str(self.root / "downloads"))
 
         @contextlib.contextmanager
-        def preparation(cwd, environment, *, refetch):
+        def preparation(cwd, environment, *, refetch, report=None):
             self.assertEqual(cwd, self.root)
             self.assertIs(environment, env)
             events.append("prepare")
             yield warm_env
             events.append("hydrate")
 
-        def warm(cwd, environment, logdir):
+        def warm(cwd, environment, logdir, *, report=None):
             self.assertIs(environment, warm_env)
             events.append("fetch")
 
@@ -78,6 +78,11 @@ class Cache(unittest.TestCase):
         self.assertEqual(two.stat().st_mtime_ns, before)
         one.write_text("{}")
         self.assertEqual(json.loads(two.read_text())["data"], data)
+        # A later preparation must repair mutable metadata and deleted artifacts.
+        (self.root / "1/artifacts" / artifact).unlink()
+        cache.hydrate(entry, self.root / "1", "d" * 16)
+        self.assertEqual(json.loads(one.read_text())["data"], data)
+        self.assertEqual((self.root / "1/artifacts" / artifact).read_bytes(), b"cached")
 
     def test_download_context_never_promotes_agent_outputs(self):
         private = self.root / "private"
@@ -124,6 +129,44 @@ class Cache(unittest.TestCase):
                 atomic_json(download / "outputs/TauCeti" / ("c" * 16 + ".json"), dict(data=wanted))
         self.assertFalse((private / "artifacts" / pool_archive.name).exists())
         self.assertEqual((private / "artifacts" / wanted).read_bytes(), b"needed")
+
+    def test_interrupted_fetch_preserves_good_private_mapping(self):
+        private = self.root / "private"
+        key = "a" * 16
+        good = dict(schemaVersion=cache.SCHEMA, data="b" * 16 + ".ltar")
+        target = private / "outputs/TauCeti" / (key + ".json")
+        atomic_json(target, good)
+        env = dict(LAKE_CACHE_DIR=str(private), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        with self.assertRaisesRegex(OSError, "interrupted fetch"):
+            with cache.preparation(self.root, env) as warm:
+                partial = Path(warm["LAKE_CACHE_DIR"]) / "outputs/TauCeti" / target.name
+                partial.parent.mkdir(parents=True)
+                partial.write_text('{"data":')
+                raise OSError("interrupted fetch")
+        self.assertEqual(json.loads(target.read_text()), good)
+
+    def test_disappearing_seed_is_an_individual_cache_miss(self):
+        archives = self.pool / "archives"
+        archives.mkdir(exist_ok=True)
+        vanished = archives / ("a" * 16 + ".ltar")
+        good = archives / ("b" * 16 + ".ltar")
+        vanished.write_bytes(b"vanished")
+        good.write_bytes(b"good")
+        private = self.root / "private"
+        env = dict(LAKE_CACHE_DIR=str(private), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        real_link = cache.link
+
+        def gc_race(source, target):
+            if source == vanished:
+                raise FileNotFoundError(source)
+            real_link(source, target)
+
+        with patch.object(cache, "link", side_effect=gc_race):
+            with cache.preparation(self.root, env) as warm:
+                download = Path(warm["LAKE_CACHE_DIR"])
+                self.assertNotEqual(download, private)
+                self.assertEqual((download / "artifacts" / good.name).read_bytes(), b"good")
+                self.assertFalse((download / "artifacts" / vanished.name).exists())
 
     def test_preparation_lock_contention_falls_back(self):
         from contextlib import contextmanager
@@ -202,7 +245,7 @@ class Cache(unittest.TestCase):
         second = self.root / "second"
         report = dict(hits=0, expanded=0)
         cache.expand(download, first, project, env, self.pool, report)
-        self.assertEqual(report, dict(hits=0, expanded=1))
+        self.assertEqual((report["hits"], report["expanded"]), (0, 1))
         self.assertTrue((first / "outputs/TauCeti" / ("e" * 16 + ".json")).exists())
         with (
             patch.object(cache, "native", side_effect=AssertionError("warm hit needs no helper")),
@@ -210,7 +253,7 @@ class Cache(unittest.TestCase):
         ):
             report = dict(hits=0, expanded=0)
             cache.expand(download, second, project, env, self.pool, report)
-        self.assertEqual(report, dict(hits=1, expanded=0))
+        self.assertEqual((report["hits"], report["expanded"]), (1, 0))
         # Use the actual project scope to ask Lake to restore this mapping.
         mapping = second / "outputs/TauCeti" / (input_hash + ".json")
         scoped = second / "outputs/cache_fixture" / mapping.name
