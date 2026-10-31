@@ -400,6 +400,13 @@ Roadmap rounds steer toward one area, a subdirectory of the
   whole roadmap over time.
 - `--roadmap-skip <area>[,<area>...]` excludes areas from both the random pick
   and the all-areas case. `--roadmap-only` wins on overlap.
+- `--extra-roadmap-prompt <text>` adds operator guidance to the roadmap prompt, for
+  example `--extra-roadmap-prompt "Work on the material relevant to Higher Topos Theory"`.
+  It steers the choice of target within the designated roadmap, and the choice
+  of area too when `--roadmap-only ""` leaves that to the agent (an unpinned
+  worker still draws its area at random before the agent sees the guidance).
+  It cannot override the skip list, others' claims, or the repository's rules.
+  Fix, rebase, and review rounds ignore it.
 - `--source <path-or-url>` adapts compatible material from an existing repository,
   and needs the roadmap phase enabled plus one pinned area. It is supplementary:
   the agent prioritizes the roadmap as written, then review-quality library code,

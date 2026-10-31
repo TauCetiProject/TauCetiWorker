@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import worker_scopes
-from .config import positive_integer, security_audit_problem
+from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
 from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
@@ -59,6 +59,7 @@ _WORKER_KEYS = {
     "roadmap_skip",
     "roadmap_extra_identities",
     "respect_claims",
+    "extra_roadmap_prompt",
     "source",
     "author_model",
     "author_effort",
@@ -190,6 +191,18 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _extra_roadmap_prompt(value, where: str) -> str | None:
+    """Operator guidance for roadmap rounds, checked at the configuration boundary like `pace`: a blank
+    or oversized value is a bad line in workers.toml, not a worker that dies on launch."""
+    text = _string(value, where, optional=True)
+    if text is None:
+        return None
+    try:
+        return validate_extra_roadmap_prompt(text)
+    except ValueError as e:
+        raise WorkersError(f"{where}: {e}") from None
+
+
 def _pace(value, where: str) -> str | None:
     """A pacing curve, checked here at the CONFIGURATION boundary. Without this a typo passes `workers
     apply --check`, and the manager discovers it only by launching a worker that rejects its own --pace
@@ -271,6 +284,7 @@ class WorkerSpec:
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
+    extra_roadmap_prompt: str | None = None
     source: str | None = None
     author_model: str | None = None
     author_effort: str | None = None
@@ -339,6 +353,9 @@ class WorkerSpec:
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
+            extra_roadmap_prompt=_extra_roadmap_prompt(
+                raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
+            ),
             source=_string(raw.get("source"), f"workers[{index}].source", optional=True),
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
@@ -408,6 +425,7 @@ class WorkerSpec:
             "conf",
             "github_state_url",
             "github_state_token_file",
+            "extra_roadmap_prompt",
             "source",
             "author_model",
             "author_effort",
@@ -472,6 +490,9 @@ class WorkerSpec:
         ):
             if field is not None:
                 argv += [flag, field]
+        if self.extra_roadmap_prompt is not None:
+            # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
+            argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
         if self.stream:
             argv.append("--stream")
         if self.isolate_home:
@@ -1433,6 +1454,11 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         if spec.get("respect_claims", True) is False:
             roadmap_values.append("claims: ignored")
         lines.extend(_status_field("roadmap", roadmap_values, width))
+    if spec.get("extra_roadmap_prompt"):
+        guidance = " ".join(str(spec["extra_roadmap_prompt"]).split())
+        if "roadmap" not in phases:
+            guidance += " (unused: the roadmap phase is not enabled)"
+        lines.extend(_status_field("guidance", [guidance], width))
 
     if spec.get("source"):
         lines.extend(_status_field("source", [str(spec["source"])], width))
@@ -1592,6 +1618,7 @@ def add_dashboard_worker(
     roadmap_only: str | None,
     roadmap_skip: str | None,
     github_account: str | None = None,
+    extra_roadmap_prompt: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1608,6 +1635,7 @@ def add_dashboard_worker(
             sandbox="bubble" if bubble else "host",
             roadmap_only=roadmap_only,
             roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
+            extra_roadmap_prompt=extra_roadmap_prompt,
         )
         _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)
@@ -1883,7 +1911,10 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        argv = shlex.split(line)
+        try:
+            argv = shlex.split(line)
+        except ValueError as exc:
+            raise WorkersError(f"{path}:{number}: {exc} (a value spanning several lines cannot be imported)") from None
         if len(argv) < 3 or Path(argv[0]).name != "tauceti" or argv[1] != "work" or "--loop" not in argv:
             raise WorkersError(f"{path}:{number}: expected a `tauceti work --loop` command")
         values: dict = {"only": []}
@@ -1905,10 +1936,13 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             if token == "--ignore-claims":
                 values["respect_claims"] = False
                 continue
-            try:
-                value = next(flags)
-            except StopIteration:
-                raise WorkersError(f"{path}:{number}: {token} needs a value") from None
+            if token.startswith("--") and "=" in token:
+                token, value = token.split("=", 1)
+            else:
+                try:
+                    value = next(flags)
+                except StopIteration:
+                    raise WorkersError(f"{path}:{number}: {token} needs a value") from None
             key = {
                 "--worker-id": "id",
                 "--agent": "agent",
@@ -1920,6 +1954,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
                 "--roadmap-extra-identities": "roadmap_extra_identities",
+                "--extra-roadmap-prompt": "extra_roadmap_prompt",
                 "--source": "source",
                 "--author-model": "author_model",
                 "--author-effort": "author_effort",
@@ -2002,6 +2037,7 @@ def add_workers_parser(subparsers) -> None:
     )
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
+    add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
     add.add_argument("--source", help="source repository; requires roadmap in --only and one pinned roadmap area")
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
@@ -2099,6 +2135,7 @@ def cmd_workers(args) -> int:
                     "github_state_url",
                     "github_state_token_file",
                     "roadmap_only",
+                    "extra_roadmap_prompt",
                     "source",
                     "author_model",
                     "author_effort",

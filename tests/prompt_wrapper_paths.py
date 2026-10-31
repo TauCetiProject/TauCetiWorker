@@ -71,6 +71,7 @@ CALL_SITES = {
         REVIEW_DIR="/opt/review",
         RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",
+        EXTRA_ROADMAP_PROMPT="",
         BIN="/bin",
         **VERIFY,
     ),
