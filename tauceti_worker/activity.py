@@ -83,6 +83,8 @@ class Round:
         self.done = False
         self.kind = "no-work"
         self.rc = 0
+        self.observation = None
+        os.environ["TAUCETI_ACTIVITY_ROUND_ID"] = self.id
         self.started_at = time.time()
         self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE", "inf"))
         _round = self
@@ -98,6 +100,7 @@ class Round:
 
     def select(self, kind):
         self.kind = kind
+        self.observation = None
         emit("round_selected", key=self.id + ":select", round_id=self.id, worker=self.worker, round_type=kind)
 
     def finish(self, exc=None):
@@ -105,6 +108,8 @@ class Round:
         if self.done:
             return
         self.done = True
+        if os.environ.get("TAUCETI_ACTIVITY_ROUND_ID") == self.id:
+            os.environ.pop("TAUCETI_ACTIVITY_ROUND_ID", None)
         code = getattr(exc, "code", None) if exc is not None else self.rc
         if exc is not None and code is None:
             # NoProgress is intentionally separate from execution failures.
@@ -150,7 +155,7 @@ class Round:
             round_id=self.id,
             worker=self.worker,
             round_type=self.kind,
-            outcome=outcome,
+            outcome=self.observation if outcome == "completed" and self.observation else outcome,
         )
         if _round is self:
             _round = None
@@ -159,6 +164,11 @@ class Round:
 def select(kind):
     if _round is not None:
         _round.select(kind)
+
+
+def observation(outcome):
+    if _round is not None:
+        _round.observation = outcome
 
 
 def current_round_id():
@@ -561,7 +571,7 @@ def _summary(db, now, column=None, identity=None):
         condition = "finished<=?" if seconds is None else "finished>=? AND finished<=?"
         times = [now] if seconds is None else [now - seconds, now]
         rows = db.execute(
-            f"SELECT kind,COUNT(*) n,SUM(outcome IN ('failed','timeout','interrupted')) failures,SUM(outcome='unknown') unknown FROM rounds {where} {'AND' if where else 'WHERE'} {condition} GROUP BY kind",
+            f"SELECT kind,COUNT(*) n,SUM(outcome IN ('failed','timeout','interrupted')) failures,SUM(outcome IN ('unknown','unconfirmed')) unknown FROM rounds {where} {'AND' if where else 'WHERE'} {condition} GROUP BY kind",
             args + times,
         )
         rounds[label] = {r["kind"]: dict(finished=r["n"], failed=r["failures"], unknown=r["unknown"]) for r in rows}

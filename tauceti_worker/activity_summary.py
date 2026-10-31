@@ -147,6 +147,9 @@ def display(value, default_kinds=()):
         ]
         rounds.append(("  " + kind, counts))
     rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in report_windows]))
+    unconfirmed = [sum(r.get("unknown", 0) for r in s["rounds"][w].values()) for w in report_windows]
+    if any(unconfirmed):
+        rounds.append(("    outcome unconfirmed", unconfirmed))
     prs = []
     for key, label in (
         ("authored", "PRs authored"),

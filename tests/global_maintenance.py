@@ -328,10 +328,11 @@ class GlobalMaintenance(unittest.TestCase):
             release=Mock(),
         )
         self.w.counters.write = lambda key, value: self.counter_values.update({key: value})
+        self.w.gh.pr_view = lambda *_: dict(headRefOid=HEAD, isDraft=False, state="OPEN", labels=[])
         sv = work.Survey(worker_id="test", me_login="science")
         sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
-        for code, checked in ((0, "b" * 40), (1, "")):
-            with self.subTest(code=code, checked=checked):
+        for label, code, checked in (("fix-ci", 0, "b" * 40), ("fix-ci", 1, ""), ("fix", 0, "b" * 40)):
+            with self.subTest(label=label, code=code, checked=checked):
                 self.counter_values.update({"per-head": 1, "per-pr": 2})
                 self.w.claims.stop_heartbeat.reset_mock()
                 self.w.claims.release.reset_mock()
@@ -347,6 +348,8 @@ class GlobalMaintenance(unittest.TestCase):
                     patch.object(work, "prepare_checkout", return_value=True),
                     patch.object(work.subprocess, "run", side_effect=checkout) as commands,
                     patch.object(work, "run_agent_host") as model,
+                    patch.object(work, "_progress_snapshot", return_value=None),
+                    patch.object(work, "_still_actionable", return_value=True),
                 ):
                     result = work._do_fixlike(
                         self.w,
@@ -355,7 +358,7 @@ class GlobalMaintenance(unittest.TestCase):
                         self.opts,
                         False,
                         prompt_file="fix-ci.md",
-                        label="fix-ci",
+                        label=label,
                         charged=("per-head", "per-pr"),
                     )
                 self.assertIsNone(result)
@@ -429,7 +432,102 @@ class GlobalMaintenance(unittest.TestCase):
         self.w.gh.pr_view = lambda *a: dict(headRefOid=HEAD, isDraft=False, state="OPEN", labels=[])
         with patch.object(self.w.rs, "gh_meta", side_effect=AssertionError("pre-agent history read")):
             self.assertTrue(work._still_actionable("review", self.w, Survey("test"), c))
+        with patch.object(self.w.rs, "gh_meta", return_value=SimpleNamespace(data={}, provenance="fetch_failed")):
             self.assertTrue(work._still_actionable("fix", self.w, Survey("test"), c))
+
+    def test_fix_reconciles_after_claim_and_skips_before_checkout(self):
+        from tauceti_worker import github_transport as transport
+
+        claimed = []
+        self.w.claims = SimpleNamespace(
+            held=("branch/10", "org/claims"),
+            begin_branch_work=lambda *args: claimed.append(True) or True,
+            stop_heartbeat=Mock(),
+            release=Mock(),
+        )
+        self.counter_values["attempt"] = 1
+        self.w.counters.write = lambda key, value: self.counter_values.update({key: value})
+
+        def progress(_):
+            self.assertTrue(claimed)
+            self.assertTrue(transport.direct_reads())
+            return dict(head="b" * 40, state="OPEN", isDraft=False, labels=[], ncomments=0)
+
+        self.w.gh.pr_progress_state = progress
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        with patch.object(work, "prepare_checkout") as checkout, patch.object(work, "run_agent_host") as model:
+            self.assertIsNone(
+                work._do_fixlike(
+                    self.w,
+                    sv,
+                    work.Candidate(10, HEAD),
+                    self.opts,
+                    False,
+                    prompt_file="fix.md",
+                    label="fix",
+                    charged=("attempt",),
+                )
+            )
+        checkout.assert_not_called()
+        model.assert_not_called()
+        self.w.claims.release.assert_called_once()
+        self.assertEqual(self.counter_values["attempt"], 0)
+        self.assertEqual(sv.open_prs[0].head_oid, HEAD)
+        # Unknown optional observations must reach normal preparation, not a wait.
+        with (
+            patch.object(work, "_progress_snapshot", return_value=None),
+            patch.object(self.w.gh, "pr_view", return_value=None, create=True),
+            patch.object(work, "scope_policy", side_effect=RuntimeError("normal preparation")),
+            self.assertRaisesRegex(RuntimeError, "normal preparation"),
+        ):
+            work._do_fixlike(self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label="fix")
+
+    def test_stale_fix_never_reaches_paid_provider_probes(self):
+        self.opts.work_model = "claude"
+        self.w.gh.pr_view = lambda *_: dict(headRefOid="b" * 40, isDraft=False, state="OPEN", labels=[])
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        with (
+            patch("tauceti_worker.github_outbox.pending_for", return_value=False),
+            patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
+            patch.object(work, "_host_agent_binary", return_value=None),
+            patch.object(work, "resolve_codex_model_access") as entitlement,
+            patch.object(work.Quota, "authorize_claude_launch") as bootstrap,
+            patch("tauceti_worker.fleet_capacity.admission_reason") as admission,
+        ):
+            self.assertIsNone(work.dispatch("fix", self.w, sv, work.Candidate(10, HEAD), self.opts))
+        entitlement.assert_not_called()
+        bootstrap.assert_not_called()
+        admission.assert_not_called()
+
+    def test_partial_fix_sees_current_reply_instead_of_repeating_it(self):
+        from tauceti_worker import github_transport as transport
+
+        self.w.gh.pr_view = lambda *a: dict(headRefOid=HEAD, isDraft=False, state="OPEN", labels=[])
+
+        def meta(*args, **kwargs):
+            self.assertTrue(transport.direct_reads())
+            return SimpleNamespace(data={"head_sha": HEAD, "replies_through": 1}, provenance="fresh")
+
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        with (
+            patch.object(self.w.rs, "gh_meta", side_effect=meta),
+            patch.object(self.w.rs, "ledger_blocking", return_value=True),
+            patch.object(self.w.rs, "newest_contest_reply", return_value={"id": 2}),
+        ):
+            self.assertFalse(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD, partial_history=True)))
+        self.counter_values[f"fix-10-{HEAD[:12]}"] = 2
+        sv.open_prs = [PRInfo.from_json(row(10, "Other", author="peer")["pr"])]
+        with (
+            patch.object(self.w.rs, "gh_meta", side_effect=meta),
+            patch.object(self.w.rs, "ledger_blocking", return_value=True),
+            patch.object(self.w.rs, "newest_contest_reply", return_value=None),
+        ):
+            self.assertTrue(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD)))
+            self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
+            self.assertFalse(work._still_actionable("fix", self.w, sv, work.Candidate(10, HEAD)))
 
     def test_cold_service_outage_uses_only_shared_inventory_not_per_pr_histories(self):
         with (

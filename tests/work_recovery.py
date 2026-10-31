@@ -545,6 +545,15 @@ def test_push_and_owner(root):
     git(co, "commit", "-qam", "pushed")
     pushed = git(co, "rev-parse", "HEAD").strip()
     env = {**os.environ, "TAUCETI_PUSH_REF": "feature", "TAUCETI_PUSH_REMOTE": str(origin), "TAUCETI_CLAIM_KEY": ""}
+    events = root / "push-events"
+    emitter = root / "push-emitter.py"
+    emitter.write_text(f"from pathlib import Path\nwith Path({str(events)!r}).open('a') as f: f.write('changed\\n')\n")
+    env.update(
+        TAUCETI_FLEET_EVENTS=str(events),
+        TAUCETI_FLEET_PYTHON=sys.executable,
+        TAUCETI_FLEET_EMITTER=str(emitter),
+        TAUCETI_PUSH_SCOPE="first-push",
+    )
     env.pop("TAUCETI_PUSH_EXPECT", None)
     rc = subprocess.run([str(REPO / "scripts" / "git-safe-push")], cwd=co, env=env, capture_output=True).returncode
     check("git-safe-push: pushed", rc == 0 and git(origin, "rev-parse", "feature").strip() == pushed)
@@ -553,6 +562,18 @@ def test_push_and_owner(root):
         git(co, "rev-parse", "refs/tauceti/published/push/feature").strip() == pushed,
     )
     check("pushed work needs no record", wr.guard(cfg, co).state == "clean")
+    env.update(TAUCETI_PUSH_EXPECT=pushed, TAUCETI_PUSH_SCOPE="unchanged-push")
+    repeat = subprocess.run([str(REPO / "scripts" / "git-safe-push")], cwd=co, env=env, capture_output=True)
+    check(
+        "up-to-date push succeeds without counting another publication",
+        repeat.returncode == 0 and events.read_text().splitlines() == ["changed"],
+    )
+    absent = subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/tauceti/published/scope/unchanged-push/feature"],
+        cwd=co,
+        capture_output=True,
+    )
+    check("up-to-date push creates no round-scoped changed-publication marker", absent.returncode != 0)
 
     saved_sync, saved_atomic = tc.agents.sync_mathlib_pool, wr.atomic_json
     tc.agents.sync_mathlib_pool = lambda cfg: None

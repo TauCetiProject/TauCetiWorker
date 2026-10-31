@@ -68,11 +68,26 @@ class GitHubPauseTests(unittest.TestCase):
         self.assertEqual(waiting.exception.retry_at, 2000)
 
     def test_post_write_progress_bypasses_webhook_lag(self):
+        from tauceti_worker.github import GitHub
+
+        with patch("tauceti_worker.github.gh_run", return_value=SimpleNamespace(returncode=1)) as read:
+            with transport.read_context(fresh=True, direct=True, retry=False):
+                GitHub("org/repo")._gh(["pr", "view", "7"])
+        self.assertEqual(read.call_args.kwargs["max_wait"], 0)
+        with patch("tauceti_worker.github.gh_run", return_value=SimpleNamespace(returncode=1)) as read:
+            with transport.read_context(fresh=True, direct=True):
+                GitHub("org/repo")._gh(["pr", "view", "7"])
+        self.assertNotIn("max_wait", read.call_args.kwargs)
         gh = SimpleNamespace(
             pr_progress_state=lambda _: {"head": "new" if transport.direct_reads() else "old", "ncomments": 0}
         )
-        self.assertTrue(
+        self.assertIsNone(
             work_units._progressed(SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0})
+        )
+        self.assertTrue(
+            work_units._progressed(
+                SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0, "published": "new"}
+            )
         )
         self.assertFalse(transport.direct_reads())
 

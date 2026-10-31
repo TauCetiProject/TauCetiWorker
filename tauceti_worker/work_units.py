@@ -44,6 +44,7 @@ from .config import (
     ClaimCollision,
     Config,
     Die,
+    GitHubUnavailable,
     NoProgress,
     SharedStateUnavailable,
     extra_roadmap_prompt,
@@ -720,45 +721,115 @@ def _open_pr_numbers(w: Worker) -> set[int] | None:
 
 
 def _progress_snapshot(w: Worker, c: Candidate) -> dict | None:
-    """Capture just enough GitHub state to tell, after the round, whether the agent actually changed
-    anything. Returns None if we can't snapshot — then the guard is skipped (never block a real
-    success on a flaky query)."""
-    if c.pr:
-        st = w.gh.pr_progress_state(c.pr)  # head + comment count in one GraphQL call
-        if st is None:
-            return None
-        return {"head": st["head"] or c.head, "ncomments": st["ncomments"], "state": st.get("state")}
-    nums = _open_pr_numbers(w)  # roadmap / bump: a new marker-bearing PR = progress
+    try:
+        return _progress_snapshot_direct(w, c)
+    except (GitHubError, GitHubUnavailable, OSError):
+        return None
+
+
+def _progress_snapshot_direct(w: Worker, c: Candidate) -> dict | None:
+    """Capture a current baseline; unavailable observations never prevent work."""
+    from .github_transport import read_context
+
+    with read_context(fresh=True, direct=True, retry=False):
+        if c.pr:
+            st = w.gh.pr_progress_state(c.pr)
+            if st is None:
+                return None
+            result = {**st, "head": st["head"] or c.head}
+            from .activity import current_round_id
+
+            result["round_id"] = current_round_id()
+            result["mutation_cursor"] = _mutation_cursor()
+            return result
+        nums = _open_pr_numbers(w)  # roadmap / bump: a new marker-bearing PR = progress
     return {"prs": nums} if nums is not None else None
 
 
-def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool:
+def _mutation_cursor():
+    """A position in the existing optional journal, not another durable receipt."""
+    path = os.environ.get("TAUCETI_FLEET_EVENTS")
+    if path:
+        try:
+            stat = Path(path).stat()
+            return (str(path), stat.st_ino, stat.st_size)
+        except OSError:
+            pass
+    return None
+
+
+def _round_mutated(c: Candidate, pre: dict) -> str | None:
+    cursor, round_id = pre.get("mutation_cursor"), pre.get("round_id")
+    if not cursor or not round_id:
+        return None
+    try:
+        with Path(cursor[0]).open("rb") as stream:
+            stat = os.fstat(stream.fileno())
+            if stat.st_ino != cursor[1] or stat.st_size < cursor[2]:
+                return None
+            stream.seek(cursor[2])
+            # Diagnostic bounds never change admission or publication.
+            data = stream.read(4 * 1024 * 1024 + 1)
+        if len(data) > 4 * 1024 * 1024 or data and not data.endswith(b"\n"):
+            return None
+        publication = None
+        for line in data.splitlines():
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                return None
+            if (
+                event.get("kind") == "pr_activity"
+                and event.get("round_id") == round_id
+                and event.get("repository") == TAUCETI
+                and event.get("pr") == c.pr
+                and event.get("activity") == "github_mutation"
+                and event.get("publication") in ("reply", "closure")
+            ):
+                if event["publication"] == "closure":
+                    return "closure"
+                publication = "reply"
+        return publication
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
     # This post-spend acknowledgement can run before the write's webhook arrives.
     # Ordinary surveys still use the freshest mirrored data without age gates.
     from .github_transport import read_context
 
-    with read_context(fresh=True, direct=True):
-        return _progressed_direct(w, c, pre)
+    try:
+        with read_context(fresh=True, direct=True, retry=False):
+            return _progressed_direct(w, c, pre)
+    except (GitHubError, GitHubUnavailable, OSError):
+        return None
 
 
-def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool:
+def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
     """True if the round left an observable mark (push / new PR / new issue-or-review comment).
-    Conservative: any query failure or ambiguity returns True, so we never falsely discard real work."""
+    Missing evidence stays unknown; it never becomes an admission dependency."""
     if pre is None:
-        return True
+        return None
     if c.pr:
+        if pre.get("published"):
+            return True
+        mutated = _round_mutated(c, pre)
+        if mutated == "closure" or mutated == "reply" and not pre.get("require_push"):
+            return True
         st = w.gh.pr_progress_state(c.pr)
         if st is None:
-            return True
+            return None
         closed = st.get("state") in {"CLOSED", "MERGED"} and pre.get("state") not in {"CLOSED", "MERGED"}
-        return (
-            closed
-            or (st["head"] or "") != pre["head"]
-            or (not pre.get("require_push") and st["ncomments"] > pre["ncomments"])
-        )
+        if pre.get("require_push") and (st["head"] or "") == pre["head"] and not closed:
+            return False
+        if (st["head"] or "") != pre["head"] or closed or st["ncomments"] > pre["ncomments"]:
+            # Bubble has no host-visible push markers. Its current baseline is
+            # taken after the branch claim; unclaimed work stays unattributed.
+            return True if pre.get("claimed_bubble") else None
+        return False
     now = _open_pr_numbers(w)
     if now is None:
-        return True
+        return None
     new = now - pre["prs"]
     if not new:
         return False
@@ -768,7 +839,7 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool:
     for num in new:
         v = w.gh.pr_view(num, ["body"])
         if v is None:
-            return True
+            return None
         if TARGET_MARKER_RE.search(v.get("body") or ""):
             return True
     return False
@@ -806,7 +877,35 @@ def raise_on_account_mismatch(cfg: Config, account: str | None, work_model: str,
         raise Die(f"{where}: {problem}")
 
 
-def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
+def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
+    if live is None:
+        return None
+    if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
+        log(
+            f"  {stage} #{c.pr}: selected {c.head[:12]}, current {(live.get('headRefOid') or '')[:12]} — selecting other work"
+        )
+        return False
+    paused = {"hold", "wip", "human", "on-hold"}
+    if stage != "review":
+        paused |= {"keep", "do-not-close"}
+    return not ({str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused)
+
+
+def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
+    from .github_transport import read_context
+
+    try:
+        # Fix selection must be current; unrelated discovery retains its existing mirror/cache policy.
+        with read_context(fresh=True, direct=True, retry=False) if stage == "fix" else contextlib.nullcontext():
+            return _still_actionable_direct(stage, w, sv, c)
+    except (GitHubError, GitHubUnavailable, OSError):
+        if stage != "fix":
+            raise
+        log(f"  fix #{c.pr}: current review read unavailable; retaining normal checkout and agent investigation")
+        return None
+
+
+def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
     """Re-read THIS PR's review state live and confirm the candidate the survey chose still stands.
 
     The survey triages on cached comment reads keyed to each PR's `updatedAt` (see
@@ -860,27 +959,22 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     # The head the survey saw. A contributor pushing since then makes every verdict below describe a
     # commit that is no longer there, and _do_fixlike would check the NEW head out and work on it.
     live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels"])
-    if live is None:
-        log(f"  {stage} #{c.pr}: could not re-read the PR before launching — leaving it for a later round")
-        return False
-    if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
-        log(f"  {stage} #{c.pr}: moved on since the survey (head, draft or closed) — skipping")
-        return False
-    paused = {"hold", "wip", "human", "on-hold"}
-    if stage != "review":
-        paused |= {"keep", "do-not-close"}
-    if {str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused:
-        return False
-    if getattr(c, "partial_history", False):
+    matches = _selected_pr_matches(stage, c, live)
+    if matches is not True:
+        return matches if stage == "fix" else False
+    if stage == "review" and getattr(c, "partial_history", False):
         # The agent/engine can inspect this selected PR. Unknown comment coverage
         # must not turn into another pre-launch dependency wait. Ordinary branch
         # claims and the review engine's per-head coordination remain authoritative.
         log(f"  {stage} #{c.pr}: investigating with partial cached history")
         return True
     meta = w.rs.gh_meta(c.pr, force=True)
+    if getattr(c, "partial_history", False) and meta.provenance in ("stale", "fetch_failed", "missing"):
+        log(f"  {stage} #{c.pr}: current head verified; investigating incomplete review history")
+        return True
     if meta.provenance in ("stale", "fetch_failed"):
-        log(f"  {stage} #{c.pr}: could not re-read review state before launching — leaving it for a later round")
-        return False
+        log(f"  {stage} #{c.pr}: current review read unavailable")
+        return None if stage == "fix" else False
     if stage == "fix":
         p = next((x for x in sv.open_prs if x.number == c.pr), None)
         if p is None:
@@ -895,19 +989,18 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
             through = meta.data.get("replies_through")
             through = through if isinstance(through, int) else 0
             pending_contest = bool(reply and reply["id"] > through)
+        attempts = w.counters.read(f"fix-{c.pr}-{c.head[:12]}")
         disp, why = fix_disposition(
             meta,
             c.head,
             p.build_success,
             blocking,
-            w.counters.read(f"fix-{c.pr}-{c.head[:12]}"),
+            attempts,
             pending_contest=pending_contest,
             unlimited=getattr(p, "automatic_bump", False),
         )
         c.final_resolution = (
-            w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS - 1
-            and p.author == sv.me_login
-            and not getattr(p, "automatic_bump", False)
+            attempts >= MAX_FIX_ATTEMPTS - 1 and p.author == sv.me_login and not getattr(p, "automatic_bump", False)
         )
         if disp != "actionable" and not (disp == "exhausted" and c.final_resolution):
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
@@ -1109,7 +1202,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # Last free check before anything that spends — the entitlement probe and the Claude bootstrap
     # below both cost a provider request. Everything above this line is local (a binary on PATH, the
     # configured account), so it stays ahead of a network read that only matters if we get this far.
-    if not _still_actionable(stage, w, sv, c):
+    actionable = _still_actionable(stage, w, sv, c)
+    if actionable is False:
         return None
     from .claude_api import admission_failure
     from .fleet_capacity import admission_reason
@@ -1176,7 +1270,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
     select(stage)
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
-    pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
+    claimed_baseline = stage == "fix" or bubble and c.pr and stage in FILE_CHANGE_STAGES
+    pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED and not claimed_baseline else None
+    c.progress = pre
     if pre is not None:
         pre["require_push"] = getattr(c, "final_resolution", False) or any(
             p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs
@@ -1205,12 +1301,24 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 raise
             raise admission_failure(str(error)) from None
         rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
+    if c.pr and stage in FILE_CHANGE_STAGES:
+        pre = c.progress
+        if pre is not None:
+            pre["require_push"] = c.final_resolution or any(
+                p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs
+            )
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
     # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
-    if rc == 0 and stage in PROGRESS_GUARDED and not _progressed(w, c, pre):
+    progress = _progressed(w, c, pre) if rc == 0 and stage in PROGRESS_GUARDED else None
+    if rc == 0 and stage in PROGRESS_GUARDED and progress is None:
+        from .activity import observation
+
+        observation("unconfirmed")
+        log(f"  {stage} #{c.pr}: outcome unconfirmed; continuing normal scheduling")
+    if rc == 0 and stage in PROGRESS_GUARDED and progress is False:
         tgt = f" #{c.pr}" if c.pr else ""
         reason = (
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
@@ -1226,7 +1334,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             )
             return None
         raise NoProgress(reason)
-    if rc == 0 and stage in PR_TASKS and c.pr:
+    if rc == 0 and stage in PR_TASKS and c.pr and (stage not in PROGRESS_GUARDED or progress is True):
         with contextlib.suppress(Exception):
             from .fleet_events import emit
 
@@ -1583,6 +1691,26 @@ def _do_fixlike(
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
 
+    if label == "fix" or bubble:
+        c.progress = _progress_snapshot(w, c)
+        live = None
+        if c.progress and all(key in c.progress for key in ("isDraft", "labels", "state")):
+            live = {**c.progress, "headRefOid": c.progress["head"]}
+        else:
+            from .github_transport import read_context
+
+            try:
+                with read_context(fresh=True, direct=True, retry=False):
+                    live = w.gh.pr_view(pr, ["headRefOid", "isDraft", "state", "labels"])
+            except (GitHubError, GitHubUnavailable, OSError):
+                pass
+        # Unknown optional reads keep the checkout/agent path running. Known
+        # changes release ownership immediately, before caches or model calls.
+        if _selected_pr_matches(label, c, live) is False:
+            return decline_repair()
+        if bubble and c.progress is not None:
+            c.progress["claimed_bubble"] = bool(held)
+
     if foreign:
         # The last fresh authorization follows the real claim. Nothing paid has
         # started; the current-at-launch option may cheaply select main once here.
@@ -1735,9 +1863,9 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         # A newer CI-retry commit has no failure to repair yet. Re-survey it
         # instead of launching a paid repair selected for the previous head.
-        if (label in {"rebase", "fix-ci"} or label == "bump" and getattr(c, "bump_integration_failure", False)) and (
-            rev.returncode or checked != head
-        ):
+        if (
+            label in {"fix", "rebase", "fix-ci"} or label == "bump" and getattr(c, "bump_integration_failure", False)
+        ) and (rev.returncode or checked != head):
             log(f"  {label} #{pr}: checkout no longer matches the selected head — selecting other work")
             return decline_repair()
         if foreign:
@@ -1858,6 +1986,10 @@ def _do_fixlike(
 
             if (co / ".git").exists():
                 published_after = _rev(co, scoped_push_marker)
+                if published_after and published_after != scoped_published_before:
+                    if c.progress is None:
+                        c.progress = {}
+                    c.progress["published"] = published_after
                 note_owner(
                     w.cfg,
                     recovery_handoffs=handoffs,

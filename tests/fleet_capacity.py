@@ -338,7 +338,13 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
             git = directory / "git"
-            git.write_text("#!/bin/sh\nexit 0\n")
+            git.write_text(
+                '#!/bin/sh\ncase "$*" in\n'
+                "  'rev-parse --verify'*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n"
+                "  mktag) cat >/dev/null; echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;\n"
+                "  '-c push.followTags=false push'*) printf '*\\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/heads/test\\t[new branch]\\n' ;;\n"
+                "esac\nexit 0\n"
+            )
             git.chmod(0o700)
             (directory / "json.py").write_text("raise RuntimeError('untrusted import')\n")
             journal = directory / "events.jsonl"
