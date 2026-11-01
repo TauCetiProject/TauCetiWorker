@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -95,6 +96,31 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(waits, [20, 0, 57, 59, 58])
         self.assertEqual(publish.call_count, 2, "failed/OOM children report errors; intentional SIGTERM does not")
         self.assertEqual(a.read_json(a.root() / "preparation-error.json")["error"], "CalledProcessError")
+
+    def test_live_sampling_continues_while_historical_refresh_is_blocked(self):
+        from tauceti_worker import activity_live, processes, worker_scopes
+
+        entered, release, sampled = threading.Event(), threading.Event(), threading.Event()
+
+        def refresh(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+
+        with (
+            patch.object(processes, "run", side_effect=refresh),
+            patch.object(worker_scopes, "collect_oom_events", return_value=False),
+            patch.object(activity_live, "sample", side_effect=sampled.set),
+        ):
+            stop = a.start_collector(None)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(sampled.wait(2), "live sampling must not wait for the historical subprocess")
+            finally:
+                stop.set()
+                release.set()
+                for thread in threading.enumerate():
+                    if thread.name in {"activity-preparation", "live-spending"}:
+                        thread.join(2)
 
     def test_collector_owner_exit_cleans_refresh_descendants_and_releases_locks(self):
         import fcntl

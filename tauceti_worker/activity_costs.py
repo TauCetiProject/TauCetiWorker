@@ -1,6 +1,9 @@
 """Prepare pooled conversation costs from the authoritative local budget ledger."""
 
 import json
+import sys
+import time
+import uuid
 from decimal import Decimal
 
 from .activity_summary import COST_WINDOWS as COST_WINDOW_NAMES
@@ -40,23 +43,35 @@ def install(db):
     """)
 
 
-def cached_usage(db, budget, session):
+def cached_usage(db, budget, session, metrics):
     """Stat small checkpoints; immutable old usage is reduced and cached in SQLite."""
+    saved = db.execute("SELECT signature,payload FROM prepared_usage WHERE id=?", (session["id"],)).fetchone()
+    if (
+        saved
+        and session["status"] == "settled"
+        and session.get("cost_provenance", "native-reported") == "native-reported"
+    ):
+        value = json.loads(saved[1])
+        if value and value["closed"]:
+            return value  # Final native evidence is immutable; late cost corrections are ledger events.
     path = usage_path(budget.directory, session["id"], session.get("bridge"))
     paths = {path, budget.directory / "usage" / (session["id"] + ".json")}
     fingerprints = []
     for candidate in sorted(paths):
         for file in (candidate, candidate.with_suffix(".jsonl")):
+            metrics["usage_metadata_checks"] += 1
             try:
                 stat = file.lstat()
                 fingerprints.append((str(file), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_uid, stat.st_mode))
             except FileNotFoundError:
                 fingerprints.append((str(file), None))
     signature = json.dumps(fingerprints)
-    saved = db.execute("SELECT signature,payload FROM prepared_usage WHERE id=?", (session["id"],)).fetchone()
     if saved and saved[0] == signature:
         return json.loads(saved[1])
+    started = time.monotonic()
     value = session_usage(budget.directory, session)
+    metrics["usage_decodes"] += 1
+    metrics["usage_decode_seconds"] += time.monotonic() - started
     if value:
         value = {
             **value,
@@ -120,28 +135,29 @@ def _write_prepared(db, table, rows):
 
 def prepare(db, now, scope_for_worker):
     """Background only. Reuse Budget's validation/reconciliation, never mutate it."""
+    started, cpu = time.monotonic(), time.process_time()
+    metrics = dict(usage_metadata_checks=0, usage_decodes=0, usage_decode_seconds=0)
     budget = Budget(clock=lambda: now)
     if not budget.ledger.exists():
         if db.execute("SELECT 1 FROM meta WHERE key='activity_funding'").fetchone():
             raise ValueError("Budget ledger unavailable")
         return
-    with budget.locked():
-        raw = budget.ledger.read_bytes()
-    records = budget.records(raw)
-    state = budget.replay(records)
+    from .activity_ledger import load
+
+    state, settled_at, replay_metrics = load(db, budget)
+    info = budget.ledger.stat()
+    metrics.update(replay_metrics, ledger_replay_seconds=time.monotonic() - started)
+    if replay_metrics["rebuilt"]:
+        db.execute("DELETE FROM prepared_usage")
+    phase = time.monotonic()
     budget.accrue(state)
-    settled_at = {}
-    for record in records:
-        for event in record["events"]:
-            if event["type"] == "settle":
-                settled_at.setdefault(event["id"], record["timestamp"])
     rows, accruals, quality_rows, accounting_rows, seen = [], [], [], [], set()
-    scopes = {}
+    scopes, calibration = {}, []
     for identity, session in sorted(state["sessions"].items(), key=lambda pair: pair[1]["started"]):
         settled = session["status"] == "settled"
         value = session.get("cost", "0")
         saved = (
-            cached_usage(db, budget, session)
+            cached_usage(db, budget, session, metrics)
             if len(identity) == 32 and all(c in "0123456789abcdef" for c in identity)
             else None
         )
@@ -156,6 +172,29 @@ def prepare(db, now, scope_for_worker):
         total = sum((money(item["cost"]) for item in priced), Decimal(0))
         source = session.get("cost_provenance", "native-reported")
         native = settled and source == "native-reported"
+        if (
+            native
+            and saved
+            and saved.get("closed")
+            and not saved.get("inflight")
+            and not session.get("resume")
+            and session.get("outcome") not in {"launch-failed", "reconciled"}
+            and money(value) > 0
+            and saved.get("journal_format")
+            and saved.get("journal_offset", 0) > saved.get("journal_start_bytes", 0)
+            and saved.get("messages")
+            and all(m["complete"] and m["cost"] is not None for m in saved["messages"].values())
+        ):
+            calibration.append(
+                dict(
+                    model=session["model"],
+                    phase=session["phase"],
+                    cost=value,
+                    journal_format=saved["journal_format"],
+                    prices_sha256=saved.get("prices_sha256"),
+                    bytes=saved["journal_offset"] - saved["journal_start_bytes"],
+                )
+            )
         if not settled:
             value = str(max(money(value), total, money(session.get("lower_bound_cost", "0"))))
         worker = session["worker"]
@@ -169,7 +208,7 @@ def prepare(db, now, scope_for_worker):
             or any(not item["complete"] or item["cost"] is None for item in items)
         )
         quality_rows.append((identity, session["worker"], scope, native, not native, incomplete))
-        live = not settled and live_identity(session, now)["live"]
+        live = not settled and live_identity(session, now, budget.directory)["live"]
         accounting_rows.append(
             (
                 identity,
@@ -238,6 +277,8 @@ def prepare(db, now, scope_for_worker):
                 value,
             )
         )
+    metrics["usage_and_allocation_seconds"] = time.monotonic() - phase
+    phase = time.monotonic()
     # This is a derived cache. A ledger repair/replacement cannot leave old sessions behind.
     for table, prepared in (
         ("conversation_costs", rows),
@@ -256,7 +297,29 @@ def prepare(db, now, scope_for_worker):
         available=str(state["balance"] - pending),
         grant_rate=str(state["rate"]),
         prepared_at=now,
+        ledger_sequence=state["seq"],
+        ledger_identity=[info.st_dev, info.st_ino],
+        generation=uuid.uuid4().hex,
     )
+    from .activity_live import calibrate
+
+    funding["live_rates"] = calibrate(calibration)
+    metrics.update(
+        table_write_seconds=time.monotonic() - phase,
+        seconds=time.monotonic() - started,
+        cpu_seconds=time.process_time() - cpu,
+        ledger_bytes=info.st_size,
+        invocations=len(rows),
+    )
+    try:
+        import resource
+
+        metrics["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (
+            1 if sys.platform == "darwin" else 1024
+        )
+    except ImportError:
+        pass
+    funding["preparation_metrics"] = metrics
     db.execute("INSERT OR REPLACE INTO meta VALUES ('activity_funding',?)", (json.dumps(funding),))
     db.execute("DELETE FROM meta WHERE key='activity_cost_error'")
 
@@ -347,6 +410,61 @@ def summarize(db, now, cutoff, column=None, identity=None):
             usd_per_hour=hourly_rate(spent, covered),
             usd_per_worker_hour=hourly_rate(spent, worker_seconds),
         )
+    baseline = {}
+    for row in db.execute(
+        f"SELECT c.id,c.worker,c.scope,c.started,c.cost,p.payload FROM conversation_costs c "
+        "JOIN conversation_accounting a ON a.id=c.id LEFT JOIN prepared_usage p ON p.id=c.id "
+        f"WHERE (a.live=1 OR a.unresolved_stopped=1) {('AND c.' + column + '=?') if column else ''}",
+        args,
+    ):
+        saved = json.loads(row[5]) if row[5] else None
+        baseline[row[0]] = dict(
+            worker=row[1],
+            scope=row[2],
+            started=row[3],
+            cost=row[4],
+            observed_at=saved.get("observed_at") if saved else row[3],
+        )
+        if saved and saved.get("journal_format") and saved.get("journal_identity"):
+            cost = sum((money(m["cost"]) for m in saved["messages"].values() if m.get("cost") is not None), Decimal(0))
+            baseline[row[0]]["summary"] = {
+                **{
+                    key: saved[key]
+                    for key in (
+                        "id",
+                        "model",
+                        "sequence",
+                        "observed_at",
+                        "journal_format",
+                        "journal_identity",
+                        "journal_offset",
+                        "journal_start_bytes",
+                        "prices_sha256",
+                    )
+                },
+                "cost": str(cost),
+                "usage_seen": cost > 0,
+            }
+    # Downward native corrections must remove spend where the prepared report
+    # actually allocated it, not create a negative cost in the latest window.
+    for row in baseline.values():
+        row["windows"] = {key: "0" for key in SPENDING_WINDOWS}
+    for invocation, start, finish, cost, _kind in accruals:
+        if invocation not in baseline:
+            continue
+        for key, seconds in SPENDING_WINDOWS.items():
+            since = (
+                max(recorded_since, now - seconds)
+                if seconds is not None and recorded_since is not None
+                else now - seconds
+                if seconds is not None
+                else recorded_since or 0
+            )
+            if start == finish:
+                part = money(cost) if since <= start <= now else Decimal(0)
+            else:
+                part = money(cost) * money(max(0, min(finish, now) - max(start, since))) / money(finish - start)
+            baseline[invocation]["windows"][key] = str(money(baseline[invocation]["windows"][key]) + part)
     return dict(
         accounting_version=3,
         windows=windows,
@@ -373,4 +491,12 @@ def summarize(db, now, cutoff, column=None, identity=None):
             )
         ),
         prepared_at=funding.get("prepared_at") if funding else None,
+        live_baseline={
+            **{key: funding.get(key) for key in ("generation", "ledger_sequence", "ledger_identity")},
+            "sessions": baseline,
+        }
+        if funding and funding.get("generation")
+        else None,
+        live_rates=funding.get("live_rates", {}) if funding else {},
+        preparation_metrics=funding.get("preparation_metrics", {}) if funding else {},
     )

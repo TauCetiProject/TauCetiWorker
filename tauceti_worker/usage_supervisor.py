@@ -294,6 +294,14 @@ def tick(budget, cache=None, stop=None):
                     value = state["sessions"].get(path.stem)
                     if value:
                         sessions.setdefault(path.stem, value)
+                        if value["status"] == "settled":
+                            # Short invocations can start and finish between
+                            # minute samples. Remember their final cost before
+                            # archiving the launch sidecar, without scanning history.
+                            pending = cache.setdefault("live_pending", {})
+                            prior = pending.get(path.stem)
+                            if not prior or prior["cost"] != value.get("cost"):
+                                pending[path.stem] = dict(cost=value.get("cost"), ledger_sequence=state["seq"])
             cache["ledger_available"] = True
         except ACCOUNTING_ERRORS as error:
             # Launch supervision must keep running while ledger reads recover.
@@ -311,6 +319,8 @@ def tick(budget, cache=None, stop=None):
     for path in paths:
         if stop is not None and stop.is_set():
             return
+        if budget.clock() < cache.get("stopped_next_poll", {}).get(path.stem, 0):
+            continue
         try:
             recover_invocation(budget, path, cache=cache, session=cache["sessions"].get(path.stem))
             errors.pop(path.stem, None)
@@ -319,6 +329,42 @@ def tick(budget, cache=None, stop=None):
             if errors.get(path.stem) != stamp:
                 print(f"{path.stem}: usage recovery retained for retry: {type(error).__name__}: {error}", flush=True)
                 errors[path.stem] = stamp
+    try:
+        from .activity_live import publish_sessions
+
+        publish_sessions(budget, cache, budget.clock())
+    except Exception:
+        pass  # Optional reporting never interferes with launch supervision.
+    now = budget.clock()
+    last_recovery = cache.setdefault("stopped_recovered_at", now)
+    try:
+        mode = recovery_mode(budget.directory)
+    except ValueError:
+        mode = None  # Individual launch/recovery errors above retain their diagnostics.
+    if now - last_recovery >= 60 and mode == "auto":
+        from .budget_recovery import live_identity, recover_stopped
+
+        cache["stopped_recovered_at"] = now
+        rows = [s for s in cache.get("sessions", {}).values() if s["status"] != "settled"]
+        # Continue the queue across minute passes; one slow group cannot starve
+        # later eligible work. Each proposal runs outside the admission lock.
+        start = cache.get("stopped_cursor", 0) % max(1, len(rows))
+        deadline = time.monotonic() + 1
+        for offset in range(len(rows)):
+            s = rows[(start + offset) % len(rows)]
+            cache["stopped_cursor"] = start + offset + 1
+            if len(s["id"]) != 32 or any(c not in "0123456789abcdef" for c in s["id"]):
+                continue
+            try:
+                if not live_identity(s, now, budget.directory)["live"]:
+                    recover_stopped(budget, s["id"])
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                if errors.get("automatic-" + s["id"]) != message:
+                    print(f"{s['id']}: stopped usage policy retained for retry: {message}", flush=True)
+                    errors["automatic-" + s["id"]] = message
+            if time.monotonic() >= deadline:
+                break
 
 
 def recovery_mode(directory):
@@ -338,6 +384,8 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     inbox, outbox = bridge / "inbox", bridge / "outbox"
     stamp = evidence_stamp(budget.directory, value)
     if value["phase"] in {"stopped", "no-inference"} and value.get("recovery_stamp") == stamp:
+        if cache is not None:
+            cache.setdefault("stopped_next_poll", {})[invocation] = budget.clock() + 60
         return
     if value.get("unknown_reserve_stamp") == stamp and any(
         e["kind"] == "remote-liveness-unconfirmed" for e in value["events"]
@@ -422,7 +470,7 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     )
     if value.get("external") and not stopped:
         event("remote-liveness-unconfirmed")
-    journal = session_usage(budget.directory, value)
+    journal = session_usage(budget.directory, value) if stopped else None
     has_usage = bool(journal and journal["messages"]) or bool(session and money(session.get("cost", "0")) > 0)
     if stopped:
         event("stopped")
@@ -486,6 +534,7 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     durable(path, value)
     if cache is not None:
         cache[invocation] = stamp
+        cache.setdefault("stopped_next_poll", {})[invocation] = budget.clock() + 60
 
 
 def ensure_supervisor(directory, *, refresh=False):
@@ -545,7 +594,15 @@ def ensure_supervisor(directory, *, refresh=False):
 def code_version():
     import hashlib
 
-    names = ("usage_supervisor.py", "usage_lifecycle.py", "usage_accounting.py", "budget.py", "budget_usage.py")
+    names = (
+        "usage_supervisor.py",
+        "usage_lifecycle.py",
+        "usage_accounting.py",
+        "budget.py",
+        "budget_usage.py",
+        "budget_recovery.py",
+        "activity_live.py",
+    )
     return hashlib.sha256(b"".join(Path(__file__).with_name(name).read_bytes() for name in names)).hexdigest()
 
 

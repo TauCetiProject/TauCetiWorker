@@ -692,7 +692,18 @@ resumes; a missing baseline does not prevent runtime work. A cost-only manual
 reconciliation does not restore that baseline. No local budget amount is passed as
 Claude's `--max-budget-usd`. After a crashed worker, first try
 `tauceti budget --recover --note "worker crash"` to recover its durable receipts
-and remove stale staged keys. Costs without a receipt still require reconciliation.
+and remove stale staged keys. Missing native totals can settle as labelled,
+correctable estimates rather than remaining unresolved indefinitely.
+
+Fleet spending also shows rates including live estimates. The existing manager
+refreshes these once per minute, independently of historical activity collection.
+It uses a small running-usage summary and, when calibrated, journal-size growth;
+sampling never parses the growing journal. Recorded spending remains available
+alongside the labelled estimate, and reservations stay excluded. Resumed sessions
+retain their attributed known prefix until deduplication supplies further usage.
+The detached usage supervisor applies the audited stopped-usage policy to eligible
+stopped invocations on ordinary minute passes; late native receipts correct those
+estimates. Reporting estimates do not change admissions or settle expenditure.
 
 Managed workers accept the same flags through `workers add`, or the
 `claude_billing = "api"`, `budget = true`, and `anthropic_api_key_file` fields

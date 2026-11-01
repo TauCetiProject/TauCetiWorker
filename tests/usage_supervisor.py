@@ -143,6 +143,29 @@ class SupervisorTests(unittest.TestCase):
         tick(self.budget)
         self.assertEqual(self.budget.ledger.read_bytes(), before)
 
+    def test_minute_pass_settles_stopped_uncertainty_and_late_receipt_corrects(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        cache = {}
+        tick(self.budget, cache)
+        self.assertEqual(self.saved()["status"], "provisional")
+        # Simulate the stopped bridge owner while retaining exact native birth checks.
+        at = self.budget.clock()
+        self.budget.clock = lambda: at + 61
+        with patch("tauceti_worker.budget.bridge_owner_alive", return_value=False):
+            tick(self.budget, cache)
+        self.assertEqual(self.saved()["status"], "settled")
+        self.assertTrue(self.saved()["recovery_audit"])
+        durable(
+            self.bridge / "inbox" / (self.id + ".receipt"), dict(id=self.id, totals={"provider": "4"}, outcome="exit:0")
+        )
+        self.budget.clock = lambda: at + 122
+        tick(self.budget, cache)
+        self.assertEqual(Decimal(self.saved()["cost"]), 4)
+        self.assertEqual(self.saved()["cost_provenance"], "native-reported")
+
     def test_sigkill_during_request_preserves_priced_prefix(self):
         native = self.launch()
         self.response(complete=False)
