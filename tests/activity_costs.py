@@ -472,6 +472,22 @@ class CostTests(unittest.TestCase):
             # usage are still fully checked, with no derived table rewrites.
             self.assertEqual(db.total_changes - before, 1)
 
+    def test_accrual_covering_indexes_preserve_decimal_sum_order_at_timestamp_ties(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM cost_accruals")
+            for identity, cost in (
+                ("z-big", "1.000000000000000000000000000"),
+                ("a-small", "0.0000000000000000000000000004"),
+                ("b-small", "0.0000000000000000000000000004"),
+            ):
+                db.execute(
+                    "INSERT INTO cost_accruals VALUES (?, 'author', 'machine', ?, ?, ?, 'native-allocated', 0)",
+                    (identity, self.now - 100, self.now - 100, cost),
+                )
+            for column, identity in ((None, None), ("worker", "author"), ("scope", "machine")):
+                value = activity_costs.summarize(db, self.now, self.now - 3600, column, identity)
+                self.assertEqual(value["windows"]["total"]["spent_usd"], "1.000000000000000000000000000")
+
     def test_summary_indexes_cover_queries_after_legacy_upgrade(self):
         for upgrade in (False, True):
             if upgrade:
@@ -496,6 +512,22 @@ class CostTests(unittest.TestCase):
                     ("quality_worker", "FROM conversation_quality"),
                     ("accounting_worker", "SELECT COALESCE(SUM(live),0)"),
                     ("accounting_estimates", "SELECT id,settled_estimates,recovered_estimates"),
+                    ("accrual_worker_covering", "SELECT id,started,finished,cost,active FROM cost_accruals"),
+                    ("round_interrupted", "SELECT id round_id,worker,started"),
+                    ("contribution_worker_covering", "SELECT * FROM pr_contributions"),
+                ):
+                    queries = [query for query in statements if pattern in query]
+                    self.assertTrue(queries, index)
+                    for query in queries:
+                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                        self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
+                statements = []
+                db.set_trace_callback(statements.append)
+                a._summary(db, self.now, "scope", "machine")
+                db.set_trace_callback(None)
+                for index, pattern in (
+                    ("accrual_scope_covering", "SELECT id,started,finished,cost,active FROM cost_accruals"),
+                    ("contribution_scope_covering", "SELECT * FROM pr_contributions"),
                 ):
                     queries = [query for query in statements if pattern in query]
                     self.assertTrue(queries, index)
