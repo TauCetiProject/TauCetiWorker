@@ -499,12 +499,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     for stage in round_stages(opts):
         if stage in ("review", "overlap-scan", "overlap-fix"):
             continue
-        # PR numbers are creation ordered within the repository. Prefer older
-        # maintenance globally; existing claims skip peers' work in the cascade.
         candidates = sv.kind(stage).actionable
-        sv.kind(stage).actionable = (
-            sorted(candidates, key=lambda c: c.pr) if global_pick else spread_candidates(candidates)
-        )
+        sv.kind(stage).actionable = spread_candidates(candidates)
 
     # The undocumented review throttles, off unless an expert asked for them. Applied here rather than
     # in survey() so they steer only what this round PICKS: the survey (and so `status`, the dashboard,
@@ -1652,8 +1648,8 @@ def _do_fixlike(
             log(f"  {label} #{pr}: explicit fork repair scope is no longer valid — skipping")
             return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
-        # Losing a claim never launched an attempt. This race is especially
-        # common when global maintenance prefers the same oldest PRs.
+        # Losing a claim never launched an attempt. Concurrent workers can
+        # still pick the same candidate after independently shuffling.
         for key in charged:
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None  # claimed elsewhere → caller tries the next candidate

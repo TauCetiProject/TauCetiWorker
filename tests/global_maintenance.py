@@ -90,6 +90,7 @@ class GlobalMaintenance(unittest.TestCase):
             patch("tauceti_worker.survey.me", return_value="science"),
             patch.object(work, "mirror_creds"),
             patch.object(work, "_branch_claimed_elsewhere", return_value=False),
+            patch.object(work, "spread_candidates", side_effect=lambda cs: sorted(cs, key=lambda c: c.pr)),
         ):
             item.start()
             self.addCleanup(item.stop)
@@ -235,7 +236,7 @@ class GlobalMaintenance(unittest.TestCase):
         mutation.assert_not_called()
 
     def test_other_roadmap_maintenance_and_claim_fallthrough(self):
-        # Newest arrives first; a peer holds the oldest. Exhausted and contested
+        # Model an independent worker's shuffled order. Claimed and contested
         # heads must not hide the remaining maintenance in a different area.
         rows = [
             row(30, "Algebra"),
@@ -244,8 +245,9 @@ class GlobalMaintenance(unittest.TestCase):
             row(15, "Geometry", contest={"id": 1, "rubric": "reuse"}),
         ]
         self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
-        _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr in (10, 20) else 0)
-        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20), ("fix", 30)])
+        with patch.object(work, "spread_candidates", side_effect=lambda cs: sorted(cs, key=lambda c: -c.pr)):
+            _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr in (30, 20) else 0)
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 30), ("fix", 20), ("fix", 10)])
         self.assertEqual(set(query.call_args.kwargs["stages"]), set(self.opts.only) - {"roadmap"})
         self.assertEqual(query.call_args.args[1], "auto")
         areas.assert_not_called()
