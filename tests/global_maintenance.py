@@ -401,6 +401,22 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round([row(10, "Other"), row(30, "Other")])
             self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
 
+    def test_missing_or_skipped_focus_keeps_global_maintenance(self):
+        for focused, skip in ((["RemovedArea"], ""), (["NewArea"], "NewArea")):
+            with (
+                patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=focused),
+                patch.dict(os.environ, TAUCETI_ROADMAP_SKIP=skip),
+            ):
+                _, query, _ = self.run_round([row(10, "Other")])
+                self.assertEqual(self.calls[0][:2], ("fix", 10))
+                self.assertEqual(query.call_args.args[1], "auto")
+
+    def test_fractional_miss_is_not_drawn_again_when_authoring(self):
+        with patch("tauceti_worker.fleet_capacity.roadmap_focus", side_effect=[[], ["NewArea"]]) as focus:
+            self.run_round([])
+            self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
+            focus.assert_called_once_with(self.w.cfg.wid)
+
     def test_fleet_focus_keeps_explicit_area_and_pr_overrides(self):
         with patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]) as focus:
             with patch.object(work, "roadmap_only", return_value="Topology"):

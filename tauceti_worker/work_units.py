@@ -418,7 +418,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                     # A reserved slot runs the normal cascade within its chosen
                     # focus area, rather than spending every round on a global
                     # backlog before it can reach focused authoring.
-                    scope = random_roadmap_area(w, focus=focus)
+                    scope = random_roadmap_area(w, focus=focus, fallback=False)
             global_pick = scope in (None, "", "auto", "any")
         sv = survey(
             w.cfg,
@@ -2823,15 +2823,13 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
         return None
 
 
-def random_roadmap_area(w, *, focus=None) -> str:
-    """Choose an eligible area for a focused round or ordinary random authoring."""
+def random_roadmap_area(w, *, focus=None, fallback=True) -> str | None:
+    """Choose an eligible area; a focus miss can preserve the ordinary global cascade."""
     from .fleet_capacity import roadmap_focus
 
     raw_areas = roadmap_areas(w.gh)
     skip = roadmap_skip()
     areas = [a for a in raw_areas if a not in skip]
-    if raw_areas and not areas:
-        raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
     focus = roadmap_focus(w.cfg.wid) if focus is None else focus
     if focus:
         focused = [a for a in areas if a in focus]
@@ -2840,6 +2838,10 @@ def random_roadmap_area(w, *, focus=None) -> str:
             log(f"Fleet roadmap focus: choosing from {', '.join(areas)}")
         else:
             log("Fleet roadmap focus: no eligible focus areas; using ordinary selection")
+            if not fallback:
+                return None
+    if raw_areas and not areas:
+        raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
     return random.choice(areas) if areas else "any"
 
 
