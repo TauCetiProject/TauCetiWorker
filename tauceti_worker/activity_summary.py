@@ -336,15 +336,27 @@ def display(value, default_kinds=()):
         print(
             f"Mathlib builds (latest per worker): {sharing.get('shared', 0)} shared, {sharing.get('private', 0)} private, {sharing.get('preparing', 0)} preparing, {sharing.get('blocked', 0)} blocked, {sharing.get('idle', 0)} idle; {sharing.get('cache_hits', 0)} cache hits; {sharing.get('preparation_seconds', 0):.1f}s preparation"
         )
-        reasons_by_mode = sharing.get("reasons_by_mode", {"unknown": sharing.get("reasons", [])})
+        reasons_by_mode = {
+            mode: list(reasons)
+            for mode, reasons in sharing.get("reasons_by_mode", {"unknown": sharing.get("reasons", [])}).items()
+        }
+        missing_checkout = "Mathlib dependency is not available for sharing"
+        # Older preparers emitted this reason in either private or required/blocked
+        # mode. Attribute it only when the counts identify exactly one of those.
+        possible_modes = [mode for mode in ("private", "blocked") if sharing.get(mode)]
+        if len(possible_modes) == 1 and missing_checkout in reasons_by_mode.get("unknown", []):
+            reasons_by_mode["unknown"].remove(missing_checkout)
+            reasons_by_mode.setdefault(possible_modes[0], []).append(missing_checkout)
         for mode, reasons in sorted(reasons_by_mode.items()):
             label = "Worker message (state unavailable)" if mode == "unknown" else f"{mode.capitalize()} builds"
             messages = set()
             for reason in reasons:
                 if reason == "shared view released; awaiting next natural round":
                     continue
-                if mode == "private" and reason == "Mathlib dependency is not available for sharing":
+                if mode == "private" and reason == missing_checkout:
                     reason = "sharing was skipped because the Mathlib checkout was absent."
+                elif mode == "blocked" and reason == missing_checkout:
+                    reason = "the Mathlib checkout was absent, but sharing is required."
                 messages.add(reason)
             for message in sorted(messages):
                 print(f"  {label}: {message}")

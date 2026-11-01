@@ -287,6 +287,22 @@ class ActivityTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(a.activity_summary.combine([older]))
         self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(private=1, reasons=[private_reason, idle_reason])
+        for value in (older, a.activity_summary.combine([older])):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertIn(f"  Private builds: {clear_reason}\n", output.getvalue())
+            self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(blocked=1, reasons=[private_reason])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(
+            "  Blocked builds: the Mathlib checkout was absent, but sharing is required.\n", output.getvalue()
+        )
+        older["summary"]["shared_mathlib"]["private"] = 1
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(f"  Worker message (state unavailable): {private_reason}\n", output.getvalue())
 
     def test_housekeeping_failure_does_not_abort_activity_refresh(self):
         from tauceti_worker import work_recovery
