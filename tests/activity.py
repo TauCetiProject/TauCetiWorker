@@ -491,13 +491,23 @@ class ActivityTests(unittest.TestCase):
     def test_missing_loc_uses_exact_git_comparison_in_normal_refresh(self):
         a.emit("pr_created", repository="org/repo", pr=7)
         head, base = "a" * 40, "b" * 40
-        response = dict(prs=[dict(number=7, state="OPEN", observed_at=self.now * 1000,
-                                  head_sha=head, base_sha=base, lean_loc=None)], missing=[])
-        env = {"TAUCETI_GITHUB_STATE_URL": "https://state.example",
-               "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock"}
-        with patch.dict(os.environ, env), patch.object(a, "observe", return_value=response), patch.object(
-            a.activity_git, "measure", return_value={7: dict(added=17, deleted=3, head_sha=head)}
-        ) as measure:
+        response = dict(
+            prs=[
+                dict(number=7, state="OPEN", observed_at=self.now * 1000, head_sha=head, base_sha=base, lean_loc=None)
+            ],
+            missing=[],
+        )
+        env = {
+            "TAUCETI_GITHUB_STATE_URL": "https://state.example",
+            "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(a, "observe", return_value=response),
+            patch.object(
+                a.activity_git, "measure", return_value={7: dict(added=17, deleted=3, head_sha=head)}
+            ) as measure,
+        ):
             a.prepare(now=self.now + 1)
             a.prepare(now=self.now + 61)
         self.assertEqual(measure.call_count, 1)

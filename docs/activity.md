@@ -76,11 +76,19 @@ added, and a closed unmerged PR contributes nothing. Reviews and other assists
 never add another author's LOC to this denominator. Fleet totals pool costs and
 weighted LOC before dividing; they do not average machine ratios.
 
-LOC comes from complete file lists already cached by the shared GitHub state
-server. Immutable file URLs must match the PR head (or base for deleted files),
-and cached file totals must agree with available PR headers. The observation
-route never schedules file collection or falls back to GitHub. Missing or stale
-LOC is extrapolated from measured PRs in the same window: measured weighted LOC
+PR state, landing evidence and exact head/base identities come from the shared
+GitHub state server. LOC uses its cached measurement when available. Otherwise,
+the existing background refresher fetches the recorded commits into a local bare
+Git cache and counts `.lean` additions and deletions in `base...head`. Renames
+use the destination filename, and complete diff totals must agree with available
+PR metadata. Ordinary Git refs preserve downloaded history for later fetches.
+Failed or missing state observations never trigger Git work; failed Git work
+leaves the count unknown and normal refresh retries. No Git work runs in `status`.
+
+File-derived measurements require complete cached file lists and immutable URL
+and total validation; Git-derived measurements bind the exact head/base pair.
+The observation route never schedules collection or falls back to GitHub.
+Missing or stale LOC is extrapolated from measured PRs in the same window: measured weighted LOC
 per measured PR weight, multiplied by total eligible PR weight (landed = 1,
 open = ½). Unknown PR states contribute zero. These estimates carry `~` and show
 measured-PR coverage. With no measured LOC, missing LOC contributes zero; positive
@@ -132,7 +140,7 @@ supports deduplicated aggregation: `tauceti activity --inventory` (optionally
 scoped by worker or group).
 
 ```sh
-# Explicit preparation, using configured shared-server credentials; never GitHub.
+# Explicit preparation, using configured shared-server observations and cached Git comparisons.
 tauceti activity refresh --config ~/.config/tauceti/workers.toml
 # Import PR creation receipts since activity recording began; follow by offset.
 tauceti activity refresh --backfill

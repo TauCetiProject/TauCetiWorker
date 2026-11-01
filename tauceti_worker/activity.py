@@ -467,7 +467,9 @@ def _refresh_prs(db, config, now, errors):
                 seen = [p["number"] for p in value["prs"]] + value["missing"]
                 if len(seen) != len(set(seen)) or set(seen) != set(batch):
                     raise ValueError("incomplete observation response")
-                if any(p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED") for p in value["prs"]):
+                if any(
+                    p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED") for p in value["prs"]
+                ):
                     raise ValueError("invalid PR observation")
                 missing_loc = [p for p in value["prs"] if p.get("lean_loc") is None]
                 git_locs = activity_git.measure(root(), repo, missing_loc)
