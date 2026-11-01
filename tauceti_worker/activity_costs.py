@@ -62,6 +62,32 @@ def cached_usage(db, budget, session):
     return value
 
 
+def _write_prepared(db, table, rows):
+    """Reconcile fully recomputed rows without rewriting unchanged SQLite pages."""
+    fields = [row[1] for row in db.execute(f"PRAGMA table_info({table})")]
+    # Accruals have multiple rows per invocation. Keep their recomputed order,
+    # including duplicate rows, exactly as the previous delete-and-insert did.
+    if table == "cost_accruals":
+        key = "rowid"
+        db.execute(f"DELETE FROM {table} WHERE rowid NOT BETWEEN 1 AND ?", (len(rows),))
+        columns = [key, *fields]
+        values = ((index, *row) for index, row in enumerate(rows, 1))
+    else:
+        key = "id"
+        identities = {row[0] for row in rows}
+        obsolete = [row[0] for row in db.execute(f"SELECT id FROM {table}") if row[0] not in identities]
+        db.executemany(f"DELETE FROM {table} WHERE id IS ?", ((identity,) for identity in obsolete))
+        columns, values = fields, rows
+    names = ",".join(fields)
+    excluded = ",".join(f"excluded.{field}" for field in fields)
+    updates = ",".join(f"{field}=excluded.{field}" for field in fields)
+    db.executemany(
+        f"INSERT INTO {table}({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
+        f"ON CONFLICT({key}) DO UPDATE SET {updates} WHERE ({names}) IS NOT ({excluded})",
+        values,
+    )
+
+
 def prepare(db, now, scope_for_worker):
     """Background only. Reuse Budget's validation/reconciliation, never mutate it."""
     budget = Budget(clock=lambda: now)
@@ -183,14 +209,13 @@ def prepare(db, now, scope_for_worker):
             )
         )
     # This is a derived cache. A ledger repair/replacement cannot leave old sessions behind.
-    db.execute("DELETE FROM conversation_costs")
-    db.executemany("INSERT INTO conversation_costs VALUES (?,?,?,?,?,?)", rows)
-    db.execute("DELETE FROM cost_accruals")
-    db.executemany("INSERT INTO cost_accruals VALUES (?,?,?,?,?,?,?,?)", accruals)
-    db.execute("DELETE FROM conversation_accounting")
-    db.executemany("INSERT INTO conversation_accounting VALUES (?,?,?,?,?,?,?)", accounting_rows)
-    db.execute("DELETE FROM conversation_quality")
-    db.executemany("INSERT INTO conversation_quality VALUES (?,?,?,?,?,?)", quality_rows)
+    for table, prepared in (
+        ("conversation_costs", rows),
+        ("cost_accruals", accruals),
+        ("conversation_accounting", accounting_rows),
+        ("conversation_quality", quality_rows),
+    ):
+        _write_prepared(db, table, prepared)
     pending = sum(
         (money(s.get("reserve", s["estimate"])) for s in state["sessions"].values() if s["status"] != "settled"),
         Decimal(0),
