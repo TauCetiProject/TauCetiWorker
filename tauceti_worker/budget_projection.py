@@ -62,7 +62,18 @@ class Sessions(Mapping):
 
     @projected_read
     def select(
-        self, *, active=False, model=None, phase=None, settled=False, positive=False, estimated=False, limit=None
+        self,
+        *,
+        active=False,
+        model=None,
+        phase=None,
+        settled=False,
+        positive=False,
+        estimated=False,
+        limit=None,
+        native=False,
+        finished_after=None,
+        finished_before=None,
     ):
         if self.fallback is not None:
             return self.owner.budget.sessions(
@@ -74,6 +85,9 @@ class Sessions(Mapping):
                 positive=positive,
                 estimated=estimated,
                 limit=limit,
+                native=native,
+                finished_after=finished_after,
+                finished_before=finished_before,
             )
         clauses, args = [], []
         if estimated:
@@ -92,6 +106,14 @@ class Sessions(Mapping):
             args.append(phase)
         if positive:
             clauses.append("positive_cost=1")
+        if native:
+            clauses.append("coalesce(json_extract(data,'$.cost_provenance'),'native-reported')='native-reported'")
+        if finished_after is not None:
+            clauses.append("CAST(json_extract(data,'$.finished') AS REAL)>=?")
+            args.append(float(finished_after))
+        if finished_before is not None:
+            clauses.append("CAST(json_extract(data,'$.finished') AS REAL)<=?")
+            args.append(float(finished_before))
         query = "SELECT data FROM sessions" + (" WHERE " + " AND ".join(clauses) if clauses else "")
         query += " ORDER BY ordinal" + (" DESC LIMIT ?" if limit is not None else "")
         if limit is not None:
@@ -129,15 +151,21 @@ class Sessions(Mapping):
                 ),
             )
             self.db.execute("DELETE FROM providers WHERE session=?", (key,))
-            self.db.executemany("INSERT INTO providers VALUES (?,?)", [(p, key) for p in value.get("totals", {})])
+            self.db.executemany(
+                "INSERT INTO providers VALUES (?,?)",
+                [(p, key) for p in set(value.get("totals", {})) | set(value.get("lower_bound_totals", {}))],
+            )
         self.changed.clear()
 
 
 class Projection:
-    def __init__(self, budget):
+    def __init__(self, budget, *, complete_prefix=False):
         self.budget = budget
         self.path = budget.directory / "projection.sqlite"
         self.db = None
+        self.complete_prefix = complete_prefix
+        self.rebuilt = False
+        self.replayed_bytes = 0
 
     def connect(self):
         if self.db is None:
@@ -155,7 +183,16 @@ class Projection:
                 CREATE INDEX IF NOT EXISTS resumes ON sessions(resume,ordinal);
                 CREATE TABLE IF NOT EXISTS providers (provider TEXT, session TEXT, PRIMARY KEY(provider,session));
                 CREATE INDEX IF NOT EXISTS provider_session ON providers(session);
+                CREATE INDEX IF NOT EXISTS native_intervals ON sessions(model,phase,CAST(json_extract(data,'$.finished') AS REAL))
+                  WHERE status='settled' AND positive_cost=1;
+                CREATE INDEX IF NOT EXISTS native_model_intervals ON sessions(model,CAST(json_extract(data,'$.finished') AS REAL))
+                  WHERE status='settled' AND positive_cost=1;
             """)
+            if self.db.execute("PRAGMA user_version").fetchone()[0] < 1:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO providers SELECT j.key,s.id FROM sessions s,json_each(s.data,'$.lower_bound_totals') j"
+                )
+                self.db.execute("PRAGMA user_version=1")
         return self.db
 
     def load(self):
@@ -194,6 +231,7 @@ class Projection:
                 if size == offset and info.st_mtime_ns != saved["mtime_ns"]:
                     valid = False
             if not valid:
+                self.rebuilt = True
                 db.execute("DELETE FROM sessions")
                 db.execute("DELETE FROM providers")
                 saved = {"offset": 0, "state": {}}
@@ -209,9 +247,12 @@ class Projection:
             try:
                 if stream:
                     stream.seek(offset)
-                    raw = stream.read()
+                    raw = stream.read(max(0, size - offset))
+                    if self.complete_prefix and raw and not raw.endswith(b"\n"):
+                        raw = raw[: raw.rfind(b"\n") + 1]
                 else:
                     raw = b""
+                self.replayed_bytes = len(raw)
                 records = self.budget.records(raw, start=state["seq"])
                 for record in records:
                     try:

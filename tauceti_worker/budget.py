@@ -355,6 +355,19 @@ class Budget:
                 rows = [s for s in rows if s.get("cost_provenance") in ESTIMATE_PROVENANCES]
             elif name == "positive" and value:
                 rows = [s for s in rows if money(s.get("cost", "0")) > 0]
+            elif name == "native" and value:
+                rows = [s for s in rows if s.get("cost_provenance", "native-reported") == "native-reported"]
+            elif name in {"finished_after", "finished_before"} and value is not None:
+                rows = [
+                    s
+                    for s in rows
+                    if type(s.get("finished")) in (str, int, float)
+                    and (
+                        money(s["finished"]) >= money(value)
+                        if name == "finished_after"
+                        else money(s["finished"]) <= money(value)
+                    )
+                ]
         return rows[-filters["limit"] :] if filters.get("limit") is not None else rows
 
     @staticmethod
@@ -365,7 +378,9 @@ class Budget:
         return [
             s
             for s in sessions.values()
-            if s["id"] == include or set(s.get("totals", {})) & set(providers) or s.get("resume") in providers
+            if s["id"] == include
+            or (set(s.get("totals", {})) | set(s.get("lower_bound_totals", {}))) & set(providers)
+            or s.get("resume") in providers
         ]
 
     def evidence_sessions(self, state, invocation):
@@ -1055,6 +1070,13 @@ class Budget:
                                 **({"finished": finished} if finished is not None else {}),
                             )
                         )
+                    from .budget_recovery import live_identity
+
+                    affected = {e["id"] for e in events if e.get("id") and e["id"] != receipt["id"]}
+                    if any(
+                        live_identity(state["sessions"][key], self.clock(), self.directory)["live"] for key in affected
+                    ):
+                        raise BudgetError("cumulative correction would change a live session; reconcile after it stops")
                     self.append(state, events)
                     return
         if session["status"] != "settled":

@@ -58,28 +58,42 @@ def interval(session, now, saved=None):
 def historical_estimate(session, sessions, now, duration):
     audit = dict(policy=POLICY, duration=duration, comparable_ids=[], rate_usd_per_second=None)
     if duration["seconds"] is not None:
-        candidates = []
         # The seven-day window precedes the invocation, not the time of repair.
         end = money(session["started"])
-        for other in sessions.values():
-            if (
-                other["id"] == session["id"]
-                or other["model"] != session["model"]
-                or other["status"] != "settled"
-                or other.get("cost_provenance", "native-reported") != "native-reported"
-                or ("estimat" in other.get("outcome", "").lower() and not other.get("totals"))
-                or other.get("outcome") in {"reconciled", "launch-failed"}
-            ):
-                continue
-            span = interval(other, now)
-            if span["seconds"] is None or not end - WEEK <= money(span["finish"]) <= end:
-                continue
-            cost = money(other["cost"])
-            if cost <= 0:
-                continue
-            candidates.append((other, cost / money(span["seconds"])))
-        phased = [(other, rate) for other, rate in candidates if other["phase"] == session["phase"]]
-        selected = phased if len(phased) >= 3 else candidates
+
+        def candidates(*, same_phase=False):
+            result = []
+            for other in sessions.values():
+                if (
+                    other["id"] == session["id"]
+                    or other["model"] != session["model"]
+                    or same_phase
+                    and other["phase"] != session["phase"]
+                    or other["status"] != "settled"
+                    or other.get("cost_provenance", "native-reported") != "native-reported"
+                    or ("estimat" in other.get("outcome", "").lower() and not other.get("totals"))
+                    or other.get("outcome") in {"reconciled", "launch-failed"}
+                ):
+                    continue
+                # Reject out-of-window endpoints before validating and pricing
+                # an interval. Most of a large fleet's history is irrelevant.
+                finish = other.get("finished")
+                try:
+                    if isinstance(finish, bool) or finish is None or not end - WEEK <= money(finish) <= end:
+                        continue
+                except BudgetError:
+                    continue
+                span = interval(other, now)
+                if span["seconds"] is None:
+                    continue
+                cost = money(other["cost"])
+                if cost > 0:
+                    result.append((other, cost / money(span["seconds"])))
+            return result
+
+        # Only compute other phases' rates when the preferred tier is too small.
+        phased = candidates(same_phase=True)
+        selected = phased if len(phased) >= 3 else candidates()
         if len(selected) >= 3:
             rate = median(rate for _, rate in selected)
             audit.update(
@@ -104,7 +118,7 @@ class Projection(Budget):
 
     def __init__(self, budget, records, now):
         super().__init__(budget.directory, clock=lambda: now)
-        self.state = super().replay(copy.deepcopy(records))
+        self.state = super().replay(copy.deepcopy(records), _samples=False)
         self.events = []
 
     def locked(self):
@@ -128,7 +142,9 @@ class Projection(Budget):
         for key in {e.get("id") for e in events if e.get("id")}:
             working["sessions"][key] = dict(working["sessions"][key])
         record = json.loads(self.record_bytes(self.state, events))
-        self.state = super().replay([record], _state=working)
+        # Budget.estimate queries sessions directly. Rebuilding the unused
+        # sample history here would scan the entire fleet for every correction.
+        self.state = super().replay([record], _state=working, _samples=False)
         self.events.extend(e for e in events if e["type"] != "accrue")
 
 
@@ -150,7 +166,11 @@ def recover(budget, note, *, dry_run=False, plan=None):
             raise BudgetError("--plan requires a dry-run manifest for this policy")
     now = budget.clock()
     with budget.locked():
-        initial = budget.replay()
+        raw = budget.ledger.read_bytes() if budget.ledger.exists() else b""
+    # A preview is a snapshot, not a transaction. Parsing history and calculating
+    # historical rates can take minutes on a large fleet; neither may block
+    # admissions. Applying still replans under the lock and checks --plan.
+    initial = budget.replay(budget.records(raw))
     # Large transcript/journal reads happen without the fleet accounting lock.
     usage_evidence = {}
     for key, session in initial["sessions"].items():
@@ -164,12 +184,13 @@ def recover(budget, note, *, dry_run=False, plan=None):
                 evidence(budget.directory, session, initial["sessions"], checkpoints=usage_evidence)
             except (ValueError, OSError, TypeError, KeyError):
                 usage_evidence[key] = None
-    with budget.locked():
-        # Plan against fresh ledger state, not the state used to collect evidence.
-        records = budget.records()
+    with contextlib.nullcontext() if dry_run else budget.locked():
+        # Applications use fresh state; previews retain the captured ledger.
+        records = budget.records(raw) if dry_run else budget.records()
         before = budget.replay(copy.deepcopy(records))
         original = before["sessions"]
         identities = {key: live_identity(s, budget.clock(), budget.directory) for key, s in original.items()}
+        live_sessions = {key: original[key] for key, identity in identities.items() if identity["live"]}
         projection = Projection(budget, records, now)
         rows, errors, checkpoints = [], [], []
         for key, session in original.items():
@@ -227,7 +248,12 @@ def recover(budget, note, *, dry_run=False, plan=None):
                                 )
                             else:
                                 row["source"] = "native-prefix"
-                        except (ValueError, OSError, TypeError, KeyError):
+                        except (ValueError, OSError, TypeError, KeyError) as error:
+                            if (
+                                str(error)
+                                == "cumulative correction would change a live session; reconcile after it stops"
+                            ):
+                                raise
                             del projection.events[event_count:]
                             projection.state = prior_state
                             row["source"] = "unusable-receipt"
@@ -316,7 +342,7 @@ def recover(budget, note, *, dry_run=False, plan=None):
                         checkpoints.append((session, saved["checkpoint"]))
                 # A late native cumulative receipt can also correct prior/successor estimates.
                 after_step = projection.replay()["sessions"]
-                if any(after_step[k] != original[k] for k in original if identities[k]["live"]):
+                if any(after_step[key] != session for key, session in live_sessions.items()):
                     raise BudgetError("cumulative correction would change a live session; reconcile after it stops")
             except (ValueError, OSError, TypeError, KeyError) as error:
                 del projection.events[event_count:]
@@ -348,7 +374,9 @@ def recover(budget, note, *, dry_run=False, plan=None):
             generated_at=now,
             dry_run=dry_run,
             ledger_sequence=before["seq"],
-            ledger_sha256=hashlib.sha256(budget.ledger.read_bytes() if budget.ledger.exists() else b"").hexdigest(),
+            ledger_sha256=hashlib.sha256(
+                raw if dry_run else budget.ledger.read_bytes() if budget.ledger.exists() else b""
+            ).hexdigest(),
             before_spent_usd=str(before["spent"]),
             after_spent_usd=str(after["spent"]),
             applied_delta_usd=str(delta),
@@ -413,3 +441,195 @@ def recover(budget, note, *, dry_run=False, plan=None):
         },
         dry_run=dry_run,
     )
+
+
+def recover_stopped(budget, invocation):
+    """One stopped provider group. Slow evidence/rate work never owns the fleet lock.
+
+    Normal receipt/prefix recovery runs first. This applies the existing explicit
+    stopped policy to the remaining uncertainty, with the same correctable totals.
+    """
+    from .usage_accounting import usage_path
+
+    now = budget.clock()
+    with budget.locked():
+        state = budget.current()
+        linked = budget.evidence_sessions(state, invocation)
+        target = linked.get(invocation)
+        if not target or target["status"] == "settled" or target.get("archive"):
+            return False
+        linked = copy.deepcopy(linked)
+        filters = dict(
+            model=target["model"],
+            settled=True,
+            positive=True,
+            native=True,
+            finished_after=float(target["started"]) - WEEK,
+            finished_before=target["started"],
+        )
+        comparables = budget.sessions(state, phase=target["phase"], **filters)
+        # Validate eligibility with the real policy outside the lock; the model
+        # fallback is fetched below if these candidates do not form a rate.
+    if live_identity(target, now, budget.directory)["live"]:
+        return False
+
+    def stamps(sessions):
+        values = {}
+        for s in sessions.values():
+            paths = [usage_path(budget.directory, s["id"], s.get("bridge")), usage_path(budget.directory, s["id"])]
+            paths += [p.with_suffix(".jsonl") for p in paths]
+            if s.get("bridge"):
+                paths.append(Path(s["bridge"]) / "inbox" / (s["id"] + ".receipt"))
+            for p in paths:
+                try:
+                    info = p.lstat()
+                    values[str(p)] = (
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_mtime_ns,
+                        info.st_size,
+                        info.st_uid,
+                        info.st_mode,
+                    )
+                except FileNotFoundError:
+                    values[str(p)] = None
+        return values
+
+    stamp = stamps(linked)
+    saved = evidence(budget.directory, target, linked)
+    providers = set(target.get("totals", {})) | set(target.get("lower_bound_totals", {}))
+    if target.get("resume"):
+        providers.add(target["resume"])
+    if saved and saved["checkpoint"].get("provider_session"):
+        providers.add(saved["checkpoint"]["provider_session"])
+    with budget.locked():
+        fresh = budget.current()
+        related = {s["id"]: copy.deepcopy(s) for s in budget.related(fresh, providers, include=invocation)}
+    if any(related.get(k) != s for k, s in linked.items()) or stamps(linked) != stamp:
+        return False
+    linked = related
+    if any(live_identity(s, now, budget.directory)["live"] for s in linked.values()):
+        return False
+    stamp = stamps(linked)
+    saved = evidence(budget.directory, target, linked)
+    if stamps(linked) != stamp:
+        return False
+    # Transcript recovery records the actual source metadata; validate it again
+    # at commit, as the synthetic checkpoint does not yet exist on disk.
+    sources = []
+    if saved:
+        for source in saved["checkpoint"].get("sources", []):
+            p = Path(source["file"])
+            info = p.stat()
+            if info.st_size != source["size"] or info.st_mtime_ns != source["mtime_ns"]:
+                return False
+            sources.append((p, info.st_size, info.st_mtime_ns))
+    duration = interval(target, now, saved)
+    floor = max(
+        money(target.get("cost", "0")),
+        money(target.get("lower_bound_cost", "0")),
+        saved["cost"] if saved else Decimal(0),
+    )
+    if saved and saved["complete"]:
+        estimate, provenance = floor, "token-priced"
+        audit = dict(policy=POLICY, tier="complete-token-usage", duration=duration, comparable_ids=[])
+    else:
+        estimate, provenance, audit = historical_estimate(target, {s["id"]: s for s in comparables}, now, duration)
+        if audit["tier"] == "prelaunch" and duration["seconds"] is not None:
+            with budget.locked():
+                comparables = budget.sessions(budget.current(), **filters)
+            estimate, provenance, audit = historical_estimate(target, {s["id"]: s for s in comparables}, now, duration)
+    cost = max(floor, estimate)
+    primary = target.get("resume") or (saved["checkpoint"].get("provider_session") if saved else None)
+    if not primary and len(target.get("lower_bound_totals", {})) == 1:
+        primary = next(iter(target["lower_bound_totals"]))
+    baseline = Decimal(0)
+    if primary:
+        for prior in linked.values():
+            if prior["id"] == invocation:
+                break
+            baseline = max(baseline, money(prior.get("totals", {}).get(primary, "0")))
+    totals = {primary: str(baseline + cost)} if primary and primary != "unknown" else {}
+    audit.update(
+        known_prefix_usd=str(floor),
+        proposed_estimate_usd=str(estimate),
+        final_charge_usd=str(cost),
+        existing_charge_usd=target.get("cost", "0"),
+        reservation_usd=str(pending(target)),
+        evidence_stamps=stamp,
+        usage_sha256=hashlib.sha256(json.dumps(saved["checkpoint"], sort_keys=True).encode()).hexdigest()
+        if saved
+        else None,
+    )
+    path = budget.directory / "recovery-audits" / (uuid.uuid4().hex + ".json")
+    atomic_json(
+        path,
+        dict(
+            policy=POLICY,
+            status="planned",
+            generated_at=now,
+            automatic=True,
+            invocations=[
+                dict(
+                    id=invocation,
+                    worker=target["worker"],
+                    model=target["model"],
+                    phase=target["phase"],
+                    confidence=provenance,
+                    audit_inputs=audit,
+                )
+            ],
+        ),
+    )
+    Budget(path.parent).sync_directory()
+    budget.sync_directory()
+    previous = money(target.get("cost", "0"))
+    note = "usage supervisor: stopped usage policy v1"
+    events = [dict(type="correction", id=invocation, delta=str(previous), cost="0", note=note)] if previous else []
+    events.append(
+        dict(
+            type="settle",
+            id=invocation,
+            cost=str(cost),
+            totals=totals,
+            outcome="recovered stopped usage estimate",
+            cost_provenance=provenance,
+            finished=duration["finish"],
+            recovery_manifest=path.name,
+            note=note,
+            recovery_audit=dict(
+                policy=POLICY,
+                tier=audit["tier"],
+                duration=duration,
+                rate_usd_per_second=audit.get("rate_usd_per_second"),
+                comparable_count=len(audit["comparable_ids"]),
+                inputs_sha256=hashlib.sha256(json.dumps(audit, sort_keys=True).encode()).hexdigest(),
+            ),
+        )
+    )
+    with budget.locked():
+        current = budget.current()
+        group = {s["id"]: s for s in budget.related(current, providers, include=invocation)}
+        if group != linked or stamps(group) != stamp:
+            return False
+        if any(live_identity(s, budget.clock(), budget.directory)["live"] for s in group.values()):
+            return False  # Includes a live resumed successor.
+        if any(current["sessions"].get(s["id"]) != s for s in comparables):
+            return False
+        if any(p.stat().st_size != size or p.stat().st_mtime_ns != mtime for p, size, mtime in sources):
+            return False
+        if saved and saved["checkpoint"].get("recovered_from"):
+            atomic_json(usage_path(budget.directory, invocation, target.get("bridge")), saved["checkpoint"])
+        committed = budget.append(current, [budget.accrue(current), *events])
+    atomic_json(
+        path.with_suffix(".application.json"),
+        dict(
+            status="committed",
+            manifest=path.name,
+            applied_delta_usd=str(cost - previous),
+            released_reservation_usd=str(pending(target)),
+            **committed,
+        ),
+    )
+    Budget(path.parent).sync_directory()
+    return True

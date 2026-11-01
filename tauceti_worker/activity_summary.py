@@ -207,6 +207,19 @@ def display(value, default_kinds=()):
             ),
             ("API spend ($/elapsed hour)", [amount(spending.get(w, {}).get("usd_per_hour")) for w in report_windows]),
         ]
+        if live := costs.get("spending_including_live"):
+            spending_rows.extend(
+                [
+                    (
+                        "With live estimates ($/worker-hour)",
+                        [amount(live.get(w, {}).get("usd_per_worker_hour")) for w in report_windows],
+                    ),
+                    (
+                        "With live estimates ($/elapsed hour)",
+                        [amount(live.get(w, {}).get("usd_per_hour")) for w in report_windows],
+                    ),
+                ]
+            )
     cost_rows = []
     loc_rows = []
     if costs.get("windows"):
@@ -299,8 +312,22 @@ def display(value, default_kinds=()):
         table(spending_title, headers, spending_rows, widths)
     if spending_rows and costs.get("quality") and costs.get("accounting_version", 1) >= 2:
         q = costs["quality"]
+        partial = (
+            "Running conversations include partial usage."
+            if costs.get("accounting_version", 1) >= 3
+            else f"{q.get('incomplete', 0)} conversations have incomplete usage."
+        )
         print(
-            f"Costs: native totals where available; token/interval estimates otherwise; {q.get('incomplete', 0)} conversations have incomplete usage. Reservations excluded."
+            "Costs: native totals where available; token/interval estimates otherwise. "
+            + partial
+            + " Reservations excluded."
+        )
+    if live := costs.get("live_estimate"):
+        age = max(0, int(time.time() - min(live["observed_at"], live.get("session_observed_at", live["observed_at"]))))
+        print(
+            f"Live estimates: updated {age}s ago"
+            + (" (stale)" if age > 180 or live.get("stale") else "")
+            + "; observed usage plus journal-size extrapolation; reservations excluded."
         )
     if spending_rows and costs.get("accounting_version", 1) >= 3:
         q = costs["accounting"]
@@ -602,6 +629,29 @@ def combine(values):
         k: sum(v.get("costs", {}).get("quality", {}).get(k, 0) for v in known)
         for k in ("native", "estimated", "incomplete")
     }
+    if any(v.get("costs", {}).get("spending_including_live") for v in known):
+        s["costs"]["spending_including_live"] = {}
+        for w in report_windows:
+            rows = [v.get("costs", {}).get("spending_including_live", {}).get(w, {}) for v in known]
+            complete = (
+                compatible_costs and len(known) == len(values) and all(r.get("spent_usd") is not None for r in rows)
+            )
+            recorded = s["costs"].get("spending", {}).get(w, {})
+            total = str(sum((Decimal(r["spent_usd"]) for r in rows), Decimal(0))) if complete else None
+            s["costs"]["spending_including_live"][w] = {
+                **recorded,
+                "spent_usd": total,
+                "recorded_spent_usd": recorded.get("spent_usd"),
+                "usd_per_hour": hourly_rate(total, recorded.get("covered_seconds")),
+                "usd_per_worker_hour": hourly_rate(total, recorded.get("worker_seconds")),
+                **{
+                    key: str(sum((Decimal(r[key]) for r in rows), Decimal(0))) if complete else None
+                    for key in ("live_observed_usd", "live_unobserved_estimate_usd", "live_adjustment_usd")
+                },
+            }
+        stamps = [v.get("costs", {}).get("live_estimate", {}).get("observed_at") for v in known]
+        if all(stamp is not None for stamp in stamps):
+            s["costs"]["live_estimate"] = dict(observed_at=min(stamps), refresh_seconds=60)
     s["costs"]["accounting"] = {
         k: sum(v.get("costs", {}).get("accounting", {}).get(k, 0) for v in known)
         for k in ("live", "settled_estimates", "recovered_estimates", "unresolved_stopped")

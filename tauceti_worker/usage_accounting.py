@@ -25,6 +25,8 @@ TOKENS = (
     "cache_creation_1h_input_tokens",
 )
 MAX_CHECKPOINT = 16 * 1024**2
+JOURNAL_FORMAT = 2
+CHECKPOINT_SECONDS = 60
 UTC = UTC
 
 
@@ -160,6 +162,10 @@ def read_usage(path, *, allow_foreign=False):
     checkpoint = None
     try:
         checkpoint = _validate(json.loads(_read(path, MAX_CHECKPOINT, allow_foreign=allow_foreign)), path.stem)
+        if checkpoint.get("journal_format") == JOURNAL_FORMAT:
+            value = _read_suffix(path, checkpoint, allow_foreign=allow_foreign)
+            if value is not None:
+                return value
         if checkpoint.get("sequence", 0) >= _latest_sequence(path.with_suffix(".jsonl"), allow_foreign=allow_foreign):
             return checkpoint
     except (OSError, ValueError, TypeError, AttributeError, ArithmeticError):
@@ -183,6 +189,84 @@ def read_usage(path, *, allow_foreign=False):
         return checkpoint
 
 
+def _read_suffix(path, checkpoint, *, allow_foreign=False):
+    """Replay only bytes following a checkpoint's exact, verified journal prefix."""
+    fd = os.open(path.with_suffix(".jsonl"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        offset = checkpoint.get("journal_offset", -1)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            and not allow_foreign
+            or checkpoint.get("journal_identity") != [info.st_dev, info.st_ino]
+            or type(offset) is not int
+            or not 0 <= offset <= info.st_size
+        ):
+            return None
+        stream.seek(max(0, offset - 256))
+        if hashlib.sha256(stream.read(min(offset, 256))).hexdigest() != checkpoint.get("journal_anchor"):
+            return None
+        stream.seek(offset)
+        value = checkpoint
+        for raw in stream:
+            if not raw.endswith(b"\n"):
+                break
+            try:
+                record = json.loads(raw)
+                if record.get("sequence") != value.get("sequence", 0) + 1:
+                    break
+                candidate = {**value, **record, "messages": {**value["messages"], **record.get("messages", {})}}
+                value = _validate(candidate, path.stem)
+                offset = stream.tell()
+            except (ValueError, TypeError, AttributeError, ArithmeticError):
+                break
+        # A consumed offset, unlike a post-read stat, never includes unparsed bytes.
+        stream.seek(max(0, offset - 256))
+        return {
+            **value,
+            "journal_offset": offset,
+            "journal_identity": [info.st_dev, info.st_ino],
+            "journal_anchor": hashlib.sha256(stream.read(min(offset, 256))).hexdigest(),
+        }
+
+
+def read_summary(path, *, allow_foreign=False):
+    """Small optional reporting cache. Never proof of complete expenditure."""
+    try:
+        try:
+            raw = _read(Path(path).with_suffix(".summary"), 8192, allow_foreign=allow_foreign)
+        except FileNotFoundError:
+            # Accept summaries from the first live release while copied shims
+            # finish naturally. New summaries do not match checkpoint *.json.
+            raw = _read(Path(path).with_suffix(".summary.json"), 8192, allow_foreign=allow_foreign)
+        value = json.loads(raw)
+        if (
+            value.get("version") != 1
+            or value.get("id") != Path(path).stem
+            or type(value.get("journal_offset")) is not int
+            or type(value.get("journal_start_bytes")) is not int
+            or type(value.get("sequence")) is not int
+            or value["sequence"] < 0
+            or value.get("journal_format") != JOURNAL_FORMAT
+            or not 0 <= value["journal_start_bytes"] <= value["journal_offset"]
+            or not isinstance(value.get("journal_identity"), list)
+            or len(value["journal_identity"]) != 2
+            or any(type(n) is not int or n < 0 for n in value["journal_identity"])
+            or not isinstance(value.get("model"), str)
+            or not isinstance(value.get("prices_sha256"), str)
+            or type(value.get("usage_seen")) is not bool
+            or not Decimal(value["cost"]).is_finite()
+            or Decimal(value["cost"]) < 0
+            or type(value.get("observed_at")) not in (int, float)
+            or not math.isfinite(value["observed_at"])
+        ):
+            return None
+        return value
+    except (OSError, ValueError, TypeError, KeyError, ArithmeticError, AttributeError):
+        return None
+
+
 class UsageJournal:
     def __init__(self, directory, invocation, *, model, clock=time.time):
         if len(invocation) != 32 or any(c not in "0123456789abcdef" for c in invocation):
@@ -192,6 +276,10 @@ class UsageJournal:
         self.path = self.directory / (invocation + ".json")
         self.log = self.directory / (invocation + ".jsonl")
         self.clock = clock
+        self.prices = json.loads(Path(__file__).with_name("prices.json").read_text())["models"]
+        self.total = Decimal(0)
+        self.last_checkpoint = self.last_summary = float("-inf")
+        self.summary_seen = False
         self.value = dict(
             version=1,
             id=invocation,
@@ -202,6 +290,7 @@ class UsageJournal:
             inflight=True,
             closed=False,
             sequence=0,
+            journal_format=JOURNAL_FORMAT,
             prices_sha256=hashlib.sha256(Path(__file__).with_name("prices.json").read_bytes()).hexdigest(),
         )
         self.current = {}
@@ -279,7 +368,7 @@ class UsageJournal:
             self.value["observed_at"] = self.clock()
             # Persist each usage change before forwarding it. No timer thread
             # or subsequent stdout event is needed to satisfy the 5s bound.
-            self.flush()
+            self.flush(checkpoint=False)
 
     def _usage(self, item, usage):
         if not isinstance(usage, dict):
@@ -301,33 +390,91 @@ class UsageJournal:
         for key, value in values.items():
             if key in TOKENS and type(value) is int and value >= 0:
                 item["usage"][key] = max(item["usage"].get(key, 0), value)
+        previous = Decimal(item.get("cost") or "0")
         item["cost"] = (
             str(cost)
-            if item["usage"] and (cost := price_usage(item["model"], item["usage"], item["at"])) is not None
+            if item["usage"]
+            and (cost := price_usage(item["model"], item["usage"], item["at"], getattr(self, "prices", None)))
+            is not None
             else None
         )
+        self.total = getattr(self, "total", Decimal(0)) + Decimal(item["cost"] or "0") - previous
 
-    def flush(self, *, closed=False):
+    def flush(self, *, closed=False, checkpoint=True):
         self.value["closed"] |= closed
         self.value["sequence"] += 1
-        delta = {**self.value, "messages": {key: self.value["messages"][key] for key in self.dirty}}
+        delta = {
+            **{
+                k: v for k, v in self.value.items() if k not in {"journal_offset", "journal_anchor", "journal_identity"}
+            },
+            "messages": {key: self.value["messages"][key] for key in self.dirty},
+        }
         raw = (json.dumps(delta, separators=(",", ":")) + "\n").encode()
         fd = os.open(self.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "ab") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        raw = (json.dumps(self.value, separators=(",", ":")) + "\n").encode()
-        tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, self.path)
+            info = os.fstat(stream.fileno())
+        self.value.update(
+            journal_identity=[info.st_dev, info.st_ino],
+            journal_offset=info.st_size,
+            journal_anchor=hashlib.sha256(raw[-256:]).hexdigest(),
+        )
+        self.value.setdefault("journal_start_bytes", info.st_size)
+        self.dirty.clear()  # The delta is durable even if the optional views fail.
+        now = self.clock()
+        if checkpoint or closed or now - self.last_checkpoint >= CHECKPOINT_SECONDS:
+            self._checkpoint()
+            self.last_checkpoint = now
+        seen = self.total > 0
+        if checkpoint or closed or seen and not self.summary_seen or now - self.last_summary >= CHECKPOINT_SECONDS:
+            # Rebuildable reporting metadata has no fsync barrier. Failure must
+            # not mark durable accounting unhealthy or prevent clean closure.
+            try:
+                summary = {
+                    k: self.value[k]
+                    for k in (
+                        "id",
+                        "model",
+                        "sequence",
+                        "observed_at",
+                        "inflight",
+                        "closed",
+                        "prices_sha256",
+                        "journal_format",
+                        "journal_start_bytes",
+                        "journal_offset",
+                        "journal_identity",
+                    )
+                }
+                summary.update(
+                    version=1,
+                    cost=str(self.total),
+                    usage_seen=seen,
+                    provider_session=self.value.get("provider_session"),
+                )
+                self._replace(self.path.with_suffix(".summary"), summary, durable=False)
+                self.last_summary, self.summary_seen = now, seen
+            except OSError:
+                pass
+
+    def _checkpoint(self):
+        self._replace(self.path, self.value, durable=True)
         directory = os.open(self.directory, os.O_RDONLY)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
-        self.dirty.clear()
+
+    @staticmethod
+    def _replace(path, value, *, durable):
+        raw = (json.dumps(value, separators=(",", ":")) + "\n").encode()
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            if durable:
+                os.fsync(stream.fileno())
+        os.replace(tmp, path)

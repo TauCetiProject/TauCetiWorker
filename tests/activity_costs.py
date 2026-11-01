@@ -472,6 +472,62 @@ class CostTests(unittest.TestCase):
             # usage are still fully checked, with no derived table rewrites.
             self.assertEqual(db.total_changes - before, 1)
 
+    def test_activity_replays_only_appended_transactions_without_admission_lock(self):
+        from tauceti_worker.budget import Budget
+
+        with contextlib.closing(a._connect()) as db, db:
+            with patch.object(Budget, "locked", side_effect=AssertionError("reporting cannot own admission lock")):
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                funding = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+                self.assertEqual(funding["preparation_metrics"]["replayed_bytes"], 0)
+                event = dict(
+                    version=1, seq=len(self.records) + 1, timestamp=self.now, events=[dict(type="grant", delta="1")]
+                )
+                raw = (json.dumps(event) + "\n").encode()
+                with (self.root / "budget/events.jsonl").open("ab") as stream:
+                    stream.write(raw)
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                updated = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+                self.assertEqual(updated["preparation_metrics"]["replayed_bytes"], len(raw))
+                self.assertEqual(Decimal(updated["balance"]), Decimal(funding["balance"]) + 1)
+        self.assertNotEqual(
+            self.root / "activity/cost-accounting/projection.sqlite", self.root / "budget/projection.sqlite"
+        )
+
+    def test_reporting_ignores_torn_final_transaction_then_recovers_it(self):
+        with contextlib.closing(a._connect()) as db, db:
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            before = db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0]
+            event = dict(
+                version=1, seq=len(self.records) + 1, timestamp=self.now, events=[dict(type="grant", delta="5")]
+            )
+            raw = json.dumps(event).encode()
+            ledger = self.root / "budget/events.jsonl"
+            with ledger.open("ab") as stream:
+                stream.write(raw[:20])
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            partial = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+            self.assertEqual(partial["balance"], json.loads(before)["balance"])
+            self.assertEqual(partial["preparation_metrics"]["replayed_bytes"], 0)
+            with ledger.open("ab") as stream:
+                stream.write(raw[20:] + b"\n")
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            after = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+            self.assertEqual(Decimal(after["balance"]), Decimal(partial["balance"]) + 5)
+
+    def test_corrupt_reporting_projection_rebuilds_without_touching_ledger(self):
+        with contextlib.closing(a._connect()) as db, db:
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            ledger = self.root / "budget/events.jsonl"
+            original = ledger.read_bytes()
+            projection = self.root / "activity/cost-accounting/projection.sqlite"
+            projection.write_bytes(b"corrupt disposable cache")
+            activity_costs.prepare(db, self.now, lambda worker: "machine")
+            funding = json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
+            self.assertTrue(funding["preparation_metrics"]["rebuilt"])
+            self.assertEqual(ledger.read_bytes(), original)
+
     def test_accrual_covering_indexes_preserve_decimal_sum_order_at_timestamp_ties(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("DELETE FROM cost_accruals")

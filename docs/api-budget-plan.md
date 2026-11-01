@@ -344,6 +344,14 @@ stdout event or final Claude result. Atomic checkpoints and the preceding valid
 journal prefix survive process termination and torn writes. Bubble mounts only its own round
 usage directory separately from the bridge and never receives the ledger.
 
+Full checkpoints are written at initialization, on explicit/final flush, and at
+most once per minute during normal observation. The durable delta journal still
+precedes event forwarding. A checkpoint records its exact consumed byte offset,
+file identity and prefix anchor so readers can replay only the newer suffix.
+A small best-effort `.summary` reports running priced usage and the matching
+byte offset without duplicating the message dictionary. Summary writes add no
+durability barrier and their failure does not invalidate durable usage evidence.
+
 New invocations also record their exact admission ticket, invocation ID, bridge,
 shim and native process birth identities in `budget/lifecycles/`. The admission
 ledger event includes the initial lifecycle identity, so a bridge crash before
@@ -354,9 +362,10 @@ not poll providers or GitHub. Recovery progress is persisted, and a separate
 heartbeat remains responsive during ledger recovery. Admission checks restart a
 lost supervisor; source updates retire it at an invocation boundary. Supervisors
 without ledger-independent processing are replaced automatically, while the existing
-protocol remains compatible with older workers. Only registered new invocations
-participate in this automatic recovery; historical cleanup remains
-separate. Reconciled native receipts are archived under `lifecycles/done/`;
+protocol remains compatible with older workers. Exact native-process supervision
+uses registered launch identities; the minute stopped-policy pass can also repair
+retained legacy admissions after their bridge liveness checks permit recovery.
+Reconciled native receipts are archived under `lifecycles/done/`;
 unchanged provisional journals are checked by file stamp without reparsing them.
 
 Every native launch, including an explicit resume or copied Bubble shim, must
@@ -413,6 +422,11 @@ requests still in flight remain incomplete rather than becoming zero-cost comple
 
 `tauceti budget --recover --dry-run --json` prepares a content-free manifest under
 `budget/recovery-audits/` without changing the ledger or deleting bridge keys.
+It copies the ledger under the accounting lock, then parses history and plans
+against that snapshot without the lock, so a large preview does not delay live
+admissions. Its manifest sequence and hash identify the copied ledger even if
+new transactions arrive while it runs; applying a pinned plan still requires
+those inputs to match.
 Every invocation has its recorded owner identity, current owner/heartbeat check,
 evidence source, known prefix, existing charge, reservation, proposed estimate,
 final total, spend delta and released reservation recorded. The manifest includes
@@ -467,8 +481,14 @@ reservation releases separately: releasing a reservation is neither spending nor
 a refund. Repeat recovery makes no monetary change. A late native receipt replaces
 an estimate through idempotent corrections, including resumed cumulative baselines.
 During ordinary live teardown, `recover_usage` still charges known prefixes and
-retains reservations when evidence is incomplete; only explicit stopped recovery
-applies this policy.
+retains reservations when evidence is incomplete. The detached supervisor's
+minute pass subsequently applies this policy to eligible stopped invocations,
+including retained legacy records, using a small provider-linked snapshot.
+Evidence reading and rate calculations happen outside the admission lock;
+commit revalidates the affected history, evidence, comparables and liveness.
+Unrelated admissions do not invalidate the proposal. A live resumed successor
+defers the group, and unchanged settled history makes no repeated monetary change.
+The explicit recovery command remains available for inspection and bulk repair.
 
 Usage evidence is collected outside the fleet ledger lock; planning replays the
 current ledger incrementally inside the lock and skips estimates with no new native
@@ -482,6 +502,29 @@ Estimates use their recorded interval in rate windows; without an interval they 
 placed at admission instead of being spread across downtime until repair.
 Reservations never enter spend reports;
 `status` still reads prepared local data without GitHub calls or recovery analysis.
+
+The manager separately refreshes a disposable live spending overlay once per
+minute, even while historical preparation is busy. The supervisor supplies the
+small active/terminal invocation view. The sampler reads only journal metadata,
+using cached summary counters as an anchor and calibrated USD per byte for
+unobserved growth. Cohorts separate model, phase, journal format and price table;
+resumes keep the attributed prefix rather than estimating replayed bytes.
+`spending` retains recorded usage; `spending_including_live` adds only the amount
+missing from the matching baseline and exposes observed/unobserved components.
+Native totals replace heuristics, including downward corrections. Terminal costs
+remain in the overlay until historical preparation incorporates their settlement.
+Baseline generations and atomic publication prevent cross-refresh double counts.
+An unchanged journal accrues no guessed wall-clock spend; observation timestamps
+and stale state remain visible. These estimates never mutate the budget ledger.
+
+Historical preparation owns a separate disposable accounting projection under
+the activity directory. It consumes complete new ledger transactions, preserves
+first-settlement times and rebuilds on cache corruption or ledger replacement.
+It never opens the admission projection or holds the fleet lock for reporting.
+Response allocation still recomputes globally to preserve response deduplication,
+late cumulative corrections and worker-scope changes. Native-settled closed usage
+is cached without repeated filesystem checks; missing/incomplete evidence retries.
+Preparation metrics expose ledger replay bytes, timing and invocation counts.
 
 The authoritative ledger and retained recovery manifests are append-only evidence.
 Ledger repair transactions name their manifest; a manifest records a plan, and the

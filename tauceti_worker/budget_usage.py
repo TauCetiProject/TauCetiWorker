@@ -100,7 +100,7 @@ def linked_transcript(directory, session, sessions=None):
             sources=[],
         )
         journal.current, journal.waiting, journal.dirty = {}, {"unknown"}, set()
-        journal.flush = lambda: None
+        journal.flush = lambda **_: None
         for provider in providers:
             until = time.time()
             if session.get("finished") is not None:

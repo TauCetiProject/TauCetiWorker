@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker.budget import Budget
-from tauceti_worker.usage_accounting import UsageJournal, price_usage, read_usage
+from tauceti_worker.usage_accounting import UsageJournal, price_usage, read_summary, read_usage
 
 MODEL = "claude-opus-5-5"
 AT = 1792404000
@@ -51,6 +51,52 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(price_usage(MODEL, tokens, AT), Decimal("37.2"))
         self.assertIsNone(price_usage("future-unknown-model", tokens, AT))
         self.assertIsNone(price_usage(MODEL, tokens, 1000))
+
+    def test_periodic_checkpoints_replay_only_durable_suffix_and_keep_running_total(self):
+        original = self.journal.path.read_bytes()
+        self.journal.observe(response(output_tokens=100))
+        self.journal.observe(response(output_tokens=100))
+        self.journal.observe(response(output_tokens=200))
+        self.assertEqual(self.journal.path.read_bytes(), original)
+        self.assertEqual(self.journal.total, Decimal(".004"))
+        from tauceti_worker import usage_accounting as usage
+
+        original_read = usage._read
+
+        def read(path, *args, **kwargs):
+            self.assertNotEqual(Path(path).suffix, ".jsonl", "new journals replay a bounded suffix, not the whole log")
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(usage, "_read", side_effect=read):
+            saved = read_usage(self.journal.path)
+        self.assertEqual(saved["messages"]["s:m"]["usage"]["output_tokens"], 200)
+        self.assertEqual(saved["journal_offset"], self.journal.log.stat().st_size)
+        self.journal.flush(closed=True)
+        summary = read_summary(self.journal.path)
+        self.assertEqual(Decimal(summary["cost"]), Decimal(".004"))
+        self.assertTrue(summary["closed"])
+
+    def test_optional_summary_write_failure_does_not_damage_durable_evidence(self):
+        original = self.journal._replace
+
+        def replace(path, *args, **kwargs):
+            if path.name.endswith(".summary"):
+                raise OSError("reporting full")
+            return original(path, *args, **kwargs)
+
+        with patch.object(self.journal, "_replace", side_effect=replace):
+            self.journal.observe(response(output_tokens=100))
+            self.journal.flush(closed=True)
+        saved = read_usage(self.journal.path)
+        self.assertTrue(saved["closed"])
+        self.assertEqual(Decimal(saved["messages"]["s:m"]["cost"]), Decimal(".002"))
+
+    def test_summary_does_not_match_checkpoint_glob_and_accepts_rolling_upgrade(self):
+        self.journal.observe(response(output_tokens=100))
+        self.assertEqual(list(self.journal.directory.glob("*.json")), [self.journal.path])
+        summary = self.journal.path.with_suffix(".summary")
+        summary.rename(self.journal.path.with_suffix(".summary.json"))
+        self.assertEqual(Decimal(read_summary(self.journal.path)["cost"]), Decimal(".002"))
 
     def test_duplicates_partial_messages_and_subagents_are_separate(self):
         self.journal.observe(response(output_tokens=100))

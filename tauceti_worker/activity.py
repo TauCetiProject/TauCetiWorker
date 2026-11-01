@@ -772,6 +772,10 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
             value["all"]["expanded_cache"] = expanded_cache.summary()
             value["all"]["verification_storage"] = read_json(verification_storage.root() / "status.json")
+            from . import activity_live
+
+            report_paths = [root() / "summary.json"]
+            live_context = activity_live.publication_context()
             for column, key in (("worker", "workers"), ("scope", "groups")):
                 ids = db.execute(
                     f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
@@ -792,10 +796,18 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                         # Storage belongs to the host, not to the accounting worker window.
                         value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]
                         value[key][row[0]]["expanded_cache"] = value["all"]["expanded_cache"]
-                    atomic_json(
-                        scope_path(key, row[0]),
-                        dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors),
-                        durable=False,
+                    report_path = scope_path(key, row[0])
+                    report_paths.append(report_path)
+                    activity_live.publish_report(
+                        report_path,
+                        dict(
+                            version=1,
+                            prepared_at=now,
+                            all=value[key][row[0]],
+                            errors=errors,
+                            live_subject={"worker" if key == "workers" else "scope": row[0]},
+                        ),
+                        carry=live_context,
                     )
             # Detail is separate; status readers never transfer a growing PR inventory.
             atomic_json(
@@ -805,11 +817,12 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             )
             # These are rebuildable views. Receipts and SQLite remain durable;
             # readers need atomic replacement, not a disk barrier for every view.
-            atomic_json(
+            activity_live.publish_report(
                 root() / "summary.json",
                 {k: v for k, v in value.items() if k not in ("workers", "groups")},
-                durable=False,
+                carry=live_context,
             )
+            activity_live.publish_inputs(value, report_paths)
             return value
 
 
@@ -869,6 +882,18 @@ def start_collector(config):
 
     thread = threading.Thread(target=run, name="activity-preparation", daemon=True)
     thread.start()
+
+    def live():
+        from .activity_live import INTERVAL, sample
+
+        while not stopping.is_set():
+            try:
+                sample()
+            except Exception:
+                pass  # Reporting must never stop the manager or paid work.
+            stopping.wait(INTERVAL)
+
+    threading.Thread(target=live, name="live-spending", daemon=True).start()
     return stopping
 
 
