@@ -28,6 +28,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -127,6 +128,9 @@ def main():
                     else:
                         raise AssertionError("preparation outage did not back off")
                     assert w.counters.read("review-err-42") == 1
+                    from tauceti_worker.state_repair import retry_key
+
+                    assert w.counters.read(retry_key(42, c.head)) > time.time()
                     record.assert_not_called()
                     sync.assert_not_called()
                     bust.assert_called_once_with(42)
