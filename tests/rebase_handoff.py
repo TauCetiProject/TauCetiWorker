@@ -243,6 +243,8 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         patch.object(survey_mod, "me", return_value="me"),
         patch.object(gh, "open_prs", return_value=[raw]),
         patch.object(gh, "issue_comments", return_value=[{"user": {"login": "tau-ceti-bors[bot]"}, "body": body}]),
+        patch.object(gh, "pr_progress_state", return_value=None),
+        patch.object(gh, "pr_view", return_value=raw),
     ):
         sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, SimpleNamespace(read=lambda name: 0), deep=False)
         candidate = sv.rebaseable.actionable[0]
@@ -250,7 +252,6 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         with (
             patch.object(work_units, "run_in_bubble", return_value=0) as agent,
             patch.object(work_units, "me", return_value="me"),
-            patch.object(gh, "pr_view", return_value=raw),
         ):
             assert (
                 work_units._do_fixlike(

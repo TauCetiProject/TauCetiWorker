@@ -636,7 +636,7 @@ def test_shared_idle_recovery_and_refusal_expiry():
             assert select(f, "claude")[1]["claude"].model_refusal
             before = f.clock.mono
             f.wait.wait()
-            assert f.clock.mono - before >= quota.RATE_LIMIT_RECHECK_MAX_S
+            assert quota.RATE_LIMIT_RECHECK_MAX_S <= f.clock.mono - before <= quota.RATE_LIMIT_RECHECK_MAX_S + 30
             assert select(f, "claude")[0] == "claude"
         assert len(f.calls) == 1
 
