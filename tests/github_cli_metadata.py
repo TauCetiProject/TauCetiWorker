@@ -76,7 +76,7 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, TAUCETI_GITHUB
         output = io.StringIO()
         with patch.object(sys, "argv", [tr.__file__, "--proxy", *args[1:]]), contextlib.redirect_stdout(output):
             try:
-                runpy.run_module("tauceti_worker.github_transport", run_name="__main__")
+                runpy.run_path(tr.__file__, run_name="__main__")
             except SystemExit as result:
                 assert result.code == 0
         assert json.loads(output.getvalue()) == {"title": "Title", "body": "Description"}
