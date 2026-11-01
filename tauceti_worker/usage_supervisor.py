@@ -283,6 +283,7 @@ def tick(budget, cache=None, stop=None):
     cache = {} if cache is None else cache
     ledger_stamp = stat_stamp(budget.ledger)
     if cache.get("ledger_stamp") != ledger_stamp or "sessions" not in cache:
+        initial = "sessions" not in cache
         try:
             with budget.locked():
                 state = budget.current()
@@ -299,9 +300,12 @@ def tick(budget, cache=None, stop=None):
                             # minute samples. Remember their final cost before
                             # archiving the launch sidecar, without scanning history.
                             pending = cache.setdefault("live_pending", {})
-                            prior = pending.get(path.stem)
-                            if not prior or prior["cost"] != value.get("cost"):
-                                pending[path.stem] = dict(cost=value.get("cost"), ledger_sequence=state["seq"])
+                            seen = cache.setdefault("live_terminal_seen", {})
+                            if path.stem not in seen or seen[path.stem] != value.get("cost"):
+                                pending[path.stem] = dict(
+                                    cost=value.get("cost"), ledger_sequence=0 if initial else state["seq"]
+                                )
+                                seen[path.stem] = value.get("cost")
             cache["ledger_available"] = True
         except ACCOUNTING_ERRORS as error:
             # Launch supervision must keep running while ledger reads recover.

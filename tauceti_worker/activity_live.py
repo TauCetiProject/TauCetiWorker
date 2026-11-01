@@ -114,7 +114,9 @@ def publish_sessions(budget, cache, now):
     if now - cache.get("live_published_at", float("-inf")) < INTERVAL:
         return
     inputs = read_json(root() / "live-inputs.json")
-    previous = cache.get("live_sessions", {})
+    previous = cache.get("live_sessions")
+    if previous is None:
+        previous = read_json(budget.directory / "live-sessions.json").get("sessions", {})
     pending = cache.get("live_pending", {})
     wanted = set(inputs.get("sessions", {})) | set(previous) | set(pending)
     with budget.locked():

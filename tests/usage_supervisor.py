@@ -37,6 +37,9 @@ class SupervisorTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        activity_env = patch.dict(os.environ, TAUCETI_ACTIVITY_DIR=str(self.root / "activity"))
+        activity_env.start()
+        self.addCleanup(activity_env.stop)
         self.budget = Budget(self.root)
         self.budget.configure(grant=100)
         self.bridge = self.root / "bridges" / uuid.uuid4().hex
@@ -70,6 +73,23 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertIsInstance(cache["sessions"], dict)
         self.assertEqual(cache["sessions"][self.id]["status"], "settled")
+
+    def test_acknowledged_estimated_terminal_is_not_announced_again(self):
+        from tauceti_worker.activity_live import root
+        from tauceti_worker.runtime_status import atomic_json
+
+        self.budget.settle(self.id, 2, provenance="token-priced")
+        cache = {}
+        with patch("tauceti_worker.usage_supervisor.recover_invocation"):
+            tick(self.budget, cache)
+            with self.budget.locked():
+                sequence = self.budget.current()["seq"]
+            atomic_json(root() / "live-inputs.json", dict(ledger_sequence=sequence, sessions={}))
+            cache["live_sessions"] = {}
+            cache["live_pending"] = {}
+            self.budget.configure(grant=1)
+            tick(self.budget, cache)
+        self.assertNotIn(self.id, cache["live_pending"])
 
     def ensure_supervisor(self, **kwargs):
         ensure_supervisor(self.root, **kwargs)
