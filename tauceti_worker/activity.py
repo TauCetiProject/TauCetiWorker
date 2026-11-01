@@ -816,7 +816,7 @@ def start_collector(config):
     stopping = threading.Event()
 
     def run():
-        from . import worker_scopes
+        from . import processes, worker_scopes
         from .paths import self_argv, self_env
 
         oom_since = time.time() - 300
@@ -832,15 +832,7 @@ def start_collector(config):
                 # SQLite row stepping must not contend with manager socket I/O
                 # for the GIL. Reuse the existing one-shot command and lock.
                 argv = self_argv("activity", "refresh", "--json") + (["--config", str(config)] if config else [])
-                with subprocess.Popen(
-                    argv, env=self_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-                ) as child:
-                    while child.poll() is None:
-                        if stopping.wait(1):
-                            child.kill()
-                            return
-                    if child.returncode:
-                        raise subprocess.CalledProcessError(child.returncode, argv)
+                processes.run(argv, env=self_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
             except Exception as error:
                 intentional_stop = isinstance(error, subprocess.CalledProcessError) and error.returncode in (
                     -signal.SIGTERM,
@@ -853,7 +845,7 @@ def start_collector(config):
 
     thread = threading.Thread(target=run, name="activity-preparation", daemon=True)
     thread.start()
-    return stopping, thread
+    return stopping
 
 
 def command(args):
