@@ -25,7 +25,8 @@ def read_json(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def atomic_json(path: Path, value: dict, *, durable: bool = True) -> None:
+    """Replace atomically; only disposable, automatically rebuilt views skip fsync."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(raw)
@@ -34,7 +35,8 @@ def atomic_json(path: Path, value: dict) -> None:
             json.dump(value, out, indent=2, sort_keys=True)
             out.write("\n")
             out.flush()
-            os.fsync(out.fileno())
+            if durable:
+                os.fsync(out.fileno())
         os.replace(tmp, path)
     finally:
         try:
@@ -61,7 +63,9 @@ def update_status(path: Path, *, wait: bool = True, timeout: float | None = None
         value = read_json(path)
         value.update(changes)
         value["status_updated_at"] = time.time()
-        atomic_json(path, value)
+        # Runtime observations are refreshed by the live process or its socket.
+        # A power loss ends that process too; this view is not a durable receipt.
+        atomic_json(path, value, durable=False)
         return value
 
 
