@@ -173,6 +173,43 @@ class ActivityTests(unittest.TestCase):
         with patch.object(a.time, "time", return_value=self.now - age):
             a.emit("round_finished", key=rid, round_id=rid, round_type=kind, outcome=outcome)
 
+    def test_receipts_stay_durable_and_missing_derived_views_rebuild_from_ingested_facts(self):
+        from tauceti_worker import runtime_status
+
+        with patch.object(runtime_status.os, "fsync", wraps=os.fsync) as sync:
+            self.assertTrue(
+                a.emit("round_finished", round_id="durable-round", round_type="review", outcome="completed")
+            )
+            self.assertEqual(sync.call_count, 1)
+        with patch.object(a, "atomic_json", wraps=a.atomic_json) as publish:
+            a.prepare(now=self.now + 1)
+        views = [call for call in publish.call_args_list if call.args[0].name != "preparation-error.json"]
+        self.assertTrue(views)
+        self.assertTrue(all(call.kwargs.get("durable") is False for call in views), views)
+        self.assertFalse(list((a.root() / "pending").glob("*.json")))
+        for path in (a.root() / "summary.json", a.scope_path("workers", "worker"), a.scope_path("groups", "machine")):
+            path.write_text("")  # Simulate a disposable cache lost during a power failure.
+        self.assertFalse(a.cached()["available"])
+        a.prepare(now=self.now + 2)
+        for selection in ({}, {"worker": "worker"}, {"group": "machine"}):
+            restored = a.cached(**selection)
+            self.assertTrue(restored["available"], restored)
+            self.assertEqual(restored["summary"]["rounds"]["total"]["review"]["finished"], 1)
+
+    def test_nondurable_view_still_replaces_atomically_and_cleans_failed_temp_file(self):
+        from tauceti_worker import runtime_status
+
+        path = a.root() / "view.json"
+        a.atomic_json(path, {"old": True})
+        with (
+            patch.object(runtime_status.os, "fsync", side_effect=AssertionError("derived view forced to disk")),
+            patch.object(runtime_status.os, "replace", side_effect=OSError("rename failed")),
+            self.assertRaises(OSError),
+        ):
+            a.atomic_json(path, {"new": True}, durable=False)
+        self.assertEqual(a.read_json(path), {"old": True})
+        self.assertFalse(list(a.root().glob(".view.json.*")))
+
     def test_upgrade_preserves_usage_history_and_ignores_old_containment_projection(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("CREATE TABLE containment(boundary TEXT PRIMARY KEY, cleanup TEXT)")

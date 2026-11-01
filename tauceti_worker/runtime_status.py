@@ -25,7 +25,8 @@ def read_json(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def atomic_json(path: Path, value: dict, *, durable: bool = True) -> None:
+    """Replace atomically; durable writes sync content, as before, not the rename's directory."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(raw)
@@ -34,7 +35,8 @@ def atomic_json(path: Path, value: dict) -> None:
             json.dump(value, out, indent=2, sort_keys=True)
             out.write("\n")
             out.flush()
-            os.fsync(out.fileno())
+            if durable:
+                os.fsync(out.fileno())
         os.replace(tmp, path)
     finally:
         try:
@@ -61,7 +63,17 @@ def update_status(path: Path, *, wait: bool = True, timeout: float | None = None
         value = read_json(path)
         value.update(changes)
         value["status_updated_at"] = time.time()
-        atomic_json(path, value)
+        # Status also records restart policy. Keep lifecycle changes and all
+        # never/on-failure (or unknown) records durable; only ordinary always-
+        # restarting worker observations can be rebuilt without that barrier.
+        spec = value.get("applied_spec")
+        durable = (
+            not isinstance(spec, dict)
+            or spec.get("restart", "always") != "always"
+            or value.get("stopped_at") is not None
+            or bool(changes.keys() & {"spec_hash", "stopped_at", "exit_code", "restart_count"})
+        )
+        atomic_json(path, value, durable=durable)
         return value
 
 

@@ -785,14 +785,23 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                         value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]
                         value[key][row[0]]["expanded_cache"] = value["all"]["expanded_cache"]
                     atomic_json(
-                        scope_path(key, row[0]), dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors)
+                        scope_path(key, row[0]),
+                        dict(version=1, prepared_at=now, all=value[key][row[0]], errors=errors),
+                        durable=False,
                     )
             # Detail is separate; status readers never transfer a growing PR inventory.
             atomic_json(
                 root() / "prs.json",
                 dict(version=1, prepared_at=now, prs=[dict(r) for r in db.execute("SELECT * FROM prs")]),
+                durable=False,
             )
-            atomic_json(root() / "summary.json", {k: v for k, v in value.items() if k not in ("workers", "groups")})
+            # These are rebuildable views. Receipts and SQLite remain durable;
+            # readers need atomic replacement, not a disk barrier for every view.
+            atomic_json(
+                root() / "summary.json",
+                {k: v for k, v in value.items() if k not in ("workers", "groups")},
+                durable=False,
+            )
             return value
 
 
