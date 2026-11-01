@@ -219,7 +219,7 @@ def summarize(db, now, cutoff, column=None, identity=None):
     ).fetchall()
     estimates = {"settled_estimates": set(), "recovered_estimates": set()}
     for invocation, settled, recovered in db.execute(
-        "SELECT id,settled_estimates,recovered_estimates FROM conversation_accounting WHERE settled_estimates=1 OR recovered_estimates=1"
+        "SELECT id,settled_estimates,recovered_estimates FROM conversation_accounting WHERE id IS NOT NULL AND (settled_estimates=1 OR recovered_estimates=1)"
     ):
         if settled == 1:
             estimates["settled_estimates"].add(invocation)

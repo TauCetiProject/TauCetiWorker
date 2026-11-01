@@ -418,6 +418,7 @@ class CostTests(unittest.TestCase):
                 ("old", "author", "machine", -7201, -7201, "64", 0),
                 ("future", "author", "machine", 50, 100, "128", 0),
                 ("missing-end", "author", "machine", -1, None, "256", 0),
+                (None, "author", "machine", -5, -5, "1", 0),
             ):
                 db.execute(
                     "INSERT INTO cost_accruals VALUES (?,?,?,?,?,?,?,?)",
@@ -437,10 +438,11 @@ class CostTests(unittest.TestCase):
                     "INSERT INTO conversation_accounting VALUES (?, 'author', 'machine', 0, ?, ?, 0)",
                     (invocation, settled, recovered),
                 )
+            db.execute("INSERT INTO conversation_accounting VALUES (NULL, 'author', 'machine', 0, 1, 1, 0)")
             for column, identity, completed, total, estimated in (
-                ("scope", "machine", 13, 15, 13),
-                ("worker", "author", 21, 23, 5),
-                (None, None, 29, 31, 13),
+                ("scope", "machine", 14, 16, 13),
+                ("worker", "author", 22, 24, 5),
+                (None, None, 30, 32, 13),
             ):
                 value = activity_costs.summarize(db, self.now, self.now - 3600, column, identity)
                 for window in value["windows"].values():
