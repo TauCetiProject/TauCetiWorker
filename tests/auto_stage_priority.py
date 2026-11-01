@@ -54,7 +54,7 @@ seen = []
 tc.work_units.survey = lambda *_a, **_k: sv
 tc.work_units.dispatch = lambda stage, *_a, **_k: seen.append(stage) or 0
 try:
-    worker = SimpleNamespace(cfg=None, gh=None, rs=None, counters=None)
+    worker = SimpleNamespace(cfg=SimpleNamespace(wid="test"), gh=None, rs=None, counters=None)
     tc.work_units.run_round(worker, SimpleNamespace(only=[], dry_run=True))
 finally:
     tc.work_units.survey = saved_survey
