@@ -615,6 +615,7 @@ class GenerationRetryTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"TAUCETI_USE_BUDGET": "0"}),
             patch.object(loop, "api_mode", return_value=True),
+            patch.object(loop, "github_budget", return_value=None),
             patch.object(
                 loop, "run_round_subprocess", side_effect=[EX_NOPROGRESS, EX_DOCUMENTATION_WAIT, EX_NOPROGRESS]
             ),

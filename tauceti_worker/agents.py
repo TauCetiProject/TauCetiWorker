@@ -35,6 +35,7 @@ from .constants import (
     OPENROUTER_MODELS,
     PI_RUN,
     REVIEW,
+    REVIEW_HEAD_CHANGED_EXIT,
     ROADMAP,
     TAUCETI,
 )
@@ -1250,7 +1251,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
         rc = run_process(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
-    if rc != 0 and not (rc == EX_CLAIM_COLLISION and label.startswith("review #")):
+    if rc != 0 and not (rc in (EX_CLAIM_COLLISION, REVIEW_HEAD_CHANGED_EXIT) and label.startswith("review #")):
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
         try:

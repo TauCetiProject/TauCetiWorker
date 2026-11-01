@@ -75,7 +75,9 @@ class GlobalMaintenance(unittest.TestCase):
             gh=gh,
             claims=SimpleNamespace(),
             rs=ReviewState(cfg, gh),
-            counters=SimpleNamespace(read=lambda key: self.counter_values.get(key, 0)),
+            counters=SimpleNamespace(
+                read=lambda key: self.counter_values.get(key, 0), write=lambda k, v: self.counter_values.update({k: v})
+            ),
         )
         self.opts = RoundOpts(
             only=["rebase", "fix-ci", "fix", "review", "roadmap"],
