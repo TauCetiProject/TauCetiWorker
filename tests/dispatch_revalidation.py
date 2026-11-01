@@ -77,7 +77,10 @@ class FakeGH:
 
 def worker(rs, gh=None):
     return SimpleNamespace(
-        rs=rs, gh=gh or FakeGH(), counters=SimpleNamespace(read=lambda key: 0), cfg=SimpleNamespace(wid="test")
+        rs=rs,
+        gh=gh or FakeGH(),
+        counters=SimpleNamespace(read=lambda key: 0, write=lambda *_: None),
+        cfg=SimpleNamespace(wid="test"),
     )
 
 

@@ -315,7 +315,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 # a tiny capped pause to avoid hammering shared claims or GitHub.
                 nap = min(30, 5 * (collision_streak - 1))
                 report_runtime(
-                    "idle", detail="peer claims busy; selecting other work", next_action_at=time.time() + nap
+                    "idle", detail="work candidates unavailable; selecting other work", next_action_at=time.time() + nap
                 )
                 if nap:
                     time.sleep(nap)

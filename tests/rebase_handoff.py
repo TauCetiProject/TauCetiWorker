@@ -205,6 +205,7 @@ def test_launch_rechecks_head_hold_and_active_marker():
     with (
         patch.object(gh, "pr_view", return_value=live),
         patch.object(gh, "rebase_requested", return_value=True) as marker,
+        patch("tauceti_worker.state_repair.repair_selected") as repair,
     ):
         assert _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
         live["labels"] = [{"name": "hold"}]
@@ -217,6 +218,7 @@ def test_launch_rechecks_head_hold_and_active_marker():
         assert not _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
         live["mergeable"] = "CONFLICTING"
         assert _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
+        assert repair.call_count == 1 and repair.call_args.args[2] == "b" * 40
 
 
 def test_semantic_evidence_reaches_claimed_repair(provisional=False):

@@ -103,7 +103,7 @@ def main():
 
         # Exercise the actual dispatch/cascade: a paid no-change fix consumes
         # its target allowance but does not stop another actionable PR.
-        cfg.wid, cfg.logdir = "test", root / "logs"
+        cfg.wid, cfg.logdir, cfg.state = "test", root / "logs", root / "state"
         counts, attempts = {}, []
         counters = types.SimpleNamespace(
             read=lambda key: counts.get(key, 0),

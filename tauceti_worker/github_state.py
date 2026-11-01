@@ -185,6 +185,54 @@ def enabled() -> bool:
     return bool(_configured_url()) and not transport.direct_reads()
 
 
+def refresh_pr(repo: str, number: int, expected: str, observed: str = "") -> dict:
+    """Optional synchronous correction. Its failure never opens the discovery circuit.
+
+    Retry deadlines belong to this PR, not the identity-wide read cooldown. In
+    particular, do not route HTTP errors through read() or _classify().
+    """
+    unavailable = dict(status="unavailable", reason="refresh_unavailable", retry_at=time.time() + 30)
+    try:
+        url = _url()
+        if not url or not re.fullmatch(r"[a-f0-9]{40}", expected):
+            return unavailable
+        token_file = os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
+        if not token_file:
+            return {**unavailable, "reason": "refresh_auth_required"}
+        token = Path(token_file).expanduser().read_text().strip()
+        body = dict(repository=repo, number=number, expected_head=expected)
+        if re.fullmatch(r"[a-f0-9]{40}", observed):
+            body["observed_head"] = observed
+        ensure_ssl_cert_file()
+        request = urllib.request.Request(
+            url + "/v1/refresh-pr",
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/json",
+                "User-Agent": "TauCetiWorker/1.0",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.load(response)
+        if not isinstance(result, dict) or result.get("repository") != repo or result.get("operation") != "pr":
+            return unavailable
+        if (
+            result.get("status") == "ok"
+            and isinstance(result.get("data"), dict)
+            and result["data"].get("number") == number
+        ):
+            return dict(status="ok", data=result["data"])
+        retry = result.get("retry_at")
+        retry = retry / 1000 if isinstance(retry, (int, float)) and math.isfinite(retry) else unavailable["retry_at"]
+        return {**unavailable, "retry_at": min(time.time() + MAX_RETRY_AFTER, max(time.time() + 1, retry))}
+    except urllib.error.HTTPError as error:
+        error.close()
+        return unavailable
+    except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException, StateQueryError):
+        return unavailable
+
+
 def _wire(data, operation):
     if operation in ("issue_comments", "review_comments", "reactions") and isinstance(data, list):
         for row in data:

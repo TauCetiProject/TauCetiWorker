@@ -76,6 +76,7 @@ from .constants import (
     PROGRESS_TTL,
     REVIEW,
     REVIEW_AFFINITY_GRACE_S,
+    REVIEW_HEAD_CHANGED_EXIT,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
     ROUND_TIMEOUT,
@@ -212,6 +213,7 @@ class Worker:
     counters: Counters
     rc: RoundContext
     claims: Claims
+    selection_changed: bool = False
 
 
 def _bubble(stage: str, opts: RoundOpts) -> bool:
@@ -392,6 +394,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # credential mirror.
     if not opts.dry_run:
         mirror_creds(w.cfg)
+        from .review_diagnostics import refund_stale_head_errors
+
+        refund_stale_head_errors(w.cfg.state, w.counters)
+    w.selection_changed = False
     global_pick = False
     scope = roadmap_only()
     if opts.only and set(opts.only) <= {"overlap-scan", "overlap-fix"}:
@@ -548,6 +554,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if not want(opts.only, stage):
             continue
         for c in sv.kind(stage).actionable:
+            from .state_repair import retry_key
+
+            if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
+                w.selection_changed = True
+                continue
             if (
                 global_pick
                 and not opts.dry_run
@@ -575,7 +586,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
         if sv.roadmap_backpressure:
-            if claim_collision:
+            if claim_collision or w.selection_changed:
                 raise ClaimCollision("authoring paused at the PR limit; available maintenance is claimed by peers")
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
@@ -600,7 +611,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         # at a reason that was never printed.
         for stage, pr in declined:
             log(f"  --pr #{pr}: {stage} candidate was offered but not taken (claimed by a peer, or re-checked stale)")
-        error = ClaimCollision if claim_collision else NoProgress
+        error = ClaimCollision if claim_collision or w.selection_changed else NoProgress
         raise error(
             f"nothing actionable on the requested PR(s) {', '.join(f'#{n}' for n in opts.prs)} this "
             f"round ({scope}) — see the per-PR reasons above; no unrelated work was done"
@@ -615,7 +626,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     for stage in ("overlap-fix", "overlap-scan"):
         if stage in opts.only and sv.kind(stage).suppressed:
             raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
-    error = ClaimCollision if claim_collision else NoProgress
+    error = ClaimCollision if claim_collision or w.selection_changed else NoProgress
     raise error(f"no eligible work this round under {scope}")
 
 
@@ -931,6 +942,10 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
 
         with read_context(fresh=True, direct=True):
             live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels", "mergeable", "baseRefName"])
+            if live and (live.get("headRefOid") != c.head or live.get("state") != "OPEN" or live.get("isDraft")):
+                from .state_repair import repair_selected
+
+                repair_selected(w, c, live.get("headRefOid") or "")
             if (
                 not live
                 or live.get("headRefOid") != c.head
@@ -951,7 +966,14 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
         return True
     # The head the survey saw. A contributor pushing since then makes every verdict below describe a
     # commit that is no longer there, and _do_fixlike would check the NEW head out and work on it.
-    live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels"])
+    from .github_transport import read_context
+
+    with read_context(fresh=True, direct=True, retry=False) if stage == "review" else contextlib.nullcontext():
+        live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels"])
+    if live and (live.get("headRefOid") != c.head or live.get("state") != "OPEN" or live.get("isDraft")):
+        from .state_repair import repair_selected
+
+        repair_selected(w, c, live.get("headRefOid") or "")
     matches = _selected_pr_matches(stage, c, live)
     if matches is not True:
         return matches if stage == "fix" else False
@@ -1402,6 +1424,19 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         from .claude_api import check_result
 
         check_result(rc)
+        if rc == REVIEW_HEAD_CHANGED_EXIT:  # Review command: head changed before any review/inference.
+            from .state_repair import repair_selected
+
+            try:
+                result = json.loads(result_file.read_text())
+            except (OSError, ValueError):
+                result = {}
+            observed = result.get("head_sha", "") if isinstance(result, dict) else ""
+            repair_selected(w, c, observed)
+            from .activity import select
+
+            select("no-work")
+            return None
         if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
@@ -1687,6 +1722,10 @@ def _do_fixlike(
         # Unknown optional reads keep the checkout/agent path running. Known
         # changes release ownership immediately, before caches or model calls.
         if _selected_pr_matches(label, c, live) is False:
+            if live and (live.get("headRefOid") != c.head or live.get("state") != "OPEN" or live.get("isDraft")):
+                from .state_repair import repair_selected
+
+                repair_selected(w, c, live.get("headRefOid") or "")
             return decline_repair()
         if bubble and c.progress is not None:
             c.progress["claimed_bubble"] = bool(held)
