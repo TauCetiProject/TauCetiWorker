@@ -1047,7 +1047,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
         print(f"tauceti workers: managing {config} every {interval:g}s", flush=True)
         from .activity import start_collector
 
-        activity_stopping = start_collector(config)
+        activity_stopping, activity_thread = start_collector(config)
         try:
             while not exiting:
                 try:
@@ -1222,6 +1222,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             return 0
         finally:
             activity_stopping.set()
+            activity_thread.join()
             signal.signal(signal.SIGTERM, old_term)
             signal.signal(signal.SIGINT, old_int)
             server.close()

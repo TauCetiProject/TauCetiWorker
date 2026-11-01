@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import json
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -830,16 +831,29 @@ def start_collector(config):
             try:
                 # SQLite row stepping must not contend with manager socket I/O
                 # for the GIL. Reuse the existing one-shot command and lock.
-                argv = self_argv("activity", "refresh") + (["--config", str(config)] if config else [])
-                subprocess.run(argv, env=self_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
+                argv = self_argv("activity", "refresh", "--json") + (["--config", str(config)] if config else [])
+                with subprocess.Popen(
+                    argv, env=self_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                ) as child:
+                    while child.poll() is None:
+                        if stopping.wait(1):
+                            child.kill()
+                            return
+                    if child.returncode:
+                        raise subprocess.CalledProcessError(child.returncode, argv)
             except Exception as error:
-                with contextlib.suppress(Exception):
-                    atomic_json(root() / "preparation-error.json", dict(at=time.time(), error=type(error).__name__))
+                intentional_stop = isinstance(error, subprocess.CalledProcessError) and error.returncode in (
+                    -signal.SIGTERM,
+                    -signal.SIGINT,
+                )
+                if not stopping.is_set() and not intentional_stop:
+                    with contextlib.suppress(Exception):
+                        atomic_json(root() / "preparation-error.json", dict(at=time.time(), error=type(error).__name__))
             stopping.wait(max(0, 60 - (time.monotonic() - started)))
 
     thread = threading.Thread(target=run, name="activity-preparation", daemon=True)
     thread.start()
-    return stopping
+    return stopping, thread
 
 
 def command(args):
