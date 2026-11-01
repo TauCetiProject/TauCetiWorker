@@ -415,7 +415,7 @@ class CostTests(unittest.TestCase):
                 ("recovered", "author", "machine", -50, -50, "3", 0),
                 ("other-worker", "peer", "machine", -100, -100, "8", 0),
                 ("other-scope", "author", "elsewhere", -100, -100, "16", 0),
-                ("old", "author", "machine", -7201, -7201, "64", 0),
+                ("old", "author", "machine", -7201, -7201, "64.00000", 0),
                 ("future", "author", "machine", 50, 100, "128", 0),
                 ("missing-end", "author", "machine", -1, None, "256", 0),
                 (None, "author", "machine", -5, -5, "1", 0),
@@ -444,15 +444,20 @@ class CostTests(unittest.TestCase):
                 ("worker", "author", 22, 24, 5),
                 (None, None, 30, 32, 13),
             ):
-                value = activity_costs.summarize(db, self.now, self.now - 3600, column, identity)
-                for window in value["windows"].values():
-                    self.assertEqual(Decimal(window["spent_usd"]), completed)
-                    self.assertEqual(Decimal(window["active_accrued_usd"]), 2)
-                    self.assertEqual(Decimal(window["estimated_usd"]), total)
-                    self.assertEqual(Decimal(window["settled_estimates_usd"]), estimated)
-                    self.assertEqual(Decimal(window["recovered_estimates_usd"]), 3)
-                for window in value["spending"].values():
-                    self.assertEqual(Decimal(window["spent_usd"]), total)
+                for history in (3600, 8 * DAY):
+                    value = activity_costs.summarize(db, self.now, self.now - history, column, identity)
+                    for key, window in value["windows"].items():
+                        wider = history > 3600 and key != "1h"
+                        spent = f"{completed + 64}.00000" if wider else str(completed)
+                        combined = f"{total + 66}.00000" if wider else str(total)
+                        self.assertEqual(window["spent_usd"], spent)
+                        self.assertEqual(window["active_accrued_usd"], "4" if wider else "2")
+                        self.assertEqual(window["estimated_usd"], combined)
+                        self.assertEqual(window["settled_estimates_usd"], str(estimated))
+                        self.assertEqual(window["recovered_estimates_usd"], "3")
+                    for key, window in value["spending"].items():
+                        expected = f"{total + 66}.00000" if history > 3600 and key != "1h" else str(total)
+                        self.assertEqual(window["spent_usd"], expected)
 
     def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
         s = self.summary()

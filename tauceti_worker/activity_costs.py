@@ -233,6 +233,7 @@ def summarize(db, now, cutoff, column=None, identity=None):
                 continue
             if accounting_kind and invocation not in estimates[accounting_kind]:
                 continue
+            # Preserve Decimal string precision by excluding older rows entirely.
             if finish < since:
                 continue
             if start == finish:
