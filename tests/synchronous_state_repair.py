@@ -61,7 +61,7 @@ class StateRepair(unittest.TestCase):
         self.assertGreater(failure["retry_at"], time.time() + 250)
         self.assertLessEqual(failure["retry_at"], time.time() + state.MAX_RETRY_AFTER)
         self.assertIs(state.last_failure(), previous)
-        self.assertEqual(read.call_args.kwargs["timeout"], 20)
+        self.assertIsNone(read.call_args.kwargs["timeout"])
         body = json.loads(read.call_args.args[0].data)
         self.assertEqual(body["expected_head"], HEAD)
 

@@ -77,6 +77,7 @@ from .constants import (
     REVIEW,
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_HEAD_CHANGED_EXIT,
+    REVIEW_PREPARATION_WAIT_EXIT,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
     ROUND_TIMEOUT,
@@ -364,7 +365,7 @@ def focus_prs(sv: Survey, opts) -> None:
             log(f"  --pr #{pr}: {pr_focus_reason(sv, opts, pr)}")
 
 
-def run_round(w: Worker, opts: RoundOpts) -> int:
+def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     if "security-audit" in opts.only:
         from .activity import select
         from .security_audit import run
@@ -399,6 +400,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         refund_stale_head_errors(w.cfg.state, w.counters)
     w.selection_changed = False
     global_pick = False
+    focused_round = False
     scope = roadmap_only()
     if opts.only and set(opts.only) <= {"overlap-scan", "overlap-fix"}:
         from .overlaps import survey_overlaps
@@ -409,6 +411,16 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if getattr(opts, "prs", ()):
             scope = "any"  # explicit targets override the ambient roadmap
         else:
+            if use_fleet_focus and scope in (None, "auto"):
+                from .fleet_capacity import roadmap_focus
+
+                focus = roadmap_focus(w.cfg.wid)
+                if focus:
+                    # A reserved slot runs the normal cascade within its chosen
+                    # focus area, rather than spending every round on a global
+                    # backlog before it can reach focused authoring.
+                    scope = random_roadmap_area(w, focus=focus, fallback=False)
+                    focused_round = scope not in (None, "any")
             global_pick = scope in (None, "", "auto", "any")
         sv = survey(
             w.cfg,
@@ -419,7 +431,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             stages=[stage for stage in round_stages(opts) if want(opts.only, stage)],
             selected_roadmap=("auto" if scope is None else scope),
             numbers=getattr(opts, "prs", ()),
-            count_all_roadmaps=global_pick,
+            count_all_roadmaps=global_pick or focused_round,
             # An expanded scan must not create per-PR hydration demand or
             # silently fall back to thousands of direct comment requests.
             cached_only=global_pick and github_state_enabled(),
@@ -586,6 +598,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
         if sv.roadmap_backpressure:
+            if focused_round:
+                log("Fleet roadmap focus: account authoring limit reached; selecting global maintenance")
+                return run_round(w, opts, use_fleet_focus=False)
             if claim_collision or w.selection_changed:
                 raise ClaimCollision("authoring paused at the PR limit; available maintenance is claimed by peers")
             raise NoProgress(
@@ -595,9 +610,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
             if scope in (None, "auto") and not opts.dry_run:
-                all_areas = roadmap_areas(w.gh)
-                areas = [area for area in all_areas if area not in roadmap_skip()]
-                sv.roadmap_only = random.choice(areas) if areas else ("auto" if all_areas else "any")
+                sv.roadmap_only = random_roadmap_area(w, focus=[])
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
@@ -1440,6 +1453,15 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
+        if rc == REVIEW_PREPARATION_WAIT_EXIT:
+            # A fetch/host outage is not a defect in the selected PR. Refresh
+            # discovery on the next ordinary attempt, including a changed head.
+            from .github_state import MAX_RETRY_AFTER
+            from .state_repair import retry_key
+
+            w.counters.write(retry_key(pr, head), int(time.time() + MAX_RETRY_AFTER) + 1)
+            w.rs.bust(pr)
+            raise NoProgress(f"review #{pr}: source preparation unavailable before inference — not charged to the PR")
         if rc == 0:
             # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
@@ -2806,17 +2828,35 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
         return None
 
 
+def random_roadmap_area(w, *, focus=None, fallback=True) -> str | None:
+    """Choose an eligible area; a focus miss can preserve the ordinary global cascade."""
+    from .fleet_capacity import roadmap_focus
+
+    raw_areas = roadmap_areas(w.gh)
+    skip = roadmap_skip()
+    areas = [a for a in raw_areas if a not in skip]
+    focus = roadmap_focus(w.cfg.wid) if focus is None else focus
+    if focus:
+        focused = [a for a in areas if a in focus]
+        if focused:
+            areas = focused
+            log(f"Fleet roadmap focus: choosing from {', '.join(areas)}")
+        else:
+            log("Fleet roadmap focus: no eligible focus areas; using ordinary selection")
+            if not fallback:
+                return None
+    if raw_areas and not areas:
+        raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
+    return random.choice(areas) if areas else "any"
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
     skip = roadmap_skip()
     if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
-        raw_areas = roadmap_areas(w.gh)
-        areas = [a for a in raw_areas if a not in skip]
-        if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
-            raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
-        only = random.choice(areas) if areas else "any"
-        log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)})")
+        only = random_roadmap_area(w, focus=[])
+        log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is

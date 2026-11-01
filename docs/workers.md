@@ -19,6 +19,22 @@ CI, reviews, merges, cache publication, or another GitHub mutation. No request
 body, command line, credential or agent prompt is retained. Event reporting is
 best effort and cannot fail a successful publication.
 
+Fleet's admission policy may also contain advisory `roadmap_focus`: `areas`
+(directory names), `workers` (designated slots), and optional `fractional_worker`
+and `fractional_percent` for a fractional slot. Designated workers select an
+area before their survey from the intersection of that list and their eligible
+live areas, then run the normal maintenance, review, and authoring cascade within
+that area. The fractional slot takes that draw with the supplied integer
+percentage each round. Other workers retain the full random draw. Explicit `--roadmap-only` and
+`--roadmap-skip` settings retain precedence; the usual maintenance and review
+priorities apply within the chosen area. Stale/malformed focus or no remaining
+eligible focus areas falls back to ordinary selection. Fleet controls this live through
+`tauceti-fleet focus HOST --percent 20 --areas PDE,SymplecticGeometry`; changing
+it does not restart workers or change admissions. The share describes focused
+slots, not runtime or output quotas. Focused slots retain the shared account-wide
+open-PR limit. If that limit prevents authoring and the selected area has no
+available maintenance, the slot falls back to the ordinary global cascade.
+
 Fleet installers can query `_fleet-protocol` to verify this integration before
 starting workers. The response is local, contains no credentials, and launches
 no agents.

@@ -213,7 +213,9 @@ def refresh_pr(repo: str, number: int, expected: str, observed: str = "") -> dic
                 "User-Agent": "TauCetiWorker/1.0",
             },
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        # The existing round deadline owns cancellation. A separate socket
+        # deadline can discard a successful shared repair still being committed.
+        with urllib.request.urlopen(request, timeout=None) as response:
             result = json.load(response)
         if (
             not isinstance(result, dict)
