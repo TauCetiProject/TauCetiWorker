@@ -521,6 +521,30 @@ class CostTests(unittest.TestCase):
                         reference.execute("SELECT rowid,* FROM cost_accruals ORDER BY rowid").fetchall(),
                     )
 
+    def test_replacement_ledger_removes_old_prepared_sessions(self):
+        tables = ("conversation_costs", "cost_accruals", "conversation_accounting", "conversation_quality")
+        with contextlib.closing(a._connect()) as db, db:
+            for remaining in ("replacement", None):
+                self.records = []
+                self.record(self.now - 30, dict(type="grant", delta="1000"))
+                if remaining:
+                    self.session(remaining, 10, "author", "7", settled=True)
+                self.write_ledger()
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                with contextlib.closing(sqlite3.connect(":memory:")) as fresh:
+                    fresh.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+                    activity_costs.install(fresh)
+                    activity_costs.prepare(fresh, self.now, lambda worker: "machine")
+                    for table in tables:
+                        self.assertEqual(
+                            {row[0] for row in db.execute(f"SELECT id FROM {table}")},
+                            {remaining} if remaining else set(),
+                        )
+                        self.assertEqual(
+                            [tuple(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY rowid")],
+                            fresh.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall(),
+                        )
+
     def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
         s = self.summary()
         other = json.loads(json.dumps(s))
