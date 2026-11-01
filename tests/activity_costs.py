@@ -472,6 +472,37 @@ class CostTests(unittest.TestCase):
             # usage are still fully checked, with no derived table rewrites.
             self.assertEqual(db.total_changes - before, 1)
 
+    def test_summary_indexes_cover_queries_after_legacy_upgrade(self):
+        for upgrade in (False, True):
+            if upgrade:
+                with contextlib.closing(a._connect()) as db, db:
+                    for name in (
+                        "round_worker_covering",
+                        "quality_worker",
+                        "accounting_worker",
+                        "accounting_estimates",
+                    ):
+                        db.execute(f"DROP INDEX {name}")
+                    db.execute("CREATE INDEX round_worker ON rounds(worker,finished)")
+            with contextlib.closing(a._connect()) as db:
+                self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='round_worker'").fetchone())
+                statements = []
+                db.set_trace_callback(statements.append)
+                a._summary(db, self.now, "worker", "author")
+                db.set_trace_callback(None)
+                # Check the production queries, including their real predicates.
+                for index, pattern in (
+                    ("round_worker_covering", "SELECT started,finished FROM rounds"),
+                    ("quality_worker", "FROM conversation_quality"),
+                    ("accounting_worker", "SELECT COALESCE(SUM(live),0)"),
+                    ("accounting_estimates", "SELECT id,settled_estimates,recovered_estimates"),
+                ):
+                    queries = [query for query in statements if pattern in query]
+                    self.assertTrue(queries, index)
+                    for query in queries:
+                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                        self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
+
     def test_prepared_row_reconciliation_matches_full_replacement(self):
         initial = {
             "conversation_costs": [

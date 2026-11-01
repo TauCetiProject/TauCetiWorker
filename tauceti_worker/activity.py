@@ -188,7 +188,8 @@ def _connect():
       CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,worker TEXT,scope TEXT,kind TEXT,
         started REAL,finished REAL,outcome TEXT,pid INTEGER,identity TEXT,hostname TEXT);
       CREATE INDEX IF NOT EXISTS round_finish ON rounds(finished,kind);
-      CREATE INDEX IF NOT EXISTS round_worker ON rounds(worker,finished);
+      CREATE INDEX IF NOT EXISTS round_worker_covering ON rounds(worker,finished,started,outcome,kind);
+      DROP INDEX IF EXISTS round_worker;
       CREATE INDEX IF NOT EXISTS round_scope ON rounds(scope,finished);
       CREATE TABLE IF NOT EXISTS prs(repo TEXT,number INTEGER,worker TEXT,scope TEXT,created REAL,
         state TEXT,landed REAL,observed REAL,checked REAL,head TEXT,source TEXT,PRIMARY KEY(repo,number));

@@ -30,6 +30,11 @@ def install(db):
       CREATE INDEX IF NOT EXISTS accrual_worker ON cost_accruals(worker,started);
       CREATE INDEX IF NOT EXISTS cost_scope ON conversation_costs(scope,settled);
       CREATE INDEX IF NOT EXISTS cost_worker ON conversation_costs(worker,settled);
+      CREATE INDEX IF NOT EXISTS quality_worker ON conversation_quality(worker,native,estimated,incomplete);
+      CREATE INDEX IF NOT EXISTS accounting_worker ON conversation_accounting(worker,live,settled_estimates,recovered_estimates,unresolved_stopped);
+      -- Match the estimate-marker predicate in summarize().
+      CREATE INDEX IF NOT EXISTS accounting_estimates ON conversation_accounting(id,settled_estimates,recovered_estimates)
+        WHERE id IS NOT NULL AND (settled_estimates=1 OR recovered_estimates=1);
     """)
 
 
@@ -243,6 +248,7 @@ def summarize(db, now, cutoff, column=None, identity=None):
         [now, *args],
     ).fetchall()
     estimates = {"settled_estimates": set(), "recovered_estimates": set()}
+    # Keep this predicate aligned with accounting_estimates in install().
     for invocation, settled, recovered in db.execute(
         "SELECT id,settled_estimates,recovered_estimates FROM conversation_accounting WHERE id IS NOT NULL AND (settled_estimates=1 OR recovered_estimates=1)"
     ):
