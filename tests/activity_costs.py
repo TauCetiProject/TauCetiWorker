@@ -494,14 +494,19 @@ class CostTests(unittest.TestCase):
                 with contextlib.closing(a._connect()) as db, db:
                     for name in (
                         "round_worker_covering",
+                        "round_scope_covering",
+                        "round_finish_covering",
                         "quality_worker",
                         "accounting_worker",
                         "accounting_estimates",
                     ):
                         db.execute(f"DROP INDEX {name}")
                     db.execute("CREATE INDEX round_worker ON rounds(worker,finished)")
+                    db.execute("CREATE INDEX round_scope ON rounds(scope,finished)")
+                    db.execute("CREATE INDEX round_finish ON rounds(finished,kind)")
             with contextlib.closing(a._connect()) as db:
-                self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='round_worker'").fetchone())
+                for name in ("round_worker", "round_scope", "round_finish"):
+                    self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name=?", (name,)).fetchone())
                 statements = []
                 db.set_trace_callback(statements.append)
                 a._summary(db, self.now, "worker", "author")
@@ -526,6 +531,10 @@ class CostTests(unittest.TestCase):
                 a._summary(db, self.now, "scope", "machine")
                 db.set_trace_callback(None)
                 for index, pattern in (
+                    ("round_scope_covering", "SELECT started,finished FROM rounds"),
+                    ("round_scope_covering", "SELECT MIN(COALESCE(started,finished)) FROM rounds"),
+                    ("round_scope_covering", "SELECT MIN(started) FROM rounds"),
+                    ("round_scope_covering", "SELECT kind,COUNT(*)"),
                     ("accrual_scope_covering", "SELECT id,started,finished,cost,active FROM cost_accruals"),
                     ("contribution_scope_covering", "SELECT * FROM pr_contributions"),
                 ):
@@ -534,6 +543,15 @@ class CostTests(unittest.TestCase):
                     for query in queries:
                         plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
                         self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
+                statements.clear()
+                db.set_trace_callback(statements.append)
+                a._summary(db, self.now)
+                db.set_trace_callback(None)
+                queries = [query for query in statements if query.startswith("SELECT kind,COUNT(*)")]
+                self.assertTrue(queries)
+                for query in queries:
+                    plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                    self.assertTrue(any("COVERING INDEX round_finish_covering" in detail for detail in plan), plan)
 
     def test_prepared_row_reconciliation_matches_full_replacement(self):
         initial = {
@@ -573,8 +591,22 @@ class CostTests(unittest.TestCase):
                         reference.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall(),
                     )
                     before = actual.total_changes
+                    statements = []
+                    actual.set_trace_callback(statements.append)
                     activity_costs._write_prepared(actual, table, desired)
+                    actual.set_trace_callback(None)
                     self.assertEqual(actual.total_changes, before)
+                    self.assertFalse(any(sql.startswith("INSERT INTO") for sql in statements), statements)
+                if table != "cost_accruals":
+                    # The existing upsert keeps the last value for an identity,
+                    # even when that last value already matches the stored row.
+                    duplicate = list(rows[0])
+                    duplicate[-1] = "7.00000" if table == "conversation_costs" else 7
+                    activity_costs._write_prepared(actual, table, [duplicate, *rows])
+                    self.assertEqual(
+                        actual.execute(f"SELECT * FROM {table} ORDER BY id").fetchall(),
+                        reference.execute(f"SELECT * FROM {table} ORDER BY id").fetchall(),
+                    )
                 if table == "cost_accruals":
                     actual.execute("UPDATE cost_accruals SET rowid=99 WHERE rowid=2")
                     actual.execute("INSERT INTO cost_accruals(rowid) VALUES (-1)")

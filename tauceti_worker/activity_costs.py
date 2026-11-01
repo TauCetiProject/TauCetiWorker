@@ -76,15 +76,38 @@ def _write_prepared(db, table, rows):
     # including duplicate rows, exactly as the previous delete-and-insert did.
     if table == "cost_accruals":
         key = "rowid"
-        db.execute(f"DELETE FROM {table} WHERE rowid NOT BETWEEN 1 AND ?", (len(rows),))
+        # Separate rowid ranges avoid a full scan for an unchanged population.
+        db.execute(f"DELETE FROM {table} WHERE rowid<1")
+        db.execute(f"DELETE FROM {table} WHERE rowid>?", (len(rows),))
         columns = [key, *fields]
-        values = ((index, *row) for index, row in enumerate(rows, 1))
+        changed = []
+        # Stream stored rows in position order, rather than retaining a second
+        # complete copy or probing the table once for every computed row.
+        stored = db.execute(f"SELECT rowid,* FROM {table} ORDER BY rowid")
+        previous = next(stored, None)
+        for index, row in enumerate(rows, 1):
+            if previous is None or previous[0] != index:
+                changed.append(index)
+            else:
+                if tuple(previous)[1:] != tuple(row):
+                    changed.append(index)
+                previous = next(stored, None)
+        stored.close()
+        values = ((index, *rows[index - 1]) for index in changed)
     else:
         key = "id"
-        identities = {row[0] for row in rows}
-        obsolete = [row[0] for row in db.execute(f"SELECT id FROM {table}") if row[0] not in identities]
+        # Index references to computed rows, not copies of every stored value.
+        # As with the UPSERT, the last desired row wins for a repeated identity.
+        latest = {row[0]: row for row in rows}
+        obsolete = set()
+        for row in db.execute(f"SELECT * FROM {table}"):
+            if row[0] not in latest:
+                obsolete.add(row[0])
+            elif row[0] is not None and tuple(row) == tuple(latest[row[0]]):
+                latest[row[0]] = None
         db.executemany(f"DELETE FROM {table} WHERE id IS ?", ((identity,) for identity in obsolete))
-        columns, values = fields, rows
+        columns = fields
+        values = (row for row in rows if row[0] is None or latest[row[0]] is row)
     names = ",".join(fields)
     excluded = ",".join(f"excluded.{field}" for field in fields)
     updates = ",".join(f"{field}=excluded.{field}" for field in fields)
