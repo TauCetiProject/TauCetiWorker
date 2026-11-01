@@ -269,6 +269,18 @@ class LiveTests(unittest.TestCase):
         output, _ = live.apply_overlay(fresh, self.view, {}, {}, NOW)
         self.assertEqual(self.total(output), 12)
 
+    def test_recovered_terminal_string_timestamp_can_mix_with_live_summary(self):
+        other = "b" * 32
+        self.view["sessions"][other] = {
+            **self.session,
+            "id": other,
+            "status": "settled",
+            "cost": "1",
+            "finished": str(NOW),
+        }
+        output, _ = live.apply_overlay(self.value, self.view, {}, {}, NOW)
+        self.assertEqual(output["all"]["costs"]["live_estimate"]["oldest_usage_at"], NOW - 120)
+
     def test_supervisor_terminal_view_is_retained_then_acknowledged(self):
         b = Budget(self.root / "budget", clock=lambda: NOW)
         b.configure(grant=100)

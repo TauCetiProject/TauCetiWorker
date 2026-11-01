@@ -264,6 +264,10 @@ def apply_overlay(value, view, inputs, previous, now, *, worker=None, scope=None
         if not baseline and base["ledger_sequence"] >= session["ledger_sequence"]:
             continue
         sample = estimates[key] if estimates is not None else estimate(session, baseline, inputs.get("rates", {}), now)
+        # Recovery persists Decimal interval endpoints as strings; summaries use
+        # JSON numbers. Keep the public timestamp type consistent across both.
+        if sample.get("observed_at") is not None:
+            sample = {**sample, "observed_at": float(sample["observed_at"])}
         if session["status"] != "settled":
             # An older optional summary may lag a newly prepared priced prefix.
             # Only a settled total may reduce already observed expenditure.
