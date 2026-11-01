@@ -82,7 +82,7 @@ For the first release, leave size extrapolation unavailable for resumes/replayed
 
 ## 2. Integrate the estimate into spending without double counting
 
-Keep the current recorded-usage rows and add an explicit **including live estimates** view for spending and its per-hour/per-worker-hour rates. Publish both values in JSON, with `live_observed_usd`, `live_unobserved_estimate_usd`, estimator provenance and observation timestamps. Display running partial usage separately from unresolved stopped accounting so normal live work does not look like a failed recovery.
+Include live estimates in the existing spending rows and their per-hour/per-worker-hour rates. Keep recorded and including-live values separate in JSON, with `live_observed_usd`, `live_unobserved_estimate_usd`, estimator provenance and observation timestamps. Healthy accounting adds no diagnostic lines; warn on unresolved stopped usage or stale live estimates, and omit an all-zero stopped-usage cost row.
 
 The existing prepared total already includes some live observed usage. Apply only the difference between each invocation's live total estimate and its contribution in the matching prepared baseline. Never add a second complete live total. Reservations remain excluded, and reporting heuristics never settle the ledger, release reservations or change funding/admission decisions.
 

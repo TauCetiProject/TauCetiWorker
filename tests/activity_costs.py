@@ -186,7 +186,8 @@ class CostTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
             a.display(cached)
-        self.assertIn("1 live; 1 settled estimates (1 recovered); 1 unresolved stopped", output.getvalue())
+        self.assertIn("Accounting: 1 stopped conversation with unresolved usage.", output.getvalue())
+        self.assertNotIn("settled estimates", output.getvalue())
 
     def test_all_fleet_costs_include_reviews_but_only_initiated_output_counts(self):
         s = self.summary()
@@ -243,6 +244,17 @@ class CostTests(unittest.TestCase):
         self.assertIn("recovered_estimates_usd", summary["costs"]["windows"]["24h"])
         lines = output.getvalue().splitlines()
         self.assertEqual(lines[lines.index(rows[-1]) + 1], "")
+
+    def test_zero_stopped_usage_is_hidden_but_unknown_or_nonzero_usage_is_visible(self):
+        summary = self.summary()
+        for value, visible in (("0", False), ("0.0001", True), (None, True)):
+            with self.subTest(value=value):
+                for row in summary["costs"]["windows"].values():
+                    row["unresolved_stopped_usd"] = "0"
+                summary["costs"]["windows"]["24h"]["unresolved_stopped_usd"] = value
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    a.display(dict(available=True, summary=summary))
+                self.assertEqual("API cost: stopped usage estimate" in output.getvalue(), visible)
 
     def test_old_prepared_windows_still_display_and_combine_without_io(self):
         summary = self.summary()
@@ -360,7 +372,7 @@ class CostTests(unittest.TestCase):
             )
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
-        self.assertIn("Spending (recorded usage)", output.getvalue())
+        self.assertIn("\nSpending ", output.getvalue())
         self.assertIn("API spend ($/elapsed hour)", output.getvalue())
         self.assertIn("Worker-hours recorded", output.getvalue())
         self.assertIn("$17.33", output.getvalue())

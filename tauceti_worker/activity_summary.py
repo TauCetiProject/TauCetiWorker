@@ -179,12 +179,12 @@ def display(value, default_kinds=()):
                 )
             )
     costs = s.get("costs", {})
-    spending_title = (
-        "Spending (recorded usage)" if costs.get("accounting_version", 1) >= 2 else "Spending (completed sessions)"
-    )
+    spending_title = "Spending" if costs.get("accounting_version", 1) >= 2 else "Spending (completed sessions)"
     spending_rows = []
     if costs.get("spending"):
-        spending = costs["spending"]
+        spending = {
+            w: costs.get("spending_including_live", {}).get(w, costs["spending"].get(w, {})) for w in report_windows
+        }
         hours = [spending.get(w, {}).get("worker_seconds") for w in report_windows]
         spending_rows = [
             (
@@ -207,19 +207,6 @@ def display(value, default_kinds=()):
             ),
             ("API spend ($/elapsed hour)", [amount(spending.get(w, {}).get("usd_per_hour")) for w in report_windows]),
         ]
-        if live := costs.get("spending_including_live"):
-            spending_rows.extend(
-                [
-                    (
-                        "With live estimates ($/worker-hour)",
-                        [amount(live.get(w, {}).get("usd_per_worker_hour")) for w in report_windows],
-                    ),
-                    (
-                        "With live estimates ($/elapsed hour)",
-                        [amount(live.get(w, {}).get("usd_per_hour")) for w in report_windows],
-                    ),
-                ]
-            )
     cost_rows = []
     loc_rows = []
     if costs.get("windows"):
@@ -237,7 +224,10 @@ def display(value, default_kinds=()):
             ),
         ):
             cost_rows.append((label, [amount(windows[w].get(key)) for w in cost_windows]))
-        if costs.get("accounting_version", 1) >= 3:
+        if costs.get("accounting_version", 1) >= 3 and any(
+            windows[w].get("unresolved_stopped_usd") is None or Decimal(windows[w]["unresolved_stopped_usd"]) != 0
+            for w in cost_windows
+        ):
             # Settled estimates are already in completed sessions; recovered
             # estimates are a subset of those. Only stopped usage adds a component.
             cost_rows.append(
@@ -283,7 +273,7 @@ def display(value, default_kinds=()):
                 )
             )
     label_width = max(
-        len("Spending (recorded usage)"),
+        len(spending_title),
         *(len(label) for label, _ in [*rounds, *prs, *ci_rows, *cost_rows, *loc_rows, *spending_rows]),
     )
     headers = tuple("All time" if w == "total" else w for w in report_windows)
@@ -310,31 +300,15 @@ def display(value, default_kinds=()):
         print(f"\nReview Git claims (24h): {local.get('git_held', 0)} held / {local['started']} starts")
     if spending_rows:
         table(spending_title, headers, spending_rows, widths)
-    if spending_rows and costs.get("quality") and costs.get("accounting_version", 1) >= 2:
-        q = costs["quality"]
-        partial = (
-            "Running conversations include partial usage."
-            if costs.get("accounting_version", 1) >= 3
-            else f"{q.get('incomplete', 0)} conversations have incomplete usage."
-        )
-        print(
-            "Costs: native totals where available; token/interval estimates otherwise. "
-            + partial
-            + " Reservations excluded."
-        )
     if live := costs.get("live_estimate"):
         age = max(0, int(time.time() - min(live["observed_at"], live.get("session_observed_at", live["observed_at"]))))
-        print(
-            f"Live estimates: updated {age}s ago"
-            + (" (stale)" if age > 180 or live.get("stale") else "")
-            + "; observed usage plus journal-size extrapolation; reservations excluded."
-        )
+        if age > 180 or live.get("stale"):
+            print(f"Live estimates stale: updated {age}s ago.")
     if spending_rows and costs.get("accounting_version", 1) >= 3:
-        q = costs["accounting"]
-        print(
-            f"Accounting: {q.get('live', 0)} live; {q.get('settled_estimates', 0)} settled estimates "
-            f"({q.get('recovered_estimates', 0)} recovered); {q.get('unresolved_stopped', 0)} unresolved stopped."
-        )
+        if unresolved := costs.get("accounting", {}).get("unresolved_stopped", 0):
+            print(
+                f"Accounting: {unresolved} stopped conversation{'s' if unresolved != 1 else ''} with unresolved usage."
+            )
     if cost_rows:
         cost_headers = tuple({"7d": "7 days", "total": "All time"}.get(w, w) for w in cost_windows)
         cost_widths = [

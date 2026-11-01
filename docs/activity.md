@@ -49,7 +49,9 @@ recorded` adds time across completed and currently running native rounds, clippe
 to each window. Capacity/budget/quota waiting and interruptions without a known
 end do not inflate it. Failed rounds with recorded durations still count. The
 report shows worker-hours first, then API dollars per worker-hour (accrued
-spending divided by worker-hours) and API dollars per elapsed hour. Active-session
+spending divided by worker-hours) and API dollars per elapsed hour. Both spending
+rows include the minute-scale live estimate when available, falling back to
+recorded usage for older snapshots. Active-session
 cost reservations do not enter either spending rate. Zero recorded worker-hours
 leave the worker-hour rate unavailable.
 Fleet averages pool spending over the longest recorded
@@ -64,10 +66,13 @@ on PRs initiated elsewhere. Native final costs correct response-level estimates 
 ongoing sessions use recorded usage, shown separately as running usage.
 Legacy costs without response timing are spread over their conversation duration. These are API costs,
 not machine charges or subscription fees. Reading the ledger never changes it.
-The cost breakdown lists completed sessions, live usage, stopped usage estimates,
-then the estimated total. Settled estimates already belong to completed sessions;
+The cost breakdown lists completed sessions, live usage, and the estimated total.
+Unresolved stopped usage estimates appear only when nonzero or unavailable;
+an all-zero row is omitted. Settled estimates already belong to completed sessions;
 recovered estimates are a subset of those. These diagnostic subsets remain in JSON
 but are omitted from the display to avoid suggesting they should be added again.
+Healthy accounting adds no diagnostic lines. Unresolved stopped conversations
+and stale live estimates still produce warnings.
 
 The 24-hour and seven-day denominators contain only PRs initiated within their respective windows;
 all-time contains all retained initiated PRs. Each verified landed PR contributes
@@ -193,8 +198,9 @@ cache). Reporting never downloads or refreshes that database.
 ## Accrued spending
 
 Spending rows use recorded usage from running, completed and interrupted
-conversations. Admission reservations are excluded. The existing rows show one
-estimated rate in each 3h/24h/7d/All-time window, followed by a compact quality note.
+conversations, including the cached live adjustment for usage not yet in the
+historical baseline. Admission reservations are excluded. The existing rows show
+one estimated rate in each 1h/3h/24h/7d/All-time window.
 Worker-hours sum recorded work intervals; elapsed hours measure the covered
 wall-clock interval. Fleet rates pool dollars and worker-hours before dividing;
 elapsed time is shared across machines, not summed.
