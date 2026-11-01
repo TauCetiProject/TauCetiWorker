@@ -26,8 +26,10 @@ def install(db):
         recovered_estimates INTEGER,unresolved_stopped INTEGER);
       CREATE TABLE IF NOT EXISTS cost_accruals(
         id TEXT,worker TEXT,scope TEXT,started REAL,finished REAL,cost TEXT,quality TEXT,active INTEGER);
-      CREATE INDEX IF NOT EXISTS accrual_scope ON cost_accruals(scope,started);
-      CREATE INDEX IF NOT EXISTS accrual_worker ON cost_accruals(worker,started);
+      CREATE INDEX IF NOT EXISTS accrual_scope_covering ON cost_accruals(scope,started,id,finished,cost,active);
+      DROP INDEX IF EXISTS accrual_scope;
+      CREATE INDEX IF NOT EXISTS accrual_worker_covering ON cost_accruals(worker,started,id,finished,cost,active);
+      DROP INDEX IF EXISTS accrual_worker;
       CREATE INDEX IF NOT EXISTS cost_scope ON conversation_costs(scope,settled);
       CREATE INDEX IF NOT EXISTS cost_worker ON conversation_costs(worker,settled);
       CREATE INDEX IF NOT EXISTS quality_worker ON conversation_quality(worker,native,estimated,incomplete);
@@ -243,8 +245,11 @@ def summarize(db, now, cutoff, column=None, identity=None):
     failure = db.execute("SELECT value FROM meta WHERE key='activity_cost_error'").fetchone()
     # Every window summarizes the same immutable prepared rows. Read them once
     # per summary instead of repeatedly walking SQLite and its page cache.
+    # Preserve the previous rowid/table or (identity,started,rowid) index order,
+    # including timestamp ties, so query-plan changes cannot reorder Decimal sums.
+    ordering = "started,rowid" if column else "rowid"
     accruals = db.execute(
-        f"SELECT id,started,finished,cost,active FROM cost_accruals WHERE started<=? AND finished IS NOT NULL {where}",
+        f"SELECT id,started,finished,cost,active FROM cost_accruals WHERE started<=? AND finished IS NOT NULL {where} ORDER BY {ordering}",
         [now, *args],
     ).fetchall()
     estimates = {"settled_estimates": set(), "recovered_estimates": set()}

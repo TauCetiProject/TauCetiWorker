@@ -191,6 +191,8 @@ def _connect():
       CREATE INDEX IF NOT EXISTS round_worker_covering ON rounds(worker,finished,started,outcome,kind);
       DROP INDEX IF EXISTS round_worker;
       CREATE INDEX IF NOT EXISTS round_scope ON rounds(scope,finished);
+      CREATE INDEX IF NOT EXISTS round_interrupted ON rounds(outcome,started DESC,id DESC,worker,scope)
+        WHERE outcome='interrupted-unfinished';
       CREATE TABLE IF NOT EXISTS prs(repo TEXT,number INTEGER,worker TEXT,scope TEXT,created REAL,
         state TEXT,landed REAL,observed REAL,checked REAL,head TEXT,source TEXT,PRIMARY KEY(repo,number));
       CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY,inode INTEGER,offset INTEGER);
@@ -209,8 +211,10 @@ def _connect():
     db.executescript("""
       CREATE TABLE IF NOT EXISTS pr_contributions(id TEXT PRIMARY KEY,repo TEXT,number INTEGER,
         worker TEXT,scope TEXT,at REAL,activity TEXT);
-      CREATE INDEX IF NOT EXISTS contribution_scope ON pr_contributions(scope,at);
-      CREATE INDEX IF NOT EXISTS contribution_worker ON pr_contributions(worker,at);
+      CREATE INDEX IF NOT EXISTS contribution_scope_covering ON pr_contributions(scope,at,id,repo,number,worker,activity);
+      DROP INDEX IF EXISTS contribution_scope;
+      CREATE INDEX IF NOT EXISTS contribution_worker_covering ON pr_contributions(worker,at,id,repo,number,scope,activity);
+      DROP INDEX IF EXISTS contribution_worker;
       CREATE TABLE IF NOT EXISTS pr_loc(repo TEXT,number INTEGER,head TEXT,added INTEGER,deleted INTEGER,
         observed REAL,PRIMARY KEY(repo,number));
       CREATE TABLE IF NOT EXISTS pr_observations(repo TEXT,number INTEGER,state TEXT,created REAL,
