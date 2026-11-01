@@ -472,6 +472,45 @@ class CostTests(unittest.TestCase):
             # usage are still fully checked, with no derived table rewrites.
             self.assertEqual(db.total_changes - before, 1)
 
+    def test_summary_indexes_cover_queries_after_legacy_upgrade(self):
+        for upgrade in (False, True):
+            if upgrade:
+                with contextlib.closing(a._connect()) as db, db:
+                    for name in (
+                        "round_worker_covering",
+                        "quality_worker",
+                        "accounting_worker",
+                        "accounting_estimates",
+                    ):
+                        db.execute(f"DROP INDEX {name}")
+                    db.execute("CREATE INDEX round_worker ON rounds(worker,finished)")
+            with contextlib.closing(a._connect()) as db:
+                self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='round_worker'").fetchone())
+                for index, query, args in (
+                    (
+                        "round_worker_covering",
+                        "SELECT started,finished FROM rounds WHERE started<=? AND (finished>=? OR finished IS NULL) AND COALESCE(outcome,'') NOT IN ('waiting','interrupted-unfinished') AND worker=?",
+                        (self.now, 0, "author"),
+                    ),
+                    (
+                        "quality_worker",
+                        "SELECT SUM(native),SUM(estimated),SUM(incomplete) FROM conversation_quality WHERE worker=?",
+                        ("author",),
+                    ),
+                    (
+                        "accounting_worker",
+                        "SELECT SUM(live),SUM(settled_estimates),SUM(recovered_estimates),SUM(unresolved_stopped) FROM conversation_accounting WHERE worker=?",
+                        ("author",),
+                    ),
+                    (
+                        "accounting_estimates",
+                        "SELECT id,settled_estimates,recovered_estimates FROM conversation_accounting WHERE id IS NOT NULL AND (settled_estimates=1 OR recovered_estimates=1)",
+                        (),
+                    ),
+                ):
+                    plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query, args)]
+                    self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
+
     def test_prepared_row_reconciliation_matches_full_replacement(self):
         initial = {
             "conversation_costs": [
