@@ -405,6 +405,53 @@ class CostTests(unittest.TestCase):
             rows = activity_costs.summarize(db, self.now, self.now - 10 * DAY, "scope", "machine")["spending"]
             self.assertTrue(all(row["usd_per_worker_hour"] is None for row in rows.values()))
 
+    def test_summary_read_sets_preserve_scope_time_and_estimate_filters(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("DELETE FROM cost_accruals")
+            db.execute("DELETE FROM conversation_accounting")
+            for invocation, worker, scope, start, finish, cost, active in (
+                ("point", "author", "machine", -100, -100, "2", 0),
+                ("interval", "author", "machine", -7200, 0, "4", 1),
+                ("recovered", "author", "machine", -50, -50, "3", 0),
+                ("other-worker", "peer", "machine", -100, -100, "8", 0),
+                ("other-scope", "author", "elsewhere", -100, -100, "16", 0),
+                ("old", "author", "machine", -7201, -7201, "64", 0),
+                ("future", "author", "machine", 50, 100, "128", 0),
+                ("missing-end", "author", "machine", -1, None, "256", 0),
+            ):
+                db.execute(
+                    "INSERT INTO cost_accruals VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        invocation,
+                        worker,
+                        scope,
+                        self.now + start,
+                        self.now + finish if finish is not None else None,
+                        cost,
+                        "native-allocated",
+                        active,
+                    ),
+                )
+            for invocation, settled, recovered in (("point", 1, 0), ("recovered", 1, 1), ("other-worker", 1, 2)):
+                db.execute(
+                    "INSERT INTO conversation_accounting VALUES (?, 'author', 'machine', 0, ?, ?, 0)",
+                    (invocation, settled, recovered),
+                )
+            for column, identity, completed, total, estimated in (
+                ("scope", "machine", 13, 15, 13),
+                ("worker", "author", 21, 23, 5),
+                (None, None, 29, 31, 13),
+            ):
+                value = activity_costs.summarize(db, self.now, self.now - 3600, column, identity)
+                for window in value["windows"].values():
+                    self.assertEqual(Decimal(window["spent_usd"]), completed)
+                    self.assertEqual(Decimal(window["active_accrued_usd"]), 2)
+                    self.assertEqual(Decimal(window["estimated_usd"]), total)
+                    self.assertEqual(Decimal(window["settled_estimates_usd"]), estimated)
+                    self.assertEqual(Decimal(window["recovered_estimates_usd"]), 3)
+                for window in value["spending"].values():
+                    self.assertEqual(Decimal(window["spent_usd"]), total)
+
     def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
         s = self.summary()
         other = json.loads(json.dumps(s))
