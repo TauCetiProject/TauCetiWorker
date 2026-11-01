@@ -79,6 +79,7 @@ def prepare(db, now, scope_for_worker):
             if event["type"] == "settle":
                 settled_at.setdefault(event["id"], record["timestamp"])
     rows, accruals, quality_rows, accounting_rows, seen = [], [], [], [], set()
+    scopes = {}
     for identity, session in sorted(state["sessions"].items(), key=lambda pair: pair[1]["started"]):
         settled = session["status"] == "settled"
         value = session.get("cost", "0")
@@ -100,7 +101,10 @@ def prepare(db, now, scope_for_worker):
         native = settled and source == "native-reported"
         if not settled:
             value = str(max(money(value), total, money(session.get("lower_bound_cost", "0"))))
-        scope = scope_for_worker(session["worker"])
+        worker = session["worker"]
+        if worker not in scopes:
+            scopes[worker] = scope_for_worker(worker)
+        scope = scopes[worker]
         incomplete = not settled and (
             not saved
             or not saved["closed"]
@@ -171,7 +175,7 @@ def prepare(db, now, scope_for_worker):
             (
                 identity,
                 session["worker"],
-                scope_for_worker(session["worker"]),
+                scope,
                 session["started"],
                 settled_at[identity] if settled else None,
                 value,
