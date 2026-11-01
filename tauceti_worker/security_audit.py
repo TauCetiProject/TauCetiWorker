@@ -1384,18 +1384,6 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     log(f"security-audit: isolated reviewer {provider}/{model}")
     try:
         if any(c["files"] for c in batch["commits"]):
-            if opts.claude_bootstrap and provider == "claude":
-                from .quota import Quota
-
-                status = Quota(cfg).authorize_claude_launch()
-                if not status.available:
-                    from .loop import _ignore_quota_verdict
-
-                    if not (
-                        getattr(opts, "ignore_quota", False)
-                        and _ignore_quota_verdict(None, status) == "telemetry-unavailable"
-                    ):
-                        raise NoProgress("security-audit: Claude quota unavailable")
             verdict = inspect(batch, provider, attempt)
         else:
             verdict = {

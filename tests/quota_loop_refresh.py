@@ -59,7 +59,6 @@ payload = {
 q = tc.Quota.__new__(tc.Quota)
 q.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-stub-"))
 q._cached_claude = lambda _fp: (payload, time.time() - tc.CLAUDE_USAGE_REFRESH_S - 1)
-q._idle_notes = lambda _readings: ({}, False)
 stores = []
 q._store_raw = lambda *args: stores.append(args)
 http_calls = []
@@ -154,7 +153,6 @@ print(
 # that has to carry the instant — and the entries that must not be believed at all.
 cache = tc.Quota.__new__(tc.Quota)
 cache.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-cache-"))
-cache._idle_notes = lambda _readings: ({}, False)
 try:
     cache._store_raw("claude", stale, "fp", time.time() + 7200, fetched_at)
     served = cache._cached_claude("fp")
@@ -289,12 +287,12 @@ status_ok = (
 print(f"[{'OK ' if status_ok else 'XX '}] backoff preserves the child diagnostic: {backoff['detail']!r}")
 
 # An automatic worker must keep polling an unresolved alternative provider even when the other
-# provider has a known, distant pacing recovery. The Claude bootstrap may become visible on the very
+# provider has a known, distant pacing recovery. A blocked idle window may change on the very
 # next read; Codex's weekly pacing clock says nothing about when that will happen.
 wait_at = time.time()
 waiting_cases = [
     (
-        "an idle alternative keeps the normal poll",
+        "a startup-blocked idle alternative keeps the normal poll",
         "auto",
         {
             "codex": tc.Provider("codex", False, None, next_eligible=wait_at + 10 * 3600),
@@ -302,7 +300,16 @@ waiting_cases = [
                 "claude",
                 False,
                 None,
-                [tc.Window("session", None, None, None, "idle", detail="bootstrap attempted; awaiting fresh usage")],
+                [
+                    tc.Window(
+                        "session",
+                        None,
+                        None,
+                        None,
+                        "idle-blocked",
+                        detail="pace budget stays 0% through 90% of the window",
+                    )
+                ],
             ),
         },
         tc.POLL,
@@ -443,7 +450,6 @@ print(
 def cooldown_quota(prefix):
     q = tc.Quota.__new__(tc.Quota)
     q.cache_dir = Path(tempfile.mkdtemp(prefix=f"tauceti-quota-{prefix}-"))
-    q._idle_notes = lambda _readings: ({}, False)
     return q
 
 

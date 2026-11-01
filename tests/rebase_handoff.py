@@ -250,6 +250,7 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         with (
             patch.object(work_units, "run_in_bubble", return_value=0) as agent,
             patch.object(work_units, "me", return_value="me"),
+            patch.object(gh, "pr_view", return_value=raw),
         ):
             assert (
                 work_units._do_fixlike(

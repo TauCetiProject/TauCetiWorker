@@ -381,9 +381,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "credential rejection and malformed usage still block (needs an explicit --agent codex|claude)",
     )
     p.add_argument("--loop-paced", action="store_true", help=argparse.SUPPRESS)
-    # Internal: the loop sets this on a round it selected while a Claude window was reset-but-unopened.
-    # It authorizes the round's launch stage to spend ONE small claude request to open that window,
-    # once it has actually found work; it is not a way to bypass pacing (see Quota.authorize_claude_launch).
+    # Accepted for older loop parents; new rounds ignore this retired internal flag.
     p.add_argument(
         "--claude-bootstrap",
         dest="claude_bootstrap",
@@ -1491,9 +1489,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
         # rather than refuse the round on a cached verdict that may be an hour old.
         if api_mode():
-            work_model, pending_init = "claude", False
+            work_model = "claude"
         else:
-            work_model, pending_init = resolve_work_model(
+            work_model = resolve_work_model(
                 cfg,
                 agent,
                 dry=dry,
@@ -1519,9 +1517,6 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             sandbox_host=not getattr(args, "bubble", False),
             dry_run=dry,
             source=source,
-            # Either the pacer just selected Claude on an unopened window (one-shot), or the loop did
-            # and passed the authorization down (--claude-bootstrap). Same launch-stage gate either way.
-            claude_bootstrap=pending_init or getattr(args, "claude_bootstrap", False),
             authoring_profile=authoring_profile,
             account=getattr(args, "account", None),
             review_min_queue=review_min_queue,

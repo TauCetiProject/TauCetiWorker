@@ -569,7 +569,7 @@ def test_failed_baseline_still_notices_real_credential_race():
         assert len(f.calls) == 1
 
 
-def test_empty_bootstrap_period_is_not_a_change():
+def test_unrelated_clock_period_is_not_a_change():
     with fixture(agent="claude") as f:
         f.clock.now += 17900
         select(f, "claude")
@@ -616,8 +616,34 @@ def test_pending_attempt_survives_two_failed_reads():
         http.assert_not_called()
 
 
+def test_shared_idle_recovery_and_refusal_expiry():
+    with fixture(agent="claude") as f:
+        assert select(f, "claude")[0] is None
+
+        def idle_publication():
+            q = quota.Quota(f.cfg)
+            body = claude_payload(f.clock.now)
+            body["five_hour"] = None
+            q._store_raw("claude", body, q._fingerprint("A"), f.clock.now + 3600)
+
+        f.clock.events.append((50, idle_publication))
+        with patch.object(quota, "_http_get_json", side_effect=AssertionError("cached recovery must not fetch")):
+            f.wait.wait()
+            assert 50 <= f.clock.mono <= 80
+            assert select(f, "claude")[0] == "claude"
+            q = quota.Quota(f.cfg)
+            q.note_model_refusal("claude", q.launch_credential("claude"))
+            assert select(f, "claude")[1]["claude"].model_refusal
+            before = f.clock.mono
+            f.wait.wait()
+            assert f.clock.mono - before >= quota.RATE_LIMIT_RECHECK_MAX_S
+            assert select(f, "claude")[0] == "claude"
+        assert len(f.calls) == 1
+
+
 if __name__ == "__main__":
     for test in (
+        test_shared_idle_recovery_and_refusal_expiry,
         test_original_deadline_and_no_side_effects,
         test_shared_recovery,
         lambda: test_shared_recovery(isolated=True),
@@ -642,7 +668,7 @@ if __name__ == "__main__":
         lambda: test_concurrent_recovery_attempt_counts(cacheable=False),
         test_conflicting_stores_keep_effective_authority,
         test_failed_baseline_still_notices_real_credential_race,
-        test_empty_bootstrap_period_is_not_a_change,
+        test_unrelated_clock_period_is_not_a_change,
         test_pending_hint_survives_transient_prepare_failure,
         lambda: test_outer_loop_reaches_launch(stop_wait=True),
         test_pending_attempt_survives_two_failed_reads,
