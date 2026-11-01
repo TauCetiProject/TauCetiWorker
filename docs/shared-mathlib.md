@@ -118,9 +118,11 @@ without reserving hundreds of GiB for an idle admission threshold.
 
 The existing activity preparer collects small local preparation receipts. Status
 reads only that prepared summary, including sharing/private modes, cache hits,
-preparation time and fallback reasons. A mounted overlay remains "preparing"
-until cache warming succeeds; a failed warmer is reported as blocked and never
-starts inference. `results.jsonl` in the pool contains
+preparation time and fallback reasons. Diagnostic messages are labeled by build
+state. Private fallback reports when the Mathlib checkout was absent; routine
+shared-view release messages are omitted because the idle count already covers
+them. A mounted overlay remains "preparing" until cache warming succeeds; a failed
+warmer is reported as blocked and never starts inference. `results.jsonl` in the pool contains
 content-free coding invocation results, cleanup phase receipts and native round IDs
 for joining the existing round/phase/resource records. A released shared view
 becomes idle rather than continuing to count as a current shared worker. Cleanup
