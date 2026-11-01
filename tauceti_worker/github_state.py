@@ -215,20 +215,56 @@ def refresh_pr(repo: str, number: int, expected: str, observed: str = "") -> dic
         )
         with urllib.request.urlopen(request, timeout=20) as response:
             result = json.load(response)
-        if not isinstance(result, dict) or result.get("repository") != repo or result.get("operation") != "pr":
+        if (
+            not isinstance(result, dict)
+            or result.get("version") != 1
+            or result.get("repository") != repo
+            or result.get("operation") != "pr"
+        ):
             return unavailable
         if (
             result.get("status") == "ok"
+            and result.get("complete") is True
             and isinstance(result.get("data"), dict)
             and result["data"].get("number") == number
+            and re.fullmatch(r"[a-f0-9]{40}", str(result["data"].get("headRefOid", "")))
         ):
-            return dict(status="ok", data=result["data"])
+            outcome = result.get("outcome")
+            if outcome not in ("refreshed", "already-changed", "recently-verified"):
+                return unavailable
+            return dict(status="ok", data=result["data"], outcome=outcome)
         retry = result.get("retry_at")
         retry = retry / 1000 if isinstance(retry, (int, float)) and math.isfinite(retry) else unavailable["retry_at"]
-        return {**unavailable, "retry_at": min(time.time() + MAX_RETRY_AFTER, max(time.time() + 1, retry))}
+        reason = result.get("reason")
+        if reason not in (
+            "refresh_unavailable",
+            "refresh_failed",
+            "refresh_timeout",
+            "superseded",
+            "capacity",
+            "secondary",
+            "primary:core",
+            "primary:graphql",
+            "primary",
+        ):
+            reason = "refresh_unavailable"
+        return {
+            **unavailable,
+            "reason": reason,
+            "retry_at": min(time.time() + MAX_RETRY_AFTER, max(time.time() + 1, retry)),
+        }
     except urllib.error.HTTPError as error:
+        reason = (
+            "refresh_unsupported"
+            if error.code in (400, 404, 405)
+            else "refresh_auth_required"
+            if error.code in (401, 403)
+            else "refresh_http_error"
+        )
         error.close()
-        return unavailable
+        return {**unavailable, "reason": reason}
+    except TimeoutError:
+        return {**unavailable, "reason": "refresh_timeout"}
     except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException, StateQueryError):
         return unavailable
 

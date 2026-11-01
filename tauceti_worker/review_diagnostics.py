@@ -324,9 +324,19 @@ def refund_stale_head_errors(state: Path, counters) -> None:
             attempts = value.get("attempts", [])
             if not isinstance(attempts, list):
                 continue
+
+            def proved_stale(attempt, pr=pr):
+                if not isinstance(attempt, dict) or attempt.get("code") != 1 or attempt.get("category") != "stale-head":
+                    return False
+                match = re.match(
+                    rf"tauceti-review: PR #{pr} head is ([0-9a-f]{{7,40}}), expected ([0-9a-f]{{7,40}})\b",
+                    str(attempt.get("summary", "")),
+                )
+                return bool(match and match[1] != match[2])
+
             pending = value.get("stale_head_refund")
             if not isinstance(pending, dict):
-                count = sum(isinstance(a, dict) and a.get("category") == "stale-head" for a in attempts)
+                count = sum(proved_stale(a) for a in attempts)
                 if not count:
                     continue
                 before = counters.read(f"review-err-{pr}")
@@ -343,7 +353,7 @@ def refund_stale_head_errors(state: Path, counters) -> None:
                 continue
             if counters.read(f"review-err-{pr}") == before:
                 counters.write(f"review-err-{pr}", after)
-            value["attempts"] = [a for a in attempts if not isinstance(a, dict) or a.get("category") != "stale-head"]
+            value["attempts"] = [a for a in attempts if not proved_stale(a)]
             value.pop("stale_head_refund", None)
             atomic_json(path, value)
         except (OSError, ValueError, TypeError):

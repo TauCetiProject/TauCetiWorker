@@ -26,12 +26,20 @@ def repair_selected(w, candidate, observed: str = "") -> None:
     with contextlib.suppress(OSError):
         w.counters.write(key, int(time.time()) + 30)
     result = github_state.refresh_pr(TAUCETI, candidate.pr, candidate.head, observed)
-    retry = result.get("retry_at", time.time() + (1 if result.get("status") == "ok" else 30))
+    confirmed_same_head = (
+        result.get("status") == "ok"
+        and result.get("data", {}).get("headRefOid") == candidate.head
+        and observed != candidate.head
+    )
+    delay = github_state.MAX_RETRY_AFTER if confirmed_same_head else (1 if result.get("status") == "ok" else 30)
+    retry = result.get("retry_at", time.time() + delay)
     with contextlib.suppress(OSError):
         w.counters.write(key, int(retry) + 1)
     if getattr(w, "rs", None) is not None:
         with contextlib.suppress(OSError):
             w.rs.bust(candidate.pr)
     log(
-        f"  PR #{candidate.pr}: selected state changed; shared refresh {result.get('status', 'unavailable')}; selecting other work"
+        f"  PR #{candidate.pr}: selected state changed; shared refresh "
+        f"{result.get('outcome') or result.get('reason') or result.get('status', 'unavailable')}"
+        f"{' (repeat head mismatch)' if confirmed_same_head else ''}; selecting other work"
     )

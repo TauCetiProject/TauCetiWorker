@@ -43,7 +43,9 @@ class StateRepair(unittest.TestCase):
     def test_refresh_does_not_touch_shared_circuit_or_retry_after(self):
         token = self.root / "token"
         token.write_text("private-test-token")
-        result = dict(repository=TAUCETI, operation="pr", status="unavailable", retry_at=(time.time() + 3600) * 1000)
+        result = dict(
+            version=1, repository=TAUCETI, operation="pr", status="unavailable", retry_at=(time.time() + 3600) * 1000
+        )
         response = io.BytesIO(json.dumps(result).encode())
         previous = state.last_failure()
         with (
@@ -130,7 +132,19 @@ class StateRepair(unittest.TestCase):
         target.write_text(
             json.dumps(
                 dict(
-                    attempts=[dict(category="stale-head"), dict(category="review-engine"), dict(category="stale-head")]
+                    attempts=[
+                        dict(
+                            category="stale-head",
+                            code=1,
+                            summary=f"tauceti-review: PR #7 head is {NEW[:12]}, expected {HEAD[:12]}",
+                        ),
+                        dict(category="review-engine"),
+                        dict(
+                            category="stale-head",
+                            code=1,
+                            summary=f"tauceti-review: PR #7 head is {NEW[:12]}, expected {HEAD[:12]}",
+                        ),
+                    ]
                 )
             )
         )
@@ -164,6 +178,31 @@ class StateRepair(unittest.TestCase):
             self.assertRaises(ClaimCollision),
         ):
             work.run_round(self.w, opts)
+
+    def test_genuine_errors_with_generic_head_words_are_not_refunded(self):
+        attempts = [
+            dict(category="stale-head", code=1, summary="expected head field in provider response"),
+            dict(category="stale-head", code=2, summary=f"tauceti-review: PR #7 head is {NEW}, expected {HEAD}"),
+        ]
+        path = self.root / "review-failure-7.json"
+        path.write_text(json.dumps(dict(attempts=attempts)))
+        self.counters.write("review-err-7", 2)
+        diagnostics.refund_stale_head_errors(self.root, self.counters)
+        self.assertEqual(self.counters.read("review-err-7"), 2)
+        self.assertEqual(json.loads(path.read_text())["attempts"], attempts)
+
+    def test_repeated_upstream_disagreement_has_a_bounded_slow_retry(self):
+        with (
+            patch.object(
+                state,
+                "refresh_pr",
+                return_value=dict(status="ok", outcome="recently-verified", data=dict(headRefOid=HEAD)),
+            ),
+            patch.object(state_repair, "log") as log,
+        ):
+            state_repair.repair_selected(self.w, Candidate(7, HEAD), NEW)
+        self.assertGreater(self.counters.read(state_repair.retry_key(7, HEAD)), time.time() + 250)
+        self.assertIn("repeat head mismatch", log.call_args.args[0])
 
 
 if __name__ == "__main__":
