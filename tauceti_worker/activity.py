@@ -187,10 +187,12 @@ def _connect():
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,worker TEXT,scope TEXT,kind TEXT,
         started REAL,finished REAL,outcome TEXT,pid INTEGER,identity TEXT,hostname TEXT);
-      CREATE INDEX IF NOT EXISTS round_finish ON rounds(finished,kind);
+      CREATE INDEX IF NOT EXISTS round_finish_covering ON rounds(finished,kind,started,outcome,worker);
+      DROP INDEX IF EXISTS round_finish;
       CREATE INDEX IF NOT EXISTS round_worker_covering ON rounds(worker,finished,started,outcome,kind);
       DROP INDEX IF EXISTS round_worker;
-      CREATE INDEX IF NOT EXISTS round_scope ON rounds(scope,finished);
+      CREATE INDEX IF NOT EXISTS round_scope_covering ON rounds(scope,finished,started,outcome,kind,worker);
+      DROP INDEX IF EXISTS round_scope;
       CREATE INDEX IF NOT EXISTS round_interrupted ON rounds(outcome,started DESC,id DESC,worker,scope)
         WHERE outcome='interrupted-unfinished';
       CREATE TABLE IF NOT EXISTS prs(repo TEXT,number INTEGER,worker TEXT,scope TEXT,created REAL,
