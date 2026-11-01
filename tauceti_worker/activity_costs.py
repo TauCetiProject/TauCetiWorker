@@ -211,17 +211,31 @@ def summarize(db, now, cutoff, column=None, identity=None):
     funding_row = db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()
     funding = json.loads(funding_row[0]) if funding_row else None
     failure = db.execute("SELECT value FROM meta WHERE key='activity_cost_error'").fetchone()
+    # Every window summarizes the same immutable prepared rows. Read them once
+    # per summary instead of repeatedly walking SQLite and its page cache.
+    accruals = db.execute(
+        f"SELECT id,started,finished,cost,active FROM cost_accruals WHERE started<=? AND finished IS NOT NULL {where}",
+        [now, *args],
+    ).fetchall()
+    estimates = {"settled_estimates": set(), "recovered_estimates": set()}
+    for invocation, settled, recovered in db.execute(
+        "SELECT id,settled_estimates,recovered_estimates FROM conversation_accounting WHERE id IS NOT NULL AND (settled_estimates=1 OR recovered_estimates=1)"
+    ):
+        if settled == 1:
+            estimates["settled_estimates"].add(invocation)
+        if recovered == 1:
+            estimates["recovered_estimates"].add(invocation)
 
     def accrued(since, active=None, accounting_kind=None):
-        query = f"SELECT started,finished,cost FROM cost_accruals WHERE finished>=? AND started<=? {where}"
-        values = [since, now, *args]
-        if active is not None:
-            query += " AND active=?"
-            values.append(active)
-        if accounting_kind:
-            query += f" AND id IN (SELECT id FROM conversation_accounting WHERE {accounting_kind}=1)"
         total = Decimal(0)
-        for start, finish, cost in db.execute(query, values):
+        for invocation, start, finish, cost, kind in accruals:
+            if active is not None and kind != active:
+                continue
+            if accounting_kind and invocation not in estimates[accounting_kind]:
+                continue
+            # Preserve Decimal string precision by excluding older rows entirely.
+            if finish < since:
+                continue
             if start == finish:
                 if since <= start <= now:
                     total += money(cost)
@@ -249,6 +263,11 @@ def summarize(db, now, cutoff, column=None, identity=None):
             0
         ]
     spending = {}
+    begin = recorded_since if recorded_since is not None else now
+    rounds = db.execute(
+        f"SELECT started,finished FROM rounds WHERE started<=? AND (finished>=? OR finished IS NULL) AND COALESCE(outcome,'') NOT IN ('waiting','interrupted-unfinished') {where}",
+        [now, begin, *args],
+    ).fetchall()
     for key, seconds in SPENDING_WINDOWS.items():
         since = (
             max(recorded_since, now - seconds) if seconds is not None and recorded_since is not None else recorded_since
@@ -258,10 +277,6 @@ def summarize(db, now, cutoff, column=None, identity=None):
         # Existing native round intervals record work, rather than the lifetime
         # of wrappers that may be waiting for capacity, budget or GitHub.
         begin = since if since is not None else now
-        rounds = db.execute(
-            f"SELECT started,finished FROM rounds WHERE started<=? AND (finished>=? OR finished IS NULL) AND COALESCE(outcome,'') NOT IN ('waiting','interrupted-unfinished') {where}",
-            [now, begin, *args],
-        )
         worker_seconds = sum(
             max(0, min(finished if finished is not None else now, now) - max(started, begin))
             for started, finished in rounds
