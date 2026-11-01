@@ -738,3 +738,12 @@ GitHub transport state (shared cache, cooldowns and pending publications) lives 
 independently of the installed worker version. `TAUCETI_GITHUB_SHARED_DIR` overrides
 this location. Comment writes are spaced across workers sharing a GitHub identity;
 secondary throttling backs off without discarding completed agent output.
+
+Plain `gh pr view --repo OWNER/REPO --json ...` scalar metadata reads also use
+the configured shared state service. Unsupported fields, formatting options,
+unavailable service data, and explicit direct-read contexts retain the normal
+CLI path. Exact-head review claims are checked as a read-only hint before
+preflight API reads; the engine still acquires and validates its existing claim.
+Request diagnostics include JSON field names and distinguish closed-PR history
+scans from open inventories. Progress batches complete labelled histories with
+independent cursors rather than caching a potentially incomplete reporting window.

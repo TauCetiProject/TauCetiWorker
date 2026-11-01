@@ -577,6 +577,58 @@ def parse_trace(stderr: str, *, identity=None, records=None) -> str:
     return "".join(clean)
 
 
+def shared_pr_view(args):
+    """Serve scalar metadata from the existing mirror; retain CLI fallback.
+
+    Nested CLI DTOs and complete check rollups have different contracts.
+    """
+    if (
+        direct_reads()
+        or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1"
+        or os.environ.get("GH_HOST", "github.com") != "github.com"
+        or args[:2] != ["pr", "view"]
+    ):
+        return None
+    repo, number, fields = None, None, None
+    i = 2
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--repo", "-R", "--json") and i + 1 < len(args):
+            if arg == "--json":
+                fields = args[i + 1].split(",")
+            else:
+                repo = args[i + 1]
+            i += 2
+        elif number is None and re.fullmatch(r"[1-9][0-9]*", arg):
+            number = int(arg)
+            i += 1
+        else:
+            return None  # Formatting, URL targets and extra CLI options keep their existing semantics.
+    if (
+        not repo
+        or not number
+        or not fields
+        or not set(fields)
+        <= {
+            "number",
+            "title",
+            "body",
+            "url",
+        }
+    ):
+        return None
+    from .github_state import read
+
+    try:
+        available, row = read(repo, "pr", number=number)
+    except (OSError, ValueError):
+        return None
+    if not available or not isinstance(row, dict) or not all(field in row for field in fields):
+        return None
+    event({"kind": "shared_cli_read", "operation": "pr:view", "json_fields": sorted(fields)})
+    return subprocess.CompletedProcess(["gh", *args], 0, json.dumps({field: row[field] for field in fields}) + "\n", "")
+
+
 def cached_metadata(args, fetch, *, env=None):
     """Coalesce the review CLI's metadata reads through the existing shared cache."""
     if len(args) not in (2, 4) or args[0] != "api" or len(args) == 4 and args[2] != "--jq":
@@ -682,6 +734,20 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             or "credential:" + (scope(effective) or "unknown")[:16],
             "credential_scope": (scope(effective) or "unknown")[:16],
             "operation": query_operation(query) if gql else ":".join(argv[1:3]),
+            "json_fields": sorted(
+                {
+                    field
+                    for i, arg in enumerate(args)
+                    for field in (
+                        args[i + 1]
+                        if arg == "--json" and i + 1 < len(args)
+                        else arg[7:]
+                        if arg.startswith("--json=")
+                        else ""
+                    ).split(",")
+                    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", field)
+                }
+            ),
             "query_fingerprint": hashlib.sha256(query.encode()).hexdigest()[:20] if query else None,
             "source": "direct",
             "readonly": readonly,
@@ -923,6 +989,8 @@ def query_operation(query: str) -> str:
         return "mutation"
     if "headRefOid" in query and "comments{totalCount}" in query:
         return "progress"
+    if "pullRequests" in query and re.search(r"states\s*:\s*\[[^\]]*\b(?:CLOSED|MERGED)\b", query):
+        return "closed_prs"
     for field, operation in (
         ("pullRequests", "open_prs"),
         ("reviewThreads", "review_threads"),
@@ -1185,6 +1253,8 @@ if __name__ == "__main__":
         migrated = migrated_identity(args)
         if migrated is None and os.environ.get("TAUCETI_GITHUB_HISTORY_BRIDGE") == "1":
             migrated = migrated_history(args)
+        if migrated is None:
+            migrated = shared_pr_view(args)
         if migrated is not None:
             sys.stdout.write(migrated.stdout or "")
             sys.stderr.write(migrated.stderr or "")

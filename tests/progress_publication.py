@@ -269,6 +269,9 @@ with (
     (work / "plan.json").write_text(json.dumps(pages))
     (work / name).write_bytes(bundle)
     assert publication.facts_bundle(work / "plan.json", verify=True).read_bytes() == bundle
+    del pages["documentation"]["mode"]  # Current Progress pins identify the bundle without a reader-mode field.
+    (work / "plan.json").write_text(json.dumps(pages))
+    assert publication.facts_bundle(work / "plan.json", verify=True).read_bytes() == bundle
     value = publication.save(cfg, "author", PROGRESS_REF)
     before = set((state / "progress/retained").iterdir())
     with patch.object(publication, "retain_facts_bundle", side_effect=OSError(errno.ENOSPC, "disk full")):

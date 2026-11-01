@@ -302,6 +302,31 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round([row(10, "Other"), row(20, "Topology")])
         self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
 
+    def test_review_claim_hint_skips_fresh_reads_without_taking_a_claim(self):
+        self.opts.only = ["review"]
+        with patch.object(work, "_review_claimed_elsewhere", return_value=True):
+            with self.assertRaises(ClaimCollision):
+                self.run_round([row(10, "Other", author="peer", blocking=False)])
+        self.assertEqual(self.calls, [])
+
+        self.w.gh.repo = "TauCetiProject/TauCeti"
+        import json
+
+        with (
+            patch.object(
+                work.subprocess,
+                "run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"owner": "peer-nonce", "expires_at": 200})
+                ),
+            ) as git,
+            patch.object(work.time, "time", return_value=100),
+            patch.object(work, "claims_repo", return_value="org/claims"),
+        ):
+            self.assertTrue(work._review_claimed_elsewhere(self.w, work.Candidate(10, HEAD)))
+        self.assertEqual(git.call_args.args[0][1:], ["read", f"review/taucetiproject/tauceti/10/{HEAD}"])
+        self.assertEqual(git.call_args.kwargs["env"]["CLAIM_REPO"], "org/claims")
+
     def test_lost_claim_race_refunds_every_retry_counter(self):
         self.w.claims = SimpleNamespace(begin_branch_work=lambda *args: False)
         self.w.counters.write = lambda key, value: self.counter_values.update({key: value})

@@ -142,15 +142,35 @@ def _branch_claimed_elsewhere(w, pr: int) -> bool:
     Unknown, expired, malformed and failed reads leave acquisition to the existing
     fail-open claim path. A claim released just after this check waits one round.
     """
+    return _claim_held_elsewhere(w, f"branch/{pr}", claims_repo())
+
+
+def _review_claimed_elsewhere(w, candidate: Candidate) -> bool:
+    """Read the engine's existing exact-head lease before preflight API reads."""
+    repo = getattr(w.gh, "repo", "")
+    if not repo:
+        return False
+    if not re.fullmatch(r"[a-f0-9]{40}", candidate.head):
+        return False
+    if repo.lower() != TAUCETI.lower() and not os.environ.get("CLAIM_REPO"):
+        return False  # Unknown engine namespace: leave normal coordination in charge.
+    namespace = claims_repo()
+    return _claim_held_elsewhere(w, f"review/{repo.lower()}/{candidate.pr}/{candidate.head}", namespace)
+
+
+def _claim_held_elsewhere(w, key: str, repository: str) -> bool:
+    if getattr(w, "claim_hint_unavailable", False):
+        return False
     try:
         result = subprocess.run(
-            [CLAIM_SH, "read", f"branch/{pr}"],
+            [CLAIM_SH, "read", key],
             capture_output=True,
             text=True,
             timeout=15,
-            env={**os.environ, "CLAIM_REPO": claims_repo()},
+            env={**os.environ, "CLAIM_REPO": repository},
         )
         if result.returncode:
+            w.claim_hint_unavailable = True
             return False
         lease = json.loads(result.stdout or "null")
         return bool(
@@ -162,6 +182,7 @@ def _branch_claimed_elsewhere(w, pr: int) -> bool:
             and lease["expires_at"] > time.time()
         )
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        w.claim_hint_unavailable = True
         return False
 
 
@@ -570,6 +591,11 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
 
             if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
                 w.selection_changed = True
+                continue
+            if stage == "review" and not opts.dry_run and _review_claimed_elsewhere(w, c):
+                log(f"Global PR work: review #{c.pr} claimed by a peer — skipping before fresh PR reads")
+                claim_collision = True
+                declined.append((stage, c.pr))
                 continue
             if (
                 global_pick
