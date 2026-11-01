@@ -97,7 +97,7 @@ class GlobalMaintenance(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
 
-    def run_round(self, rows, dispatch=None):
+    def run_round(self, rows, dispatch=None, *, author_count=3):
         self.calls = []
 
         def perform(stage, _w, sv, candidate, _opts):
@@ -106,7 +106,8 @@ class GlobalMaintenance(unittest.TestCase):
 
         with (
             patch(
-                "tauceti_worker.github_state.read_survey", return_value=(True, SurveyRows(rows, {"science": 3}))
+                "tauceti_worker.github_state.read_survey",
+                return_value=(True, SurveyRows(rows, {"science": author_count})),
             ) as query,
             patch.object(work, "dispatch", side_effect=perform),
             patch.object(work, "roadmap_areas", return_value=["NewArea"]) as areas,
@@ -386,6 +387,53 @@ class GlobalMaintenance(unittest.TestCase):
         _, _, areas = self.run_round([row(5, "Other", complete=False, mergeable="CONFLICTING")])
         self.assertEqual(self.calls[0][:2], ("rebase", 5))
         areas.assert_not_called()
+
+    def test_reserved_fleet_slot_uses_area_cascade_and_shared_backpressure(self):
+        with (
+            patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]) as focus,
+            patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="2"),
+        ):
+            _, query, areas = self.run_round([row(10, "Other"), row(20, "NewArea")])
+            self.assertEqual(self.calls[0][:2], ("fix", 20))
+            self.assertEqual(query.call_args.args[1], "NewArea")
+            areas.assert_called_once_with(self.w.gh)
+            focus.assert_called_once_with(self.w.cfg.wid)
+            # Focus cannot exceed the shared account limit; useful global work
+            # replaces an otherwise idle focused round when authoring is capped.
+            focus.reset_mock()
+            _, query, _ = self.run_round([row(10, "Other"), row(30, "Other")])
+            self.assertEqual(self.calls[0][:2], ("fix", 10))
+            self.assertEqual(query.call_args.args[1], "auto")
+            focus.assert_called_once_with(self.w.cfg.wid)
+            # Below the shared limit, new authoring remains in the focus area.
+            self.run_round([], author_count=1)
+            self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
+
+    def test_missing_or_skipped_focus_keeps_global_maintenance(self):
+        for focused, skip in ((["RemovedArea"], ""), (["NewArea"], "NewArea")):
+            with (
+                patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=focused),
+                patch.dict(os.environ, TAUCETI_ROADMAP_SKIP=skip),
+            ):
+                _, query, _ = self.run_round([row(10, "Other")])
+                self.assertEqual(self.calls[0][:2], ("fix", 10))
+                self.assertEqual(query.call_args.args[1], "auto")
+
+    def test_fractional_miss_is_not_drawn_again_when_authoring(self):
+        with patch("tauceti_worker.fleet_capacity.roadmap_focus", side_effect=[[], ["NewArea"]]) as focus:
+            self.run_round([])
+            self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
+            focus.assert_called_once_with(self.w.cfg.wid)
+
+    def test_fleet_focus_keeps_explicit_area_and_pr_overrides(self):
+        with patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]) as focus:
+            with patch.object(work, "roadmap_only", return_value="Topology"):
+                self.run_round([row(10, "Other"), row(20, "Topology")])
+                self.assertEqual(self.calls[0][:2], ("fix", 20))
+            self.opts.prs = (10,)
+            self.run_round([row(10, "Other"), row(20, "NewArea")])
+            self.assertEqual(self.calls[0][:2], ("fix", 10))
+            focus.assert_not_called()
 
     def test_new_authoring_selects_area_last(self):
         _, query, areas = self.run_round([])
