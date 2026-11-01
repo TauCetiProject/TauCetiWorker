@@ -1290,8 +1290,8 @@ class WorkerBackend:
         if capacity := admission_reason(self.w.cfg.wid):
             raise Wait("worker-capacity", capacity)
         try:
-            chosen, pending = (
-                ("claude", False)
+            chosen = (
+                "claude"
                 if api_mode() and profile.provider == "claude"
                 else resolve_work_model(
                     self.w.cfg,
@@ -1304,7 +1304,7 @@ class WorkerBackend:
             )
         except Exception as error:
             raise Wait("budget-refused", str(error)) from error
-        if chosen != profile.provider or pending:
+        if chosen != profile.provider:
             raise Wait("budget-refused", "Fresh provider admission did not authorize the original profile")
         raise_on_account_mismatch(self.w.cfg, auth.get("account") or self.opts.account, profile.provider, "recovery")
         return auth, profile, keys

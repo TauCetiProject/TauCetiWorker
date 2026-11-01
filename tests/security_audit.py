@@ -23,7 +23,6 @@ from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
-from tauceti_worker.quota import Provider, Window
 from tauceti_worker.work_units import want
 
 
@@ -142,7 +141,7 @@ class WorkerBoundJudgments(unittest.TestCase):
             "attempt": str(self.original),
             "reason": "security-audit: reviewer did not read the complete input",
         }
-        quota = patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False))
+        quota = patch("tauceti_worker.loop.resolve_work_model", return_value="codex")
         quota.start()
         self.addCleanup(quota.stop)
         self.evidence()
@@ -633,7 +632,7 @@ class WorkerBoundJudgments(unittest.TestCase):
             ignore_quota=True,
         )
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)) as quota,
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex") as quota,
             patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
             patch.object(sa, "advance", return_value="b" * 40),
         ):
@@ -650,7 +649,7 @@ class WorkerBoundJudgments(unittest.TestCase):
             loop_paced=True,
         )
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)) as quota,
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex") as quota,
             patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
             patch.object(sa, "advance", return_value="b" * 40),
         ):
@@ -1351,7 +1350,7 @@ class Authority(unittest.TestCase):
                     run_round=DEFAULT,
                 ) as mocks,
             ):
-                mocks["resolve_work_model"].return_value = ("codex", False)
+                mocks["resolve_work_model"].return_value = "codex"
                 mocks["run_round"].return_value = 0
                 cli.cmd_work(
                     SimpleNamespace(worker_id="default", dry_run=True, ignore_quota=ignored),
@@ -2152,7 +2151,7 @@ class Run(unittest.TestCase):
         self.state = Path(self.tmp.name)
         self.old, self.target = "a" * 40, "b" * 40
         self.batch = {"from_sha": self.old, "input_digest": "digest", "commits": [{"sha": self.target, "files": [{}]}]}
-        self.opts = SimpleNamespace(dry_run=False, work_model="codex", claude_bootstrap=False)
+        self.opts = SimpleNamespace(dry_run=False, work_model="codex")
         for name, kwargs in (
             ("require_admin", {}),
             ("remote_sha", {"return_value": self.old}),
@@ -2165,26 +2164,16 @@ class Run(unittest.TestCase):
             mock.start()
             self.addCleanup(mock.stop)
 
-    def test_launch_telemetry_failure_requires_explicit_override(self):
-        for ignored, exhausted in ((False, False), (True, False), (True, True)):
-            opts = SimpleNamespace(dry_run=False, work_model="claude", claude_bootstrap=True, ignore_quota=ignored)
-            status = Provider("claude", False, None, error="claude usage HTTP 429", telemetry_unavailable=True)
-            if exhausted:
-                status.windows = [Window("session", 100, 50, None, "exhausted")]
-            with (
-                self.subTest(ignored=ignored, exhausted=exhausted),
-                patch("tauceti_worker.quota.Quota") as quota,
-                patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
-                patch.object(sa, "advance", return_value=self.target),
-            ):
-                quota.return_value.authorize_claude_launch.return_value = status
-                if ignored and not exhausted:
-                    self.assertEqual(sa.run(SimpleNamespace(state=self.state), opts), 0)
-                    model.assert_called_once()
-                else:
-                    with self.assertRaisesRegex(NoProgress, "quota unavailable"):
-                        sa.run(SimpleNamespace(state=self.state), opts)
-                    model.assert_not_called()
+    def test_ordinary_launch_needs_no_bootstrap_telemetry(self):
+        opts = SimpleNamespace(dry_run=False, work_model="claude")
+        with (
+            patch("tauceti_worker.quota.Quota") as quota,
+            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
+            patch.object(sa, "advance", return_value=self.target),
+        ):
+            self.assertEqual(sa.run(SimpleNamespace(state=self.state), opts), 0)
+            model.assert_called_once()
+            quota.assert_not_called()
 
     def test_pending_threshold_skips_all_model_and_planning_work(self):
         for count in (0, 1, 19):
@@ -2399,7 +2388,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=inspect) as model,
             patch.object(sa, "advance", return_value=self.target),
         ):
@@ -2479,7 +2468,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=model) as inspect,
             patch.object(sa, "advance", return_value=self.target),
         ):
@@ -2535,7 +2524,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=model) as inspect,
             patch.object(sa, "advance", return_value=self.target),
         ):
@@ -2594,7 +2583,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=incomplete_model) as model,
             patch.object(sa, "advance") as advance,
             self.assertRaises(Die),
@@ -2620,7 +2609,7 @@ class Run(unittest.TestCase):
         cfg = SimpleNamespace(state=self.state)
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=Die("malformed output")) as model,
             patch.object(sa, "advance") as advance,
         ):

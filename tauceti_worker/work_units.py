@@ -86,7 +86,7 @@ from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_
 from .github_state import enabled as github_state_enabled
 from .intentions import avoid_list
 from .paths import CLAIM_SH, HERE
-from .quota import Quota, _unavail_reason, mirror_creds
+from .quota import Quota, mirror_creds
 from .review_diagnostics import (
     clear_review_failure,
     public_review_failure,
@@ -176,9 +176,6 @@ class RoundOpts:
     sandbox_host: bool  # True = run on the host (the default); False = --bubble (use the sandbox)
     dry_run: bool
     source: str | None = None  # local directory or Git URL used read-only by a single-area roadmap PR
-    # Claude was selected while one of its quota windows was reset-but-unopened. The round may spend ONE
-    # small claude request to open it — at its LAUNCH STAGE (dispatch), never before there is work.
-    claude_bootstrap: bool = False
     authoring_profile: AuthoringProfile | None = None
     # --account: the Codex account this round is REQUIRED to spend under. Checked, never switched to.
     account: str | None = None
@@ -1199,8 +1196,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # credentials at the top of every round, so a rotation since preflight is visible by now.
     if getattr(opts, "account", None):
         raise_on_account_mismatch(w.cfg, opts.account, opts.work_model, stage)
-    # Last free check before anything that spends — the entitlement probe and the Claude bootstrap
-    # below both cost a provider request. Everything above this line is local (a binary on PATH, the
+    # Last free check before the entitlement probe can spend a provider request. Everything above this line is local (a binary on PATH, the
     # configured account), so it stays ahead of a network read that only matters if we get this far.
     actionable = _still_actionable(stage, w, sv, c)
     if actionable is False:
@@ -1221,18 +1217,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         checked = validate_kiro_model_access(w.cfg, kiro_probe_profile)
         if stage != "review":
             opts.authoring_profile = checked
-    # LAUNCH STAGE for a Claude round selected on an unopened window. Everything the bootstrap decision
-    # requires is true exactly here and not earlier: a concrete work unit is in hand, the survey (and so
-    # the GitHub preflight) succeeded, Claude is the model actually about to run, and the agent binary
-    # exists. A round that surveys and finds nothing never reaches this line, so deciding that there is
-    # nothing to do costs no quota.
-    if opts.claude_bootstrap and opts.work_model == "claude":
-        prov = Quota(w.cfg).authorize_claude_launch()
-        if not prov.available:
-            from .loop import _ignore_quota_verdict
-
-            if not (opts.ignore_quota and _ignore_quota_verdict(None, prov) == "telemetry-unavailable"):
-                raise NoProgress(f"claude: {prov.error or _unavail_reason(prov)[1]} — not launching this round")
     fn = {
         "review": do_review,
         "fix": do_fix,

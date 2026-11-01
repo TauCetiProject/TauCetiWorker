@@ -30,18 +30,20 @@ def worker(root, wid, source="source"):
     (root / source).mkdir(exist_ok=True)
     (credentials / ".tauceti-creds-source").write_text(str(root / source))
     q = quota.Quota(SimpleNamespace(home=home, quota_cache=home / "cache"))
-    q._idle_notes = lambda _readings: ({}, False)
     return q
 
 
-def run_concurrent(root, wid, start, calls, results, code):
+def run_concurrent(root, wid, start, calls, results, code, idle=False):
     q = worker(root, wid)
 
     def http(*_args, **_kwargs):
         with calls.get_lock():
             calls.value += 1
         time.sleep(0.05)
-        return (200, payload(time.time()), None) if code == 200 else (429, {}, 1800)
+        body = payload(time.time())
+        if idle:
+            body["five_hour"] = None
+        return (200, body, None) if code == 200 else (429, {}, 1800)
 
     with patch.object(quota, "_http_get_json", http):
         start.wait(10)
@@ -49,7 +51,7 @@ def run_concurrent(root, wid, start, calls, results, code):
         results.put((p.available, p.rate_limited))
 
 
-def test_concurrent_workers_fetch_once(root, code, *, recovering=False):
+def test_concurrent_workers_fetch_once(root, code, *, recovering=False, idle=False):
     if recovering:
         q = worker(root, "seed")
         observed = time.time() - 300
@@ -61,7 +63,8 @@ def test_concurrent_workers_fetch_once(root, code, *, recovering=False):
     ctx = multiprocessing.get_context("fork")
     start, calls, results = ctx.Event(), ctx.Value("i", 0), ctx.Queue()
     processes = [
-        ctx.Process(target=run_concurrent, args=(root, f"worker{i}", start, calls, results, code)) for i in range(4)
+        ctx.Process(target=run_concurrent, args=(root, f"worker{i}", start, calls, results, code, idle))
+        for i in range(4)
     ]
     for p in processes:
         p.start()
@@ -182,7 +185,9 @@ def test_headerless_backoff_and_recovery(root):
 def test_read_only_credentials_keep_shared_caching(root):
     qa, qb = worker(root, "one"), worker(root, "two")
     (root / "source" / quota.CLAUDE_QUOTA_DIRNAME).write_text("cannot create a cache here")
-    with patch.object(quota, "_http_get_json", return_value=(200, payload(time.time()), None)) as http:
+    body = payload(time.time())
+    body["five_hour"] = None
+    with patch.object(quota, "_http_get_json", return_value=(200, body, None)) as http:
         assert qa._claude_pass("fp", "token", refresh=True, account="account")[0].available
         assert qb._claude_pass("fp", "token", refresh=True, account="account")[0].available
         assert http.call_count == 1
@@ -198,6 +203,9 @@ if __name__ == "__main__":
             with tempfile.TemporaryDirectory() as directory:
                 test_concurrent_workers_fetch_once(Path(directory), code)
                 print(f"PASS concurrent workers share HTTP {code}")
+        with tempfile.TemporaryDirectory() as directory:
+            test_concurrent_workers_fetch_once(Path(directory), 200, idle=True)
+            print("PASS concurrent workers share an idle observation")
         with tempfile.TemporaryDirectory() as directory:
             test_concurrent_workers_fetch_once(Path(directory), 200, recovering=True)
             print("PASS concurrent workers all resume after pace recovery")

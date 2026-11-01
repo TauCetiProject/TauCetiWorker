@@ -249,7 +249,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve) as model,
         ):
@@ -312,7 +312,7 @@ class Fixture(unittest.TestCase):
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve_and_die),
         ):
@@ -358,7 +358,7 @@ class Fixture(unittest.TestCase):
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=interrupted),
         ):
@@ -383,7 +383,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
         ):
@@ -401,7 +401,7 @@ class Fixture(unittest.TestCase):
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve_and_die),
         ):
@@ -423,7 +423,7 @@ class Fixture(unittest.TestCase):
     def test_verified_provider_outage_refunds_content_but_counts_infrastructure(self):
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", return_value=1),
             patch("tauceti_worker.agents.take_last_agent_infra_failure", return_value="529 before work"),
@@ -439,7 +439,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 100
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", return_value=1),
             patch(
@@ -460,7 +460,7 @@ class Fixture(unittest.TestCase):
     def test_post_launch_file_error_does_not_refund_content(self):
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=FileNotFoundError("after launch")),
         ):
@@ -473,7 +473,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=AgentLaunchUnavailable("missing binary")),
         ):
@@ -587,7 +587,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 2
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
         ):
@@ -657,7 +657,7 @@ class Fixture(unittest.TestCase):
             self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.retry_now()
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -691,7 +691,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
         ):
@@ -736,7 +736,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=import_history),
         ):
@@ -1009,7 +1009,7 @@ class Fixture(unittest.TestCase):
         FakeVerification.failures = 1
         self.opts.ignore_quota = True
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)) as admission,
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude") as admission,
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -1036,7 +1036,7 @@ class Fixture(unittest.TestCase):
         recovery = rr.Recovery(self.record, self.backend)
         recovery.manifest["conversation"] = dict(actor="other", identity="old-account", profile={"model": "other"})
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -1217,7 +1217,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=BuildCacheUnavailable("cache offline")),
         ):
@@ -1336,7 +1336,7 @@ class Fixture(unittest.TestCase):
         )
         with (
             patch.object(rr, "conversation_identity", return_value="account-a"),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -1446,7 +1446,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch(
                 "tauceti_worker.agents.run_agent_host",
@@ -1570,7 +1570,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve) as model,
         ):
@@ -1605,7 +1605,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
         ):
@@ -1758,14 +1758,14 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=import_history),
         ):
             self.assertFalse(self.run_recovery())
         self.retry_now()
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
         ):
@@ -1809,7 +1809,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=import_old_target),
         ):
@@ -1900,7 +1900,7 @@ class Fixture(unittest.TestCase):
     def test_zero_exit_with_conflicts_can_retarget_and_resolve(self):
         self.rewritten_checkpoint(conflicting=True)
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", return_value=0),
         ):
@@ -1916,7 +1916,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
         ):
@@ -2463,7 +2463,7 @@ class Fixture(unittest.TestCase):
         script = "from pathlib import Path; Path('A.lean').write_text('fresh fixture repair\\n')"
         with (
             patch.dict(sys.modules, {"tauceti_worker.containment": None}),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch.object(rr, "conversation_identity", return_value="fixture-account"),
             patch(
@@ -2671,7 +2671,7 @@ fi
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=finish) as model,
         ):
@@ -2690,7 +2690,7 @@ fi
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=unfinished),
             self.assertRaises(Death),
@@ -2702,7 +2702,7 @@ fi
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=finish) as model,
         ):
@@ -2867,7 +2867,7 @@ fi
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=merge_old_lineage),
         ):

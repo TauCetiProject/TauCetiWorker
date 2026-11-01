@@ -25,7 +25,6 @@ def worker(root):
     )
     q = quota.Quota(cfg)
     q._claude_creds_source = lambda: root / ".claude"
-    q._idle_notes = lambda _readings: ({}, False)
     return q
 
 
@@ -84,7 +83,7 @@ def test_only_transient_failures_are_overridden(root):
         assert loop._ignore_quota_verdict(None, p) == ("telemetry-unavailable" if transient else "wait")
         with patch.object(loop, "choose_model", return_value=(None, {"claude": p})):
             if transient:
-                assert loop.resolve_work_model(q.cfg, "claude", dry=False, ignore_quota=True) == ("claude", False)
+                assert loop.resolve_work_model(q.cfg, "claude", dry=False, ignore_quota=True) == "claude"
             try:
                 loop.resolve_work_model(q.cfg, "claude", dry=False, ignore_quota=False)
             except loop.NoProgress:
@@ -228,13 +227,13 @@ def test_forbidden_telemetry_preserves_headroom_and_serializes_retries(root):
 
 
 def test_loop_handoff_preserves_operator_choice(root):
-    idle = quota.Provider("claude", False, None, bootstrap_eligible=True, pending_bootstrap=["session"])
+    idle = quota.Provider("claude", True, "opus")
     outage = quota.Provider("claude", False, None, telemetry_unavailable=True, error="claude usage HTTP 429")
     for ignored in (False, True):
 
         def child(tail, ignored=ignored):
             args = cli.build_parser().parse_args(["_round", *tail])
-            assert args.loop_paced and args.ignore_quota == ignored and args.claude_bootstrap
+            assert args.loop_paced and args.ignore_quota == ignored and not args.claude_bootstrap
             with patch.object(loop, "choose_model", return_value=(None, {"claude": outage})):
                 try:
                     loop.resolve_work_model(
@@ -248,7 +247,7 @@ def test_loop_handoff_preserves_operator_choice(root):
             raise KeyboardInterrupt
 
         with (
-            patch.object(loop, "choose_model", return_value=(None, {"claude": idle})),
+            patch.object(loop, "choose_model", return_value=("claude", {"claude": idle})),
             patch.object(loop, "github_budget", return_value={}),
             patch.object(loop, "run_round_subprocess", side_effect=child) as run,
         ):
@@ -266,30 +265,6 @@ def test_transient_failures_share_backoff(root):
                 p, _ = worker(q.cfg.home)._claude_pass("fp", "token", refresh=True, account="account")
                 assert p.telemetry_unavailable and 0 < p.retry_after <= quota.RATE_LIMIT_RECHECK_MAX_S
             assert http.call_count == 1
-
-
-def test_failed_bootstrap_stops_before_another_telemetry_read(root):
-    q = worker(root)
-    idle = quota.Provider(
-        "claude",
-        False,
-        None,
-        [quota.Window("session", None, 0, None, "idle")],
-        bootstrap_eligible=True,
-        pending_bootstrap=["session"],
-    )
-    with (
-        patch.object(q, "claude", return_value=idle) as read,
-        patch.object(q, "_episode_key", return_value="episode"),
-        patch.object(q, "_reserve_bootstrap", return_value=(True, "")),
-        patch.object(q, "_claude_bootstrap_request", return_value=(False, "model refused")),
-        patch.object(q, "_settle_bootstrap"),
-        patch.object(q, "_forget_raw"),
-    ):
-        result = q.authorize_claude_launch()
-    assert read.call_count == 1 and not result.telemetry_unavailable
-    assert loop._ignore_quota_verdict(None, result) == "wait"
-    assert "bootstrap failed: model refused" in result.windows[0].detail
 
 
 def test_changed_unknown_account_does_not_inherit_long_wait(root):
@@ -447,7 +422,8 @@ def test_real_model_refusal_is_scoped_bounded_and_recoverable(root):
         patch.object(quota, "_http_get_json", return_value=(200, {"five_hour": None}, None)),
     ):
         q._claude_pass("old", "launch-token", refresh=True, account="account")
-    assert not q._model_refusal_path("claude", quota.Quota._fingerprint("launch-token")).exists()
+    with patch.object(quota.time, "time", return_value=time.time() + 7201):
+        assert q._model_refusal("claude") is None
 
 
 def test_readonly_credentials_share_model_refusals(root):
@@ -472,11 +448,8 @@ def test_readonly_credentials_share_model_refusals(root):
         patch.object(quota, "_http_get_json", return_value=(200, {"five_hour": None}, None)),
     ):
         sibling._claude_pass("fp", "token", refresh=True, account="account")
-    assert all(
-        not p.exists()
-        for p in sibling._model_refusal_paths("claude", credential)
-        if p.parent != source / quota.CLAUDE_QUOTA_DIRNAME / "usage"
-    )
+    with patch.object(quota.time, "time", return_value=time.time() + 7201):
+        assert sibling._model_refusal("claude") is None
     with patch.object(q, "_claude_creds", return_value=({"accessToken": 99}, False)):
         assert q.launch_credential("claude") is None
     assert (
@@ -526,7 +499,6 @@ if __name__ == "__main__":
         test_forbidden_telemetry_preserves_headroom_and_serializes_retries,
         test_loop_handoff_preserves_operator_choice,
         test_transient_failures_share_backoff,
-        test_failed_bootstrap_stops_before_another_telemetry_read,
         test_changed_unknown_account_does_not_inherit_long_wait,
         test_cli_preserves_soft_handoff_without_granting_outage_permission,
         test_real_model_refusal_is_scoped_bounded_and_recoverable,

@@ -13,9 +13,6 @@ from pathlib import Path
 
 from .config import log
 from .quota import (
-    CLAUDE_BOOTSTRAP_RETRY_S,
-    CLAUDE_BOOTSTRAP_STALE_MARGIN_S,
-    CLAUDE_BOOTSTRAP_TIMEOUT_S,
     RATE_LIMIT_RECHECK_MAX_S,
     Quota,
     _cooldown_left,
@@ -72,9 +69,6 @@ def observe(
             return value
 
         q._cache_reader = record
-        # Fully resolved cached windows need no bootstrap annotation for a wake
-        # hint. Avoid nested credential/ledger reads in this observational path.
-        q._idle_notes = lambda _readings: ({}, False)
         source, credential_data = q.local_credentials(provider, _read, identities)
         if provider == "claude":
             oauth = credential_data
@@ -144,24 +138,6 @@ def observe(
                     model_releases.append(until)
         if model_releases:
             releases.append(max(model_releases))
-        if provider == "claude":
-            # Bootstrap annotations can change without any new usage sample.
-            ledger = record(q._bootstrap_paths()[0]) or {}
-            active = {}
-            for window in ("session", "weekly"):
-                key = q._episode_key(window)
-                reservation = ledger.get(key)
-                if isinstance(reservation, dict):
-                    active[key] = reservation
-                    at = reservation.get("at")
-                    duration = (
-                        CLAUDE_BOOTSTRAP_TIMEOUT_S + CLAUDE_BOOTSTRAP_STALE_MARGIN_S
-                        if reservation.get("state") == "in-progress"
-                        else CLAUDE_BOOTSTRAP_RETRY_S
-                    )
-                    if isinstance(at, (int, float)) and math.isfinite(at) and at <= now < at + duration:
-                        releases.append(at + duration)
-            records.append(active)
         identity = q._fingerprint(fp, token_fp, str(source))
         signature = hashlib.sha256(json.dumps([identity, records], sort_keys=True).encode()).hexdigest()
         return Observation(signature, identity, min(releases, default=None), headroom, has_cache, parts, token_fp)

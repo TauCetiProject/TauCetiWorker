@@ -493,12 +493,10 @@ class GlobalMaintenance(unittest.TestCase):
             patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
             patch.object(work, "_host_agent_binary", return_value=None),
             patch.object(work, "resolve_codex_model_access") as entitlement,
-            patch.object(work.Quota, "authorize_claude_launch") as bootstrap,
             patch("tauceti_worker.fleet_capacity.admission_reason") as admission,
         ):
             self.assertIsNone(work.dispatch("fix", self.w, sv, work.Candidate(10, HEAD), self.opts))
         entitlement.assert_not_called()
-        bootstrap.assert_not_called()
         admission.assert_not_called()
 
     def test_partial_fix_sees_current_reply_instead_of_repeating_it(self):
