@@ -77,6 +77,7 @@ from .constants import (
     REVIEW,
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_HEAD_CHANGED_EXIT,
+    REVIEW_PREPARATION_WAIT_EXIT,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
     ROUND_TIMEOUT,
@@ -1440,6 +1441,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
+        if rc == REVIEW_PREPARATION_WAIT_EXIT:
+            # A fetch/host outage is not a defect in the selected PR. Refresh
+            # discovery on the next ordinary attempt, including a changed head.
+            w.rs.bust(pr)
+            raise NoProgress(f"review #{pr}: source preparation unavailable before inference — not charged to the PR")
         if rc == 0:
             # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
