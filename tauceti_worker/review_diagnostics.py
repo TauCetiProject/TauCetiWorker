@@ -329,6 +329,7 @@ def refund_stale_head_errors(state: Path, counters) -> None:
                 if not isinstance(attempt, dict) or attempt.get("code") != 1 or attempt.get("category") != "stale-head":
                     return False
                 match = re.match(
+                    rf"(?:review #{pr} exited with status 1: )?"
                     rf"tauceti-review: PR #{pr} head is ([0-9a-f]{{7,40}}), expected ([0-9a-f]{{7,40}})\b",
                     str(attempt.get("summary", "")),
                 )
