@@ -164,6 +164,22 @@ class StateRepair(unittest.TestCase):
         self.assertEqual(self.counters.read("review-err-7"), 1)
         self.assertEqual(json.loads(target.read_text())["attempts"], [dict(category="review-engine")])
 
+    def test_refund_accepts_the_retained_worker_wrapper(self):
+        diagnostics.record_review_failure(
+            self.root,
+            worker="test",
+            pr=7,
+            head=HEAD,
+            provider="claude",
+            code=1,
+            reason=f"review #7 exited with status 1: tauceti-review: PR #7 head is {NEW[:12]}, expected {HEAD[:12]}.",
+        )
+        self.counters.write("review-err-7", 1)
+        diagnostics.refund_stale_head_errors(self.root, self.counters)
+        diagnostics.refund_stale_head_errors(self.root, self.counters)
+        self.assertEqual(self.counters.read("review-err-7"), 0)
+        self.assertEqual(diagnostics.read_review_failure(self.root, 7)["attempts"], [])
+
     def test_retry_deadline_uses_temporary_wait_instead_of_failure_backoff(self):
         self.counters.write(state_repair.retry_key(7, HEAD), int(time.time()) + 60)
         sv = Survey(worker_id="test")
@@ -183,6 +199,16 @@ class StateRepair(unittest.TestCase):
         attempts = [
             dict(category="stale-head", code=1, summary="expected head field in provider response"),
             dict(category="stale-head", code=2, summary=f"tauceti-review: PR #7 head is {NEW}, expected {HEAD}"),
+            dict(
+                category="stale-head",
+                code=1,
+                summary=f"review #8 exited with status 1: tauceti-review: PR #7 head is {NEW}, expected {HEAD}",
+            ),
+            dict(
+                category="stale-head",
+                code=1,
+                summary=f"review #7 exited with status 1: tauceti-review: PR #8 head is {NEW}, expected {HEAD}",
+            ),
         ]
         path = self.root / "review-failure-7.json"
         path.write_text(json.dumps(dict(attempts=attempts)))
