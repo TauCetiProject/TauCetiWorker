@@ -486,30 +486,22 @@ class CostTests(unittest.TestCase):
                     db.execute("CREATE INDEX round_worker ON rounds(worker,finished)")
             with contextlib.closing(a._connect()) as db:
                 self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='round_worker'").fetchone())
-                for index, query, args in (
-                    (
-                        "round_worker_covering",
-                        "SELECT started,finished FROM rounds WHERE started<=? AND (finished>=? OR finished IS NULL) AND COALESCE(outcome,'') NOT IN ('waiting','interrupted-unfinished') AND worker=?",
-                        (self.now, 0, "author"),
-                    ),
-                    (
-                        "quality_worker",
-                        "SELECT SUM(native),SUM(estimated),SUM(incomplete) FROM conversation_quality WHERE worker=?",
-                        ("author",),
-                    ),
-                    (
-                        "accounting_worker",
-                        "SELECT SUM(live),SUM(settled_estimates),SUM(recovered_estimates),SUM(unresolved_stopped) FROM conversation_accounting WHERE worker=?",
-                        ("author",),
-                    ),
-                    (
-                        "accounting_estimates",
-                        "SELECT id,settled_estimates,recovered_estimates FROM conversation_accounting WHERE id IS NOT NULL AND (settled_estimates=1 OR recovered_estimates=1)",
-                        (),
-                    ),
+                statements = []
+                db.set_trace_callback(statements.append)
+                a._summary(db, self.now, "worker", "author")
+                db.set_trace_callback(None)
+                # Check the production queries, including their real predicates.
+                for index, pattern in (
+                    ("round_worker_covering", "SELECT started,finished FROM rounds"),
+                    ("quality_worker", "FROM conversation_quality"),
+                    ("accounting_worker", "SELECT COALESCE(SUM(live),0)"),
+                    ("accounting_estimates", "SELECT id,settled_estimates,recovered_estimates"),
                 ):
-                    plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query, args)]
-                    self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
+                    queries = [query for query in statements if pattern in query]
+                    self.assertTrue(queries, index)
+                    for query in queries:
+                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                        self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
 
     def test_prepared_row_reconciliation_matches_full_replacement(self):
         initial = {
