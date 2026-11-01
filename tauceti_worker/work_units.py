@@ -365,7 +365,7 @@ def focus_prs(sv: Survey, opts) -> None:
             log(f"  --pr #{pr}: {pr_focus_reason(sv, opts, pr)}")
 
 
-def run_round(w: Worker, opts: RoundOpts) -> int:
+def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     if "security-audit" in opts.only:
         from .activity import select
         from .security_audit import run
@@ -400,6 +400,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         refund_stale_head_errors(w.cfg.state, w.counters)
     w.selection_changed = False
     global_pick = False
+    focused_round = False
     scope = roadmap_only()
     if opts.only and set(opts.only) <= {"overlap-scan", "overlap-fix"}:
         from .overlaps import survey_overlaps
@@ -410,7 +411,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if getattr(opts, "prs", ()):
             scope = "any"  # explicit targets override the ambient roadmap
         else:
-            if scope in (None, "auto"):
+            if use_fleet_focus and scope in (None, "auto"):
                 from .fleet_capacity import roadmap_focus
 
                 focus = roadmap_focus(w.cfg.wid)
@@ -419,6 +420,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                     # focus area, rather than spending every round on a global
                     # backlog before it can reach focused authoring.
                     scope = random_roadmap_area(w, focus=focus, fallback=False)
+                    focused_round = scope not in (None, "any")
             global_pick = scope in (None, "", "auto", "any")
         sv = survey(
             w.cfg,
@@ -429,7 +431,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             stages=[stage for stage in round_stages(opts) if want(opts.only, stage)],
             selected_roadmap=("auto" if scope is None else scope),
             numbers=getattr(opts, "prs", ()),
-            count_all_roadmaps=global_pick,
+            count_all_roadmaps=global_pick or focused_round,
             # An expanded scan must not create per-PR hydration demand or
             # silently fall back to thousands of direct comment requests.
             cached_only=global_pick and github_state_enabled(),
@@ -596,6 +598,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
         if sv.roadmap_backpressure:
+            if focused_round:
+                log("Fleet roadmap focus: account authoring limit reached; selecting global maintenance")
+                return run_round(w, opts, use_fleet_focus=False)
             if claim_collision or w.selection_changed:
                 raise ClaimCollision("authoring paused at the PR limit; available maintenance is claimed by peers")
             raise NoProgress(
@@ -2850,7 +2855,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
     if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
-        only = random_roadmap_area(w)
+        only = random_roadmap_area(w, focus=[])
         log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")

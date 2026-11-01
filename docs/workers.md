@@ -31,7 +31,9 @@ priorities apply within the chosen area. Stale/malformed focus or no remaining
 eligible focus areas falls back to ordinary selection. Fleet controls this live through
 `tauceti-fleet focus HOST --percent 20 --areas PDE,SymplecticGeometry`; changing
 it does not restart workers or change admissions. The share describes focused
-slots, not runtime or output quotas.
+slots, not runtime or output quotas. Focused slots retain the shared account-wide
+open-PR limit. If that limit prevents authoring and the selected area has no
+available maintenance, the slot falls back to the ordinary global cascade.
 
 Fleet installers can query `_fleet-protocol` to verify this integration before
 starting workers. The response is local, contains no credentials, and launches
