@@ -459,6 +459,92 @@ class CostTests(unittest.TestCase):
                         expected = f"{total + 66}.00000" if history > 3600 and key != "1h" else str(total)
                         self.assertEqual(window["spent_usd"], expected)
 
+    def test_unchanged_preparation_does_not_rewrite_derived_rows(self):
+        with contextlib.closing(a._connect()) as db, db:
+
+            def scope(worker):
+                return a._worker_scope(db, worker)
+
+            activity_costs.prepare(db, self.now, scope)
+            before = db.total_changes
+            activity_costs.prepare(db, self.now, scope)
+            # Only the ordinary funding metadata is replaced. The ledger and
+            # usage are still fully checked, with no derived table rewrites.
+            self.assertEqual(db.total_changes - before, 1)
+
+    def test_prepared_row_reconciliation_matches_full_replacement(self):
+        initial = {
+            "conversation_costs": [
+                ("a", "author", "machine", 1, 2, "0.10000"),
+                ("b", "reviewer", "machine", 1, None, "2"),
+            ],
+            "conversation_accounting": [
+                ("a", "author", "machine", 0, 1, 0, 0),
+                ("b", "reviewer", "machine", 1, 0, 0, 0),
+            ],
+            "conversation_quality": [("a", "author", "machine", 1, 0, 0), ("b", "reviewer", "machine", 0, 1, 1)],
+            "cost_accruals": [
+                ("a", "author", "machine", 1, 2, "0.10000", "native-allocated", 0),
+                ("a", "author", "machine", 1, 2, "0.10000", "native-allocated", 0),
+                ("b", "reviewer", "machine", 1, None, "2", "native-allocated", 1),
+            ],
+        }
+        with (
+            contextlib.closing(sqlite3.connect(":memory:")) as actual,
+            contextlib.closing(sqlite3.connect(":memory:")) as reference,
+        ):
+            activity_costs.install(actual)
+            activity_costs.install(reference)
+            for table, rows in initial.items():
+                corrected = [list(row) for row in reversed(rows)]
+                corrected[0][0] = "new"
+                corrected[0][2] = "reassigned"
+                corrected[0][-1] = "3.00000" if table == "conversation_costs" else 2
+                for desired in (rows, corrected, corrected[:1], [], rows):
+                    activity_costs._write_prepared(actual, table, desired)
+                    reference.execute(f"DELETE FROM {table}")
+                    reference.executemany(f"INSERT INTO {table} VALUES ({','.join('?' for _ in rows[0])})", desired)
+                    order = "rowid" if table == "cost_accruals" else "id"
+                    self.assertEqual(
+                        actual.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall(),
+                        reference.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall(),
+                    )
+                    before = actual.total_changes
+                    activity_costs._write_prepared(actual, table, desired)
+                    self.assertEqual(actual.total_changes, before)
+                if table == "cost_accruals":
+                    actual.execute("UPDATE cost_accruals SET rowid=99 WHERE rowid=2")
+                    actual.execute("INSERT INTO cost_accruals(rowid) VALUES (-1)")
+                    activity_costs._write_prepared(actual, table, rows)
+                    self.assertEqual(
+                        actual.execute("SELECT rowid,* FROM cost_accruals ORDER BY rowid").fetchall(),
+                        reference.execute("SELECT rowid,* FROM cost_accruals ORDER BY rowid").fetchall(),
+                    )
+
+    def test_replacement_ledger_removes_old_prepared_sessions(self):
+        tables = ("conversation_costs", "cost_accruals", "conversation_accounting", "conversation_quality")
+        with contextlib.closing(a._connect()) as db, db:
+            for remaining in ("replacement", None):
+                self.records = []
+                self.record(self.now - 30, dict(type="grant", delta="1000"))
+                if remaining:
+                    self.session(remaining, 10, "author", "7", settled=True)
+                self.write_ledger()
+                activity_costs.prepare(db, self.now, lambda worker: "machine")
+                with contextlib.closing(sqlite3.connect(":memory:")) as fresh:
+                    fresh.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+                    activity_costs.install(fresh)
+                    activity_costs.prepare(fresh, self.now, lambda worker: "machine")
+                    for table in tables:
+                        self.assertEqual(
+                            {row[0] for row in db.execute(f"SELECT id FROM {table}")},
+                            {remaining} if remaining else set(),
+                        )
+                        self.assertEqual(
+                            [tuple(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY rowid")],
+                            fresh.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall(),
+                        )
+
     def test_fleet_hourly_rate_pools_spending_over_wall_time_not_machine_hours(self):
         s = self.summary()
         other = json.loads(json.dumps(s))
