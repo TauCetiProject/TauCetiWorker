@@ -27,6 +27,7 @@ def install(db):
       CREATE TABLE IF NOT EXISTS cost_accruals(
         id TEXT,worker TEXT,scope TEXT,started REAL,finished REAL,cost TEXT,quality TEXT,active INTEGER);
       CREATE INDEX IF NOT EXISTS accrual_scope ON cost_accruals(scope,started);
+      CREATE INDEX IF NOT EXISTS accrual_worker ON cost_accruals(worker,started);
       CREATE INDEX IF NOT EXISTS cost_scope ON conversation_costs(scope,settled);
       CREATE INDEX IF NOT EXISTS cost_worker ON conversation_costs(worker,settled);
     """)
