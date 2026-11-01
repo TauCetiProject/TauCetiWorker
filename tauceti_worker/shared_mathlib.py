@@ -793,6 +793,11 @@ def summary(env=None, *, scope=None, worker=None):
                 pass  # Includes a namespace retaining its lease after supervisor death.
             except (OSError, Unavailable):
                 row.update(mode="blocked", reason="shared Mathlib lease status unavailable")
+    reasons_by_mode = {}
+    for row in rows:
+        if row.get("reason"):
+            mode = "preparing" if row.get("mode") == "overlay-ready" else row.get("mode", "unknown")
+            reasons_by_mode.setdefault(mode, set()).add(row["reason"])
     return dict(
         shared=sum(r.get("mode") == "shared" for r in rows),
         private=sum(r.get("mode") == "private" for r in rows),
@@ -802,6 +807,7 @@ def summary(env=None, *, scope=None, worker=None):
         idle=sum(r.get("mode") == "idle" for r in rows),
         preparation_seconds=sum(r.get("preparation_seconds", 0) for r in rows),
         reasons=sorted({r["reason"] for r in rows if r.get("reason")}),
+        reasons_by_mode={mode: sorted(reasons) for mode, reasons in sorted(reasons_by_mode.items())},
     )
 
 
@@ -829,7 +835,9 @@ def view(cwd, env, logdir, fetch):
             pool,
             env,
             mode="private",
-            reason=selection_reason if selected == "off" else "Mathlib dependency is not available for sharing",
+            reason=selection_reason
+            if selected == "off"
+            else "sharing was skipped because the Mathlib checkout was absent.",
         )
         yield []
         return

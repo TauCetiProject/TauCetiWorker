@@ -1047,6 +1047,28 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         atomic_json(path, row)
         self.assertEqual(s.summary(self.env)["preparing"], 0)
 
+    def test_summary_keeps_worker_states_with_reasons(self):
+        reason = "Mathlib dependency is not available for sharing"
+        for worker, mode, message in (
+            ("private-one", "private", reason),
+            ("private-two", "private", reason),
+            ("idle", "idle", "shared view released; awaiting next natural round"),
+            ("blocked", "blocked", reason),
+            ("preparing", "overlay-ready", "warming caches"),
+        ):
+            s.report(self.pool, {**self.env, "TAUCETI_WORKER_ID": worker}, mode=mode, reason=message)
+        summary = s.summary(self.env)
+        self.assertEqual(summary["private"], 2)
+        self.assertEqual(
+            summary["reasons_by_mode"],
+            {
+                "private": [reason],
+                "idle": ["shared view released; awaiting next natural round"],
+                "blocked": [reason],
+                "preparing": ["warming caches"],
+            },
+        )
+
     def test_summary_rejects_invalid_lock_key(self):
         s.report(self.pool, self.env, mode="shared", key="../unexpected")
         self.assertEqual(s.summary(self.env)["blocked"], 1)

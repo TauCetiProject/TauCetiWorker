@@ -257,6 +257,53 @@ class ActivityTests(unittest.TestCase):
         pr_start = next(i for i, line in enumerate(lines) if line.startswith("PRs authored"))
         self.assertEqual(lines[pr_start - 1], "")
 
+    def test_mathlib_worker_message_states_survive_fleet_aggregation(self):
+        a.prepare(now=self.now)
+        one, two, older = a.cached(), a.cached(), a.cached()
+        private_reason = "Mathlib dependency is not available for sharing"
+        clear_reason = "sharing was skipped because the Mathlib checkout was absent."
+        idle_reason = "shared view released; awaiting next natural round"
+        one["summary"]["shared_mathlib"] = dict(
+            private=2,
+            idle=14,
+            reasons=[private_reason, idle_reason],
+            reasons_by_mode={"private": [private_reason], "idle": [idle_reason]},
+        )
+        two["summary"]["shared_mathlib"] = dict(
+            private=1, reasons=[clear_reason], reasons_by_mode={"private": [clear_reason]}
+        )
+        older["summary"]["shared_mathlib"] = dict(private=1, reasons=["legacy reason"])
+        for value in (one, a.activity_summary.combine([one, two, older])):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertEqual(output.getvalue().count(f"  Private builds: {clear_reason}\n"), 1)
+            self.assertNotIn(idle_reason, output.getvalue())
+            self.assertNotIn(f"  {private_reason}\n", output.getvalue())
+        self.assertIn("  Worker message (state unavailable): legacy reason\n", output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn("  Worker message (state unavailable): legacy reason\n", output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(idle=1, reasons=[idle_reason])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.activity_summary.combine([older]))
+        self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(private=1, reasons=[private_reason, idle_reason])
+        for value in (older, a.activity_summary.combine([older])):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertIn(f"  Private builds: {clear_reason}\n", output.getvalue())
+            self.assertNotIn(idle_reason, output.getvalue())
+        older["summary"]["shared_mathlib"] = dict(blocked=1, reasons=[private_reason])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(
+            "  Blocked builds: the Mathlib checkout was absent, but sharing is required.\n", output.getvalue()
+        )
+        older["summary"]["shared_mathlib"]["private"] = 1
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(older)
+        self.assertIn(f"  Worker message (state unavailable): {private_reason}\n", output.getvalue())
+
     def test_housekeeping_failure_does_not_abort_activity_refresh(self):
         from tauceti_worker import work_recovery
 
