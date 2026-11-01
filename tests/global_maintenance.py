@@ -387,14 +387,29 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertEqual(self.calls[0][:2], ("rebase", 5))
         areas.assert_not_called()
 
-    def test_fleet_focus_is_applied_only_after_global_maintenance(self):
-        with patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]) as focus:
-            self.run_round([row(40, "Other", author="peer", blocking=False)])
-            self.assertEqual(self.calls[0][:2], ("review", 40))
-            focus.assert_not_called()
-            self.run_round([])
-            self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
+    def test_reserved_fleet_slot_uses_area_cascade_and_scoped_backpressure(self):
+        with (
+            patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]) as focus,
+            patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="2"),
+        ):
+            _, query, areas = self.run_round([row(10, "Other"), row(20, "NewArea")])
+            self.assertEqual(self.calls[0][:2], ("fix", 20))
+            self.assertEqual(query.call_args.args[1], "NewArea")
+            areas.assert_called_once_with(self.w.gh)
             focus.assert_called_once_with(self.w.cfg.wid)
+            # A backlog elsewhere cannot consume this slot or block its authoring.
+            self.run_round([row(10, "Other"), row(30, "Other")])
+            self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
+
+    def test_fleet_focus_keeps_explicit_area_and_pr_overrides(self):
+        with patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]) as focus:
+            with patch.object(work, "roadmap_only", return_value="Topology"):
+                self.run_round([row(10, "Other"), row(20, "Topology")])
+                self.assertEqual(self.calls[0][:2], ("fix", 20))
+            self.opts.prs = (10,)
+            self.run_round([row(10, "Other"), row(20, "NewArea")])
+            self.assertEqual(self.calls[0][:2], ("fix", 10))
+            focus.assert_not_called()
 
     def test_new_authoring_selects_area_last(self):
         _, query, areas = self.run_round([])

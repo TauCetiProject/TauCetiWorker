@@ -410,6 +410,15 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if getattr(opts, "prs", ()):
             scope = "any"  # explicit targets override the ambient roadmap
         else:
+            if scope in (None, "auto"):
+                from .fleet_capacity import roadmap_focus
+
+                focus = roadmap_focus(w.cfg.wid)
+                if focus:
+                    # A reserved slot runs the normal cascade within its chosen
+                    # focus area, rather than spending every round on a global
+                    # backlog before it can reach focused authoring.
+                    scope = random_roadmap_area(w, focus=focus)
             global_pick = scope in (None, "", "auto", "any")
         sv = survey(
             w.cfg,
@@ -596,7 +605,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
             if scope in (None, "auto") and not opts.dry_run:
-                sv.roadmap_only = random_roadmap_area(w)
+                sv.roadmap_only = random_roadmap_area(w, focus=[])
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
@@ -2810,8 +2819,8 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
         return None
 
 
-def random_roadmap_area(w) -> str:
-    """Choose new authoring work, applying advisory fleet focus after operator exclusions."""
+def random_roadmap_area(w, *, focus=None) -> str:
+    """Choose an eligible area for a focused round or ordinary random authoring."""
     from .fleet_capacity import roadmap_focus
 
     raw_areas = roadmap_areas(w.gh)
@@ -2819,7 +2828,7 @@ def random_roadmap_area(w) -> str:
     areas = [a for a in raw_areas if a not in skip]
     if raw_areas and not areas:
         raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
-    focus = roadmap_focus(w.cfg.wid)
+    focus = roadmap_focus(w.cfg.wid) if focus is None else focus
     if focus:
         focused = [a for a in areas if a in focus]
         if focused:
