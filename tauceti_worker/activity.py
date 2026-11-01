@@ -10,8 +10,10 @@ import contextlib
 import hashlib
 import json
 import os
+import signal
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.error
@@ -814,7 +816,8 @@ def start_collector(config):
     stopping = threading.Event()
 
     def run():
-        from . import worker_scopes
+        from . import processes, worker_scopes
+        from .paths import self_argv, self_env
 
         oom_since = time.time() - 300
         while not stopping.is_set():
@@ -826,10 +829,18 @@ def start_collector(config):
             except Exception:
                 pass
             try:
-                prepare(config)
+                # SQLite row stepping must not contend with manager socket I/O
+                # for the GIL. Reuse the existing one-shot command and lock.
+                argv = self_argv("activity", "refresh", "--json") + (["--config", str(config)] if config else [])
+                processes.run(argv, env=self_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
             except Exception as error:
-                with contextlib.suppress(Exception):
-                    atomic_json(root() / "preparation-error.json", dict(at=time.time(), error=type(error).__name__))
+                intentional_stop = isinstance(error, subprocess.CalledProcessError) and error.returncode in (
+                    -signal.SIGTERM,
+                    -signal.SIGINT,
+                )
+                if not stopping.is_set() and not intentional_stop:
+                    with contextlib.suppress(Exception):
+                        atomic_json(root() / "preparation-error.json", dict(at=time.time(), error=type(error).__name__))
             stopping.wait(max(0, 60 - (time.monotonic() - started)))
 
     thread = threading.Thread(target=run, name="activity-preparation", daemon=True)

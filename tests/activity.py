@@ -6,7 +6,9 @@ import io
 import json
 import os
 import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,25 +48,34 @@ class ActivityTests(unittest.TestCase):
         self.now = time.time()
 
     def test_collector_keeps_minute_cadence_without_overlapping_or_replaying_missed_ticks(self):
-        from tauceti_worker import worker_scopes
+        from tauceti_worker import processes, worker_scopes
 
         clock = [0.0]
         starts, waits = [], []
-        durations = iter([40, 82, 3])
+        durations = iter([40, 82, 3, 1, 2])
+        exits = iter([0, 0, 1, -signal.SIGTERM, -signal.SIGKILL])
 
         class Stop:
             def is_set(self):
-                return len(waits) == 3
+                return len(waits) == 5
 
             def wait(self, delay):
                 waits.append(delay)
                 clock[0] += delay
 
-        def prepare(config):
+        def refresh(argv, **kwargs):
+            self.assertEqual(
+                argv[-5:], ["activity", "refresh", "--json", "--config", str(Path(self.tmp.name) / "workers.toml")]
+            )
+            self.assertEqual(kwargs["env"]["TAUCETI_ACTIVITY_DIR"], self.tmp.name)
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            self.assertTrue(kwargs["check"])
             starts.append(clock[0])
             clock[0] += next(durations)
-            if len(starts) == 3:
-                raise OSError("temporary preparation failure")
+            returncode = next(exits)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, argv)
 
         # Run the actual collector body synchronously with a controlled clock.
         # Thread creation is the only scheduling boundary replaced here.
@@ -75,13 +86,87 @@ class ActivityTests(unittest.TestCase):
             patch.object(a.threading, "Event", return_value=Stop()),
             patch.object(a.threading, "Thread", side_effect=start_thread),
             patch.object(a.time, "monotonic", side_effect=lambda: clock[0]),
-            patch.object(a, "prepare", side_effect=prepare),
+            patch.object(processes, "run", side_effect=refresh),
+            patch.object(a, "atomic_json", wraps=a.atomic_json) as publish,
             patch.object(worker_scopes, "collect_oom_events", return_value=False),
         ):
             a.start_collector(Path(self.tmp.name) / "workers.toml")
-        self.assertEqual(starts, [0, 60, 142])
-        self.assertEqual(waits, [20, 0, 57])
-        self.assertEqual(a.read_json(a.root() / "preparation-error.json")["error"], "OSError")
+        self.assertEqual(starts, [0, 60, 142, 202, 262])
+        self.assertEqual(waits, [20, 0, 57, 59, 58])
+        self.assertEqual(publish.call_count, 2, "failed/OOM children report errors; intentional SIGTERM does not")
+        self.assertEqual(a.read_json(a.root() / "preparation-error.json")["error"], "CalledProcessError")
+
+    def test_collector_owner_exit_cleans_refresh_descendants_and_releases_locks(self):
+        import fcntl
+
+        from tauceti_worker.paths import self_env
+
+        marker = a.root() / "child-started"
+        locks = [a.root() / "prepare.lock", a.root() / "helper.lock"]
+        helper = (
+            "import fcntl,sys,time;from pathlib import Path;"
+            "lock=open(sys.argv[1],'a');fcntl.flock(lock,fcntl.LOCK_EX);"
+            "Path(sys.argv[2]).touch();time.sleep(60)"
+        )
+        refresh = (
+            "import fcntl,subprocess,sys;"
+            "lock=open(sys.argv[1],'a');fcntl.flock(lock,fcntl.LOCK_EX);"
+            f"subprocess.run([sys.executable,'-c',{helper!r},sys.argv[2],sys.argv[3]],check=True)"
+        )
+        argv = [sys.executable, "-c", refresh, *map(str, locks), str(marker)]
+        wait_for_child = f"while not Path({str(marker)!r}).exists(): time.sleep(.01)"
+        owner_code = (
+            "import os,time;from pathlib import Path;from tauceti_worker import activity,paths,worker_scopes;"
+            f"paths.self_argv=lambda *args:{argv!r};"
+            "worker_scopes.collect_oom_events=lambda *args:False;activity.start_collector(None);"
+            f"exec({wait_for_child!r});os._exit(0)"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", owner_code],
+            env=self_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        ) as owner:
+            try:
+                owner.wait(timeout=15)
+            except BaseException:
+                owner.kill()
+                raise
+            self.assertEqual(owner.returncode, 0)
+        self.assertTrue(marker.exists(), "refresh helper never acquired its lock")
+        for path in locks:
+            with path.open("a") as lock:
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail(f"orphaned refresh process still holds {path.name}")
+                        time.sleep(0.01)
+
+    def test_refresh_child_inherits_activity_root_and_respects_existing_preparation_lock(self):
+        import fcntl
+
+        from tauceti_worker.paths import self_argv, self_env
+
+        published = dict(version=1, prepared_at=self.now, all={"marker": "previous publication"}, errors=[])
+        a.atomic_json(a.root() / "summary.json", published)
+        with (a.root() / "prepare.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            child = subprocess.run(
+                self_argv("activity", "refresh", "--json", "--config", str(a.root() / "workers.toml")),
+                env=self_env(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+        self.assertEqual(json.loads(child.stdout)["summary"], published["all"])
+        self.assertEqual(a.read_json(a.root() / "summary.json"), published)
+        self.assertFalse((a.root() / "activity.sqlite").exists())
 
     def finish(self, age, kind="review", outcome="completed", rid=None):
         rid = rid or str(age)
