@@ -164,3 +164,5 @@ Unpaid synthetic measurements on the development host:
 | Same unchanged history; warm preparation | Approximately 76 ms; zero ledger bytes replayed |
 
 These fixtures measure local collection cost, not real-workload latency or estimator error. Regression coverage includes metadata-only sampling, independent refresh scheduling, duplicate counters, missing/replaced files, stale sources, generation/publication races, interval overlap, resumes, downward native corrections, terminal acknowledgement, automatic recovery concurrency, corruption and torn journal/ledger suffixes. The repository test runner includes the new live-accounting suite.
+
+Live rollout found and repaired two compatibility cases: summary files now use `.summary` so legacy checkpoint `*.json` discovery stays valid, and historical publication rebases the last sampled estimate without another journal sample. Readers also accept first-release `.summary.json` sidecars while paid shims finish naturally. A newer baseline excludes already-accounted invocations from an older active view.

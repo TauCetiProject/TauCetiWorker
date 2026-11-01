@@ -234,7 +234,13 @@ def _read_suffix(path, checkpoint, *, allow_foreign=False):
 def read_summary(path, *, allow_foreign=False):
     """Small optional reporting cache. Never proof of complete expenditure."""
     try:
-        value = json.loads(_read(Path(path).with_suffix(".summary.json"), 8192, allow_foreign=allow_foreign))
+        try:
+            raw = _read(Path(path).with_suffix(".summary"), 8192, allow_foreign=allow_foreign)
+        except FileNotFoundError:
+            # Accept summaries from the first live release while copied shims
+            # finish naturally. New summaries do not match checkpoint *.json.
+            raw = _read(Path(path).with_suffix(".summary.json"), 8192, allow_foreign=allow_foreign)
+        value = json.loads(raw)
         if (
             value.get("version") != 1
             or value.get("id") != Path(path).stem
@@ -448,7 +454,7 @@ class UsageJournal:
                     usage_seen=seen,
                     provider_session=self.value.get("provider_session"),
                 )
-                self._replace(self.path.with_suffix(".summary.json"), summary, durable=False)
+                self._replace(self.path.with_suffix(".summary"), summary, durable=False)
                 self.last_summary, self.summary_seen = now, seen
             except OSError:
                 pass
@@ -464,7 +470,7 @@ class UsageJournal:
     @staticmethod
     def _replace(path, value, *, durable):
         raw = (json.dumps(value, separators=(",", ":")) + "\n").encode()
-        tmp = path.with_suffix(".tmp")
+        tmp = path.with_name(path.name + ".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)

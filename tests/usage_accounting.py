@@ -80,7 +80,7 @@ class UsageTests(unittest.TestCase):
         original = self.journal._replace
 
         def replace(path, *args, **kwargs):
-            if path.name.endswith(".summary.json"):
+            if path.name.endswith(".summary"):
                 raise OSError("reporting full")
             return original(path, *args, **kwargs)
 
@@ -90,6 +90,13 @@ class UsageTests(unittest.TestCase):
         saved = read_usage(self.journal.path)
         self.assertTrue(saved["closed"])
         self.assertEqual(Decimal(saved["messages"]["s:m"]["cost"]), Decimal(".002"))
+
+    def test_summary_does_not_match_checkpoint_glob_and_accepts_rolling_upgrade(self):
+        self.journal.observe(response(output_tokens=100))
+        self.assertEqual(list(self.journal.directory.glob("*.json")), [self.journal.path])
+        summary = self.journal.path.with_suffix(".summary")
+        summary.rename(self.journal.path.with_suffix(".summary.json"))
+        self.assertEqual(Decimal(read_summary(self.journal.path)["cost"]), Decimal(".002"))
 
     def test_duplicates_partial_messages_and_subagents_are_separate(self):
         self.journal.observe(response(output_tokens=100))

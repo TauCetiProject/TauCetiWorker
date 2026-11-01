@@ -56,11 +56,45 @@ def baseline_path(path):
     return root() / "live-baselines" / (hashlib.sha256(str(path).encode()).hexdigest() + ".json")
 
 
-def publish_report(path, value):
+def publication_context():
+    from .budget import budget_dir
+
+    return dict(view=read_json(budget_dir() / "live-sessions.json"), overlay=read_json(root() / "live-overlay.json"))
+
+
+def publish_report(path, value, *, carry=None):
     """An immutable baseline plus its public view, sharing a brief publication lock."""
+    output = value
+    if carry and carry["overlay"].get("observed_at") is not None:
+        view = carry["view"]
+        base = value.get("all", {}).get("costs", {}).get("live_baseline") or {}
+        prior = carry["overlay"].get("reports", {}).get(str(path), {})
+        estimates = {}
+        for key, session in view.get("sessions", {}).items():
+            known = max(
+                money(base.get("sessions", {}).get(key, {}).get("cost", "0")),
+                money(session.get("cost", "0")),
+                money(session.get("lower_bound_cost", "0")),
+            )
+            if session["status"] == "settled":
+                estimates[key] = dict(
+                    total=session["cost"],
+                    observed=session["cost"],
+                    source="settled",
+                    observed_at=session.get("finished"),
+                )
+            else:
+                estimates[key] = prior.get("sessions", {}).get(key) or dict(
+                    total=str(known), observed=str(known), source="known-prefix", observed_at=None
+                )
+        output, _ = apply_overlay(
+            value, view, base, prior, time.time(), estimates=estimates, **value.get("live_subject", {})
+        )
+        if output.get("all", {}).get("costs", {}).get("live_estimate"):
+            output["all"]["costs"]["live_estimate"]["observed_at"] = carry["overlay"]["observed_at"]
     with publication_lock():
         atomic_json(baseline_path(path), value, durable=False)
-        atomic_json(path, value, durable=False)
+        atomic_json(path, output, durable=False)
 
 
 def publish_inputs(value, paths):
@@ -208,13 +242,12 @@ def apply_overlay(value, view, inputs, previous, now, *, worker=None, scope=None
     """Pure rebase against a matching prepared generation; negative corrections replace estimates."""
     value = copy.deepcopy(value)
     costs = value.get("all", {}).get("costs", {})
-    base = costs.get("live_baseline", {})
+    base = costs.get("live_baseline") or {}
     generation = base.get("generation")
     if (
         not generation
         or inputs.get("generation", generation) != generation
         or view.get("ledger_identity") != base.get("ledger_identity")
-        or view.get("ledger_sequence", 0) < base.get("ledger_sequence", 0)
     ):
         return value, previous
     old = previous.get("sessions", {}) if previous.get("generation") == generation else {}
@@ -228,7 +261,7 @@ def apply_overlay(value, view, inputs, previous, now, *, worker=None, scope=None
             continue
         baseline = base.get("sessions", {}).get(key, {})
         # A terminal row absent from the new baseline has already been included.
-        if session["status"] == "settled" and not baseline and base["ledger_sequence"] >= session["ledger_sequence"]:
+        if not baseline and base["ledger_sequence"] >= session["ledger_sequence"]:
             continue
         sample = estimates[key] if estimates is not None else estimate(session, baseline, inputs.get("rates", {}), now)
         if session["status"] != "settled":

@@ -348,7 +348,7 @@ Full checkpoints are written at initialization, on explicit/final flush, and at
 most once per minute during normal observation. The durable delta journal still
 precedes event forwarding. A checkpoint records its exact consumed byte offset,
 file identity and prefix anchor so readers can replay only the newer suffix.
-A small best-effort `.summary.json` reports running priced usage and the matching
+A small best-effort `.summary` reports running priced usage and the matching
 byte offset without duplicating the message dictionary. Summary writes add no
 durability barrier and their failure does not invalidate durable usage evidence.
 

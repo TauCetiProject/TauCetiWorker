@@ -775,6 +775,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             from . import activity_live
 
             report_paths = [root() / "summary.json"]
+            live_context = activity_live.publication_context()
             for column, key in (("worker", "workers"), ("scope", "groups")):
                 ids = db.execute(
                     f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
@@ -806,6 +807,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                             errors=errors,
                             live_subject={"worker" if key == "workers" else "scope": row[0]},
                         ),
+                        carry=live_context,
                     )
             # Detail is separate; status readers never transfer a growing PR inventory.
             atomic_json(
@@ -816,7 +818,9 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             # These are rebuildable views. Receipts and SQLite remain durable;
             # readers need atomic replacement, not a disk barrier for every view.
             activity_live.publish_report(
-                root() / "summary.json", {k: v for k, v in value.items() if k not in ("workers", "groups")}
+                root() / "summary.json",
+                {k: v for k, v in value.items() if k not in ("workers", "groups")},
+                carry=live_context,
             )
             activity_live.publish_inputs(value, report_paths)
             return value

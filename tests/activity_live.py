@@ -249,6 +249,26 @@ class LiveTests(unittest.TestCase):
         output, _ = live.apply_overlay(self.value, self.view, {}, {}, NOW, estimates=old)
         self.assertEqual(self.total(output), 11)
 
+    def test_historical_publication_carries_estimates_without_resampling(self):
+        path = live.root() / "summary.json"
+        output, state = live.apply_overlay(self.value, self.view, {}, {}, NOW)
+        carry = dict(view=self.view, overlay=dict(observed_at=NOW, reports={str(path): state}))
+        fresh = copy.deepcopy(self.value)
+        fresh["all"]["costs"]["live_baseline"].update(generation="g2", ledger_sequence=3)
+        with patch.object(Path, "lstat", side_effect=AssertionError("publication must not sample journals")):
+            live.publish_report(path, fresh, carry=carry)
+        published = read_json(path)
+        self.assertEqual(self.total(published), 12)
+        self.assertEqual(published["all"]["costs"]["live_estimate"]["observed_at"], NOW)
+        self.assertNotIn("spending_including_live", read_json(live.baseline_path(path))["all"]["costs"])
+
+    def test_new_baseline_does_not_double_count_older_active_view(self):
+        fresh = copy.deepcopy(self.value)
+        fresh["all"]["costs"]["live_baseline"].update(generation="g2", ledger_sequence=3, sessions={})
+        fresh["all"]["costs"]["spending"]["total"]["spent_usd"] = "12"
+        output, _ = live.apply_overlay(fresh, self.view, {}, {}, NOW)
+        self.assertEqual(self.total(output), 12)
+
     def test_supervisor_terminal_view_is_retained_then_acknowledged(self):
         b = Budget(self.root / "budget", clock=lambda: NOW)
         b.configure(grant=100)
