@@ -36,6 +36,7 @@ trap 'rm -rf "$TAUCETI_ACTIVITY_DIR"' EXIT
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
   activity.py
+  activity_git.py
   activity_costs.py
   api_budget.py
   budget_projection.py
