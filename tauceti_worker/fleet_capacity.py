@@ -9,6 +9,7 @@ import contextlib
 import json
 import math
 import os
+import random
 import time
 from pathlib import Path
 
@@ -46,6 +47,44 @@ def admission_reason(worker: str, *, env=None, now=None) -> str | None:
 
 
 _CURRENT_UNIT = None
+
+
+def roadmap_focus(worker: str, *, env=None, now=None) -> list[str]:
+    """Read optional, live roadmap steering for this slot. Admission remains independent.
+
+    Older controllers have no focus field; malformed or stale steering falls back
+    to ordinary selection. It must never pause reviews, repairs, or admissions.
+    """
+    env = os.environ if env is None else env
+    path = env.get("TAUCETI_FLEET_ADMISSION_FILE")
+    if not path:
+        return []
+    now = time.time() if now is None else now
+    try:
+        policy = json.loads(Path(path).read_text())
+        expires = policy["expires_at"]
+        focus = policy.get("roadmap_focus", {})
+        areas = focus.get("areas", [])
+        workers = focus.get("workers", [])
+        fractional_percent = focus.get("fractional_percent", 0)
+        if (
+            policy.get("version") == 1
+            and type(expires) in (int, float)
+            and now < expires <= now + 30
+            and isinstance(workers, list)
+            and isinstance(areas, list)
+            and all(isinstance(a, str) and a.strip() for a in areas)
+        ):
+            if worker in workers or (
+                worker == focus.get("fractional_worker")
+                and type(fractional_percent) is int
+                and 0 < fractional_percent < 100
+                and random.randrange(100) < fractional_percent
+            ):
+                return sorted(set(areas))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return []
 
 
 @contextlib.contextmanager

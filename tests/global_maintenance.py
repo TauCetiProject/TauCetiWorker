@@ -387,6 +387,15 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertEqual(self.calls[0][:2], ("rebase", 5))
         areas.assert_not_called()
 
+    def test_fleet_focus_is_applied_only_after_global_maintenance(self):
+        with patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]) as focus:
+            self.run_round([row(40, "Other", author="peer", blocking=False)])
+            self.assertEqual(self.calls[0][:2], ("review", 40))
+            focus.assert_not_called()
+            self.run_round([])
+            self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
+            focus.assert_called_once_with(self.w.cfg.wid)
+
     def test_new_authoring_selects_area_last(self):
         _, query, areas = self.run_round([])
         self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])

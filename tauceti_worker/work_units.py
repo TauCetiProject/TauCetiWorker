@@ -596,9 +596,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
             if scope in (None, "auto") and not opts.dry_run:
-                all_areas = roadmap_areas(w.gh)
-                areas = [area for area in all_areas if area not in roadmap_skip()]
-                sv.roadmap_only = random.choice(areas) if areas else ("auto" if all_areas else "any")
+                sv.roadmap_only = random_roadmap_area(w)
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
@@ -2812,17 +2810,33 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
         return None
 
 
+def random_roadmap_area(w) -> str:
+    """Choose new authoring work, applying advisory fleet focus after operator exclusions."""
+    from .fleet_capacity import roadmap_focus
+
+    raw_areas = roadmap_areas(w.gh)
+    skip = roadmap_skip()
+    areas = [a for a in raw_areas if a not in skip]
+    if raw_areas and not areas:
+        raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
+    focus = roadmap_focus(w.cfg.wid)
+    if focus:
+        focused = [a for a in areas if a in focus]
+        if focused:
+            areas = focused
+            log(f"Fleet roadmap focus: choosing from {', '.join(areas)}")
+        else:
+            log("Fleet roadmap focus: no eligible focus areas; using ordinary selection")
+    return random.choice(areas) if areas else "any"
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
     skip = roadmap_skip()
     if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
-        raw_areas = roadmap_areas(w.gh)
-        areas = [a for a in raw_areas if a not in skip]
-        if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
-            raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
-        only = random.choice(areas) if areas else "any"
-        log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)})")
+        only = random_roadmap_area(w)
+        log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is
