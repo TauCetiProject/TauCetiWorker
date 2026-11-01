@@ -132,6 +132,15 @@ class CostTests(unittest.TestCase):
         a.prepare(now=self.now + 1)
         return a.cached(group="machine")["summary"]
 
+    def test_scope_resolution_scales_with_workers_not_invocations(self):
+        for i in range(120):
+            self.session(f"historical-{i}", 2 * DAY, "author" if i % 2 else "reviewer", "1", settled=True)
+        self.write_ledger()
+        with patch.object(a, "_worker_scope", wraps=a._worker_scope) as lookup:
+            summary = self.summary()
+        self.assertEqual(sorted(call.args[1] for call in lookup.call_args_list), ["author", "not-in-fleet", "reviewer"])
+        self.assertEqual(Decimal(summary["costs"]["windows"]["total"]["spent_usd"]), Decimal(180))
+
     def test_recovered_estimate_uses_recorded_interval_in_spending_windows(self):
         self.session("d" * 32, 2 * DAY, "author", "6", settled=True)
         self.records[-1]["timestamp"] = self.now
