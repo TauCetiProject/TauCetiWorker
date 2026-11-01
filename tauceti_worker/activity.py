@@ -818,6 +818,7 @@ def start_collector(config):
 
         oom_since = time.time() - 300
         while not stopping.is_set():
+            started = time.monotonic()
             observed_at = time.time()
             try:
                 if worker_scopes.collect_oom_events(config, oom_since):
@@ -829,7 +830,7 @@ def start_collector(config):
             except Exception as error:
                 with contextlib.suppress(Exception):
                     atomic_json(root() / "preparation-error.json", dict(at=time.time(), error=type(error).__name__))
-            stopping.wait(60)
+            stopping.wait(max(0, 60 - (time.monotonic() - started)))
 
     thread = threading.Thread(target=run, name="activity-preparation", daemon=True)
     thread.start()

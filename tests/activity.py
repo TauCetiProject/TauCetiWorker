@@ -45,6 +45,44 @@ class ActivityTests(unittest.TestCase):
         self.addCleanup(recovery_home.stop)
         self.now = time.time()
 
+    def test_collector_keeps_minute_cadence_without_overlapping_or_replaying_missed_ticks(self):
+        from tauceti_worker import worker_scopes
+
+        clock = [0.0]
+        starts, waits = [], []
+        durations = iter([40, 82, 3])
+
+        class Stop:
+            def is_set(self):
+                return len(waits) == 3
+
+            def wait(self, delay):
+                waits.append(delay)
+                clock[0] += delay
+
+        def prepare(config):
+            starts.append(clock[0])
+            clock[0] += next(durations)
+            if len(starts) == 3:
+                raise OSError("temporary preparation failure")
+
+        # Run the actual collector body synchronously with a controlled clock.
+        # Thread creation is the only scheduling boundary replaced here.
+        def start_thread(**kwargs):
+            return SimpleNamespace(start=kwargs["target"])
+
+        with (
+            patch.object(a.threading, "Event", return_value=Stop()),
+            patch.object(a.threading, "Thread", side_effect=start_thread),
+            patch.object(a.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(a, "prepare", side_effect=prepare),
+            patch.object(worker_scopes, "collect_oom_events", return_value=False),
+        ):
+            a.start_collector(Path(self.tmp.name) / "workers.toml")
+        self.assertEqual(starts, [0, 60, 142])
+        self.assertEqual(waits, [20, 0, 57])
+        self.assertEqual(a.read_json(a.root() / "preparation-error.json")["error"], "OSError")
+
     def finish(self, age, kind="review", outcome="completed", rid=None):
         rid = rid or str(age)
         with patch.object(a.time, "time", return_value=self.now - age):
