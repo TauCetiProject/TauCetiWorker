@@ -597,6 +597,16 @@ class CostTests(unittest.TestCase):
                     actual.set_trace_callback(None)
                     self.assertEqual(actual.total_changes, before)
                     self.assertFalse(any(sql.startswith("INSERT INTO") for sql in statements), statements)
+                if table != "cost_accruals":
+                    # The existing upsert keeps the last value for an identity,
+                    # even when that last value already matches the stored row.
+                    duplicate = list(rows[0])
+                    duplicate[-1] = "7.00000" if table == "conversation_costs" else 7
+                    activity_costs._write_prepared(actual, table, [duplicate, *rows])
+                    self.assertEqual(
+                        actual.execute(f"SELECT * FROM {table} ORDER BY id").fetchall(),
+                        reference.execute(f"SELECT * FROM {table} ORDER BY id").fetchall(),
+                    )
                 if table == "cost_accruals":
                     actual.execute("UPDATE cost_accruals SET rowid=99 WHERE rowid=2")
                     actual.execute("INSERT INTO cost_accruals(rowid) VALUES (-1)")
