@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import activity_ci, activity_costs, activity_summary
+from . import activity_ci, activity_costs, activity_git, activity_summary
 from .constants import WORK_TASKS
 from .runtime_status import atomic_json, read_json
 
@@ -467,9 +467,17 @@ def _refresh_prs(db, config, now, errors):
                 seen = [p["number"] for p in value["prs"]] + value["missing"]
                 if len(seen) != len(set(seen)) or set(seen) != set(batch):
                     raise ValueError("incomplete observation response")
+                if any(
+                    p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED") for p in value["prs"]
+                ):
+                    raise ValueError("invalid PR observation")
+                missing_loc = [p for p in value["prs"] if p.get("lean_loc") is None]
+                git_locs = activity_git.measure(root(), repo, missing_loc)
+                if any(p.get("head_sha") and p.get("base_sha") and p["number"] not in git_locs for p in missing_loc):
+                    message = "Some exact PR LOC comparisons are unavailable; normal refresh will retry"
+                    if message not in errors:
+                        errors.append(message)
                 for p in value["prs"]:
-                    if p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED"):
-                        raise ValueError("invalid PR observation")
                     fields = (
                         p["state"],
                         _epoch(p.get("landed_at")),
@@ -489,7 +497,7 @@ def _refresh_prs(db, config, now, errors):
                         "UPDATE pr_observations SET state=?,landed=COALESCE(?,landed),observed=?,checked=?,head=?,source=COALESCE(?,source),created=COALESCE(?,created) WHERE repo=? AND number=?",
                         fields,
                     )
-                    loc = p.get("lean_loc")
+                    loc = p.get("lean_loc") or git_locs.get(p["number"])
                     if loc is not None:
                         if loc.get("head_sha") != p.get("head_sha") or not all(
                             type(loc.get(k)) is int and loc[k] >= 0 for k in ("added", "deleted")

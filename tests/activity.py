@@ -488,6 +488,33 @@ class ActivityTests(unittest.TestCase):
             self.assertEqual(observation.call_count, 1)
         self.assertEqual(a.cached()["summary"]["open_prs"], 1)
 
+    def test_missing_loc_uses_exact_git_comparison_in_normal_refresh(self):
+        a.emit("pr_created", repository="org/repo", pr=7)
+        head, base = "a" * 40, "b" * 40
+        response = dict(
+            prs=[
+                dict(number=7, state="OPEN", observed_at=self.now * 1000, head_sha=head, base_sha=base, lean_loc=None)
+            ],
+            missing=[],
+        )
+        env = {
+            "TAUCETI_GITHUB_STATE_URL": "https://state.example",
+            "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(a, "observe", return_value=response),
+            patch.object(
+                a.activity_git, "measure", return_value={7: dict(added=17, deleted=3, head_sha=head)}
+            ) as measure,
+        ):
+            a.prepare(now=self.now + 1)
+            a.prepare(now=self.now + 61)
+        self.assertEqual(measure.call_count, 1)
+        with contextlib.closing(a._connect()) as db:
+            row = db.execute("SELECT head,added,deleted FROM pr_loc WHERE repo='org/repo' AND number=7").fetchone()
+            self.assertEqual(tuple(row), (head, 17, 3))
+
     def test_read_and_display_do_not_open_database_or_network(self):
         self.finish(10)
         a.prepare(now=self.now)
