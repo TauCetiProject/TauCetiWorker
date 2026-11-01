@@ -106,7 +106,8 @@ class GlobalMaintenance(unittest.TestCase):
 
         with (
             patch(
-                "tauceti_worker.github_state.read_survey", return_value=(True, SurveyRows(rows, {"science": author_count}))
+                "tauceti_worker.github_state.read_survey",
+                return_value=(True, SurveyRows(rows, {"science": author_count})),
             ) as query,
             patch.object(work, "dispatch", side_effect=perform),
             patch.object(work, "roadmap_areas", return_value=["NewArea"]) as areas,
