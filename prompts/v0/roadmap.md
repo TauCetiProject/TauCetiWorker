@@ -46,7 +46,7 @@ Once you have settled on a target, derive a short stable id for it and claim it 
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
   Classic `import Mathlib...` syntax is simplest.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Choose a target supported by an existing roadmap; if none is suitable, finish without opening a PR.
-- Aim for ~200–600 lines of genuine, non-vacuous content. A shorter PR that closes a milestone beats a longer peripheral one, and smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions, and never silence a linter or use `set_option`.
+- Aim for ~500–1200 lines of genuine, non-vacuous content. A shorter PR that closes a milestone beats a longer peripheral one, and smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions, and never silence a linter or use `set_option`.
 - Must build green AND pass the axiom audit (allowlist: `propext`, `Classical.choice`, `Quot.sound`; no `sorry`/`native_decide`/new axioms/`maxHeartbeats`).
 
 ## Review your own diff, before you verify
