@@ -1451,6 +1451,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         if rc == REVIEW_PREPARATION_WAIT_EXIT:
             # A fetch/host outage is not a defect in the selected PR. Refresh
             # discovery on the next ordinary attempt, including a changed head.
+            from .github_state import MAX_RETRY_AFTER
+            from .state_repair import retry_key
+
+            w.counters.write(retry_key(pr, head), int(time.time() + MAX_RETRY_AFTER) + 1)
             w.rs.bust(pr)
             raise NoProgress(f"review #{pr}: source preparation unavailable before inference — not charged to the PR")
         if rc == 0:
