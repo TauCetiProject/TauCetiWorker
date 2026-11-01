@@ -617,7 +617,8 @@ def shared_pr_view(args):
         }
     ):
         return None
-    from .github_state import read
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tauceti_worker.github_state import read
 
     try:
         available, row = read(repo, "pr", number=number)
