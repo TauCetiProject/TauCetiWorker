@@ -744,6 +744,42 @@ class WorkerBoundJudgments(unittest.TestCase):
         advance.assert_not_called()
         self.assertTrue((self.work / "blocked.json").exists())
 
+    def test_unfinished_with_damaged_token_resumes_same_inspection_without_approval(self):
+        value = self.unfinished_evidence()
+        value["read_token"] = "damaged-token"
+        self.replace_answer(value)
+        original = (self.original / "model-transcript.jsonl").read_bytes()
+        with (
+            patch.object(sa, "inspect", side_effect=OSError("retry later")) as model,
+            patch.object(sa, "advance") as advance,
+            self.assertRaises(NoProgress),
+        ):
+            recovery.recover(self.cfg, self.opts, self.block)
+        self.assertEqual(model.call_args.kwargs["resume_from"], self.original)
+        self.assertTrue(model.call_args.kwargs["continue_reading"])
+        advance.assert_not_called()
+        self.assertEqual((self.original / "model-transcript.jsonl").read_bytes(), original)
+        self.assertTrue((self.work / "blocked.json").exists())
+
+    def test_damaged_progress_token_does_not_relax_passing_or_receipt_checks(self):
+        value = self.unfinished_evidence()
+        value.update(verdict="pass", read_token="damaged-token")
+        self.replace_answer(value)
+        with patch.object(sa, "inspect") as model, patch.object(sa, "advance") as advance:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+        advance.assert_not_called()
+        value["verdict"] = "unfinished"
+        self.replace_answer(value)
+        receipt = self.original / "read-receipt.json"
+        proof = json.loads(receipt.read_text())
+        proof["input_digest"] = "wrong-batch"
+        receipt.write_text(sa.serialize(proof))
+        with patch.object(sa, "inspect") as model, patch.object(sa, "advance") as advance:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+        advance.assert_not_called()
+
     def test_unfinished_with_source_concern_and_inspected_code_uncertainty_are_held(self):
         for verdict in ("finding", "incomplete", "unfinished"):
             value = self.unfinished_evidence()
