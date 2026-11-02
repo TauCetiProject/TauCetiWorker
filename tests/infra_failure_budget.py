@@ -58,6 +58,14 @@ cases = [
     ("401 stays charged", "Failed to authenticate. API Error: 401 Invalid authentication credentials", None),
     ("403 stays charged", "API Error: 403 Forbidden", None),
     ("400 stays charged", "API Error: 400 Bad Request", None),
+    (
+        "credit refusal",
+        "Credit balance is too low\nAPI Error: 400",
+        "provider credit balance exhausted",
+    ),
+    ("quoted credit refusal", "The test asserts: Credit balance is too low\nAPI Error: 400", None),
+    ("credit text without provider status", "Credit balance is too low", None),
+    ("credit text followed by auth failure", "Credit balance is too low\nAPI Error: 400\nAPI Error: 401", None),
     ("404 stays charged", "API Error: 404 model not found", None),
     ("transport reset", "Error: read ECONNRESET", "could not reach the provider"),
     ("socket hang up", "request failed: socket hang up", "could not reach the provider"),
@@ -176,28 +184,27 @@ with tempfile.TemporaryDirectory() as state:
     check("cap survives a moving head", charged_again, True)
     check("cap leaves the attempt charged", w.counters.read(KEYS[0]), 3)
 
-with tempfile.TemporaryDirectory() as state:
-    w = fresh(state)
-    for _ in range(wu.MAX_INFRA_REFUNDS + 3):
+for refusal in ("provider credit balance exhausted", "provider subscription limit reached"):
+    with tempfile.TemporaryDirectory() as state:
+        w = fresh(state)
+        for _ in range(wu.MAX_INFRA_REFUNDS + 3):
+            w.counters.write(KEYS[0], 1)
+            agents._LAST_AGENT_FAILURE = refusal
+            try:
+                wu._refund_infra_failure(w, CAND, "fix", KEYS)
+            except NoProgress:
+                pass
+            else:
+                check(f"{refusal} always stops the round", False, True)
+        check(f"{refusal} cannot exhaust a PR's allowance", w.counters.read(KEYS[0]), 0)
+        check(f"{refusal} leaves the ambiguous-refund allowance intact", w.counters.read(f"infra-fix-{CAND.pr}"), 0)
         w.counters.write(KEYS[0], 1)
-        agents._LAST_AGENT_FAILURE = "provider subscription limit reached"
+        agents._LAST_AGENT_FAILURE = "provider returned 529"
         try:
             wu._refund_infra_failure(w, CAND, "fix", KEYS)
         except NoProgress:
             pass
-        else:
-            check("subscription refusal always stops the round", False, True)
-    check("repeated subscription refusals cannot exhaust a PR's allowance", w.counters.read(KEYS[0]), 0)
-    check(
-        "subscription refusals leave the ambiguous-refund allowance intact", w.counters.read(f"infra-fix-{CAND.pr}"), 0
-    )
-    w.counters.write(KEYS[0], 1)
-    agents._LAST_AGENT_FAILURE = "provider returned 529"
-    try:
-        wu._refund_infra_failure(w, CAND, "fix", KEYS)
-    except NoProgress:
-        pass
-    check("a later genuine 529 still gets its refund", w.counters.read(KEYS[0]), 0)
+        check("a later genuine 529 still gets its refund", w.counters.read(KEYS[0]), 0)
 
 agents._LAST_AGENT_FAILURE = None
 print("\nFAIL" if fails else "\nall infra-failure budget checks passed")

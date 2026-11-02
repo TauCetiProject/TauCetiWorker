@@ -1003,6 +1003,8 @@ def classify_agent_failure(text: str) -> str | None:
     for m in _API_ERROR_RE.finditer(hay):
         status = int(m.group(1))
     if status is not None:
+        if status == 400 and any(re.fullmatch(r"Credit balance is too low", line, re.I) for line in lines):
+            return "provider credit balance exhausted"
         # A status we DID parse and that is not transient is a definite task-side answer (a bad
         # request, a dead credential). Stop here rather than falling through to the transport
         # patterns, which could otherwise rescue a 401 that happens to mention a socket.
@@ -1194,6 +1196,11 @@ def run_agent_proc(
         if renderer.terminal_failure_final and renderer.terminal_failure_text:
             classification_text = renderer.terminal_failure_text
         reason = classify_agent_failure(classification_text)
+        if reason == "provider credit balance exhausted" and not all(
+            type(renderer.usage.get(key)) is int and renderer.usage[key] == 0
+            for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+        ):
+            return None  # Refunding a credit refusal requires explicit zero-token evidence.
         if reason == "provider subscription limit reached" and quota_reader is not None:
             quota_reader.note_model_refusal(provider, launch_credential)
         return reason

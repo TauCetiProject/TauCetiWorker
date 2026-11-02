@@ -435,6 +435,12 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.values["fix-10-head"], 0)
 
     def test_subscription_refusal_preserves_recovery_at_the_infra_cap(self):
+        self.check_provider_limit_refusal("provider subscription limit reached")
+
+    def test_credit_refusal_preserves_recovery_at_the_infra_cap(self):
+        self.check_provider_limit_refusal("provider credit balance exhausted")
+
+    def check_provider_limit_refusal(self, reason):
         from tauceti_worker.constants import MAX_INFRA_REFUNDS
 
         FakeVerification.failures = 100
@@ -444,7 +450,7 @@ class Fixture(unittest.TestCase):
             patch("tauceti_worker.agents.run_agent_host", return_value=1),
             patch(
                 "tauceti_worker.agents.take_last_agent_infra_failure",
-                return_value="provider subscription limit reached",
+                return_value=reason,
             ),
         ):
             self.assertFalse(self.run_recovery())
