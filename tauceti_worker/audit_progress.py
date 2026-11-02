@@ -168,8 +168,18 @@ def continuable(
         ):
             return False
         token = value["read_token"]
-        if not isinstance(token, str) or (proof["read"] and token != proof["last_token"]):
+        if not isinstance(token, str):
             return False
-        return value["verdict"] == "unfinished" or (value["verdict"] == "pass" and bool(proof["missing"]))
+        # An unfinished answer never authorizes advancement. A copied token can
+        # be damaged without losing the owned receipt or the native inspection;
+        # continuation replays the last page with an empty token. Passing answers
+        # still need the exact delivery token, including premature passes.
+        if value["verdict"] == "unfinished":
+            return True
+        return (
+            value["verdict"] == "pass"
+            and bool(proof["missing"])
+            and (not proof["read"] or token == proof["last_token"])
+        )
     except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
