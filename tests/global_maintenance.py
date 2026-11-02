@@ -141,6 +141,18 @@ class GlobalMaintenance(unittest.TestCase):
                 pr["review"]["meta"]["head_sha"] = "b" * 40
                 self.run_round([pr])
                 self.assertEqual(self.calls[0][:2], ("roadmap", 0))
+                # An old awaiting-author label with incomplete history must
+                # not substitute for actual findings at the new head.
+                pr["pr"]["labels"].append({"name": "awaiting-author"})
+                pr["review"]["issue_complete"] = False
+                pr["review"]["review_complete"] = False
+                self.run_round([pr])
+                self.assertEqual(self.calls[0][:2], ("roadmap", 0))
+        self.opts.only = ["fix-ci", "fix", "review", "roadmap"]
+        pr = row(10, "Other")
+        pr["pr"]["statusCheckRollup"] = [{"context": "build", "state": "FAILURE"}]
+        self.run_round([pr])
+        self.assertEqual(self.calls[0][:2], ("fix-ci", 10))
 
     def test_old_pause_comments_cannot_strand_maintenance(self):
         for marker, expected in (
