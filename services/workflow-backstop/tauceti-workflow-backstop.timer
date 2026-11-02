@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Tau Ceti maintenance workflow scheduling every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

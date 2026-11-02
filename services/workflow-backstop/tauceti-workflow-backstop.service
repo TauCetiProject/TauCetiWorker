@@ -1,0 +1,20 @@
+[Unit]
+Description=Backstop for Tau Ceti maintenance workflow scheduling
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+ExecStart=%h/.local/share/tauceti/workflow-backstop/current/bin/tauceti-workflow-backstop --repo TauCetiProject/TauCeti --state %S/tauceti/workflow-backstop/state.json --execute
+Environment=PATH=%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+StateDirectory=tauceti/workflow-backstop
+StateDirectoryMode=0700
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=512M
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/tauceti/workflow-backstop
