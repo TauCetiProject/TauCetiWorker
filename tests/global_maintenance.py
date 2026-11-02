@@ -128,6 +128,32 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round([held, row(20, "Other")])
             self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
 
+    def test_current_review_findings_can_be_fixed_without_green_ci(self):
+        self.opts.only = ["fix", "review", "roadmap"]
+        for state in (None, "PENDING", "FAILURE"):
+            with self.subTest(build=state):
+                pr = row(10, "Other")
+                pr["pr"]["statusCheckRollup"] = [] if state is None else [{"context": "build", "state": state}]
+                self.run_round([pr])
+                self.assertEqual(self.calls[0][:2], ("fix", 10))
+                # Moving the head invalidates these findings even when CI is
+                # unavailable; removing the CI prerequisite must not revive them.
+                pr["review"]["meta"]["head_sha"] = "b" * 40
+                self.run_round([pr])
+                self.assertEqual(self.calls[0][:2], ("roadmap", 0))
+                # An old awaiting-author label with incomplete history must
+                # not substitute for actual findings at the new head.
+                pr["pr"]["labels"].append({"name": "awaiting-author"})
+                pr["review"]["issue_complete"] = False
+                pr["review"]["review_complete"] = False
+                self.run_round([pr])
+                self.assertEqual(self.calls[0][:2], ("roadmap", 0))
+        self.opts.only = ["fix-ci", "fix", "review", "roadmap"]
+        pr = row(10, "Other")
+        pr["pr"]["statusCheckRollup"] = [{"context": "build", "state": "FAILURE"}]
+        self.run_round([pr])
+        self.assertEqual(self.calls[0][:2], ("fix-ci", 10))
+
     def test_old_pause_comments_cannot_strand_maintenance(self):
         for marker, expected in (
             ({"head": HEAD, "author": "science"}, [("fix", 10)]),
