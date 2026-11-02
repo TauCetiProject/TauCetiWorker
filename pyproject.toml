@@ -11,6 +11,7 @@ dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTo
 
 [project.scripts]
 tauceti = "tauceti_worker.cli:cli_main"
+tauceti-workflow-backstop = "tauceti_worker.workflow_backstop:main"
 
 # The worker is the tauceti_worker/ package. Its prompts/ and scripts/ wrappers live at the repo
 # root for the `./tauceti` shim (HERE resolves to the repo root in a checkout); the wheel bundles
