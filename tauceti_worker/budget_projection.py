@@ -232,6 +232,7 @@ class Projection:
                     valid = False
             if not valid:
                 self.rebuilt = True
+                self.before_rebuild(db)
                 db.execute("DELETE FROM sessions")
                 db.execute("DELETE FROM providers")
                 saved = {"offset": 0, "state": {}}
@@ -293,6 +294,9 @@ class Projection:
                 raise
             state["sessions"] = Sessions(db, self)
             return state
+
+    def before_rebuild(self, db):
+        """Allow derived consumers to invalidate their cursor in this transaction."""
 
     def discard(self):
         self.close()

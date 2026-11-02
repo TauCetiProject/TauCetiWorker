@@ -207,7 +207,7 @@ class ActivityTests(unittest.TestCase):
                 a.emit("round_finished", round_id="durable-round", round_type="review", outcome="completed")
             )
             self.assertEqual(sync.call_count, 1)
-        with patch.object(a, "atomic_json", wraps=a.atomic_json) as publish:
+        with patch("tauceti_worker.activity_live.atomic_json", wraps=a.atomic_json) as publish:
             a.prepare(now=self.now + 1)
         views = [call for call in publish.call_args_list if call.args[0].name != "preparation-error.json"]
         self.assertTrue(views)

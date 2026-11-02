@@ -145,24 +145,76 @@ Use live runtime updates with worker and CI admissions enabled. Verify running r
 
 Completion means the requested live estimate is visible and cheap even when historical preparation is slow, stopped accounting catches up without manual bulk recovery, final receipts replace estimates correctly, and collection does not interfere with useful work. Analytics integration remains outside this plan.
 
-## Implementation notes (November 1)
+## Incremental accounting and operating cost
 
-Implemented locally in [activity_live.py](../../tauceti_worker/activity_live.py), [activity_ledger.py](../../tauceti_worker/activity_ledger.py), the existing usage writer/supervisor and shared activity presentation module. Deployment and observation on naturally running new-format sessions remain the rollout steps; these local measurements do not establish production accuracy.
+The manager retains two minute-scale tasks: a metadata-only live sampler and an
+incremental historical preparer. Neither needs the analytics API. The sampler
+uses one journal `lstat()` per active invocation and shares its result across
+scope views; status readers only consume prepared JSON.
 
-- The existing manager owns an independent minute task. Each invocation's summary anchor is published by the supervisor; the sampler uses one journal `lstat()`, with no growing-journal reads. Scope views reuse those samples. The existing launch-sidecar pass also retains terminal notifications for short invocations that finish between samples.
-- Reports retain recorded spending and publish `spending_including_live`, including observed/unobserved adjustments, timestamps and provenance. Separate baseline generations and a brief publication lock protect rebasing. Terminal notifications stay until historical preparation acknowledges them.
-- The writer tracks cumulative priced cost, publishes a small optional summary at initialization/first priced usage, minute intervals and final flush, and retains synced deltas before forwarding events. Full checkpoints use minute intervals during normal observation; readers verify and consume their newer suffix.
-- The stopped-policy minute pass plans a provider group outside the admission lock, uses indexed native comparables, and rechecks dependencies, liveness and evidence before an audited append. Late native corrections also protect live related sessions. Routine stopped evidence polling is minute-scale; existing live launch gates retain their required responsiveness.
-- Activity owns an independent disposable projection that consumes complete ledger transactions and preserves first settlement times. Allocation continues to recompute globally for attribution/scope correctness. Closed native usage avoids repeated filesystem checks. Preparation metrics include replayed bytes, metadata/decode counts, timings, CPU and peak memory.
+The preparer maintains an activity-owned SQLite projection of complete ledger
+transactions. A durable change queue identifies affected invocations. Its cursor
+is acknowledged only after the activity transaction commits, and its epoch changes
+inside the projection rebuild transaction. A crash or ledger replacement cannot
+lose a notification or preserve phantom spending.
 
-Unpaid synthetic measurements on the development host:
+Only changed invocations, currently live usage and bounded recent-final-checkpoint
+retries inspect evidence. Response ownership is indexed by provider/message and
+first admission order. A new or corrected owner reallocates the linked
+invocations, without enumerating unrelated settled history. Attribution is frozen
+per invocation; a worker changing scope does not reprocess its old conversations.
+Native receipts can restate costs at their original response timestamps.
+
+Report totals use persisted moving prefixes. Point costs and interval slopes enter
+an indexed event stream. Advancing each reporting boundary visits only events
+crossing that boundary; values for other subjects are evaluated lazily. Late
+corrections update existing prefixes directly. Round counts, worker durations,
+PR/LOC cohorts, contributions and CI totals use the same machinery. Prefixes and
+dirty-fact acknowledgements commit before views are published. The complete PR
+inventory is read from prepared SQLite only on an explicit inventory request,
+rather than exported every minute.
+
+A failed invocation rolls back its own preparation, retains an explicit retry,
+and does not pin the successful ledger cursor. Known-incomplete preparation keeps
+costs unavailable and produces a diagnostic until it succeeds. The whole cost
+generation also has a savepoint for failures that cannot be isolated. Disposable
+report aggregates carry a schema version; format changes rebuild them once from
+retained facts. Initial migration and a lost/replaced cache may require a single
+history scan, never a recurring full-history refresh.
+
+The supervisor keeps its launch responsiveness and minute stopped-recovery pass.
+Settled local recovery watches retire only with definite birth/liveness evidence
+for shim, native, gate and owner, plus a stopped parent or an exact completed-round
+fence. Unknown, malformed or unreadable identities and external producers retain
+their late-receipt watch. Retirement archives evidence and changes no financial
+settlement or cost provenance.
+
+Validated measurements:
 
 | Workload | Result |
 | --- | --- |
-| 40 active invocations; global, group and 40 worker views | 40 journal metadata checks; approximately 13 ms for the minute sample |
-| 10,000 settled invocations; first preparation | Approximately 283 ms; 4.16 MB replayed |
-| Same unchanged history; warm preparation | Approximately 76 ms; zero ledger bytes replayed |
+| 40 active invocations, shared across 42 views | 40 journal metadata checks; approximately 13 ms for sampling |
+| 100 / 1,000 / 10,000 settled invocations, idle refresh | 1,500 SQLite instructions in every case; approximately 1 ms for the scoped accounting check |
+| 71,109 real invocations, 61 views, warm snapshot | Approximately 0.51 s overall, 0.024 s cost preparation, 36.4 MiB process peak; zero invocations reprocessed, zero usage decoded, zero ledger bytes replayed |
+| Same real history, comparison with prior aggregation | All 61 views matched; maximum USD difference 4.5e-22 |
 
-These fixtures measure local collection cost, not real-workload latency or estimator error. Regression coverage includes metadata-only sampling, independent refresh scheduling, duplicate counters, missing/replaced files, stale sources, generation/publication races, interval overlap, resumes, downward native corrections, terminal acknowledgement, automatic recovery concurrency, corruption and torn journal/ledger suffixes. The repository test runner includes the new live-accounting suite.
+The real-history snapshot retained 23 active ledger entries, so the warm check
+included 92 bounded metadata probes for that working set. Its ledger was frozen
+for repeatable validation; late real completions were not committed to the test
+copy. The first isolated migration took approximately five minutes and peaked at
+142 MiB with the initial migration implementation. It is performed separately
+from live report collection. Memory measurements are process high-water marks,
+not an allocation measurement attributable solely to one accounting function.
 
-Live rollout found and repaired two compatibility cases: summary files now use `.summary` so legacy checkpoint `*.json` discovery stays valid, and historical publication rebases the last sampled estimate without another journal sample. Readers also accept first-release `.summary.json` sidecars while paid shims finish naturally. A newer baseline excludes already-accounted invocations from an older active view.
+Regression coverage includes 100x idle-history scaling, time-boundary inclusion,
+intervals, late and downward corrections, response ownership changes, projection
+replacement and crash recovery, invocation-local failures, cross-connection
+prefix persistence, minute live sampling, publication races, terminal
+acknowledgement and recovery-watch retirement with conservative liveness.
+
+Deploy through live module/runtime updates and a prebuilt derived cache, keeping
+worker and CI admissions enabled. Preserve the ledger, usage journals, lifecycle
+evidence, native checkouts and other live patches. Verify revisions, report
+freshness, useful completions and uninterrupted worker PIDs after activation.
+Rollback restores reporting code and its derived cache; it does not undo audited
+financial corrections. Analytics integration remains outside this plan.
