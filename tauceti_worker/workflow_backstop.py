@@ -16,10 +16,13 @@ from pathlib import Path
 from .verification import atomic
 
 ACTIVE = ("in_progress", "queued", "pending", "waiting", "requested")
+EVENTS = ("schedule", "workflow_dispatch", "push", "repository_dispatch")
 
 
 @dataclass(frozen=True)
 class Workflow:
+    """Maintenance workflow filename, minimum attempt interval in seconds, and alert opt-in."""
+
     name: str
     interval: int
     alerts: bool = False
@@ -36,21 +39,25 @@ WORKFLOWS = (
 
 
 class ObservationError(RuntimeError):
-    pass
+    """An authoritative observation or dispatch result is unavailable; defer safely."""
 
 
 def repository_name(value: str) -> str:
+    """Validate the owner/name passed to gh without permitting extra path components."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
         raise ObservationError("repository must be OWNER/NAME")
     return value
 
 
 class GitHub:
+    """Bounded gh transport using the existing authenticated operator account."""
+
     def __init__(self, repo: str):
         self.repo = repository_name(repo)
 
     @staticmethod
     def command(*args: str) -> str:
+        """Run one gh request with a 45-second bound, returning stdout or an observation error."""
         try:
             result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=45)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -60,6 +67,7 @@ class GitHub:
         return result.stdout
 
     def read(self, path: str, **parameters: str) -> dict:
+        """GET a JSON object, refusing transport errors or incomplete JSON envelopes."""
         args = ["api", "--method", "GET", path]
         for key, value in parameters.items():
             args += ["-f", f"{key}={value}"]
@@ -72,43 +80,73 @@ class GitHub:
         return value
 
     def repository(self) -> dict:
+        """Read repository identity, default branch, and admission state."""
         return self.read(f"repos/{self.repo}")
 
     def workflow(self, name: str) -> dict:
+        """Read whether the named workflow remains enabled."""
         return self.read(f"repos/{self.repo}/actions/workflows/{name}")
 
     def runs(self, name: str, branch: str, status: str | None = None, *, repo_id: int) -> list[dict]:
-        parameters = {"branch": branch, "per_page": "1", "exclude_pull_requests": "true"}
+        """Read recent maintenance runs; query each event if a PR obscures the latest row.
+
+        GitHub's branch filter matches names across forks. Event-filtered fallback reads
+        avoid allowing a newer same-named PR branch to suppress default-branch maintenance.
+        The common path uses one request; active-status reads preserve older active work.
+        """
+        parameters = {"branch": branch, "per_page": "1"}
         if status:
             parameters["status"] = status
-        value = self.read(f"repos/{self.repo}/actions/workflows/{name}/runs", **parameters)
-        rows, total = value.get("workflow_runs"), value.get("total_count")
-        if (
-            not isinstance(rows, list)
-            or type(total) is not int
-            or total < 0
-            or len(rows) > total
-            or (total and not rows)
-        ):
-            raise ObservationError("GitHub returned an incomplete workflow-run page")
-        for row in rows:
+
+        def page(event=None):
+            value = self.read(
+                f"repos/{self.repo}/actions/workflows/{name}/runs",
+                **parameters,
+                **({"event": event} if event else {}),
+            )
+            rows, total = value.get("workflow_runs"), value.get("total_count")
             if (
-                not isinstance(row, dict)
-                or row.get("head_branch") != branch
-                or not isinstance(row.get("head_repository"), dict)
-                or row["head_repository"].get("id") != repo_id
-                or row.get("event") not in {"schedule", "workflow_dispatch", "push", "repository_dispatch"}
-                or row.get("status") not in (*ACTIVE, "completed")
-                or (status is not None and row.get("status") != status)
+                not isinstance(rows, list)
+                or type(total) is not int
+                or total < 0
+                or len(rows) > total
+                or (total and not rows)
             ):
-                raise ObservationError("GitHub returned an unexpected workflow run")
-        return rows
+                raise ObservationError("GitHub returned an incomplete workflow-run page")
+            for row in rows:
+                if (
+                    not isinstance(row, dict)
+                    or row.get("head_branch") != branch
+                    or not isinstance(row.get("head_repository"), dict)
+                    or not isinstance(row.get("event"), str)
+                    or row.get("status") not in (*ACTIVE, "completed")
+                    or (status is not None and row.get("status") != status)
+                    or (event is not None and row.get("event") != event)
+                ):
+                    raise ObservationError("GitHub returned an unexpected workflow run")
+            return rows
+
+        def maintenance(row):
+            return row["head_repository"].get("id") == repo_id and row["event"] in EVENTS
+
+        rows = page()
+        if not rows or all(maintenance(row) for row in rows):
+            return rows
+        candidates = []
+        for event in EVENTS:
+            rows = page(event)
+            if any(not maintenance(row) for row in rows):
+                raise ObservationError("GitHub returned maintenance from another repository")
+            candidates.extend(rows)
+        return candidates
 
     def dispatch(self, name: str, branch: str) -> str:
+        """Submit one manual workflow request; return its response without claiming completion."""
         return self.command("workflow", "run", name, f"--repo={self.repo}", f"--ref={branch}").strip()
 
 
 def timestamp(value: object, now: float) -> float:
+    """Parse a timezone-aware run creation time, rejecting invalid or future observations."""
     try:
         date = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if date.tzinfo is None:
@@ -130,6 +168,18 @@ def reconcile(
     clock=time.time,
     persist=lambda _state: None,
 ) -> list[dict]:
+    """Preview or dispatch overdue enabled workflows on the current default branch.
+
+    ``state`` is the versioned mutable dictionary returned by load_state. Execution pins
+    repository identity and records each accepted/uncertain request immediately through
+    ``persist``; callers executing real dispatches must supply durable persistence and
+    hold an exclusive state lock. Persistence errors stop the cycle. ``clock`` supplies
+    Unix seconds for policy intervals and cooldowns. Preview never mutates state.
+
+    Recent attempts, uncertain cooldowns and any nonterminal run suppress dispatch.
+    Observation failures defer that workflow; unrelated workflows can continue. Alert
+    reconciliation requires include_alerts because it sends external messages.
+    """
     repo = api.repository()
     repo_id, branch = repo.get("id"), repo.get("default_branch")
     if type(repo_id) is not int or repo_id <= 0 or not isinstance(branch, str) or not branch:
@@ -198,6 +248,7 @@ def reconcile(
 
 
 def load_state(path: Path) -> dict:
+    """Read versioned state, initialize an absent file, and reject corruption or symlinks."""
     if path.is_symlink():
         raise ObservationError("state path must not be a symlink")
     try:
@@ -218,6 +269,7 @@ def load_state(path: Path) -> dict:
 
 
 def main(argv=None) -> int:
+    """Run a read-only preview or an explicitly enabled, locked execution cycle."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--state", required=True, type=Path)

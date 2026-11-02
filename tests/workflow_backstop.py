@@ -189,16 +189,28 @@ class StorageAndAuthority(unittest.TestCase):
                 with self.assertRaises(wb.ObservationError):
                     api.runs("update.yml", "main", repo_id=12)
 
-    def test_api_filters_out_pr_runs_before_selecting_the_latest_maintenance_run(self):
+    def test_pr_run_cannot_obscure_older_maintenance(self):
+        api = wb.GitHub("org/repo")
+        pr = {**run(), "head_repository": {"id": 99}, "event": "pull_request"}
+
+        def response(_path, **params):
+            rows = (
+                [pr]
+                if "event" not in params
+                else ([{**run(4000), "event": "schedule"}] if params["event"] == "schedule" else [])
+            )
+            return {"total_count": len(rows), "workflow_runs": rows}
+
+        with patch.object(api, "read", side_effect=response) as read:
+            rows = api.runs("update.yml", "main", repo_id=12)
+        self.assertEqual(rows, [{**run(4000), "event": "schedule"}])
+        self.assertEqual([call.kwargs.get("event") for call in read.call_args_list], [None, *wb.EVENTS])
+
+    def test_common_maintenance_read_uses_one_request(self):
         api = wb.GitHub("org/repo")
         with patch.object(api, "read", return_value={"total_count": 1, "workflow_runs": [run()]}) as read:
             self.assertEqual(api.runs("update.yml", "main", repo_id=12), [run()])
-        read.assert_called_once_with(
-            "repos/org/repo/actions/workflows/update.yml/runs",
-            branch="main",
-            per_page="1",
-            exclude_pull_requests="true",
-        )
+        read.assert_called_once_with("repos/org/repo/actions/workflows/update.yml/runs", branch="main", per_page="1")
 
     def test_state_roundtrip_and_corruption(self):
         with tempfile.TemporaryDirectory() as directory:
