@@ -7,13 +7,13 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
-import os
 import re
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from .verification import atomic
 
 ACTIVE = ("in_progress", "queued", "pending", "waiting", "requested")
 
@@ -77,8 +77,8 @@ class GitHub:
     def workflow(self, name: str) -> dict:
         return self.read(f"repos/{self.repo}/actions/workflows/{name}")
 
-    def runs(self, name: str, branch: str, status: str | None = None) -> list[dict]:
-        parameters = {"branch": branch, "per_page": "1"}
+    def runs(self, name: str, branch: str, status: str | None = None, *, repo_id: int) -> list[dict]:
+        parameters = {"branch": branch, "per_page": "1", "exclude_pull_requests": "true"}
         if status:
             parameters["status"] = status
         value = self.read(f"repos/{self.repo}/actions/workflows/{name}/runs", **parameters)
@@ -95,6 +95,9 @@ class GitHub:
             if (
                 not isinstance(row, dict)
                 or row.get("head_branch") != branch
+                or not isinstance(row.get("head_repository"), dict)
+                or row["head_repository"].get("id") != repo_id
+                or row.get("event") not in {"schedule", "workflow_dispatch", "push", "repository_dispatch"}
                 or row.get("status") not in (*ACTIVE, "completed")
                 or (status is not None and row.get("status") != status)
             ):
@@ -152,7 +155,7 @@ def reconcile(
                 results.append({**result, "decision": "disabled"})
                 continue
             now = clock()
-            rows = api.runs(policy.name, branch)
+            rows = api.runs(policy.name, branch, repo_id=repo_id)
             latest = max((timestamp(row.get("created_at"), now) for row in rows), default=0)
             if any(row["status"] in ACTIVE for row in rows):
                 results.append({**result, "decision": "active"})
@@ -172,7 +175,7 @@ def reconcile(
 
             # An older active run can be absent from the latest history page. Query each
             # nonterminal status explicitly before dispatching; never walk all PR history.
-            if any(api.runs(policy.name, branch, status) for status in ACTIVE):
+            if any(api.runs(policy.name, branch, status, repo_id=repo_id) for status in ACTIVE):
                 results.append({**result, "decision": "active"})
                 continue
             if not execute:
@@ -214,26 +217,6 @@ def load_state(path: Path) -> dict:
     return value
 
 
-def save_state(path: Path, state: dict) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            json.dump(state, stream, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary)
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
@@ -257,7 +240,7 @@ def main(argv=None) -> int:
                 state,
                 execute=args.execute,
                 include_alerts=args.include_alerts,
-                persist=lambda value: save_state(args.state, value),
+                persist=lambda value: atomic(args.state, value),
             )
             print(json.dumps(rows, sort_keys=True))
             return int(any(row["decision"] == "deferred" for row in rows))

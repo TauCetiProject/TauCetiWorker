@@ -22,6 +22,8 @@ def run(age=0, status="completed", branch="main"):
     return {
         "status": status,
         "head_branch": branch,
+        "head_repository": {"id": 12},
+        "event": "workflow_dispatch",
         "created_at": datetime.fromtimestamp(NOW - age, UTC).isoformat(),
     }
 
@@ -44,7 +46,8 @@ class FakeGitHub:
             raise wb.ObservationError("read unavailable")
         return self.enabled
 
-    def runs(self, _name, _branch, status=None):
+    def runs(self, _name, _branch, status=None, *, repo_id):
+        assert repo_id == self.info["id"]
         return self.latest if status is None else self.active.get(status, [])
 
     def dispatch(self, name, branch):
@@ -162,21 +165,47 @@ class StorageAndAuthority(unittest.TestCase):
         ):
             with self.subTest(page=page), patch.object(api, "read", return_value=page):
                 with self.assertRaises(wb.ObservationError):
-                    api.runs("update.yml", "main")
+                    api.runs("update.yml", "main", repo_id=12)
 
     def test_wrong_branch_or_status_filter_is_rejected(self):
         api = wb.GitHub("org/repo")
         for row, status in ((run(branch="other"), None), (run(status="completed"), "queued")):
             with patch.object(api, "read", return_value={"total_count": 1, "workflow_runs": [row]}):
                 with self.assertRaises(wb.ObservationError):
-                    api.runs("update.yml", "main", status)
+                    api.runs("update.yml", "main", status, repo_id=12)
+
+    def test_same_named_fork_branch_and_pr_events_cannot_count_as_maintenance(self):
+        api = wb.GitHub("org/repo")
+        for row in (
+            {**run(), "head_repository": {"id": 99}},
+            {**run(), "head_repository": None},
+            {**run(), "event": "pull_request"},
+            {**run(), "event": "pull_request_target"},
+        ):
+            with (
+                self.subTest(row=row),
+                patch.object(api, "read", return_value={"total_count": 1, "workflow_runs": [row]}),
+            ):
+                with self.assertRaises(wb.ObservationError):
+                    api.runs("update.yml", "main", repo_id=12)
+
+    def test_api_filters_out_pr_runs_before_selecting_the_latest_maintenance_run(self):
+        api = wb.GitHub("org/repo")
+        with patch.object(api, "read", return_value={"total_count": 1, "workflow_runs": [run()]}) as read:
+            self.assertEqual(api.runs("update.yml", "main", repo_id=12), [run()])
+        read.assert_called_once_with(
+            "repos/org/repo/actions/workflows/update.yml/runs",
+            branch="main",
+            per_page="1",
+            exclude_pull_requests="true",
+        )
 
     def test_state_roundtrip_and_corruption(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             state = wb.load_state(path)
             state["repo_id"] = 12
-            wb.save_state(path, state)
+            wb.atomic(path, state)
             self.assertEqual(wb.load_state(path), state)
             path.write_text("{}")
             with self.assertRaises(wb.ObservationError):
