@@ -1311,7 +1311,6 @@ class WorkerBackend:
 
     def continue_source(self, checkout, record, m, facts, why, j):
         from .agents import (
-            PROVIDER_LIMIT_REFUSALS,
             BuildCacheUnavailable,
             run_agent_host,
             take_last_agent_infra_failure,
@@ -1423,18 +1422,19 @@ class WorkerBackend:
             from .constants import MAX_INFRA_REFUNDS
 
             infra = take_last_agent_infra_failure()
+            account_limit = infra in {"provider subscription limit reached", "provider credit balance exhausted"}
             if (
                 infra
                 and not infra.startswith("local API admission")
                 and not (api and api.blocked_reason)
-                and (infra in PROVIDER_LIMIT_REFUSALS or j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS)
+                and (account_limit or j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS)
             ):
                 refund_content(known_no_launch=True)
                 write(
                     record,
                     j,
                     "resuming",
-                    provider_refunds=j.get("provider_refunds", 0) + (0 if infra in PROVIDER_LIMIT_REFUSALS else 1),
+                    provider_refunds=j.get("provider_refunds", 0) + (0 if account_limit else 1),
                 )
                 raise RuntimeError(f"Provider failed before structured work: {infra}")
             raise ContentFailure(

@@ -952,10 +952,6 @@ def run_agent_host(
 # that failure, and it burned two PRs' worth of scoreboards before a human noticed).
 _TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
 
-# These account limits cannot be fixed by changing the selected PR. Confirmed
-# refusals do not consume the allowance for ambiguous infrastructure refunds.
-PROVIDER_LIMIT_REFUSALS = frozenset({"provider subscription limit reached", "provider credit balance exhausted"})
-
 # Claude Code in -p mode reports a provider failure as `API Error: <status> <text>` and, when the
 # call never produced a turn, that single line is the WHOLE log — observed verbatim as
 # "Failed to authenticate. API Error: 401 Invalid authentication credentials". Jeremy Kahn's report

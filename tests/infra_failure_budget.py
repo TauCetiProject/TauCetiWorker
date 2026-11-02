@@ -184,7 +184,7 @@ with tempfile.TemporaryDirectory() as state:
     check("cap survives a moving head", charged_again, True)
     check("cap leaves the attempt charged", w.counters.read(KEYS[0]), 3)
 
-for refusal in sorted(agents.PROVIDER_LIMIT_REFUSALS):
+for refusal in ("provider credit balance exhausted", "provider subscription limit reached"):
     with tempfile.TemporaryDirectory() as state:
         w = fresh(state)
         for _ in range(wu.MAX_INFRA_REFUNDS + 3):

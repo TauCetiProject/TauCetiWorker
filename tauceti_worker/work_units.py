@@ -18,7 +18,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .agents import (
-    PROVIDER_LIMIT_REFUSALS,
     AuthoringProfile,
     BuildCacheUnavailable,
     _claude_review_model,
@@ -1669,7 +1668,7 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     reason = take_last_agent_infra_failure()
     if not reason:
         return
-    account_limit = reason in PROVIDER_LIMIT_REFUSALS
+    account_limit = reason in {"provider subscription limit reached", "provider credit balance exhausted"}
     refunds = w.counters.read(f"infra-{label}-{c.pr}") if account_limit else w.counters.incr(f"infra-{label}-{c.pr}")
     if refunds > MAX_INFRA_REFUNDS and not account_limit:
         warn_red(
