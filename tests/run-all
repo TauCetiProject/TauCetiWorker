@@ -38,6 +38,7 @@ RUN_STDLIB=(
   activity.py
   activity_git.py
   activity_costs.py
+  activity_incremental.py
   activity_live.py
   api_budget.py
   budget_projection.py

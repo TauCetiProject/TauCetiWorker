@@ -333,6 +333,13 @@ def tick(budget, cache=None, stop=None):
             if errors.get(path.stem) != stamp:
                 print(f"{path.stem}: usage recovery retained for retry: {type(error).__name__}: {error}", flush=True)
                 errors[path.stem] = stamp
+    remaining = {path.stem for path in paths if path.exists()}
+    cache["sessions"] = {
+        key: session for key, session in cache["sessions"].items() if session["status"] != "settled" or key in remaining
+    }
+    cache["live_terminal_seen"] = {
+        key: cost for key, cost in cache.get("live_terminal_seen", {}).items() if key in remaining
+    }
     try:
         from .activity_live import publish_sessions
 
@@ -381,13 +388,86 @@ def recovery_mode(directory):
     return mode
 
 
+def definitely_dead(producer):
+    """Retirement requires birth evidence; malformed or unreadable means unknown."""
+    if not isinstance(producer, dict) or producer.get("unsupported") or producer.get("remote"):
+        return False
+    required = ("pid", "boot", "start", "view") if sys.platform == "linux" else ("pid", "boot", "start")
+    if sys.platform not in {"linux", "darwin"} or not all(producer.get(key) is not None for key in required):
+        return False
+    try:
+        if sys.platform == "linux" and producer["view"] != os.readlink("/proc/self/ns/pid"):
+            return False
+        pid = int(producer["pid"])
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    try:
+        observed = identity(pid)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    if any(observed.get(key) != producer[key] for key in ("boot", "start")):
+        return True
+    try:
+        if sys.platform == "linux":
+            status = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            return status in {"Z", "X"}
+        from .usage_lifecycle import darwin_process
+
+        return darwin_process(pid)[1] == 5
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def delivery_finished(directory, value):
+    if value.get("external") or not definitely_dead(value.get("shim")) or not definitely_dead(value.get("owner")):
+        return False
+    native, gate = value.get("native"), value.get("gate")
+    if value.get("phase") == "stopped" and (not native or not gate):
+        return False
+    if native and not definitely_dead(native):
+        return False
+    if gate and not definitely_dead(gate):
+        # resolve() persisted the host identity corresponding to this exact
+        # gate before granting the permit, even across PID namespaces.
+        if not (
+            native
+            and all(gate.get(k) is not None and gate.get(k) == native.get(k) for k in ("boot", "start", "namespace"))
+        ):
+            return False
+    if definitely_dead(value.get("parent")):
+        return True
+    try:
+        ending = safe_message(Path(directory) / "round-exits" / round_key(value.get("owner")))
+        return ending.get("owner") == value["owner"] and ending.get("kind") in {"exit", "signal", "timeout"}
+    except (OSError, ValueError):
+        return False
+
+
 def recover_invocation(budget, path, *, cache=None, session=None):
     mode = recovery_mode(budget.directory)
     value = read_lifecycle(budget.directory, path.stem)
     bridge, invocation = Path(value["bridge"]), value["id"]
     inbox, outbox = bridge / "inbox", bridge / "outbox"
     stamp = evidence_stamp(budget.directory, value)
+    sealed_estimate = (
+        mode == "auto"
+        and session
+        and session["status"] == "settled"
+        and value["phase"] in {"stopped", "no-inference"}
+        and delivery_finished(budget.directory, value)
+    )
     if value["phase"] in {"stopped", "no-inference"} and value.get("recovery_stamp") == stamp:
+        if sealed_estimate:
+            # Every recorded producer is gone. Preserve all evidence in done/,
+            # without polling settled historical lifecycles forever. A producer
+            # whose identity/liveness is unknown keeps the late-receipt watch.
+            archive_lifecycle(path, value)
+            return
         if cache is not None:
             cache.setdefault("stopped_next_poll", {})[invocation] = budget.clock() + 60
         return
@@ -539,6 +619,8 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     if cache is not None:
         cache[invocation] = stamp
         cache.setdefault("stopped_next_poll", {})[invocation] = budget.clock() + 60
+    if sealed_estimate:
+        archive_lifecycle(path, value)
 
 
 def ensure_supervisor(directory, *, refresh=False):

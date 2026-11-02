@@ -18,6 +18,7 @@ from tauceti_worker.budget import Budget, BudgetError, process_identity
 from tauceti_worker.usage_accounting import UsageJournal, read_usage
 from tauceti_worker.usage_lifecycle import alive, durable, identity, resolve
 from tauceti_worker.usage_supervisor import (
+    definitely_dead,
     ensure_supervisor,
     lifecycle_path,
     read_lifecycle,
@@ -90,6 +91,41 @@ class SupervisorTests(unittest.TestCase):
             self.budget.configure(grant=1)
             tick(self.budget, cache)
         self.assertNotIn(self.id, cache["live_pending"])
+
+    def test_settled_estimate_stops_polling_only_after_all_delivery_is_proven_finished(self):
+        native = self.launch()
+        self.response()
+        self.stop(native)
+        self.stop(self.shim)
+        cache = {}
+        tick(self.budget, cache)
+        at = self.budget.clock()
+        self.budget.clock = lambda: at + 61
+        with patch("tauceti_worker.budget.bridge_owner_alive", return_value=False):
+            tick(self.budget, cache)
+        self.assertEqual(self.saved()["status"], "settled")
+        before = self.saved()["cost"]
+        dead_parent = self.sleeper()
+        owner, parent = process_identity(dead_parent.pid), identity(dead_parent.pid)
+        self.stop(dead_parent)
+        value = read_lifecycle(self.root, self.id)
+        value.update(owner=owner, parent=parent)
+        durable(lifecycle_path(self.root, self.id), value)
+        self.budget.clock = lambda: at + 122
+        tick(self.budget, cache)
+        self.assertFalse(lifecycle_path(self.root, self.id).exists())
+        self.assertEqual(read_lifecycle(self.root, self.id)["phase"], "reconciled")
+        self.assertEqual(self.saved()["cost"], before)
+        with patch(
+            "tauceti_worker.usage_supervisor.recover_invocation", side_effect=AssertionError("polled retired history")
+        ):
+            tick(self.budget, cache)
+
+    def test_missing_or_unreadable_birth_evidence_is_not_proof_of_death(self):
+        self.assertFalse(definitely_dead({"pid": 999999999}))
+        self.assertFalse(definitely_dead({**identity(), "unsupported": True}))
+        with patch("tauceti_worker.usage_supervisor.identity", side_effect=PermissionError("unreadable")):
+            self.assertFalse(definitely_dead(self.owner))
 
     def ensure_supervisor(self, **kwargs):
         ensure_supervisor(self.root, **kwargs)

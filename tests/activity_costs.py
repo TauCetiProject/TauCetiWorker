@@ -138,7 +138,7 @@ class CostTests(unittest.TestCase):
         self.write_ledger()
         with patch.object(a, "_worker_scope", wraps=a._worker_scope) as lookup:
             summary = self.summary()
-        self.assertEqual(sorted(call.args[1] for call in lookup.call_args_list), ["author", "not-in-fleet", "reviewer"])
+        self.assertEqual(sorted(call.args[1] for call in lookup.call_args_list), ["author", "reviewer"])
         self.assertEqual(Decimal(summary["costs"]["windows"]["total"]["spent_usd"]), Decimal(180))
 
     def test_recovered_estimate_uses_recorded_interval_in_spending_windows(self):
@@ -462,14 +462,14 @@ class CostTests(unittest.TestCase):
                         wider = history > 3600 and key != "1h"
                         spent = f"{completed + 64}.00000" if wider else str(completed)
                         combined = f"{total + 66}.00000" if wider else str(total)
-                        self.assertEqual(window["spent_usd"], spent)
-                        self.assertEqual(window["active_accrued_usd"], "4" if wider else "2")
-                        self.assertEqual(window["estimated_usd"], combined)
-                        self.assertEqual(window["settled_estimates_usd"], str(estimated))
-                        self.assertEqual(window["recovered_estimates_usd"], "3")
+                        self.assertEqual(Decimal(window["spent_usd"]), Decimal(spent))
+                        self.assertEqual(Decimal(window["active_accrued_usd"]), Decimal("4" if wider else "2"))
+                        self.assertEqual(Decimal(window["estimated_usd"]), Decimal(combined))
+                        self.assertEqual(Decimal(window["settled_estimates_usd"]), Decimal(estimated))
+                        self.assertEqual(Decimal(window["recovered_estimates_usd"]), 3)
                     for key, window in value["spending"].items():
                         expected = f"{total + 66}.00000" if history > 3600 and key != "1h" else str(total)
-                        self.assertEqual(window["spent_usd"], expected)
+                        self.assertEqual(Decimal(window["spent_usd"]), Decimal(expected))
 
     def test_unchanged_preparation_does_not_rewrite_derived_rows(self):
         with contextlib.closing(a._connect()) as db, db:
@@ -481,7 +481,7 @@ class CostTests(unittest.TestCase):
             before = db.total_changes
             activity_costs.prepare(db, self.now, scope)
             # Only the ordinary funding metadata is replaced. The ledger and
-            # usage are still fully checked, with no derived table rewrites.
+            # active usage are checked, with no derived table rewrites.
             self.assertEqual(db.total_changes - before, 1)
 
     def test_activity_replays_only_appended_transactions_without_admission_lock(self):
@@ -540,7 +540,7 @@ class CostTests(unittest.TestCase):
             self.assertTrue(funding["preparation_metrics"]["rebuilt"])
             self.assertEqual(ledger.read_bytes(), original)
 
-    def test_accrual_covering_indexes_preserve_decimal_sum_order_at_timestamp_ties(self):
+    def test_prefix_sums_preserve_small_payments_at_timestamp_ties(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("DELETE FROM cost_accruals")
             for identity, cost in (
@@ -554,7 +554,7 @@ class CostTests(unittest.TestCase):
                 )
             for column, identity in ((None, None), ("worker", "author"), ("scope", "machine")):
                 value = activity_costs.summarize(db, self.now, self.now - 3600, column, identity)
-                self.assertEqual(value["windows"]["total"]["spent_usd"], "1.000000000000000000000000000")
+                self.assertEqual(value["windows"]["total"]["spent_usd"], "1.000000000000000000000000001")
 
     def test_summary_indexes_cover_queries_after_legacy_upgrade(self):
         for upgrade in (False, True):
@@ -568,7 +568,7 @@ class CostTests(unittest.TestCase):
                         "accounting_worker",
                         "accounting_estimates",
                     ):
-                        db.execute(f"DROP INDEX {name}")
+                        db.execute(f"DROP INDEX IF EXISTS {name}")
                     db.execute("CREATE INDEX round_worker ON rounds(worker,finished)")
                     db.execute("CREATE INDEX round_scope ON rounds(scope,finished)")
                     db.execute("CREATE INDEX round_finish ON rounds(finished,kind)")
@@ -579,110 +579,26 @@ class CostTests(unittest.TestCase):
                 db.set_trace_callback(statements.append)
                 a._summary(db, self.now, "worker", "author")
                 db.set_trace_callback(None)
-                # Check the production queries, including their real predicates.
-                for index, pattern in (
-                    ("round_worker_covering", "SELECT started,finished FROM rounds"),
-                    ("quality_worker", "FROM conversation_quality"),
-                    ("accounting_worker", "SELECT COALESCE(SUM(live),0)"),
-                    ("accounting_estimates", "SELECT id,settled_estimates,recovered_estimates"),
-                    ("accrual_worker_covering", "SELECT id,started,finished,cost,active FROM cost_accruals"),
-                    ("round_interrupted", "SELECT id round_id,worker,started"),
-                    ("contribution_worker_covering", "SELECT * FROM pr_contributions"),
-                ):
-                    queries = [query for query in statements if pattern in query]
-                    self.assertTrue(queries, index)
-                    for query in queries:
-                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
-                        self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
-                statements = []
-                db.set_trace_callback(statements.append)
-                a._summary(db, self.now, "scope", "machine")
-                db.set_trace_callback(None)
-                for index, pattern in (
-                    ("round_scope_covering", "SELECT started,finished FROM rounds"),
-                    ("round_scope_covering", "SELECT MIN(COALESCE(started,finished)) FROM rounds"),
-                    ("round_scope_covering", "SELECT MIN(started) FROM rounds"),
-                    ("round_scope_covering", "SELECT kind,COUNT(*)"),
-                    ("accrual_scope_covering", "SELECT id,started,finished,cost,active FROM cost_accruals"),
-                    ("contribution_scope_covering", "SELECT * FROM pr_contributions"),
-                ):
-                    queries = [query for query in statements if pattern in query]
-                    self.assertTrue(queries, index)
-                    for query in queries:
-                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
-                        self.assertTrue(any(f"COVERING INDEX {index}" in detail for detail in plan), plan)
-                statements.clear()
-                db.set_trace_callback(statements.append)
-                a._summary(db, self.now)
-                db.set_trace_callback(None)
-                queries = [query for query in statements if query.startswith("SELECT kind,COUNT(*)")]
-                self.assertTrue(queries)
-                for query in queries:
-                    plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
-                    self.assertTrue(any("COVERING INDEX round_finish_covering" in detail for detail in plan), plan)
-
-    def test_prepared_row_reconciliation_matches_full_replacement(self):
-        initial = {
-            "conversation_costs": [
-                ("a", "author", "machine", 1, 2, "0.10000"),
-                ("b", "reviewer", "machine", 1, None, "2"),
-            ],
-            "conversation_accounting": [
-                ("a", "author", "machine", 0, 1, 0, 0),
-                ("b", "reviewer", "machine", 1, 0, 0, 0),
-            ],
-            "conversation_quality": [("a", "author", "machine", 1, 0, 0), ("b", "reviewer", "machine", 0, 1, 1)],
-            "cost_accruals": [
-                ("a", "author", "machine", 1, 2, "0.10000", "native-allocated", 0),
-                ("a", "author", "machine", 1, 2, "0.10000", "native-allocated", 0),
-                ("b", "reviewer", "machine", 1, None, "2", "native-allocated", 1),
-            ],
-        }
-        with (
-            contextlib.closing(sqlite3.connect(":memory:")) as actual,
-            contextlib.closing(sqlite3.connect(":memory:")) as reference,
-        ):
-            activity_costs.install(actual)
-            activity_costs.install(reference)
-            for table, rows in initial.items():
-                corrected = [list(row) for row in reversed(rows)]
-                corrected[0][0] = "new"
-                corrected[0][2] = "reassigned"
-                corrected[0][-1] = "3.00000" if table == "conversation_costs" else 2
-                for desired in (rows, corrected, corrected[:1], [], rows):
-                    activity_costs._write_prepared(actual, table, desired)
-                    reference.execute(f"DELETE FROM {table}")
-                    reference.executemany(f"INSERT INTO {table} VALUES ({','.join('?' for _ in rows[0])})", desired)
-                    order = "rowid" if table == "cost_accruals" else "id"
-                    self.assertEqual(
-                        actual.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall(),
-                        reference.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall(),
-                    )
-                    before = actual.total_changes
+                for query in statements:
+                    self.assertNotIn("SELECT kind,COUNT(*)", query)
+                    self.assertNotIn("SELECT id,settled_estimates,recovered_estimates", query)
+                for column, identity in (("worker", "author"), ("scope", "machine"), (None, None)):
+                    a._summary(db, self.now + 60, column, identity)
                     statements = []
-                    actual.set_trace_callback(statements.append)
-                    activity_costs._write_prepared(actual, table, desired)
-                    actual.set_trace_callback(None)
-                    self.assertEqual(actual.total_changes, before)
-                    self.assertFalse(any(sql.startswith("INSERT INTO") for sql in statements), statements)
-                if table != "cost_accruals":
-                    # The existing upsert keeps the last value for an identity,
-                    # even when that last value already matches the stored row.
-                    duplicate = list(rows[0])
-                    duplicate[-1] = "7.00000" if table == "conversation_costs" else 7
-                    activity_costs._write_prepared(actual, table, [duplicate, *rows])
-                    self.assertEqual(
-                        actual.execute(f"SELECT * FROM {table} ORDER BY id").fetchall(),
-                        reference.execute(f"SELECT * FROM {table} ORDER BY id").fetchall(),
-                    )
-                if table == "cost_accruals":
-                    actual.execute("UPDATE cost_accruals SET rowid=99 WHERE rowid=2")
-                    actual.execute("INSERT INTO cost_accruals(rowid) VALUES (-1)")
-                    activity_costs._write_prepared(actual, table, rows)
-                    self.assertEqual(
-                        actual.execute("SELECT rowid,* FROM cost_accruals ORDER BY rowid").fetchall(),
-                        reference.execute("SELECT rowid,* FROM cost_accruals ORDER BY rowid").fetchall(),
-                    )
+                    db.set_trace_callback(statements.append)
+                    a._summary(db, self.now + 120, column, identity)
+                    db.set_trace_callback(None)
+                    queries = [q for q in statements if "FROM report_events WHERE at" in q]
+                    for query in queries:
+                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                        self.assertTrue(any("report_event_time" in line for line in plan), plan)
+                        self.assertIn("AND at", query)  # Existing cursors never rescan the prefix.
+                    queries = [q for q in statements if "SELECT COALESCE(started,finished) FROM rounds" in q]
+                    self.assertTrue(queries)
+                    index = "report_rounds_" + (column or "all") + "_first"
+                    for query in queries:
+                        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                        self.assertTrue(any(index in line for line in plan), plan)
 
     def test_replacement_ledger_removes_old_prepared_sessions(self):
         tables = ("conversation_costs", "cost_accruals", "conversation_accounting", "conversation_quality")

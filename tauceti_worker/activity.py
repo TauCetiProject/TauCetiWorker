@@ -187,11 +187,11 @@ def _connect():
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,worker TEXT,scope TEXT,kind TEXT,
         started REAL,finished REAL,outcome TEXT,pid INTEGER,identity TEXT,hostname TEXT);
-      CREATE INDEX IF NOT EXISTS round_finish_covering ON rounds(finished,kind,started,outcome,worker);
+      DROP INDEX IF EXISTS round_finish_covering;
       DROP INDEX IF EXISTS round_finish;
-      CREATE INDEX IF NOT EXISTS round_worker_covering ON rounds(worker,finished,started,outcome,kind);
+      DROP INDEX IF EXISTS round_worker_covering;
       DROP INDEX IF EXISTS round_worker;
-      CREATE INDEX IF NOT EXISTS round_scope_covering ON rounds(scope,finished,started,outcome,kind,worker);
+      DROP INDEX IF EXISTS round_scope_covering;
       DROP INDEX IF EXISTS round_scope;
       CREATE INDEX IF NOT EXISTS round_interrupted ON rounds(outcome,started DESC,id DESC,worker,scope)
         WHERE outcome='interrupted-unfinished';
@@ -213,9 +213,9 @@ def _connect():
     db.executescript("""
       CREATE TABLE IF NOT EXISTS pr_contributions(id TEXT PRIMARY KEY,repo TEXT,number INTEGER,
         worker TEXT,scope TEXT,at REAL,activity TEXT);
-      CREATE INDEX IF NOT EXISTS contribution_scope_covering ON pr_contributions(scope,at,id,repo,number,worker,activity);
+      DROP INDEX IF EXISTS contribution_scope_covering;
       DROP INDEX IF EXISTS contribution_scope;
-      CREATE INDEX IF NOT EXISTS contribution_worker_covering ON pr_contributions(worker,at,id,repo,number,scope,activity);
+      DROP INDEX IF EXISTS contribution_worker_covering;
       DROP INDEX IF EXISTS contribution_worker;
       CREATE TABLE IF NOT EXISTS pr_loc(repo TEXT,number INTEGER,head TEXT,added INTEGER,deleted INTEGER,
         observed REAL,PRIMARY KEY(repo,number));
@@ -233,6 +233,9 @@ def _connect():
         # Older preparers advanced these journals while filtering review starts out.
         # Replay once; stable event IDs keep already-counted activity idempotent.
         db.execute("DELETE FROM cursors WHERE path NOT LIKE '%/resources.jsonl'")
+    from .activity_rollup_sources import install as install_rollups
+
+    install_rollups(db)
     return db
 
 
@@ -355,12 +358,13 @@ def backfill(db, history_roots=()):
 def _clean_history(db):
     # Pin the start once, using the first native lifecycle receipt. Preserve event
     # deduplication tombstones so replaying a journal cannot restore discarded facts.
-    db.execute("""
-      INSERT OR IGNORE INTO meta(key,value)
-      SELECT 'history_cutoff', MIN(COALESCE(started,finished)) FROM rounds
-      WHERE id NOT LIKE 'resource:%' HAVING MIN(COALESCE(started,finished)) IS NOT NULL
-    """)
-    db.execute("DELETE FROM rounds WHERE id LIKE 'resource:%'")
+    if not db.execute("SELECT 1 FROM meta WHERE key='history_cutoff'").fetchone():
+        db.execute("""
+          INSERT OR IGNORE INTO meta(key,value)
+          SELECT 'history_cutoff', MIN(COALESCE(started,finished)) FROM rounds
+          WHERE id NOT LIKE 'resource:%' HAVING MIN(COALESCE(started,finished)) IS NOT NULL
+        """)
+    db.execute("DELETE FROM rounds WHERE id>='resource:' AND id<'resource;'")
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     if cutoff:
         db.execute("DELETE FROM rounds WHERE COALESCE(started,finished) < ?", (cutoff[0],))
@@ -423,28 +427,31 @@ def _refresh_prs(db, config, now, errors):
     from .worker_manager import load_worker_specs
 
     specs = {s.id: s for s in load_worker_specs(config)} if config else {}
-    tracked = {
-        (r["repo"], r["number"]): r["worker"] for r in db.execute("SELECT repo,number,worker FROM pr_contributions")
-    }
-    owned = {(r["repo"], r["number"]): dict(r) for r in db.execute("SELECT * FROM prs")}
-    tracked.update({key: p["worker"] for key, p in owned.items()})
-    for repo, number in tracked:
-        db.execute("INSERT OR IGNORE INTO pr_observations(repo,number) VALUES (?,?)", (repo, number))
+    # Indexed due work replaces enumerating every PR and contribution receipt.
+    due = db.execute(
+        "SELECT repo,number,worker FROM report_pr_refresh WHERE next_at<=? ORDER BY next_at LIMIT 1000", (now,)
+    ).fetchall()
     batches = {}
-    for h in db.execute("SELECT * FROM pr_observations"):
-        key = (h["repo"], h["number"])
-        if key not in tracked:
-            continue
-        p = owned.get(key, h)
+    for repo, number, worker in due:
+        key = (repo, number)
+        db.execute("INSERT OR IGNORE INTO pr_observations(repo,number) VALUES (?,?)", key)
+        p = db.execute("SELECT * FROM prs WHERE repo=? AND number=?", key).fetchone()
+        h = db.execute("SELECT * FROM pr_observations WHERE repo=? AND number=?", key).fetchone()
+        p = p or h
         checked = max(h["checked"] or 0, p["checked"] or 0)
         loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", key).fetchone()
-        if checked > now - 300 or (p["landed"] is not None and loc and loc[0] == p["head"]):
+        settled = p["landed"] is not None and loc and loc[0] == p["head"]
+        db.execute(
+            "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
+            (None if settled else max(now, checked) + 300, *key),
+        )
+        if settled or checked > now - 300:
             continue
-        spec = specs.get(tracked[key])
+        spec = specs.get(worker)
         url = getattr(spec, "github_state_url", None) or os.environ.get("TAUCETI_GITHUB_STATE_URL")
         token = getattr(spec, "github_state_token_file", None) or os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
         if url and token:
-            batches.setdefault((url, str(token), h["repo"]), []).append(h["number"])
+            batches.setdefault((url, str(token), repo), []).append(number)
     prior = db.execute("SELECT value FROM meta WHERE key='observation_errors'").fetchone()
     observation_errors = json.loads(prior[0]) if prior else {}
     deadline = time.monotonic() + 10
@@ -524,6 +531,16 @@ def _refresh_prs(db, config, now, errors):
             db.executemany(
                 "UPDATE pr_observations SET checked=? WHERE repo=? AND number=?", [(now, repo, n) for n in batch]
             )
+            for number in batch:
+                p = db.execute("SELECT * FROM prs WHERE repo=? AND number=?", (repo, number)).fetchone()
+                if p is None:
+                    p = db.execute("SELECT * FROM pr_observations WHERE repo=? AND number=?", (repo, number)).fetchone()
+                loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", (repo, number)).fetchone()
+                settled = p and (p["landed"] is not None and loc and loc[0] == p["head"])
+                db.execute(
+                    "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
+                    (None if settled else now + 300, repo, number),
+                )
     db.execute("INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)", (json.dumps(observation_errors),))
     errors.extend(observation_errors.values())
 
@@ -582,40 +599,38 @@ def _summary(db, now, column=None, identity=None):
             )
             for field in ("started", "git_held")
         }
+    from . import activity_rollup as rollup
+    from .activity_rollup_sources import flush
+
+    flush(db, now)
+    upper, totals = rollup.snapshot(db, now, WINDOWS, column=column, identity=identity)
     where, args = (f"WHERE {column}=?", [identity]) if column else ("", [])
     rounds = {}
-    for label, seconds in WINDOWS.items():
-        condition = "finished<=?" if seconds is None else "finished>=? AND finished<=?"
-        times = [now] if seconds is None else [now - seconds, now]
-        rows = db.execute(
-            f"SELECT kind,COUNT(*) n,SUM(outcome IN ('failed','timeout','interrupted')) failures,SUM(outcome IN ('unknown','unconfirmed')) unknown FROM rounds {where} {'AND' if where else 'WHERE'} {condition} GROUP BY kind",
-            args + times,
-        )
-        rounds[label] = {r["kind"]: dict(finished=r["n"], failed=r["failures"], unknown=r["unknown"]) for r in rows}
-    prs = [dict(r) for r in db.execute(f"SELECT * FROM prs {where}", args)]
-    # Closed and verified landed PRs are settled history. Their observations may
-    # stop updating permanently, so they cannot indicate stale current coverage.
-    unresolved = [p for p in prs if p["landed"] is None and p["state"] != "CLOSED"]
-    first_round = db.execute(f"SELECT MIN(COALESCE(started,finished)) FROM rounds {where}", args).fetchone()[0]
-    first_pr = min((p["created"] for p in prs), default=None)
-    since = min((v for v in (first_round, first_pr) if v is not None), default=None)
+    for window, values in totals.items():
+        kinds = {json.loads(key[6:])[0] for key in values if key.startswith("round:") and values[key]}
+        rounds[window] = {
+            kind: {
+                field: int(values.get("round:" + json.dumps([kind, field]), 0))
+                for field in ("finished", "failed", "unknown")
+            }
+            for kind in kinds
+        }
+
+    def minimum(table, field, extra=""):
+        predicate = where + (" AND " if where else " WHERE ") + field + " IS NOT NULL"
+        if extra:
+            predicate += " AND " + extra
+        return db.execute(f"SELECT {field} FROM {table} {predicate} ORDER BY {field} LIMIT 1", args).fetchone()
+
+    first_round = minimum("rounds", "COALESCE(started,finished)")
+    first_pr = minimum("prs", "created")
+    since = min((row[0] for row in (first_round, first_pr) if row is not None), default=None)
+    native_since = minimum("rounds", "started")
     pr_windows = {
-        label: dict(
-            authored=sum((seconds is None or p["created"] >= now - seconds) and p["created"] <= now for p in prs),
-            landed=sum(
-                p["landed"] is not None and (seconds is None or p["landed"] >= now - seconds) and p["landed"] <= now
-                for p in prs
-            ),
-        )
-        for label, seconds in WINDOWS.items()
+        window: {key: int(values.get(key, 0)) for key in ("authored", "landed", "assisted", "reviews", "fixes")}
+        for window, values in totals.items()
     }
-    native_since = db.execute(f"SELECT MIN(started) FROM rounds {where}", args).fetchone()[0]
     interrupted_where = f"{where} {'AND' if where else 'WHERE'} outcome='interrupted-unfinished'"
-    interrupted = db.execute(
-        f"SELECT COUNT(*) total, COALESCE(SUM(started BETWEEN ? AND ?),0) started_1h, "
-        f"COALESCE(SUM(started BETWEEN ? AND ?),0) started_24h FROM rounds {interrupted_where}",
-        [now - 3600, now, now - 86400, now, *args],
-    ).fetchone()
     latest_interrupted = db.execute(
         f"SELECT id round_id,worker,started FROM rounds {interrupted_where} "
         "AND started IS NOT NULL ORDER BY started DESC,id DESC LIMIT 1",
@@ -624,52 +639,30 @@ def _summary(db, now, column=None, identity=None):
     cutoff_row = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     cutoff = cutoff_row[0] if cutoff_row else since
     costs = activity_costs.summarize(db, now, cutoff, column, identity)
-    locs = {(r["repo"], r["number"]): dict(r) for r in db.execute("SELECT * FROM pr_loc")}
-    for window, seconds in activity_costs.COST_WINDOWS.items():
-        begin = max(cutoff or 0, now - seconds) if seconds is not None else cutoff or 0
-        cohort = [p for p in prs if begin <= p["created"] <= now]
-        landed = [p for p in cohort if p["landed"] is not None and p["landed"] <= now]
-        opened = [p for p in cohort if p["state"] == "OPEN" and p["landed"] is None]
-
-        def measured(p):
-            loc = locs.get((p["repo"], p["number"]))
-            return loc if loc and loc["head"] == p["head"] else None
-
-        landed_loc = sum((measured(p) or {}).get("added", 0) for p in landed)
-        open_loc = sum((measured(p) or {}).get("added", 0) for p in opened)
-        missing = sum(measured(p) is None for p in [*landed, *opened]) + sum(
-            p["state"] is None and p["landed"] is None for p in cohort
-        )
+    _, cohorts = rollup.snapshot(db, now, WINDOWS, cutoff, column, identity)
+    for window in activity_costs.COST_WINDOWS:
+        values = cohorts[window]
         row = costs["windows"][window]
         row.update(
-            landed_loc_added=landed_loc,
-            open_loc_added=open_loc,
-            landed_prs=len(landed),
-            open_prs=len(opened),
-            missing_loc_prs=missing,
-            known_loc_prs=len(landed) + len(opened) - sum(measured(p) is None for p in [*landed, *opened]),
-            measured_pr_weight=sum(measured(p) is not None for p in landed)
-            + sum(measured(p) is not None for p in opened) / 2,
+            {
+                key: int(values.get(key, 0))
+                for key in (
+                    "landed_loc_added",
+                    "open_loc_added",
+                    "landed_prs",
+                    "open_prs",
+                    "missing_loc_prs",
+                    "known_loc_prs",
+                )
+            }
         )
+        row["measured_pr_weight"] = float(values.get("measured_pr_weight", 0))
         row.update(activity_summary.loc_estimate(row))
-    contributions = [dict(r) for r in db.execute(f"SELECT * FROM pr_contributions {where}", args)]
-    owned_keys = {(p["repo"], p["number"]) for p in prs}
-    for window, seconds in WINDOWS.items():
-        begin = float("-inf") if seconds is None else now - seconds
-        others = [c for c in contributions if begin <= c["at"] <= now and (c["repo"], c["number"]) not in owned_keys]
-        meaningful = [
-            c
-            for c in others
-            if c["activity"] in ("review", "fix", "fix-ci", "rebase", "bump", "lint-repair", "branch_push")
-        ]
-        pr_windows[window].update(
-            assisted=len({(c["repo"], c["number"]) for c in meaningful}),
-            reviews=db.execute(
-                f"SELECT COUNT(*) FROM rounds {where} {'AND' if where else 'WHERE'} kind='review' AND outcome='completed' AND finished>=? AND finished<=?",
-                [*args, begin, now],
-            ).fetchone()[0],
-            fixes=sum(c["activity"] in ("fix", "fix-ci", "rebase", "bump", "lint-repair") for c in others),
-        )
+    raw_observed = minimum("prs", "observed")
+    raw_checked = minimum("prs", "checked")
+    unresolved = "landed IS NULL AND state IS NOT 'CLOSED'"
+    oldest_observed = minimum("prs", "observed", unresolved)
+    oldest_missing = minimum("prs", "created", unresolved + " AND observed IS NULL")
     return dict(
         prepared_at=now,
         review_coordination={
@@ -692,20 +685,20 @@ def _summary(db, now, column=None, identity=None):
             if native_since is not None
             else None
         ),
-        interrupted_unfinished=interrupted["total"],
+        interrupted_unfinished=int(upper.get("interrupted_total", 0)),
         interrupted_unfinished_details=dict(
-            started_1h=interrupted["started_1h"],
-            started_24h=interrupted["started_24h"],
+            started_1h=int(totals["1h"].get("interrupted", 0)),
+            started_24h=int(totals["24h"].get("interrupted", 0)),
             latest=dict(latest_interrupted) if latest_interrupted else None,
         ),
-        open_prs=sum(p["state"] == "OPEN" and p["landed"] is None for p in prs),
-        unknown_prs=sum(p["state"] is None for p in prs),
-        unknown_landings=sum(p["state"] == "MERGED" and p["landed"] is None for p in prs),
-        pr_observed_at=min((p["observed"] for p in prs if p["observed"]), default=None),
-        pr_checked_at=min((p["checked"] for p in prs if p["checked"]), default=None),
+        open_prs=int(upper.get("open_stock", 0)),
+        unknown_prs=int(upper.get("unknown_prs", 0)),
+        unknown_landings=int(upper.get("unknown_landings", 0)),
+        pr_observed_at=raw_observed[0] if raw_observed else None,
+        pr_checked_at=raw_checked[0] if raw_checked else None,
         pr_freshness=dict(
-            observed_at=min((p["observed"] for p in unresolved if p["observed"] is not None), default=None),
-            missing_since=min((p["created"] for p in unresolved if p["observed"] is None), default=None),
+            observed_at=oldest_observed[0] if oldest_observed else None,
+            missing_since=oldest_missing[0] if oldest_missing else None,
         ),
     )
 
@@ -740,6 +733,9 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     errors.append("Local CI history preparation failed; retaining last-known data")
                 try:
                     activity_costs.prepare(db, now, lambda worker: _worker_scope(db, worker))
+                    pending = db.execute("SELECT value FROM meta WHERE key='activity_cost_error'").fetchone()
+                    if pending:
+                        errors.append("Conversation cost preparation incomplete: " + pending[0])
                 except (OSError, ValueError, KeyError) as error:
                     db.execute("INSERT OR REPLACE INTO meta VALUES ('activity_cost_error',?)", (type(error).__name__,))
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
@@ -765,56 +761,58 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 verification_storage.housekeep(states)
             except Exception as error:
                 errors.append(f"Verification storage housekeeping deferred ({type(error).__name__})")
-            sharing = shared_mathlib.summary()
-            value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
-            value["all"]["shared_mathlib"] = sharing
-            value["all"]["work_recovery"] = work_recovery.summary()
-            value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
-            value["all"]["expanded_cache"] = expanded_cache.summary()
-            value["all"]["verification_storage"] = read_json(verification_storage.root() / "status.json")
-            from . import activity_live
+            with db:
+                sharing = shared_mathlib.summary()
+                value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
+                value["all"]["shared_mathlib"] = sharing
+                value["all"]["work_recovery"] = work_recovery.summary()
+                value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
+                value["all"]["expanded_cache"] = expanded_cache.summary()
+                value["all"]["verification_storage"] = read_json(verification_storage.root() / "status.json")
+                from . import activity_live
 
-            report_paths = [root() / "summary.json"]
-            live_context = activity_live.publication_context()
-            for column, key in (("worker", "workers"), ("scope", "groups")):
-                ids = db.execute(
-                    f"SELECT {column} FROM rounds UNION SELECT {column} FROM prs UNION SELECT {column} FROM pr_contributions UNION SELECT {column} FROM conversation_costs"
-                    + (" UNION SELECT scope FROM ci_activity" if column == "scope" else "")
-                ).fetchall()
-                for row in ids:
-                    value[key][row[0]] = _summary(db, now, column, row[0])
-                    value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
-                        **{"scope" if key == "groups" else "worker": row[0]}
-                    )
-                    members = (
-                        {r[0] for r in db.execute("SELECT DISTINCT worker FROM rounds WHERE scope=?", (row[0],))}
-                        if key == "groups"
-                        else {row[0]}
-                    )
-                    value[key][row[0]]["work_recovery"] = work_recovery.summary(workers=members)
-                    if key == "groups":
-                        # Storage belongs to the host, not to the accounting worker window.
-                        value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]
-                        value[key][row[0]]["expanded_cache"] = value["all"]["expanded_cache"]
-                    report_path = scope_path(key, row[0])
-                    report_paths.append(report_path)
-                    activity_live.publish_report(
-                        report_path,
-                        dict(
-                            version=1,
-                            prepared_at=now,
-                            all=value[key][row[0]],
-                            errors=errors,
-                            live_subject={"worker" if key == "workers" else "scope": row[0]},
-                        ),
-                        carry=live_context,
-                    )
-            # Detail is separate; status readers never transfer a growing PR inventory.
-            atomic_json(
-                root() / "prs.json",
-                dict(version=1, prepared_at=now, prs=[dict(r) for r in db.execute("SELECT * FROM prs")]),
-                durable=False,
-            )
+                report_paths = [root() / "summary.json"]
+                reports = []
+                live_context = activity_live.publication_context()
+                from .activity_rollup_sources import flush
+
+                flush(db, now)
+                subjects = [
+                    json.loads(row[0]) for row in db.execute("SELECT subject FROM report_subjects WHERE refs>0")
+                ]
+                for column, key in (("worker", "workers"), ("scope", "groups")):
+                    ids = [(identity,) for kind, identity in subjects if kind == column]
+                    for row in ids:
+                        value[key][row[0]] = _summary(db, now, column, row[0])
+                        value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
+                            **{"scope" if key == "groups" else "worker": row[0]}
+                        )
+                        members = (
+                            {r[0] for r in db.execute("SELECT worker FROM report_members WHERE scope=?", (row[0],))}
+                            if key == "groups"
+                            else {row[0]}
+                        )
+                        value[key][row[0]]["work_recovery"] = work_recovery.summary(workers=members)
+                        if key == "groups":
+                            # Storage belongs to the host, not to the accounting worker window.
+                            value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]
+                            value[key][row[0]]["expanded_cache"] = value["all"]["expanded_cache"]
+                        report_path = scope_path(key, row[0])
+                        report_paths.append(report_path)
+                        reports.append(
+                            (
+                                report_path,
+                                dict(
+                                    version=1,
+                                    prepared_at=now,
+                                    all=value[key][row[0]],
+                                    errors=errors,
+                                    live_subject={"worker" if key == "workers" else "scope": row[0]},
+                                ),
+                            )
+                        )
+            for report_path, report in reports:
+                activity_live.publish_report(report_path, report, carry=live_context)
             # These are rebuildable views. Receipts and SQLite remain durable;
             # readers need atomic replacement, not a disk barrier for every view.
             activity_live.publish_report(
@@ -908,13 +906,20 @@ def command(args):
     if args.action == "refresh":
         prepare(args.config, import_history=args.backfill, history_roots=args.history_root)
     if args.inventory:
-        value = read_json(root() / "prs.json")
-        if args.worker or args.group:
-            value["prs"] = [
-                p
-                for p in value.get("prs", [])
-                if (not args.worker or p["worker"] == args.worker) and (not args.group or p["scope"] == args.group)
-            ]
+        # A complete inventory is an explicit request, never a periodic export.
+        # Read the prepared facts without schema changes, collectors or network.
+        path = root() / "activity.sqlite"
+        value = dict(version=1, prs=[])
+        if path.exists():
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                db.row_factory = sqlite3.Row
+                predicates, args_ = [], []
+                for column, selected in (("worker", args.worker), ("scope", args.group)):
+                    if selected:
+                        predicates.append(column + "=?")
+                        args_.append(selected)
+                where = " WHERE " + " AND ".join(predicates) if predicates else ""
+                value["prs"] = [dict(row) for row in db.execute("SELECT * FROM prs" + where, args_)]
     else:
         value = cached(worker=args.worker, group=args.group)
     if args.json or args.inventory:

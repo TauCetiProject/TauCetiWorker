@@ -66,6 +66,8 @@ on PRs initiated elsewhere. Native final costs correct response-level estimates 
 ongoing sessions use recorded usage, shown separately as running usage.
 Legacy costs without response timing are spread over their conversation duration. These are API costs,
 not machine charges or subscription fees. Reading the ledger never changes it.
+Closed history is indexed once; routine preparation processes only ledger changes,
+changed/live invocation evidence, and reporting-window expirations.
 The cost breakdown lists completed sessions, live usage, and the estimated total.
 Unresolved stopped usage estimates appear only when nonzero or unavailable;
 an all-zero row is omitted. Settled estimates already belong to completed sessions;
@@ -220,3 +222,20 @@ the rate. Costs remain seven days and all time; hourly rates retain four windows
 
 Preparation is local and runs in the existing background collector. Reading
 `status` performs no transcript scans, SQL queries or additional GitHub requests.
+
+## Incremental historical preparation
+
+Historical cost preparation owns an independent SQLite projection and a durable
+queue of changed invocations. It never takes the admission projection lock.
+Indexed provider/message ownership limits corrections to affected invocations;
+settled journals are not rechecked on each report. Recent final-checkpoint races
+have a bounded retry period. Per-invocation errors roll back and retry separately
+without repeatedly preparing successful changes; incomplete costs remain visibly
+unavailable until the retry succeeds.
+
+Persisted prefix totals advance the 1h/3h/24h/7d boundaries by consuming only
+crossing events. Completed history is not loaded into Python to rebuild totals.
+The same totals cover worker time, rounds, PR/LOC output, contributions and CI.
+A new schema or discarded/replaced cache may require one migration scan.
+`--inventory` explicitly reads the prepared PR table; the collector does not
+serialize the entire inventory every minute.
