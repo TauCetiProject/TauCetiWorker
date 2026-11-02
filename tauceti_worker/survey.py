@@ -1019,8 +1019,9 @@ def survey(
         #    green, attempts spent) so a fix-focused worker explains its idleness instead of a bare
         #    "no eligible work" — reviews are async, so a one-shot fix run can precede the scoreboard.
         for p in tended:
-            if cached_only and not p.build_success:
-                continue
+            # Review findings at this head can be repaired while CI is queued.
+            # Discovery uses shared cached facts; dispatch rechecks this PR's
+            # head and findings before acting, independently of its build status.
             if not history_ready(p):
                 if "awaiting-author" in p.labels:
                     c = Candidate(
