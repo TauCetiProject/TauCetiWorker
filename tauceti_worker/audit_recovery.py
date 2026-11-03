@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
-from .audit_progress import continuable, legacy_coverage_only
+from .audit_progress import continuable, coverage, legacy_coverage_only
 from .config import Die, NoProgress, log
 
 # The reviewed version-1 launcher deployed before worker-bound judgments. This
@@ -24,6 +24,7 @@ V2_PROFILE = {
     "reader_digest": "f852a254efc4336cce71f853b8c86e3ccc87084f2914efbf085463c3bb57bfc0",
     "catalog_digest": "d8b52bbd35338aed56afb8a6b475cc1ebf2e57d4a7956a04a00c4794e115eebb",
 }
+READING_RETRY_SECONDS = 60
 
 
 def safe_judgment(value, batch: dict, paged: bool, *, legacy=False, allow_empty=False) -> bool:
@@ -463,6 +464,10 @@ def recover(cfg, opts, previous: dict) -> bool:
     )
     log(f"security-audit: automatic same-session recovery {batch['from_sha'][:12]}..{target[:12]}")
     try:
+        before_read = coverage(batch, original / "read-receipt.json")["read"] if paged else None
+    except Exception:
+        before_read = None  # Advisory scheduling must not change recovery eligibility.
+    try:
         verdict = sa.inspect(
             batch,
             "codex",
@@ -492,6 +497,47 @@ def recover(cfg, opts, previous: dict) -> bool:
             failure["attempt"] = str(original)
         save(work / "blocked.json", failure)
         sa.record(work / "ledger.jsonl", failure)
+        if (
+            isinstance(exc, Die)
+            and str(exc) == "security-audit: inspection unfinished; retained for same-session continuation"
+            and before_read is not None
+        ):
+            try:
+                # Reading more of the same immutable input is useful work. Shorten
+                # only the scheduling delay; preserve the reserved attempt count and
+                # every eligibility, quota, coverage and final-judgment check.
+                after, after_batch, after_execution, after_legacy = retained(work, failure)
+                after_read = coverage(batch, after / "read-receipt.json")["read"] if paged else []
+                if (
+                    after_batch == batch
+                    and sa.retained_thread(after) == sa.retained_thread(original)
+                    and set(before_read) < set(after_read)
+                    and continuable(
+                        (after / "model-transcript.jsonl").read_text(),
+                        batch,
+                        after / "read-receipt.json",
+                        after,
+                        legacy=after_legacy,
+                        allowed=after_execution.get("_allowed_history", ()),
+                        paged=paged,
+                    )
+                ):
+                    retry_at = time.time() + READING_RETRY_SECONDS
+                    sa.record(
+                        work / "ledger.jsonl",
+                        {
+                            **recovery,
+                            "recovery_kind": "reading-progress-v3",
+                            "reading_progress_retry_at": retry_at,
+                            "pages_before": len(before_read),
+                            "pages_after": len(after_read),
+                        },
+                    )
+                    state[key]["retry_at"] = retry_at
+                    save(state_path, state)
+                    log("security-audit: verified new reading progress; same-session recovery eligible after 60s")
+            except Exception as schedule_error:
+                log(f"security-audit: preserving failure backoff ({type(schedule_error).__name__})")
         notify_block(work, failure)
         raise NoProgress(f"security-audit: retained recovery did not advance: {exc}") from exc
     return True
