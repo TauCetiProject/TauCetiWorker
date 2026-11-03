@@ -33,6 +33,7 @@ was published from a transcript; resuming retained work is a separate consumer o
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -60,6 +61,9 @@ PUBLISHED = "refs/tauceti/published"
 PRESERVED = "refs/tauceti/preserved"
 PENDING = "refs/tauceti-pending"  # outside refs/tauceti/, so a pending tip never counts as preserved
 PSEUDO_HEADS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD")
+
+BUNDLE_SAVE_TIMEOUT = 60
+INCOMPLETE_SAVE_TTL = 3600
 
 MAX_UNTRACKED_BYTES = 128 * 1024 * 1024
 MAX_UNTRACKED_FILES = 20000
@@ -166,6 +170,7 @@ class Work:
 
 
 _WORK = ContextVar("recovery_work", default=None)
+_SAVE_LEASE = ContextVar("recovery_save_lease", default=None)
 
 
 def _charge(**fields):
@@ -262,9 +267,15 @@ def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout
     if work is not None and work.seconds != float("inf"):
         # Bound bytes at the pipe, rather than accounting for an arbitrarily large captured
         # rev-list/diff/ls-files output after it has already been read into memory.
-        returncode, output, stderr = _bounded_git(command, env, work)
+        returncode, output, stderr = _bounded_git(command, env, work, timeout=timeout)
     else:
-        p = subprocess.run(command, capture_output=True, timeout=timeout, env=env)
+        p = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            pass_fds=(() if _SAVE_LEASE.get() is None else (_SAVE_LEASE.get(),)),
+        )
         output, stderr, returncode = p.stdout, p.stderr, p.returncode
         _charge(read=len(output) + len(stderr))
     if check and returncode:
@@ -273,8 +284,15 @@ def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout
     return output.decode(errors="replace") if text else output
 
 
-def _bounded_git(command, env, work):
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as process:
+def _bounded_git(command, env, work, *, timeout=600):
+    deadline = min(work.started + work.seconds, work.deadline, time.monotonic() + timeout)
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        pass_fds=(() if _SAVE_LEASE.get() is None else (_SAVE_LEASE.get(),)),
+    ) as process:
         output = {process.stdout: bytearray(), process.stderr: bytearray()}
         try:
             with selectors.DefaultSelector() as selector:
@@ -282,7 +300,9 @@ def _bounded_git(command, env, work):
                     selector.register(stream, selectors.EVENT_READ)
                 while selector.get_map():
                     work.charge()
-                    remaining = min(work.started + work.seconds, work.deadline) - time.monotonic()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
                     for event, _ in selector.select(max(0, remaining)):
                         capacity = min(65536, work.read_remaining)
                         if capacity <= 0:
@@ -293,7 +313,7 @@ def _bounded_git(command, env, work):
                             output[event.fileobj].extend(data)
                         else:
                             selector.unregister(event.fileobj)
-            remaining = max(0.001, min(work.started + work.seconds, work.deadline) - time.monotonic())
+            remaining = max(0.001, deadline - time.monotonic())
             rc = process.wait(timeout=remaining)
             return rc, bytes(output[process.stdout]), bytes(output[process.stderr])
         except BaseException:
@@ -908,6 +928,28 @@ def _handoff_source_receipts(cfg, owner, checkpoint, *, checkout=None):
 
 
 def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
+    """Serialize saves and exclude partial-save cleanup, including while Git children live."""
+    root = cfg.state / "recovery"
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as error:
+        raise RecordError(f"could not create {root}: {error}") from error
+    try:
+        with (cfg.state / "recovery-save.lock").open("a+b") as lease:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RecordError("another source save is still running; retain the checkout") from None
+            token = _SAVE_LEASE.set(lease.fileno())
+            try:
+                return _record_locked(cfg, repo, snap, label, repository, owner=owner)
+            finally:
+                _SAVE_LEASE.reset(token)
+    except OSError as error:
+        raise RecordError(f"could not acquire source-save lease: {error}") from error
+
+
+def _record_locked(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
     """Write or reuse a complete record for this exact snapshot. Raises RecordError on any failure."""
     from .activity import current_round_id
 
@@ -984,6 +1026,7 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
                 "--not",
                 "--remotes",
                 f"--glob={PUBLISHED}",
+                timeout=BUNDLE_SAVE_TIMEOUT,
             )
             with open(tmp / "commits.bundle", "rb+") as handle:
                 os.fsync(handle.fileno())
@@ -1038,13 +1081,14 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         final = root / record_id
         os.rename(tmp, final)
         _fsync_dir(root)
-    except (OSError, subprocess.SubprocessError, tarfile.TarError, RecordError) as error:
-        # Only our own partial copy is removed; the checkout itself is untouched.
+    except BaseException as error:
+        # Cancellation also abandons our partial copy; the checkout itself is untouched.
         shutil.rmtree(tmp, ignore_errors=True)
-        _update_refs(repo, [f"delete {pending}/{name}" for name in bundle_refs], check=False)
-        if isinstance(error, RecordError):
-            raise
-        raise RecordError(f"could not save recovery record: {error}") from error
+        with contextlib.suppress(Exception):
+            _update_refs(repo, [f"delete {pending}/{name}" for name in bundle_refs], check=False)
+        if isinstance(error, (OSError, subprocess.SubprocessError, tarfile.TarError)):
+            raise RecordError(f"could not save recovery record: {error}") from error
+        raise
     receipt_error = None
     try:
         _handoff_source_receipts(cfg, owner, final, checkout=repo)
@@ -1078,6 +1122,7 @@ def _update_refs(repo: Path, commands: list[str], *, check: bool = True) -> None
         input="".join(c + "\n" for c in commands).encode(),
         capture_output=True,
         env=_git_environment(repo),
+        pass_fds=(() if _SAVE_LEASE.get() is None else (_SAVE_LEASE.get(),)),
     )
     if check and p.returncode:
         raise RecordError(f"git update-ref failed: {p.stderr.decode(errors='replace').strip()[-200:]}")

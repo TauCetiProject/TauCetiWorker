@@ -15,7 +15,7 @@ Pinned here, with local git fixtures only (no GitHub, no agents):
   6. Save failures (no space, permission, archive bound), a live process using the checkout, and an
      unstable tree move the whole checkout aside unmodified and preparation continues on a fresh
      clone; a later preparation saves and removes the retained copy once nothing uses it.
-  7. Interrupted saves, corrupt manifests and damaged payloads are never trusted or deleted.
+  7. Interrupted saves are never trusted; abandoned partials expire. Completed corrupt records stay intact.
   8. Host work (`prepare_checkout`, roadmap) and progress preparation proceed after saving.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
@@ -400,12 +400,12 @@ def test_move_aside(root):
     check("unsavable and unmovable: refused, retried next round", not d.ok and "left intact" in d.reason)
     check("unsavable and unmovable: checkout intact", (co / "Draft.lean").read_text() == "x\n")
 
-    # A crash mid-save leaves a .tmp directory: never mistaken for a record, counted as incomplete.
+    # A crash mid-save leaves temporary debris, never an operator recovery task.
     rec = cfg.state / "recovery"
     rec.mkdir(parents=True, exist_ok=True)
     (rec / ".tmp-crashed-1-abcd").mkdir()
     s = prepared_summary(root / "stuck" / "state")
-    check("interrupted save counted incomplete", s["incomplete"] == 1 and s["records"] == 0)
+    check("interrupted save not a recovery task", s["incomplete"] == 0 and s["records"] == 0)
 
     # Corrupt manifest and damaged payloads: neither reused nor deleted.
     origin, co, cfg = fixture(root / "corrupt")
@@ -734,7 +734,7 @@ def test_activity(root):
     with patch.object(wr, "HERE", root / "act"), patch.object(activity, "_refresh_prs", lambda *a: None):
         value = activity.prepare()
     rec = value["all"]["work_recovery"]
-    check("activity: retained and incomplete counted", rec["retained"] >= 1 and rec["incomplete"] == 1)
+    check("activity: retained counted, temporary writes omitted", rec["retained"] >= 1 and rec["incomplete"] == 0)
     check("activity: reason names the worker", any(r.startswith("w: ") for r in rec["reasons"]))
     summary = activity.cached()
     combined = activity_summary.combine([summary, summary])
