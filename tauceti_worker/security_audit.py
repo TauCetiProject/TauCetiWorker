@@ -539,19 +539,42 @@ def codex_final(transcript: str, paged: bool) -> dict:
 
 def successful_read_pages(transcript: str, provider: str) -> set[int]:
     """Read ordinary client success reports; these are not model acknowledgments."""
-    # A timeout can cut the final JSON line short. Earlier complete client
-    # reports still establish successful reads; malformed interior lines do not.
+    # Partial/malformed client lines provide no evidence. Preserve valid earlier
+    # reports without replacing a timeout exception with a JSON parsing failure.
     lines = [line for line in transcript.splitlines() if line.strip()]
     events = []
-    for number, line in enumerate(lines):
+    for line in lines:
         try:
-            events.append(json.loads(line))
+            event = json.loads(line)
         except ValueError:
-            if number != len(lines) - 1:
-                raise
-    pages = set()
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    pages, pending = set(), set()
     calls = {}
     for event in events:
+        # A killed client's final tool report may precede durable conversation
+        # storage. A later model event confirms it crossed that boundary; replay
+        # the last pending read after a timeout rather than assume write ordering.
+        if provider == "codex":
+            item = event.get("item", {})
+            following_model_event = (
+                event.get("type") == "turn.completed"
+                or (
+                    event.get("type") == "item.started"
+                    and item.get("type") in ("reasoning", "agent_message", "mcp_tool_call")
+                )
+                or (event.get("type") == "item.completed" and item.get("type") in ("reasoning", "agent_message"))
+            )
+        else:
+            following_model_event = event.get("type") == "assistant" or (
+                event.get("type") == "result"
+                and not event.get("is_error")
+                and event.get("subtype") in (None, "success")
+            )
+        if following_model_event:
+            pages.update(pending)
+            pending.clear()
         if provider == "codex":
             item = event.get("item", {})
             if (
@@ -570,7 +593,7 @@ def successful_read_pages(transcript: str, provider: str) -> set[int]:
                 continue
             page = item.get("arguments", {}).get("page")
             if type(page) is int:
-                pages.add(page)
+                pending.add(page)
         else:
             for item in event.get("message", {}).get("content", []):
                 if not isinstance(item, dict):
@@ -584,7 +607,7 @@ def successful_read_pages(transcript: str, provider: str) -> set[int]:
                 if event.get("type") == "user" and item.get("type") == "tool_result" and not item.get("is_error"):
                     page = calls.get(item.get("tool_use_id"))
                     if type(page) is int:
-                        pages.add(page)
+                        pending.add(page)
     return pages
 
 

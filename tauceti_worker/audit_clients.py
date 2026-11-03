@@ -115,7 +115,9 @@ def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int
                 check(provider, state)
                 if not verified(expected):
                     raise ValueError("client changed or did not produce a matching record")
-            except (Die, OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+            except Exception as exc:
+                # This is an isolated, bounded compatibility probe. Unexpected
+                # client formats also need a cooldown, never a hot retry loop.
                 failures[provider] = {"fingerprint": expected, "retry_at": time.time() + 300, "error": str(exc)}
                 save(failures_path, failures)
                 log(

@@ -224,8 +224,10 @@ flushes the response before atomically recording served coverage. Failed writes
 receive no credit; a crash before the receipt is committed can require a reread.
 The Worker saves coverage before each client call and reconciles it with the
 client's successful tool-call reports afterwards, including on timeout or failure.
-It keeps the contiguous confirmed prefix and rereads only the unconfirmed remainder
-in the same conversation. If the Worker dies without saving a transcript, the
+A read is retained only after a later model event follows its successful client
+report, so a timeout can require replaying the last read. The Worker keeps the
+contiguous confirmed prefix and rereads only the unconfirmed remainder in the
+same conversation. If the Worker dies without saving a transcript, the
 launch's new reads are replayed. Earlier findings and uncertainty are preserved;
 partial progress never substitutes for a final safety judgment.
 

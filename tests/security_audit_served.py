@@ -24,7 +24,7 @@ from tauceti_worker import security_audit as sa
 from tauceti_worker.config import Die, NoProgress
 
 
-def read_events(provider, pages, *, failed=False):
+def read_events(provider, pages, *, failed=False, confirmed=True):
     events = []
     for page in pages:
         if provider == "codex":
@@ -68,6 +68,12 @@ def read_events(provider, pages, *, failed=False):
                         },
                     },
                 ]
+            )
+        if confirmed:
+            events.append(
+                {"type": "item.started", "item": {"id": f"next-{page}", "type": "reasoning"}}
+                if provider == "codex"
+                else {"type": "assistant", "message": {"content": []}}
             )
     return events
 
@@ -450,7 +456,9 @@ class ServedJudgments(unittest.TestCase):
             events = [{"type": "thread.started", "thread_id": self.thread}] + read_events(
                 "codex", range(start, start + 1)
             )
-            raise subprocess.TimeoutExpired("codex", 1800, output="\n".join(map(sa.serialize, events)).encode())
+            raise subprocess.TimeoutExpired(
+                "codex", 1800, output=("\n".join(map(sa.serialize, events)) + '\n{"type":').encode()
+            )
 
         previous = self.block
         with (
@@ -477,6 +485,21 @@ class ServedJudgments(unittest.TestCase):
         (self.original / "model-transcript.jsonl").write_text("\n".join(map(sa.serialize, events)))
         self.assertEqual(sa.reconcile_coverage(self.original, self.batch)["served"], [0, 1])
         self.assertEqual(sa.reconcile_coverage(self.original, self.batch)["served"], [0, 1])
+
+    def test_killed_client_last_report_requires_a_following_model_event(self):
+        for provider in ("codex", "claude"):
+            events = read_events(provider, [0], confirmed=False)
+            transcript = "\n".join(map(sa.serialize, events))
+            self.assertEqual(sa.successful_read_pages(transcript, provider), set())
+            follow = (
+                {"type": "item.started", "item": {"type": "reasoning"}}
+                if provider == "codex"
+                else {"type": "assistant", "message": {"content": []}}
+            )
+            self.assertEqual(sa.successful_read_pages(transcript + "\n" + sa.serialize(follow), provider), {0})
+            # Garbage and non-object JSON cannot manufacture progress or mask a timeout.
+            malformed = transcript + '\ninvalid\n42\n{"type":'
+            self.assertEqual(sa.successful_read_pages(malformed, provider), set())
 
     def test_client_reports_must_confirm_read_success(self):
         for provider in ("codex", "claude"):
@@ -716,7 +739,7 @@ class ClientCompatibility(unittest.TestCase):
             state = Path(tmp)
             with (
                 patch.object(clients, "fingerprint", return_value={"client": "one"}) as fingerprint,
-                patch.object(check, "verify", side_effect=ValueError("truncated tool result")) as probe,
+                patch.object(check, "verify", side_effect=RuntimeError("unexpected client format")) as probe,
                 patch.object(clients.time, "time", return_value=1000) as now,
             ):
                 self.assertEqual(clients.selected_protocol("codex", state), 3)
