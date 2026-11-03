@@ -150,6 +150,7 @@ RUN_STDLIB=(
   safe_exists.py
   scoreboard_trust.py
   security_audit.py
+  security_audit_served.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py

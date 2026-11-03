@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -33,7 +34,7 @@ from .audit_progress import (
     continuation_prompt,
     snapshot,
 )
-from .audit_reader import pages
+from .audit_reader_v3 import pages
 from .audit_recovery import mechanical_output, recover, safe_history
 from .config import Die, NoProgress, log
 from .constants import TAUCETI
@@ -102,7 +103,8 @@ SCHEMA = {
 # Version 1 remains available only for validating retained historical evidence.
 # Batch identity is attached by the trusted launcher in version 2, never generated
 # by the reviewer. The reader token separately checks complete result delivery.
-PROTOCOL_VERSION = 3
+TOKEN_PROTOCOL_VERSION = 3  # Retained token inspections keep their original protocol.
+PROTOCOL_VERSION = 4
 MODEL_PROMPT = PROMPT.replace(
     "Return ONLY JSON with input_digest, commits (all SHA strings in order), verdict\n"
     "(pass, finding, incomplete), and findings (list of strings with commit/path/line\n"
@@ -159,6 +161,42 @@ V2_CODEX_CATALOG["models"][0]["model_messages"]["instructions_template"] = (
     + "\nThe only permitted tool is audit.read_page, which reads the prepared input."
 )
 CODEX_CATALOG["models"][0]["model_messages"]["instructions_template"] = MODEL_PROMPT + COMPACTION_POLICY + GOAL_REQUEST
+
+
+# Preserve the exact historical prompt/catalog above for retained inspections.
+SERVED_GOAL_REQUEST = GOAL_REQUEST.replace("complete reader coverage and its final token", "complete served coverage")
+SERVED_COMPACTION_POLICY = COMPACTION_POLICY.replace(
+    "findings, unresolved questions and the latest reader token across compaction.",
+    "findings and unresolved questions across compaction.",
+)
+SERVED_MODEL_PROMPT = MODEL_PROMPT.replace("next_unread_page", "next_unserved_page").replace(
+    "The Worker independently verifies coverage", "The Worker tracks served coverage"
+)
+SERVED_CLAUDE_PROMPT = V2_MODEL_PROMPT
+SERVED_CODEX_CATALOG = copy.deepcopy(CODEX_CATALOG)
+SERVED_CODEX_CATALOG["models"][0]["model_messages"]["instructions_template"] = (
+    SERVED_MODEL_PROMPT + SERVED_COMPACTION_POLICY + SERVED_GOAL_REQUEST
+)
+
+
+def reader_path(protocol=3):
+    return Path(__file__).with_name("audit_reader.py" if protocol == 4 else "audit_reader_v3.py").resolve()
+
+
+def reader_pages(batch, protocol=3):
+    if protocol == 4:
+        from .audit_reader import pages as served_pages
+
+        return served_pages(batch)
+    return pages(batch)
+
+
+def attempt_protocol(work):
+    return json.loads((work / "execution.json").read_text()).get("protocol_version", 1)
+
+
+def inspection_catalog(protocol=3):
+    return SERVED_CODEX_CATALOG if protocol == 4 else CODEX_CATALOG
 
 
 def api(path: str, *, method: str = "GET", body=None):
@@ -334,7 +372,7 @@ def bind_verdict(value, batch: dict) -> dict:
     )
 
 
-def reviewer_argv(provider: str, *, goals: bool = True) -> list[str]:
+def reviewer_argv(provider: str, *, goals: bool = True, protocol: int = 3) -> list[str]:
     if provider == "claude":
         return [
             "claude",
@@ -358,7 +396,7 @@ def reviewer_argv(provider: str, *, goals: bool = True) -> list[str]:
             "--permission-mode",
             "dontAsk",
             "--append-system-prompt",
-            MODEL_PROMPT + COMPACTION_POLICY,
+            SERVED_CLAUDE_PROMPT + SERVED_COMPACTION_POLICY if protocol == 4 else MODEL_PROMPT + COMPACTION_POLICY,
         ]
     if provider == "codex":
         cmd = [
@@ -497,6 +535,123 @@ def codex_final(transcript: str, paged: bool) -> dict:
     ):
         raise Die("security-audit: incomplete model response")
     return json.loads(messages[-1][1])
+
+
+def successful_read_pages(transcript: str, provider: str) -> set[int]:
+    """Read ordinary client success reports; these are not model acknowledgments."""
+    # Partial/malformed client lines provide no evidence. Preserve valid earlier
+    # reports without replacing a timeout exception with a JSON parsing failure.
+    lines = [line for line in transcript.splitlines() if line.strip()]
+    events = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    pages = set()
+    calls = {}
+    for event in events:
+        if provider == "codex":
+            item = event.get("item", {})
+            if (
+                event.get("type") != "item.completed"
+                or item.get("type") != "mcp_tool_call"
+                or item.get("server") != "audit"
+                or item.get("tool") != "read_page"
+            ):
+                continue
+            if (
+                item.get("status") != "completed"
+                or item.get("error")
+                or not isinstance(item.get("result"), dict)
+                or item["result"].get("isError")
+            ):
+                continue
+            page = item.get("arguments", {}).get("page")
+            if type(page) is int:
+                pages.add(page)
+        else:
+            for item in event.get("message", {}).get("content", []):
+                if not isinstance(item, dict):
+                    continue
+                if (
+                    event.get("type") == "assistant"
+                    and item.get("type") == "tool_use"
+                    and item.get("name") == "mcp__audit__read_page"
+                ):
+                    calls[item["id"]] = item.get("input", {}).get("page")
+                if event.get("type") == "user" and item.get("type") == "tool_result" and not item.get("is_error"):
+                    page = calls.get(item.get("tool_use_id"))
+                    if type(page) is int:
+                        pages.add(page)
+    return pages
+
+
+def tool_texts(value):
+    if isinstance(value, str):
+        yield value
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return
+        yield from tool_texts(decoded)
+    elif isinstance(value, list):
+        for item in value:
+            yield from tool_texts(item)
+    elif isinstance(value, dict):
+        for key in ("text", "content", "result"):
+            if key in value:
+                yield from tool_texts(value[key])
+
+
+def saved_read_pages(rollouts: list[Path], expected_pages: list[list[dict]]) -> set[int]:
+    """Find reads whose outputs are in the exact native history Codex will resume."""
+    if len(rollouts) != 1:
+        return set()
+    calls, pages = {}, set()
+    for line in rollouts[0].read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+            if row.get("type") != "response_item":
+                continue
+            item = row["payload"]
+            if item.get("type") == "function_call" and item.get("name") in ("read_page", "mcp__audit__read_page"):
+                args = json.loads(item["arguments"])
+                if type(args.get("page")) is int and isinstance(item.get("call_id"), str):
+                    calls[item["call_id"]] = args["page"]
+            if item.get("type") == "function_call_output" and "output" in item:
+                page = calls.get(item.get("call_id"))
+                if type(page) is int:
+                    # A previous failed/skip-ahead call for this page can have
+                    # an error output in the native history. Require the actual
+                    # reader payload, rather than crediting any output by page.
+                    for text in tool_texts(item["output"]):
+                        try:
+                            delivered = json.loads(text)
+                            if (
+                                0 <= page < len(expected_pages)
+                                and delivered.get("page") == page
+                                and delivered.get("sections") == expected_pages[page]
+                            ):
+                                pages.add(page)
+                        except (ValueError, TypeError, AttributeError, KeyError):
+                            continue
+        except (ValueError, TypeError, AttributeError, KeyError):
+            continue  # A partial/malformed native row provides no read evidence.
+    return pages
+
+
+def claude_result(transcript: str) -> dict:
+    events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+    results = [e for e in events if e.get("type") == "result"]
+    if len(results) != 1:
+        raise Die("security-audit: missing final reviewer result")
+    result = results[0]
+    if result.get("is_error") or result.get("subtype") not in (None, "success"):
+        raise Die("security-audit: reviewer failed")
+    return result
 
 
 def repair_shape(value: dict, batch: dict, paged: bool) -> bool:
@@ -640,6 +795,7 @@ def codex_service_error(
                                 allow_empty=True,
                                 legacy=legacy_history,
                                 allowed=allowed_history,
+                                protocol=protocol,
                             )
                             if protocol >= 2
                             else repair_history(work, repair_batch, paged)
@@ -704,11 +860,11 @@ def retained_thread(work: Path) -> str:
         raise Die(f"security-audit: invalid retained native conversation: {exc}") from exc
 
 
-def inspection_profile() -> dict:
+def inspection_profile(protocol: int = 3) -> dict:
     return {
         "launcher_code_digest": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "reader_digest": hashlib.sha256(Path(__file__).with_name("audit_reader.py").read_bytes()).hexdigest(),
-        "catalog_digest": hashlib.sha256(serialize(CODEX_CATALOG).encode()).hexdigest(),
+        "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
+        "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest(),
     }
 
 
@@ -725,6 +881,13 @@ CONTINUE_PROMPT = (
 )
 
 
+SERVED_CONTINUE_PROMPT = (
+    "Continue the SAME retained inspection, preserving ALL previous findings, notes and uncertainty. "
+    "Request the next unserved page by number, or reread earlier pages for missing context. "
+    "Return one verdict and findings for the entire original batch. Served coverage is not approval.\n"
+)
+
+
 def retain_client(work: Path, home: Path, receipt: Path) -> None:
     if receipt.exists() and receipt.resolve() != (work / "read-receipt.json").resolve():
         (work / "read-receipt.json").write_bytes(receipt.read_bytes())
@@ -732,10 +895,55 @@ def retain_client(work: Path, home: Path, receipt: Path) -> None:
         (work / f"model-rollout-{i}.jsonl").write_bytes(rollout.read_bytes())
 
 
-def strip_recovery_prefixes(prompt: str, work: Path, batch: dict) -> str:
-    prefixes = [OUTPUT_REPAIR_PROMPT, LEGACY_OUTPUT_REPAIR_PROMPT, CONTINUE_PROMPT, INLINE_CONTINUE_PROMPT]
+def reconcile_coverage(work: Path, batch: dict) -> dict:
+    """Keep the contiguous served prefix confirmed by ordinary client success reports.
+
+    This also works after timeouts and nonzero exits. With no surviving transcript,
+    replay only this launch's unconfirmed reads in the same retained conversation.
+    """
+    from .audit_reader import Reader
+
+    value = json.loads((work / "coverage-launch.json").read_text())
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"before", "provider"}
+        or value["provider"] not in ("codex", "claude")
+    ):
+        raise Die("security-audit: invalid served coverage checkpoint")
+    before_path = work / "coverage-before-launch.json"
+    save(before_path, value["before"])
+    before_reader = Reader(batch, before_path)
+    before = before_reader.coverage()
+    transcript = work / "model-transcript.jsonl"
+    successful = (
+        successful_read_pages(transcript.read_text(encoding="utf-8", errors="replace"), value["provider"])
+        if transcript.exists()
+        else set()
+    )
+    if value["provider"] == "codex":
+        successful &= saved_read_pages(native_rollouts(work), before_reader.pages)
+    receipt = work / "read-receipt.json"
+    with receipt.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        served = Reader(batch, receipt).coverage()
+        count = len(before["served"])
+        while count < len(served["served"]) and count in successful:
+            count += 1
+        reconciled = {**before, "served": list(range(count))}
+        save(receipt, reconciled)
+    return reconciled
+
+
+def strip_recovery_prefixes(prompt: str, work: Path, batch: dict, *, protocol=3) -> str:
+    prefixes = [
+        OUTPUT_REPAIR_PROMPT,
+        LEGACY_OUTPUT_REPAIR_PROMPT,
+        CONTINUE_PROMPT,
+        SERVED_CONTINUE_PROMPT,
+        INLINE_CONTINUE_PROMPT,
+    ]
     if (work / "coverage-before.json").exists():
-        prefixes.append(continuation_prompt(batch, work / "coverage-before.json"))
+        prefixes.append(continuation_prompt(batch, work / "coverage-before.json", protocol=protocol))
     while any(prompt.startswith(p) for p in prefixes):
         prompt = prompt[len(next(p for p in prefixes if prompt.startswith(p))) :]
     return prompt
@@ -784,16 +992,41 @@ def defer_goal_continuation(state: Path, thread: str) -> None:
 
 
 def run_client(
-    cmd, prompt, *, home, env, work, receipt, provider, paged, batch=None, legacy_history=False, allowed_history=()
+    cmd,
+    prompt,
+    *,
+    home,
+    env,
+    work,
+    receipt,
+    provider,
+    paged,
+    batch=None,
+    legacy_history=False,
+    allowed_history=(),
+    protocol=3,
 ):
     """At most three requests, resuming one conversation for service/output recovery."""
-    base_prompt = strip_recovery_prefixes(prompt, work, batch) if batch is not None else prompt
+    continue_prompt = SERVED_CONTINUE_PROMPT if protocol == 4 else CONTINUE_PROMPT
+    base_prompt = strip_recovery_prefixes(prompt, work, batch, protocol=protocol) if batch is not None else prompt
     repairing = prompt.startswith(OUTPUT_REPAIR_PROMPT)
     while base_prompt.startswith((OUTPUT_REPAIR_PROMPT, CONTINUE_PROMPT)):
         base_prompt = base_prompt[
             len(OUTPUT_REPAIR_PROMPT) if base_prompt.startswith(OUTPUT_REPAIR_PROMPT) else len(CONTINUE_PROMPT) :
         ]
     for number in range(3):
+        if protocol == 4 and number:
+            from .audit_clients import selected_protocol
+
+            if selected_protocol(provider, work.parent) != 4:
+                raise NoProgress("security-audit: awaiting client delivery verification")
+        if protocol == 4:
+            from .audit_reader import Reader
+
+            checkpoint = {"before": Reader(batch, receipt).coverage(), "provider": provider}
+            save(work / "coverage-launch.json", checkpoint)
+            # A stale completed transcript must never describe the next launch.
+            (work / "model-transcript.jsonl").write_text("")
         (work / "prompt.txt").write_text(prompt)
         (work / "execution.json").write_text(
             serialize(
@@ -801,7 +1034,7 @@ def run_client(
                     "argv": cmd,
                     "environment": env,
                     "paged": paged,
-                    "protocol_version": PROTOCOL_VERSION,
+                    "protocol_version": protocol,
                     "legacy_history": legacy_history,
                     "coverage_history": bool(allowed_history),
                     "batch_identity": {
@@ -811,7 +1044,7 @@ def run_client(
                     if batch is not None
                     else None,
                     "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
-                    **inspection_profile(),
+                    **inspection_profile(protocol),
                 }
             )
         )
@@ -838,10 +1071,12 @@ def run_client(
             )
             raise
         else:
-            (work / "model-transcript.jsonl").write_text(result.stdout)
+            (work / "model-transcript.jsonl").write_bytes(result.stdout.encode())
             (work / "model-stderr.txt").write_text(result.stderr)
         finally:
             retain_client(work, home, receipt)
+            if protocol == 4:
+                reconcile_coverage(work, batch)
         if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
             raise Die("security-audit: resumed client changed the retained conversation identity")
         error = (
@@ -850,7 +1085,7 @@ def run_client(
                 paged,
                 work,
                 batch,
-                protocol=3,
+                protocol=protocol,
                 legacy_history=legacy_history,
                 allowed_history=allowed_history,
             )
@@ -859,10 +1094,18 @@ def run_client(
         )
         repair = (
             provider == "codex"
+            and protocol < 4
             and not result.returncode
             and batch is not None
             and mechanical_output(
-                result.stdout, batch, receipt, paged, work, legacy_history=legacy_history, allowed=allowed_history
+                result.stdout,
+                batch,
+                receipt,
+                paged,
+                work,
+                legacy_history=legacy_history,
+                allowed=allowed_history,
+                protocol=protocol,
             )
         )
         progress = (
@@ -870,7 +1113,14 @@ def run_client(
             and not result.returncode
             and batch is not None
             and continuable(
-                result.stdout, batch, receipt, work, legacy=legacy_history, allowed=allowed_history, paged=paged
+                result.stdout,
+                batch,
+                receipt,
+                work,
+                legacy=legacy_history,
+                allowed=allowed_history,
+                paged=paged,
+                protocol=protocol,
             )
         )
         if (error is None and not repair and not progress) or number == 2:
@@ -904,11 +1154,11 @@ def run_client(
         prefix = cmd[: cmd.index("resume")] if "resume" in cmd else cmd[:-1]
         cmd = [*prefix, "resume", thread, "-"]
         repairing = repairing or repair
-        prompt = (OUTPUT_REPAIR_PROMPT if repairing else "") + CONTINUE_PROMPT + base_prompt
+        prompt = (OUTPUT_REPAIR_PROMPT if repairing else "") + continue_prompt + base_prompt
         if progress:
             # Saved separately: exact prompt validation never reconstructs old
             # instructions from the subsequently advanced live receipt.
-            prompt = (snapshot(batch, receipt, work) if paged else INLINE_CONTINUE_PROMPT) + prompt
+            prompt = (snapshot(batch, receipt, work, protocol=protocol) if paged else INLINE_CONTINUE_PROMPT) + prompt
         log(
             f"security-audit: {'unfinished inspection' if progress else 'output repair' if repair else 'service error'}; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s"
         )
@@ -924,14 +1174,15 @@ def codex_launch(
     receipt: Path | None = None,
     *,
     goals: bool = True,
+    protocol: int = 3,
 ) -> list[str]:
-    cmd = reviewer_argv("codex", goals=goals)[:-1]
+    cmd = reviewer_argv("codex", goals=goals, protocol=protocol)[:-1]
     if paged:
         reader = [
-            str(Path(__file__).with_name("audit_reader.py").resolve()),
+            str(reader_path(protocol)),
             str(home / "input.json"),
             str(receipt or home / "read-receipt.json"),
-            token,
+            *([token] if protocol < 4 else []),
         ]
         cmd += [
             "-c",
@@ -964,12 +1215,13 @@ def validate_output_profile(
     policy_prompt: str = PROMPT,
     durable: bool = False,
     goals: bool = True,
+    protocol: int = 3,
 ) -> None:
     paged = len(serialize(batch).encode()) > INLINE_BYTES
     if execution.get("paged") is not paged:
         raise Die("security-audit: retained input delivery mode changed")
     prompt = (original / "prompt.txt").read_text()
-    prompt = strip_recovery_prefixes(prompt, original, batch)
+    prompt = strip_recovery_prefixes(prompt, original, batch, protocol=protocol)
     if not prompt.startswith(policy_prompt):
         raise Die("security-audit: retained prompt does not use the current inspection policy")
     if batch["input_digest"] not in prompt:
@@ -982,15 +1234,23 @@ def validate_output_profile(
         if len(candidates) != 1:
             raise Die("security-audit: retained launcher must have one fixed input reader")
         args = json.loads(candidates[0].split("=", 1)[1])
-        token = args[-1]
-        if not isinstance(token, str) or not re.fullmatch("[0-9a-f]{32}", token):
-            raise Die("security-audit: invalid retained reader bootstrap token")
-        if len(args) != 5 or args[0] != "-I" or not Path(args[1]).is_absolute():
+        if protocol < 4:
+            token = args[-1]
+            if not isinstance(token, str) or not re.fullmatch("[0-9a-f]{32}", token):
+                raise Die("security-audit: invalid retained reader bootstrap token")
+        if len(args) != (4 if protocol == 4 else 5) or args[0] != "-I" or not Path(args[1]).is_absolute():
             raise Die("security-audit: retained reader arguments changed")
-        if hashlib.sha256(Path(args[1]).read_bytes()).hexdigest() != execution.get("reader_digest"):
-            raise Die("security-audit: retained reader script changed")
+        try:
+            recorded_digest = hashlib.sha256(Path(args[1]).read_bytes()).hexdigest()
+        except OSError:
+            recorded_digest = None
+        if recorded_digest != execution.get("reader_digest"):
+            # A release may be pruned or updated in place. The frozen reader is
+            # a valid replacement only when its bytes match the recorded digest.
+            if hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest() != execution.get("reader_digest"):
+                raise Die("security-audit: retained reader script changed")
         # Relocating an immutable Worker release may relocate this same reader.
-        args[1] = str(Path(__file__).with_name("audit_reader.py").resolve())
+        args[1] = str(reader_path(protocol))
         argv[argv.index(candidates[0])] = "mcp_servers.audit.args=" + json.dumps(args)
         commands = [arg for arg in argv if arg.startswith("mcp_servers.audit.command=")]
         if (
@@ -998,14 +1258,14 @@ def validate_output_profile(
             and Path(json.loads(commands[0].split("=", 1)[1])).resolve() == Path(sys.executable).resolve()
         ):
             argv[argv.index(commands[0])] = "mcp_servers.audit.command=" + json.dumps(sys.executable)
-    if prompt != inspection_prompt(batch, paged, token, policy=policy_prompt, goals=goals):
+    if prompt != inspection_prompt(batch, paged, token, policy=policy_prompt, goals=goals, protocol=protocol):
         raise Die("security-audit: retained prompt differs from the immutable inspection")
     thread = retained_thread(original) if "resume" in argv else None
-    if goals and execution.get("protocol_version") == PROTOCOL_VERSION:
+    if goals and execution.get("protocol_version") in (3, 4):
         if execution["environment"].get("CODEX_SQLITE_HOME") != str(goal_state(original, batch)):
             raise Die("security-audit: retained goal state belongs to another inspection")
     if argv != codex_launch(
-        home, paged, token, thread, original / "read-receipt.json" if durable else None, goals=goals
+        home, paged, token, thread, original / "read-receipt.json" if durable else None, goals=goals, protocol=protocol
     ):
         raise Die("security-audit: retained launcher does not match the complete isolated Luna profile")
 
@@ -1035,23 +1295,38 @@ Manifest:
 """
 
 
+SERVED_PAGE_PROMPT = """
+The complete bundle is available through audit.read_page (Claude: mcp__audit__read_page).
+Read ALL numbered chunks in this ONE inspection session. Call read_page with only
+page (an integer). Request next_unserved_page; earlier pages may be reread. Later
+unserved pages cannot be skipped. Keep all findings and unresolved questions across
+compaction and reread when notes are insufficient. Return ONLY verdict and findings
+for the entire batch. The Worker tracks served coverage, which does not establish
+understanding or source safety. No other tools, commands, files, URLs or agents are
+available, apart from goal bookkeeping when enabled.
+Manifest:
+"""
+
+
 def inspection_prompt(
-    batch: dict, paged: bool, token: str = "", *, policy: str = MODEL_PROMPT, goals: bool = True
+    batch: dict, paged: bool, token: str = "", *, policy: str = MODEL_PROMPT, goals: bool = True, protocol: int = 3
 ) -> str:
-    policy = policy + GOAL_REQUEST if goals else policy
+    if protocol == 4 and policy == MODEL_PROMPT:
+        policy = SERVED_MODEL_PROMPT
+    policy = policy + (SERVED_GOAL_REQUEST if protocol == 4 else GOAL_REQUEST) if goals else policy
     if not paged:
-        if policy.startswith(MODEL_PROMPT):
+        if policy.startswith((MODEL_PROMPT, SERVED_MODEL_PROMPT)):
             policy += INLINE_POLICY
         return policy + "\n" + serialize(batch)
     manifest = {
         "input_digest": batch["input_digest"],
-        "pages": len(pages(batch)),
-        "reader_token": token,
+        "pages": len(reader_pages(batch, protocol)),
+        **({"reader_token": token} if protocol < 4 else {}),
         "commits": [
             {"sha": c["sha"], "parent": c["parent"], "files": [f["path"] for f in c["files"]]} for c in batch["commits"]
         ],
     }
-    return policy + PAGE_PROMPT + serialize(manifest)
+    return policy + (SERVED_PAGE_PROMPT if protocol == 4 else PAGE_PROMPT) + serialize(manifest)
 
 
 def inspect(
@@ -1064,8 +1339,28 @@ def inspect(
     legacy_history: bool = False,
     allowed_history=(),
     continue_reading: bool = False,
+    protocol: int | None = None,
 ) -> dict:
-    cmd = reviewer_argv(provider)
+    from .audit_clients import selected_protocol
+
+    if resume_from is not None:
+        retained_protocol = attempt_protocol(resume_from)
+        retained_protocol = 3 if retained_protocol in (1, 2) else retained_protocol
+        if protocol is not None and protocol != retained_protocol:
+            raise Die("security-audit: cannot change a retained inspection protocol")
+        protocol = retained_protocol
+        if protocol == 4:
+            reconcile_coverage(resume_from, batch)
+            if selected_protocol(provider, work.parent) != 4:
+                raise NoProgress("security-audit: awaiting client delivery verification")
+    elif protocol is None:
+        protocol = selected_protocol(provider, work.parent)
+    if protocol not in (3, 4):
+        raise Die("security-audit: unknown inspection protocol")
+    if protocol == 4 and repair_output:
+        raise Die("security-audit: token output repair is unavailable in protocol 4")
+    cmd = reviewer_argv(provider, protocol=protocol)
+    continue_prompt = SERVED_CONTINUE_PROMPT if protocol == 4 else CONTINUE_PROMPT
     thread = None
     if resume_from is not None:
         if provider != "codex":
@@ -1119,8 +1414,14 @@ def inspect(
         if not dest.is_file():
             raise Die("security-audit: no usable subscription access token available")
         dest.chmod(0o600)
-        policy = MODEL_PROMPT if provider == "codex" else V2_MODEL_PROMPT
-        prompt = inspection_prompt(batch, False, policy=policy, goals=provider == "codex")
+        policy = (
+            (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+            if protocol == 4
+            else MODEL_PROMPT
+            if provider == "codex"
+            else V2_MODEL_PROMPT
+        )
+        prompt = inspection_prompt(batch, False, policy=policy, goals=provider == "codex", protocol=protocol)
         schema_value = MODEL_SCHEMA
         receipt = (work / "read-receipt.json").resolve()
         if provider == "codex":
@@ -1138,10 +1439,10 @@ def inspect(
         if paged:
             schema_value = {
                 **schema_value,
-                "required": [*MODEL_SCHEMA["required"], "read_token"],
+                "required": [*MODEL_SCHEMA["required"], *(["read_token"] if protocol < 4 else [])],
                 "properties": {
                     **schema_value["properties"],
-                    "read_token": {"type": "string"},
+                    **({"read_token": {"type": "string"}} if protocol < 4 else {}),
                     "verdict": {
                         **MODEL_SCHEMA["properties"]["verdict"],
                         "enum": [*MODEL_SCHEMA["properties"]["verdict"]["enum"], "unfinished"]
@@ -1152,11 +1453,11 @@ def inspect(
             }
             source = home / "input.json"
             source.write_text(serialize(batch))
-            token = secrets.token_hex(16)
-            reader = [str(Path(__file__).with_name("audit_reader.py").resolve()), str(source), str(receipt), token]
-            prompt = inspection_prompt(batch, True, token, policy=policy, goals=provider == "codex")
+            token = secrets.token_hex(16) if protocol < 4 else ""
+            reader = [str(reader_path(protocol)), str(source), str(receipt), *([token] if protocol < 4 else [])]
+            prompt = inspection_prompt(batch, True, token, policy=policy, goals=provider == "codex", protocol=protocol)
             if resume_from is not None:
-                prompt = CONTINUE_PROMPT + prompt
+                prompt = continue_prompt + prompt
             if provider == "claude":
                 # Safe mode suppresses even this explicitly configured MCP
                 # server. The empty HOME, --restricted, empty settings sources,
@@ -1170,15 +1471,15 @@ def inspect(
             schema = home / "verdict-schema.json"
             schema.write_text(serialize(schema_value))
             catalog = home / "model-catalog.json"
-            catalog.write_text(serialize(CODEX_CATALOG))
-            cmd = codex_launch(home, paged, token if paged else "", thread, receipt)
+            catalog.write_text(serialize(inspection_catalog(protocol)))
+            cmd = codex_launch(home, paged, token if paged else "", thread, receipt, protocol=protocol)
         else:
             cmd += ["--json-schema", serialize(schema_value)]
         (work / "prompt.txt").write_text(prompt)
         if repair_output:
             prompt = OUTPUT_REPAIR_PROMPT + prompt
         if continue_reading:
-            prompt = (snapshot(batch, receipt, work) if paged else INLINE_CONTINUE_PROMPT) + prompt
+            prompt = (snapshot(batch, receipt, work, protocol=protocol) if paged else INLINE_CONTINUE_PROMPT) + prompt
         p = run_client(
             cmd,
             prompt,
@@ -1191,6 +1492,7 @@ def inspect(
             batch=batch,
             legacy_history=legacy_history,
             allowed_history=allowed_history,
+            protocol=protocol,
         )
         if p.returncode:
             raise Die(f"security-audit: {provider} failed; see {work / 'model-stderr.txt'}")
@@ -1205,18 +1507,17 @@ def inspect(
                             {"StructuredOutput", "mcp__audit__read_page"} if paged else {"StructuredOutput"}
                         ):
                             raise Die("security-audit: reviewer attempted an unauthorized tool call")
-            results = [e for e in events if e.get("type") == "result"]
-            if len(results) != 1:
-                raise Die("security-audit: missing final reviewer result")
-            result = results[0]
-            if result.get("is_error") or result.get("subtype") not in (None, "success"):
-                raise Die("security-audit: reviewer failed")
-            value = result.get("structured_output")
+            value = claude_result(p.stdout).get("structured_output")
         else:
             value = codex_final(p.stdout, paged)
         if paged and isinstance(value, dict) and value.get("verdict") == "unfinished":
+            if not (
+                set(value) == ({"verdict", "findings"} | ({"read_token"} if protocol < 4 else set()))
+                and value["findings"] == []
+            ):
+                raise Die("security-audit: malformed unfinished judgment")
             raise Die("security-audit: inspection unfinished; retained for same-session continuation")
-        read_token = value.pop("read_token", None) if paged and isinstance(value, dict) else None
+        read_token = value.pop("read_token", None) if protocol < 4 and paged and isinstance(value, dict) else None
         verdict = bind_verdict(value, batch)
         if (
             provider == "codex"
@@ -1228,6 +1529,7 @@ def inspect(
                 legacy=legacy_history,
                 allowed=allowed_history,
                 allow_empty=(work / "output-repairs.jsonl").exists(),
+                protocol=protocol,
             )
         ):
             # An earlier source judgment is binding even if a later answer says
@@ -1243,13 +1545,21 @@ def inspect(
                     prior = {k: v for k, v in prior.items() if k != "read_token"}
                     return validate_verdict(prior, batch) if "input_digest" in prior else bind_verdict(prior, batch)
             raise Die("security-audit: retained native history is missing or contains an unresolved judgment")
-        validate_reads(verdict, batch, receipt, paged, read_token)
+        validate_reads(verdict, batch, receipt, paged, read_token, protocol=protocol)
         return verdict
 
 
-def validate_reads(verdict: dict, batch: dict, receipt: Path, paged: bool, read_token: str | None = None) -> None:
+def validate_reads(
+    verdict: dict, batch: dict, receipt: Path, paged: bool, read_token: str | None = None, *, protocol=3
+) -> None:
     """A model's pass cannot substitute for delivering the entire prepared input."""
     if not paged or verdict["verdict"] != "pass":
+        return
+    if protocol == 4:
+        from .audit_progress import coverage
+
+        if coverage(batch, receipt, protocol=protocol)["missing"]:
+            raise Die("security-audit: reader has not served the complete input")
         return
     if not receipt.is_file():
         raise Die("security-audit: reviewer did not read the complete input")
@@ -1380,11 +1690,14 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     (attempt / "input.json").write_text(serialize(batch))
     actor = api("user")["login"]  # Resolve identity before a model verdict can exist.
     provider = opts.work_model
+    from .audit_clients import selected_protocol
+
+    protocol = selected_protocol(provider, work)
     model = "gpt-6-luna" if provider == "codex" else "haiku"
-    log(f"security-audit: isolated reviewer {provider}/{model}")
+    log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
     try:
         if any(c["files"] for c in batch["commits"]):
-            verdict = inspect(batch, provider, attempt)
+            verdict = inspect(batch, provider, attempt, protocol=protocol)
         else:
             verdict = {
                 "input_digest": batch["input_digest"],
@@ -1399,14 +1712,20 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
                 "provider": provider,
                 "model": model,
                 "batch": batch["input_digest"],
-                "prompt_digest": hashlib.sha256(MODEL_PROMPT.encode()).hexdigest(),
-                "protocol_version": PROTOCOL_VERSION,
-                "launcher_profile": reviewer_argv(provider),
+                "prompt_digest": hashlib.sha256(
+                    (
+                        (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+                        if protocol == 4
+                        else MODEL_PROMPT
+                    ).encode()
+                ).hexdigest(),
+                "protocol_version": protocol,
+                "launcher_profile": reviewer_argv(provider, protocol=protocol),
                 "execution_record": str(attempt / "execution.json"),
-                "catalog_digest": hashlib.sha256(serialize(CODEX_CATALOG).encode()).hexdigest()
+                "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
                 if provider == "codex"
                 else None,
-                "reader_digest": hashlib.sha256(Path(__file__).with_name("audit_reader.py").read_bytes()).hexdigest(),
+                "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
                 "input_policy": "compacting-session-v1",
                 "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
                 if (attempt / "output-repairs.jsonl").exists()
@@ -1443,6 +1762,7 @@ def resume_incomplete(
     Never create a fresh review, resume a finding, attest source, or remove the
     original block before a complete pass and confirmed reference update.
     """
+    protocol = 3
     require_admin()
     if not reason.strip():
         raise Die("security-audit: continuation requires an administrative reason")
@@ -1657,8 +1977,8 @@ def resume_incomplete(
                 "prompt_digest": hashlib.sha256((attempt / "prompt.txt").read_bytes()).hexdigest(),
                 "launcher_profile": reviewer_argv("codex"),
                 "execution_record": str(attempt / "execution.json"),
-                "catalog_digest": hashlib.sha256(serialize(CODEX_CATALOG).encode()).hexdigest(),
-                "reader_digest": hashlib.sha256(Path(__file__).with_name("audit_reader.py").read_bytes()).hexdigest(),
+                "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest(),
+                "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
                 "input_policy": "compacting-session-v1",
                 "verdict": verdict,
             },

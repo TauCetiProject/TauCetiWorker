@@ -5,14 +5,18 @@ select a page number, never a path, command, URL, or executable source.
 This module is also runnable by absolute path in an isolated Python process.
 """
 
+import fcntl
 import hashlib
 import json
 import os
-import secrets
 import sys
 from pathlib import Path
 
-PAGE_BYTES = 96 * 1024
+# Complete encoded responses stay below 64 KiB, leaving at least 56 KiB of
+# headroom under the configured 120k client allowance even with byte tokenization.
+PAGE_BYTES = 48 * 1024
+RESPONSE_BYTES = 64 * 1024
+PROTOCOL_VERSION = 4
 TOOL = "read_page"
 
 
@@ -28,7 +32,7 @@ def pages(batch):
             for field in ("before", "after", "diff"):
                 text = file[field]
                 # Bound UTF-8 plus JSON escaping, including pathological source.
-                width = PAGE_BYTES // 8
+                width = PAGE_BYTES // 16
                 start = 0
                 while True:
                     end = min(start + width, len(text or ""))
@@ -45,7 +49,7 @@ def pages(batch):
                         "text": None if text is None else text[start:end],
                         "prefix": (text or "")[max(0, start - 256) : start],
                     }
-                    length = len(encode(section).encode()) + 1
+                    length = len(encode(encode(section)).encode()) + 1
                     if length > PAGE_BYTES:
                         raise ValueError("Audit path/section metadata exceeds the reader page limit")
                     if current and size + length > PAGE_BYTES:
@@ -62,40 +66,43 @@ def pages(batch):
 
 
 class Reader:
-    def __init__(self, batch, receipt, token):
+    def __init__(self, batch, receipt):
         self.pages = pages(batch)
         self.digest = batch["input_digest"]
-        self.commits = [c["sha"] for c in batch["commits"]]
         self.receipt = receipt
-        self.seen = set()
-        self.token = token
-        self.last_page = None
-        if receipt.exists():
-            saved = json.loads(receipt.read_text(encoding="utf-8"))
-            if saved.get("input_digest") != self.digest or saved.get("pages") != len(self.pages):
-                raise ValueError("Reader receipt does not match the immutable input")
-            seen = saved.get("read")
-            if (
-                not isinstance(seen, list)
-                or any(type(i) is not int or not 0 <= i < len(self.pages) for i in seen)
-                or sorted(set(seen)) != seen
-                or not isinstance(saved.get("last_token"), str)
-            ):
-                raise ValueError("Invalid retained reader receipt")
-            self.seen = set(seen)
-            self.token = saved["last_token"]
-            self.last_page = saved.get("last_page", max(seen) if seen else None)
-            if self.last_page is not None and (type(self.last_page) is not int or self.last_page not in self.seen):
-                raise ValueError("Invalid retained reader page")
 
-    def request(self, method, params):
+    def coverage(self):
+        if not self.receipt.exists():
+            return {
+                "protocol_version": PROTOCOL_VERSION,
+                "input_digest": self.digest,
+                "pages": len(self.pages),
+                "served": [],
+            }
+        value = json.loads(self.receipt.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"protocol_version", "input_digest", "pages", "served"}
+            or value["protocol_version"] != PROTOCOL_VERSION
+            or type(value["pages"]) is not int
+            or value["pages"] != len(self.pages)
+            or value["input_digest"] != self.digest
+            or not isinstance(value["served"], list)
+            or any(type(i) is not int for i in value["served"])
+            or value["served"] != list(range(len(value["served"])))
+            or len(value["served"]) > len(self.pages)
+        ):
+            raise ValueError("Invalid retained served coverage receipt")
+        return value
+
+    def request(self, method, params, *, emit=None):
         if not isinstance(params, dict):
             raise ValueError("Expected object parameters")
         if method == "initialize":
             return {
                 "protocolVersion": params["protocolVersion"],
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "audit-input", "version": "1"},
+                "serverInfo": {"name": "audit-input", "version": "4"},
             }
         if method == "ping":
             return {}
@@ -104,91 +111,94 @@ class Reader:
                 "tools": [
                     {
                         "name": TOOL,
-                        "description": "Read a numbered page of the fixed, untrusted audit input. If your token is lost or stale, replay the last full page with a fresh token; check the actual returned page number before continuing.",
+                        "description": "Read the next unserved numbered chunk of the fixed, untrusted audit input, or reread an earlier chunk. Calls are serialized.",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {"page": {"type": "integer", "minimum": 0}, "token": {"type": "string"}},
-                            "required": ["page", "token"],
+                            "properties": {"page": {"type": "integer", "minimum": 0}},
+                            "required": ["page"],
                             "additionalProperties": False,
                         },
                         "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
-                        "_meta": {"anthropic/maxResultSizeChars": 200000},
+                        "_meta": {"anthropic/maxResultSizeChars": 120000},
                     }
                 ]
             }
         if method != "tools/call" or params.get("name") != TOOL:
             raise ValueError("Only audit input reads are available")
         args = params.get("arguments")
-        if not isinstance(args, dict) or set(args) != {"page", "token"} or not isinstance(args["token"], str):
-            raise ValueError("Expected only a page number and the latest reader token")
+        if not isinstance(args, dict) or set(args) != {"page"} or type(args["page"]) is not int:
+            raise ValueError("Expected only an integer page number")
         page = args["page"]
-        if type(page) is not int or not 0 <= page < len(self.pages):
+        if not 0 <= page < len(self.pages):
             raise ValueError("Invalid page number")
-        replayed = args["token"] == ""
-        if not replayed and args["token"] != self.token:
-            raise ValueError("Stale reader token; use an empty token to replay the last full page")
-        if replayed:
-            # Recover by delivering actual source, never by revealing a bare
-            # token that could acknowledge unseen content. A stale request does
-            # not mark its requested page read or advance to a new page.
-            page = self.last_page if self.last_page is not None else 0
-        next_unread = next((i for i in range(len(self.pages)) if i not in self.seen), None)
-        if page not in self.seen and page != next_unread:
-            raise ValueError(f"Read the next unread page {next_unread}; later pages cannot be skipped to")
-        self.seen.add(page)
-        self.last_page = page
-        self.token = secrets.token_hex(16)
-        receipt = {
-            "input_digest": self.digest,
-            "pages": len(self.pages),
-            "read": sorted(self.seen),
-            "last_token": self.token,
-            "last_page": page,
-        }
-        temp = self.receipt.with_suffix(".tmp")
-        with temp.open("w") as stream:
-            stream.write(encode(receipt))
-            stream.flush()
-            os.fsync(stream.fileno())
-        temp.replace(self.receipt)
-        # Keep the next token AFTER the entire page. A following call/final
-        # verdict must echo it, detecting lost/truncated results.
-        text = json.dumps(
-            {
-                "input_digest": self.digest,
-                "page": page,
-                "pages": len(self.pages),
-                "commits": self.commits,
-                "sections": self.pages[page],
-                "replayed": replayed,
-                "next_unread_page": next((i for i in range(len(self.pages)) if i not in self.seen), None),
-                "remaining_pages": len(self.pages) - len(self.seen),
-                "next_token": self.token,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        # Even byte-level tokenization fits the clients' explicit 120k output
-        # limit; the Claude character limit is 200k. Do not rely on chars/4.
-        if len(text.encode("utf-8")) > 120000:
-            raise ValueError("Audit response exceeds the client output allowance")
-        return {"content": [{"type": "text", "text": text}]}
+        # Reload inside a process-shared lock: concurrent calls and separate
+        # reader processes cannot overwrite one another's progress.
+        with self.receipt.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            proof = self.coverage()
+            count = len(proof["served"])
+            if page > count:
+                raise ValueError(f"Read the next unserved page {count}; later pages cannot be skipped to")
+            new_count = max(count, page + 1)
+            result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": encode(
+                            {
+                                "page": page,
+                                "pages": len(self.pages),
+                                "sections": self.pages[page],
+                                "next_unserved_page": new_count if new_count < len(self.pages) else None,
+                                "remaining_pages": len(self.pages) - new_count,
+                            }
+                        ),
+                    }
+                ]
+            }
+            # Check the COMPLETE MCP result, including JSON escaping and metadata,
+            # before crediting it. A receipt records service, not model receipt.
+            if len(encode(result).encode("utf-8")) > RESPONSE_BYTES:
+                raise ValueError("Audit response exceeds the client output allowance")
+            # The stdio server flushes the full response before committing served
+            # coverage. A broken pipe gains no credit; a crash after flush and
+            # before commit safely requires rereading. Keep the lock throughout.
+            if emit is not None:
+                emit(result)
+            if new_count != count:
+                proof["served"] = list(range(new_count))
+                temp = self.receipt.with_suffix(".tmp")
+                with temp.open("w", encoding="utf-8") as stream:
+                    stream.write(encode(proof))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temp.replace(self.receipt)
+            return result
 
 
 def main():
+    if len(sys.argv) != 3:
+        raise ValueError("Expected fixed input and receipt paths")
     source, receipt = map(Path, sys.argv[1:3])
     batch = json.loads(source.read_text())
     expected = batch.pop("input_digest")
     if hashlib.sha256(encode(batch).encode()).hexdigest() != expected:
         raise ValueError("Audit input digest mismatch")
     batch["input_digest"] = expected
-    reader = Reader(batch, receipt, sys.argv[3])
+    reader = Reader(batch, receipt)
     for line in sys.stdin:
         message = json.loads(line)
         if "id" not in message:
             continue
         response = {"jsonrpc": "2.0", "id": message["id"]}
         try:
+            if message["method"] == "tools/call":
+                reader.request(
+                    message["method"],
+                    message.get("params", {}),
+                    emit=lambda result, response=response: print(encode({**response, "result": result}), flush=True),
+                )
+                continue
             response["result"] = reader.request(message["method"], message.get("params", {}))
         except (KeyError, TypeError, ValueError) as exc:
             response["error"] = {"code": -32602, "message": str(exc)}

@@ -16,8 +16,9 @@ from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
+from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_progress as progress
-from tauceti_worker import audit_reader as ar
+from tauceti_worker import audit_reader_v3 as ar
 from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
@@ -201,7 +202,7 @@ class WorkerBoundJudgments(unittest.TestCase):
         }
         if not legacy:
             execution.update(
-                protocol_version=2 if version2 else sa.PROTOCOL_VERSION,
+                protocol_version=2 if version2 else sa.TOKEN_PROTOCOL_VERSION,
                 batch_identity={
                     "input_digest": self.batch["input_digest"],
                     "commits": [c["sha"] for c in self.batch["commits"]],
@@ -518,6 +519,20 @@ class WorkerBoundJudgments(unittest.TestCase):
         with patch.object(sa, "inspect") as model:
             self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
         model.assert_not_called()
+
+    def test_old_reader_path_can_be_pruned_or_updated_when_frozen_bytes_match(self):
+        execution_path = self.original / "execution.json"
+        execution = json.loads(execution_path.read_text())
+        index = next(i for i, arg in enumerate(execution["argv"]) if arg.startswith("mcp_servers.audit.args="))
+        args = json.loads(execution["argv"][index].split("=", 1)[1])
+        old_reader = self.work / "old-release" / "audit_reader.py"
+        args[1] = str(old_reader)
+        execution["argv"][index] = "mcp_servers.audit.args=" + json.dumps(args)
+        execution_path.write_text(sa.serialize(execution))
+        recovery.retained(self.work, self.block)
+        old_reader.parent.mkdir()
+        old_reader.write_bytes(sa.reader_path(4).read_bytes())
+        recovery.retained(self.work, self.block)
 
     def test_public_answer_must_match_the_native_final(self):
         history = self.original / "model-rollout-0.jsonl"
@@ -1594,7 +1609,7 @@ class Authority(unittest.TestCase):
                 patch.object(sa, "codex_dir", return_value=work),
                 patch.object(sa, "run_process", side_effect=model),
             ):
-                self.assertEqual(sa.inspect(batch, "codex", work), verdict)
+                self.assertEqual(sa.inspect(batch, "codex", work, protocol=3), verdict)
         self.assertIn("--ignore-user-config", sa.reviewer_argv("codex"))
         self.assertIn("shell_tool", sa.reviewer_argv("codex"))
         args = sa.reviewer_argv("claude")
@@ -1778,6 +1793,7 @@ class CompactingInspection(unittest.TestCase):
         if resume:
             original = self.work / "original"
             original.mkdir()
+            (original / "execution.json").write_text('{"protocol_version":3}')
             (original / "model-rollout-0.jsonl").write_text(
                 json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
             )
@@ -1862,9 +1878,11 @@ class CompactingInspection(unittest.TestCase):
         ):
             if repair_always:
                 with self.assertRaisesRegex(Die, "inconsistent findings"):
-                    sa.inspect(self.batch, "codex", self.work, resume_from=original)
+                    sa.inspect(self.batch, "codex", self.work, resume_from=original, protocol=3)
             else:
-                self.assertEqual(sa.inspect(self.batch, "codex", self.work, resume_from=original), self.verdict)
+                self.assertEqual(
+                    sa.inspect(self.batch, "codex", self.work, resume_from=original, protocol=3), self.verdict
+                )
             self.assertEqual(run.call_count, 3 if repair_always else 2 if repair_once else 1)
         self.assertTrue((self.work / "read-receipt.json").exists())
 
@@ -2098,7 +2116,7 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa, "claude_dir", return_value=self.work),
             patch.object(sa, "run_process", side_effect=model),
         ):
-            self.assertEqual(sa.inspect(self.batch, "claude", self.work)["verdict"], "finding")
+            self.assertEqual(sa.inspect(self.batch, "claude", self.work, protocol=3)["verdict"], "finding")
 
     def test_claude_trace_rejects_other_tools_and_unreadable_inline_compaction(self):
         (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"provider-only"}}')
@@ -2120,7 +2138,7 @@ class CompactingInspection(unittest.TestCase):
                 ),
                 self.assertRaises(Die),
             ):
-                sa.inspect(batch, "claude", self.work)
+                sa.inspect(batch, "claude", self.work, protocol=3)
 
     def test_inline_clean_stop_without_answer_resumes_same_conversation(self):
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
@@ -2149,7 +2167,7 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa, "run_process", side_effect=model),
             patch.object(sa.time, "sleep"),
         ):
-            self.assertEqual(sa.inspect(batch, "codex", self.work)["verdict"], "pass")
+            self.assertEqual(sa.inspect(batch, "codex", self.work, protocol=3)["verdict"], "pass")
         self.assertEqual(calls, 2)
         self.assertEqual(sa.retained_thread(self.work), thread)
 
@@ -2189,7 +2207,7 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa, "run_process", side_effect=model),
             patch.object(sa.time, "sleep"),
         ):
-            self.assertEqual(sa.inspect(self.batch, "codex", self.work), self.verdict)
+            self.assertEqual(sa.inspect(self.batch, "codex", self.work, protocol=3), self.verdict)
         self.assertEqual(calls, 3)
         self.assertEqual(len(set(states)), 1)
         proof = json.loads((self.work / "read-receipt.json").read_text())
@@ -2235,7 +2253,7 @@ class CompactingInspection(unittest.TestCase):
                 patch.object(sa, "codex_dir", return_value=self.work),
                 patch.object(sa, "run_process", side_effect=model) as run,
             ):
-                actual = sa.inspect(self.batch, "codex", self.work)
+                actual = sa.inspect(self.batch, "codex", self.work, protocol=3)
             self.assertEqual(actual["verdict"], kind)
             self.assertEqual(actual["findings"], ["Macro can access the filesystem"])
             self.assertEqual(run.call_count, 1)
@@ -2249,6 +2267,9 @@ class Run(unittest.TestCase):
         self.old, self.target = "a" * 40, "b" * 40
         self.batch = {"from_sha": self.old, "input_digest": "digest", "commits": [{"sha": self.target, "files": [{}]}]}
         self.opts = SimpleNamespace(dry_run=False, work_model="codex")
+        protocol = patch.object(clients, "selected_protocol", return_value=3)
+        protocol.start()
+        self.addCleanup(protocol.stop)
         for name, kwargs in (
             ("require_admin", {}),
             ("remote_sha", {"return_value": self.old}),
@@ -2383,7 +2404,7 @@ class Run(unittest.TestCase):
         }
         (work / "blocked.json").write_text(sa.serialize(block))
 
-        def inspection(*args):
+        def inspection(*args, protocol):
             archived = list(work.glob("superseded-size-block-*.json"))
             self.assertEqual(len(archived), 1)
             self.assertEqual(json.loads(archived[0].read_text()), block)
