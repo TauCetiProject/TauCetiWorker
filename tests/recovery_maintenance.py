@@ -921,7 +921,7 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
         self.assertGreater(decision.details["preparation"]["hash_bytes"], 10000)
         self.restored(saved, expected)
 
-    def test_crash_before_descriptor_rename_leaves_exact_source(self):
+    def test_cancellation_before_descriptor_rename_removes_partial_and_keeps_source(self):
         expected = self.dirty()
         rename = os.rename
 
@@ -933,8 +933,129 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
         with patch.object(wr.os, "rename", crash), self.assertRaises(Crash):
             wr.guard(self.cfg, self.co)
         self.assertEqual(snapshot_tree(self.co), expected)
-        self.assertTrue(list((self.cfg.state / "recovery").glob(".tmp-*")))
+        self.assertFalse(list((self.cfg.state / "recovery").glob(".tmp-*")))
         self.restored(wr.guard(self.cfg, self.co).record, expected)
+
+    def age_partial(self, record):
+        old = time.time() - wr.INCOMPLETE_SAVE_TTL - 10
+        for path in [record, *record.iterdir()]:
+            os.utime(path, (old, old), follow_symlinks=False)
+
+    def test_abandoned_partial_expires_but_fresh_writes_and_complete_records_survive(self):
+        expected = self.dirty()
+        complete = wr.guard(self.cfg, self.co).record
+        root = self.cfg.state / "recovery"
+        old = root / ".tmp-abandoned"
+        old.mkdir()
+        (old / "unstaged.patch").write_text("discard this incomplete save")
+        self.age_partial(old)
+        fresh = root / ".tmp-fresh"
+        fresh.mkdir()
+        (fresh / "unstaged.patch").write_text("still preparing")
+        self.tick()
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.restored(complete, expected)
+        for _ in range(2):
+            self.tick()
+        self.assertFalse(list((self.cfg.state / "recovery-cleanup/discarded").glob("*")))
+        self.assertEqual(wr.summary(self.cfg.state.parent)["incomplete"], 0)
+
+    def test_save_lease_and_live_users_protect_even_old_partials(self):
+        root = self.cfg.state / "recovery"
+        root.mkdir(parents=True)
+        partial = root / ".tmp-active"
+        partial.mkdir()
+        self.age_partial(partial)
+        with (self.cfg.state / "recovery-save.lock").open("a+b") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        with patch.object(wr, "live_users", return_value=["active child"]):
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        with patch.object(maintenance.retention, "mount_points", return_value=[partial]):
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        self.assertTrue(partial.exists())
+        with patch.object(maintenance.retention, "mount_points", return_value=[]):
+            self.assertIsNotNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+
+    def test_partial_changed_during_live_use_check_is_not_discarded(self):
+        partial = self.cfg.state / "recovery/.tmp-changing"
+        partial.mkdir(parents=True)
+        patch_file = partial / "unstaged.patch"
+        patch_file.write_text("old partial")
+        self.age_partial(partial)
+
+        def late_write(path):
+            patch_file.write_text("new writes must survive")
+            return []
+
+        with patch.object(wr, "live_users", side_effect=late_write):
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        self.assertEqual(patch_file.read_text(), "new writes must survive")
+
+    def test_bounded_git_honors_short_timeout_inside_a_larger_housekeeping_budget(self):
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            wr._bounded_git(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                os.environ.copy(),
+                wr.Work(seconds=5),
+                timeout=0.05,
+            )
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_bundle_timeout_abandons_partial_without_touching_original_source(self):
+        (self.co / "A.lean").write_text("local unpublished commit")
+        git(self.co, "commit", "-qam", "unfinished")
+        expected = snapshot_tree(self.co)
+        original = wr._git
+        timeouts = []
+
+        def slow_bundle(repo, *args, **kwargs):
+            if args[:2] == ("bundle", "create"):
+                timeouts.append(kwargs.get("timeout"))
+                raise subprocess.TimeoutExpired("git bundle", kwargs["timeout"])
+            return original(repo, *args, **kwargs)
+
+        with patch.object(wr, "_git", slow_bundle), self.assertRaises(wr.RecordError):
+            wr._record(self.cfg, self.co, wr.inspect(self.co), "TauCeti", wr.TAUCETI)
+        self.assertEqual(timeouts, [60])
+        self.assertEqual(git(self.co, "for-each-ref", "refs/tauceti-pending"), "")
+        self.assertFalse(list((self.cfg.state / "recovery").glob(".tmp-*")))
+        self.assertEqual(snapshot_tree(self.co), expected)
+
+    def test_killed_save_is_later_abandoned_and_git_inherits_the_save_lease(self):
+        expected = self.dirty()
+        source = str(Path(__file__).resolve().parent.parent)
+        script = """import sys,os
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+from tauceti_worker import work_recovery as wr
+cfg=SimpleNamespace(state=Path(sys.argv[2]), checkout=Path(sys.argv[3]), wid='w')
+wr._archive=lambda *args,**kwargs: os._exit(73)
+wr.guard(cfg,cfg.checkout)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, source, str(self.cfg.state), str(self.co)], capture_output=True, timeout=15
+        )
+        self.assertEqual(result.returncode, 73, result.stderr)
+        partials = list((self.cfg.state / "recovery").glob(".tmp-*"))
+        self.assertEqual(len(partials), 1)
+        self.age_partial(partials[0])
+        self.tick()
+        self.assertFalse(partials[0].exists())
+        self.assertEqual(snapshot_tree(self.co), expected)
+        with (self.cfg.state / "recovery-save.lock").open("a+b") as lease:
+            token = wr._SAVE_LEASE.set(lease.fileno())
+            try:
+                with patch.object(
+                    wr.subprocess, "run", return_value=SimpleNamespace(stdout=b"", stderr=b"", returncode=0)
+                ) as run:
+                    wr._git(self.co, "version")
+                self.assertIn(lease.fileno(), run.call_args.kwargs["pass_fds"])
+            finally:
+                wr._SAVE_LEASE.reset(token)
 
     def test_large_cache_cleanup_resumes_with_all_budgets_and_restart(self):
         expected = self.dirty()

@@ -57,9 +57,18 @@ record is initially trusted only when every payload matches; restore always repe
 exact digest validation. Warm preparation may reuse that verification receipt while
 the manifest and every payload retain the same device, inode, size, mtime and ctime.
 A damaged record is reported as corrupt, kept, and
-replaced by a fresh copy. An interrupted save leaves at most a `.tmp-*`
-directory, which status reports as incomplete. Nothing in `state/*/recovery`
-is ever deleted automatically.
+replaced by a fresh copy. Normal exceptions and shutdown interruptions remove
+an unfinished `.tmp-*` save immediately. Git bundle creation is capped at 60 seconds;
+failed saves leave the original checkout intact or retained under the ordinary guard.
+
+A hard kill can still leave a partial directory. Partials are disposable staging,
+not recovery records, and do not appear as operator recovery tasks. After one hour
+without new payload writes, background housekeeping abandons them to the existing
+bounded trash collector. Saves serialize on a per-worker `recovery-save.lock` lease
+inherited by Git children. Cleanup requires that lease plus clear live-use,
+verification-reference and mount checks, so it cannot remove an active save.
+Completed records retain their existing validation and retirement rules; this policy
+only abandons `.tmp-*` directories and does not try to salvage their contents.
 
 Excluded by name: dependency and build caches (`.lake`, `node_modules`,
 `__pycache__`, top-level `build`, `*.olean` and similar) and credential-like

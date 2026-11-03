@@ -788,6 +788,70 @@ def _cleanup(state, tree, root, work, observation=None):
             _write_job(path, job)
 
 
+def abandon_incomplete(state, record):
+    """Move an old, unused partial save to ordinary bounded disposal. Never salvage it."""
+    from . import work_recovery as wr
+
+    if record.parent != state / "recovery" or not record.name.startswith(".tmp-") or record.is_symlink():
+        return None
+    info = record.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    latest = info.st_mtime
+    stamps = {}
+    for name in (
+        "commits.bundle",
+        "commits.bundle.lock",
+        "staged.patch",
+        "unstaged.patch",
+        "untracked.tar",
+        "manifest.json",
+    ):
+        wr._charge(entries=1)
+        try:
+            payload = (record / name).lstat()
+            latest = max(latest, payload.st_mtime)
+            stamps[name] = (payload.st_dev, payload.st_ino, payload.st_size, payload.st_mtime_ns, payload.st_ctime_ns)
+        except FileNotFoundError:
+            stamps[name] = None
+    if time.time() - latest < wr.INCOMPLETE_SAVE_TTL:
+        return None
+    with (state / "recovery-save.lock").open("a+b") as lease:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        # Fresh process/mount/reference checks also protect pre-lease saves and stragglers.
+        with completed_check():
+            if _referenced(state, record) or wr.live_users(record):
+                return None
+            mounts = retention.mount_points()
+            if mounts is None:
+                return None
+            target = canonical_candidate(record)
+            if any(mount == target or mount.is_relative_to(target) for mount in mounts):
+                return None
+        current = record.lstat()
+        if (current.st_dev, current.st_ino, current.st_mtime_ns) != (info.st_dev, info.st_ino, info.st_mtime_ns):
+            return None
+        for name, before in stamps.items():
+            wr._charge(entries=1)
+            try:
+                payload = (record / name).lstat()
+                after = (payload.st_dev, payload.st_ino, payload.st_size, payload.st_mtime_ns, payload.st_ctime_ns)
+            except FileNotFoundError:
+                after = None
+            if after != before:
+                return None  # A legacy writer changed bytes without changing the directory mtime.
+        discarded = state / "recovery-cleanup" / "discarded"
+        discarded.mkdir(parents=True, exist_ok=True)
+        target = discarded / ("partial-" + record.name[5:] + "-" + uuid.uuid4().hex)
+        record.rename(target)
+        wr._fsync_dir(record.parent)
+        wr._fsync_dir(discarded)
+        return target
+
+
 class Sweep:
     def __init__(self, base, *, cleanup=True):
         self.base = base
@@ -1055,8 +1119,9 @@ class Sweep:
             if not path.is_dir() or path.is_symlink():
                 return
             if path.name.startswith(".tmp-"):
-                row["incomplete"] += 1
-                return
+                if self.cleanup:
+                    self.cleanup_pending |= abandon_incomplete(state, path) is not None
+                return  # Temporary writes are not recovery records or operator tasks.
             consumer = read_json(path / "recovery.json")
             from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE, write
 
