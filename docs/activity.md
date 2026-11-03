@@ -22,12 +22,14 @@ processes interrupted without a finish receipt are separate. The current
 "workers working" count is distinct workers with an active work round, excluding
 workers waiting for capacity or budget; it can lag until the next preparation.
 Discovery of an interruption never supplies a fabricated finish time. The
-"Rounds missing finish records" diagnostic shows 1-hour and 24-hour counts by
-round **start time**, alongside the total over retained history. It identifies
-the latest affected round's start, worker, and round ID for checking worker logs
-for crashes, forced stops, or OOM kills; it does not infer the cause or time of
-exit. Older prepared summaries show the retained total with recent timing marked
-unavailable. Fleet recent counts require timing details from every host.
+"Round reporting gaps" line shows 1-hour and 24-hour counts by round **start
+time**, and the age of the latest affected start. It is omitted when all gaps
+have starts older than 24 hours. A gap from the last hour also shows the worker
+and round ID for finding its log. A missing finish can follow an intentional
+stop or a crash; it is not pending work, and no exit cause or time is inferred.
+Historical totals and exact identities remain in JSON. Older prepared summaries
+show the retained total with recent counts marked unavailable. Fleet recent
+counts require timing details from every host.
 
 PR authorship comes from successful tracked creation, not the entire GitHub
 account's history. Authored counts use creation time; landed counts use landing
@@ -140,6 +142,13 @@ historical observations may stop updating permanently. The original all-history
 observation/check timestamps remain available in JSON. Older summaries without
 unresolved-PR freshness fields do not produce an age warning. Coverage errors
 remain visible independently of these age warnings.
+Repository access warnings identify which open/landed counts may be stale and
+that background preparation retries. Stored observation errors are discarded
+once the repository has no remaining refresh work, so removed or fully settled
+repositories do not leave permanent warnings.
+Worker and group reports include repository failures only when their own PRs or
+contributions track that repository; unrelated local history does not warn every
+fleet group. Installation-wide JSON retains the full set of current errors.
 
 Each worker and fleet group has its own small summary file, so status does not
 load the entire historical inventory. A separate prepared PR identity inventory

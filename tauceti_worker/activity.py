@@ -454,6 +454,15 @@ def _refresh_prs(db, config, now, errors):
             batches.setdefault((url, str(token), repo), []).append(number)
     prior = db.execute("SELECT value FROM meta WHERE key='observation_errors'").fetchone()
     observation_errors = json.loads(prior[0]) if prior else {}
+    # A removed/settled repository will never have another observation attempt
+    # to clear its old error. Retain failures only while refresh work remains.
+    observation_errors = {
+        repo: error
+        for repo, error in observation_errors.items()
+        if db.execute(
+            "SELECT 1 FROM report_pr_refresh WHERE repo=? AND next_at IS NOT NULL LIMIT 1", (repo,)
+        ).fetchone()
+    }
     deadline = time.monotonic() + 10
     for (url, token, repo), numbers in batches.items():
         observation_errors.pop(repo, None)
@@ -703,6 +712,20 @@ def _summary(db, now, column=None, identity=None):
     )
 
 
+def _observation_error_subjects(db):
+    """Resolve only errored repositories once, using repository-indexed facts."""
+    prior = db.execute("SELECT value FROM meta WHERE key='observation_errors'").fetchone()
+    subjects = {}
+    for repo, error in (json.loads(prior[0]) if prior else {}).items():
+        affected = subjects.setdefault(error, set())
+        for worker, scope in db.execute(
+            "SELECT worker,scope FROM prs WHERE repo=? UNION SELECT worker,scope FROM pr_contributions WHERE repo=?",
+            (repo, repo),
+        ):
+            affected.update((("worker", worker), ("scope", scope)))
+    return subjects
+
+
 def prepare(config=None, *, import_history=False, history_roots=(), now=None):
     """Explicit/background preparation. The CLI's normal read never calls this."""
     import fcntl
@@ -762,6 +785,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             except Exception as error:
                 errors.append(f"Verification storage housekeeping deferred ({type(error).__name__})")
             with db:
+                error_subjects = _observation_error_subjects(db)
                 sharing = shared_mathlib.summary()
                 value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
                 value["all"]["shared_mathlib"] = sharing
@@ -806,7 +830,11 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                                     version=1,
                                     prepared_at=now,
                                     all=value[key][row[0]],
-                                    errors=errors,
+                                    errors=[
+                                        e
+                                        for e in errors
+                                        if e not in error_subjects or (column, row[0]) in error_subjects[e]
+                                    ],
                                     live_subject={"worker" if key == "workers" else "scope": row[0]},
                                 ),
                             )

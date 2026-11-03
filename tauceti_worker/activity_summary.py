@@ -407,17 +407,23 @@ def display(value, default_kinds=()):
     if s.get("interrupted_unfinished"):
         detail = s.get("interrupted_unfinished_details")
         if detail:
-            print(
-                f"Rounds missing finish records (by start time): {detail['started_1h']} in 1h; "
-                f"{detail['started_24h']} in 24h; {s['interrupted_unfinished']} all time"
-            )
-            if latest := detail.get("latest"):
-                started = datetime.fromtimestamp(latest["started"], UTC).isoformat(timespec="seconds")
-                print(f"  Latest affected round started {started}: {latest['worker']}, round {latest['round_id']}")
+            if detail["started_24h"]:
+                line = (
+                    f"Round reporting gaps: {detail['started_1h']} in 1h; "
+                    f"{detail['started_24h']} in 24h (by start time)"
+                )
+                if latest := detail.get("latest"):
+                    age = max(0, int(time.time() - latest["started"]))
+                    elapsed = f"{age // 3600}h" if age >= 3600 else f"{age // 60}m" if age >= 60 else "<1m"
+                    line += f"; latest start {elapsed} ago"
+                print(line)
+                if detail["started_1h"] and latest:
+                    print(
+                        f"  {latest['worker']}, round {latest['round_id']}: no outcome recorded; "
+                        "excluded from finished totals. See worker log."
+                    )
         else:
-            print(f"Rounds missing finish records: {s['interrupted_unfinished']} all time; recent timing unavailable")
-        print("  Processes exited without reporting an outcome; excluded from finished counts.")
-        print("  Check worker logs for crashes, forced stops, or OOM kills.")
+            print(f"Round reporting gaps: {s['interrupted_unfinished']} historical; recent counts unavailable")
     # Older summaries only have an all-history minimum, which cannot establish
     # whether unresolved PRs are stale. Never use it as a freshness warning.
     now = time.time()
@@ -429,8 +435,14 @@ def display(value, default_kinds=()):
         if at is not None and now - at > PR_STALE_SECONDS:
             minutes = int((now - at) // 60)
             print(f"PR evidence: {label} {minutes // 60}h {minutes % 60}m ago (stale; expected within 2h)")
-    for error in value.get("errors", []):
-        print("Activity coverage: " + error)
+    for error in dict.fromkeys(value.get("errors", [])):
+        prefix = "Shared PR observations unavailable for "
+        if error.startswith(prefix):
+            repo = error[len(prefix) :].split(" ", 1)[0]
+            cause = "access denied (HTTP 403)" if "HTTP 403" in error else "observations unavailable"
+            print(f"PR reporting: {repo} {cause}; open/landed counts may be stale. Retrying in background.")
+        else:
+            print("Activity coverage: " + error)
 
 
 def combine(values):
