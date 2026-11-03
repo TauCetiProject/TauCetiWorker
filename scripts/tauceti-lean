@@ -48,14 +48,20 @@ class Trace:
                 self.client = client
         except Exception:
             if "client" in locals():
-                client.close()
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def event(self, phase):
         if self.client:
             try:
                 self.client.sendall(f"{phase}:{time.monotonic():.6f}\n".encode())
-            except OSError:
-                self.client.close()
+            except Exception:
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
                 self.client = None
 
 

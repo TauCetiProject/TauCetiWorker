@@ -48,8 +48,9 @@ Worker toolchains are left untouched. The worker's PATH alias catches direct
 
 TauCetiFleet vendors the standalone helper and installs it, its environment, and
 the Bash startup hook into each new CI guest. The hook wraps only the disposable
-watchdog's `bin/lean-real` symlink after it has been prepared, pointing directly
-at the official compiler. It leaves official compiler files and their
+watchdog's `bin/lean` entry point after it has been prepared. Capacity waits
+precede the watchdog's execution deadline, while its `lean-real` symlink still
+points at the official compiler. It leaves official compiler files and their
 snapshot manifests untouched. This catches compilation inside sandboxes that
 clear their environment without invalidating the official toolchain cache.
 The hook is idempotent, guards against recursive shell startup, and warns on
