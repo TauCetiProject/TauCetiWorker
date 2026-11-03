@@ -89,7 +89,7 @@ def cpu_percent(before, after):
 
 def wait_for_capacity():
     before = cpu_sample()
-    time.sleep(random.uniform(0.5, 1.5))
+    time.sleep(random.uniform(0.2, 0.5))
     waiting = False
     # Successful compiler output is a build failure under `lake build --iofail`.
     debug = os.environ.get("TAUCETI_LEAN_PRESSURE_DEBUG") == "1"
@@ -178,39 +178,21 @@ def real_lean():
     return unwrapped(binary)
 
 
-def install_toolchain(binary):
-    """Wrap an installed CI compiler, including calls from env-clearing sandboxes."""
+def install_watchdog(binary):
+    """Replace a disposable watchdog's compiler symlink; never replace a real compiler."""
     binary = Path(binary).absolute()
+    if binary.name != "lean-real":
+        raise ValueError("expected the watchdog's bin/lean-real symlink")
     root = binary.parent.parent
     source = Path(__file__).read_bytes()
     with (root / ".tauceti-lean.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        real = binary.with_name("lean-unthrottled")
-        current = binary.read_bytes() if binary.stat().st_size == len(source) else None
-        if real.exists() and (root / MARKER).is_file() and current == source:
+        if not binary.is_symlink():
             return
-        wrapped = is_wrapper(binary)
-        if not real.exists() and wrapped:
-            raise ValueError(f"wrapped compiler has no saved original: {binary}")
-        if wrapped:
-            unwrapped(binary)  # Refuse a corrupt/cyclic saved compiler before replacing anything.
-        if not real.exists():
-            # Keep bin/lean present throughout a live installation.
-            os.link(binary, real)
-        elif not wrapped:
-            # Elan or a local Lean build can replace the compiler in the same
-            # prefix. Preserve that new compiler instead of restoring an old one.
-            fd, temporary = tempfile.mkstemp(dir=binary.parent)
-            os.close(fd)
-            Path(temporary).unlink()
-            try:
-                os.link(binary, temporary)
-                os.replace(temporary, real)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
+        real = unwrapped(binary)
         fd, temporary = tempfile.mkstemp(dir=root)
         with os.fdopen(fd, "w") as stream:
-            json.dump(dict(lean=str(real), installed=True), stream)
+            json.dump(dict(lean=str(real)), stream)
         os.replace(temporary, root / MARKER)
         fd, temporary = tempfile.mkstemp(dir=binary.parent)
         try:
@@ -274,8 +256,8 @@ def main(args=None):
             # Keep the lean alias transparent where /proc observations do not exist.
             lean = real_lean()
             exec_lean(lean, args)
-        if len(args) == 2 and args[0] == "--install-toolchain":
-            install_toolchain(args[1])
+        if len(args) == 2 and args[0] == "--install-watchdog":
+            install_watchdog(args[1])
             return 0
         lean = real_lean()
         if args == ["--print-prefix"]:

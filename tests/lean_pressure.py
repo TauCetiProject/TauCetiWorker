@@ -131,44 +131,34 @@ class LeanPressure(unittest.TestCase):
             self.assertEqual(gate.main(["Main.lean"]), 2)
             execute.assert_not_called()
 
-    def test_live_install_is_idempotent_and_survives_cleared_environment(self):
+    def test_watchdog_install_keeps_original_unchanged_and_survives_cleared_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "bin").mkdir()
-            binary = root / "bin/lean"
-            binary.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit 23\n')
-            binary.chmod(0o755)
-            gate.install_toolchain(binary)
-            gate.install_toolchain(binary)
-            original = root / "bin/lean-unthrottled"
-            self.assertIn("exit 23", original.read_text())
-            # Cosmetic helper upgrades must never be saved over the compiler.
-            binary.write_text(
-                binary.read_text().replace(
-                    '"""Wait for spare RAM/CPU before execing Lean.', '"""Changed wrapper description.'
-                )
-            )
-            gate.install_toolchain(binary)
-            self.assertIn("exit 23", original.read_text())
-            self.assertEqual(json.loads((root / gate.MARKER).read_text())["lean"], str(original))
-            watchdog = root / "watchdog/bin/lean-real"
-            watchdog.parent.mkdir(parents=True)
-            watchdog.symlink_to(binary)
+            original = root / "compiler"
+            original.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit 23\n')
+            original.chmod(0o755)
+            before = original.read_bytes()
+            watchdog = root / "watchdog"
+            (watchdog / "bin").mkdir(parents=True)
+            binary = watchdog / "bin/lean-real"
+            binary.symlink_to(original)
+            gate.install_watchdog(binary)
+            gate.install_watchdog(binary)
+            self.assertEqual(original.read_bytes(), before)
+            self.assertEqual(json.loads((watchdog / gate.MARKER).read_text())["lean"], str(original))
             for args, rc in [(["--print-prefix"], 0), (["--githash"], 23)]:
                 result = subprocess.run(
-                    [str(watchdog), *args], env={"PATH": os.environ["PATH"]}, text=True, capture_output=True
+                    [str(binary), *args], env={"PATH": os.environ["PATH"]}, text=True, capture_output=True
                 )
                 self.assertEqual(result.returncode, rc, result.stderr)
-                self.assertEqual(result.stdout.strip(), str(root) if rc == 0 else "--githash")
-            # Rebuilding/reinstalling Lean at the same prefix must update the
-            # saved original, rather than silently reverting the compiler.
-            binary.unlink()
-            binary.write_text("#!/bin/sh\nexit 24\n")
-            binary.chmod(0o755)
-            gate.install_toolchain(binary)
-            self.assertIn("exit 24", original.read_text())
-            result = subprocess.run([str(binary), "--githash"], capture_output=True)
-            self.assertEqual(result.returncode, 24, result.stderr)
+                self.assertEqual(result.stdout.strip(), str(watchdog) if rc == 0 else "--githash")
+            # A later helper revision must not replace an already-installed helper
+            # or save it over the actual compiler, regardless of header wording.
+            previous = binary.read_text().replace('"""Wait for spare RAM/CPU', '"""Earlier helper')
+            binary.write_text(previous)
+            gate.install_watchdog(binary)
+            self.assertEqual(binary.read_text(), previous)
+            self.assertEqual(original.read_bytes(), before)
 
     def test_saved_wrapper_cycle_fails_before_replacing_the_compiler(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -181,11 +171,6 @@ class LeanPressure(unittest.TestCase):
             (root / gate.MARKER).write_text(json.dumps(dict(lean=str(original))))
             with self.assertRaisesRegex(ValueError, "cycle"):
                 gate.unwrapped(binary)
-            # Force an upgrade so it reaches the validation before publication.
-            binary.write_text(binary.read_text().replace('"""Wait for spare RAM/CPU', '"""Earlier helper'))
-            with self.assertRaisesRegex(ValueError, "cycle"):
-                gate.install_toolchain(binary)
-            self.assertEqual(original.read_bytes(), SCRIPT.read_bytes())
 
     def test_overlay_keeps_libraries_and_compiler_on_the_wrapper(self):
         with tempfile.TemporaryDirectory() as directory:

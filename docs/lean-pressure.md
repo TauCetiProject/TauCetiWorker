@@ -6,7 +6,7 @@ inside the container. These settings reach cache preparation, local verification
 and agent subprocesses.
 
 Before starting a compiler, the helper samples aggregate CPU use for a random
-0.5–1.5 seconds. It waits while CPU use exceeds **90%**, or memory use exceeds
+0.2–0.5 seconds. It waits while CPU use exceeds **90%**, or memory use exceeds
 the threshold below, sleeping for a fresh random **1–5 seconds** before checking
 again. CPU use is busy `/proc/stat` ticks, excluding idle and I/O wait, normalized
 across all CPUs. Memory use is `MemTotal - MemAvailable`, also bounded by finite
@@ -36,16 +36,18 @@ Worker toolchains are left untouched. The worker's PATH alias catches direct
 
 TauCetiFleet vendors the standalone helper and installs it, its environment, and
 the Bash startup hook into each new CI guest. The hook wraps only the disposable
-watchdog's `bin/lean-real` after it has been prepared, keeping the original
-compiler in `bin/lean-unthrottled`. It leaves official compiler files and their
+watchdog's `bin/lean-real` symlink after it has been prepared, pointing directly
+at the official compiler. It leaves official compiler files and their
 snapshot manifests untouched. This catches compilation inside sandboxes that
 clear their environment without invalidating the official toolchain cache.
-The hook is idempotent and guards against recursive shell startup. It does not
-need a new base image.
+The hook is idempotent, guards against recursive shell startup, and warns on
+installation failure while allowing final CI status reporting to run. It does
+not need a new base image.
 Workers and CI may both use free RAM up to a common parent slice ceiling, which
 preserves OS headroom; workers no longer subtract the full configured CI RAM from
-their own limit. Workers have a higher emergency OOM score so they are preferred
-over CI guests when the kernel must kill a process. Existing CPU priorities remain in effect. Running disposable
+their own limit. A higher worker OOM score biases emergency kernel victim
+selection toward workers, without guaranteeing protection for large guests.
+Existing CPU priorities remain in effect. Running disposable
 guests acquire the new setup when they finish and are replaced.
 
 This is a start-time gate with independent random retries. Existing compilers
