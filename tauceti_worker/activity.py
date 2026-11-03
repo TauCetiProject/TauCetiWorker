@@ -454,6 +454,15 @@ def _refresh_prs(db, config, now, errors):
             batches.setdefault((url, str(token), repo), []).append(number)
     prior = db.execute("SELECT value FROM meta WHERE key='observation_errors'").fetchone()
     observation_errors = json.loads(prior[0]) if prior else {}
+    # A removed/settled repository will never have another observation attempt
+    # to clear its old error. Retain failures only while refresh work remains.
+    observation_errors = {
+        repo: error
+        for repo, error in observation_errors.items()
+        if db.execute(
+            "SELECT 1 FROM report_pr_refresh WHERE repo=? AND next_at IS NOT NULL LIMIT 1", (repo,)
+        ).fetchone()
+    }
     deadline = time.monotonic() + 10
     for (url, token, repo), numbers in batches.items():
         observation_errors.pop(repo, None)

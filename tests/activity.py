@@ -442,11 +442,11 @@ class ActivityTests(unittest.TestCase):
         )
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(value)
-        self.assertIn("Rounds missing finish records (by start time): 2 in 1h; 3 in 24h; 5 all time", output.getvalue())
-        self.assertIn("Latest affected round started", output.getvalue())
+        self.assertIn("Round reporting gaps: 2 in 1h; 3 in 24h (by start time)", output.getvalue())
+        self.assertIn("latest start 1m ago", output.getvalue())
         self.assertIn("worker, round recent", output.getvalue())
-        self.assertIn("excluded from finished counts", output.getvalue())
-        self.assertIn("Check worker logs", output.getvalue())
+        self.assertIn("excluded from finished totals", output.getvalue())
+        self.assertNotIn("all time", output.getvalue())
 
         # A delayed finish reconciles the round rather than leaving a permanent
         # interruption warning or counting it in both categories.
@@ -480,8 +480,33 @@ class ActivityTests(unittest.TestCase):
             self.assertNotIn("interrupted_unfinished_details", value["summary"])
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 a.display(value)
-            self.assertIn("all time; recent timing unavailable", output.getvalue())
-            self.assertNotIn("Latest affected round", output.getvalue())
+            self.assertIn("historical; recent counts unavailable", output.getvalue())
+            self.assertNotIn("latest start", output.getvalue())
+
+    def test_old_reporting_gaps_are_quiet_and_recent_history_is_compact(self):
+        self.finish(0)
+        a.prepare(now=self.now)
+        value = a.cached()
+        s = value["summary"]
+        s["interrupted_unfinished"] = 176
+        detail = dict(
+            started_1h=0,
+            started_24h=14,
+            latest=dict(started=self.now - 13 * 3600, worker="worker", round_id="long-round-identity"),
+        )
+        s["interrupted_unfinished_details"] = detail
+        with patch("tauceti_worker.activity_summary.time.time", return_value=self.now):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertIn(
+                "Round reporting gaps: 0 in 1h; 14 in 24h (by start time); latest start 13h ago", output.getvalue()
+            )
+            self.assertNotIn("long-round-identity", output.getvalue())
+            detail["started_24h"] = 0
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                a.display(value)
+            self.assertNotIn("Round reporting gaps", output.getvalue())
+        self.assertEqual(s["interrupted_unfinished"], 176)
 
     def test_transport_wait_is_not_counted_as_a_failed_round(self):
         from tauceti_worker.config import Die
@@ -568,6 +593,28 @@ class ActivityTests(unittest.TestCase):
             "Shared PR observations unavailable for org/roadmap (HTTP 403; repository unavailable or access denied); retaining last-known data",
             a.cached()["errors"],
         )
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.cached())
+        self.assertIn(
+            "PR reporting: org/roadmap access denied (HTTP 403); open/landed counts may be stale", output.getvalue()
+        )
+        self.assertIn("Retrying in background", output.getvalue())
+
+    def test_observation_errors_expire_without_refresh_work_and_survive_retry_delay(self):
+        a.emit("pr_created", repository="org/roadmap", pr=7)
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)",
+                (json.dumps({"org/repo": "orphan warning", "org/roadmap": "real warning"}),),
+            )
+        with patch.object(a, "observe", side_effect=AssertionError("No retry before due")):
+            a.prepare(now=self.now + 60)
+        self.assertEqual(a.cached()["errors"], ["real warning"])
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE report_pr_refresh SET next_at=NULL WHERE repo='org/roadmap'")
+        a.prepare(now=self.now + 61)
+        self.assertEqual(a.cached()["errors"], [])
 
     def test_pr_freshness_excludes_settled_history_and_respects_scope(self):
         old = self.now - 3 * 86400
