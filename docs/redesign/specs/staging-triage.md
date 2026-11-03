@@ -32,44 +32,48 @@ Located suspects themselves are handled well. A `provisional_repair` suspect rec
 
 ### 1. No solo staging runs for isolated PRs
 
-A PR isolated from a batch by a merge conflict, by compiler or audit attribution, or by any other diagnostic takes the existing located-suspect path: `needs-rebase`, the head-bound repair request with the conflict or failure evidence, and withdrawal from the queue until re-approval. It never receives a staging build of its own. The remainder is dispatched immediately, as now.
+A PR isolated from a batch by a merge conflict, by compiler or audit attribution, or by any other diagnostic takes the existing located-suspect path: `needs-rebase`, the head-bound repair request with the conflict or failure evidence, and withdrawal from the queue until re-approval. It never receives a staging build of its own, neither as a confirmation run nor as a conflict singleton. The remainder is dispatched immediately, as now.
 
-The only batches of one are PRs approved when nothing else is waiting. The explicit `singleton` setting keeps its current meaning.
+Two existing paths put isolated PRs back into solo CI and are removed: the conflict partition in `failure_isolation.ex` that creates a one-member sealed retry batch, and `SourceCompatibility.provisional_fallback`, which after 95 minutes without a new head creates a sealed singleton for an unchanged suspect (its repair request text promises this and is updated). The repair request asks for a rebase onto current `main`; `main` has advanced by then, so the result is a new head and ordinary readmission follows, including for a conflict-peeled PR that was never broken.
 
-Expected effect: the singleton rows above, 28% of slot time, disappear, and the remainder batches they delayed start sooner.
+Batches of one that arise otherwise (a PR approved when nothing else is waiting, a two-member batch minus one suspect, an explicit `singleton` setting) keep running as they do today; no scheduling is added to prevent them. Retry batches that already exist at deployment drain under the old rules.
+
+Expected effect: the confirmation and conflict singletons, most of the 28% of slot time in the singleton rows, stop being dispatched, and the remainder batches they delayed start sooner.
 
 ### 2. Staging builds run to completion
 
 Remove `--fail-fast` from the staging invocation in `sandbox-build.sh`. `--iofail` stays. A failed build then reports every independently broken module. Runs whose first error arrives early cost up to 20 extra runner minutes; with about three culprits per batch, finding them in one round instead of three saves one to two rounds of the serial slot per landed batch.
 
-If the build fails, the audit and lint phases still do not run; they need a complete build. Running the duplicate-declaration audit over the modules that did compile is a possible later addition, not part of this change.
+If the build fails, the audit and lint phases still do not run; they need a complete build, so an audit or lint culprit is found only after the compiler culprits are gone. A module that fails because its import failed is still hidden behind that import; only independently broken modules become visible. Running the duplicate-declaration audit over the modules that did compile is a possible later addition, not part of this change.
 
 ### 3. Strip every attributed culprit in one round
 
-With complete diagnostics, the partition already supports several suspects (`failure_isolation.ex`, `[suspects, ids -- suspects]`). Each suspect takes the change 1 path individually, with its own evidence; suspects are not grouped into a shared retry batch. The remainder, with all suspects removed, is dispatched immediately.
+With complete diagnostics, the partition already supports several suspects (`failure_isolation.ex`, `[suspects, ids -- suspects]`). Only directly attributed owners are suspects: a PR whose changed file is named in a compiler error or an audit finding. The partition's expansion of suspects through shared paths and import components stays a retry-grouping hint and does not withdraw anyone. Each suspect takes the change 1 path with its own evidence; suspects are not grouped into a shared retry batch.
 
-A `bad import` of a module that no batch member and no dependency provides is attributed to the importing PR, not treated as fallout.
+The handoff withdraws all suspects, creates the remainder once and retires the parent in one transaction, as the existing single-suspect `provisional_failure` does. It cannot be done by calling that helper once per suspect: `split` treats an existing `provisional_repair` event on the candidate as completion and returns `:retrying`. An empty remainder (every member attributed) completes the parent without a new batch. The remainder is dispatched immediately.
+
+A speculative successor that fails while its predecessor has not landed keeps today's behaviour (`independent_provisional_base?` declines the handoff) because its failure cannot be assigned to either batch; it is re-evaluated once the predecessor's outcome is known.
 
 ### 4. Attribute audit and lint failures to modules
 
-- The parser recognises the audit driver's `duplicate-declarations: <decl> is declared in both <module> and <module>` line and maps both modules to owners through `changed_files`. An unchanged base module has no owner; every changed side is a suspect, as the existing `duplicate_declaration` handling already specifies.
-- The environment lint driver (`scripts/LintEnvDriver.lean`) emits the defining module path for every finding in `LINT-ENV-LOCATIONS`. Bors uses that path directly. The private-origin name decoding added on 2026-11-03 remains as a fallback for older logs.
+- The log parser is `priv/failure_diagnostics.py` in bors-ng; the Elixir side maps its observations to owners. Its `AUDIT` pattern matches only the import-collision form (`audit-driver: import <module> failed, environment already contains '<decl>' from <module>`). Add the duplicate-declaration form, `duplicate-declarations: <decl> is declared in both <module> and <module>`, producing the same `duplicate_declaration` observation; owner mapping through `changed_files` already treats every changed side as a suspect and an unchanged base module as ownerless.
+- The environment lint driver (`scripts/LintEnvDriver.lean`) emits the defining module path for every finding in `LINT-ENV-LOCATIONS`. The parser's `environment_locations` schema currently requires `path`, `line` and `column` all present and positive; it accepts a record with a module path and no range. The private-origin name decoding added on 2026-11-03 remains as a fallback for older logs.
+- `bad import` lines do not match the parser's compiler-error patterns (both require `file:line:col`), so fail-fast fallout is not attributed today and will not be after change 2. Nothing is added for them.
 - Any failure the parser cannot attribute is logged with the raw failing lines and counted. Deterministic bisection remains the last resort, and the count is the measure of parser gaps still to close.
 
 ## Expected effect
 
-Taking the window above as the baseline: singleton runs go to zero, and a landed large batch needs about two rounds (one failure that strips all culprits, one green remainder) instead of about four. The slot time per landed large batch falls from roughly 110 minutes to roughly 60, before any change to batch size, slot count or the queue model. These are projections from the measured round counts, not promised rates; the measurements below decide whether they held.
+Taking the window above as the baseline: confirmation and conflict singletons stop, and a landed large batch needs fewer rounds, with two (one failure that strips every independently broken module, one green remainder) as the optimistic case. Rounds remain for modules hidden behind a failed import, for audit and lint findings that only a green build exposes, and for anything still unattributed. The 3.3 failed rounds per landing above also include repeated bisections of a single unattributed finding, so it does not establish three independent culprits per batch. Roughly 60 slot minutes per landed large batch, from roughly 110 today, is the target; the measurements below decide whether it was met.
 
 ## Measurement
 
 From the candidate journal, before and after each change:
 
-- rounds per landed large batch (failed large candidates divided by promoted large candidates);
-- slot minutes by category, as in the table above;
-- singleton candidates dispatched per day, by isolation reason;
-- deterministic bisections per day, with the unattributed raw lines they were caused by;
+- failed rounds per landed large batch, both as the window aggregate (failed large candidates divided by promoted large candidates, 3.3 in the window above) and per completed lineage through the journal's recorded parent candidate IDs, counting the smaller descendants a split produces;
+- slot minutes by category, as in the table above, with singletons split into confirmation or conflict runs (the ones change 1 removes) and remainders of one;
+- deterministic bisections per day, with the unattributed raw lines that caused them;
 - suspects per failure partition;
-- time from `provisional_repair` to the suspect's next approved head.
+- time from `provisional_repair` to the suspect's next admission, and the number of suspects still withdrawn, so a PR that never comes back is visible rather than absent.
 
 The journal has every field needed; no new instrumentation is required beyond the unattributed-failure counter in change 4.
 
@@ -77,10 +81,10 @@ The journal has every field needed; no new instrumentation is required beyond th
 
 | Change | Location |
 | --- | --- |
-| 1 | `TauCetiProject/bors-ng` `lib/worker/failure_isolation.ex`: conflict and diagnostic units route to the located-suspect path instead of a retry batch |
+| 1 | `TauCetiProject/bors-ng` `lib/worker/failure_isolation.ex`: conflict and diagnostic units route to the located-suspect path instead of a retry batch; `lib/worker/source_compatibility.ex`: remove `provisional_fallback` and its 95-minute grace |
 | 2 | `TauCetiProject/TauCetiTools` `tauceti_tools/assets/scripts/sandbox-build.sh`, pinned in `TauCeti/scripts/sandbox-build.sh` and `tauceti.toml`; remove the `IS_BATCH` `--fail-fast` branch, then bump the pin |
-| 3 | `lib/worker/failure_isolation.ex` partition and the retry/withdrawal path |
-| 4 | `lib/worker/failure_diagnostics.ex` parser; `TauCeti/scripts/LintEnvDriver.lean` output; the audit driver's duplicate-declaration line |
+| 3 | `lib/worker/failure_isolation.ex` partition and `lib/worker/source_compatibility.ex` `provisional_failure`, generalised to a set of suspects in one transaction |
+| 4 | `priv/failure_diagnostics.py` patterns and location schema, `lib/worker/failure_diagnostics.ex` owner mapping; `TauCeti/scripts/LintEnvDriver.lean` output |
 
 ## Rollout
 
