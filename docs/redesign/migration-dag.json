@@ -1,0 +1,29 @@
+{
+  "schema": "tauceti.migration-dag/v1",
+  "nodes": [
+    {"id": "E", "title": "Current system and baseline", "depends_on": [], "document": "current-system.md"},
+    {"id": "P", "title": "Shared protocol fixtures", "depends_on": [], "document": "specs/shared-protocol.md"},
+    {"id": "M", "title": "Measurement and replay harness", "depends_on": ["E", "P"], "document": "migration-plan.md"},
+    {"id": "FE", "title": "Portable executor protocol and runtime", "depends_on": ["P"], "document": "specs/build-cluster.md"},
+    {"id": "FS", "title": "SSH discovery and bootstrap", "depends_on": ["FE"], "document": "specs/build-cluster.md"},
+    {"id": "FT", "title": "Collaborator token enrollment", "depends_on": ["FE"], "document": "specs/build-cluster.md"},
+    {"id": "FK", "title": "Managed pool adapter", "depends_on": ["FE"], "document": "specs/build-cluster.md"},
+    {"id": "B", "title": "Remote build MVP", "depends_on": ["P", "FE"], "document": "specs/lean-build-service.md"},
+    {"id": "A", "title": "Assignment MVP", "depends_on": [], "document": "specs/work-assignment-service.md"},
+    {"id": "R", "title": "Review continuity adapter", "depends_on": ["P"], "document": "specs/review-continuity.md"},
+    {"id": "L", "title": "Library registry and resolver", "depends_on": ["P"], "document": "specs/library-integration-service.md"},
+    {"id": "BP", "title": "Remote build live pilot", "depends_on": ["B", "M", "FS"], "document": "specs/lean-build-service.md"},
+    {"id": "FC", "title": "Mixed owner and backend qualification", "depends_on": ["BP", "FT", "FK"], "document": "specs/build-cluster.md"},
+    {"id": "AP", "title": "Assignment live pilot", "depends_on": ["A", "M"], "document": "specs/work-assignment-service.md"},
+    {"id": "RP", "title": "Permissive review live pilot", "depends_on": ["R", "M"], "document": "specs/review-continuity.md"},
+    {"id": "LP", "title": "Downstream library pilot", "depends_on": ["L", "M"], "document": "specs/library-integration-service.md"},
+    {"id": "Q", "title": "Queue backend adapters", "depends_on": ["L", "R"], "document": "specs/library-integration-service.md"},
+    {"id": "S", "title": "Standalone AI merge queue fixture and adapters", "depends_on": [], "document": "specs/ai-merge-queue.md"},
+    {"id": "G", "title": "Internal source service and mirror", "depends_on": ["P"], "document": "target-system.md"},
+    {"id": "U", "title": "Native contribution interface", "depends_on": ["R", "G", "L"], "document": "target-system.md"},
+    {"id": "N", "title": "Native end to end library pilot", "depends_on": ["BP", "AP", "RP", "LP", "U", "Q"], "document": "migration-plan.md"},
+    {"id": "SP", "title": "AI staging live pilot", "depends_on": ["S"], "document": "specs/ai-merge-queue.md"},
+    {"id": "X", "title": "Expand independent libraries", "depends_on": ["N", "SP", "FC"], "document": "migration-plan.md"},
+    {"id": "T", "title": "100 contributions per hour exercise", "depends_on": ["X", "M"], "document": "migration-plan.md"}
+  ]
+}

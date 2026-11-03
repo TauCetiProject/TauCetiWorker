@@ -84,6 +84,8 @@ below works either way, and this README writes the installed form.
 
 Local checks use [concurrent verification with exact-input receipts](docs/verification.md).
 
+The [redesign documents](docs/redesign/README.md) describe the current system, a proposed multi-library contribution service, its migration DAG, and implementation specifications for early components.
+
 ### Multiple GitHub accounts
 
 Log each account into `gh`, then select a login for each worker:
