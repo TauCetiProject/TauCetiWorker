@@ -17,7 +17,7 @@ from unittest.mock import DEFAULT, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
 from tauceti_worker import audit_progress as progress
-from tauceti_worker import audit_reader as ar
+from tauceti_worker import audit_reader_v3 as ar
 from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
@@ -201,7 +201,7 @@ class WorkerBoundJudgments(unittest.TestCase):
         }
         if not legacy:
             execution.update(
-                protocol_version=2 if version2 else sa.PROTOCOL_VERSION,
+                protocol_version=2 if version2 else sa.TOKEN_PROTOCOL_VERSION,
                 batch_identity={
                     "input_digest": self.batch["input_digest"],
                     "commits": [c["sha"] for c in self.batch["commits"]],
@@ -1778,6 +1778,7 @@ class CompactingInspection(unittest.TestCase):
         if resume:
             original = self.work / "original"
             original.mkdir()
+            (original / "execution.json").write_text('{"protocol_version":3}')
             (original / "model-rollout-0.jsonl").write_text(
                 json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
             )

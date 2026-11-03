@@ -214,28 +214,49 @@ Each session inspects complete per-commit diffs and before/after file contents,
 up to 20 commits with a 2 MiB workload target. A single larger commit is inspected
 alone without an aggregate byte cap, through the same compacting session. Each
 source blob remains limited to 4 MiB, and each model launch to 30 minutes.
-The batching target is separate from the model's live context window. Small inputs are supplied inline; larger
-inputs are available through one read-only `audit.read_page` tool. It accepts only
-a numbered page and a continuation token, with no filesystem paths, URLs, commands
-or writes. Each read returns the token for the next call; a stale nonempty token
-is rejected. To recover a lost token, explicitly send an empty token: the reader
-replays the last full page with a fresh token. It does not count the requested new
-page as read. The same Luna/Haiku conversation can compact its history and
-re-read pages as needed, then returns one verdict covering the entire batch. There
-are no independent partial inspections or combined partial approvals. A pass is
-rejected unless the reader's receipt accounts for every page and the verdict echoes
-the token that follows the last page's contents. Delivery coverage
-does not prove the model understood the source; compaction can lose details, so
-the prompt requires retaining findings and unresolved questions, re-reading when
-needed, and returning incomplete if the full inspection cannot be completed.
+The batching target is separate from the model's live context window. Small
+inputs are supplied inline; larger inputs use one read-only `audit.read_page` tool.
+In protocol 4 it accepts only a numbered chunk, with no paths, commands or copied
+identifiers. The reader serves the next unserved chunk or an earlier reread and
+rejects skipping ahead. The complete encoded tool response is capped at 64 KiB,
+with headroom under the configured 120k output allowance. It validates size and
+flushes the response before atomically recording served coverage. Failed writes
+receive no credit; a crash before the receipt is committed can require a reread.
+
+Protocol 4 trusts the verified client to deliver successful tool responses intact.
+Served coverage proves neither model receipt nor understanding. The same isolated
+Luna/Haiku conversation may compact and reread source, then returns only `verdict`
+and `findings` for the entire batch. The Worker supplies the immutable digest and
+ordered commit list. Missing chunks, earlier source concerns and malformed final
+answers block approval. There are no independent partial approvals. The prompt
+requires retaining findings and uncertainty across compaction and returning
+incomplete if the inspection cannot be completed.
+
+New inspections use protocol 4 only after the installed client passes an intact
+response check for this Worker release. Run the local check for each provider:
+
+```bash
+python3 -m tauceti_worker.audit_client_check --provider codex --state /path/to/worker/state/security-audit
+python3 -m tauceti_worker.audit_client_check --provider claude --state /path/to/worker/state/security-audit
+```
+
+This runs the real client and reader against a loopback test endpoint, with
+synthetic source and no subscription credentials or real model requests. It
+compares the complete chunks in actual reviewer requests, including Unicode and
+escaped text, and writes a private `client-coverage.json` compatibility record.
+The record is tied to client paths, file hashes, version and the reader, launcher,
+catalog and verification code. A client or Worker upgrade requires verification
+again. Missing, invalid or outdated verification leaves new inspections on the
+historical protocol 3. Verification supports native executables and the managed
+Codex launcher; other wrappers keep protocol 3 because their underlying code
+cannot be identified reliably. Retained protocol-4 inspections wait for verification rather
+than silently changing protocol. Existing protocol-3 inspections keep their exact
+reader, page layout, prompts and token checks; they are never reinterpreted as
+protocol-4 approvals. `audit_reader_v3.py` preserves that historical reader.
 
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
-Worker code alone verifies ancestry and moves the ref. In judgment protocol v3,
-the model returns only `verdict` and `findings`, plus the final `read_token` for
-paged inputs. The Worker attaches the immutable input digest and ordered commit
-list from the launch record. Neither commit SHAs nor a digest are copied from
-model output. Unknown response fields are rejected. Coverage and final-token
-checks remain mandatory; host-owned identity does not establish source safety.
+Worker code alone verifies ancestry and moves the ref. Host-owned identity and
+served coverage do not establish source safety.
 No Lean builds or candidate scripts run. A finding, incomplete inspection, unsupported
 source blob or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
@@ -284,8 +305,9 @@ structured-output request. Objective, status and accounting are preserved separa
 from temporary provider credentials. A model's goal status never approves source or
 changes the cursor.
 
-The reader rejects skipping unread pages and reports `next_unread_page` and
-`remaining_pages` after the source, before its final delivery token. When only
+The protocol-4 reader rejects skipping unserved chunks and reports
+`next_unserved_page` and `remaining_pages`. The historical protocol-3 reader uses
+`next_unread_page` and a final delivery token. When only
 reading work remains, the reviewer returns `unfinished` with no findings. That is
 progress, not a source verdict. The Worker also detects a premature empty-finding
 pass with missing coverage, or a cleanly ended turn without a final answer. It
@@ -314,8 +336,9 @@ scheduling. Reading progress changes scheduling only; it cannot approve source.
 Every invocation rechecks hard quota limits, admin authority, the current cursor,
 exact next main prefix,
 immutable input, original UUID, launch policy, reader, catalog, exact prompt and
-all prior judgments. Complete coverage, the final delivery token, a complete
-passing judgment and confirmed ref update remain mandatory for advancement.
+all prior judgments. Complete coverage, a complete passing judgment and a
+confirmed ref update remain mandatory for advancement. Protocol 3 additionally
+requires its final copied delivery token.
 
 Known Codex capacity and request-processing retry notices are nonterminal progress
 when followed by a completed turn and its answer. Unknown errors and failed turns
@@ -323,7 +346,8 @@ remain failures. If a current-protocol inspection already finished successfully
 but was blocked during result handling, the Worker can revalidate its retained
 answer without another model request or model quota check. The public answer must
 match the native final, all prior judgments must remain clear, and complete reader
-coverage and the final token must validate. Fresh admin, cursor and exact main-prefix
+coverage must validate under the original protocol, including its final token
+when that protocol requires one. Fresh admin, cursor and exact main-prefix
 checks still precede advancement; the ledger records reuse of the original attempt,
 and its evidence and block remain preserved until the ref update is confirmed.
 
@@ -339,6 +363,7 @@ mismatched evidence remain blocked. Private alerts retain their usual deduplicat
 The `retry-service` and `repair-output` administrative commands remain for their
 restricted historical recovery profiles; automatic protocol-v3 recovery uses the
 ordinary worker loop and does not need those commands or a human attestation.
+Protocol 4 uses the same recovery loop with no token-output repair path.
 
 For the recorded legacy Luna failure where the final two pages were inaccessible
 because the reader token was lost, an admin may explicitly continue the **same

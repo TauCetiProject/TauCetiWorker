@@ -27,11 +27,11 @@ V2_PROFILE = {
 READING_RETRY_SECONDS = 60
 
 
-def safe_judgment(value, batch: dict, paged: bool, *, legacy=False, allow_empty=False) -> bool:
+def safe_judgment(value, batch: dict, paged: bool, *, legacy=False, allow_empty=False, protocol=3) -> bool:
     """Recognize only a pass or, for bounded immediate repair, an empty incomplete."""
     if not isinstance(value, dict) or value.get("findings") != []:
         return False
-    keys = {"verdict", "findings"} | ({"read_token"} if paged else set())
+    keys = {"verdict", "findings"} | ({"read_token"} if paged and protocol < 4 else set())
     if legacy and "input_digest" in value:
         keys |= {"input_digest", "commits"}
         if value["input_digest"] != batch["input_digest"] or not isinstance(value.get("commits"), list):
@@ -46,7 +46,7 @@ def safe_judgment(value, batch: dict, paged: bool, *, legacy=False, allow_empty=
 
 
 def safe_history(
-    work: Path, batch: dict, paged: bool, *, legacy=False, allow_empty=False, allowed=(), goals=True
+    work: Path, batch: dict, paged: bool, *, legacy=False, allow_empty=False, allowed=(), goals=True, protocol=3
 ) -> bool:
     from . import security_audit as sa
 
@@ -74,7 +74,7 @@ def safe_history(
                 if item.get("phase") not in ("final", "final_answer"):
                     return False
                 if sa.serialize(value) not in allowed and not safe_judgment(
-                    value, batch, paged, legacy=legacy, allow_empty=allow_empty
+                    value, batch, paged, legacy=legacy, allow_empty=allow_empty, protocol=protocol
                 ):
                     return False
         return True
@@ -116,10 +116,13 @@ def mechanical_output(
     legacy_history=False,
     allow_empty=True,
     allowed=(),
+    protocol=3,
 ) -> bool:
     """Validate everything except a known mechanical final-output failure. Never approve it."""
     from . import security_audit as sa
 
+    if protocol == 4:
+        return False  # No token or identity-copy repair in the new protocol.
     try:
         events = sa.codex_events(transcript, paged)
         thread = sa.retained_thread(work)
@@ -203,11 +206,11 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
         if any(execution.get(k) != v for k, v in profile.items()):
             raise Die("security-audit: unknown legacy inspection profile")
         policy = sa.PROMPT if version == 1 else sa.V2_MODEL_PROMPT
-    elif version == sa.PROTOCOL_VERSION:
-        profile = sa.inspection_profile()
+    elif version in (3, 4):
+        profile = sa.inspection_profile(version)
         if any(execution.get(k) != profile[k] for k in ("catalog_digest", "reader_digest")):
             raise Die("security-audit: retained inspection policy or reader changed")
-        policy = sa.MODEL_PROMPT
+        policy = sa.SERVED_MODEL_PROMPT if version == 4 else sa.MODEL_PROMPT
     else:
         raise Die("security-audit: unknown judgment protocol")
     if version != 1:
@@ -228,7 +231,7 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
     if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
         raise Die("security-audit: retained inspection prompt digest mismatch")
     sa.validate_output_profile(
-        execution, original, batch, policy_prompt=policy, durable=version != 1, goals=version >= 3
+        execution, original, batch, policy_prompt=policy, durable=version != 1, goals=version >= 3, protocol=version
     )
     paged = len(sa.serialize(batch).encode()) > sa.INLINE_BYTES
     if version == 2 and paged and (original / "model-transcript.jsonl").exists():
@@ -251,7 +254,7 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
             if not native_finals(original) or native_finals(original)[-1] != value:
                 raise Die("security-audit: retained coverage answer differs from the native final")
             allowed.append(sa.serialize(value))
-    if not safe_history(original, batch, paged, legacy=legacy, allowed=allowed, goals=version >= 3):
+    if not safe_history(original, batch, paged, legacy=legacy, allowed=allowed, goals=version >= 3, protocol=version):
         raise Die("security-audit: previous findings or uncertainty forbid automatic recovery")
     allowed_verdicts = {
         sa.serialize(sa.bind_verdict({k: v for k, v in json.loads(text).items() if k != "read_token"}, batch))
@@ -279,8 +282,9 @@ def completed_pass(original: Path, batch: dict, execution: dict) -> dict | None:
     """
     from . import security_audit as sa
 
-    if execution.get("protocol_version") != sa.PROTOCOL_VERSION:
+    if execution.get("protocol_version") not in (3, 4):
         return None
+    protocol = execution["protocol_version"]
     try:
         transcript = (original / "model-transcript.jsonl").read_text()
         events = sa.codex_events(transcript, execution["paged"])
@@ -313,11 +317,11 @@ def completed_pass(original: Path, batch: dict, execution: dict) -> dict | None:
         if Counter(messages[:-1]) - notes:
             return None
         answer = dict(value)
-        token = answer.pop("read_token", None) if execution["paged"] else None
+        token = answer.pop("read_token", None) if execution["paged"] and protocol < 4 else None
         verdict = sa.bind_verdict(answer, batch)
         if verdict["verdict"] != "pass":
             return None
-        sa.validate_reads(verdict, batch, original / "read-receipt.json", execution["paged"], token)
+        sa.validate_reads(verdict, batch, original / "read-receipt.json", execution["paged"], token, protocol=protocol)
         return verdict
     except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
@@ -340,7 +344,9 @@ def check_current_batch(work: Path, batch: dict) -> None:
 def finish_pass(work: Path, batch: dict, evidence: dict, verdict: dict) -> None:
     from . import security_audit as sa
 
-    sa.record(work / "ledger.jsonl", {**evidence, "verdict": verdict, "protocol_version": sa.PROTOCOL_VERSION})
+    sa.record(
+        work / "ledger.jsonl", {**evidence, "verdict": verdict, "protocol_version": evidence.get("protocol_version", 3)}
+    )
     landed = sa.advance(work / "objects.git", batch)
     sa.record(work / "ledger.jsonl", {**evidence, "advanced": landed})
     (work / "blocked.json").rename(work / f"resolved-operational-block-{time.time_ns()}.json")
@@ -355,6 +361,8 @@ def recover(cfg, opts, previous: dict) -> bool:
     work = cfg.state / sa.CURSOR
     try:
         original, batch, execution, legacy = retained(work, previous)
+        protocol = execution.get("protocol_version", 1)
+        protocol = 3 if protocol < 3 else protocol
         paged = execution["paged"]
         allowed = execution.get("_allowed_history", ())
         completed = completed_pass(original, batch, execution)
@@ -369,15 +377,23 @@ def recover(cfg, opts, previous: dict) -> bool:
             legacy_history=legacy,
             allow_empty=False,
             allowed=allowed,
+            protocol=protocol,
         )
         service = (
             sa.codex_service_error(
-                transcript, paged, original, batch, protocol=3, legacy_history=legacy, allowed_history=allowed
+                transcript, paged, original, batch, protocol=protocol, legacy_history=legacy, allowed_history=allowed
             )
             is not None
         )
         progress = continuable(
-            transcript, batch, original / "read-receipt.json", original, legacy=legacy, allowed=allowed, paged=paged
+            transcript,
+            batch,
+            original / "read-receipt.json",
+            original,
+            legacy=legacy,
+            allowed=allowed,
+            paged=paged,
+            protocol=protocol,
         )
         if paged and allowed and transcript:
             progress = progress or sa.serialize(sa.codex_final(transcript, True)) in allowed
@@ -395,7 +411,8 @@ def recover(cfg, opts, previous: dict) -> bool:
             "from_sha": batch["from_sha"],
             "to_sha": batch["commits"][-1]["sha"],
             "attempt": str(original),
-            "recovery_kind": "retained-pass-v3",
+            "recovery_kind": f"retained-pass-v{protocol}",
+            "protocol_version": protocol,
         }
         log("security-audit: revalidated retained completed pass; no model request needed")
         finish_pass(work, batch, evidence, completed)
@@ -447,7 +464,8 @@ def recover(cfg, opts, previous: dict) -> bool:
         "to_sha": target,
         "continuation_of": str(original),
         "attempt": str(attempt),
-        "recovery_kind": "operational-v3",
+        "recovery_kind": f"operational-v{protocol}",
+        "protocol_version": protocol,
     }
     sa.record(work / "ledger.jsonl", recovery)
     # Journal the in-flight attempt before launch. Its native history and receipt
@@ -464,7 +482,7 @@ def recover(cfg, opts, previous: dict) -> bool:
     )
     log(f"security-audit: automatic same-session recovery {batch['from_sha'][:12]}..{target[:12]}")
     try:
-        before_read = coverage(batch, original / "read-receipt.json")["read"] if paged else None
+        before_read = coverage(batch, original / "read-receipt.json", protocol=protocol)["read"] if paged else None
     except Exception:
         before_read = None  # Advisory scheduling must not change recovery eligibility.
     try:
@@ -477,9 +495,10 @@ def recover(cfg, opts, previous: dict) -> bool:
             repair_output=mechanical,
             allowed_history=allowed,
             continue_reading=progress,
+            **({"protocol": protocol} if protocol == 4 else {}),
         )
         if verdict["verdict"] != "pass":
-            sa.record(work / "ledger.jsonl", {**recovery, "verdict": verdict, "protocol_version": sa.PROTOCOL_VERSION})
+            sa.record(work / "ledger.jsonl", {**recovery, "verdict": verdict, "protocol_version": protocol})
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
         finish_pass(work, batch, recovery, verdict)
     except (Die, NoProgress, OSError, ValueError, TypeError, AttributeError, sa.subprocess.TimeoutExpired) as exc:
@@ -507,7 +526,7 @@ def recover(cfg, opts, previous: dict) -> bool:
                 # only the scheduling delay; preserve the reserved attempt count and
                 # every eligibility, quota, coverage and final-judgment check.
                 after, after_batch, after_execution, after_legacy = retained(work, failure)
-                after_read = coverage(batch, after / "read-receipt.json")["read"] if paged else []
+                after_read = coverage(batch, after / "read-receipt.json", protocol=protocol)["read"] if paged else []
                 if (
                     after_batch == batch
                     and sa.retained_thread(after) == sa.retained_thread(original)
@@ -520,6 +539,7 @@ def recover(cfg, opts, previous: dict) -> bool:
                         legacy=after_legacy,
                         allowed=after_execution.get("_allowed_history", ()),
                         paged=paged,
+                        protocol=protocol,
                     )
                 ):
                     retry_at = time.time() + READING_RETRY_SECONDS
@@ -527,7 +547,7 @@ def recover(cfg, opts, previous: dict) -> bool:
                         work / "ledger.jsonl",
                         {
                             **recovery,
-                            "recovery_kind": "reading-progress-v3",
+                            "recovery_kind": f"reading-progress-v{protocol}",
                             "reading_progress_retry_at": retry_at,
                             "pages_before": len(before_read),
                             "pages_after": len(after_read),
