@@ -224,10 +224,10 @@ flushes the response before atomically recording served coverage. Failed writes
 receive no credit; a crash before the receipt is committed can require a reread.
 The Worker saves coverage before each client call and reconciles it with the
 client's successful tool-call reports afterwards, including on timeout or failure.
-A read is retained only after a later model event follows its successful client
-report, so a timeout can require replaying the last read. The Worker keeps the
+For Codex recovery, each successful read must also have its matching tool output
+in the saved native conversation that will be resumed. The Worker keeps the
 contiguous confirmed prefix and rereads only the unconfirmed remainder in the
-same conversation. If the Worker dies without saving a transcript, the
+same conversation. This works independently of parallel tool-call ordering. If the Worker dies without saving a transcript, the
 launch's new reads are replayed. Earlier findings and uncertainty are preserved;
 partial progress never substitutes for a final safety judgment.
 
@@ -255,8 +255,8 @@ python3 -m tauceti_worker.audit_client_check --provider claude --state /path/to/
 
 This runs the real client and reader against a loopback test endpoint, with
 synthetic source and no subscription credentials or real model requests. It
-compares the complete chunks in actual reviewer requests, including Unicode and
-escaped text, and writes a private `client-coverage.json` compatibility record.
+compares the complete chunks in actual reviewer requests and, for Codex, in the
+saved native conversation, including Unicode and escaped text, and writes a private `client-coverage.json` compatibility record.
 The record is tied to client paths, file hashes, version and the reader, launcher,
 catalog and verification code. A client or Worker upgrade requires verification
 again, which the Worker performs automatically. A failed verification leaves new

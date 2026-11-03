@@ -33,9 +33,9 @@ and integration tests. No client patches or new acknowledgment protocol.
    atomically. Rereads do not count as new progress. A crash can require rereading
    a chunk; recovery must not manufacture coverage. Reconcile each launch's new
    coverage with successful client tool-call reports, retaining the contiguous
-   confirmed prefix even after timeouts. Require a later model event after a
-   successful read report, replaying the final read if interrupted at that boundary.
-   Replay unconfirmed reads when no transcript survives. Call this served coverage, rather than proof of delivery
+   confirmed prefix even after timeouts. For Codex recovery, require the matching
+   tool output in the saved native conversation that will be resumed. Replay
+   unconfirmed reads when no transcript survives. Call this served coverage, rather than proof of delivery
    or review.
 
 4. **Simplify verdict validation.** Require only `verdict` and `findings` from
@@ -59,6 +59,7 @@ and integration tests. No client patches or new acknowledgment protocol.
 - Exercise each supported client against a test reader with near-limit chunks,
   Unicode and heavily escaped text. Capture the actual reviewer request at a test
   endpoint and compare its complete source payload with the expected chunk.
+  For Codex, check that the saved native conversation preserves those chunks too.
   Public console output alone is insufficient. Require this test for supported
   client upgrades. Run it automatically when missing or stale, serialize probes,
   and cache failures briefly before retrying. A failed check keeps new inspections

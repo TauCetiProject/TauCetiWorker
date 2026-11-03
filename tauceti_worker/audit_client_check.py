@@ -290,11 +290,29 @@ def verify(provider: str, state: Path):
             or capture.error
             or capture.received != expected_pages
             or sa.successful_read_pages(result.stdout, provider) != expected_pages
+            or (
+                provider == "codex"
+                and sa.saved_read_pages(list((home / ".codex/sessions").rglob("*.jsonl"))) != expected_pages
+            )
         ):
             raise ValueError(
                 f"{provider} delivery check failed: {capture.error or result.stderr[-1200:]} "
                 f"({len(capture.received)}/{len(capture.expected)} chunks)"
             )
+        if provider == "codex":
+            # Recovery resumes this exact native history, rather than console
+            # output. Verify its stored source is complete too, using the same
+            # exact-content comparison as the captured model request.
+            capture.received.clear()
+            outputs = [
+                row["payload"]
+                for path in (home / ".codex/sessions").rglob("*.jsonl")
+                for row in map(json.loads, path.read_text().splitlines())
+                if row.get("type") == "response_item" and row.get("payload", {}).get("type") == "function_call_output"
+            ]
+            capture.consume({"input": outputs}, provider)
+            if capture.received != expected_pages:
+                raise ValueError("client saved conversation omitted source chunks")
     after = clients.fingerprint(provider)
     if before != after:
         raise ValueError("client changed during verification")

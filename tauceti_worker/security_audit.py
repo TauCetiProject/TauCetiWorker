@@ -550,31 +550,9 @@ def successful_read_pages(transcript: str, provider: str) -> set[int]:
             continue
         if isinstance(event, dict):
             events.append(event)
-    pages, pending = set(), set()
+    pages = set()
     calls = {}
     for event in events:
-        # A killed client's final tool report may precede durable conversation
-        # storage. A later model event confirms it crossed that boundary; replay
-        # the last pending read after a timeout rather than assume write ordering.
-        if provider == "codex":
-            item = event.get("item", {})
-            following_model_event = (
-                event.get("type") == "turn.completed"
-                or (
-                    event.get("type") == "item.started"
-                    and item.get("type") in ("reasoning", "agent_message", "mcp_tool_call")
-                )
-                or (event.get("type") == "item.completed" and item.get("type") in ("reasoning", "agent_message"))
-            )
-        else:
-            following_model_event = event.get("type") == "assistant" or (
-                event.get("type") == "result"
-                and not event.get("is_error")
-                and event.get("subtype") in (None, "success")
-            )
-        if following_model_event:
-            pages.update(pending)
-            pending.clear()
         if provider == "codex":
             item = event.get("item", {})
             if (
@@ -593,7 +571,7 @@ def successful_read_pages(transcript: str, provider: str) -> set[int]:
                 continue
             page = item.get("arguments", {}).get("page")
             if type(page) is int:
-                pending.add(page)
+                pages.add(page)
         else:
             for item in event.get("message", {}).get("content", []):
                 if not isinstance(item, dict):
@@ -607,7 +585,31 @@ def successful_read_pages(transcript: str, provider: str) -> set[int]:
                 if event.get("type") == "user" and item.get("type") == "tool_result" and not item.get("is_error"):
                     page = calls.get(item.get("tool_use_id"))
                     if type(page) is int:
-                        pending.add(page)
+                        pages.add(page)
+    return pages
+
+
+def saved_read_pages(rollouts: list[Path]) -> set[int]:
+    """Find reads whose outputs are in the exact native history Codex will resume."""
+    if len(rollouts) != 1:
+        return set()
+    calls, pages = {}, set()
+    for line in rollouts[0].read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+            if row.get("type") != "response_item":
+                continue
+            item = row["payload"]
+            if item.get("type") == "function_call" and item.get("name") in ("read_page", "mcp__audit__read_page"):
+                args = json.loads(item["arguments"])
+                if type(args.get("page")) is int and isinstance(item.get("call_id"), str):
+                    calls[item["call_id"]] = args["page"]
+            if item.get("type") == "function_call_output" and "output" in item:
+                page = calls.get(item.get("call_id"))
+                if type(page) is int:
+                    pages.add(page)
+        except (ValueError, TypeError, AttributeError, KeyError):
+            continue  # A partial/malformed native row provides no read evidence.
     return pages
 
 
@@ -887,6 +889,8 @@ def reconcile_coverage(work: Path, batch: dict) -> dict:
         if transcript.exists()
         else set()
     )
+    if value["provider"] == "codex":
+        successful &= saved_read_pages(native_rollouts(work))
     receipt = work / "read-receipt.json"
     with receipt.with_suffix(".lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
