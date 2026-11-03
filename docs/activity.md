@@ -146,6 +146,9 @@ Repository access warnings identify which open/landed counts may be stale and
 that background preparation retries. Stored observation errors are discarded
 once the repository has no remaining refresh work, so removed or fully settled
 repositories do not leave permanent warnings.
+Worker and group reports include repository failures only when their own PRs or
+contributions track that repository; unrelated local history does not warn every
+fleet group. Installation-wide JSON retains the full set of current errors.
 
 Each worker and fleet group has its own small summary file, so status does not
 load the entire historical inventory. A separate prepared PR identity inventory

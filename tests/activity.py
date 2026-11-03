@@ -616,6 +616,25 @@ class ActivityTests(unittest.TestCase):
         a.prepare(now=self.now + 61)
         self.assertEqual(a.cached()["errors"], [])
 
+    def test_repository_warning_only_reaches_affected_workers_and_groups(self):
+        self.finish(0)
+        a.emit("pr_created", repository="TauCetiProject/TauCeti", pr=1)
+        a.emit(
+            "pr_activity", repository="org/repo", pr=7, worker="other-worker", group="other-machine", activity="review"
+        )
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)",
+                (json.dumps({"org/repo": "unrelated repository access failure"}),),
+            )
+        a.prepare(now=self.now + 60)
+        self.assertEqual(a.cached(worker="worker")["errors"], [])
+        self.assertEqual(a.cached(group="machine")["errors"], [])
+        self.assertEqual(a.cached(worker="other-worker")["errors"], ["unrelated repository access failure"])
+        self.assertEqual(a.cached(group="other-machine")["errors"], ["unrelated repository access failure"])
+        self.assertEqual(a.cached()["errors"], ["unrelated repository access failure"])
+
     def test_pr_freshness_excludes_settled_history_and_respects_scope(self):
         old = self.now - 3 * 86400
         with contextlib.closing(a._connect()) as db, db:
