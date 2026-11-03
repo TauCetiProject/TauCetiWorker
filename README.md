@@ -302,10 +302,17 @@ durable while the subprocess runs, so a restart retains evidence written before
 stdout capture finishes.
 
 After those immediate requests, ordinary `work` recovers operational and unfinished
-coverage blocks without human intervention. A durable budget waits 5, 10, 20, 40,
-then 60 minutes between recovery invocations, capped at one per hour thereafter.
-Reservation precedes launch and survives restarts. Every invocation rechecks hard
-quota limits, admin authority, the current cursor, exact next main prefix,
+coverage blocks without human intervention. Failed or stalled invocations use a
+durable budget that waits 5, 10, 20, 40, then 60 minutes between recoveries, capped
+at one per hour thereafter. Reservation precedes launch and survives restarts.
+When a validated continuation delivers new pages and returns clear
+coverage-only progress, its next recovery is eligible after one minute instead
+of the failure backoff. The reserved attempt count is preserved. Rereading old
+pages, provider failures, source findings and damaged evidence never earn this
+shorter delay. Actual launches also follow the worker loop's cadence and quota
+scheduling. Reading progress changes scheduling only; it cannot approve source.
+Every invocation rechecks hard quota limits, admin authority, the current cursor,
+exact next main prefix,
 immutable input, original UUID, launch policy, reader, catalog, exact prompt and
 all prior judgments. Complete coverage, the final delivery token, a complete
 passing judgment and confirmed ref update remain mandatory for advancement.

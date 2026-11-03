@@ -918,8 +918,62 @@ class WorkerBoundJudgments(unittest.TestCase):
     def test_migrated_coverage_diagnostic_remains_verified_after_another_restart(self):
         self.run_three_turns_then_recover_after_restart(version2=True)
 
-    def run_three_turns_then_recover_after_restart(self, *, version2):
-        self.unfinished_evidence(version2=version2)
+    def test_new_reading_progress_shortens_cooldown_without_approval_or_resetting_attempts(self):
+        self.run_three_turns_then_recover_after_restart(version2=False, read_more=True)
+
+    def test_new_pages_with_findings_or_damaged_receipts_keep_original_backoff(self):
+        for damage in ("finding", "uncertainty", "receipt", "thread", "exit", "timeout"):
+            with self.subTest(damage=damage):
+                self.unfinished_evidence()
+                (self.work / "operational-recovery.json").unlink(missing_ok=True)
+                (self.work / "ledger.jsonl").write_text("")
+
+                def model(batch, provider, attempt, *, damage=damage, **kwargs):
+                    verdict = (
+                        "finding" if damage == "finding" else "incomplete" if damage == "uncertainty" else "unfinished"
+                    )
+                    self.evidence(
+                        original=attempt,
+                        verdict=verdict,
+                        findings=["IO concern"] if damage in ("finding", "uncertainty") else [],
+                    )
+                    if damage in ("finding", "uncertainty"):
+                        return sa.bind_verdict({"verdict": verdict, "findings": ["IO concern"]}, batch)
+                    if damage == "exit":
+                        raise Die("security-audit: codex failed; see model-stderr.txt")
+                    if damage == "timeout":
+                        raise subprocess.TimeoutExpired("codex", 1800)
+                    if damage == "receipt":
+                        p = attempt / "read-receipt.json"
+                        p.write_text(sa.serialize({**json.loads(p.read_text()), "input_digest": "other"}))
+                    else:
+                        p = attempt / "model-rollout-0.jsonl"
+                        rows = list(map(json.loads, p.read_text().splitlines()))
+                        rows[0]["payload"]["id"] = "22222222-2222-4333-8444-555555555555"
+                        p.write_text("\n".join(map(sa.serialize, rows)) + "\n")
+                    raise Die("security-audit: inspection unfinished; retained for same-session continuation")
+
+                with (
+                    patch.object(recovery.time, "time", return_value=1000),
+                    patch.object(sa, "inspect", side_effect=model),
+                    patch.object(sa, "advance") as advance,
+                    self.assertRaises(NoProgress),
+                ):
+                    recovery.recover(self.cfg, self.opts, self.block)
+                advance.assert_not_called()
+                state = json.loads((self.work / "operational-recovery.json").read_text())
+                self.assertEqual(next(iter(state.values())), {"attempts": 1, "retry_at": 1300})
+
+    def test_advisory_coverage_failure_does_not_remove_service_recovery_eligibility(self):
+        self.evidence(service=True)
+        p = self.original / "read-receipt.json"
+        p.write_text(sa.serialize({**json.loads(p.read_text()), "last_token": ""}))
+        with patch.object(sa, "inspect", side_effect=OSError("provider down")) as model, self.assertRaises(NoProgress):
+            recovery.recover(self.cfg, self.opts, self.block)
+        model.assert_called_once()
+
+    def run_three_turns_then_recover_after_restart(self, *, version2, read_more=False):
+        self.unfinished_evidence(version2=version2, large=read_more)
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
         calls = 0
         states = []
@@ -940,6 +994,9 @@ class WorkerBoundJudgments(unittest.TestCase):
                         reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
                 verdict = "pass"
             else:
+                if read_more:
+                    page = next(i for i in range(len(reader.pages)) if i not in reader.seen)
+                    reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page, "token": reader.token}})
                 verdict = "unfinished"
             value = {"verdict": verdict, "findings": [], "read_token": reader.token}
             append_native(kwargs["cwd"], value, self.thread)
@@ -960,14 +1017,18 @@ class WorkerBoundJudgments(unittest.TestCase):
                 recovery.recover(self.cfg, self.opts, self.block)
             self.assertEqual(calls, 3)
             advance.assert_not_called()
+            state = json.loads((self.work / "operational-recovery.json").read_text())
+            self.assertEqual(next(iter(state.values())), {"attempts": 1, "retry_at": 1060 if read_more else 1300})
             previous = json.loads((self.work / "blocked.json").read_text())
             with patch.object(recovery.time, "time", return_value=1001), self.assertRaisesRegex(NoProgress, "cooldown"):
                 recovery.recover(self.cfg, self.opts, previous)
             self.assertEqual(calls, 3)
-            with patch.object(recovery.time, "time", return_value=1301):
+            with patch.object(recovery.time, "time", return_value=1061 if read_more else 1301):
                 self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
             self.assertEqual(calls, 4)
             advance.assert_called_once()
+            state = json.loads((self.work / "operational-recovery.json").read_text())
+            self.assertEqual(next(iter(state.values()))["attempts"], 2)
         self.assertEqual(states[0], states[1])
         self.assertEqual(states[1], states[2])
         self.assertNotEqual(states[2], states[3])
