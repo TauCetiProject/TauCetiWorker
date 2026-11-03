@@ -72,7 +72,8 @@ def read_events(provider, pages, *, failed=False):
     return events
 
 
-def native_read_rows(pages):
+def native_read_rows(pages, batch):
+    expected = ar.pages(batch)
     rows = []
     for page in pages:
         rows.extend(
@@ -88,21 +89,27 @@ def native_read_rows(pages):
                 },
                 {
                     "type": "response_item",
-                    "payload": {"type": "function_call_output", "call_id": f"read-{page}", "output": "fixture source"},
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": f"read-{page}",
+                        "output": [
+                            {"type": "input_text", "text": sa.serialize({"page": page, "sections": expected[page]})}
+                        ],
+                    },
                 },
             ]
         )
     return rows
 
 
-def append_native_reads(home, pages, thread):
+def append_native_reads(home, pages, thread, batch):
     directory = home / ".codex/sessions"
     directory.mkdir(parents=True, exist_ok=True)
     path = next(directory.glob("*.jsonl"), directory / "rollout.jsonl")
     if not path.exists():
         path.write_text(sa.serialize({"type": "session_meta", "payload": {"id": thread}}) + "\n")
     with path.open("a") as stream:
-        stream.write("\n".join(map(sa.serialize, native_read_rows(pages))) + "\n")
+        stream.write("\n".join(map(sa.serialize, native_read_rows(pages, batch))) + "\n")
 
 
 class NumberedReader(unittest.TestCase):
@@ -266,7 +273,7 @@ class ServedJudgments(unittest.TestCase):
 
         native = attempt / "model-rollout-0.jsonl"
         rows = native.read_text().splitlines()
-        rows[-1:-1] = list(map(sa.serialize, native_read_rows(range(len(r.pages)))))
+        rows[-1:-1] = list(map(sa.serialize, native_read_rows(range(len(r.pages)), self.batch)))
         native.write_text("\n".join(rows) + "\n")
         transcript = attempt / "model-transcript.jsonl"
         transcript.write_text(
@@ -427,7 +434,7 @@ class ServedJudgments(unittest.TestCase):
             self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], [])
             self.assertIsNone(recovery.completed_pass(attempt, self.batch, {"protocol_version": 4, "paged": True}))
 
-    def test_timeout_keeps_earlier_reads_and_replays_the_final_unconfirmed_read(self):
+    def test_timeout_does_not_credit_saved_error_for_unsaved_success(self):
         attempt = self.work / "attempt-last-read"
         attempt.mkdir()
         home = attempt / "isolated"
@@ -438,7 +445,7 @@ class ServedJudgments(unittest.TestCase):
             r = ar.Reader(self.batch, receipt)
             for page in (0, 1):
                 r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-            append_native_reads(home, [0], self.thread)
+            append_native_reads(home, [0], self.thread, self.batch)
             events = read_events("codex", [0]) + read_events("codex", [1])
             raise subprocess.TimeoutExpired("codex", 1800, output="\n".join(map(sa.serialize, events)).encode())
 
@@ -476,7 +483,7 @@ class ServedJudgments(unittest.TestCase):
             for page in pages:
                 r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
             rounds += 1
-            append_native_reads(home, pages, self.thread)
+            append_native_reads(home, pages, self.thread, self.batch)
             historical.append_native(home, {"verdict": "unfinished", "findings": []}, self.thread)
             # Preserve complete tool success reports even if the final event is
             # cut off when the subprocess times out.
@@ -516,7 +523,7 @@ class ServedJudgments(unittest.TestCase):
             for page in range(start, start + 1):
                 r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
             calls += 1
-            append_native_reads(kwargs["cwd"], range(start, start + 1), self.thread)
+            append_native_reads(kwargs["cwd"], range(start, start + 1), self.thread, self.batch)
             historical.append_native(kwargs["cwd"], {"verdict": "unfinished", "findings": []}, self.thread)
             events = [{"type": "thread.started", "thread_id": self.thread}] + read_events(
                 "codex", range(start, start + 1)
@@ -553,15 +560,26 @@ class ServedJudgments(unittest.TestCase):
 
     def test_saved_read_requires_the_matching_native_tool_output(self):
         path = self.work / "native-read.jsonl"
-        rows = native_read_rows([0])
+        rows = native_read_rows([0], self.batch)
         path.write_text(sa.serialize(rows[0]) + "\n")
-        self.assertEqual(sa.saved_read_pages([path]), set())
+        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
         path.write_text("\n".join(map(sa.serialize, rows)) + '\ninvalid\n42\n{"type":')
-        self.assertEqual(sa.saved_read_pages([path]), {0})
+        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), {0})
+        original_output = rows[-1]["payload"]["output"]
+        rows[-1]["payload"]["output"] = [{"type": "input_text", "text": sa.serialize({"page": 0, "sections": []})}]
+        path.write_text("\n".join(map(sa.serialize, rows)))
+        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
+        rows[-1]["payload"]["output"] = original_output
+        # A saved error for an earlier request of the same page is not source.
+        successful_output = rows[-1]["payload"]["output"]
+        rows[-1]["payload"]["output"] = [{"type": "input_text", "text": "Error: skipped page"}]
+        path.write_text("\n".join(map(sa.serialize, rows)))
+        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
+        rows[-1]["payload"]["output"] = successful_output
         # A function output belonging to a different call cannot vouch for this read.
         rows[-1]["payload"]["call_id"] = "other-call"
         path.write_text("\n".join(map(sa.serialize, rows)))
-        self.assertEqual(sa.saved_read_pages([path]), set())
+        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
 
     def test_client_reports_must_confirm_read_success(self):
         for provider in ("codex", "claude"):
@@ -617,7 +635,7 @@ class ServedJudgments(unittest.TestCase):
                 for page in range(len(r.pages)):
                     r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
                 if provider == "codex":
-                    append_native_reads(kwargs["cwd"], range(len(r.pages)), self.thread)
+                    append_native_reads(kwargs["cwd"], range(len(r.pages)), self.thread, self.batch)
                     historical.append_native(kwargs["cwd"], value, self.thread)
                     events = [
                         {"type": "thread.started", "thread_id": self.thread},
@@ -655,7 +673,7 @@ class ServedJudgments(unittest.TestCase):
                 for page in range(len(r.pages)):
                     r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
             value = {"verdict": "pass" if calls == 4 else "unfinished", "findings": []}
-            append_native_reads(kwargs["cwd"], range(len(r.pages)) if calls == 4 else [0], self.thread)
+            append_native_reads(kwargs["cwd"], range(len(r.pages)) if calls == 4 else [0], self.thread, self.batch)
             historical.append_native(kwargs["cwd"], value, self.thread)
             events = [
                 {"type": "thread.started", "thread_id": self.thread},
@@ -824,7 +842,6 @@ class ClientCompatibility(unittest.TestCase):
                 with self.subTest(output=output[:20]), self.assertRaises(ValueError):
                     capture.consume(
                         {
-                            "parallel_tool_calls": False,
                             "input": [{"type": "function_call_output", "call_id": "audit_page_0", "output": output}],
                         },
                         "codex",
@@ -832,7 +849,6 @@ class ClientCompatibility(unittest.TestCase):
             self.assertEqual(capture.received, set())
             capture.consume(
                 {
-                    "parallel_tool_calls": False,
                     "input": [{"type": "function_call_output", "call_id": "audit_page_0", "output": text}],
                 },
                 "codex",

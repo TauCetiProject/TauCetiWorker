@@ -45,6 +45,7 @@ class Capture:
     def __init__(self, batch, directory):
         self.expected = []
         r = reader.Reader(batch, directory / "expected.json")
+        self.sections = r.pages
         for page in range(len(r.pages)):
             result = r.request("tools/call", {"name": reader.TOOL, "arguments": {"page": page}})
             self.expected.append(result["content"][0]["text"])
@@ -74,25 +75,9 @@ class Capture:
                 continue
             page = int(call.removeprefix("audit_page_"))
 
-            def texts(value):
-                if isinstance(value, str):
-                    yield value
-                    try:
-                        decoded = json.loads(value)
-                    except ValueError:
-                        return
-                    yield from texts(decoded)
-                elif isinstance(value, list):
-                    for item in value:
-                        yield from texts(item)
-                elif isinstance(value, dict):
-                    for key in ("text", "content", "result"):
-                        if key in value:
-                            yield from texts(value[key])
-
             # Codex may add a standard timing/header wrapper. The entire exact
             # expected tool text must remain present, including its middle/end.
-            if not any(self.expected[page] in text for text in texts(output)):
+            if not any(self.expected[page] in text for text in sa.tool_texts(output)):
                 raise ValueError(f"client omitted or altered chunk {page}: {str(output)[:800]!r}")
             self.received.add(page)
         for tool in body.get("tools", []):
@@ -292,7 +277,8 @@ def verify(provider: str, state: Path):
             or sa.successful_read_pages(result.stdout, provider) != expected_pages
             or (
                 provider == "codex"
-                and sa.saved_read_pages(list((home / ".codex/sessions").rglob("*.jsonl"))) != expected_pages
+                and sa.saved_read_pages(list((home / ".codex/sessions").rglob("*.jsonl")), capture.sections)
+                != expected_pages
             )
         ):
             raise ValueError(

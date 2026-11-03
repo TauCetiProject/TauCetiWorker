@@ -589,7 +589,24 @@ def successful_read_pages(transcript: str, provider: str) -> set[int]:
     return pages
 
 
-def saved_read_pages(rollouts: list[Path]) -> set[int]:
+def tool_texts(value):
+    if isinstance(value, str):
+        yield value
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return
+        yield from tool_texts(decoded)
+    elif isinstance(value, list):
+        for item in value:
+            yield from tool_texts(item)
+    elif isinstance(value, dict):
+        for key in ("text", "content", "result"):
+            if key in value:
+                yield from tool_texts(value[key])
+
+
+def saved_read_pages(rollouts: list[Path], expected_pages: list[list[dict]]) -> set[int]:
     """Find reads whose outputs are in the exact native history Codex will resume."""
     if len(rollouts) != 1:
         return set()
@@ -607,7 +624,20 @@ def saved_read_pages(rollouts: list[Path]) -> set[int]:
             if item.get("type") == "function_call_output" and "output" in item:
                 page = calls.get(item.get("call_id"))
                 if type(page) is int:
-                    pages.add(page)
+                    # A previous failed/skip-ahead call for this page can have
+                    # an error output in the native history. Require the actual
+                    # reader payload, rather than crediting any output by page.
+                    for text in tool_texts(item["output"]):
+                        try:
+                            delivered = json.loads(text)
+                            if (
+                                0 <= page < len(expected_pages)
+                                and delivered.get("page") == page
+                                and delivered.get("sections") == expected_pages[page]
+                            ):
+                                pages.add(page)
+                        except (ValueError, TypeError, AttributeError, KeyError):
+                            continue
         except (ValueError, TypeError, AttributeError, KeyError):
             continue  # A partial/malformed native row provides no read evidence.
     return pages
@@ -882,7 +912,8 @@ def reconcile_coverage(work: Path, batch: dict) -> dict:
         raise Die("security-audit: invalid served coverage checkpoint")
     before_path = work / "coverage-before-launch.json"
     save(before_path, value["before"])
-    before = Reader(batch, before_path).coverage()
+    before_reader = Reader(batch, before_path)
+    before = before_reader.coverage()
     transcript = work / "model-transcript.jsonl"
     successful = (
         successful_read_pages(transcript.read_text(encoding="utf-8", errors="replace"), value["provider"])
@@ -890,7 +921,7 @@ def reconcile_coverage(work: Path, batch: dict) -> dict:
         else set()
     )
     if value["provider"] == "codex":
-        successful &= saved_read_pages(native_rollouts(work))
+        successful &= saved_read_pages(native_rollouts(work), before_reader.pages)
     receipt = work / "read-receipt.json"
     with receipt.with_suffix(".lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
