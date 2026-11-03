@@ -21,6 +21,22 @@ loader.exec_module(gate)
 
 
 class LeanPressure(unittest.TestCase):
+    def test_optional_observer_permissions_do_not_fail_compilation(self):
+        with patch.object(gate, "Path", side_effect=PermissionError("inaccessible observer")):
+            self.assertIsNone(gate.Trace().client)
+
+    def test_language_server_does_not_pollute_compilation_timings(self):
+        with (
+            patch.object(gate, "real_lean", return_value=Path("/real/lean")),
+            patch.object(gate, "Trace") as trace,
+            patch.object(gate, "wait_for_capacity") as wait,
+            patch.object(gate, "exec_lean", side_effect=SystemExit(0)),
+        ):
+            with self.assertRaises(SystemExit):
+                gate.main(["--server"])
+            trace.assert_not_called()
+            wait.assert_called_once()
+
     def setUp(self):
         for name in ("SIGPIPE", "SIGXFSZ"):
             if number := getattr(gate.signal, name, None):

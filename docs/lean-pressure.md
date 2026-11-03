@@ -31,13 +31,26 @@ Missing or invalid pressure observations prevent a compilation with a clear erro
 Normal waits are silent so `lake build --iofail` continues to work; set
 `TAUCETI_LEAN_PRESSURE_DEBUG=1` for wait diagnostics during manual investigation.
 
+When a Fleet timing collector is available, the helper reports pressure wait
+reasons and the transition to execution over a local Unix socket. The socket
+survives `exec`; its closure measures compiler elapsed time without adding a
+parent process or changing signals, output, arguments, or exit status. Collection
+is optional: a missing, full, or failed observer never blocks compilation.
+The normal initial CPU measurement is recorded separately from time blocked on
+capacity. Metadata probes are excluded. Fleet reports summed capacity-wait time
+divided by summed capacity-wait plus execution time, including active waits;
+parallel invocations contribute separate elapsed seconds. Wait quantiles use
+bounded histograms of admitted invocations that actually waited. Existing
+processes are reported separately until they acquire instrumentation.
+
 Worker toolchains are left untouched. The worker's PATH alias catches direct
 `lean` commands, and the toolchain overlay catches Lake's compiler invocations.
 
 TauCetiFleet vendors the standalone helper and installs it, its environment, and
 the Bash startup hook into each new CI guest. The hook wraps only the disposable
-watchdog's `bin/lean-real` symlink after it has been prepared, pointing directly
-at the official compiler. It leaves official compiler files and their
+watchdog's `bin/lean` entry point after it has been prepared. Capacity waits
+precede the watchdog's execution deadline, while its `lean-real` symlink still
+points at the official compiler. It leaves official compiler files and their
 snapshot manifests untouched. This catches compilation inside sandboxes that
 clear their environment without invalidating the official toolchain cache.
 The hook is idempotent, guards against recursive shell startup, and warns on
