@@ -2185,9 +2185,11 @@ def run_in_bubble(
     (rounddir / "prompt.txt").write_text(prompt)
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
-    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
+    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh", "tauceti-lean"):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
+    shutil.copy(HERE / "scripts/tauceti-lean", rounddir / "lean")
+    (rounddir / "lean").chmod(0o755)
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
     # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
@@ -2312,6 +2314,7 @@ def run_in_bubble(
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache"
+    tcenv += " LAKE_OVERRIDE_LEAN=true LEAN=/opt/round/tauceti-lean"
     if inner_cmd is None:
         for key, value in _foreground_shell_env(
             getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)

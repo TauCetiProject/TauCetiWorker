@@ -1784,6 +1784,17 @@ def cli_main() -> int:
     if ensure_ssl_cert_file() is None:
         log("no system CA bundle found; set SSL_CERT_FILE if TLS verification fails")
     _ensure_scripts_executable()
+    if sys.platform == "linux":
+        os.environ.pop("LEAN_SYSROOT", None)
+        os.environ["LAKE_OVERRIDE_LEAN"] = "true"
+        os.environ["LEAN"] = str(HERE / "scripts/tauceti-lean")
+        os.environ["PATH"] = str(HERE / "scripts") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["TAUCETI_LEAN_WRAPPER"] = os.environ["LEAN"]
+        startup = str(HERE / "scripts/tauceti-lean-env")
+        if previous := os.environ.get("BASH_ENV"):
+            if previous != startup:
+                os.environ["TAUCETI_PREVIOUS_BASH_ENV"] = previous
+        os.environ["BASH_ENV"] = startup
     from .github_transport import blocking_event_since
 
     started = time.time()
@@ -1869,6 +1880,8 @@ def _ensure_scripts_executable() -> None:
         "tauceti-verify",
         "tauceti-local-axioms",
         "tauceti-local-lint",
+        "tauceti-lean",
+        "lean",
     ):
         p = HERE / "scripts" / f
         try:

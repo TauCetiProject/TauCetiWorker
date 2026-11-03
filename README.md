@@ -83,6 +83,7 @@ instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
 
 Local checks use [concurrent verification with exact-input receipts](docs/verification.md).
+Linux workers also [wait for spare RAM and CPU before launching Lean](docs/lean-pressure.md).
 
 ### Multiple GitHub accounts
 
