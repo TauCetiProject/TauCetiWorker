@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -171,6 +172,7 @@ SERVED_COMPACTION_POLICY = COMPACTION_POLICY.replace(
 SERVED_MODEL_PROMPT = MODEL_PROMPT.replace("next_unread_page", "next_unserved_page").replace(
     "The Worker independently verifies coverage", "The Worker tracks served coverage"
 )
+SERVED_CLAUDE_PROMPT = V2_MODEL_PROMPT
 SERVED_CODEX_CATALOG = copy.deepcopy(CODEX_CATALOG)
 SERVED_CODEX_CATALOG["models"][0]["model_messages"]["instructions_template"] = (
     SERVED_MODEL_PROMPT + SERVED_COMPACTION_POLICY + SERVED_GOAL_REQUEST
@@ -394,7 +396,7 @@ def reviewer_argv(provider: str, *, goals: bool = True, protocol: int = 3) -> li
             "--permission-mode",
             "dontAsk",
             "--append-system-prompt",
-            SERVED_MODEL_PROMPT + SERVED_COMPACTION_POLICY if protocol == 4 else MODEL_PROMPT + COMPACTION_POLICY,
+            SERVED_CLAUDE_PROMPT + SERVED_COMPACTION_POLICY if protocol == 4 else MODEL_PROMPT + COMPACTION_POLICY,
         ]
     if provider == "codex":
         cmd = [
@@ -776,6 +778,42 @@ def retain_client(work: Path, home: Path, receipt: Path) -> None:
         (work / f"model-rollout-{i}.jsonl").write_bytes(rollout.read_bytes())
 
 
+def restore_interrupted_coverage(work: Path, batch: dict) -> bool:
+    """Discard served credit from an interrupted client call, never its findings.
+
+    Trust normal completed client calls. A pipe write alone is insufficient after
+    a crash: replay the call's new chunks in the SAME retained conversation.
+    """
+    from .audit_reader import Reader
+
+    checkpoint = work / "coverage-launch.json"
+    if not checkpoint.exists():
+        raise Die("security-audit: missing served coverage checkpoint")
+    value = json.loads(checkpoint.read_text())
+    if not isinstance(value, dict) or set(value) != {"completed", "transcript_digest", "before"}:
+        raise Die("security-audit: invalid served coverage checkpoint")
+    if type(value["completed"]) is not bool:
+        raise Die("security-audit: invalid served coverage checkpoint")
+    # Validate the saved receipt with the same strict reader checks before using
+    # it. Never invent progress from an invalid or unrelated checkpoint.
+    before_path = work / "coverage-before-launch.json"
+    save(before_path, value["before"])
+    before = Reader(batch, before_path).coverage()
+    transcript = work / "model-transcript.jsonl"
+    if value["completed"]:
+        if (
+            not transcript.is_file()
+            or hashlib.sha256(transcript.read_bytes()).hexdigest() != value["transcript_digest"]
+        ):
+            raise Die("security-audit: completed served coverage transcript changed")
+        return True
+    receipt = work / "read-receipt.json"
+    with receipt.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        save(receipt, before)
+    return False
+
+
 def strip_recovery_prefixes(prompt: str, work: Path, batch: dict, *, protocol=3) -> str:
     prefixes = [
         OUTPUT_REPAIR_PROMPT,
@@ -857,11 +895,18 @@ def run_client(
             len(OUTPUT_REPAIR_PROMPT) if base_prompt.startswith(OUTPUT_REPAIR_PROMPT) else len(CONTINUE_PROMPT) :
         ]
     for number in range(3):
-        if protocol == 4:
+        if protocol == 4 and number:
             from .audit_clients import selected_protocol
 
             if selected_protocol(provider, work.parent) != 4:
                 raise Die("security-audit: protocol 4 requires client delivery verification for this release")
+        if protocol == 4:
+            from .audit_reader import Reader
+
+            checkpoint = {"before": Reader(batch, receipt).coverage(), "completed": False, "transcript_digest": None}
+            save(work / "coverage-launch.json", checkpoint)
+            # A stale completed transcript must never describe the next launch.
+            (work / "model-transcript.jsonl").write_text("")
         (work / "prompt.txt").write_text(prompt)
         (work / "execution.json").write_text(
             serialize(
@@ -912,6 +957,20 @@ def run_client(
             retain_client(work, home, receipt)
         if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
             raise Die("security-audit: resumed client changed the retained conversation identity")
+        if protocol == 4 and not result.returncode:
+            try:
+                if provider == "codex":
+                    codex_final(result.stdout, paged)
+                else:
+                    results = [e for e in map(json.loads, result.stdout.splitlines()) if e.get("type") == "result"]
+                    if len(results) != 1 or results[0].get("is_error") or results[0].get("subtype") != "success":
+                        raise ValueError("client did not complete")
+                checkpoint.update(completed=True, transcript_digest=hashlib.sha256(result.stdout.encode()).hexdigest())
+                save(work / "coverage-launch.json", checkpoint)
+            except (Die, ValueError, TypeError, AttributeError):
+                pass  # Recovery rolls back this launch's served credit.
+        if protocol == 4:
+            restore_interrupted_coverage(work, batch)
         error = (
             codex_service_error(
                 result.stdout,
@@ -1073,8 +1132,15 @@ def validate_output_profile(
                 raise Die("security-audit: invalid retained reader bootstrap token")
         if len(args) != (4 if protocol == 4 else 5) or args[0] != "-I" or not Path(args[1]).is_absolute():
             raise Die("security-audit: retained reader arguments changed")
-        if hashlib.sha256(Path(args[1]).read_bytes()).hexdigest() != execution.get("reader_digest"):
-            raise Die("security-audit: retained reader script changed")
+        try:
+            recorded_digest = hashlib.sha256(Path(args[1]).read_bytes()).hexdigest()
+        except OSError:
+            recorded_digest = None
+        if recorded_digest != execution.get("reader_digest"):
+            # A release may be pruned or updated in place. The frozen reader is
+            # a valid replacement only when its bytes match the recorded digest.
+            if hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest() != execution.get("reader_digest"):
+                raise Die("security-audit: retained reader script changed")
         # Relocating an immutable Worker release may relocate this same reader.
         args[1] = str(reader_path(protocol))
         argv[argv.index(candidates[0])] = "mcp_servers.audit.args=" + json.dumps(args)
@@ -1175,6 +1241,10 @@ def inspect(
         if protocol is not None and protocol != retained_protocol:
             raise Die("security-audit: cannot change a retained inspection protocol")
         protocol = retained_protocol
+        if protocol == 4:
+            restore_interrupted_coverage(resume_from, batch)
+            if selected_protocol(provider, work.parent) != 4:
+                raise NoProgress("security-audit: awaiting client delivery verification")
     elif protocol is None:
         protocol = selected_protocol(provider, work.parent)
     if protocol not in (3, 4):
@@ -1236,7 +1306,13 @@ def inspect(
         if not dest.is_file():
             raise Die("security-audit: no usable subscription access token available")
         dest.chmod(0o600)
-        policy = SERVED_MODEL_PROMPT if protocol == 4 else MODEL_PROMPT if provider == "codex" else V2_MODEL_PROMPT
+        policy = (
+            (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+            if protocol == 4
+            else MODEL_PROMPT
+            if provider == "codex"
+            else V2_MODEL_PROMPT
+        )
         prompt = inspection_prompt(batch, False, policy=policy, goals=provider == "codex", protocol=protocol)
         schema_value = MODEL_SCHEMA
         receipt = (work / "read-receipt.json").resolve()
@@ -1519,7 +1595,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     log(f"security-audit: isolated reviewer {provider}/{model}")
     try:
         if any(c["files"] for c in batch["commits"]):
-            verdict = inspect(batch, provider, attempt, **({"protocol": 4} if protocol == 4 else {}))
+            verdict = inspect(batch, provider, attempt, protocol=protocol)
         else:
             verdict = {
                 "input_digest": batch["input_digest"],

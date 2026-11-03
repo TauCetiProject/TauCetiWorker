@@ -7,6 +7,7 @@ successful capture is client-coverage.json written. Never uses subscription keys
 from __future__ import annotations
 
 import argparse
+import fcntl
 import gzip
 import hashlib
 import json
@@ -290,9 +291,11 @@ def verify(provider: str, state: Path):
         raise ValueError("client changed during verification")
     state.mkdir(parents=True, exist_ok=True)
     path = state / clients.RECORD
-    value = json.loads(path.read_text()) if path.exists() else {}
-    value[provider] = {"protocol_version": 4, "fingerprint": after, "intact": True}
-    save(path, value)
+    with path.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        value = json.loads(path.read_text()) if path.exists() else {}
+        value[provider] = {"protocol_version": 4, "fingerprint": after, "intact": True}
+        save(path, value)
     print(
         f"{provider}: complete source of all {len(capture.expected)} chunks captured at the test endpoint; saved {path}"
     )

@@ -222,6 +222,9 @@ rejects skipping ahead. The complete encoded tool response is capped at 64 KiB,
 with headroom under the configured 120k output allowance. It validates size and
 flushes the response before atomically recording served coverage. Failed writes
 receive no credit; a crash before the receipt is committed can require a reread.
+The Worker also saves coverage before each client call. If that call times out,
+fails or is interrupted, recovery discards its new served credit and rereads those
+chunks in the same conversation. Earlier findings and uncertainty are preserved.
 
 Protocol 4 trusts the verified client to deliver successful tool responses intact.
 Served coverage proves neither model receipt nor understanding. The same isolated

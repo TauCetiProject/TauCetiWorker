@@ -519,6 +519,20 @@ class WorkerBoundJudgments(unittest.TestCase):
             self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
         model.assert_not_called()
 
+    def test_old_reader_path_can_be_pruned_or_updated_when_frozen_bytes_match(self):
+        execution_path = self.original / "execution.json"
+        execution = json.loads(execution_path.read_text())
+        index = next(i for i, arg in enumerate(execution["argv"]) if arg.startswith("mcp_servers.audit.args="))
+        args = json.loads(execution["argv"][index].split("=", 1)[1])
+        old_reader = self.work / "old-release" / "audit_reader.py"
+        args[1] = str(old_reader)
+        execution["argv"][index] = "mcp_servers.audit.args=" + json.dumps(args)
+        execution_path.write_text(sa.serialize(execution))
+        recovery.retained(self.work, self.block)
+        old_reader.parent.mkdir()
+        old_reader.write_bytes(sa.reader_path(4).read_bytes())
+        recovery.retained(self.work, self.block)
+
     def test_public_answer_must_match_the_native_final(self):
         history = self.original / "model-rollout-0.jsonl"
         history.write_text(history.read_text().splitlines()[0] + "\n")
@@ -2384,7 +2398,7 @@ class Run(unittest.TestCase):
         }
         (work / "blocked.json").write_text(sa.serialize(block))
 
-        def inspection(*args):
+        def inspection(*args, protocol):
             archived = list(work.glob("superseded-size-block-*.json"))
             self.assertEqual(len(archived), 1)
             self.assertEqual(json.loads(archived[0].read_text()), block)

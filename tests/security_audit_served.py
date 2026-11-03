@@ -142,7 +142,20 @@ class ServedJudgments(unittest.TestCase):
         verified.start()
         self.addCleanup(verified.stop)
 
-    replace_answer = historical.WorkerBoundJudgments.replace_answer
+    def replace_answer(self, value):
+        historical.WorkerBoundJudgments.replace_answer(self, value)
+        receipt = ar.Reader(self.batch, self.original / "read-receipt.json").coverage()
+        (self.original / "coverage-launch.json").write_text(
+            sa.serialize(
+                {
+                    "completed": True,
+                    "before": receipt,
+                    "transcript_digest": hashlib.sha256(
+                        (self.original / "model-transcript.jsonl").read_bytes()
+                    ).hexdigest(),
+                }
+            )
+        )
 
     def evidence(self, *, verdict="unfinished", findings=None, original=None):
         a = original or self.original
@@ -240,20 +253,93 @@ class ServedJudgments(unittest.TestCase):
         with self.assertRaisesRegex(Die, "unavailable in protocol 4"):
             sa.inspect(self.batch, "codex", self.work, protocol=4, repair_output=True)
         with patch.object(clients, "selected_protocol", return_value=3), patch.object(sa, "run_process") as model:
-            with self.assertRaisesRegex(Die, "delivery verification"):
-                sa.run_client(
-                    [],
-                    "",
-                    home=self.original,
+            with self.assertRaisesRegex(NoProgress, "delivery verification"):
+                sa.inspect(self.batch, "codex", self.work, resume_from=self.original)
+        model.assert_not_called()
+
+    def test_missing_verification_does_not_reserve_quota_or_a_recovery_attempt(self):
+        ledger = (self.work / "ledger.jsonl").read_bytes()
+        with (
+            patch.object(clients, "selected_protocol", return_value=3),
+            patch("tauceti_worker.loop.resolve_work_model") as quota,
+            patch.object(sa, "inspect") as model,
+            self.assertRaisesRegex(NoProgress, "awaiting client"),
+        ):
+            recovery.recover(self.cfg, self.opts, self.block)
+        quota.assert_not_called()
+        model.assert_not_called()
+        self.assertFalse((self.work / "operational-recovery.json").exists())
+        self.assertEqual((self.work / "ledger.jsonl").read_bytes(), ledger)
+
+    def test_crash_after_pipe_write_rolls_back_new_coverage_without_losing_findings(self):
+        before = ar.Reader(self.batch, self.original / "read-receipt.json").coverage()
+        self.all_served()
+        self.replace_answer({"verdict": "pass", "findings": []})
+        # The client died before its new tool result reached a completed turn.
+        (self.original / "coverage-launch.json").write_text(
+            sa.serialize(
+                {
+                    "before": before,
+                    "completed": False,
+                    "transcript_digest": None,
+                }
+            )
+        )
+        self.assertIsNone(recovery.completed_pass(self.original, self.batch, {"protocol_version": 4, "paged": True}))
+        self.assertEqual(ar.Reader(self.batch, self.original / "read-receipt.json").coverage(), before)
+        prompt = progress.snapshot(self.batch, self.original / "read-receipt.json", self.original, protocol=4)
+        self.assertIn("next_unserved_page=1", prompt)
+        self.assertNotIn("All chunks were served", prompt)
+        # Source judgments are retained even though coverage rolls back.
+        self.replace_answer({"verdict": "finding", "findings": ["Possible IO before interruption"]})
+        with patch.object(sa, "inspect") as model:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+
+    def test_timeout_and_nonzero_exit_cannot_credit_fresh_served_chunks(self):
+        for kind in ("timeout", "nonzero"):
+            attempt = self.work / ("attempt-" + kind)
+            attempt.mkdir()
+            home = attempt / "isolated"
+            home.mkdir()
+            receipt = attempt / "read-receipt.json"
+
+            def model(argv, *, kind=kind, receipt=receipt, home=home, **kwargs):
+                r = ar.Reader(self.batch, receipt)
+                for page in range(len(r.pages)):
+                    r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+                value = {"verdict": "pass", "findings": []}
+                historical.append_native(home, value, self.thread)
+                if kind == "timeout":
+                    raise subprocess.TimeoutExpired("codex", 1800, output=b"")
+                events = [
+                    {"type": "thread.started", "thread_id": self.thread},
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                    {"type": "turn.completed"},
+                ]
+                return SimpleNamespace(
+                    returncode=1, stdout="\n".join(map(sa.serialize, events)), stderr="client failed"
+                )
+
+            with patch.object(sa, "run_process", side_effect=model):
+                kwargs = dict(
+                    home=home,
                     env={},
-                    work=self.original,
-                    receipt=self.original / "read-receipt.json",
+                    work=attempt,
+                    receipt=receipt,
                     provider="codex",
                     paged=True,
                     batch=self.batch,
                     protocol=4,
                 )
-        model.assert_not_called()
+                if kind == "timeout":
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        sa.run_client(["codex", "exec", "-"], "", **kwargs)
+                else:
+                    self.assertEqual(sa.run_client(["codex", "exec", "-"], "", **kwargs).returncode, 1)
+            self.assertFalse(sa.restore_interrupted_coverage(attempt, self.batch))
+            self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], [])
+            self.assertIsNone(recovery.completed_pass(attempt, self.batch, {"protocol_version": 4, "paged": True}))
 
     def test_wrong_native_conversation_and_extra_final_fields_block_approval(self):
         self.all_served()
@@ -378,6 +464,16 @@ class FreshRun(unittest.TestCase):
         self.assertEqual(row["protocol_version"], 4)
         self.assertEqual(row["reader_digest"], sa.inspection_profile(4)["reader_digest"])
         self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.SERVED_MODEL_PROMPT.encode()).hexdigest())
+
+    def test_protocol_selection_is_passed_once_even_if_verification_changes(self):
+        with (
+            patch.object(clients, "selected_protocol", side_effect=[3, 4]) as selected,
+            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
+            patch.object(sa, "advance", return_value=self.target),
+        ):
+            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
+        selected.assert_called_once()
+        self.assertEqual(model.call_args.kwargs, {"protocol": 3})
 
 
 class ClientCompatibility(unittest.TestCase):

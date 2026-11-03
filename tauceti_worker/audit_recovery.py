@@ -233,6 +233,8 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
     sa.validate_output_profile(
         execution, original, batch, policy_prompt=policy, durable=version != 1, goals=version >= 3, protocol=version
     )
+    if version == 4:
+        sa.restore_interrupted_coverage(original, batch)
     paged = len(sa.serialize(batch).encode()) > sa.INLINE_BYTES
     if version == 2 and paged and (original / "model-transcript.jsonl").exists():
         transcript = (original / "model-transcript.jsonl").read_text()
@@ -286,6 +288,8 @@ def completed_pass(original: Path, batch: dict, execution: dict) -> dict | None:
         return None
     protocol = execution["protocol_version"]
     try:
+        if protocol == 4 and not sa.restore_interrupted_coverage(original, batch):
+            return None
         transcript = (original / "model-transcript.jsonl").read_text()
         events = sa.codex_events(transcript, execution["paged"])
         if [e.get("thread_id") for e in events if e.get("type") == "thread.started"] != [sa.retained_thread(original)]:
@@ -417,6 +421,11 @@ def recover(cfg, opts, previous: dict) -> bool:
         log("security-audit: revalidated retained completed pass; no model request needed")
         finish_pass(work, batch, evidence, completed)
         return True
+    if protocol == 4:
+        from .audit_clients import selected_protocol
+
+        if selected_protocol("codex", work) != 4:
+            raise NoProgress("security-audit: awaiting client delivery verification")
     state_path = work / "operational-recovery.json"
     try:
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
