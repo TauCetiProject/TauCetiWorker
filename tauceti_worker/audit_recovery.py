@@ -170,7 +170,10 @@ def mechanical_output(
 
 
 def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tuple[Path, dict, dict, bool]:
-    """Check owned input, launcher, lineage and all prior judgments before any model call."""
+    """Validate a stopped attempt, rolling back interrupted protocol-4 coverage.
+
+    Recovery owns this state. Do not call on a live attempt or from status readers.
+    """
     from . import security_audit as sa
 
     original = Path(previous["attempt"]).resolve()

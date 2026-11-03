@@ -537,6 +537,59 @@ def codex_final(transcript: str, paged: bool) -> dict:
     return json.loads(messages[-1][1])
 
 
+def successful_read_pages(transcript: str, provider: str) -> set[int]:
+    """Read ordinary client success reports; these are not model acknowledgments."""
+    events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+    pages = set()
+    calls = {}
+    for event in events:
+        if provider == "codex":
+            item = event.get("item", {})
+            if (
+                event.get("type") != "item.completed"
+                or item.get("type") != "mcp_tool_call"
+                or item.get("server") != "audit"
+                or item.get("tool") != "read_page"
+            ):
+                continue
+            if (
+                item.get("status") != "completed"
+                or item.get("error")
+                or not isinstance(item.get("result"), dict)
+                or item["result"].get("isError")
+            ):
+                continue
+            page = item.get("arguments", {}).get("page")
+            if type(page) is int:
+                pages.add(page)
+        else:
+            for item in event.get("message", {}).get("content", []):
+                if not isinstance(item, dict):
+                    continue
+                if (
+                    event.get("type") == "assistant"
+                    and item.get("type") == "tool_use"
+                    and item.get("name") == "mcp__audit__read_page"
+                ):
+                    calls[item["id"]] = item.get("input", {}).get("page")
+                if event.get("type") == "user" and item.get("type") == "tool_result" and not item.get("is_error"):
+                    page = calls.get(item.get("tool_use_id"))
+                    if type(page) is int:
+                        pages.add(page)
+    return pages
+
+
+def claude_result(transcript: str) -> dict:
+    events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+    results = [e for e in events if e.get("type") == "result"]
+    if len(results) != 1:
+        raise Die("security-audit: missing final reviewer result")
+    result = results[0]
+    if result.get("is_error") or result.get("subtype") not in (None, "success"):
+        raise Die("security-audit: reviewer failed")
+    return result
+
+
 def repair_shape(value: dict, batch: dict, paged: bool) -> bool:
     if not isinstance(value, dict) or value.get("findings") != []:
         return False
@@ -951,7 +1004,7 @@ def run_client(
             )
             raise
         else:
-            (work / "model-transcript.jsonl").write_text(result.stdout)
+            (work / "model-transcript.jsonl").write_bytes(result.stdout.encode())
             (work / "model-stderr.txt").write_text(result.stderr)
         finally:
             retain_client(work, home, receipt)
@@ -962,9 +1015,12 @@ def run_client(
                 if provider == "codex":
                     codex_final(result.stdout, paged)
                 else:
-                    results = [e for e in map(json.loads, result.stdout.splitlines()) if e.get("type") == "result"]
-                    if len(results) != 1 or results[0].get("is_error") or results[0].get("subtype") != "success":
-                        raise ValueError("client did not complete")
+                    claude_result(result.stdout)
+                from .audit_reader import Reader
+
+                newly_served = set(Reader(batch, receipt).coverage()["served"]) - set(checkpoint["before"]["served"])
+                if not newly_served <= successful_read_pages(result.stdout, provider):
+                    raise Die("security-audit: client did not report successful reads for new chunks")
                 checkpoint.update(completed=True, transcript_digest=hashlib.sha256(result.stdout.encode()).hexdigest())
                 save(work / "coverage-launch.json", checkpoint)
             except (Die, ValueError, TypeError, AttributeError):
@@ -1399,13 +1455,7 @@ def inspect(
                             {"StructuredOutput", "mcp__audit__read_page"} if paged else {"StructuredOutput"}
                         ):
                             raise Die("security-audit: reviewer attempted an unauthorized tool call")
-            results = [e for e in events if e.get("type") == "result"]
-            if len(results) != 1:
-                raise Die("security-audit: missing final reviewer result")
-            result = results[0]
-            if result.get("is_error") or result.get("subtype") not in (None, "success"):
-                raise Die("security-audit: reviewer failed")
-            value = result.get("structured_output")
+            value = claude_result(p.stdout).get("structured_output")
         else:
             value = codex_final(p.stdout, paged)
         if paged and isinstance(value, dict) and value.get("verdict") == "unfinished":
@@ -1611,7 +1661,11 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
                 "model": model,
                 "batch": batch["input_digest"],
                 "prompt_digest": hashlib.sha256(
-                    (SERVED_MODEL_PROMPT if protocol == 4 else MODEL_PROMPT).encode()
+                    (
+                        (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+                        if protocol == 4
+                        else MODEL_PROMPT
+                    ).encode()
                 ).hexdigest(),
                 "protocol_version": protocol,
                 "launcher_profile": reviewer_argv(provider, protocol=protocol),

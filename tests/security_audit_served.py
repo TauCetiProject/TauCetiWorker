@@ -24,6 +24,54 @@ from tauceti_worker import security_audit as sa
 from tauceti_worker.config import Die, NoProgress
 
 
+def read_events(provider, pages, *, failed=False):
+    events = []
+    for page in pages:
+        if provider == "codex":
+            events.append(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": str(page),
+                        "type": "mcp_tool_call",
+                        "server": "audit",
+                        "tool": "read_page",
+                        "arguments": {"page": page},
+                        "status": "failed" if failed else "completed",
+                        "error": {"message": "client timeout"} if failed else None,
+                        "result": None if failed else {"content": []},
+                    },
+                }
+            )
+        else:
+            events.extend(
+                [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": str(page),
+                                    "name": "mcp__audit__read_page",
+                                    "input": {"page": page},
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": str(page), "is_error": failed, "content": []}
+                            ]
+                        },
+                    },
+                ]
+            )
+    return events
+
+
 class NumberedReader(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -296,8 +344,8 @@ class ServedJudgments(unittest.TestCase):
             self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
         model.assert_not_called()
 
-    def test_timeout_and_nonzero_exit_cannot_credit_fresh_served_chunks(self):
-        for kind in ("timeout", "nonzero"):
+    def test_interrupted_or_failed_client_reads_cannot_credit_fresh_chunks(self):
+        for kind in ("timeout", "nonzero", "failed-tool"):
             attempt = self.work / ("attempt-" + kind)
             attempt.mkdir()
             home = attempt / "isolated"
@@ -318,13 +366,17 @@ class ServedJudgments(unittest.TestCase):
                     {"type": "turn.completed"},
                 ]
                 return SimpleNamespace(
-                    returncode=1, stdout="\n".join(map(sa.serialize, events)), stderr="client failed"
+                    returncode=0 if kind == "failed-tool" else 1,
+                    stdout="\n".join(
+                        map(sa.serialize, read_events("codex", range(len(r.pages)), failed=True) + events)
+                    ),
+                    stderr="client failed",
                 )
 
-            with patch.object(sa, "run_process", side_effect=model):
+            with patch.object(sa, "run_process", side_effect=model), patch.object(sa.time, "sleep"):
                 kwargs = dict(
                     home=home,
-                    env={},
+                    env={"CODEX_SQLITE_HOME": str(home)},
                     work=attempt,
                     receipt=receipt,
                     provider="codex",
@@ -336,10 +388,28 @@ class ServedJudgments(unittest.TestCase):
                     with self.assertRaises(subprocess.TimeoutExpired):
                         sa.run_client(["codex", "exec", "-"], "", **kwargs)
                 else:
-                    self.assertEqual(sa.run_client(["codex", "exec", "-"], "", **kwargs).returncode, 1)
+                    self.assertEqual(
+                        sa.run_client(["codex", "exec", "-"], "", **kwargs).returncode,
+                        0 if kind == "failed-tool" else 1,
+                    )
             self.assertFalse(sa.restore_interrupted_coverage(attempt, self.batch))
             self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], [])
             self.assertIsNone(recovery.completed_pass(attempt, self.batch, {"protocol_version": 4, "paged": True}))
+
+    def test_completed_launch_transcript_cannot_be_replaced(self):
+        transcript = self.original / "model-transcript.jsonl"
+        transcript.write_bytes(transcript.read_bytes() + b"\n")
+        with self.assertRaisesRegex(Die, "transcript changed"):
+            sa.restore_interrupted_coverage(self.original, self.batch)
+
+    def test_client_reports_must_confirm_read_success(self):
+        for provider in ("codex", "claude"):
+            for failed in (False, True):
+                transcript = "\n".join(map(sa.serialize, read_events(provider, [0, 1], failed=failed)))
+                self.assertEqual(sa.successful_read_pages(transcript, provider), set() if failed else {0, 1})
+        # Both completion paths accept blank lines and an omitted legacy subtype.
+        transcript = '\n{"type":"result","structured_output":{"verdict":"pass","findings":[]}}\n\n'
+        self.assertEqual(sa.claude_result(transcript)["structured_output"]["verdict"], "pass")
 
     def test_wrong_native_conversation_and_extra_final_fields_block_approval(self):
         self.all_served()
@@ -394,6 +464,7 @@ class ServedJudgments(unittest.TestCase):
                     ]
                 else:
                     events = [{"type": "result", "subtype": "success", "structured_output": value}]
+                events = read_events(provider, range(len(r.pages))) + events
                 return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
             with (
@@ -428,6 +499,7 @@ class ServedJudgments(unittest.TestCase):
                 {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
                 {"type": "turn.completed"},
             ]
+            events = read_events("codex", range(len(r.pages)) if calls == 4 else [0]) + events
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
@@ -464,6 +536,18 @@ class FreshRun(unittest.TestCase):
         self.assertEqual(row["protocol_version"], 4)
         self.assertEqual(row["reader_digest"], sa.inspection_profile(4)["reader_digest"])
         self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.SERVED_MODEL_PROMPT.encode()).hexdigest())
+
+    def test_fresh_claude_ledger_identifies_the_executed_prompt(self):
+        self.opts.work_model = "claude"
+        with (
+            patch.object(clients, "selected_protocol", return_value=4),
+            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}),
+            patch.object(sa, "advance", return_value=self.target),
+        ):
+            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
+        rows = list(map(json.loads, (self.state / sa.CURSOR / "ledger.jsonl").read_text().splitlines()))
+        row = next(r for r in rows if "verdict" in r)
+        self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.SERVED_CLAUDE_PROMPT.encode()).hexdigest())
 
     def test_protocol_selection_is_passed_once_even_if_verification_changes(self):
         with (

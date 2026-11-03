@@ -31,7 +31,9 @@ and integration tests. No client patches or new acknowledgment protocol.
 3. **Retain ordinary progress records.** Keep the existing private receipt tied
    to the immutable input and retained inspection. Record served chunk numbers
    atomically. Rereads do not count as new progress. A crash can require rereading
-   a chunk; recovery must not manufacture coverage. Call this served coverage,
+   a chunk; recovery must not manufacture coverage. Keep new coverage only after
+   the client completes its turn and reports successful reads for those chunks.
+   Call this served coverage,
    rather than proof of delivery or review.
 
 4. **Simplify verdict validation.** Require only `verdict` and `findings` from

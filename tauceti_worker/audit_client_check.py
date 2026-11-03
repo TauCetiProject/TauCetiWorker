@@ -281,7 +281,17 @@ def verify(provider: str, state: Path):
             server.shutdown()
             server.server_close()
             thread.join()
-        if result.returncode or capture.error or capture.received != set(range(len(capture.expected))):
+        expected_pages = set(range(len(capture.expected)))
+        if provider == "codex":
+            sa.codex_final(result.stdout, True)
+        else:
+            sa.claude_result(result.stdout)
+        if (
+            result.returncode
+            or capture.error
+            or capture.received != expected_pages
+            or sa.successful_read_pages(result.stdout, provider) != expected_pages
+        ):
             raise ValueError(
                 f"{provider} delivery check failed: {capture.error or result.stderr[-1200:]} "
                 f"({len(capture.received)}/{len(capture.expected)} chunks)"
