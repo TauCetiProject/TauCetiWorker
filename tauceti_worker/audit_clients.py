@@ -7,11 +7,13 @@ source approval. Missing or stale evidence leaves new inspections on protocol 3.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 RECORD = "client-coverage.json"
@@ -62,15 +64,67 @@ def fingerprint(provider: str) -> dict:
     }
 
 
-def selected_protocol(provider: str, state: Path) -> int:
-    try:
+def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int:
+    """Refresh compatibility locally when needed, with one cached failure per client."""
+    from .audit_alerts import save
+    from .config import Die, log
+
+    def verified(expected):
         record = state / RECORD
-        if record.is_symlink() or record.stat().st_uid != os.getuid() or record.stat().st_mode & 0o022:
-            return 3
-        value = json.loads(record.read_text())
+        try:
+            if record.is_symlink() or record.stat().st_uid != os.getuid() or record.stat().st_mode & 0o022:
+                return False
+            value = json.loads(record.read_text())
+            return value.get(provider) == {"protocol_version": 4, "fingerprint": expected, "intact": True}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+    try:
         expected = fingerprint(provider)
-        if value.get(provider) == {"protocol_version": 4, "fingerprint": expected, "intact": True}:
+        if verified(expected):
             return 4
-    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
-        pass
+        if not verify:
+            return 3
+        state.mkdir(parents=True, exist_ok=True)
+        # Separate from verify()'s short record-update lock: one probe at a time,
+        # without holding the lock the probe itself needs to save its result.
+        with (state / "client-coverage-check.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            expected = fingerprint(provider)
+            if verified(expected):
+                return 4
+            failures_path = state / "client-coverage-failures.json"
+            try:
+                failures = json.loads(failures_path.read_text())
+                if not isinstance(failures, dict):
+                    failures = {}
+            except (OSError, ValueError):
+                failures = {}
+            failed = failures.get(provider, {})
+            if (
+                isinstance(failed, dict)
+                and failed.get("fingerprint") == expected
+                and type(failed.get("retry_at")) in (int, float)
+                and failed["retry_at"] > time.time()
+            ):
+                return 3
+            log(f"security-audit: checking {provider} tool delivery at a local endpoint")
+            try:
+                from .audit_client_check import verify as check
+
+                check(provider, state)
+                if not verified(expected):
+                    raise ValueError("client changed or did not produce a matching record")
+            except (Die, OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+                failures[provider] = {"fingerprint": expected, "retry_at": time.time() + 300, "error": str(exc)}
+                save(failures_path, failures)
+                log(
+                    f"security-audit: {provider} delivery check failed; protocol 4 unavailable, retrying after 5 minutes: {exc}"
+                )
+                return 3
+            failures.pop(provider, None)
+            save(failures_path, failures)
+            return 4
+    except (Die, OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+        log(f"security-audit: {provider} delivery verification unavailable: {exc}")
     return 3

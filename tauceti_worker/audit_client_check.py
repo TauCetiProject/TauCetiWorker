@@ -12,7 +12,6 @@ import gzip
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import threading
@@ -276,7 +275,7 @@ def verify(provider: str, state: Path):
             )
             cmd += ["--allowedTools", "mcp__audit__read_page", "--json-schema", sa.serialize(sa.MODEL_SCHEMA)]
         try:
-            result = subprocess.run(cmd, input=prompt, cwd=home, env=env, capture_output=True, text=True, timeout=180)
+            result = sa.run_process(cmd, input=prompt, cwd=home, env=env, capture_output=True, text=True, timeout=180)
         finally:
             server.shutdown()
             server.server_close()
@@ -303,7 +302,12 @@ def verify(provider: str, state: Path):
     path = state / clients.RECORD
     with path.with_suffix(".lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        value = json.loads(path.read_text()) if path.exists() else {}
+        try:
+            value = json.loads(path.read_text())
+            if not isinstance(value, dict):
+                value = {}
+        except (OSError, ValueError):
+            value = {}
         value[provider] = {"protocol_version": 4, "fingerprint": after, "intact": True}
         save(path, value)
     print(

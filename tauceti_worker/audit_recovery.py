@@ -170,7 +170,7 @@ def mechanical_output(
 
 
 def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tuple[Path, dict, dict, bool]:
-    """Validate a stopped attempt, rolling back interrupted protocol-4 coverage.
+    """Validate a stopped attempt and reconcile protocol-4 client read reports.
 
     Recovery owns this state. Do not call on a live attempt or from status readers.
     """
@@ -237,7 +237,7 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
         execution, original, batch, policy_prompt=policy, durable=version != 1, goals=version >= 3, protocol=version
     )
     if version == 4:
-        sa.restore_interrupted_coverage(original, batch)
+        sa.reconcile_coverage(original, batch)
     paged = len(sa.serialize(batch).encode()) > sa.INLINE_BYTES
     if version == 2 and paged and (original / "model-transcript.jsonl").exists():
         transcript = (original / "model-transcript.jsonl").read_text()
@@ -291,8 +291,8 @@ def completed_pass(original: Path, batch: dict, execution: dict) -> dict | None:
         return None
     protocol = execution["protocol_version"]
     try:
-        if protocol == 4 and not sa.restore_interrupted_coverage(original, batch):
-            return None
+        if protocol == 4:
+            sa.reconcile_coverage(original, batch)
         transcript = (original / "model-transcript.jsonl").read_text()
         events = sa.codex_events(transcript, execution["paged"])
         if [e.get("thread_id") for e in events if e.get("type") == "thread.started"] != [sa.retained_thread(original)]:

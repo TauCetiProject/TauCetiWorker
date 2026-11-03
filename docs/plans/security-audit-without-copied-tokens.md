@@ -31,10 +31,11 @@ and integration tests. No client patches or new acknowledgment protocol.
 3. **Retain ordinary progress records.** Keep the existing private receipt tied
    to the immutable input and retained inspection. Record served chunk numbers
    atomically. Rereads do not count as new progress. A crash can require rereading
-   a chunk; recovery must not manufacture coverage. Keep new coverage only after
-   the client completes its turn and reports successful reads for those chunks.
-   Call this served coverage,
-   rather than proof of delivery or review.
+   a chunk; recovery must not manufacture coverage. Reconcile each launch's new
+   coverage with successful client tool-call reports, retaining the contiguous
+   confirmed prefix even after timeouts. Replay unconfirmed reads when no
+   transcript survives. Call this served coverage, rather than proof of delivery
+   or review.
 
 4. **Simplify verdict validation.** Require only `verdict` and `findings` from
    the model. The Worker attaches the batch identity. A pass requires complete
@@ -58,7 +59,9 @@ and integration tests. No client patches or new acknowledgment protocol.
   Unicode and heavily escaped text. Capture the actual reviewer request at a test
   endpoint and compare its complete source payload with the expected chunk.
   Public console output alone is insufficient. Require this test for supported
-  client upgrades; an unverified client keeps the existing protocol.
+  client upgrades. Run it automatically when missing or stale, serialize probes,
+  and cache failures briefly before retrying. A failed check keeps new inspections
+  on the existing protocol; retained inspections retry without changing protocol.
 - Test premature passes, missing chunks, findings before compaction, and retained
   conversation identity. Complete coverage must never override a source concern.
 - Run the security-audit regression suite and repository CI, then review the

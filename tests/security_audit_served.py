@@ -193,17 +193,7 @@ class ServedJudgments(unittest.TestCase):
     def replace_answer(self, value):
         historical.WorkerBoundJudgments.replace_answer(self, value)
         receipt = ar.Reader(self.batch, self.original / "read-receipt.json").coverage()
-        (self.original / "coverage-launch.json").write_text(
-            sa.serialize(
-                {
-                    "completed": True,
-                    "before": receipt,
-                    "transcript_digest": hashlib.sha256(
-                        (self.original / "model-transcript.jsonl").read_bytes()
-                    ).hexdigest(),
-                }
-            )
-        )
+        (self.original / "coverage-launch.json").write_text(sa.serialize({"before": receipt, "provider": "codex"}))
 
     def evidence(self, *, verdict="unfinished", findings=None, original=None):
         a = original or self.original
@@ -240,6 +230,11 @@ class ServedJudgments(unittest.TestCase):
         r = ar.Reader(self.batch, attempt / "read-receipt.json")
         for page in range(len(r.pages)):
             r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+
+        transcript = attempt / "model-transcript.jsonl"
+        transcript.write_text(
+            "\n".join(map(sa.serialize, read_events("codex", range(len(r.pages))))) + "\n" + transcript.read_text()
+        )
 
     def test_prompt_schema_and_launcher_contain_no_copied_identifiers(self):
         prompt = sa.inspection_prompt(self.batch, True, protocol=4)
@@ -328,8 +323,7 @@ class ServedJudgments(unittest.TestCase):
             sa.serialize(
                 {
                     "before": before,
-                    "completed": False,
-                    "transcript_digest": None,
+                    "provider": "codex",
                 }
             )
         )
@@ -392,15 +386,97 @@ class ServedJudgments(unittest.TestCase):
                         sa.run_client(["codex", "exec", "-"], "", **kwargs).returncode,
                         0 if kind == "failed-tool" else 1,
                     )
-            self.assertFalse(sa.restore_interrupted_coverage(attempt, self.batch))
+            self.assertEqual(sa.reconcile_coverage(attempt, self.batch)["served"], [])
             self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], [])
             self.assertIsNone(recovery.completed_pass(attempt, self.batch, {"protocol_version": 4, "paged": True}))
 
-    def test_completed_launch_transcript_cannot_be_replaced(self):
-        transcript = self.original / "model-transcript.jsonl"
-        transcript.write_bytes(transcript.read_bytes() + b"\n")
-        with self.assertRaisesRegex(Die, "transcript changed"):
-            sa.restore_interrupted_coverage(self.original, self.batch)
+    def test_two_timeouts_preserve_cumulative_successful_reading(self):
+        attempt = self.work / "attempt-timeouts"
+        attempt.mkdir()
+        home = attempt / "isolated"
+        home.mkdir()
+        receipt = attempt / "read-receipt.json"
+        rounds = 0
+
+        def model(argv, **kwargs):
+            nonlocal rounds
+            r = ar.Reader(self.batch, receipt)
+            start = len(r.coverage()["served"])
+            self.assertEqual(start, rounds * 2)
+            pages = range(start, start + 2)
+            for page in pages:
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            rounds += 1
+            historical.append_native(home, {"verdict": "unfinished", "findings": []}, self.thread)
+            # Preserve complete tool success reports even if the final event is
+            # cut off when the subprocess times out.
+            transcript = "\n".join(map(sa.serialize, read_events("codex", pages))) + '\n{"type":'
+            raise subprocess.TimeoutExpired("codex", 1800, output=transcript.encode())
+
+        with patch.object(sa, "run_process", side_effect=model):
+            for expected in (2, 4):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    sa.run_client(
+                        ["codex", "exec", "-"],
+                        "",
+                        home=home,
+                        env={},
+                        work=attempt,
+                        receipt=receipt,
+                        provider="codex",
+                        paged=True,
+                        batch=self.batch,
+                        protocol=4,
+                    )
+                self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], list(range(expected)))
+                self.assertIsNone(recovery.completed_pass(attempt, self.batch, {"protocol_version": 4, "paged": True}))
+
+    def test_automatic_recovery_accumulates_progress_across_timeouts(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
+        calls = 0
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            self.assertEqual(argv[-3:], ["resume", self.thread, "-"])
+            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
+            receipt = Path(args[3])
+            r = ar.Reader(self.batch, receipt)
+            start = len(r.coverage()["served"])
+            self.assertEqual(start, 1 + calls)
+            for page in range(start, start + 1):
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            calls += 1
+            historical.append_native(kwargs["cwd"], {"verdict": "unfinished", "findings": []}, self.thread)
+            events = [{"type": "thread.started", "thread_id": self.thread}] + read_events(
+                "codex", range(start, start + 1)
+            )
+            raise subprocess.TimeoutExpired("codex", 1800, output="\n".join(map(sa.serialize, events)).encode())
+
+        previous = self.block
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+            patch.object(sa, "advance") as advance,
+        ):
+            for now, count in ((1000, 2), (10000, 3)):
+                with patch.object(recovery.time, "time", return_value=now), self.assertRaises(NoProgress) as stopped:
+                    recovery.recover(self.cfg, self.opts, previous)
+                previous = json.loads((self.work / "blocked.json").read_text())
+                receipt = Path(previous["attempt"]) / "read-receipt.json"
+                self.assertEqual(
+                    ar.Reader(self.batch, receipt).coverage()["served"], list(range(count)), str(stopped.exception)
+                )
+            advance.assert_not_called()
+        self.assertEqual(calls, 2)
+
+    def test_partial_tool_failure_keeps_only_the_successful_contiguous_prefix(self):
+        before = ar.Reader(self.batch, self.original / "read-receipt.json").coverage()
+        self.all_served()
+        (self.original / "coverage-launch.json").write_text(sa.serialize({"before": before, "provider": "codex"}))
+        events = read_events("codex", [1, 3]) + read_events("codex", [2], failed=True)
+        (self.original / "model-transcript.jsonl").write_text("\n".join(map(sa.serialize, events)))
+        self.assertEqual(sa.reconcile_coverage(self.original, self.batch)["served"], [0, 1])
+        self.assertEqual(sa.reconcile_coverage(self.original, self.batch)["served"], [0, 1])
 
     def test_client_reports_must_confirm_read_success(self):
         for provider in ("codex", "claude"):
@@ -582,15 +658,76 @@ class ClientCompatibility(unittest.TestCase):
             state = Path(tmp)
             expected = {"client": "one"}
             with patch.object(clients, "fingerprint", return_value=expected):
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
                 p = state / clients.RECORD
                 p.write_text(sa.serialize({"codex": {"protocol_version": 4, "fingerprint": expected, "intact": True}}))
-                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 4)
                 with patch.object(clients, "fingerprint", return_value={"client": "two"}):
-                    self.assertEqual(clients.selected_protocol("codex", state), 3)
-                self.assertEqual(clients.selected_protocol("claude", state), 3)
+                    self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
+                self.assertEqual(clients.selected_protocol("claude", state, verify=False), 3)
                 p.chmod(0o666)
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
+
+    def test_missing_and_changed_verification_refresh_automatically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            current = {"client": "one"}
+
+            def verify(provider, state):
+                (state / clients.RECORD).write_text(
+                    sa.serialize({provider: {"protocol_version": 4, "fingerprint": dict(current), "intact": True}})
+                )
+
+            with (
+                patch.object(clients, "fingerprint", side_effect=lambda _: dict(current)),
+                patch.object(check, "verify", side_effect=verify) as probe,
+            ):
+                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(probe.call_count, 1)
+                current["client"] = "two"
+                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(probe.call_count, 2)
+
+    def test_concurrent_selection_runs_only_one_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            expected = {"client": "one"}
+
+            def verify(provider, state):
+                from tauceti_worker.audit_alerts import save
+
+                save(
+                    state / clients.RECORD, {provider: {"protocol_version": 4, "fingerprint": expected, "intact": True}}
+                )
+
+            with (
+                patch.object(clients, "fingerprint", return_value=expected),
+                patch.object(check, "verify", side_effect=verify) as probe,
+            ):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    self.assertEqual(
+                        list(pool.map(lambda _: clients.selected_protocol("codex", state), range(8))), [4] * 8
+                    )
+                probe.assert_called_once()
+
+    def test_failed_probe_is_cached_retried_and_invalidated_by_client_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            with (
+                patch.object(clients, "fingerprint", return_value={"client": "one"}) as fingerprint,
+                patch.object(check, "verify", side_effect=ValueError("truncated tool result")) as probe,
+                patch.object(clients.time, "time", return_value=1000) as now,
+            ):
                 self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(probe.call_count, 1)
+                now.return_value = 1301
+                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(probe.call_count, 2)
+                fingerprint.return_value = {"client": "two"}
+                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(probe.call_count, 3)
 
     def test_capture_rejects_missing_or_truncated_middle_even_if_tail_survives(self):
         with tempfile.TemporaryDirectory() as tmp:

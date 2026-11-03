@@ -222,11 +222,12 @@ rejects skipping ahead. The complete encoded tool response is capped at 64 KiB,
 with headroom under the configured 120k output allowance. It validates size and
 flushes the response before atomically recording served coverage. Failed writes
 receive no credit; a crash before the receipt is committed can require a reread.
-The Worker also saves coverage before each client call. If that call times out,
-fails or is interrupted, recovery discards its new served credit and rereads those
-chunks in the same conversation. A completed turn keeps new coverage only for
-chunks the client reports as successful tool calls. Earlier findings and
-uncertainty are preserved.
+The Worker saves coverage before each client call and reconciles it with the
+client's successful tool-call reports afterwards, including on timeout or failure.
+It keeps the contiguous confirmed prefix and rereads only the unconfirmed remainder
+in the same conversation. If the Worker dies without saving a transcript, the
+launch's new reads are replayed. Earlier findings and uncertainty are preserved;
+partial progress never substitutes for a final safety judgment.
 
 Protocol 4 trusts the verified client to deliver successful tool responses intact.
 Served coverage proves neither model receipt nor understanding. The same isolated
@@ -238,7 +239,12 @@ requires retaining findings and uncertainty across compaction and returning
 incomplete if the inspection cannot be completed.
 
 New inspections use protocol 4 only after the installed client passes an intact
-response check for this Worker release. Run the local check for each provider:
+response check for this Worker release. The Worker runs this check automatically
+when verification is missing or stale, serializes concurrent checks, and caches
+failures for five minutes before retrying. A changed client bypasses that failure
+cooldown. The selected protocol and verification failures are logged, with failure
+details retained in `client-coverage-failures.json`. The same check is available
+manually for diagnosis:
 
 ```bash
 python3 -m tauceti_worker.audit_client_check --provider codex --state /path/to/worker/state/security-audit
@@ -251,11 +257,12 @@ compares the complete chunks in actual reviewer requests, including Unicode and
 escaped text, and writes a private `client-coverage.json` compatibility record.
 The record is tied to client paths, file hashes, version and the reader, launcher,
 catalog and verification code. A client or Worker upgrade requires verification
-again. Missing, invalid or outdated verification leaves new inspections on the
-historical protocol 3. Verification supports native executables and the managed
+again, which the Worker performs automatically. A failed verification leaves new
+inspections on historical protocol 3 until a later check succeeds. Verification
+supports native executables and the managed
 Codex launcher; other wrappers keep protocol 3 because their underlying code
-cannot be identified reliably. Retained protocol-4 inspections wait for verification rather
-than silently changing protocol. Existing protocol-3 inspections keep their exact
+cannot be identified reliably. Retained protocol-4 inspections retry verification
+automatically while keeping their original protocol. Existing protocol-3 inspections keep their exact
 reader, page layout, prompts and token checks; they are never reinterpreted as
 protocol-4 approvals. `audit_reader_v3.py` preserves that historical reader.
 

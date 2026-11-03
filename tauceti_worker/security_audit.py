@@ -539,7 +539,16 @@ def codex_final(transcript: str, paged: bool) -> dict:
 
 def successful_read_pages(transcript: str, provider: str) -> set[int]:
     """Read ordinary client success reports; these are not model acknowledgments."""
-    events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+    # A timeout can cut the final JSON line short. Earlier complete client
+    # reports still establish successful reads; malformed interior lines do not.
+    lines = [line for line in transcript.splitlines() if line.strip()]
+    events = []
+    for number, line in enumerate(lines):
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            if number != len(lines) - 1:
+                raise
     pages = set()
     calls = {}
     for event in events:
@@ -831,40 +840,40 @@ def retain_client(work: Path, home: Path, receipt: Path) -> None:
         (work / f"model-rollout-{i}.jsonl").write_bytes(rollout.read_bytes())
 
 
-def restore_interrupted_coverage(work: Path, batch: dict) -> bool:
-    """Discard served credit from an interrupted client call, never its findings.
+def reconcile_coverage(work: Path, batch: dict) -> dict:
+    """Keep the contiguous served prefix confirmed by ordinary client success reports.
 
-    Trust normal completed client calls. A pipe write alone is insufficient after
-    a crash: replay the call's new chunks in the SAME retained conversation.
+    This also works after timeouts and nonzero exits. With no surviving transcript,
+    replay only this launch's unconfirmed reads in the same retained conversation.
     """
     from .audit_reader import Reader
 
-    checkpoint = work / "coverage-launch.json"
-    if not checkpoint.exists():
-        raise Die("security-audit: missing served coverage checkpoint")
-    value = json.loads(checkpoint.read_text())
-    if not isinstance(value, dict) or set(value) != {"completed", "transcript_digest", "before"}:
+    value = json.loads((work / "coverage-launch.json").read_text())
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"before", "provider"}
+        or value["provider"] not in ("codex", "claude")
+    ):
         raise Die("security-audit: invalid served coverage checkpoint")
-    if type(value["completed"]) is not bool:
-        raise Die("security-audit: invalid served coverage checkpoint")
-    # Validate the saved receipt with the same strict reader checks before using
-    # it. Never invent progress from an invalid or unrelated checkpoint.
     before_path = work / "coverage-before-launch.json"
     save(before_path, value["before"])
     before = Reader(batch, before_path).coverage()
     transcript = work / "model-transcript.jsonl"
-    if value["completed"]:
-        if (
-            not transcript.is_file()
-            or hashlib.sha256(transcript.read_bytes()).hexdigest() != value["transcript_digest"]
-        ):
-            raise Die("security-audit: completed served coverage transcript changed")
-        return True
+    successful = (
+        successful_read_pages(transcript.read_text(encoding="utf-8", errors="replace"), value["provider"])
+        if transcript.exists()
+        else set()
+    )
     receipt = work / "read-receipt.json"
     with receipt.with_suffix(".lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        save(receipt, before)
-    return False
+        served = Reader(batch, receipt).coverage()
+        count = len(before["served"])
+        while count < len(served["served"]) and count in successful:
+            count += 1
+        reconciled = {**before, "served": list(range(count))}
+        save(receipt, reconciled)
+    return reconciled
 
 
 def strip_recovery_prefixes(prompt: str, work: Path, batch: dict, *, protocol=3) -> str:
@@ -952,11 +961,11 @@ def run_client(
             from .audit_clients import selected_protocol
 
             if selected_protocol(provider, work.parent) != 4:
-                raise Die("security-audit: protocol 4 requires client delivery verification for this release")
+                raise NoProgress("security-audit: awaiting client delivery verification")
         if protocol == 4:
             from .audit_reader import Reader
 
-            checkpoint = {"before": Reader(batch, receipt).coverage(), "completed": False, "transcript_digest": None}
+            checkpoint = {"before": Reader(batch, receipt).coverage(), "provider": provider}
             save(work / "coverage-launch.json", checkpoint)
             # A stale completed transcript must never describe the next launch.
             (work / "model-transcript.jsonl").write_text("")
@@ -1008,25 +1017,10 @@ def run_client(
             (work / "model-stderr.txt").write_text(result.stderr)
         finally:
             retain_client(work, home, receipt)
+            if protocol == 4:
+                reconcile_coverage(work, batch)
         if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
             raise Die("security-audit: resumed client changed the retained conversation identity")
-        if protocol == 4 and not result.returncode:
-            try:
-                if provider == "codex":
-                    codex_final(result.stdout, paged)
-                else:
-                    claude_result(result.stdout)
-                from .audit_reader import Reader
-
-                newly_served = set(Reader(batch, receipt).coverage()["served"]) - set(checkpoint["before"]["served"])
-                if not newly_served <= successful_read_pages(result.stdout, provider):
-                    raise Die("security-audit: client did not report successful reads for new chunks")
-                checkpoint.update(completed=True, transcript_digest=hashlib.sha256(result.stdout.encode()).hexdigest())
-                save(work / "coverage-launch.json", checkpoint)
-            except (Die, ValueError, TypeError, AttributeError):
-                pass  # Recovery rolls back this launch's served credit.
-        if protocol == 4:
-            restore_interrupted_coverage(work, batch)
         error = (
             codex_service_error(
                 result.stdout,
@@ -1298,7 +1292,7 @@ def inspect(
             raise Die("security-audit: cannot change a retained inspection protocol")
         protocol = retained_protocol
         if protocol == 4:
-            restore_interrupted_coverage(resume_from, batch)
+            reconcile_coverage(resume_from, batch)
             if selected_protocol(provider, work.parent) != 4:
                 raise NoProgress("security-audit: awaiting client delivery verification")
     elif protocol is None:
@@ -1642,7 +1636,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
 
     protocol = selected_protocol(provider, work)
     model = "gpt-6-luna" if provider == "codex" else "haiku"
-    log(f"security-audit: isolated reviewer {provider}/{model}")
+    log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
     try:
         if any(c["files"] for c in batch["commits"]):
             verdict = inspect(batch, provider, attempt, protocol=protocol)
