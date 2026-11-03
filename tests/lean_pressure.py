@@ -21,6 +21,19 @@ loader.exec_module(gate)
 
 
 class LeanPressure(unittest.TestCase):
+    def test_non_linux_alias_forwards_probes_and_compilation_without_procfs(self):
+        with (
+            patch.object(gate.sys, "platform", "darwin"),
+            patch.object(gate, "real_lean", return_value=Path("/real/lean")),
+            patch.object(gate, "wait_for_capacity") as wait,
+            patch.object(gate.os, "execv", side_effect=SystemExit(0)) as execute,
+        ):
+            for args in (["--print-prefix"], ["Main.lean"]):
+                with self.assertRaises(SystemExit):
+                    gate.main(args)
+                execute.assert_called_with("/real/lean", ["/real/lean", *args])
+            wait.assert_not_called()
+
     def test_headroom_is_more_than_twice_worst_rss_and_floor_is_explicit(self):
         with patch.object(gate, "WORST_FILE_RSS_BYTES", 8 * 1024**3):
             for gib in (64, 128, 256):

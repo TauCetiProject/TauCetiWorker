@@ -230,6 +230,11 @@ def overlay(lean):
 def main(args=None):
     args = sys.argv[1:] if args is None else args
     try:
+        if sys.platform != "linux":
+            # scripts/ is also on macOS agents' PATH for the other helpers.
+            # Keep the lean alias transparent where /proc observations do not exist.
+            lean = real_lean()
+            os.execv(str(lean), [str(lean), *args])
         if args == ["--install-available"]:
             install_available()
             return 0
