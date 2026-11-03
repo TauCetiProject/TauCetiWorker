@@ -443,6 +443,9 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
                     scope = random_roadmap_area(w, focus=focus, fallback=False)
                     focused_round = scope not in (None, "any")
             global_pick = scope in (None, "", "auto", "any")
+            # Fleet status counts focused running rounds from this field; the
+            # loop clears it between rounds and a fallback round clears it here.
+            report_runtime(roadmap_focus=scope if focused_round else None)
         sv = survey(
             w.cfg,
             w.gh,

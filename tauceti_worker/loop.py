@@ -79,7 +79,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'}{targeted} "
         f"agent={agent}{' [bubble]' if bubble else ''}"
     )
-    report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
+    report_runtime("idle", detail="loop started", phase=None, target=None, roadmap_focus=None, next_action_at=None)
     streak = 0
     admission_streak = 0
     recovery_probe_at = 0.0
@@ -137,6 +137,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 detail="checking provider availability",
                 phase=None,
                 target=None,
+                roadmap_focus=None,
                 failure_reason=None,
                 failure_code=None,
                 failure_log=None,
@@ -378,7 +379,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if rc == 0:
                 streak = 0
                 report_runtime(
-                    "idle", detail="round completed", phase=None, target=None, next_action_at=time.time() + INTERROUND
+                    "idle",
+                    detail="round completed",
+                    phase=None,
+                    target=None,
+                    roadmap_focus=None,
+                    next_action_at=time.time() + INTERROUND,
                 )
                 time.sleep(INTERROUND)
             else:
