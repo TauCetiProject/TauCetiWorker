@@ -80,6 +80,119 @@ class RecoveryMaintenance(unittest.TestCase):
                 self.assertEqual(summary["records"], 0)
                 self.assertEqual(summary["reasons"], [])
 
+    def expire_record(self, record):
+        manifest = json.loads((record / "manifest.json").read_text())
+        manifest["created_at"] = time.time() - maintenance.RECOVERY_RECORD_TTL - 1
+        maintenance.atomic_json(record / "manifest.json", manifest)
+
+    def test_record_lifetime_expires_unclassified_retry_and_stale_handoff_without_model_work(self):
+        for journal in (
+            {},
+            dict(state="eligible", reason=dict(code="invocation-failed"), retry_at=time.time() + 999999),
+            dict(state="resuming", handoff=dict(state="offered"), reason=dict(code="source-handoff-source-pending")),
+            dict(state="publication-pending", publication=dict(oid="unconfirmed", push_started=True)),
+        ):
+            with self.subTest(journal=journal):
+                self.dirty()
+                record = wr.guard(self.cfg, self.co).record
+                self.expire_record(record)
+                maintenance.atomic_json(record / "recovery.json", journal | dict(updated_at=time.time()))
+                outbox = self.cfg.state / "github-outbox/keep.json"
+                maintenance.atomic_json(outbox, dict(pending=True))
+                with patch.object(wr, "inspect", side_effect=AssertionError("retirement needs no source work")):
+                    self.tick()
+                self.assertFalse(record.exists())
+                self.assertEqual(json.loads(outbox.read_text()), dict(pending=True))
+
+    def test_native_cleanup_restart_progresses_past_slow_fresh_records(self):
+        base = self.cfg.state.parent
+        for name in ("a", "b", "c"):
+            record = base / name / "recovery/fresh"
+            record.mkdir(parents=True)
+            maintenance.atomic_json(record / "manifest.json", dict(created_at=time.time()))
+        expired = base / "z" / "recovery/expired"
+        expired.mkdir(parents=True)
+        maintenance.atomic_json(expired / "manifest.json", dict(created_at=time.time() - 90000))
+        original = maintenance._metadata
+
+        def slow_front(path, *args, **kwargs):
+            if path.parent.name == "fresh":
+                time.sleep(0.03)
+            return original(path, *args, **kwargs)
+
+        with patch.object(maintenance, "_metadata", side_effect=slow_front):
+            for _ in range(12):
+                maintenance._SWEEPS.clear()  # Fresh hourly collector, not a persistent process.
+                maintenance.prepare(base, seconds=0.02, entries=10000)
+                if not expired.exists():
+                    break
+        self.assertFalse(expired.exists(), "saved metadata progress must reach the old record")
+        self.assertTrue((base / "a/recovery/fresh").is_dir())
+
+    def test_exhausted_content_allowance_retires_a_fresh_record(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        maintenance.atomic_json(record / "recovery.json", dict(state="eligible", reason=dict(code="content-allowance")))
+        self.tick()
+        self.assertFalse(record.exists())
+
+    def test_deadline_uses_manifest_creation_not_recent_retry_or_future_timestamp(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        self.expire_record(record)
+        for _ in range(3):
+            maintenance.atomic_json(record / "recovery.json", dict(state="resuming", updated_at=time.time()))
+            self.assertEqual(maintenance.abandonment_reason(record, {}), "recovery-lifetime-exhausted")
+        manifest = json.loads((record / "manifest.json").read_text())
+        manifest["created_at"] = time.time() + 999999
+        maintenance.atomic_json(record / "manifest.json", manifest)
+        old = time.time() - maintenance.RECOVERY_RECORD_TTL - 1
+        os.utime(record / "manifest.json", (old, old))
+        self.assertEqual(maintenance.abandonment_reason(record, {}), "recovery-lifetime-exhausted")
+
+    def test_expiry_defers_for_actual_lock_live_user_and_mount_then_retires(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        self.expire_record(record)
+        with (record / "recovery.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        with patch.object(wr, "live_users", return_value=["active verifier"]):
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        with patch.object(maintenance.retention, "mount_points", return_value=[record]):
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        self.assertTrue(record.exists())
+        self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+
+    def test_expired_handoff_protects_its_live_round_but_not_an_unrelated_new_round(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        self.expire_record(record)
+        maintenance.atomic_json(
+            record / "recovery.json",
+            dict(state="resuming", handoff=dict(state="offered", source_round="receiver", checkout=str(self.co))),
+        )
+        owner = self.cfg.state / "checkout-owners/TauCeti.json"
+        maintenance.atomic_json(owner, dict(round_id="receiver", process=wr.process_owner()))
+        with patch.object(wr, "live_users", return_value=[]):
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        maintenance.atomic_json(owner, dict(round_id="new-round", process=wr.process_owner()))
+
+        def users(path):
+            return ["unrelated work"] if path == self.co else []
+
+        with patch.object(wr, "live_users", side_effect=users):
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+
+    def test_bundle_without_command_timeout_still_obeys_housekeeping_budget(self):
+        with self.assertRaises(wr.BudgetExhausted):
+            wr._bounded_git(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                os.environ.copy(),
+                wr.Work(seconds=0.05),
+                timeout=None,
+            )
+
     def test_infrastructure_retry_keeps_warm_artifacts(self):
         self.dirty()
         record = wr.guard(self.cfg, self.co).record
@@ -1004,7 +1117,7 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
             )
         self.assertLess(time.monotonic() - started, 2)
 
-    def test_bundle_timeout_abandons_partial_without_touching_original_source(self):
+    def test_bundle_has_no_fixed_cutoff_and_budget_failure_preserves_original_source(self):
         (self.co / "A.lean").write_text("local unpublished commit")
         git(self.co, "commit", "-qam", "unfinished")
         expected = snapshot_tree(self.co)
@@ -1019,7 +1132,7 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
 
         with patch.object(wr, "_git", slow_bundle), self.assertRaises(wr.RecordError):
             wr._record(self.cfg, self.co, wr.inspect(self.co), "TauCeti", wr.TAUCETI)
-        self.assertEqual(timeouts, [60])
+        self.assertEqual(timeouts, [None])
         self.assertEqual(git(self.co, "for-each-ref", "refs/tauceti-pending"), "")
         self.assertFalse(list((self.cfg.state / "recovery").glob(".tmp-*")))
         self.assertEqual(snapshot_tree(self.co), expected)
