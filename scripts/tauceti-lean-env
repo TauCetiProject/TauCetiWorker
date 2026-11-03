@@ -1,9 +1,0 @@
-# Sourced by noninteractive Bash before each worker/CI shell step. Toolchains may
-# have been installed since the last step; wrap them before sandbox construction.
-if [ -n "${TAUCETI_PREVIOUS_BASH_ENV:-}" ] && [ -f "$TAUCETI_PREVIOUS_BASH_ENV" ]; then
-    tauceti_pressure_previous=$TAUCETI_PREVIOUS_BASH_ENV
-    unset TAUCETI_PREVIOUS_BASH_ENV
-    . "$tauceti_pressure_previous"
-    unset tauceti_pressure_previous
-fi
-"${TAUCETI_LEAN_WRAPPER:?}" --install-available

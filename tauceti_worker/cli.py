@@ -1788,13 +1788,9 @@ def cli_main() -> int:
         os.environ.pop("LEAN_SYSROOT", None)
         os.environ["LAKE_OVERRIDE_LEAN"] = "true"
         os.environ["LEAN"] = str(HERE / "scripts/tauceti-lean")
-        os.environ["PATH"] = str(HERE / "scripts") + os.pathsep + os.environ.get("PATH", "")
-        os.environ["TAUCETI_LEAN_WRAPPER"] = os.environ["LEAN"]
-        startup = str(HERE / "scripts/tauceti-lean-env")
-        if previous := os.environ.get("BASH_ENV"):
-            if previous != startup:
-                os.environ["TAUCETI_PREVIOUS_BASH_ENV"] = previous
-        os.environ["BASH_ENV"] = startup
+        scripts = str(HERE / "scripts")
+        if scripts not in os.get_exec_path():
+            os.environ["PATH"] = scripts + os.pathsep + os.environ.get("PATH", "")
     from .github_transport import blocking_event_since
 
     started = time.time()

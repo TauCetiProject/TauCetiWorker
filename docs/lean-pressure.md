@@ -10,7 +10,7 @@ Before starting a compiler, the helper samples aggregate CPU use for a random
 the threshold below, sleeping for a fresh random **1–5 seconds** before checking
 again. CPU use is busy `/proc/stat` ticks, excluding idle and I/O wait, normalized
 across all CPUs. Memory use is `MemTotal - MemAvailable`, also bounded by finite
-cgroup-v2 ancestor limits; clean file cache is reclaimable, while shared memory,
+cgroup-v2 ancestor `memory.max` and `memory.high` limits; clean file cache is reclaimable, while shared memory,
 dirty pages, and writeback pages remain charged.
 
 The memory threshold is
@@ -31,17 +31,21 @@ Missing or invalid pressure observations prevent a compilation with a clear erro
 Normal waits are silent so `lake build --iofail` continues to work; set
 `TAUCETI_LEAN_PRESSURE_DEBUG=1` for wait diagnostics during manual investigation.
 
-Worker Bash startup also wraps the selected installed compiler atomically,
-retaining the original as `bin/lean-unthrottled`. This catches direct compiler
-calls and trusted CI watchdogs inside sandboxes that clear their environment.
-The setup is idempotent, keeps `bin/lean` present during an update, and does not
-interrupt existing compiler processes. A pre-existing `BASH_ENV` is sourced first.
+Worker toolchains are left untouched. The worker's PATH alias catches direct
+`lean` commands, and the toolchain overlay catches Lake's compiler invocations.
 
 TauCetiFleet vendors the standalone helper and installs it, its environment, and
-the Bash startup hook into each new CI guest. It does not need a new base image.
+the Bash startup hook into each new CI guest. The hook wraps only the disposable
+watchdog's `bin/lean-real` after it has been prepared, keeping the original
+compiler in `bin/lean-unthrottled`. It leaves official compiler files and their
+snapshot manifests untouched. This catches compilation inside sandboxes that
+clear their environment without invalidating the official toolchain cache.
+The hook is idempotent and guards against recursive shell startup. It does not
+need a new base image.
 Workers and CI may both use free RAM up to a common parent slice ceiling, which
 preserves OS headroom; workers no longer subtract the full configured CI RAM from
-their own limit. Existing CPU priorities remain in effect. Running disposable
+their own limit. Workers have a higher emergency OOM score so they are preferred
+over CI guests when the kernel must kill a process. Existing CPU priorities remain in effect. Running disposable
 guests acquire the new setup when they finish and are replaced.
 
 This is a start-time gate with independent random retries. Existing compilers

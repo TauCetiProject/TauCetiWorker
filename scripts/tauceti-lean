@@ -10,6 +10,7 @@ import math
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,13 +33,21 @@ def memory():
         for k, v in (line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
     }
     total, available = fields["MemTotal"], fields["MemAvailable"]
-    relative = Path("/proc/self/cgroup").read_text().split("0::", 1)[1].strip()
+    relative = next(
+        (line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::")), None
+    )
+    if relative is None:
+        return total, available
     root = Path("/sys/fs/cgroup")
     group = root / relative.lstrip("/")
     while group.is_relative_to(root):
-        maximum = group / "memory.max"
-        if maximum.exists() and (value := maximum.read_text().strip()) != "max":
-            limit = int(value)
+        limits = []
+        for name in ("memory.max", "memory.high"):
+            maximum = group / name
+            if maximum.exists() and (value := maximum.read_text().strip()) != "max":
+                limits.append(int(value))
+        if limits:
+            limit = min(limits)
             stats = dict(line.split() for line in (group / "memory.stat").read_text().splitlines())
             # Active clean file pages are reclaimable too. Counting them as
             # permanently used could stall every waiter on a warm artifact cache
@@ -106,12 +115,42 @@ def wait_for_capacity():
         time.sleep(random.uniform(1, 5))
 
 
+def is_wrapper(binary):
+    with Path(binary).open("rb") as stream:
+        header = stream.read(4096)
+    # Stable across docstring, shebang, and implementation changes. Also matches
+    # the first deployed revision, which had no dedicated magic comment.
+    return header.startswith(b"#!") and b'MARKER = ".tauceti-lean.json"' in header
+
+
+def unwrapped(binary):
+    binary = Path(binary).resolve()
+    seen = set()
+    while is_wrapper(binary):
+        if binary in seen:
+            raise ValueError(f"compiler wrapper cycle: {binary}")
+        seen.add(binary)
+        marker = binary.parent.parent / MARKER
+        if not marker.is_file():
+            raise ValueError(f"wrapped compiler has no saved original: {binary}")
+        binary = Path(json.loads(marker.read_text())["lean"]).resolve()
+    return binary
+
+
 def real_lean():
     # An overlay invocation knows its real compiler even after `lake env` adds its
     # bin directory to PATH. Never ask that PATH's `lean` and recurse into ourselves.
     marker = Path(sys.argv[0]).resolve().parent.parent / MARKER
     if marker.is_file():
-        return Path(json.loads(marker.read_text())["lean"])
+        return unwrapped(Path(json.loads(marker.read_text())["lean"]))
+    # An explicitly selected Lake binary defines its compiler even when the
+    # working directory nominates a different toolchain.
+    try:
+        parent = Path(f"/proc/{os.getppid()}/exe").resolve(strict=True)
+        if parent.name == "lake" and (parent.parent / "lean").is_file():
+            return unwrapped(parent.parent / "lean")
+    except OSError:
+        pass
     clean = dict(os.environ)
     clean.pop("LEAN_SYSROOT", None)
     if elan := shutil.which("elan"):
@@ -126,7 +165,7 @@ def real_lean():
                 continue
             marker = candidate.resolve().parent.parent / MARKER
             if marker.is_file():
-                return Path(json.loads(marker.read_text())["lean"])
+                return unwrapped(Path(json.loads(marker.read_text())["lean"]))
             # The `lean` PATH alias may be a wheel-materialized copy of this
             # helper rather than a symlink. Skip both forms without recursion.
             if candidate.stat().st_size == len(source) and candidate.read_bytes() == source:
@@ -136,10 +175,7 @@ def real_lean():
     if not binary or Path(binary).resolve() == Path(__file__).resolve():
         raise ValueError("cannot find the real Lean compiler (install elan or put Lean on PATH)")
     binary = Path(binary).resolve()
-    marker = binary.parent.parent / MARKER
-    if marker.is_file():
-        return Path(json.loads(marker.read_text())["lean"])
-    return binary
+    return unwrapped(binary)
 
 
 def install_toolchain(binary):
@@ -150,12 +186,14 @@ def install_toolchain(binary):
     with (root / ".tauceti-lean.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         real = binary.with_name("lean-unthrottled")
-        current = binary.read_bytes()
+        current = binary.read_bytes() if binary.stat().st_size == len(source) else None
         if real.exists() and (root / MARKER).is_file() and current == source:
             return
-        wrapped = current.startswith(source.split(b"\n\n", 1)[0])
+        wrapped = is_wrapper(binary)
         if not real.exists() and wrapped:
             raise ValueError(f"wrapped compiler has no saved original: {binary}")
+        if wrapped:
+            unwrapped(binary)  # Refuse a corrupt/cyclic saved compiler before replacing anything.
         if not real.exists():
             # Keep bin/lean present throughout a live installation.
             os.link(binary, real)
@@ -184,26 +222,19 @@ def install_toolchain(binary):
             Path(temporary).unlink(missing_ok=True)
 
 
-def install_available():
-    """One interpreter per shell startup, even when many toolchains are cached."""
-    home = Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan")))
-    binaries = {p.resolve() for p in (home / "toolchains").glob("*/bin/lean") if p.is_file()}
-    if elan := shutil.which("elan"):
-        selected = subprocess.run([elan, "which", "lean"], text=True, capture_output=True)
-        if selected.returncode == 0:
-            binaries.add(Path(selected.stdout.strip()).resolve())
-    for binary in sorted(binaries):
-        install_toolchain(binary)
-
-
 def overlay(lean):
     """Lake invokes <prefix>/bin/lean, so LEAN alone cannot wrap compilation."""
     source = Path(__file__).resolve()
+    lean = unwrapped(lean)
     # Include the helper identity so upgrades never redirect another running build.
-    key = hashlib.sha256(str(lean).encode() + source.read_bytes()).hexdigest()[:24]
+    info = lean.stat()
+    identity = f"{lean}:{info.st_ino}:{info.st_mtime_ns}"
+    key = hashlib.sha256(identity.encode() + source.read_bytes()).hexdigest()[:24]
     base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "tauceti/lean-pressure"
-    base.mkdir(parents=True, exist_ok=True)
     target = base / key
+    if target.is_dir():
+        return target
+    base.mkdir(parents=True, exist_ok=True)
     with (base / "setup.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not target.exists():
@@ -227,6 +258,14 @@ def overlay(lean):
     return target
 
 
+def exec_lean(lean, args):
+    # Python ignores these at startup; Lean should inherit a normal CLI disposition.
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        if number := getattr(signal, name, None):
+            signal.signal(number, signal.SIG_DFL)
+    os.execv(str(lean), [str(lean), *args])
+
+
 def main(args=None):
     args = sys.argv[1:] if args is None else args
     try:
@@ -234,10 +273,7 @@ def main(args=None):
             # scripts/ is also on macOS agents' PATH for the other helpers.
             # Keep the lean alias transparent where /proc observations do not exist.
             lean = real_lean()
-            os.execv(str(lean), [str(lean), *args])
-        if args == ["--install-available"]:
-            install_available()
-            return 0
+            exec_lean(lean, args)
         if len(args) == 2 and args[0] == "--install-toolchain":
             install_toolchain(args[1])
             return 0
@@ -249,7 +285,7 @@ def main(args=None):
         # Lake probes these during discovery. Keep them fast and stdout pristine.
         if args not in (["--githash"], ["--version"], ["-v"], ["--help"], ["-h"], ["--print-libdir"]):
             wait_for_capacity()
-        os.execv(str(lean), [str(lean), *args])
+        exec_lean(lean, args)
     except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError) as error:
         print(f"tauceti-lean: {error}", file=sys.stderr)
         return 2

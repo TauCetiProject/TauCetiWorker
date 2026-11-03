@@ -21,6 +21,11 @@ loader.exec_module(gate)
 
 
 class LeanPressure(unittest.TestCase):
+    def setUp(self):
+        for name in ("SIGPIPE", "SIGXFSZ"):
+            if number := getattr(gate.signal, name, None):
+                self.addCleanup(gate.signal.signal, number, gate.signal.getsignal(number))
+
     def test_non_linux_alias_forwards_probes_and_compilation_without_procfs(self):
         with (
             patch.object(gate.sys, "platform", "darwin"),
@@ -78,6 +83,12 @@ class LeanPressure(unittest.TestCase):
             with patch.object(gate, "Path", side_effect=lambda path: root / str(path).lstrip("/")):
                 _, available = gate.memory()
             self.assertEqual(available, int(2.5 * gib))
+            (cg / "user/worker/memory.high").write_text(str(4 * gib))
+            with patch.object(gate, "Path", side_effect=lambda path: root / str(path).lstrip("/")):
+                self.assertEqual(gate.memory(), (4 * gib, int(0.5 * gib)))
+            (proc / "self/cgroup").write_text("1:memory:/legacy\n")
+            with patch.object(gate, "Path", side_effect=lambda path: root / str(path).lstrip("/")):
+                self.assertEqual(gate.memory(), (64 * gib, 48 * gib))
 
     def test_waits_for_either_pressure_source_then_exec_can_proceed(self):
         # First interval is CPU-bound; the next is memory-bound; the third is safe.
@@ -131,6 +142,14 @@ class LeanPressure(unittest.TestCase):
             gate.install_toolchain(binary)
             original = root / "bin/lean-unthrottled"
             self.assertIn("exit 23", original.read_text())
+            # Cosmetic helper upgrades must never be saved over the compiler.
+            binary.write_text(
+                binary.read_text().replace(
+                    '"""Wait for spare RAM/CPU before execing Lean.', '"""Changed wrapper description.'
+                )
+            )
+            gate.install_toolchain(binary)
+            self.assertIn("exit 23", original.read_text())
             self.assertEqual(json.loads((root / gate.MARKER).read_text())["lean"], str(original))
             watchdog = root / "watchdog/bin/lean-real"
             watchdog.parent.mkdir(parents=True)
@@ -150,6 +169,23 @@ class LeanPressure(unittest.TestCase):
             self.assertIn("exit 24", original.read_text())
             result = subprocess.run([str(binary), "--githash"], capture_output=True)
             self.assertEqual(result.returncode, 24, result.stderr)
+
+    def test_saved_wrapper_cycle_fails_before_replacing_the_compiler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bin").mkdir()
+            binary = root / "bin/lean"
+            original = root / "bin/lean-unthrottled"
+            for path in (binary, original):
+                path.write_bytes(SCRIPT.read_bytes())
+            (root / gate.MARKER).write_text(json.dumps(dict(lean=str(original))))
+            with self.assertRaisesRegex(ValueError, "cycle"):
+                gate.unwrapped(binary)
+            # Force an upgrade so it reaches the validation before publication.
+            binary.write_text(binary.read_text().replace('"""Wait for spare RAM/CPU', '"""Earlier helper'))
+            with self.assertRaisesRegex(ValueError, "cycle"):
+                gate.install_toolchain(binary)
+            self.assertEqual(original.read_bytes(), SCRIPT.read_bytes())
 
     def test_overlay_keeps_libraries_and_compiler_on_the_wrapper(self):
         with tempfile.TemporaryDirectory() as directory:
