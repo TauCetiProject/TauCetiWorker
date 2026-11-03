@@ -98,6 +98,20 @@ def main():
     if not args.modules.read_text().strip():
         print("local-axioms: checked 0 changed module(s); full checks run in CI.")
         return 0
+    if os.environ.get("GILGAI_URL"):
+        # Builds may have run on the build server, so the changed modules' own artifacts can be absent
+        # locally. Build exactly those modules here; GILGAI_LOCAL=1 makes the shim pass through.
+        modules = [m for m in args.modules.read_text().split() if m]
+        local = subprocess.run(
+            ["lake", "build", *[f"+{m}" for m in modules]],
+            env={**os.environ, "GILGAI_LOCAL": "1"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if local.returncode != 0:
+            print(f"local-axioms: local build of changed modules failed:\n{local.stderr.rstrip()}", file=sys.stderr)
+            return local.returncode
     prefix = Path(subprocess.check_output(["lean", "--print-prefix"], text=True).strip()).resolve()
     native = checker(Path(__file__).resolve().with_name("LocalAxioms.lean"), prefix, cache_root())
     argv = [str(native), str(args.modules.resolve()), args.root, str(args.artifacts.resolve())]

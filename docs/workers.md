@@ -233,6 +233,15 @@ copy keeps them working, and measured on a 1500-declaration module, returning to
 a previously built state still fell from 4s of recompilation to 0s of restore.
 An explicit value in a worker's `env` table overrides either default.
 
+Host rounds can send `lake build` to a gilgai build server instead of running it on the worker.
+Opt in through the `env` table with `TAUCETI_GILGAI = "1"`, `TAUCETI_GILGAI_SHIM_DIR` (a directory
+whose `lake` is the `gilgai-lake` shim), `TAUCETI_GILGAI_URL` and `TAUCETI_GILGAI_TOKEN_FILE` (a
+private client-token file). The worker then puts the shim first on the agent's PATH; the shim ships
+the working tree to the server, returns the real log and exit code, and runs the real lake for
+anything it cannot ship. A missing piece logs one warning and leaves builds local. The shim comes
+from the gilgai repository (https://github.com/TauCetiProject/gilgai, stage 1). CI and Bubble rounds
+are unaffected.
+
 The trade is disk: old build generations remain in the store, and Lake supplies
 no selective eviction — `lake cache clean` empties it all or nothing. TauCeti
 records the toolchain on canonical `main` for each worker and clears that
