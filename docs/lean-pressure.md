@@ -31,6 +31,18 @@ Missing or invalid pressure observations prevent a compilation with a clear erro
 Normal waits are silent so `lake build --iofail` continues to work; set
 `TAUCETI_LEAN_PRESSURE_DEBUG=1` for wait diagnostics during manual investigation.
 
+When a Fleet timing collector is available, the helper reports pressure wait
+reasons and the transition to execution over a local Unix socket. The socket
+survives `exec`; its closure measures compiler elapsed time without adding a
+parent process or changing signals, output, arguments, or exit status. Collection
+is optional: a missing, full, or failed observer never blocks compilation.
+The normal initial CPU measurement is recorded separately from time blocked on
+capacity. Metadata probes are excluded. Fleet reports summed capacity-wait time
+divided by summed capacity-wait plus execution time, including active waits;
+parallel invocations contribute separate elapsed seconds. Wait quantiles use
+bounded histograms of admitted invocations that actually waited. Existing
+processes are reported separately until they acquire instrumentation.
+
 Worker toolchains are left untouched. The worker's PATH alias catches direct
 `lean` commands, and the toolchain overlay catches Lake's compiler invocations.
 

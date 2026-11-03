@@ -11,6 +11,7 @@ import os
 import random
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,45 @@ WORST_FILE_RSS_BYTES = 9_431_461_888
 MEMORY_FLOOR_PERCENT = 60
 CPU_LIMIT_PERCENT = 90
 MARKER = ".tauceti-lean.json"
+
+_TRACE = None
+
+
+class Trace:
+    """Optional inherited socket; accounting never changes compiler process semantics."""
+
+    def __init__(self):
+        self.client = None
+        path = (Path('/usr/local/share/tauceti/lean-statistics.sock') if Path('/usr/local/share/tauceti/host-pressure.required').exists()
+                else Path('/run/user') / str(os.getuid()) / 'tauceti-lean-statistics.sock')
+        try:
+            if path.exists():
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(.01)
+                client.connect(str(path))
+                client.set_inheritable(True)
+                self.client = client
+        except OSError:
+            if 'client' in locals():
+                client.close()
+
+    def event(self, phase):
+        if self.client:
+            try:
+                self.client.sendall(f'{phase}:{time.monotonic():.6f}\n'.encode())
+            except OSError:
+                self.client.close()
+                self.client = None
+
+
+def pause(seconds, reason):
+    if _TRACE:
+        _TRACE.event(reason)
+    try:
+        time.sleep(seconds)
+    finally:
+        if _TRACE:
+            _TRACE.event('prepare')
 
 
 def memory():
@@ -89,7 +129,7 @@ def cpu_percent(before, after):
 
 def wait_for_capacity():
     before = cpu_sample()
-    time.sleep(random.uniform(0.2, 0.5))
+    pause(random.uniform(0.2, 0.5), 'probe')
     waiting = False
     # Successful compiler output is a build failure under `lake build --iofail`.
     debug = os.environ.get("TAUCETI_LEAN_PRESSURE_DEBUG") == "1"
@@ -112,7 +152,8 @@ def wait_for_capacity():
             )
         waiting = True
         before = after
-        time.sleep(random.uniform(1, 5))
+        pause(random.uniform(1, 5), 'cpu+ram' if cpu > CPU_LIMIT_PERCENT and used > limit
+              else 'cpu' if cpu > CPU_LIMIT_PERCENT else 'ram')
 
 
 def is_wrapper(binary):
@@ -249,6 +290,7 @@ def exec_lean(lean, args):
 
 
 def main(args=None):
+    global _TRACE
     args = sys.argv[1:] if args is None else args
     try:
         if sys.platform != "linux":
@@ -266,7 +308,9 @@ def main(args=None):
             return 0
         # Lake probes these during discovery. Keep them fast and stdout pristine.
         if args not in (["--githash"], ["--version"], ["-v"], ["--help"], ["-h"], ["--print-libdir"]):
+            _TRACE = Trace()
             wait_for_capacity()
+            _TRACE.event('run')
         exec_lean(lean, args)
     except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError) as error:
         print(f"tauceti-lean: {error}", file=sys.stderr)
