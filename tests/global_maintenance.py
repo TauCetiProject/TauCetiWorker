@@ -460,6 +460,28 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round([], author_count=1)
             self.assertEqual(self.calls, [("roadmap", 0, "NewArea", "NewArea")])
 
+    def test_focused_round_is_reported_for_fleet_status(self):
+        def reported(runtime):
+            return [c.kwargs["roadmap_focus"] for c in runtime.call_args_list if "roadmap_focus" in c.kwargs]
+
+        with (
+            patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]),
+            patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="2"),
+            patch.object(work, "report_runtime") as runtime,
+        ):
+            self.run_round([row(10, "Other"), row(20, "NewArea")])
+            self.assertEqual(reported(runtime), ["NewArea"])
+            # A capped focus slot that falls back to global work is no longer focused.
+            runtime.reset_mock()
+            self.run_round([row(10, "Other"), row(30, "Other")])
+            self.assertEqual(reported(runtime), ["NewArea", None])
+        with (
+            patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=[]),
+            patch.object(work, "report_runtime") as runtime,
+        ):
+            self.run_round([row(10, "Other")])
+            self.assertEqual(reported(runtime), [None])
+
     def test_missing_or_skipped_focus_keeps_global_maintenance(self):
         for focused, skip in ((["RemovedArea"], ""), (["NewArea"], "NewArea")):
             with (
