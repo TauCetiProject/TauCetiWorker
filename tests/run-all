@@ -48,6 +48,7 @@ RUN_STDLIB=(
   expanded_cache.py
   cache_storage.py
   local_lint.py
+  lean_pressure.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
