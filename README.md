@@ -225,11 +225,11 @@ receive no credit; a crash before the receipt is committed can require a reread.
 The Worker saves coverage before each client call and reconciles it with the
 client's successful tool-call reports afterwards, including on timeout or failure.
 For Codex recovery, each successful read must also have its matching complete
-source sections in the saved native conversation that will be resumed. The Worker keeps the
-contiguous confirmed prefix and rereads only the unconfirmed remainder in the
+source sections in the saved native conversation that will be resumed. The Worker
+keeps the contiguous confirmed prefix and rereads only the unconfirmed remainder in the
 same conversation. This works independently of parallel tool-call ordering.
-If the Worker dies without saving a transcript, the
-launch's new reads are replayed. Earlier findings and uncertainty are preserved;
+If the Worker dies without saving a transcript, the launch's new reads are replayed.
+Earlier findings and uncertainty are preserved;
 partial progress never substitutes for a final safety judgment.
 
 Protocol 4 trusts the verified client to deliver successful tool responses intact.

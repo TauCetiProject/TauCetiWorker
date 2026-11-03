@@ -446,6 +446,12 @@ class ServedJudgments(unittest.TestCase):
             for page in (0, 1):
                 r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
             append_native_reads(home, [0], self.thread, self.batch)
+            # The earlier skip-ahead error is saved, but the later successful
+            # page-1 result exists only in stdout when the client times out.
+            failed_rows = native_read_rows([1], self.batch)
+            failed_rows[-1]["payload"]["output"] = [{"type": "input_text", "text": "Error: skipped page"}]
+            with next((home / ".codex/sessions").glob("*.jsonl")).open("a") as native:
+                native.write("\n".join(map(sa.serialize, failed_rows)) + "\n")
             events = read_events("codex", [0]) + read_events("codex", [1])
             raise subprocess.TimeoutExpired("codex", 1800, output="\n".join(map(sa.serialize, events)).encode())
 
