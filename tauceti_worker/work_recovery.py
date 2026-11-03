@@ -62,7 +62,6 @@ PRESERVED = "refs/tauceti/preserved"
 PENDING = "refs/tauceti-pending"  # outside refs/tauceti/, so a pending tip never counts as preserved
 PSEUDO_HEADS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD")
 
-BUNDLE_SAVE_TIMEOUT = 60
 INCOMPLETE_SAVE_TTL = 3600
 
 MAX_UNTRACKED_BYTES = 128 * 1024 * 1024
@@ -257,11 +256,12 @@ def _git_environment(repo):
     return env
 
 
-def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout: int = 600):
+def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout: float | None = 600):
     work = _WORK.get()
     if work is not None:
         work.charge(entries=1)
-        timeout = min(timeout, max(0.001, work.seconds - (time.monotonic() - work.started)))
+        remaining = max(0.001, min(work.started + work.seconds, work.deadline) - time.monotonic())
+        timeout = (None if remaining == float("inf") else remaining) if timeout is None else min(timeout, remaining)
     command = ["git", "-C", str(repo), "-c", "core.quotepath=off", *args]
     env = _git_environment(repo)
     if work is not None and work.seconds != float("inf"):
@@ -285,7 +285,9 @@ def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout
 
 
 def _bounded_git(command, env, work, *, timeout=600):
-    deadline = min(work.started + work.seconds, work.deadline, time.monotonic() + timeout)
+    deadline = min(
+        work.started + work.seconds, work.deadline, float("inf") if timeout is None else time.monotonic() + timeout
+    )
     with subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -303,7 +305,7 @@ def _bounded_git(command, env, work, *, timeout=600):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(command, timeout)
-                    for event, _ in selector.select(max(0, remaining)):
+                    for event, _ in selector.select(None if remaining == float("inf") else max(0, remaining)):
                         capacity = min(65536, work.read_remaining)
                         if capacity <= 0:
                             raise BudgetExhausted("git output byte budget; retry preservation")
@@ -314,7 +316,7 @@ def _bounded_git(command, env, work, *, timeout=600):
                         else:
                             selector.unregister(event.fileobj)
             remaining = max(0.001, deadline - time.monotonic())
-            rc = process.wait(timeout=remaining)
+            rc = process.wait(timeout=None if remaining == float("inf") else remaining)
             return rc, bytes(output[process.stdout]), bytes(output[process.stderr])
         except BaseException:
             # Only the Git subprocess started by this housekeeping operation, never a session.
@@ -1026,11 +1028,11 @@ def _record_locked(cfg, repo: Path, snap: Snapshot, label: str, repository: str,
                 "--not",
                 "--remotes",
                 f"--glob={PUBLISHED}",
-                timeout=BUNDLE_SAVE_TIMEOUT,
+                timeout=None,  # Foreground bundles scale with history; housekeeping still has its Work budget.
             )
             with open(tmp / "commits.bundle", "rb+") as handle:
                 os.fsync(handle.fileno())
-            _git(repo, "bundle", "verify", "-q", str(tmp / "commits.bundle"))
+            _git(repo, "bundle", "verify", "-q", str(tmp / "commits.bundle"), timeout=None)
         _write(tmp / "staged.patch", snap.staged)
         _write(tmp / "unstaged.patch", snap.unstaged)
         _archive(repo, snap.untracked, tmp / "untracked.tar")
