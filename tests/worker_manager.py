@@ -36,6 +36,13 @@ import tauceti_worker.worker_manager as wm
 from tauceti_worker.cli import build_parser
 from tauceti_worker.runtime_status import report_failure, report_runtime
 
+# A wrapper raises its own OOM score from the environment, but never lowers it.
+score = root / "oom_score_adj"
+for current, wanted, expected in (("0", "500", "500"), ("700", "500", "700"), ("0", "", "0"), ("0", "x", "0")):
+    score.write_text(current + "\n")
+    wm.raise_oom_score({"TAUCETI_WORKER_OOM_SCORE_ADJ": wanted}, score)
+    assert score.read_text().strip() == expected, (current, wanted, score.read_text())
+
 
 def wait_for(predicate, timeout=10):
     deadline = time.monotonic() + timeout

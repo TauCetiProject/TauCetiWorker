@@ -742,7 +742,26 @@ def _serve_one(server: socket.socket, handler) -> None:
             pass
 
 
+def raise_oom_score(env=None, path=Path("/proc/self/oom_score_adj")) -> None:
+    """Apply TAUCETI_WORKER_OOM_SCORE_ADJ before the wrapper starts any child.
+
+    A supervisor can then keep a low score itself while its expendable workers
+    remain preferred kernel OOM victims. Only raises: an unprivileged process
+    cannot lower its score, and a supervisor's own higher score is kept.
+    """
+    raw = (os.environ if env is None else env).get("TAUCETI_WORKER_OOM_SCORE_ADJ")
+    if not raw:
+        return
+    try:
+        wanted = int(raw)
+        if -1000 <= wanted <= 1000 and wanted > int(path.read_text()):
+            path.write_text(f"{wanted}\n")
+    except (OSError, ValueError):
+        pass
+
+
 def cmd_managed_runner(args) -> int:
+    raise_oom_score()
     spec = _decode_spec(args.spec)
     state_dir = Path(args.state_dir)
     runtime_dir = Path(args.runtime_dir)
