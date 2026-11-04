@@ -1,0 +1,399 @@
+{
+ "schema": "tauceti-queue.repair-experiments/v1",
+ "generated_at": "2026-11-04T05:45:28+00:00",
+ "summary": {
+  "candidates": 5,
+  "complete": 4,
+  "green": 4,
+  "lineages": 4,
+  "agent_minutes": {
+   "count": 4,
+   "min": 1.0,
+   "p25": 1.1,
+   "median": 2.9,
+   "p75": 2.9,
+   "max": 4.7,
+   "mean": 2.4
+  },
+  "time_to_green_minutes": {
+   "count": 4,
+   "min": 1.1,
+   "p25": 1.3,
+   "median": 3.1,
+   "p75": 3.1,
+   "max": 4.9,
+   "mean": 2.6
+  },
+  "preparation_minutes": {
+   "count": 4,
+   "min": 0.4,
+   "p25": 10.4,
+   "median": 10.7,
+   "p75": 10.7,
+   "max": 14.9,
+   "mean": 9.1
+  },
+  "modules_built_in_preparation": {
+   "count": 4,
+   "min": 0,
+   "p25": 214,
+   "median": 4645,
+   "p75": 4645,
+   "max": 4903,
+   "mean": 2440.5
+  },
+  "estimated_cost_usd_total": 2.14,
+  "total_tokens": 2359521,
+  "shrink_events": 0,
+  "messages_preserved_everywhere": true
+ },
+ "candidates": [
+  {
+   "candidate": 1843,
+   "generation": 1,
+   "batch": 2525,
+   "lineage": 1843,
+   "members": 2,
+   "base_sha": "aeaa11500f9c",
+   "kinds": [
+    "compiler"
+   ],
+   "failing_modules": [
+    "TauCeti/RingTheory/PowerSeries/Substitution.lean"
+   ],
+   "suspects": [],
+   "status": "complete",
+   "error": null,
+   "ci_modules_built": 7,
+   "preparation": {
+    "base_cache_seconds": 4.9,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 214,
+    "modules_replayed": 0,
+    "modules_fetched": 42016,
+    "failed_modules_local": [
+     "TauCeti.RingTheory.PowerSeries.Substitution"
+    ],
+    "build_seconds": 618.1,
+    "build_rc": 1,
+    "load_1m_at_build": 58.5
+   },
+   "preparation_seconds": 624.0,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": false,
+   "agent_wall_seconds": 174.6,
+   "agent_rc": 0,
+   "agent_timed_out": false,
+   "agent_turns": 10,
+   "model": "claude-opus-5-5",
+   "tokens": {
+    "input_tokens": 20,
+    "cache_creation_input_tokens": 44416,
+    "cache_read_input_tokens": 432096,
+    "output_tokens": 4670,
+    "total_tokens": 481202
+   },
+   "estimated_cost_usd": 0.5352,
+   "claude_reported_cost_usd": 0.5352272,
+   "green": true,
+   "confirm_build_seconds": 8.7,
+   "confirm_modules_built": 0,
+   "confirm_failed_modules": [],
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": 183.3,
+   "edited_prs": [
+    25596
+   ],
+   "shrink_prs": [],
+   "emptied_prs": [],
+   "messages_preserved": true,
+   "edited_without_explanation": [],
+   "validation_problems": [],
+   "diffstat": "1 file changed, 4 insertions(+), 16 deletions(-)",
+   "load_1m_at_agent_start": 66.6,
+   "load_1m_at_agent_end": 49.8,
+   "disk_free_gb_start": 110.1,
+   "started_at": "2026-11-04T05:31:25+00:00",
+   "finished_at": "2026-11-04T05:44:56+00:00"
+  },
+  {
+   "candidate": 1914,
+   "generation": 1,
+   "batch": 2561,
+   "lineage": 1861,
+   "members": 14,
+   "base_sha": "ddf649351572",
+   "kinds": [
+    "lint"
+   ],
+   "failing_modules": [
+    "TauCeti/LowDimTopology/DehnSurgery/Slope.lean"
+   ],
+   "suspects": [
+    25376,
+    26169,
+    26209,
+    26212,
+    26241,
+    26416,
+    26862
+   ],
+   "status": "sources_ready",
+   "error": null,
+   "ci_modules_built": 2250,
+   "preparation": null,
+   "preparation_seconds": null,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": false,
+   "agent_wall_seconds": null,
+   "agent_rc": null,
+   "agent_timed_out": null,
+   "agent_turns": null,
+   "model": null,
+   "tokens": {},
+   "estimated_cost_usd": null,
+   "claude_reported_cost_usd": null,
+   "green": null,
+   "confirm_build_seconds": null,
+   "confirm_modules_built": null,
+   "confirm_failed_modules": null,
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": null,
+   "edited_prs": null,
+   "shrink_prs": null,
+   "emptied_prs": null,
+   "messages_preserved": null,
+   "edited_without_explanation": null,
+   "validation_problems": null,
+   "diffstat": null,
+   "load_1m_at_agent_start": null,
+   "load_1m_at_agent_end": null,
+   "disk_free_gb_start": 81.9,
+   "started_at": "2026-11-04T05:45:12+00:00",
+   "finished_at": null
+  },
+  {
+   "candidate": 1930,
+   "generation": 1,
+   "batch": 2623,
+   "lineage": 1886,
+   "members": 116,
+   "base_sha": "519af858c47a",
+   "kinds": [
+    "audit"
+   ],
+   "failing_modules": [
+    "TauCeti/Combinatorics/SimpleGraph/Connectivity/Menger.lean",
+    "TauCeti/Combinatorics/SimpleGraph/Paths.lean"
+   ],
+   "suspects": [],
+   "status": "complete",
+   "error": null,
+   "ci_modules_built": 4903,
+   "preparation": {
+    "base_cache_seconds": 4.9,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 4903,
+    "modules_replayed": 0,
+    "modules_fetched": 2536,
+    "failed_modules_local": [],
+    "build_seconds": 889.9,
+    "build_rc": 0,
+    "load_1m_at_build": 60.1
+   },
+   "preparation_seconds": 896.0,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": true,
+   "agent_wall_seconds": 57.1,
+   "agent_rc": 0,
+   "agent_timed_out": false,
+   "agent_turns": 8,
+   "model": "claude-opus-5-5",
+   "tokens": {
+    "input_tokens": 16,
+    "cache_creation_input_tokens": 33728,
+    "cache_read_input_tokens": 299208,
+    "output_tokens": 3439,
+    "total_tokens": 336391
+   },
+   "estimated_cost_usd": 0.3985,
+   "claude_reported_cost_usd": 0.3985096,
+   "green": true,
+   "confirm_build_seconds": 6.8,
+   "confirm_modules_built": 0,
+   "confirm_failed_modules": [],
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": 63.9,
+   "edited_prs": [
+    24945
+   ],
+   "shrink_prs": [],
+   "emptied_prs": [],
+   "messages_preserved": true,
+   "edited_without_explanation": [],
+   "validation_problems": [],
+   "diffstat": "1 file changed, 1 insertion(+), 6 deletions(-)",
+   "load_1m_at_agent_start": 51.8,
+   "load_1m_at_agent_end": 47.8,
+   "disk_free_gb_start": 90.4,
+   "started_at": "2026-11-04T05:14:52+00:00",
+   "finished_at": "2026-11-04T05:31:04+00:00"
+  },
+  {
+   "candidate": 1931,
+   "generation": 1,
+   "batch": 2615,
+   "lineage": 1867,
+   "members": 110,
+   "base_sha": "519af858c47a",
+   "kinds": [
+    "compiler"
+   ],
+   "failing_modules": [
+    "TauCeti/AlgebraicGeometry/Modules/PseudoCoherent/Pullback.lean"
+   ],
+   "suspects": [
+    26269
+   ],
+   "status": "complete",
+   "error": null,
+   "ci_modules_built": 1189,
+   "preparation": {
+    "base_cache_seconds": 7.0,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 4645,
+    "modules_replayed": 0,
+    "modules_fetched": 0,
+    "failed_modules_local": [
+     "TauCeti.AlgebraicGeometry.Modules.PseudoCoherent.Pullback",
+     "TauCeti.Algebra.Lie.Current.CompletedModules"
+    ],
+    "build_seconds": 633.0,
+    "build_rc": 1,
+    "load_1m_at_build": 96.5
+   },
+   "preparation_seconds": 642.5,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": true,
+   "agent_wall_seconds": 280.7,
+   "agent_rc": 0,
+   "agent_timed_out": false,
+   "agent_turns": 22,
+   "model": "claude-opus-5-5",
+   "tokens": {
+    "input_tokens": 44,
+    "cache_creation_input_tokens": 50570,
+    "cache_read_input_tokens": 1062044,
+    "output_tokens": 8294,
+    "total_tokens": 1120952
+   },
+   "estimated_cost_usd": 0.783,
+   "claude_reported_cost_usd": 0.7830248000000001,
+   "green": true,
+   "confirm_build_seconds": 15.6,
+   "confirm_modules_built": 0,
+   "confirm_failed_modules": [],
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": 296.3,
+   "edited_prs": [
+    25202,
+    26269
+   ],
+   "shrink_prs": [],
+   "emptied_prs": [],
+   "messages_preserved": true,
+   "edited_without_explanation": [],
+   "validation_problems": [],
+   "diffstat": "2 files changed, 4 insertions(+), 2 deletions(-)",
+   "load_1m_at_agent_start": 127.0,
+   "load_1m_at_agent_end": 66.3,
+   "disk_free_gb_start": 57.8,
+   "started_at": "2026-11-04T04:53:26+00:00",
+   "finished_at": "2026-11-04T05:12:55+00:00"
+  },
+  {
+   "candidate": 1932,
+   "generation": 1,
+   "batch": 2627,
+   "lineage": 1867,
+   "members": 109,
+   "base_sha": "519af858c47a",
+   "kinds": [
+    "compiler"
+   ],
+   "failing_modules": [
+    "TauCeti/Algebra/Lie/Current/CompletedModules.lean"
+   ],
+   "suspects": [
+    25202
+   ],
+   "status": "complete",
+   "error": null,
+   "ci_modules_built": 4645,
+   "preparation": {
+    "base_cache_seconds": 6.8,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 0,
+    "modules_replayed": 0,
+    "modules_fetched": 1,
+    "failed_modules_local": [
+     "TauCeti.Algebra.Lie.Current.CompletedModules"
+    ],
+    "build_seconds": 16.1,
+    "build_rc": 1,
+    "load_1m_at_build": 70.0
+   },
+   "preparation_seconds": 24.6,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": true,
+   "agent_wall_seconds": 63.8,
+   "agent_rc": 0,
+   "agent_timed_out": false,
+   "agent_turns": 10,
+   "model": "claude-opus-5-5",
+   "tokens": {
+    "input_tokens": 20,
+    "cache_creation_input_tokens": 35417,
+    "cache_read_input_tokens": 382282,
+    "output_tokens": 3257,
+    "total_tokens": 420976
+   },
+   "estimated_cost_usd": 0.425,
+   "claude_reported_cost_usd": 0.42501239999999996,
+   "green": true,
+   "confirm_build_seconds": 13.0,
+   "confirm_modules_built": 0,
+   "confirm_failed_modules": [],
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": 76.8,
+   "edited_prs": [
+    25202
+   ],
+   "shrink_prs": [],
+   "emptied_prs": [],
+   "messages_preserved": true,
+   "edited_without_explanation": [],
+   "validation_problems": [],
+   "diffstat": "1 file changed, 2 insertions(+), 1 deletion(-)",
+   "load_1m_at_agent_start": 67.7,
+   "load_1m_at_agent_end": 57.9,
+   "disk_free_gb_start": 91.3,
+   "started_at": "2026-11-04T05:12:56+00:00",
+   "finished_at": "2026-11-04T05:14:52+00:00"
+  }
+ ]
+}
