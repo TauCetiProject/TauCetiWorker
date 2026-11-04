@@ -1072,7 +1072,17 @@ def prepare_artifacts(worktree: Path, failure: Failure, env: dict, logdir: Path,
     fetch["artifacts_downloaded"] = text.count("downloaded artifact")
     record["base_cache"] = fetch
     own = run_logged(
-        ["lake", "cache", "get", "--service", CACHE_SERVICE, "--repo", REPO, "--rev=HEAD", "--mappings-only"],
+        [
+            "lake",
+            "cache",
+            "get",
+            "--service",
+            CACHE_SERVICE,
+            "--repo",
+            REPO,
+            f"--rev={failure.commit or 'HEAD'}",
+            "--mappings-only",
+        ],
         worktree,
         logdir / "cache-get-candidate.log",
         env=env,
