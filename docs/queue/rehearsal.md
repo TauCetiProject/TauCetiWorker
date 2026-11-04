@@ -42,7 +42,9 @@ webhook delivery log.
 5. **Run it** on a host with the App credentials in `~/.config/tauceti-queue/`, `gh` logged in as a
    repository admin (the operator), the pinned toolchain installed (`elan` resolves
    `leanprover/lean4:v4.36.0-rc2`), and `git` able to push to the scratch repository through `gh`'s
-   credential helper:
+   credential helper. The scratch repository must be reachable by the organisation's Namespace runners
+   (the scaffold's jobs run on `nscloud-ubuntu-24.04-amd64-2x4`; GitHub-hosted labels never got a runner
+   here):
 
    ```sh
    cd ~/TauCetiWorker   # any checkout of this repository
@@ -156,6 +158,33 @@ the one expected skip).
 
 ## Findings
 
+From the live run on the scratch repository (2026-11-04, report in `rehearsal-live.md`), each fixed
+in the code or the runbook:
+
+- Retained refs were created through the Git Data API, which cannot point at a commit GitHub does
+  not have; the candidate tip exists only in the service's clone, so every dispatched run failed at
+  checkout and ended as `missing-status`. `update_ref` now pushes `+<sha>:refs/<ref>` from the clone
+  and the controller pushes the head's ref before each dispatch. The fake pushed objects implicitly,
+  which is why the dry run never saw it.
+- GitHub publishes a job's log a little after the run completes. Observing in that window gave only a
+  `log_unavailable` infrastructure finding and a genuine source failure was re-dispatched instead of
+  repaired. A failed run without a readable log is now observed again for up to ten minutes.
+- This organisation hands no GitHub-hosted runners to the scratch repository: jobs on `ubuntu-latest`
+  and `ubuntu-24.04` queued indefinitely, private or public. TauCeti's own jobs run on Namespace, and
+  the scaffold's jobs use `nscloud-ubuntu-24.04-amd64-2x4`, which starts within seconds.
+- The installation's permissions lag the App registration until the operator accepts the update:
+  `checks: write` was registered but the token carried `checks: read` for most of the run. The rig
+  reads the token's permissions, not the registration, and skips the eligibility scenario with that
+  reason; re-run `--only clean` once the token carries `write`.
+- The App's webhook delivery log answers 404 while the App has no active webhook, so deliveries are
+  synthesized from the API objects the rehearsal creates and the service observes CI by polling.
+- The operator's token is a shared account quota: approval comments, admin calls and every `gh`
+  call the operator makes during the run draw on it, and the service resolves the bearer token
+  through `GET /user` on each fresh process. Keep `gh` use during a run to a minimum; a restart no
+  longer re-applies settings for that reason.
+- GitHub's own degradation (5xx on pushes and PR creation, cancellations not processed for an hour,
+  `force-cancel` needed to free a concurrency group) is survivable: pushes retry, a PR create that
+  was applied but answered 5xx is adopted on the retry, and the waits are hours rather than minutes.
 - An infrastructure re-dispatch creates a second `pr-build.yml` run with the same `run-name` (same
   head, base and batch id). The adapter raised `AmbiguousCandidateRun` for two runs with one title,
   so a head whose first run was cancelled, lost or reported without its status could never finish;
