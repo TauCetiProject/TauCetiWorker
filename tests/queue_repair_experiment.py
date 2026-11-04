@@ -320,6 +320,71 @@ with tempfile.TemporaryDirectory() as raw:
     check("prompt names Bors's suspect as a hint", "#26269" in prompt and "not a verdict" in prompt)
     check("prompt explains verification", "lake build --iofail" in prompt and "scripts/lint-env.sh" in prompt)
 
+# ---- chain construction through the chain tool, with the retained-chain fallback -----------------
+
+with tempfile.TemporaryDirectory() as raw:
+    repo = Path(raw)
+    subprocess.run(["git", "init", "--quiet", "-b", "main", str(repo)], check=True)
+    sh(repo, "config", "user.name", "t")
+    sh(repo, "config", "user.email", "t@x")
+    base = commit(repo, "base", {"TauCeti/A.lean": "theorem a : True := trivial\n"})
+    sh(repo, "checkout", "--quiet", "-b", "pr1")
+    head1 = commit(repo, "wip one", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+    sh(repo, "checkout", "--quiet", "--detach", base)
+    head2 = commit(repo, "wip two", {"TauCeti/B.lean": "theorem b : True := trivial\n"})
+    # Bors's retained chain: squash of #1 then #2, subjects carrying the PR number.
+    sh(repo, "checkout", "--quiet", "--detach", base)
+    retained1 = commit(repo, "feat: improve A (#1)\n\nOne.\n", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+    retained2 = commit(repo, "feat: add B (#2)\n\nTwo.\n", {"TauCeti/B.lean": "theorem b : True := trivial\n"})
+    failure = rx.Failure(
+        1,
+        1,
+        1,
+        base,
+        retained2,
+        None,
+        [rx.Member(1, head1, None, None, None), rx.Member(2, head2, None, None, None)],
+        [],
+        [],
+        {},
+        None,
+        None,
+        [],
+        None,
+        None,
+    )
+    tip, built_chain, outcome = rx.construct_chain(repo, failure, retained2)
+    check(
+        "the chain tool rebuilds the retained tree from the accepted heads",
+        outcome["source"] == "chain.build"
+        and outcome["tree_matches_retained"]
+        and sh(repo, "rev-parse", f"{tip}^{{tree}}") == sh(repo, "rev-parse", f"{retained2}^{{tree}}"),
+    )
+    check(
+        "chain tool commits carry the PR titles and trailers",
+        built_chain[1].subject == "feat: add B" and built_chain[1].accepted_head == head2 and built_chain[0].pr == 1,
+    )
+    check(
+        "the chain tool's chain validates", outcome["validate_ok"] and rx.validate_chain(repo, base, tip, [1, 2]) == []
+    )
+    # A head that differs from what Bors merged: the tool's tree diverges and the retained chain is reworded instead.
+    sh(repo, "checkout", "--quiet", "--detach", head2)
+    head2b = commit(repo, "more two", {"TauCeti/B.lean": "theorem b : True := trivial\ntheorem b2 : True := trivial\n"})
+    failure.members[1].head_sha = head2b
+    tip2, chain2, outcome2 = rx.construct_chain(repo, failure, retained2)
+    check(
+        "a divergent tool chain falls back to the reworded retained chain",
+        outcome2["source"] == "retained_reword"
+        and outcome2["tree_matches_retained"] is False
+        and outcome2["first_divergent_prs"] == [2],
+    )
+    check(
+        "the fallback keeps the retained tree and the member heads",
+        sh(repo, "rev-parse", f"{tip2}^{{tree}}") == sh(repo, "rev-parse", f"{retained2}^{{tree}}")
+        and chain2[1].accepted_head == head2b,
+    )
+    check("the tree difference is recorded", "B.lean" in outcome2["tree_difference"])
+
 # ---- agent usage accounting from a stream-json transcript --------------------------------------
 
 with tempfile.TemporaryDirectory() as raw:

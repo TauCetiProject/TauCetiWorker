@@ -39,6 +39,8 @@ import sys
 import time
 from pathlib import Path
 
+from tauceti_queue import chain as chain_tool
+
 REPO = "TauCetiProject/TauCeti"
 JOURNAL_URL = "https://bors.taucetiproject.org/repositories/1/candidates?base=main"
 REF_PREFIX = "refs/repair-experiments"
@@ -900,13 +902,103 @@ def fetch_job_log(job_id: int, dest: Path) -> Path | None:
     return dest
 
 
+def fetch_member_heads(clone: Path, members: list[Member], batch: int = 40) -> int:
+    """Fetch the accepted heads that are not yet in the clone (network); returns how many were fetched."""
+    missing = [m.head_sha for m in members if git(clone, "cat-file", "-t", m.head_sha, check=False).strip() != "commit"]
+    for index in range(0, len(missing), batch):
+        git(clone, "fetch", "--quiet", "origin", *missing[index : index + batch])
+    return len(missing)
+
+
+def construct_chain(clone: Path, failure: Failure, retained_sha: str) -> tuple[str, list[ChainCommit], dict]:
+    """The attributed chain the agent edits, built with the chain tool from the accepted heads.
+
+    Bors's retained commit is already one squash commit per member on ``base_sha``; its subjects and
+    bodies (the PR titles and descriptions) become the chain tool's member titles and descriptions.
+    When the tool's chain is clean and its tip tree equals the retained tree it is used as is. When
+    it conflicts or its tree differs, the difference is recorded and the retained chain is reworded
+    with the trailers instead, so the agent always starts from the exact tree CI built and failed.
+    """
+    retained = read_chain(clone, failure.base_sha, retained_sha)
+    by_pr = {c.pr: c for c in retained}
+    heads = {m.pr: m.head_sha for m in failure.members}
+    missing = sorted(set(heads) - set(by_pr))
+    extra = sorted(set(by_pr) - set(heads))
+    if missing or extra:
+        raise RuntimeError(f"retained chain/member mismatch: missing {missing}, unexpected {extra}")
+    members = []
+    for commit in retained:
+        subject = SUBJECT_PR.sub("", commit.subject).strip()
+        body = commit.message.split("\n", 1)[1].strip() if "\n" in commit.message else ""
+        members.append(
+            chain_tool.Member(REPO, commit.pr, heads[commit.pr], title=subject, description=body, coauthors=())
+        )
+    record: dict = {"tool": "tauceti_queue.chain.build"}
+    retained_tree = git(clone, "rev-parse", f"{retained_sha}^{{tree}}").strip()
+    try:
+        built = chain_tool.build(clone, failure.base_sha, members, chain_id=f"repair-experiment-{failure.ref}")
+        record["status"] = built.status
+        record["tip"] = built.tip
+        record["ref"] = built.ref
+        conflict = built.conflict
+        if conflict is not None:
+            record["conflict"] = conflict.to_dict()
+        built_tree = git(clone, "rev-parse", f"{built.tip}^{{tree}}").strip()
+        record["tree_matches_retained"] = built.status == chain_tool.CLEAN and built_tree == retained_tree
+        if built.status == chain_tool.CLEAN and not record["tree_matches_retained"]:
+            record["tree_difference"] = git(clone, "diff", "--stat", "--no-color", built.tip, retained_sha).strip()[
+                -2000:
+            ]
+            divergent = []
+            for record_commit, retained_commit in zip(built.commits, retained, strict=False):
+                if (
+                    record_commit.sha
+                    and git(clone, "rev-parse", f"{record_commit.sha}^{{tree}}").strip() != retained_commit.tree
+                ):
+                    divergent.append(retained_commit.pr)
+            record["first_divergent_prs"] = divergent[:5]
+    except chain_tool.ChainError as error:
+        record["status"] = "error"
+        record["error"] = str(error)
+        record["tree_matches_retained"] = False
+    if record.get("tree_matches_retained"):
+        tip = record["tip"]
+        source = "chain.build"
+    else:
+        tip, _ = build_attributed_chain(clone, failure.base_sha, retained_sha, failure.members)
+        source = "retained_reword"
+    chain = read_chain(clone, failure.base_sha, tip)
+    report = chain_tool.validate(clone, failure.base_sha, tip, [m.source_pr for m in members])
+    if not report.ok:
+        raise RuntimeError("chain validation failed: " + "; ".join(v.detail for v in report.violations))
+    record["source"] = source
+    record["validate_ok"] = report.ok
+    return tip, chain, record
+
+
+def checkout_worktree(clone: Path, sha: str, path: Path) -> bool:
+    """A detached worktree at ``sha``; an existing one is re-pointed so its ``.lake`` outputs stay warm.
+
+    Returns True when a worktree was reused. The worktree belongs to the harness alone: tracked
+    changes left by a previous agent are discarded (its result is already retained under a ref) and
+    untracked files other than ``.lake`` are removed.
+    """
+    if path.is_dir() and git(path, "rev-parse", "--is-inside-work-tree", check=False).strip() == "true":
+        git(path, "checkout", "--quiet", "--force", "--detach", sha)
+        git(path, "clean", "-fdq", "-e", ".lake", check=False)
+        return True
+    create_worktree(clone, sha, path)
+    return False
+
+
 def prepare_sources(clone: Path, failure: Failure, experiment_dir: Path, worktree: Path, seed_packages: Path) -> dict:
-    """Retained commit, CI log, attributed chain and a private detached worktree at the chain tip."""
+    """Retained commit, member heads, CI log, attributed chain and the detached worktree at its tip."""
     record: dict = {}
     started = time.monotonic()
     sha = ensure_candidate_ref(clone, failure)
     record["retained_sha"] = sha
     record["retained_tree"] = git(clone, "rev-parse", f"{sha}^{{tree}}").strip()
+    record["member_heads_fetched"] = fetch_member_heads(clone, failure.members)
     logs = []
     for job in failure.job_ids:
         path = fetch_job_log(job, experiment_dir / "ci" / f"job-{job}.log")
@@ -934,16 +1026,18 @@ def prepare_sources(clone: Path, failure: Failure, experiment_dir: Path, worktre
         findings["canceled_jobs"] = max(findings["canceled_jobs"], found["canceled_jobs"])
     record["ci_findings"] = findings
     (experiment_dir / "ci-findings.json").write_text(json.dumps(findings, indent=1))
-    tip, chain = build_attributed_chain(clone, failure.base_sha, sha, failure.members)
+    tip, chain, chain_record = construct_chain(clone, failure, sha)
     chain_ref = f"{REF_PREFIX}/chain/{failure.ref}"
     git(clone, "update-ref", chain_ref, tip)
+    record["chain_tool"] = chain_record
     record["chain_tip"] = tip
     record["chain_ref"] = chain_ref
+    record["chain_source"] = chain_record["source"]
     record["chain_tree_matches_retained"] = (
         git(clone, "rev-parse", f"{tip}^{{tree}}").strip() == record["retained_tree"]
     )
     record["chain_length"] = len(chain)
-    create_worktree(clone, tip, worktree)
+    record["worktree_reused"] = checkout_worktree(clone, tip, worktree)
     link_shared_packages(worktree, seed_packages)
     record["seconds"] = round(time.monotonic() - started, 1)
     return record
@@ -1294,6 +1388,13 @@ def measure_repair(
     record["result_ref"] = result_ref
     record["tip_changed"] = tip != chain_before[-1].sha if chain_before else None
     problems = validate_chain(clone, failure.base_sha, tip, failure.member_prs)
+    tool_members = [f"{REPO}#{pr}" for pr in failure.member_prs]
+    try:
+        tool_report = chain_tool.validate(clone, failure.base_sha, tip, tool_members)
+        record["chain_tool_validate"] = tool_report.to_dict()
+        problems += [f"chain tool: {v.detail}" for v in tool_report.violations if v.detail not in " ".join(problems)]
+    except chain_tool.ChainError as error:
+        problems.append(f"chain tool validate: {error}")
     record["validation_problems"] = problems
     comparison: list[dict] = []
     try:
@@ -1301,9 +1402,23 @@ def measure_repair(
         comparison = compare_chains(clone, chain_before, chain_after)
     except RuntimeError as error:
         record["validation_problems"] = problems + [f"chain unreadable: {error}"]
+    tool_edited: list[int] | None = None
+    if chain_before:
+        try:
+            tool_compare = chain_tool.compare(clone, failure.base_sha, chain_before[-1].sha, failure.base_sha, tip)
+            record["chain_tool_compare"] = tool_compare.to_dict()
+            tool_edited = sorted(
+                int(m.source_pr.rsplit("#", 1)[1]) for m in tool_compare.members if m.provenance == chain_tool.EDITED
+            )
+            replay_edited = {int(m.source_pr.rsplit("#", 1)[1]) for m in tool_compare.members if m.content_changed}
+            for row in comparison:
+                row["content_changed_vs_replay"] = row["pr"] in replay_edited
+        except chain_tool.ChainError as error:
+            record["chain_tool_compare_error"] = str(error)
     record["comparison"] = comparison
     edited = [row["pr"] for row in comparison if row.get("status") == "edited"]
-    record["edited_prs"] = edited
+    record["edited_prs_patch_id"] = edited
+    record["edited_prs"] = tool_edited if tool_edited is not None else edited
     record["shrink_prs"] = [row["pr"] for row in comparison if row.get("shrink")]
     record["emptied_prs"] = [row["pr"] for row in comparison if row.get("empty_after") and not row.get("empty_before")]
     record["messages_preserved"] = all(row.get("message_preserved", True) for row in comparison)
@@ -1411,15 +1526,19 @@ def run_experiment(
     agent_timeout: float = 3 * 3600,
     build_timeout: float = 3 * 3600,
     skip_agent: bool = False,
-    keep_worktree: bool = False,
+    keep_worktree: bool = True,
     min_free_gb: float = 15.0,
 ) -> dict:
-    """One historical repair experiment, end to end, with a progressively written result record."""
+    """One historical repair experiment, end to end, with a progressively written result record.
+
+    The worktree is per base commit and kept by default, so the next candidate on the same base
+    reuses the 14 GB restore of main's cache; ``clean`` removes the worktrees at the end.
+    """
     experiment_dir = root / str(failure.candidate_id)
     experiment_dir.mkdir(parents=True, exist_ok=True)
     record_path = experiment_dir / "result.json"
-    worktree = root / "worktrees" / failure.ref
-    seed_packages = seed_packages or (root / "seed" / "TauCeti" / ".lake" / "packages")
+    worktree = root / "worktrees" / f"base-{failure.base_sha[:12]}"
+    seed_packages = seed_packages or (root / "seed" / "packages")
     record: dict = {
         "candidate": failure.to_json(),
         "status": "starting",
@@ -1538,7 +1657,10 @@ def result_row(record: dict) -> dict:
         "ci_modules_built": ((sources.get("ci_findings") or {}).get("built_modules")),
         "preparation": warmth,
         "preparation_seconds": artifacts.get("seconds"),
+        "chain_source": sources.get("chain_source"),
+        "chain_tool_tree_matches_retained": (sources.get("chain_tool") or {}).get("tree_matches_retained"),
         "chain_tree_matches_retained": sources.get("chain_tree_matches_retained"),
+        "worktree_reused": sources.get("worktree_reused"),
         "agent_wall_seconds": agent.get("wall_seconds"),
         "agent_rc": agent.get("rc"),
         "agent_timed_out": agent.get("timed_out"),
@@ -1691,7 +1813,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--agent-timeout", type=float, default=3 * 3600)
     run.add_argument("--build-timeout", type=float, default=3 * 3600)
     run.add_argument("--skip-agent", action="store_true", help="prepare and measure artifacts only")
-    run.add_argument("--keep-worktree", action="store_true")
+    run.add_argument("--remove-worktree", action="store_true", help="remove the base worktree afterwards")
+    clean = sub.add_parser("clean", help="remove every experiment worktree under the root")
+    clean.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    clean.add_argument("--clone", type=Path, default=DEFAULT_CLONE)
     report = sub.add_parser("report", help="aggregate result records into the results table and JSON")
     report.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     report.add_argument("--json", type=Path, help="write the per-candidate records here")
@@ -1723,10 +1848,15 @@ def main(argv: list[str] | None = None) -> int:
             agent_timeout=args.agent_timeout,
             build_timeout=args.build_timeout,
             skip_agent=args.skip_agent,
-            keep_worktree=args.keep_worktree,
+            keep_worktree=not args.remove_worktree,
         )
         print(json.dumps(result_row(record), indent=1, default=str))
         return 0 if record.get("status") in {"complete", "prepared_only"} else 1
+    if args.command == "clean":
+        for path in sorted((args.root / "worktrees").glob("*")):
+            remove_worktree(args.clone, path)
+            print(f"removed {path}")
+        return 0
     if args.command == "report":
         rows = [result_row(r) for r in load_results(args.root)]
         payload = {
