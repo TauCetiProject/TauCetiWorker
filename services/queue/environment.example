@@ -1,0 +1,5 @@
+# Environment for tauceti-queue.service: ~/.config/tauceti-queue/environment (mode 0600).
+# Any TAUCETI_QUEUE_<KEY> here overrides config.toml; keep secrets in the credential files, not
+# here. The file is optional; an empty file is fine.
+#TAUCETI_QUEUE_CONFIG=/home/operator/.config/tauceti-queue/config.toml
+#TAUCETI_QUEUE_LISTEN_PORT=8780

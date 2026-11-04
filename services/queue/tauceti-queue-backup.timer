@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up the Tau Ceti AI merge queue database daily
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

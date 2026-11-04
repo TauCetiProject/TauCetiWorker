@@ -1,0 +1,30 @@
+# Tau Ceti AI merge queue service configuration: ~/.config/tauceti-queue/config.toml
+# (tauceti_queue/config.py documents every key; `tauceti-queue check-config` prints the
+# effective values with their sources). Environment variables TAUCETI_QUEUE_<KEY> override.
+
+repository = "TauCetiProject/TauCeti"
+# Leave empty to discover the default branch from the repository at start.
+canonical_branch = ""
+# The host this service runs on, as reported in status; empty means this machine's host name.
+host = ""
+# The cutover flag. false is shadow mode: the service observes, builds batches and reports what
+# it would do without publishing. Set to true only in the cutover step of the runbook.
+publication_enabled = false
+
+content_clone = "~/.local/share/tauceti-queue/content"
+database = "~/.local/state/tauceti-queue/queue.sqlite3"
+credentials_dir = "~/.config/tauceti-queue"
+log_dir = "~/.local/state/tauceti-queue/logs"
+
+# Local listen address; the Cloudflare tunnel forwards queue.taucetiproject.org here.
+listen_host = "127.0.0.1"
+listen_port = 8780
+public_url = "https://queue.taucetiproject.org"
+reconcile_interval_seconds = 30
+
+# Initial runtime controls. Once the store exists these are changed with
+# `tauceti-queue settings set <key> <value>`, not by editing this file.
+[settings]
+insertion_age_window = 16
+repair_concurrency = 1
+stall_interval_seconds = 900
