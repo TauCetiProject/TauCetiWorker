@@ -263,8 +263,15 @@ def format_identity(identity: str) -> tuple[str, str]:
 
 
 def squash_message(member: Member, coauthors: Sequence[str]) -> str:
-    """The squash commit message: subject, description, then Co-authored-by and identity trailers."""
+    """The squash commit message: subject, description, then Co-authored-by and identity trailers.
+
+    The subject is Bors's `<title> (#<number>)`, so tooling that attributes commits to PRs by the
+    subject suffix (TauCetiTools `lint-scope.sh`, GitHub's commit-to-PR links) keeps working.
+    """
+    suffix = f"(#{member.number})"
     subject = " ".join(member.title.split()) or f"{member.source_pr} at {member.head_sha[:12]}"
+    if not subject.endswith(suffix):
+        subject = f"{subject} {suffix}"
     paragraphs = [subject]
     if member.description.strip():
         paragraphs.append(member.description.strip())

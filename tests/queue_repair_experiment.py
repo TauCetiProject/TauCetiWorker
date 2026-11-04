@@ -385,7 +385,9 @@ with tempfile.TemporaryDirectory() as raw:
     )
     check(
         "chain tool commits carry the PR titles and trailers",
-        built_chain[1].subject == "feat: add B" and built_chain[1].accepted_head == head2 and built_chain[0].pr == 1,
+        built_chain[1].subject == "feat: add B (#2)"
+        and built_chain[1].accepted_head == head2
+        and built_chain[0].pr == 1,
     )
     check(
         "the chain tool's chain validates", outcome["validate_ok"] and rx.validate_chain(repo, base, tip, [1, 2]) == []
