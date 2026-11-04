@@ -583,6 +583,15 @@ class GitHubAdapter:
         matches = [r for r in runs if isinstance(r, dict) and r.get("display_title") == expected]
         if not matches:
             return None
+        if len(matches) > 1 and since is not None:
+            # An infrastructure re-dispatch of the same head, base and batch creates a second run with
+            # the same title; the one created at or after the dispatch being observed answers for it,
+            # the newest first. Runs whose creation time is unreadable stay ambiguous.
+            dated = [(_timestamp(r.get("created_at")), r) for r in matches]
+            recent = [(t, r) for t, r in dated if t is not None and t >= since - 60]
+            if recent:
+                recent.sort(key=lambda item: (item[0], int(item[1].get("id") or 0)))
+                matches = [recent[-1][1]]
         if len(matches) > 1:
             raise AmbiguousCandidateRun(f"{len(matches)} runs titled {expected!r}")
         return self.candidate_run(repo, matches[0], with_jobs=with_jobs, with_diagnostics=with_diagnostics)

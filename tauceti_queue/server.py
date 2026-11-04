@@ -518,6 +518,7 @@ def server_config(config, *, adapter=None, app=None, controller=None) -> ServerC
         adapter=adapter,
         host=config.listen_host,
         port=config.listen_port,
+        review_app_id=int(getattr(config, "review_app_id", webhook.REVIEW_APP_ID) or webhook.REVIEW_APP_ID),
     )
 
 

@@ -118,6 +118,7 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `listen_host`, `listen_port` | `127.0.0.1`, `8780` | the local listen address the tunnel forwards to |
 | `public_url` | `https://queue.taucetiproject.org` | the public base; the webhook address is `<public_url>/webhook/github` |
 | `reconcile_interval_seconds` | `30` | the loop's cadence between event-driven wakeups |
+| `review_app_id` | `3947238` | the GitHub App whose `merge eligibility` checks and exact-head comments are approvals (TauCetiReview); the rehearsal points it at the queue's own App on the scratch repository |
 | `[settings] insertion_age_window` | `16` | initial runtime control (plan, "Runtime controls") |
 | `[settings] repair_concurrency` | `1` | initial runtime control |
 | `[settings] stall_interval_seconds` | `900` | initial runtime control |

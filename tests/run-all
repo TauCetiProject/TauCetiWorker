@@ -137,6 +137,7 @@ RUN_STDLIB=(
   queue_store.py
   queue_config.py
   queue_cli.py
+  queue_rehearsal.py
   rebase_handoff.py
   scoped_repair_route.py
   rebase_budget.py

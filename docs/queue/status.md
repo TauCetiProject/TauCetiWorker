@@ -27,7 +27,7 @@ experiment sample and without a shadow period; the scratch-repository rehearsal 
 | F. GitHub adapters and Bors-compatible surface (`github_app.py`, `github_adapter.py`, `commands.py`, `eligibility.py`, `webhook.py`, `feeds.py`, `server.py`) | `queue/github-adapters` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/484 |
 | G. Repair task runner (`tauceti_queue/repair.py`, `repair_task.py`) | `queue/repair-task` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/483 |
 | H. Deployment (`config.py`, `__main__.py`, `runtime.py`, `services/queue/`, runbook) | `queue/deployment` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/482 |
-| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, scratch repository scaffold, scenario driver) | `queue/rehearsal` | in progress; the live run waits for the scratch repository |
+| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, `scripts/queue-rehearsal`, `docs/queue/rehearsal.md`) | `queue/rehearsal` | the scenario script and the scratch content are written; the dry run over the fakes passes (`tests/queue_rehearsal.py`, every record); the live run waits for the scratch repository (operator item 2) and its addition to the App installation |
 
 Storage is one SQLite file on the service host rather than PostgreSQL: a single-process service does
 not need a server database, and the operator prefers the simpler host.
@@ -42,7 +42,7 @@ keeps `MERGE_BACKEND=bors`, suspends the `tau-ceti-bors` App installation, point
 ## Operator items outstanding
 
 1. Done: the `tauceti-queue` App is created and installed on `TauCetiProject/TauCeti`.
-2. Create `TauCetiProject/TauCetiQueueScratch` (stream I).
+2. Create `TauCetiProject/TauCetiQueueScratch` (stream I) and add it to the `tauceti-queue` App installation; optionally grant the App `checks: write` so the rehearsal can approve through `merge eligibility` checks (`docs/queue/rehearsal.md`). The rehearsal pushes the content itself.
 3. Staging capacity: no action for now (operator decision, 2026-11-04). Revisit from the pilot's measurements.
 4. Name the service host (increment 1): a fleet host with the `~/.config/tauceti-queue/` credentials (already on chungus2) and a public HTTPS endpoint `queue.taucetiproject.org` through Cloudflare.
 

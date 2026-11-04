@@ -113,8 +113,15 @@ class GitHubPort(Protocol):
         """`repository_dispatch` of `pr-build.yml` with event `tauceti-bors-staging`; returns a dispatch id."""
         ...
 
-    def find_candidate_run(self, repo: str, *, batch_id: str, head_sha: str, base_sha: str) -> CandidateRun | None:
-        """The run whose display title is `bors branch=<base_ref> batch=<batch_id> head=<head_sha> base=<base_sha>`."""
+    def find_candidate_run(
+        self, repo: str, *, batch_id: str, head_sha: str, base_sha: str, since: float | None = None
+    ) -> CandidateRun | None:
+        """The run whose display title is `bors branch=<base_ref> batch=<batch_id> head=<head_sha> base=<base_sha>`.
+
+        `since` is the dispatch time of the attempt being observed: an infrastructure re-dispatch
+        of the same head, base and batch produces a second run with the same title, and the newest
+        run created at or after `since` (less a minute of skew) is the one that answers for it.
+        """
         ...
 
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None: ...

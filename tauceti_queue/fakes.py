@@ -425,12 +425,16 @@ class FakeGitHub:
             self.dispatches.append(dispatch)
             return f"dispatch-{self._run_counter}"
 
-    def find_candidate_run(self, repo: str, *, batch_id: str, head_sha: str, base_sha: str) -> CandidateRun | None:
+    def find_candidate_run(
+        self, repo: str, *, batch_id: str, head_sha: str, base_sha: str, since: float | None = None
+    ) -> CandidateRun | None:
         with self.lock:
             self._call("find_candidate_run", batch_id, head_sha, base_sha)
             matching = [
                 r for r in self.runs if r.batch_id == batch_id and r.head_sha == head_sha and r.base_sha == base_sha
             ]
+            if since is not None:
+                matching = [r for r in matching if r.created_at >= since - 60]
             if not matching:
                 return None
             return matching[-1].to_candidate_run()

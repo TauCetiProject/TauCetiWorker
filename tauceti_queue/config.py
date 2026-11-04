@@ -23,6 +23,7 @@ through the admin endpoint (`tauceti-queue settings set`), never by editing this
     listen_port = 8780
     public_url = "https://queue.taucetiproject.org"
     reconcile_interval_seconds = 30
+    review_app_id = 3947238        # the App whose `merge eligibility` checks approve (TauCetiReview)
 
     [settings]
     insertion_age_window = 16
@@ -93,6 +94,7 @@ class Config:
     listen_port: int = 8780
     public_url: str = "https://queue.taucetiproject.org"
     reconcile_interval_seconds: int = 30
+    review_app_id: int = 3947238  # the App whose `merge eligibility` checks and exact-head comments approve
     settings: Settings = field(default_factory=Settings)
     # Bookkeeping, not configuration: where the file came from and the source of every value.
     path: Path | None = None
@@ -249,6 +251,8 @@ def validate(config: Config) -> list[str]:
         problems.append(f"public_url must be an http(s) URL, got {config.public_url!r}")
     if config.reconcile_interval_seconds < 1:
         problems.append("reconcile_interval_seconds must be at least 1")
+    if config.review_app_id < 1:
+        problems.append("review_app_id must be a positive GitHub App id")
     for name in SETTING_FIELDS:
         if getattr(config.settings, name) < 1:
             problems.append(f"{name} must be at least 1")
