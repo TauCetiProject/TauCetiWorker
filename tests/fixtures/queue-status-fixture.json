@@ -1,0 +1,56 @@
+{
+  "schema": "tauceti-queue.status/v1",
+  "generated_at": "2026-11-04T08:00:00Z",
+  "service": {
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "revision_source": "git",
+    "dirty": false,
+    "started_at": "2026-11-04T06:30:00Z",
+    "host": "chungus2",
+    "pid": 4242,
+    "repository": "TauCetiProject/TauCeti",
+    "canonical_branch": "main",
+    "publication_enabled": false,
+    "mode": "shadow",
+    "controller": "running",
+    "reason": null
+  },
+  "settings": {
+    "insertion_age_window": 16,
+    "repair_concurrency": 1,
+    "stall_interval_seconds": 900
+  },
+  "conditions": [
+    {
+      "condition": "stall_over_two_intervals",
+      "since": "2026-11-04T07:20:00Z",
+      "detail": "build phase silent for 2100s on runner chungus2-ci-3"
+    }
+  ],
+  "head": {
+    "batch": "batch-0042",
+    "version": 7,
+    "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "members": 23,
+    "claim": {"operation": "ci", "worker": "controller", "token": 19, "expires_at": "2026-11-04T08:05:00Z"},
+    "ci": {
+      "run_id": 987654321,
+      "runner": "chungus2-ci-3",
+      "host": "chungus2",
+      "started_at": "2026-11-04T06:55:00Z",
+      "phases": [
+        {"name": "preparation", "started_at": "2026-11-04T06:55:00Z", "updated_at": "2026-11-04T06:57:00Z", "finished_at": "2026-11-04T06:57:00Z", "progress": "done"},
+        {"name": "cache_restore", "started_at": "2026-11-04T06:57:00Z", "updated_at": "2026-11-04T07:02:00Z", "finished_at": "2026-11-04T07:02:00Z", "progress": "done"},
+        {"name": "build", "started_at": "2026-11-04T07:02:00Z", "updated_at": "2026-11-04T07:25:00Z", "finished_at": null, "progress": "412/900 modules"}
+      ]
+    },
+    "waiting_for": "ci"
+  },
+  "open_batch": {"batch": "batch-0043", "size": 5, "oldest_member_age_seconds": 1860},
+  "approved_waiting": 3,
+  "pending_task": null,
+  "stall": {"since": "2026-11-04T07:40:00Z", "phase": "build", "silent_seconds": 2100},
+  "hold": {"since": "2026-11-04T07:50:00Z", "last_error": "anthropic: 529 overloaded after 5 retries"},
+  "feeds": {"observation": "/api/observation", "candidates": "/repositories/1/candidates"}
+}

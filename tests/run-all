@@ -128,6 +128,8 @@ RUN_STDLIB=(
   queue_github_adapter.py
   queue_feeds.py
   queue_server.py
+  queue_config.py
+  queue_cli.py
   rebase_handoff.py
   scoped_repair_route.py
   rebase_budget.py
