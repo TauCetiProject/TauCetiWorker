@@ -188,7 +188,7 @@ The service is a drop-in replacement for Bors's batch policy, not a new interfac
 12. Coordinator outages preserve active tool calls and useful source; restart recovers actual worker/CI/publication state before repeating work.
 13. When every inference path is unavailable, the queue holds with all membership and retained source intact, reports the hold and its cause in status, and resumes automatically on the first successful task or provider call. No member changes state during the hold.
 14. A contribution the agent cannot make pass is shrunk, down to an empty commit, and the batch still lands; its PR comment names what was dropped. No repair task is ever abandoned for lack of a time budget.
-15. Live activation/rollback retains useful source and declared ownership of every pending batch/member.
+15. Live activation retains useful source and declared ownership of every pending batch/member.
 16. A problem reported by an author or reviewer after staging admission does not withdraw the contribution or reopen admission review. The batch lands the AI's best-effort integration after required CI; corrections are separate follow-up PRs to Tau Ceti.
 17. A sealed batch of 110 PRs containing two source failures lands with zero singleton CI runs and at most three full CI runs, and its head time from first dispatch to fast-forward is under 120 minutes with warm artifacts available to the repair agent.
 18. No approved PR waits more than `insertion_age_window` insertion passes without being drawn.
@@ -197,7 +197,7 @@ The service is a drop-in replacement for Bors's batch policy, not a new interfac
 21. A review or repair pipeline closing or relabelling a member PR does not change batch membership; the PR's content still lands.
 22. Queue status names the runner and host of the running head build, shows phase progress with timestamps, and raises a stall condition when progress stops; it also reports the service's running revision.
 23. Increment 0: the historical repair experiments, run over at least twenty past failed candidates, report time to a green local build, edited PRs, shrink events and cost for each, without publishing anything; a suspect readmitted after repair is ordered by its original admission age.
-24. Transition: the shadow period shows two days of membership-for-membership agreement with Bors; the rehearsal passes on the scratch repository including rollback; cutover and rollback are each one setting change that preserves every approved input with its original age.
+24. Transition: the shadow period shows two days of membership-for-membership agreement with Bors; the rehearsal passes on the scratch repository; cutover is one setting change that preserves every approved input with its original age.
 
 ## Work plan for autonomous implementation
 
@@ -215,7 +215,7 @@ The service lives in `TauCetiProject/TauCetiWorker` as the package `tauceti_queu
 | F. GitHub adapters and compatibility surface | the GitHub App (operator) and a scratch repository | App authentication, webhook receiver, command parsing compatible with Bors, status and check reads, `repository_dispatch` of `pr-build.yml`, fast-forward promotion, comments with idempotency markers, and the two observation feeds byte-compatible with Bors's schemas (validated against saved production responses) |
 | G. Repair task runner | A, B's harness | the worker-side task: claim, prepare artifacts, run the agent, return a chain; reuses `work_units.py`, `repair_recovery.py` and `security_audit.py` |
 | H. Deployment | the host, tunnel and secrets (operator) | systemd unit, Postgres on the host, configuration, the status endpoint with running revision, the runbook in `docs/queue/operations.md` |
-| I. Cutover rehearsal | E, F, G, H | the full transition below executed against the scratch repository with synthetic PRs, including rollback, before any production step |
+| I. Cutover rehearsal | E, F, G, H | the full transition below executed against the scratch repository with synthetic PRs before any production step |
 
 Streams A, B, C, D and E start immediately. F and G can be developed against fakes and the saved production feed responses before the App exists, then verified live. H and I follow.
 
@@ -224,7 +224,7 @@ Return control to the operator, with the exact request and nothing else pending 
 1. Create and install the GitHub App for the service on `TauCetiProject/TauCeti` and the scratch repository: repository permissions contents write, pull requests write, issues write, checks read, statuses write, actions write, workflows write, metadata read; subscribed events pull request, pull request review, issue comment, status, check run, check suite, push, workflow run. Place the App ID and private key where `docs/queue/operations.md` says.
 2. Create the scratch repository `TauCetiProject/TauCetiQueueScratch` with the TauCeti workflow files and a small Lean library, for stream I.
 3. Provide the host for the service (a fleet host with Postgres and a public HTTPS endpoint for webhooks, through the existing Cloudflare account), and reserve dedicated staging runner capacity.
-4. Approve the production cutover step and the rollback step below when they are reached; both are a single setting change each.
+4. Approve the production cutover step below when it is reached; it is a single setting change.
 
 Progress is reported in the PRs and in a running `docs/queue/status.md`: what is merged, what is blocked on which operator item, and the latest experiment numbers. Admin-merge the service's PRs when they are green; this work has the operator's highest priority.
 
@@ -233,10 +233,9 @@ Progress is reported in the PRs and in a running `docs/queue/status.md`: what is
 The transition is live; normal worker and CI admissions stay enabled throughout and nothing is drained.
 
 1. **Shadow.** The service runs beside Bors on production webhooks with publication disabled. It parses the same commands, records the same approvals, builds its open batch and a head from them locally, and reports in status what it would have sealed, dispatched and landed, next to what Bors did. The repair task runs on Bors's live failures without adoption. Exit criterion: two days in which every Bors landing is a landing the service would also have produced, membership for membership, with no crash, no missed command and no divergent approval record.
-2. **Rehearsal.** The full cutover and rollback are executed on the scratch repository with synthetic PRs, including a conflict, a source failure repaired in place, a shrink-to-green, an urgent PR, a stale-status race and an inference hold. Exit criterion: every acceptance scenario that the scratch repository can express passes there.
-3. **Cutover.** One setting change: the merge backend for `TauCetiProject/TauCeti` is switched from Bors to the service (the existing `MERGE_BACKEND` repository variable that the workflow callers already honour, plus the service's own `publication_enabled` flag). At that moment the service imports Bors's current state from the observation feed: every approved PR waiting or in an unsealed batch becomes an approved input with its original admission age, and Bors's running head is left to finish and land under Bors. The service seals its first head only after that landing, which it observes as a canonical advance. Bors receives no new approvals from then on; its remaining sealed batches are released back to approved inputs of the service with their ages. Bors stays deployed, serving nothing, until rollback is no longer wanted.
+2. **Rehearsal.** The full cutover is executed on the scratch repository with synthetic PRs, including a conflict, a source failure repaired in place, a shrink-to-green, an urgent PR, a stale-status race and an inference hold. Exit criterion: every acceptance scenario that the scratch repository can express passes there.
+3. **Cutover.** One setting change: the merge backend for `TauCetiProject/TauCeti` is switched from Bors to the service (the existing `MERGE_BACKEND` repository variable that the workflow callers already honour, plus the service's own `publication_enabled` flag). At that moment the service imports Bors's current state from the observation feed: every approved PR waiting or in an unsealed batch becomes an approved input with its original admission age, and Bors's running head is left to finish and land under Bors. The service seals its first head only after that landing, which it observes as a canonical advance. Bors receives no new approvals from then on; its remaining sealed batches are released back to approved inputs of the service with their ages. Bors is then retired.
 4. **First week.** The first three heads are watched by a person as well as by status: membership, chain validation, dispatch identity, verdict binding, promotion, comments. The journal report runs daily against the service's feed and against the Bors baseline window.
-5. **Rollback.** The same setting change in reverse. The service stops sealing and publishing, Bors resumes admissions, and the service's approved inputs and open batch are handed back as Bors approvals with their original ages; a head mid-build is allowed to finish and land under the service if its CI is already running, otherwise released. Rollback is rehearsed in step 2 and is not an emergency procedure.
 
 ## Production monitoring
 
@@ -246,7 +245,7 @@ The journal report, run daily and after every change, compares against the triag
 
 Conditions that stop the pipeline and page nothing but become the first line of status, to be acted on by whoever next looks: a stall condition on the head for longer than two stall intervals, an inference hold older than an hour, a chain that fails validation twice for the same head, a promotion that fails for a reason other than a canonical advance, and any divergence between the service's observation feed and its own records.
 
-The first exit criterion for keeping the service is the plan's throughput scenario: a 110-PR head with two source failures landing in under 120 minutes. The second is a week in which landed PRs per hour exceed the triage-period baseline with no regression in the comment or attribution checks. Failing either after two weeks of pilot triggers rollback and a revision of this plan from the measurements, not a longer pilot.
+The first exit criterion for keeping the service is the plan's throughput scenario: a 110-PR head with two source failures landing in under 120 minutes. The second is a week in which landed PRs per hour exceed the triage-period baseline with no regression in the comment or attribution checks. Failing either after two weeks of pilot triggers a revision of this plan from the measurements, not a longer pilot.
 
 ## Later increments
 
