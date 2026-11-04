@@ -27,7 +27,7 @@ experiment sample and without a shadow period; the scratch-repository rehearsal 
 | F. GitHub adapters and Bors-compatible surface (`github_app.py`, `github_adapter.py`, `commands.py`, `eligibility.py`, `webhook.py`, `feeds.py`, `server.py`) | `queue/github-adapters` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/484 |
 | G. Repair task runner (`tauceti_queue/repair.py`, `repair_task.py`) | `queue/repair-task` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/483 |
 | H. Deployment (`config.py`, `__main__.py`, `runtime.py`, `services/queue/`, runbook) | `queue/deployment` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/482 |
-| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, `scripts/queue-rehearsal`, `docs/queue/rehearsal.md`) | `queue/rehearsal` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/491; the dry run over the fakes passes (14 records); the live run on the scratch repository waits for the operator items below |
+| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, `scripts/queue-rehearsal`, `docs/queue/rehearsal.md`) | `queue/rehearsal` | merged (https://github.com/TauCetiProject/TauCetiWorker/pull/491); the live run on `TauCetiProject/TauCetiQueueScratch` (created 2026-11-04, public since 13:40 UTC after GitHub's outage left it wedged for an hour) is in progress; its first heads found and fixed a real defect, https://github.com/TauCetiProject/TauCetiWorker/pull/495 (retained candidate refs must be pushed with their objects before dispatch) |
 
 Storage is one SQLite file on the service host rather than PostgreSQL: a single-process service does
 not need a server database, and the operator prefers the simpler host.
@@ -47,6 +47,13 @@ repository (`docs/queue/rehearsal.md`, 40 to 60 minutes); the service is install
 publication disabled and its revision, feeds and a claimable task are verified
 (`docs/queue/operations.md`); then the cutover is one step for the operator to approve: suspend the
 `tau-ceti-bors` installation, point `bors.taucetiproject.org` at the service, enable publication.
+
+Landed after the streams, 2026-11-04 afternoon: https://github.com/TauCetiProject/TauCetiWorker/pull/494
+(tauchonki deployment record and installer clone fix), https://github.com/TauCetiProject/TauCetiWorker/pull/496
+(Bors state import for cutover and the approval poller, with a store locking fix),
+https://github.com/TauCetiProject/TauCetiWorker/pull/498 (trust the review App's check suite when GraphQL hides
+its App under the queue App's token; without it the poller approved nothing). tauchonki runs each merge within
+minutes through `services/queue/install.sh`.
 
 ## Operator items outstanding
 
