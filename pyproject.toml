@@ -7,11 +7,18 @@ name = "tauceti"
 version = "0.1.0"
 description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
-dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@b97c515e4a9a10018cc0d785e9ab19fcea76db5f", "rich>=13", "textual>=8,<9", "psutil>=7; sys_platform == 'darwin'"]
+dependencies = [
+    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@b97c515e4a9a10018cc0d785e9ab19fcea76db5f",
+    "rich>=13",
+    "textual>=8,<9",
+    "psutil>=7; sys_platform == 'darwin'",
+    "cryptography>=42",
+]
 
 [project.scripts]
 tauceti = "tauceti_worker.cli:cli_main"
 tauceti-workflow-backstop = "tauceti_worker.workflow_backstop:main"
+tauceti-queue = "tauceti_queue.__main__:main"
 
 # The worker is the tauceti_worker/ package. Its prompts/ and scripts/ wrappers live at the repo
 # root for the `./tauceti` shim (HERE resolves to the repo root in a checkout); the wheel bundles

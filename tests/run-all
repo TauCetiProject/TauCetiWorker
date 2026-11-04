@@ -46,6 +46,7 @@ RUN_STDLIB=(
   usage_accounting.py
   usage_supervisor.py
   queue_repair_experiment.py
+  queue_repair_task.py
   expanded_cache.py
   cache_storage.py
   local_lint.py
@@ -125,6 +126,17 @@ RUN_STDLIB=(
   quota_wakeups.py
   quota_shared_usage.py
   queue_chain.py
+  queue_commands.py
+  queue_github_adapter.py
+  queue_feeds.py
+  queue_server.py
+  queue_eligibility.py
+  queue_diagnostics.py
+  queue_controller.py
+  queue_fixture.py
+  queue_store.py
+  queue_config.py
+  queue_cli.py
   rebase_handoff.py
   scoped_repair_route.py
   rebase_budget.py
@@ -160,6 +172,7 @@ RUN_STDLIB=(
   extra_roadmap_prompt.py
   spread_candidates.py
   ssl_cert_file.py
+  staging_journal_report.py
   status_labels.py
   tend_bot_permissions.py
   worker_claude_config.py

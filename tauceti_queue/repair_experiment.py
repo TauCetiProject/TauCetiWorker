@@ -33,31 +33,65 @@ import datetime as dt
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
+from tauceti_queue.repair import (  # noqa: F401  (re-exported for the harness's callers and tests)
+    AGENT_INSTRUCTION,
+    ANSI,
+    CACHE_DOMAIN,
+    CACHE_SERVICE,
+    DEFAULT_REPOSITORY,
+    FAILED_MODULE,
+    MODULE_PATH,
+    STAMP,
+    SUBJECT_PR,
+    ChainCommit,
+    PromptContext,
+    agent_environment,
+    agent_usage,
+    checkout_worktree,
+    compare_chains,
+    create_worktree,
+    declaration_module,
+    findings_kinds,
+    findings_modules,
+    git,
+    host_state,
+    lake_env,
+    link_shared_packages,
+    module_to_path,
+    owners_of,
+    parse_lake_build_log,
+    prune_pool,
+    read_chain,
+    remove_worktree,
+    run_agent,
+    run_logged,
+    split_trailers,
+    strip_log,
+    validate_chain,
+    write_record,
+)
+from tauceti_queue.repair import compose_prompt as _compose_prompt
+from tauceti_queue.repair import prepare_artifacts as _prepare_artifacts
 
-REPO = "TauCetiProject/TauCeti"
+REPO = DEFAULT_REPOSITORY
 JOURNAL_URL = "https://bors.taucetiproject.org/repositories/1/candidates?base=main"
 REF_PREFIX = "refs/repair-experiments"
 DEFAULT_ROOT = Path(os.environ.get("TAUCETI_REPAIR_ROOT") or Path.home() / "tmp" / "repair-experiments")
 DEFAULT_CLONE = Path(os.environ.get("TAUCETI_REPAIR_CLONE") or Path.home() / "TauCeti")
-CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
-CACHE_SERVICE = os.environ.get("TAUCETI_CACHE_SERVICE", "tauceti-public")
 
-# The plan's agent instruction, used verbatim ("Explanations and PR comments").
-AGENT_INSTRUCTION = (
-    "Resolve the reported conflicts or CI failures in this batch. Preserve the constituent PRs' intent as "
-    "best you can; where they conflict, use your judgment to choose the best alternative or combination. "
-    "Update the constituent commits, retaining their source PR identities. When you change a commit's "
-    "content, append a very concise explanation of what changed and why to its existing message. If a "
-    "contribution cannot be made to pass, reduce it to the part that does, down to an empty commit, and "
-    "say so in its message."
-)
+
+def _split_trailers(clone: Path, message: str) -> tuple[str, dict[str, str]]:
+    """The harness's original signature; the clone is not needed."""
+    return split_trailers(message)
+
+
+_kinds_from_findings = findings_kinds
 
 # Journal observation kinds that make a failed candidate eligible, and the failure kind they imply.
 OBSERVATION_KINDS = {
@@ -65,11 +99,6 @@ OBSERVATION_KINDS = {
     "duplicate_declaration": "audit",
     "environment_linter": "lint",
 }
-
-SUBJECT_PR = re.compile(r"\(#(\d+)\)\s*$")
-MODULE_PATH = re.compile(r"TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)+\.lean")
-PRIVATE_DECL = re.compile(r"^_private\.((?:[A-Za-z_][A-Za-z0-9_']*\.)*[A-Za-z_][A-Za-z0-9_']*)\.\d+\.")
-
 
 # ----------------------------------------------------------------------------------------------
 # Journal selection
@@ -101,21 +130,6 @@ class Observation:
             if module:
                 return [module]
         return []
-
-
-def declaration_module(declaration: str) -> str | None:
-    """``_private.TauCeti.A.B.0.TauCeti.c`` names its defining module ``TauCeti/A/B.lean``.
-
-    A plain declaration name has no module information; the environment lint driver now emits the
-    module path explicitly (staging-triage.md change 4) and older journals only have the private form.
-    """
-    match = PRIVATE_DECL.match(declaration)
-    if not match:
-        return None
-    parts = match.group(1).split(".")
-    if parts[0] != "TauCeti" or len(parts) < 2:
-        return None
-    return "/".join(parts) + ".lean"
 
 
 @dataclasses.dataclass
@@ -389,22 +403,10 @@ def selection_table(failures: list[Failure]) -> str:
 # ----------------------------------------------------------------------------------------------
 # CI log findings (pure text processing)
 
-ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[0-9:.]+Z ")
 COMPILER_ERROR = re.compile(r"^(?:error: )?(" + MODULE_PATH.pattern + r"):(\d+):(\d+):\s*(?:error:\s*)?(.*)$")
-FAILED_MODULE = re.compile(r"^✖ \[\d+/\d+\] (?:Building|Running) (TauCeti(?:\.[A-Za-z_][A-Za-z0-9_']*)+)")
 DUPLICATE = re.compile(r"^duplicate-declarations: (\S+) is declared in both (\S+) and (\S+)")
 COLLISION = re.compile(r"^audit-driver: import (\S+) failed, environment already contains '([^']+)' from (\S+)")
 LINT_LOCATIONS = re.compile(r"^LINT-ENV-LOCATIONS (\{.*\})\s*$")
-
-
-def strip_log(text: str) -> list[str]:
-    lines = []
-    for raw in text.splitlines():
-        line = ANSI.sub("", raw)
-        line = STAMP.sub("", line)
-        lines.append(line.rstrip())
-    return lines
 
 
 def extract_log_findings(text: str) -> dict:
@@ -495,40 +497,8 @@ def effective_kinds(failure: Failure, findings: dict | None) -> list[str]:
     return sorted(kinds, key=["compiler", "audit", "lint"].index)
 
 
-def module_to_path(module: str) -> str:
-    return module.replace(".", "/") + ".lean"
-
-
-def findings_modules(findings: dict) -> list[str]:
-    modules: dict[str, None] = {}
-    for error in findings["compiler_errors"]:
-        modules.setdefault(error["path"], None)
-    for duplicate in findings["duplicate_declarations"]:
-        for module in duplicate["modules"]:
-            modules.setdefault(module_to_path(module), None)
-    for collision in findings["import_collisions"]:
-        modules.setdefault(module_to_path(collision["module"]), None)
-        modules.setdefault(module_to_path(collision["other_module"]), None)
-    for finding in findings["lint"]["findings"]:
-        path = finding.get("path") or (
-            declaration_module(finding["declaration"]) if finding.get("declaration") else None
-        )
-        if path:
-            modules.setdefault(path, None)
-    return list(modules)
-
-
 # ----------------------------------------------------------------------------------------------
 # Git helpers
-
-
-def git(clone: Path, *args: str, check: bool = True, env: dict | None = None, input: str | None = None) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(clone), *args], text=True, capture_output=True, env=env, input=input, check=False
-    )
-    if check and result.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}")
-    return result.stdout
 
 
 def ensure_candidate_ref(clone: Path, failure: Failure) -> str:
@@ -543,82 +513,6 @@ def ensure_candidate_ref(clone: Path, failure: Failure) -> str:
     if git(clone, "cat-file", "-t", failure.base_sha, check=False).strip() != "commit":
         git(clone, "fetch", "--quiet", "origin", failure.base_sha)
     return sha
-
-
-@dataclasses.dataclass
-class ChainCommit:
-    sha: str
-    parent: str
-    tree: str
-    parent_tree: str
-    pr: int | None
-    accepted_head: str | None
-    subject: str
-    message: str  # full message without the Source-PR/Accepted-Head trailers
-
-    @property
-    def empty(self) -> bool:
-        return self.tree == self.parent_tree
-
-
-def _commit_fields(clone: Path, sha: str) -> tuple[str, str, str, str]:
-    """(parent, tree, subject, body) for a commit; requires exactly one parent."""
-    out = git(clone, "show", "-s", "--format=%P%x00%T%x00%s%x00%B", sha)
-    parents, tree, subject, body = out.split("\x00", 3)
-    parent_list = parents.split()
-    if len(parent_list) != 1:
-        raise RuntimeError(f"commit {sha[:12]} has {len(parent_list)} parents; the chain must be single-parent")
-    return parent_list[0], tree, subject, body
-
-
-TRAILER_LINE = re.compile(r"^(Source-PR|Accepted-Head):\s*(.+?)\s*$")
-
-
-def _split_trailers(clone: Path, message: str) -> tuple[str, dict[str, str]]:
-    """The message without its identity trailers, and the trailers.
-
-    The trailers are looked for on any line, not only in the final paragraph: an agent that appends
-    its explanation after the existing message leaves them mid-message, where git's own
-    `interpret-trailers` no longer recognises them (observed in candidate 1931's repair).
-    """
-    trailers: dict[str, str] = {}
-    kept: list[str] = []
-    for line in message.split("\n"):
-        match = TRAILER_LINE.match(line)
-        if match:
-            trailers.setdefault(match.group(1), match.group(2))
-            continue
-        kept.append(line)
-    body = "\n".join(kept)
-    body = re.sub(r"\n{3,}", "\n\n", body).rstrip("\n") + "\n"
-    return body, trailers
-
-
-def read_chain(clone: Path, base: str, tip: str) -> list[ChainCommit]:
-    """The linear chain base..tip, oldest first, with each commit's PR identity.
-
-    The PR comes from the ``Source-PR`` trailer when present (an attributed chain) and from Bors's
-    ``(#N)`` subject suffix otherwise (the retained squash chain).
-    """
-    shas = git(clone, "rev-list", "--reverse", "--first-parent", f"{base}..{tip}").split()
-    chain: list[ChainCommit] = []
-    expected_parent = git(clone, "rev-parse", f"{base}^{{commit}}").strip()
-    parent_tree = git(clone, "rev-parse", f"{base}^{{tree}}").strip()
-    for sha in shas:
-        parent, tree, subject, body = _commit_fields(clone, sha)
-        if parent != expected_parent:
-            raise RuntimeError(f"commit {sha[:12]} does not continue the chain (parent {parent[:12]})")
-        message, trailers = _split_trailers(clone, body)
-        pr = None
-        if "Source-PR" in trailers:
-            match = re.search(r"#(\d+)\s*$", trailers["Source-PR"])
-            pr = int(match.group(1)) if match else None
-        if pr is None:
-            match = SUBJECT_PR.search(subject)
-            pr = int(match.group(1)) if match else None
-        chain.append(ChainCommit(sha, parent, tree, parent_tree, pr, trailers.get("Accepted-Head"), subject, message))
-        expected_parent, parent_tree = sha, tree
-    return chain
 
 
 def build_attributed_chain(
@@ -669,308 +563,8 @@ def build_attributed_chain(
     return tip, chain
 
 
-def validate_chain(
-    clone: Path, base: str, tip: str, member_prs: list[int], chain: list[ChainCommit] | None = None
-) -> list[str]:
-    """Single-parent history on the declared base, one Source-PR per commit, bijection with members."""
-    problems: list[str] = []
-    try:
-        chain = chain if chain is not None else read_chain(clone, base, tip)
-    except RuntimeError as error:
-        return [str(error)]
-    if subprocess.run(["git", "-C", str(clone), "merge-base", "--is-ancestor", base, tip], check=False).returncode != 0:
-        problems.append("base is not an ancestor of the tip")
-    prs = [c.pr for c in chain]
-    if any(p is None for p in prs):
-        problems.append("a commit has no Source-PR identity")
-    if any(c.accepted_head is None for c in chain):
-        problems.append("a commit has no Accepted-Head trailer")
-    counts = collections.Counter(p for p in prs if p is not None)
-    duplicates = sorted(p for p, n in counts.items() if n > 1)
-    if duplicates:
-        problems.append(f"PRs with more than one commit: {duplicates}")
-    missing = sorted(set(member_prs) - set(counts))
-    if missing:
-        problems.append(f"members without a commit: {missing}")
-    extra = sorted(set(counts) - set(member_prs))
-    if extra:
-        problems.append(f"commits for non-members: {extra}")
-    return problems
-
-
-def _patch_id(clone: Path, commit: ChainCommit) -> str:
-    if commit.empty:
-        return "empty"
-    patch = git(clone, "diff-tree", "-p", "--no-color", commit.parent, commit.sha)
-    out = git(clone, "patch-id", "--stable", input=patch)
-    return out.split()[0] if out.split() else "empty"
-
-
-def _diffstat(clone: Path, commit: ChainCommit) -> dict[str, int]:
-    stat = {"files": 0, "insertions": 0, "deletions": 0}
-    if commit.empty:
-        return stat
-    out = git(clone, "diff-tree", "--shortstat", "--no-color", commit.parent, commit.sha).strip()
-    for pattern, key in (
-        (r"(\d+) files? changed", "files"),
-        (r"(\d+) insertions?", "insertions"),
-        (r"(\d+) deletions?", "deletions"),
-    ):
-        match = re.search(pattern, out)
-        if match:
-            stat[key] = int(match.group(1))
-    return stat
-
-
-def compare_chains(clone: Path, before: list[ChainCommit], after: list[ChainCommit]) -> list[dict]:
-    """Per-PR provenance: clean (identical patch) or edited; append-only message check; shrink events.
-
-    Membership is compared by PR identity, not position.
-    """
-    before_by_pr = {c.pr: c for c in before if c.pr is not None}
-    after_by_pr = {c.pr: c for c in after if c.pr is not None}
-    rows: list[dict] = [
-        {"pr": None, "status": "unidentified", "after": c.sha, "subject": c.subject} for c in after if c.pr is None
-    ]
-    for pr in sorted(set(before_by_pr) | set(after_by_pr)):
-        old, new = before_by_pr.get(pr), after_by_pr.get(pr)
-        if old is None or new is None:
-            rows.append({"pr": pr, "status": "missing_before" if old is None else "missing_after"})
-            continue
-        old_id, new_id = _patch_id(clone, old), _patch_id(clone, new)
-        changed = old_id != new_id
-        old_stat, new_stat = _diffstat(clone, old), _diffstat(clone, new)
-        old_message = old.message.rstrip()
-        new_message = new.message.rstrip()
-        preserved = new_message.startswith(old_message)
-        explanation = new_message[len(old_message) :].strip() if preserved else None
-        # A shrink event: the commit became empty, lost whole files, or lost more than half of its
-        # insertions (at least twenty lines) while its content changed.
-        shrink = (new.empty and not old.empty) or (
-            changed
-            and not new.empty
-            and (
-                new_stat["files"] < old_stat["files"]
-                or old_stat["insertions"] - new_stat["insertions"] >= max(20, old_stat["insertions"] // 2)
-            )
-        )
-        rows.append(
-            {
-                "pr": pr,
-                "status": "edited" if changed else "clean",
-                "before": old.sha,
-                "after": new.sha,
-                "empty_before": old.empty,
-                "empty_after": new.empty,
-                "diffstat_before": old_stat,
-                "diffstat_after": new_stat,
-                "message_preserved": preserved,
-                "explanation": explanation,
-                "shrink": shrink,
-            }
-        )
-    return rows
-
-
-def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
-    """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it)."""
-    if not chain:
-        return []
-    shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
-    return [c.pr for c in chain if c.sha in shas and c.pr is not None]
-
-
 # ----------------------------------------------------------------------------------------------
 # Host state and worktrees
-
-
-def host_state() -> dict:
-    load = os.getloadavg()
-    usage = shutil.disk_usage(str(DEFAULT_ROOT if DEFAULT_ROOT.exists() else Path.home()))
-    return {
-        "time": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
-        "load_1m": round(load[0], 1),
-        "load_5m": round(load[1], 1),
-        "load_15m": round(load[2], 1),
-        "disk_free_gb": round(usage.free / 1e9, 1),
-        "cpus": os.cpu_count(),
-    }
-
-
-def create_worktree(clone: Path, sha: str, path: Path) -> None:
-    if path.exists():
-        remove_worktree(clone, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    git(clone, "worktree", "add", "--detach", str(path), sha)
-
-
-def remove_worktree(clone: Path, path: Path) -> None:
-    if path.exists():
-        lake = path / ".lake"
-        if lake.is_dir() and not lake.is_symlink():
-            packages = lake / "packages"
-            if packages.is_symlink():
-                packages.unlink()
-            shutil.rmtree(lake, ignore_errors=True)
-        git(clone, "worktree", "remove", "--force", str(path), check=False)
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-    git(clone, "worktree", "prune", check=False)
-
-
-def link_shared_packages(worktree: Path, seed_packages: Path) -> None:
-    """Share one extracted Mathlib (and the other dependencies) across experiments.
-
-    All candidates in the sample pin the same Mathlib revision and toolchain, so the seed's
-    ``.lake/packages`` is read-only for every build; this stands in for the workers' shared Mathlib
-    view (docs/shared-mathlib.md) without the overlay.
-    """
-    lake = worktree / ".lake"
-    lake.mkdir(exist_ok=True)
-    target = lake / "packages"
-    if target.is_symlink() or target.exists():
-        if target.is_symlink():
-            target.unlink()
-        else:
-            shutil.rmtree(target)
-    target.symlink_to(seed_packages)
-
-
-def lake_env(root: Path, base_env: dict | None = None) -> dict:
-    """The workers' artifact-cache environment: the public service and a private artifact pool."""
-    config = root / "lake.toml"
-    if not config.exists():
-        config.write_text(
-            f'[[cache.service]]\nname = "{CACHE_SERVICE}"\nkind = "s3"\n'
-            f'artifactEndpoint = "https://{CACHE_DOMAIN}/artifacts"\n'
-            f'revisionEndpoint = "https://{CACHE_DOMAIN}/revisions"\n'
-        )
-    env = dict(os.environ if base_env is None else base_env)
-    env["LAKE_CONFIG"] = str(config)
-    env["LAKE_CACHE_DIR"] = str(root / "lake-cache")
-    env["LAKE_ARTIFACT_CACHE"] = "1"
-    env["LAKE_RESTORE_ARTIFACTS"] = "1"
-    env.pop("TAUCETI_PR_CACHE_MISS", None)
-    return env
-
-
-def prune_pool(
-    root: Path, shared: Path | None = None, *, drop_revisions: tuple[str, ...] = (), newer_than: float | None = None
-) -> dict:
-    """Drop built outputs from the private artifact pool, keeping the published base mappings.
-
-    Lake stores every artifact a build produces into ``LAKE_CACHE_DIR`` (hardlinked with the worktree's
-    ``.lake/build``), so a 110-PR candidate adds about 13 GB per build. After a base group is finished
-    the pool keeps only artifacts named by a ``revisions/*/*.jsonl`` mapping or shared by hardlink with
-    the seed cache (``~/.cache/lake``), and ``outputs/`` entries whose artifact is gone are removed.
-    ``drop_revisions`` also forgets the mappings of bases that are finished with (their artifacts are
-    then pruned too); ``newer_than`` protects artifacts a running build may still be writing. Freed
-    bytes count only files with no other hardlink: a built output also linked from a worktree frees
-    nothing until that worktree goes.
-    """
-    pool = root / "lake-cache"
-    shared = shared or Path.home() / ".cache" / "lake"
-    dropped = 0
-    for mapping in (pool / "revisions").glob("*/*.jsonl"):
-        if any(mapping.stem.startswith(rev) for rev in drop_revisions if rev):
-            mapping.unlink()
-            dropped += 1
-    referenced: set[str] = set()
-    for mapping in (pool / "revisions").glob("*/*.jsonl"):
-        for line in mapping.read_text(errors="replace").splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, list) and len(row) >= 2 and isinstance(row[1], str):
-                referenced.add(row[1])
-    removed = removed_bytes = kept = 0
-    artifacts = pool / "artifacts"
-    if artifacts.is_dir():
-        for path in artifacts.iterdir():
-            if path.name in referenced:
-                kept += 1
-                continue
-            twin = shared / "artifacts" / path.name
-            try:
-                if twin.exists() and os.path.samefile(path, twin):
-                    kept += 1
-                    continue
-                stat = path.stat()
-                if newer_than is not None and stat.st_mtime >= newer_than:
-                    kept += 1
-                    continue
-                path.unlink()
-                removed += 1
-                removed_bytes += stat.st_size if stat.st_nlink == 1 else 0
-            except OSError:
-                continue
-    stale = 0
-    outputs = pool / "outputs"
-    if outputs.is_dir():
-        for entry in outputs.glob("*/*.json"):
-            try:
-                data = json.loads(entry.read_text()).get("data")
-            except (OSError, json.JSONDecodeError):
-                continue
-            if isinstance(data, str) and not (artifacts / data).exists():
-                entry.unlink(missing_ok=True)
-                stale += 1
-    return {
-        "removed": removed,
-        "freed_gb": round(removed_bytes / 1e9, 2),
-        "kept": kept,
-        "stale_outputs_removed": stale,
-        "revisions_dropped": dropped,
-    }
-
-
-def run_logged(argv: list[str], cwd: Path, log: Path, env: dict | None = None, timeout: float | None = None) -> dict:
-    """Run a command with output to ``log``; return rc, seconds and the host load around it."""
-    before = host_state()
-    started = time.monotonic()
-    log.parent.mkdir(parents=True, exist_ok=True)
-    timed_out = False
-    with log.open("ab") as handle:
-        handle.write(f"$ {' '.join(argv)}\n".encode())
-        handle.flush()
-        try:
-            proc = subprocess.run(
-                argv, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT, timeout=timeout, check=False
-            )
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            rc, timed_out = 124, True
-    return {
-        "rc": rc,
-        "seconds": round(time.monotonic() - started, 1),
-        "timed_out": timed_out,
-        "load_before": before,
-        "load_after": host_state(),
-        "log": str(log),
-    }
-
-
-def parse_lake_build_log(text: str) -> dict:
-    """Module counts from a `lake build` log: built, replayed/restored, failed and canceled jobs."""
-    lines = strip_log(text)
-    counts = {"built": 0, "replayed": 0, "fetched": 0, "failed_modules": [], "canceled": 0, "total_jobs": None}
-    for line in lines:
-        if "] Built TauCeti" in line:
-            counts["built"] += 1
-        elif "] Replayed TauCeti" in line:
-            counts["replayed"] += 1
-        elif "] Fetched TauCeti" in line or "] Restored TauCeti" in line or "] Unpacked TauCeti" in line:
-            counts["fetched"] += 1
-        elif "] Canceled " in line:
-            counts["canceled"] += 1
-        failed = FAILED_MODULE.match(line)
-        if failed and failed.group(1) not in counts["failed_modules"]:
-            counts["failed_modules"].append(failed.group(1))
-        match = re.search(r"\[\d+/(\d+)\]", line)
-        if match:
-            counts["total_jobs"] = int(match.group(1))
-    return counts
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1066,21 +660,6 @@ def construct_chain(clone: Path, failure: Failure, retained_sha: str) -> tuple[s
     return tip, chain, record
 
 
-def checkout_worktree(clone: Path, sha: str, path: Path) -> bool:
-    """A detached worktree at ``sha``; an existing one is re-pointed so its ``.lake`` outputs stay warm.
-
-    Returns True when a worktree was reused. The worktree belongs to the harness alone: tracked
-    changes left by a previous agent are discarded (its result is already retained under a ref) and
-    untracked files other than ``.lake`` are removed.
-    """
-    if path.is_dir() and git(path, "rev-parse", "--is-inside-work-tree", check=False).strip() == "true":
-        git(path, "checkout", "--quiet", "--force", "--detach", sha)
-        git(path, "clean", "-fdq", "-e", ".lake", check=False)
-        return True
-    create_worktree(clone, sha, path)
-    return False
-
-
 def prepare_sources(clone: Path, failure: Failure, experiment_dir: Path, worktree: Path, seed_packages: Path) -> dict:
     """Retained commit, member heads, CI log, attributed chain and the detached worktree at its tip."""
     record: dict = {}
@@ -1134,48 +713,11 @@ def prepare_sources(clone: Path, failure: Failure, experiment_dir: Path, worktre
 
 
 def prepare_artifacts(worktree: Path, failure: Failure, env: dict, logdir: Path, build_timeout: float) -> dict:
-    """Warm artifacts the way the plan's default source does: main's cache at the base, then an
-    incremental build of the batch's modules. Returns timings and module counts."""
-    record: dict = {}
-    fetch = run_logged(
-        ["lake", "cache", "get", "--service", CACHE_SERVICE, "--repo", REPO, f"--rev={failure.base_sha}"],
-        worktree,
-        logdir / "cache-get-base.log",
-        env=env,
-        timeout=1800,
+    """Warm artifacts the way the plan's default source does (``tauceti_queue.repair.prepare_artifacts``),
+    probing as well whether the failed candidate's own outputs were published."""
+    return _prepare_artifacts(
+        worktree, failure.base_sha, env, logdir, build_timeout, repository=REPO, candidate=failure.commit or "HEAD"
     )
-    text = Path(fetch["log"]).read_text(errors="replace")
-    fetch["mapping_found"] = fetch["rc"] == 0 and "outputs not found for revision" not in text
-    fetch["artifacts_downloaded"] = text.count("downloaded artifact")
-    record["base_cache"] = fetch
-    own = run_logged(
-        [
-            "lake",
-            "cache",
-            "get",
-            "--service",
-            CACHE_SERVICE,
-            "--repo",
-            REPO,
-            f"--rev={failure.commit or 'HEAD'}",
-            "--mappings-only",
-        ],
-        worktree,
-        logdir / "cache-get-candidate.log",
-        env=env,
-        timeout=600,
-    )
-    own["published"] = own["rc"] == 0 and "outputs not found for revision" not in Path(own["log"]).read_text(
-        errors="replace"
-    )
-    record["candidate_outputs_published"] = own
-    build = run_logged(
-        ["lake", "build", "--iofail"], worktree, logdir / "prepare-build.log", env=env, timeout=build_timeout
-    )
-    build.update(parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
-    record["incremental_build"] = build
-    record["seconds"] = round(fetch["seconds"] + own["seconds"] + build["seconds"], 1)
-    return record
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1184,307 +726,15 @@ def prepare_artifacts(worktree: Path, failure: Failure, env: dict, logdir: Path,
 
 def compose_prompt(failure: Failure, findings: dict, chain: list[ChainCommit], clone: Path, base_short: str) -> str:
     """The plan's instruction, then the candidate's real diagnostics and its constituent commits."""
-    lines = [AGENT_INSTRUCTION, ""]
-    lines += [
-        "## The batch",
-        "",
-        f"You are in a private, detached Git worktree of {REPO}. HEAD is the tip of a batch of {len(chain)} "
-        f"constituent commits, one squash commit per pull request, on base `{base_short}` (the `main` of the time). "
-        f"This batch was staging candidate {failure.candidate_id} and failed CI. Nothing you do here is published: "
-        "do not push, do not open pull requests, do not comment, do not use `gh`. Only this worktree and its commits matter.",
-        "Do not edit `lakefile.toml`, `lake-manifest.json`, `lean-toolchain`, `scripts/`, `.github/` or anything under `.lake/`.",
-        "",
-        "## CI failure evidence",
-        "",
-        "The staging build ran `lake build --iofail` with `--fail-fast`, so it reports the first independently broken "
-        "module; more may appear once that one builds. Audit and lint phases only run after a complete build.",
-        "",
-    ]
-    if findings["compiler_errors"]:
-        lines.append("Compiler errors:")
-        lines.append("")
-        for error in findings["compiler_errors"]:
-            owners = owners_of(clone, chain, error["path"])
-            owner_text = (
-                f" (changed by PR {', '.join('#' + str(p) for p in owners)})"
-                if owners
-                else " (not changed by this batch)"
-            )
-            lines.append(f"- `{error['path']}:{error['line']}:{error['column']}`{owner_text}")
-            for text in error["message"].splitlines():
-                lines.append(f"      {text}")
-        lines.append("")
-    if findings["duplicate_declarations"]:
-        lines.append("Audit findings (duplicate declarations across modules; the audit rejects a name declared twice):")
-        lines.append("")
-        for duplicate in findings["duplicate_declarations"]:
-            modules = [module_to_path(m) for m in duplicate["modules"]]
-            owners = {m: owners_of(clone, chain, m) for m in modules}
-            lines.append(
-                f"- `{duplicate['declaration']}` is declared in both "
-                + " and ".join(
-                    f"`{m}` (PR {', '.join('#' + str(p) for p in owners[m]) or 'unchanged'})" for m in modules
-                )
-            )
-        lines.append("")
-    if findings["import_collisions"]:
-        lines.append("Audit findings (import collisions):")
-        lines.append("")
-        for collision in findings["import_collisions"]:
-            module, other = module_to_path(collision["module"]), module_to_path(collision["other_module"])
-            lines.append(
-                f"- importing `{module}` (PR {', '.join('#' + str(p) for p in owners_of(clone, chain, module)) or 'unchanged'}) "
-                f"failed: the environment already contains `{collision['declaration']}` from `{other}` "
-                f"(PR {', '.join('#' + str(p) for p in owners_of(clone, chain, other)) or 'unchanged'})"
-            )
-        lines.append("")
-    if findings["lint"]["findings"] or findings["lint"]["report"]:
-        lines.append(
-            "Environment lint findings (`scripts/lint-env.sh`, new violations against the grandfathered baseline):"
-        )
-        lines.append("")
-        for finding in findings["lint"]["findings"]:
-            path = finding.get("path") or (
-                declaration_module(finding["declaration"]) if finding.get("declaration") else None
-            )
-            owners = owners_of(clone, chain, path) if path else []
-            where = f" in `{path}` (PR {', '.join('#' + str(p) for p in owners) or 'unchanged'})" if path else ""
-            lines.append(f"- linter `{finding.get('linter')}`: `{finding.get('declaration')}`{where}")
-        if findings["lint"]["report"]:
-            lines.append("")
-            lines.append("Lint report excerpt:")
-            lines.append("")
-            lines += [f"    {text}" for text in findings["lint"]["report"][:40]]
-        lines.append("")
-    journal_modules = failure.failing_modules
-    if journal_modules:
-        lines.append("Modules the journal's diagnostics name: " + ", ".join(f"`{m}`" for m in journal_modules) + ".")
-    if failure.suspects:
-        lines.append(
-            "Bors attributed the failure to PR "
-            + ", ".join(f"#{p} (accepted head `{failure.suspect_heads.get(p, '?')[:12]}`)" for p in failure.suspects)
-            + "; use this as a hint, not a verdict."
-        )
-    lines += [
-        "",
-        "## Constituent commits (oldest first)",
-        "",
-        "Each commit carries `Source-PR:` and `Accepted-Head:` trailers; keep them on the commit that represents that PR.",
-        "",
-    ]
-    for commit in chain:
-        lines.append(f"- `{commit.sha[:12]}` #{commit.pr}: {commit.subject}")
-    lines += [
-        "",
-        "## Editing constituent commits",
-        "",
-        "Edit the commit that owns the change rather than adding a repair commit on top. One workable recipe: make the fix "
-        "in the working tree, `git add` it, `git commit --fixup=<sha>`, and when the message needs its explanation appended "
-        "write the complete original message followed by the explanation into a file and `git commit --allow-empty "
-        "--fixup=amend:<sha> -F <file>`; finally `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash --keep-empty --empty=keep "
-        f"{base_short}`. Any method is fine as long as the result is a linear chain on `{base_short}` with exactly one commit per "
-        "Source-PR trailer, every previous message preserved as a prefix of the new one, and empty commits kept where a "
-        "contribution was reduced to nothing. Leave HEAD (detached) at the new chain tip with a clean working tree.",
-        "",
-        "## Verifying locally",
-        "",
-        "Artifacts are warm: Mathlib and every module of this batch that compiled are already built in `.lake`, so "
-        "`lake build --iofail` (whole library, incremental, as CI runs it) rebuilds only the failing modules and their "
-        "dependents. Run it in the foreground and judge it by its exit status. Shell commands have a ten-minute limit; if "
-        "a build times out, rerun the same command in the same checkout, completed modules are kept. Do not run "
-        "`lake exe cache get` or `lake cache get`; do not use `--fail-fast`. "
-        "For lint findings, `bash scripts/lint-env.sh` reproduces the environment lint (it needs the complete build and takes "
-        "a while). For duplicate declarations there is no light local audit: make sure the name is declared exactly once "
-        "across the two modules (or made private/renamed so both intents survive) and that both modules build. "
-        "Do not weaken anything to get green: no `sorry`, no `native_decide`, no new axioms, no silenced linters, no "
-        "`maxHeartbeats` overrides.",
-        "",
-        "Work synchronously to completion in this turn; nothing resumes you. Finish with a short summary of what failed, "
-        "what you changed in which PR's commit, and the exit status of the final `lake build --iofail`.",
-    ]
-    return "\n".join(lines)
-
-
-def claude_profile():
-    from tauceti_worker.agents import resolve_authoring_profile
-
-    return resolve_authoring_profile("claude")
-
-
-def prepare_claude_config(root: Path) -> Path:
-    """An isolated Claude config dir seeded the way workers seed theirs: credentials, not personality."""
-    from tauceti_worker.agents import seed_worker_claude_config
-    from tauceti_worker.quota import claude_dir
-
-    iso = root / "claude-config"
-    iso.mkdir(parents=True, exist_ok=True)
-    real = claude_dir(Path(os.environ.get("HOME", os.path.expanduser("~"))))
-    seed_worker_claude_config(real, iso)
-    for name in (".credentials.json",):
-        src = real / name
-        if src.exists():
-            shutil.copy2(src, iso / name)
-    return iso
-
-
-def agent_environment(prompt: str, root: Path, env_lake: dict, deadline_seconds: float) -> tuple[list[str], dict]:
-    """The worker's exact argv for a Claude host round, plus the experiment's isolation."""
-    os.environ["TAUCETI_ROUND_DEADLINE"] = str(time.time() + deadline_seconds)
-    from tauceti_worker.agents import host_agent_argv
-
-    argv, env = host_agent_argv(prompt, claude_profile())
-    for key in ("LAKE_CONFIG", "LAKE_CACHE_DIR", "LAKE_ARTIFACT_CACHE", "LAKE_RESTORE_ARTIFACTS"):
-        env[key] = env_lake[key]
-    env["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root))
-    env.pop("GH_TOKEN", None)
-    env.pop("GITHUB_TOKEN", None)
-    empty_gh = root / "gh-config-empty"
-    empty_gh.mkdir(exist_ok=True)
-    env["GH_CONFIG_DIR"] = str(empty_gh)
-    env["GIT_CONFIG_COUNT"] = "2"
-    env["GIT_CONFIG_KEY_0"] = "remote.origin.pushurl"
-    env["GIT_CONFIG_VALUE_0"] = str(root / "no-push")
-    env["GIT_CONFIG_KEY_1"] = "advice.detachedHead"
-    env["GIT_CONFIG_VALUE_1"] = "false"
-    return argv, env
-
-
-def run_agent(worktree: Path, argv: list[str], env: dict, logdir: Path, timeout: float) -> dict:
-    """Run the agent with its stream-json transcript captured; wall time from handoff to exit."""
-    logdir.mkdir(parents=True, exist_ok=True)
-    stream = logdir / "agent-stream.jsonl"
-    stderr = logdir / "agent-stderr.log"
-    before = host_state()
-    started = time.monotonic()
-    timed_out = False
-    with stream.open("wb") as out, stderr.open("wb") as err:
-        proc = subprocess.Popen(argv, cwd=worktree, env=env, stdout=out, stderr=err, start_new_session=True)
-        try:
-            rc = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            os.killpg(proc.pid, 15)
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, 9)
-                proc.wait()
-            rc = 124
-    record = {
-        "rc": rc,
-        "timed_out": timed_out,
-        "wall_seconds": round(time.monotonic() - started, 1),
-        "stream": str(stream),
-        "load_before": before,
-        "load_after": host_state(),
-    }
-    record.update(agent_usage(stream, Path(env.get("CLAUDE_CONFIG_DIR", ""))))
-    return record
-
-
-def agent_usage(stream: Path, config_dir: Path | None = None) -> dict:
-    """Tokens, model and estimated API cost from the stream-json transcript.
-
-    Assistant events repeat the message usage per content block, so usage is counted once per message
-    id (as ``cost_model._parse_claude`` does). Cost uses the repository's dated price table through
-    ``cost_model._api_cost``; Claude's own ``total_cost_usd`` is kept beside it for comparison.
-    """
-    from tauceti_worker.cost_model import _api_cost
-
-    totals: collections.defaultdict[str, int] = collections.defaultdict(int)
-    per_model: dict[str, collections.defaultdict[str, int]] = {}
-    seen: set[str] = set()
-    model = None
-    result_event: dict = {}
-    session_id = None
-    if stream.exists():
-        with stream.open(errors="replace") as handle:
-            for line in handle:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                session_id = event.get("session_id") or session_id
-                if event.get("type") == "assistant":
-                    message = event.get("message") or {}
-                    usage = message.get("usage") or {}
-                    this_model = message.get("model")
-                    if isinstance(this_model, str) and this_model != "<synthetic>":
-                        model = this_model
-                    usage_id = str(message.get("id") or event.get("uuid"))
-                    if usage and usage_id not in seen:
-                        seen.add(usage_id)
-                        bucket = per_model.setdefault(str(this_model), collections.defaultdict(int))
-                        for key, value in usage.items():
-                            if isinstance(value, (int, float)):
-                                totals[key] += int(value)
-                                bucket[key] += int(value)
-                        creation = usage.get("cache_creation") or {}
-                        if isinstance(creation, dict):
-                            for suffix, key in (
-                                ("1h", "ephemeral_1h_input_tokens"),
-                                ("5m", "ephemeral_5m_input_tokens"),
-                            ):
-                                value = creation.get(key)
-                                if isinstance(value, (int, float)):
-                                    totals[f"cache_creation_{suffix}_input_tokens"] += int(value)
-                                    bucket[f"cache_creation_{suffix}_input_tokens"] += int(value)
-                elif event.get("type") == "result":
-                    result_event = event
-    # The result event's per-model totals are authoritative: assistant events report a message's usage
-    # as it streams, so the output count of the first event per message id is a lower bound.
-    reported = result_event.get("modelUsage") or {}
-    if isinstance(reported, dict) and reported:
-        per_model = {}
-        totals = collections.defaultdict(int)
-        for name, usage in reported.items():
-            if not isinstance(usage, dict):
-                continue
-            bucket = collections.defaultdict(int)
-            for source, key in (
-                ("inputTokens", "input_tokens"),
-                ("outputTokens", "output_tokens"),
-                ("cacheReadInputTokens", "cache_read_input_tokens"),
-                ("cacheCreationInputTokens", "cache_creation_input_tokens"),
-                ("cacheCreationEphemeral5mInputTokens", "cache_creation_5m_input_tokens"),
-                ("cacheCreationEphemeral1hInputTokens", "cache_creation_1h_input_tokens"),
-            ):
-                value = usage.get(source)
-                if isinstance(value, (int, float)):
-                    bucket[key] += int(value)
-                    totals[key] += int(value)
-            per_model[name] = bucket
-            model = model or name
-    when = dt.datetime.now(dt.UTC)
-    cost = 0.0
-    priced = True
-    for name, bucket in per_model.items():
-        value = _api_cost("claude", name, dict(bucket), when)
-        if value is None:
-            priced = False
-        else:
-            cost += value
-    tokens = {
-        key: totals.get(key, 0)
-        for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
-    }
-    tokens["total_tokens"] = sum(tokens.values())
-    return {
-        "model": model,
-        "session_id": session_id,
-        "tokens": tokens,
-        "models": {name: dict(bucket) for name, bucket in per_model.items()},
-        "estimated_cost_usd": round(cost, 4) if priced else None,
-        "claude_reported_cost_usd": result_event.get("total_cost_usd"),
-        "num_turns": result_event.get("num_turns"),
-        "result_subtype": result_event.get("subtype"),
-        "is_error": result_event.get("is_error"),
-        "final_text": (result_event.get("result") or "")[:4000]
-        if isinstance(result_event.get("result"), str)
-        else None,
-    }
+    context = PromptContext(
+        repository=REPO,
+        base=failure.base_sha,
+        origin=f"This batch was staging candidate {failure.candidate_id} and failed CI.",
+        suspects=list(failure.suspects),
+        suspect_heads=dict(failure.suspect_heads),
+        named_modules=failure.failing_modules,
+    )
+    return _compose_prompt(context, findings, chain, clone)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1649,13 +899,6 @@ def duplicate_declaration_check(worktree: Path, experiment_dir: Path) -> dict:
 
 # ----------------------------------------------------------------------------------------------
 # Orchestration
-
-
-def write_record(path: Path, record: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(record, indent=1, default=str))
-    os.replace(tmp, path)
 
 
 def run_experiment(
@@ -1870,19 +1113,6 @@ def result_row(record: dict) -> dict:
         "started_at": record.get("started_at"),
         "finished_at": record.get("finished_at"),
     }
-
-
-def _kinds_from_findings(findings: dict | None) -> list[str]:
-    if not findings:
-        return []
-    kinds = []
-    if findings.get("compiler_errors"):
-        kinds.append("compiler")
-    if findings.get("duplicate_declarations") or findings.get("import_collisions"):
-        kinds.append("audit")
-    if (findings.get("lint") or {}).get("findings"):
-        kinds.append("lint")
-    return kinds
 
 
 def results_table(rows: list[dict]) -> str:
