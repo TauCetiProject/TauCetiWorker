@@ -814,6 +814,46 @@ class Adapter(unittest.TestCase):
         with self.assertRaises(ga.GitHubError):
             a.list_open_pull_requests(TAUCETI, review_app_id=3947238)
 
+    def test_list_open_pull_requests_trusts_the_filtered_suite_when_app_is_null(self):
+        """Production shape (2026-11-04): through the installation token the review App's suite has `app: null`."""
+        fixture = json.loads((REPO / "tests/fixtures/merge-eligibility-check-runs.json").read_text())
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, fixture["graphql"])
+        a = adapter(transport)
+        listed = a.list_open_pull_requests(fixture["repo"], review_app_id=fixture["review_app_id"])
+        self.assertEqual([p.number for p in listed], [24557, 9268])
+        from tauceti_queue import eligibility
+
+        eligible, withdrawn = listed
+        self.assertEqual([c["app"]["id"] for c in eligible.eligibility_checks], [3947238, 3947238])
+        self.assertTrue(all(eligibility.trusted(c) for c in eligible.eligibility_checks))
+        decision = eligibility.latest(
+            list(eligible.eligibility_checks),
+            fixture["repo"],
+            eligible.number,
+            eligible.head_sha,
+            fixture["review_app_id"],
+        )
+        self.assertEqual(
+            (decision.check_id, decision.eligible, decision.review_safe, decision.merge_base_sha),
+            (125149712005, True, True, "93af5b549b7d9ed44291d6ceb093a8013dda00f8"),
+            "the highest check id wins over the earlier withdrawal",
+        )
+        decision = eligibility.latest(
+            list(withdrawn.eligibility_checks),
+            fixture["repo"],
+            withdrawn.number,
+            withdrawn.head_sha,
+            fixture["review_app_id"],
+        )
+        self.assertEqual((decision.eligible, decision.review_safe), (False, False))
+        # The mapped records equal the REST records in every field the reader uses.
+        rest = {c["id"]: c for c in fixture["rest"]}
+        for check in eligible.eligibility_checks:
+            for key in ("id", "name", "head_sha", "status", "conclusion", "external_id", "completed_at", "html_url"):
+                self.assertEqual(check[key], rest[check["id"]][key], key)
+            self.assertEqual(check["app"]["id"], rest[check["id"]]["app"]["id"])
+
     def test_rate_limit_falls_back_to_the_endpoint(self):
         transport = FakeTransport()
         transport.add(

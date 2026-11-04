@@ -754,7 +754,9 @@ class GitHubAdapter:
         One GraphQL page per 100 PRs: the PR's head, draft flag and base, and from the head commit
         the review App's check suite (`checkSuites(filterBy: {appId})`) with its `merge eligibility`
         runs, mapped to the REST record shape `eligibility.latest` reads. Twelve calls for 1,200
-        open PRs, on the GraphQL quota rather than the REST one.
+        open PRs, on the GraphQL quota rather than the REST one. The suite's `app` is null when read
+        with an installation token (observed on production, 2026-11-04), so the review App id the
+        filter selected by is what the mapped records carry.
         """
         owner, name = repo.split("/", 1)
         listed: list[ports.OpenPullRequest] = []
@@ -774,7 +776,12 @@ class GitHubAdapter:
                     commit = (commit_node or {}).get("commit") or {}
                     oid = str(commit.get("oid") or head)
                     for suite in ((commit.get("checkSuites") or {}).get("nodes")) or []:
+                        # The suites were selected by `filterBy: {appId}`, so they are the review App's;
+                        # through an installation token GraphQL returns `app: null` on another App's
+                        # suite, and the REST record's `app.id` must still name it for `eligibility.trusted`.
                         app_id = ((suite or {}).get("app") or {}).get("databaseId")
+                        if not isinstance(app_id, int):
+                            app_id = int(review_app_id)
                         for run in (((suite or {}).get("checkRuns") or {}).get("nodes")) or []:
                             if isinstance(run, dict) and run.get("name") == "merge eligibility":
                                 checks.append(_rest_check_run(run, oid, app_id))
