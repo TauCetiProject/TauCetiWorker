@@ -19,6 +19,7 @@ The [canonical sample](evidence/README.md) contains 500 recent landed contributi
 | [Work assignment service](specs/work-assignment-service.md) | Implementation handoff for central selection, dispatch, continuation, and reconciliation |
 | [Staging triage](specs/staging-triage.md) | Immediate fixes to the existing Bors path: no solo CI for isolated PRs, full staging builds, strip every attributed culprit per round |
 | [AI merge queue](specs/ai-merge-queue.md) | Standalone scripted queue with attributed PR commits and AI conflict/CI repair |
+| [Declaration collisions](specs/declaration-collisions.md) | Detect duplicate declarations between batch-mates at assembly, from module headers recorded at PR build time |
 | [Review continuity](specs/review-continuity.md) | Implementation handoff for structured findings and approval reuse in the existing GitHub workflow |
 | [Library integration service](specs/library-integration-service.md) | Implementation handoff for library registration, dependency snapshots, independent queues, and queue backends |
 | [Evidence](evidence/README.md) | Measurement definitions, reproducible collection, samples, and limitations |
