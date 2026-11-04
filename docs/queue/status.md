@@ -9,10 +9,10 @@ orchestrating session as streams land.
 
 | Stream | Branch | State |
 | --- | --- | --- |
-| A. Attributed chain tool (`tauceti_queue/chain.py`) | `queue/chain-tool` | in progress |
-| B. Historical repair experiments (`tauceti_queue/repair_experiment.py`, `docs/queue/repair-experiments.md`) | `queue/repair-experiments` | in progress; stacks on A |
-| C. Journal report (`scripts/staging_journal_report.py`, `docs/queue/journal-report.md`) | `queue/journal-report` | in progress |
-| D. Readmission age in Bors (`queue_age.ex`, handoff record) | bors-ng `queue-age/readmitted-suspects` | in progress |
+| A. Attributed chain tool (`tauceti_queue/chain.py`) | `queue/chain-tool` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/474 |
+| B. Historical repair experiments (`tauceti_queue/repair_experiment.py`, `docs/queue/repair-experiments.md`) | `queue/repair-experiments` | running on chungus2; harness PR https://github.com/TauCetiProject/TauCetiWorker/pull/477 open, results pushed to it as candidates complete |
+| C. Journal report (`scripts/staging_journal_report.py`, `docs/queue/journal-report.md`) | `queue/journal-report` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/475; baseline for candidates 1833 to 1932 in [journal-report.md](journal-report.md) |
+| D. Readmission age in Bors (`queue_age.ex`, handoff record) | bors-ng | merged: https://github.com/TauCetiProject/bors-ng/pull/99 (inherit the age once per handoff), https://github.com/TauCetiProject/bors-ng/pull/100 (same head after a lifted conflict request), https://github.com/TauCetiProject/bors-ng/pull/102 (a retired handoff parent no longer blocks the automatic re-offer); deployed through the automatic Cloudflare build, verification waits for the next `provisional_repair` whose `suspects[]` carry `original_admitted_at` (none since 04:42 UTC) |
 | GitHub App | operator item 1 | waiting on the operator; registration URL and credential layout in [`operations.md`](operations.md) |
 | Dedicated staging runners | operator item 3 | investigation in [staging-runners.md](staging-runners.md); workflow change https://github.com/TauCetiProject/TauCeti/pull/27526 open; Namespace profile and `STAGING_RUNS_ON` waiting on the operator |
 
@@ -32,5 +32,12 @@ orchestrating session as streams land.
 
 ## Latest numbers
 
-None yet. The journal baseline for candidates 1833 through 1932 lands with stream C; the repair
-experiment table lands with stream B.
+Journal baseline (candidates 1833 to 1932, 2026-11-03): 1394 slot minutes, 23 failed large rounds per
+7 landed large batches (3.3), 10 conflict and 3 confirmation singletons, 11 handoffs of which 5 were
+readmitted (median 51 minutes). Full tables in [journal-report.md](journal-report.md).
+
+Repair experiments (interim, 2026-11-04 05:45 UTC, lane running): 4 of 4 completed candidates green
+(1931, 1932, 1930, 1843), agent time 57 s to 175 s, estimated inference cost $0.40 to $0.54 each; the
+candidate whose modules were already in the warm pool prepared in 16 s. The sample continues toward
+twenty candidates; the table and the warm-artifact decision land in `repair-experiments.md` with
+stream B.
