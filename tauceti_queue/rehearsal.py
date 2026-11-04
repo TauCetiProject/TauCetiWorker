@@ -1207,8 +1207,8 @@ class LiveRig(Rig):
         self.tag = time.strftime("%Y%m%dT%H%M%S")
         self.content = Content(self.tag)
         self.poll = 3.0
-        self.timeout = 900.0
-        self.ci_timeout = 1800.0
+        self.timeout = 1800.0
+        self.ci_timeout = float(os.environ.get("REHEARSAL_CI_TIMEOUT", 3 * 3600))  # GitHub queues runs for long stretches when degraded
         self.operator_token = operator_token
         self.keep_service = keep_service
         self.port = port
