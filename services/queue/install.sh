@@ -94,6 +94,20 @@ if ! uv run tauceti-queue check-config >/dev/null; then
   die "configuration problems; fix $CONFIG_DIR and rerun"
 fi
 
+# --- content clone --------------------------------------------------------------------------------
+# The controller runs chain construction and replay against a local clone of the opted-in
+# repository; without one the service serves status only ("content clone missing" in /status).
+# Create it on first install; the service fetches into it from then on.
+content_clone="$(uv run tauceti-queue check-config --print content_clone)"
+repository="$(uv run tauceti-queue check-config --print repository)"
+if [ ! -e "$content_clone/HEAD" ] && [ ! -e "$content_clone/.git" ]; then
+  log "cloning https://github.com/$repository.git into $content_clone"
+  mkdir -p "$(dirname "$content_clone")"
+  git clone --quiet "https://github.com/$repository.git" "$content_clone"
+else
+  log "content clone present at $content_clone"
+fi
+
 # --- units ----------------------------------------------------------------------------------------
 mkdir -p "$UNIT_DIR"
 for unit in tauceti-queue.service tauceti-queue-backup.service tauceti-queue-backup.timer; do

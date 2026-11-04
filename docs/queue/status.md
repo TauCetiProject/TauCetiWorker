@@ -53,7 +53,12 @@ publication disabled and its revision, feeds and a claimable task are verified
 1. Done: the `tauceti-queue` App is created and installed on `TauCetiProject/TauCeti`.
 2. Create `TauCetiProject/TauCetiQueueScratch` (stream I) and add it to the `tauceti-queue` App installation; optionally grant the App `checks: write` so the rehearsal can approve through `merge eligibility` checks (`docs/queue/rehearsal.md`). The rehearsal pushes the content itself.
 3. Staging capacity: no action for now (operator decision, 2026-11-04). Revisit from the pilot's measurements.
-4. Name the service host (increment 1): a fleet host with the `~/.config/tauceti-queue/` credentials (already on chungus2) and a public HTTPS endpoint `queue.taucetiproject.org` through Cloudflare.
+4. Service host: tauchonki, temporary, installed 2026-11-04 with publication disabled, revision `045c7e589c676ec3a0bee2900111d49d2ca4aabd` ([operations.md](operations.md), "Current deployment"). No tunnel, DNS record or webhook yet; Bors untouched. The dedicated, stable host is still to be named.
+
+## Next steps
+
+- Move the service from tauchonki to a dedicated, stable host before it becomes the production merge backend (operator condition, 2026-11-04); the procedure is in [operations.md](operations.md), "Moving to the dedicated host". The tunnel, DNS record, webhook activation and publication flag are done on that host, not on tauchonki.
+- Until the webhook delivers, the shadow service sees canonical advances but no approvals (approval intake is webhook-only at this revision), so the two days of shadow agreement with Bors start after the move and the webhook activation.
 
 ## Latest numbers
 
