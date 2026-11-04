@@ -1131,6 +1131,8 @@ def results_table(rows: list[dict]) -> str:
             if prep.get("base_mapping_found") is False:
                 warmth += ", no base mapping"
         green = "-" if row.get("green") is None else ("yes" if row["green"] else "no")
+        if str(row.get("status") or "").startswith("aborted"):
+            green = "aborted"
         if row.get("agent_timed_out"):
             green += " (agent timed out)"
         tokens = (row.get("tokens") or {}).get("total_tokens")

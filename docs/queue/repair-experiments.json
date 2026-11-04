@@ -1,8 +1,8 @@
 {
  "schema": "tauceti-queue.repair-experiments/v1",
- "generated_at": "2026-11-04T08:59:41+00:00",
+ "generated_at": "2026-11-04T09:13:52+00:00",
  "summary": {
-  "candidates": 9,
+  "candidates": 10,
   "complete": 9,
   "green": 9,
   "lineages": 5,
@@ -25,22 +25,22 @@
    "mean": 13.0
   },
   "preparation_minutes": {
-   "count": 9,
+   "count": 10,
    "min": 0.2,
-   "p25": 2.6,
-   "median": 10.7,
+   "p25": 1.6,
+   "median": 10.4,
    "p75": 12.5,
    "max": 15.0,
-   "mean": 8.7
+   "mean": 8.0
   },
   "modules_built_in_preparation": {
-   "count": 9,
+   "count": 10,
    "min": 0,
    "p25": 214,
-   "median": 1468,
+   "median": 435,
    "p75": 4077,
    "max": 4903,
-   "mean": 2061.3
+   "mean": 1882.2
   },
   "estimated_cost_usd_total": 7.48,
   "total_tokens": 11036636,
@@ -289,6 +289,82 @@
    "disk_free_gb_start": 18.1,
    "started_at": "2026-11-04T07:40:42+00:00",
    "finished_at": "2026-11-04T08:59:14+00:00"
+  },
+  {
+   "candidate": 1864,
+   "generation": 1,
+   "batch": 2560,
+   "lineage": 1861,
+   "members": 27,
+   "base_sha": "8c3e8d8caaa0",
+   "kinds": [
+    "lint"
+   ],
+   "failing_modules": [
+    "TauCeti/LowDimTopology/DehnSurgery/Slope.lean"
+   ],
+   "suspects": [
+    25376,
+    26135,
+    26157,
+    26169,
+    26202,
+    26209,
+    26212,
+    26216,
+    26241,
+    26271,
+    26416,
+    26549,
+    26862,
+    26900
+   ],
+   "status": "aborted_by_operator",
+   "error": "aborted at 09:11 UTC: host disk pressure (coordinator instruction); agent stopped by PID",
+   "ci_modules_built": 2260,
+   "preparation": {
+    "base_cache_seconds": 5.1,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 270,
+    "modules_replayed": 0,
+    "modules_fetched": 856,
+    "failed_modules_local": [],
+    "build_seconds": 86.8,
+    "build_rc": 0,
+    "load_1m_at_build": 36.7
+   },
+   "preparation_seconds": 93.2,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": true,
+   "agent_wall_seconds": null,
+   "agent_rc": null,
+   "agent_timed_out": null,
+   "agent_turns": null,
+   "model": null,
+   "tokens": {},
+   "estimated_cost_usd": null,
+   "claude_reported_cost_usd": null,
+   "green": null,
+   "confirm_build_seconds": null,
+   "confirm_modules_built": null,
+   "confirm_failed_modules": null,
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": null,
+   "edited_prs": null,
+   "shrink_prs": null,
+   "emptied_prs": null,
+   "messages_preserved": null,
+   "edited_without_explanation": null,
+   "validation_problems": null,
+   "diffstat": null,
+   "load_1m_at_agent_start": null,
+   "load_1m_at_agent_end": null,
+   "disk_free_gb_start": 31.4,
+   "started_at": "2026-11-04T08:59:44+00:00",
+   "finished_at": "2026-11-04T09:11:29+00:00"
   },
   {
    "candidate": 1914,
