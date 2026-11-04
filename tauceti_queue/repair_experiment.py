@@ -848,6 +848,62 @@ def lake_env(root: Path, base_env: dict | None = None) -> dict:
     return env
 
 
+def prune_pool(root: Path, shared: Path | None = None) -> dict:
+    """Drop built outputs from the private artifact pool, keeping the published base mappings.
+
+    Lake stores every artifact a build produces into ``LAKE_CACHE_DIR`` (hardlinked with the worktree's
+    ``.lake/build``), so a 110-PR candidate adds about 13 GB per build. After a base group is finished
+    the pool keeps only artifacts named by a ``revisions/*/*.jsonl`` mapping or shared by hardlink with
+    the seed cache (``~/.cache/lake``), and ``outputs/`` entries whose artifact is gone are removed.
+    """
+    pool = root / "lake-cache"
+    shared = shared or Path.home() / ".cache" / "lake"
+    referenced: set[str] = set()
+    for mapping in (pool / "revisions").glob("*/*.jsonl"):
+        for line in mapping.read_text(errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, list) and len(row) >= 2 and isinstance(row[1], str):
+                referenced.add(row[1])
+    removed = removed_bytes = kept = 0
+    artifacts = pool / "artifacts"
+    if artifacts.is_dir():
+        for path in artifacts.iterdir():
+            if path.name in referenced:
+                kept += 1
+                continue
+            twin = shared / "artifacts" / path.name
+            try:
+                if twin.exists() and os.path.samefile(path, twin):
+                    kept += 1
+                    continue
+                size = path.stat().st_size
+                path.unlink()
+                removed += 1
+                removed_bytes += size
+            except OSError:
+                continue
+    stale = 0
+    outputs = pool / "outputs"
+    if outputs.is_dir():
+        for entry in outputs.glob("*/*.json"):
+            try:
+                data = json.loads(entry.read_text()).get("data")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, str) and not (artifacts / data).exists():
+                entry.unlink(missing_ok=True)
+                stale += 1
+    return {
+        "removed": removed,
+        "removed_gb": round(removed_bytes / 1e9, 2),
+        "kept": kept,
+        "stale_outputs_removed": stale,
+    }
+
+
 def run_logged(argv: list[str], cwd: Path, log: Path, env: dict | None = None, timeout: float | None = None) -> dict:
     """Run a command with output to ``log``; return rc, seconds and the host load around it."""
     before = host_state()
@@ -1613,9 +1669,10 @@ def run_experiment(
         if not keep_worktree:
             try:
                 remove_worktree(clone, worktree)
+                record["pool_prune"] = prune_pool(root)
             except Exception as error:
                 record["cleanup_error"] = str(error)
-                write_record(record_path, record)
+            write_record(record_path, record)
     return record
 
 
@@ -1855,9 +1912,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--build-timeout", type=float, default=3 * 3600)
     run.add_argument("--skip-agent", action="store_true", help="prepare and measure artifacts only")
     run.add_argument("--remove-worktree", action="store_true", help="remove the base worktree afterwards")
-    clean = sub.add_parser("clean", help="remove every experiment worktree under the root")
+    clean = sub.add_parser("clean", help="remove every experiment worktree under the root and prune the pool")
     clean.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     clean.add_argument("--clone", type=Path, default=DEFAULT_CLONE)
+    prune = sub.add_parser("prune", help="drop built outputs from the private artifact pool")
+    prune.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     report = sub.add_parser("report", help="aggregate result records into the results table and JSON")
     report.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     report.add_argument("--json", type=Path, help="write the per-candidate records here")
@@ -1897,6 +1956,10 @@ def main(argv: list[str] | None = None) -> int:
         for path in sorted((args.root / "worktrees").glob("*")):
             remove_worktree(args.clone, path)
             print(f"removed {path}")
+        print(json.dumps(prune_pool(args.root)))
+        return 0
+    if args.command == "prune":
+        print(json.dumps(prune_pool(args.root)))
         return 0
     if args.command == "report":
         rows = [result_row(r) for r in load_results(args.root)]

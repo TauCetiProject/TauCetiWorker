@@ -463,6 +463,36 @@ with tempfile.TemporaryDirectory() as raw:
         "a missing stream yields zero usage", rx.agent_usage(Path(raw) / "missing.jsonl")["tokens"]["total_tokens"] == 0
     )
 
+# ---- pool pruning --------------------------------------------------------------------------------
+
+with tempfile.TemporaryDirectory() as raw:
+    root = Path(raw)
+    pool, shared = root / "lake-cache", root / "shared"
+    (pool / "artifacts").mkdir(parents=True)
+    (pool / "revisions" / "TauCeti").mkdir(parents=True)
+    (pool / "outputs" / "TauCeti").mkdir(parents=True)
+    (shared / "artifacts").mkdir(parents=True)
+    (pool / "artifacts" / "base.ltar").write_bytes(b"b" * 10)
+    (shared / "artifacts" / "seed.ltar").write_bytes(b"s" * 10)
+    os.link(shared / "artifacts" / "seed.ltar", pool / "artifacts" / "seed.ltar")
+    (pool / "artifacts" / "built.ltar").write_bytes(b"x" * 1000)
+    (pool / "revisions" / "TauCeti" / "abc.jsonl").write_text('"2026-03-17"\n["0011", "base.ltar"]\n')
+    (pool / "outputs" / "TauCeti" / "0011.json").write_text(json.dumps({"data": "base.ltar"}))
+    (pool / "outputs" / "TauCeti" / "0022.json").write_text(json.dumps({"data": "built.ltar"}))
+    pruned = rx.prune_pool(root, shared)
+    check(
+        "pruning drops built outputs and keeps mapped and shared artifacts",
+        pruned["removed"] == 1
+        and pruned["kept"] == 2
+        and sorted(p.name for p in (pool / "artifacts").iterdir()) == ["base.ltar", "seed.ltar"],
+    )
+    check(
+        "pruning removes stale output entries",
+        pruned["stale_outputs_removed"] == 1
+        and not (pool / "outputs" / "TauCeti" / "0022.json").exists()
+        and (pool / "outputs" / "TauCeti" / "0011.json").exists(),
+    )
+
 # ---- results table and summary ----------------------------------------------------------------
 
 record = {
