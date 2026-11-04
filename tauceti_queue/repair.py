@@ -564,16 +564,27 @@ def lake_env(root: Path, base_env: dict | None = None) -> dict:
 LAKE_ENV_KEYS = ("LAKE_CONFIG", "LAKE_CACHE_DIR", "LAKE_ARTIFACT_CACHE", "LAKE_RESTORE_ARTIFACTS")
 
 
-def prune_pool(root: Path, shared: Path | None = None) -> dict:
+def prune_pool(
+    root: Path, shared: Path | None = None, *, drop_revisions: tuple[str, ...] = (), newer_than: float | None = None
+) -> dict:
     """Drop built outputs from the private artifact pool, keeping the published base mappings.
 
     Lake stores every artifact a build produces into ``LAKE_CACHE_DIR`` (hardlinked with the worktree's
     ``.lake/build``), so a 110-PR candidate adds about 13 GB per build. After a base group is finished
     the pool keeps only artifacts named by a ``revisions/*/*.jsonl`` mapping or shared by hardlink with
     the seed cache (``~/.cache/lake``), and ``outputs/`` entries whose artifact is gone are removed.
+    ``drop_revisions`` also forgets the mappings of bases that are finished with (their artifacts are
+    then pruned too); ``newer_than`` protects artifacts a running build may still be writing. Freed
+    bytes count only files with no other hardlink: a built output also linked from a worktree frees
+    nothing until that worktree goes.
     """
     pool = root / "lake-cache"
     shared = shared or Path.home() / ".cache" / "lake"
+    dropped = 0
+    for mapping in (pool / "revisions").glob("*/*.jsonl"):
+        if any(mapping.stem.startswith(rev) for rev in drop_revisions if rev):
+            mapping.unlink()
+            dropped += 1
     referenced: set[str] = set()
     for mapping in (pool / "revisions").glob("*/*.jsonl"):
         for line in mapping.read_text(errors="replace").splitlines():
@@ -595,10 +606,13 @@ def prune_pool(root: Path, shared: Path | None = None) -> dict:
                 if twin.exists() and os.path.samefile(path, twin):
                     kept += 1
                     continue
-                size = path.stat().st_size
+                stat = path.stat()
+                if newer_than is not None and stat.st_mtime >= newer_than:
+                    kept += 1
+                    continue
                 path.unlink()
                 removed += 1
-                removed_bytes += size
+                removed_bytes += stat.st_size if stat.st_nlink == 1 else 0
             except OSError:
                 continue
     stale = 0
@@ -614,9 +628,10 @@ def prune_pool(root: Path, shared: Path | None = None) -> dict:
                 stale += 1
     return {
         "removed": removed,
-        "removed_gb": round(removed_bytes / 1e9, 2),
+        "freed_gb": round(removed_bytes / 1e9, 2),
         "kept": kept,
         "stale_outputs_removed": stale,
+        "revisions_dropped": dropped,
     }
 
 
