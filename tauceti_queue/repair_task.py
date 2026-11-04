@@ -304,6 +304,10 @@ class ClaimLease(threading.Thread):
         self.cancel = cancel if cancel is not None else threading.Event()
         self.lost = threading.Event()
         self.stopped = threading.Event()
+        # Set while a result or release is in flight: the service frees the claim when it accepts
+        # either, so a renewal refused during that window is not a loss; the submission's own
+        # response decides, and the heartbeat simply ends.
+        self.submitting = threading.Event()
         self.retry_interval = retry_interval
         self.clock = clock
         self.expires_at = task.expires_at
@@ -320,6 +324,9 @@ class ClaimLease(threading.Thread):
                 self.renewals += 1
                 interval = max(0.05, float(self.task.renew_after))
             except ClaimRefused as error:
+                if self.submitting.is_set():
+                    log(f"renewal refused while a submission is in flight; the submission decides ({error})")
+                    return
                 self._lose(str(error))
                 return
             except ServiceError as error:
@@ -560,7 +567,9 @@ def run_repair_agent(
         changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_timeout)
         started = time.monotonic()
         state.write("agent_running", agent_label=label, agent_attempt=index, prompt=str(prompt_path), resume=resume)
-        timer = threading.Timer(cfg.agent_timeout, cancel.set)
+        # The worker's cap on one attempt; the plan gives the task itself no time budget.
+        expired = threading.Event()
+        timer = threading.Timer(cfg.agent_timeout, _expire_attempt, args=(expired, cancel))
         timer.daemon = True
         timer.start()
         try:
@@ -579,13 +588,15 @@ def run_repair_agent(
         except BuildCacheUnavailable as error:
             return {"status": "artifacts_unavailable", "reason": str(error), "attempts": attempts}
         except NoProgress as error:
-            if cancel.is_set():
+            if cancel.is_set() and not expired.is_set():
                 return {"status": "cancelled", "attempts": attempts}
             rc, reason = 75, f"agent could not start: {error}"
         else:
             reason = take_last_agent_infra_failure()
         finally:
             timer.cancel()
+        if expired.is_set():
+            cancel.clear()  # the lease is still live; only this attempt is over
         session = state.session()
         record = {
             "rc": rc,
@@ -597,6 +608,9 @@ def run_repair_agent(
         usage = (record["telemetry"] or {}).get("usage") or {}
         record["estimated_cost_usd"] = repair.price_usage(provider, getattr(profile, "model", None), usage)
         attempts.append(record)
+        if expired.is_set():
+            record["timed_out"] = True
+            return {"status": "failed", "attempts": attempts, "session": session, "rc": rc, "timed_out": True}
         if cancel.is_set():
             return {"status": "cancelled", "attempts": attempts, "session": session}
         if rc == 0:
@@ -610,6 +624,11 @@ def run_repair_agent(
             if cancel.wait(delay):
                 return {"status": "cancelled", "attempts": attempts, "session": session}
     return {"status": "inference_unavailable", "reason": reason, "attempts": attempts}
+
+
+def _expire_attempt(expired: threading.Event, cancel: threading.Event) -> None:
+    expired.set()
+    cancel.set()
 
 
 def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir: Path, expect: str | None) -> dict:
@@ -650,9 +669,12 @@ def release_task(
     reason: str,
     detail,
     outcome: dict | None = None,
+    lease: ClaimLease | None = None,
 ) -> dict:
     """Give the task back with a reason; without a ``release`` endpoint the claim is left to expire."""
     assert reason in RELEASE_REASONS
+    if lease is not None:
+        lease.submitting.set()
     notes = {"worker": cfg.worker, "detail": detail}
     outcome = outcome if outcome is not None else {"task_id": task.task_id}
     outcome.update(status="released", reason=reason, detail=detail)
@@ -724,10 +746,12 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
             state.write("artifacts_ready" if artifacts["available"] else "artifacts_unavailable", artifacts=artifacts)
             if not artifacts["available"]:
                 return release_task(
-                    cfg, client, task, state, "artifacts_unavailable", artifacts["unavailable_reason"], outcome
+                    cfg, client, task, state, "artifacts_unavailable", artifacts["unavailable_reason"], outcome, lease
                 )
         elif not worktree.is_dir():
-            return release_task(cfg, client, task, state, "agent_failed", "resume: the worktree is gone", outcome)
+            return release_task(
+                cfg, client, task, state, "agent_failed", "resume: the worktree is gone", outcome, lease
+            )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         findings = task_findings(task)
         feedback: str | None = None
@@ -767,9 +791,13 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
             if agent["status"] == "cancelled":
                 return discard(lease.lost_reason or "the agent was cancelled")
             if agent["status"] == "inference_unavailable":
-                return release_task(cfg, client, task, state, "inference_unavailable", agent.get("reason"), outcome)
+                return release_task(
+                    cfg, client, task, state, "inference_unavailable", agent.get("reason"), outcome, lease
+                )
             if agent["status"] == "artifacts_unavailable":
-                return release_task(cfg, client, task, state, "artifacts_unavailable", agent.get("reason"), outcome)
+                return release_task(
+                    cfg, client, task, state, "artifacts_unavailable", agent.get("reason"), outcome, lease
+                )
             tip = git(worktree, "rev-parse", "HEAD").strip()
             git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
             report = repair.chain_report(cfg.clone, task.validation_base, task.tip, tip, task.member_keys)
@@ -791,7 +819,7 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                     return discard(lease.lost_reason or "the explanation turn was cancelled")
                 if follow["status"] == "inference_unavailable":
                     return release_task(
-                        cfg, client, task, state, "inference_unavailable", follow.get("reason"), outcome
+                        cfg, client, task, state, "inference_unavailable", follow.get("reason"), outcome, lease
                     )
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
@@ -803,7 +831,9 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
             acceptable = report["ok"] and not report["dirty"] and not report["unchanged"]
             if not acceptable:
                 detail = format_report(report)
-                if agent["status"] == "failed":
+                if agent.get("timed_out"):
+                    detail = f"agent exceeded the worker's {cfg.agent_timeout:.0f}s cap\n{detail}"
+                elif agent["status"] == "failed":
                     detail = f"agent exited {agent.get('rc')}\n{detail}"
                 if attempt < cfg.agent_attempts:
                     feedback = (
@@ -814,14 +844,14 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                     )
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
-                return release_task(cfg, client, task, state, "agent_failed", detail, outcome)
+                return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             if cancel.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
             push = push_result(cfg, task, worktree, tip, logdir, pushed)
             outcome["push"] = {k: v for k, v in push.items() if "load" not in k}
             if not push["ok"]:
                 return release_task(
-                    cfg, client, task, state, "push_failed", f"git-safe-push exited {push['rc']}", outcome
+                    cfg, client, task, state, "push_failed", f"git-safe-push exited {push['rc']}", outcome, lease
                 )
             pushed = tip
             state.write("pushed", tip=tip, pushed_ref=push["ref"])
@@ -836,6 +866,7 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                     a.get("estimated_cost_usd") or 0 for r in agent_records for a in r.get("attempts", [])
                 ),
             }
+            lease.submitting.set()
             try:
                 response = with_retries(
                     functools.partial(client.submit, task, tip, push["ref"], notes),
@@ -848,10 +879,12 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
             state.write("submitted", attempt=attempt, response=response)
             outcome["response"] = response
             if response.get("adopted"):
+                lease.stop()
                 outcome.update(status="adopted", tip=tip, pushed_ref=push["ref"])
                 state.write("adopted", outcome=outcome)
                 return outcome
             if response.get("reason") == "validation" and validation_retries < cfg.validation_retries:
+                lease.submitting.clear()
                 validation_retries += 1
                 feedback = "The queue's validation of the previous attempt's chain:\n" + format_service_validation(
                     response

@@ -506,6 +506,8 @@ class HappyPath(Fixture):
         self.assertEqual(sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/t1/attempt-1"), outcome["tip"])
         self.assertEqual(sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/t1/input"), self.content.tip)
         self.assertIsNotNone(outcome["agent"][0]["attempts"][0]["estimated_cost_usd"])
+        written = json.loads((self.root / "state" / "tasks" / "t1" / "outcome.json").read_text())
+        self.assertEqual(written["status"], "adopted")
         self.assertFalse((self.root / "state" / "worktrees" / "task-t1").exists())
         self.assertIsNone(repair_task.claim_and_run(cfg, self.client(cfg)), "the adopted task is not claimable again")
 
@@ -669,6 +671,21 @@ class InferenceUnavailable(Fixture):
         self.assertIn("nothing was repaired", outcome["detail"])
         self.assertEqual(len(self.agent_calls()), 2, "one bounded retry with the local report")
         self.assertEqual(self.service.results, [])
+
+
+class AgentTimeout(Fixture):
+    def test_the_worker_cap_is_an_agent_failure_not_a_lost_claim(self):
+        os.environ["STUB_AGENT_MODE"] = "sleep"
+        os.environ["STUB_SLEEP"] = "30"
+        cfg = self.config(agent_timeout=2, agent_attempts=1)
+        started = time.monotonic()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "agent_failed")
+        self.assertIn("cap", outcome["detail"])
+        self.assertFalse(outcome["lease"]["lost"], "the claim itself was never lost")
+        self.assertEqual([r["reason"] for r in self.service.releases], ["agent_failed"])
 
 
 class Resume(Fixture):

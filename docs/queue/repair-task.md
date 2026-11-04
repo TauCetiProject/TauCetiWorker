@@ -92,7 +92,14 @@ without a successful one. A lost claim sets the agent's cancellation event (`run
 the agent's process group), and the attempt's result is discarded rather than submitted late: the
 outcome is `claim_lost`, nothing is pushed or submitted after the loss, and the chain the agent had
 reached stays under the local attempt ref. `result` and `release` calls that the service refuses
-with a stale-claim status end the task the same way.
+with a stale-claim status end the task the same way. While a `result` or `release` call is in
+flight the heartbeat treats a refused renewal as the service having already accepted the submission
+(it frees the claim on adoption and release) and simply ends; the submission's own response decides.
+
+The worker also caps one agent attempt at `agent_timeout` (3 h by default, the experiment's cap).
+That cap is the worker's, not the task's: an attempt that exceeds it is an ordinary agent failure
+(`agent_failed` after the bounded retry), never a lost claim, and the plan's rule that no repair task
+has a time budget holds because the service re-exposes the task.
 
 ## Phases
 
