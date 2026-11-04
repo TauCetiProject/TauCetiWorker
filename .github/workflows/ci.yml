@@ -92,7 +92,7 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint tests/*.sh tests/run-all
+        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint services/queue/*.sh tests/*.sh tests/run-all
 
   build:
     runs-on:
