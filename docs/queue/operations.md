@@ -10,6 +10,11 @@ The service acts through its own GitHub App, `TauCeti Queue`, owned by `TauCetiP
 increment 0 shadow repair task and the status endpoint run on its API budget, never on a personal
 account's rate limit.
 
+The App exists: slug `tauceti-queue`, App ID `5607007`, created 2026-11-04, with the permissions and
+events below confirmed from `gh api /apps/tauceti-queue`. Its webhook address is
+`https://queue.taucetiproject.org/webhook/github`, registered inactive until the service host and that
+Cloudflare hostname exist; the deployment stream uses the same name.
+
 Registration is prefilled by:
 
 ```sh
