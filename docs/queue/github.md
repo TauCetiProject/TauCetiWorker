@@ -12,6 +12,8 @@ comments and observation feeds. The modules:
 | `tauceti_queue/commands.py` | Bors-compatible command parsing and execution with admission evidence |
 | `tauceti_queue/eligibility.py` | the review App's `merge eligibility` checks, the way TauCetiReview approves today |
 | `tauceti_queue/webhook.py` | signature verification, delivery deduplication, routing |
+| `tauceti_queue/approval_poll.py` | the periodic reconciliation of `merge eligibility` checks behind the webhooks (`docs/queue/operations.md`, "Approval polling") |
+| `tauceti_queue/bors_import.py` | the cutover import of Bors's approved PRs and running head from its feeds (`docs/queue/controller.md`) |
 | `tauceti_queue/feeds.py` | the two Bors feeds over the controller's records, the schema fixture derivation and validator |
 | `tauceti_queue/server.py` | `create_server(controller, config, status=...)`: health, status, feeds, webhook, worker and admin endpoints |
 
@@ -65,7 +67,12 @@ are unix seconds, run and comment ids strings, `repo` is `owner/name`, SHAs are 
 Also used by the server, the command runner and the eligibility reader: `fetch_pr_or_none`,
 `pr_merge_base`, `collaborator_permission`, `eligibility_checks`, `labels`, `user_for_token` (the
 worker endpoints' bearer token resolved through `GET /user`), `post_commit_status`, `workflow_run`,
-`job_log`, `app`, `installation_repositories`.
+`job_log`, `app`, `installation_repositories`. The approval poll's listing is
+`list_open_pull_requests(repo, review_app_id=)`: one GraphQL query per 100 open PRs (`POST /graphql`,
+on the GraphQL quota, whose headers are kept out of the REST counter) returning each PR's number,
+head, base, draft flag and the review App's `merge eligibility` check runs from the head commit's
+check suite (`checkSuites(filterBy: {appId})`), mapped to the REST `check_runs[]` record shape so
+`eligibility.latest` reads them unchanged.
 
 All calls go through `GitHubClient`, which records the primary limit from every response, waits on
 secondary limits (`Retry-After`, or `X-RateLimit-Remaining: 0` until the reset, at most 120 s, at
@@ -129,7 +136,10 @@ hide it); an eligible decision approves at the live head with reviewer `tauceti-
 `single` recorded, and the check as evidence, once the live merge base equals the reviewed one, the
 PR is open, not a draft, on the canonical branch and carries no keep label (`keep`, `hold`, `wip`,
 `human`, `do-not-close`); an unsafe review unapproves; neutral and ineligible decisions change
-nothing. The checks describe eligibility independently of `MERGE_BACKEND`.
+nothing. The checks describe eligibility independently of `MERGE_BACKEND`. Behind the deliveries,
+`approval_poll.ApprovalPoller` lists the open PRs' checks every `approval_poll_interval_seconds` and
+reconciles the decisions the controller has not recorded (`docs/queue/operations.md`, "Approval
+polling"), so an inactive or lossy webhook cannot lose an approval or a revocation.
 
 **The review App's exact-head comments.** `bors r+ sha=<head>`, `bors r+ single sha=<head>` and
 `bors r- sha=<head>` are still accepted from comments whose `performed_via_github_app.id` is the

@@ -115,6 +115,10 @@ class FakeController(FakeSource):
             raise LookupError("no such approved PR")
         return {"urgent": pr}
 
+    def import_bors_state(self, observation, candidates=None, *, dry_run=False, release_head=False):
+        self.calls.append(("import_bors_state", observation.get("schema"), candidates, dry_run, release_head))
+        return {"imported": 3, "present": 0, "refused": 0, "dry_run": dry_run}
+
 
 class FakeAdapter:
     class client:  # noqa: N801 - mirrors the attribute the server reads
@@ -416,6 +420,46 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("POST", "/admin/urgent", {"repo": TAUCETI, "pr": 42}, self.bearer("ghp_kim"))
         self.assertEqual((status, body), (200, {"urgent": 42}))
         self.assertEqual(self.controller.calls[-1], ("mark_urgent", TAUCETI, 42, "kim-em"))
+
+    def test_import_bors_and_reconcile_approvals_endpoints(self):
+        feed = {"schema": "tauceti-bors.observation/v1", "repo": TAUCETI, "batches": []}
+        self.assertEqual(self.request("POST", "/admin/import-bors", {"observation": feed})[0], 401)
+        status, body = self.request("POST", "/admin/import-bors", {"observation": feed}, self.bearer("ghp_worker"))
+        self.assertEqual((status, body), (403, {"error": "worker-login is not a repository admin"}))
+        self.assertEqual(
+            self.request("POST", "/admin/import-bors", {"observation": []}, self.bearer("ghp_kim"))[0], 400
+        )
+        self.assertEqual(
+            self.request(
+                "POST", "/admin/import-bors", {"observation": feed, "candidates": "x"}, self.bearer("ghp_kim")
+            )[0],
+            400,
+        )
+        status, body = self.request(
+            "POST",
+            "/admin/import-bors",
+            {"observation": feed, "candidates": [{"admissions": []}], "dry_run": True},
+            self.bearer("ghp_kim"),
+        )
+        self.assertEqual((status, body), (200, {"imported": 3, "present": 0, "refused": 0, "dry_run": True}))
+        self.assertEqual(
+            self.controller.calls[-1],
+            ("import_bors_state", "tauceti-bors.observation/v1", [{"admissions": []}], True, False),
+        )
+        self.assertEqual(self.request("POST", "/admin/reconcile-approvals", {})[0], 401)
+        status, body = self.request("POST", "/admin/reconcile-approvals", {}, self.bearer("ghp_kim"))
+        self.assertEqual(status, 503, "no poller is attached to this server")
+
+        class StubPoller:
+            def run_once(self, *, reason):
+                return {"reason": reason, "listed": 2, "approved": 1}
+
+        self.server.poller = StubPoller()
+        try:
+            status, body = self.request("POST", "/admin/reconcile-approvals", {}, self.bearer("ghp_kim"))
+            self.assertEqual((status, body), (200, {"reason": "operator kim-em", "listed": 2, "approved": 1}))
+        finally:
+            self.server.poller = None
 
 
 class ServiceConfigForm(unittest.TestCase):
