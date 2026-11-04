@@ -707,6 +707,39 @@ class HeadOperations(QueueFixture):
         self.tick(2)
         self.assertEqual(self.repo.main_sha(), head["tip"])
 
+    def test_failed_run_without_a_readable_log_yet_is_observed_again_not_classified(self):
+        # GitHub publishes job logs a little after a run completes: the adapter then reports only a
+        # `log_unavailable` infrastructure finding. That is not a verdict; the next observation decides.
+        self.github.ci_policy = lambda *_: (
+            "fail",
+            [
+                {
+                    "kind": "infrastructure",
+                    "module": "",
+                    "message": "log of job 1 unavailable",
+                    "reason": "log_unavailable",
+                }
+            ],
+        )
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        head = self.head()
+        self.run_ci()
+        reasons = self.tick()
+        self.assertIn("waiting for its log", " ".join(reasons))
+        attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"]}, order="id DESC")
+        self.assertEqual(attempt["outcome"], "pending")
+        self.assertEqual(len(self.github.dispatches), 1, "no re-dispatch while the log is pending")
+        # The log appears: the same run now yields the compiler finding and a repair task opens.
+        with self.github.lock:
+            self.github.runs[-1].diagnostics = [
+                {"kind": "compiler", "module": "TauCeti/A.lean", "message": "error in A"}
+            ]
+        self.clock.advance(self.controller.setting("polling_interval_seconds") + 1)
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+        self.assertEqual(self.controller.status()["head"]["task"]["diagnostics"][0]["module"], "TauCeti/A.lean")
+
     def test_s9_conflicting_pr_is_probed_again_and_inserts_once_its_batch_mate_landed(self):
         self.github.ci_policy = fail_members(102)
         self.approve(101, {"A.lean": "a\n"})

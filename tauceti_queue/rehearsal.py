@@ -48,7 +48,7 @@ from . import chain, feeds, webhook
 
 SCHEMA = "tauceti-queue.rehearsal/v1"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.36.0-rc2"  # TauCeti's pin
-SCAFFOLD_VERSION = "1"
+SCAFFOLD_VERSION = "4"
 SCRATCH_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 LOCAL_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 QUEUE_APP_ID = 5607007
@@ -156,7 +156,7 @@ jobs:
   # Deliberately named as in TauCeti: the service reads this job's log for diagnostics and its
   # runner for status, and never names a job `build` (that name is the required commit status).
   sandboxed-build:
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4  # the organisation's Namespace pool, as TauCeti's jobs; GitHub-hosted labels queue indefinitely here
     timeout-minutes: 30
     outputs:
       status-sha: ${{ steps.candidate.outputs.sha }}
@@ -192,12 +192,21 @@ jobs:
       - name: Install elan
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
-          curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-init.sh \
-            | sh -s -- -y --default-toolchain none
+          set -o pipefail
+          installer=https://elan.lean-lang.org/elan-init.sh
+          curl -sSfL "$installer" -o elan-init.sh \
+            || curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          rm -f elan-init.sh
       - name: Build
         id: build
         run: |
           export PATH="$HOME/.elan/bin:$PATH"
+          if ! command -v lake > /dev/null; then
+            echo "::error::lake is not installed on this runner"
+            echo "infra=1" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           lake build --iofail
       - name: Report the build status
         id: report
@@ -207,10 +216,13 @@ jobs:
           SHA: ${{ steps.candidate.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
+          BUILD_INFRA: ${{ steps.build.outputs.infra }}
         run: |
           case "$BUILD_OUTCOME" in
             success) state=success; desc="Build succeeded" ;;
-            failure) state=failure; desc="Build failed: lake build --iofail reported errors" ;;
+            failure)
+              state=failure; desc="Build failed: lake build --iofail reported errors"
+              [ "$BUILD_INFRA" = "1" ] && desc="infrastructure: lake is not installed on the runner" ;;
             *) state=failure; desc="infrastructure: the build step did not run ($BUILD_OUTCOME)" ;;
           esac
           { echo "build-state=$state"; echo "build-description=$desc"; } >> "$GITHUB_OUTPUT"
@@ -224,7 +236,7 @@ jobs:
   finalize-merge-group-build:
     needs: sandboxed-build
     if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' }}
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4  # the organisation's Namespace pool, as TauCeti's jobs; GitHub-hosted labels queue indefinitely here
     timeout-minutes: 10
     permissions:
       contents: read
@@ -644,10 +656,18 @@ class Rig:
     # -- the service
 
     def status(self) -> dict:
-        code, document = fetch_json(self.service_url + "/status")
-        if code != 200 or not isinstance(document, dict):
-            raise Failure(f"GET /status answered {code}: {document}")
-        return document
+        last = None
+        for attempt in range(6):
+            try:
+                code, document = fetch_json(self.service_url + "/status")
+            except OSError as error:
+                code, document = 0, {"error": str(error)}
+            if code == 200 and isinstance(document, dict):
+                return document
+            last = f"GET /status answered {code}: {document}"
+            self.facts.setdefault("status_errors", []).append({"at": _now_iso(), "error": last})
+            time.sleep(min(5.0, 0.5 * 2**attempt))
+        raise Failure(str(last))
 
     def feed(self, which: str, **query: str) -> dict:
         params = "&".join([f"base={self.branch}"] + [f"{k}={v}" for k, v in query.items()])
@@ -1187,8 +1207,10 @@ class LiveRig(Rig):
         self.tag = time.strftime("%Y%m%dT%H%M%S")
         self.content = Content(self.tag)
         self.poll = 3.0
-        self.timeout = 900.0
-        self.ci_timeout = 1800.0
+        self.timeout = 1800.0
+        self.ci_timeout = float(
+            os.environ.get("REHEARSAL_CI_TIMEOUT", 3 * 3600)
+        )  # GitHub queues runs for long stretches when degraded
         self.operator_token = operator_token
         self.keep_service = keep_service
         self.port = port
@@ -1430,15 +1452,16 @@ class LiveRig(Rig):
             if time.monotonic() > deadline:
                 raise Failure(f"the service did not answer /status within 180 s; see {logfile.name}")
             time.sleep(2)
-        self.admin(
-            "/admin/settings",
-            {
-                "polling_interval_seconds": 15,
-                "infrastructure_retry_backoff_seconds": 5,
-                "outbox_retry_seconds": 5,
-                "dispatch_timeout_seconds": 900,
-            },
-        )
+        if fresh:  # the settings persist in the store, so a restart needs no admin call (and no token quota)
+            self.admin(
+                "/admin/settings",
+                {
+                    "polling_interval_seconds": 15,
+                    "infrastructure_retry_backoff_seconds": 5,
+                    "outbox_retry_seconds": 5,
+                    "dispatch_timeout_seconds": 900,
+                },
+            )
 
     def stop_service(self) -> None:
         if self.process is None:
@@ -1902,7 +1925,13 @@ class Rehearsal:
 
         def predicate(status: dict):
             head = status.get("head")
-            if not head or head["id"] != batch_id or not head.get("ci"):
+            if head is None or head["id"] != batch_id:
+                # Live builds can finish inside one service poll; waiting hours for a run of a head that
+                # already landed is the wrong failure.
+                raise Failure(
+                    f"head {batch_id} left the queue before its run was observed {'running' if started else 'bound'}"
+                )
+            if not head.get("ci"):
                 return None
             ci = head["ci"]
             if ci["outcome"] != "pending" or not ci["run_id"]:
@@ -2686,7 +2715,9 @@ class Rehearsal:
             self.rig.hold_ci()
             self.approve(romeo)
             head = self.wait_head_with(romeo)
-            head = self.wait_run(head["id"], started=True)
+            # A queued run is enough: the recovery property is the same, and a live build on a fast runner
+            # can finish inside one of the service's observation intervals.
+            head = self.wait_run(head["id"])
             before = self.status()
             service_before = before.get("service") or {}
             rec.evidence["before"] = {
