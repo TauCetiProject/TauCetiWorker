@@ -1,0 +1,41 @@
+# Tau Ceti AI merge queue repair worker (docs/queue/operations.md, "Repair worker").
+#
+# A systemd user unit on a host with the Lean toolchain, `claude` and `gh`. It runs
+# `python -m tauceti_queue.repair_task` from the checkout at ~/TauCetiQueue as a long-running worker:
+# claim a repair or rebase-conflict task from the queue service, prepare warm artifacts, run the
+# repair agent, push the chain to the task's submission ref and submit it; sleep when nothing is
+# claimable. `services/queue/install-repair.sh` installs it and checks it is serving.
+#
+# Configuration is the environment file below (service URL, worker name, poll interval, the content
+# clone, the task root and where the credentials are); secrets stay in files of mode 0600, never
+# in this unit. Logs go to the journal: `journalctl --user -u tauceti-queue-repair -f`.
+
+[Unit]
+Description=Tau Ceti AI merge queue repair worker
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/queue/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/TauCetiQueue
+EnvironmentFile=%h/.config/tauceti-queue/repair-environment
+Environment=PATH=%h/.local/bin:%h/.elan/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=UV_NO_SYNC=1
+ExecStart=/usr/bin/env uv run python -m tauceti_queue.repair_task
+# SIGTERM stops a running agent and keeps its claim and checkpoint; the restarted worker renews the
+# claim and resumes the same session. A task past validation finishes its push and submission first.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=300
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tauceti-queue-repair
+LimitNOFILE=65536
+UMask=0077
+
+[Install]
+WantedBy=default.target

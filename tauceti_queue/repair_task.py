@@ -30,8 +30,13 @@ Phases, each checkpointed in ``<root>/tasks/<task_id>/task.json`` so a restarted
 the same model session instead of starting over: claimed, sources_ready, artifacts_ready,
 agent_running, validated, pushed, submitted, then adopted / not_adopted / released / claim_lost.
 
-CLI: ``python -m tauceti_queue.repair_task --service <url> [--once]``. The same ``RunnerConfig`` and
-``claim_and_run`` are what the worker loop calls when the task is integrated as a work unit.
+CLI: ``python -m tauceti_queue.repair_task --service <url> [--once | --check]``. Without ``--once`` the
+runner is a long-running worker (``serve``): it resumes checkpointed tasks, claims, runs and submits,
+reports provider outcomes to ``POST /tasks/inference`` for the service's inference hold, sleeps the
+poll interval when nothing is claimable, survives a task's failure, and on SIGTERM stops the running
+agent while keeping its claim and checkpoint so the next start resumes the same session
+(``services/queue/tauceti-queue-repair.service``). The same ``RunnerConfig`` and ``claim_and_run`` are
+what the worker loop calls when the task is integrated as a work unit.
 """
 
 from __future__ import annotations
@@ -42,11 +47,14 @@ import dataclasses
 import functools
 import json
 import os
+import shutil
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -338,6 +346,16 @@ class TaskClient:
             raise ServiceError(f"release: unexpected HTTP {status}")
         return payload if isinstance(payload, dict) else {"released": True}
 
+    def report_inference(self, ok: bool, error: str = "") -> None:
+        """``report_inference(worker, ok, error)``: a provider outcome for the service's inference hold."""
+        status, payload = self._post("/tasks/inference", {"worker": self.worker, "ok": ok, "error": error or ""})
+        if status in (404, 405, 501):
+            raise EndpointMissing(f"inference: HTTP {status}")
+        if status in (401, 403):
+            raise ClaimRefused(f"inference report refused: HTTP {status} {_error_text(payload)}".strip())
+        if status not in (200, 204):
+            raise ServiceError(f"inference: unexpected HTTP {status} {_error_text(payload)}".strip())
+
 
 def _claim_code(payload) -> str | None:
     if not isinstance(payload, dict):
@@ -449,8 +467,31 @@ class ClaimLease(threading.Thread):
 # Authorization and identity
 
 
+def token_source() -> str:
+    """Where ``worker_token`` reads the token from (named, never the value): ``TAUCETI_QUEUE_TOKEN_FILE``
+    (a mode 0600 file, the service unit's choice), the environment, else gh's store."""
+    path = os.environ.get("TAUCETI_QUEUE_TOKEN_FILE")
+    if path:
+        return f"file {path}"
+    for key in ("TAUCETI_QUEUE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        if os.environ.get(key):
+            return f"${key}"
+    return "gh auth token"
+
+
 def worker_token() -> str:
-    """The GitHub token of the worker's account: explicit, the usual environment, else gh's store."""
+    """The GitHub token of the worker's account: a token file, the usual environment, else gh's store."""
+    from tauceti_worker.config import Die
+
+    path = os.environ.get("TAUCETI_QUEUE_TOKEN_FILE")
+    if path:
+        try:
+            token = Path(path).read_text().strip()
+        except OSError as error:
+            raise Die(f"cannot read the queue token file {path}: {error.strerror}") from error
+        if not token:
+            raise Die(f"the queue token file {path} is empty")
+        return token
     for key in ("TAUCETI_QUEUE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         value = os.environ.get(key)
         if value:
@@ -458,9 +499,7 @@ def worker_token() -> str:
     result = subprocess.run(["gh", "auth", "token"], text=True, capture_output=True, check=False)
     token = result.stdout.strip()
     if result.returncode != 0 or not token:
-        from tauceti_worker.config import Die
-
-        raise Die("no GitHub token for the queue service: set TAUCETI_QUEUE_TOKEN or log in with gh")
+        raise Die("no GitHub token for the queue service: set TAUCETI_QUEUE_TOKEN_FILE or log in with gh")
     return token
 
 
@@ -474,7 +513,60 @@ def verify_admin(repository: str) -> None:
 
 
 def default_worker_identity() -> str:
-    return f"{os.environ.get('TAUCETI_WORKER_ID', 'default')}@{socket.gethostname()}"
+    return (
+        os.environ.get("TAUCETI_QUEUE_WORKER")
+        or f"{os.environ.get('TAUCETI_WORKER_ID', 'default')}@{socket.gethostname()}"
+    )
+
+
+class Stop:
+    """The worker's stop latch: set by the signal handlers, waited on by ``serve``.
+
+    Events attached to it (a running task's ``cancel``) are set with it, so a SIGTERM reaches the agent
+    through the same path a lost claim does; the task then records itself as interrupted instead of
+    lost, keeping its claim and checkpoint for the next start to resume.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._attached: list[threading.Event] = []
+        self.reason: str | None = None
+
+    def set(self, reason: str = "stop") -> None:
+        with self._lock:
+            if not self._event.is_set():
+                self.reason = reason
+            self._event.set()
+            attached = list(self._attached)
+        for event in attached:
+            event.set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    def attach(self, event: threading.Event) -> None:
+        with self._lock:
+            self._attached.append(event)
+            fire = self._event.is_set()
+        if fire:
+            event.set()
+
+    def detach(self, event: threading.Event) -> None:
+        with self._lock, contextlib.suppress(ValueError):
+            self._attached.remove(event)
+
+
+def install_signal_handlers(stop: Stop) -> dict:
+    """SIGTERM and SIGINT set ``stop``; returns the previous handlers (main thread only)."""
+
+    def handler(signum: int, _frame) -> None:
+        stop.set(signal.Signals(signum).name)
+
+    return {sig: signal.signal(sig, handler) for sig in (signal.SIGTERM, signal.SIGINT)}
 
 
 # ----------------------------------------------------------------------------------------------
@@ -542,6 +634,18 @@ class TaskState:
     @property
     def state(self) -> str | None:
         return self.record.get("state")
+
+    @property
+    def resumable(self) -> bool:
+        """A checkpoint a restarted runner continues: mid-agent, or interrupted by a stop."""
+        return self.state in ("agent_running", "interrupted")
+
+    @property
+    def agent_started(self) -> bool:
+        """The agent had been launched when the checkpoint was written (resume its session)."""
+        return self.state == "agent_running" or (
+            self.state == "interrupted" and self.record.get("phase") == "agent_running"
+        )
 
     def session(self) -> str | None:
         from tauceti_worker.runtime_status import read_json
@@ -810,14 +914,29 @@ def release_task(
     return outcome
 
 
-def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state: TaskState | None = None) -> dict:
+def run_task(
+    cfg: RunnerConfig,
+    task: Task,
+    client: TaskClient,
+    *,
+    resume_state: TaskState | None = None,
+    stop: Stop | None = None,
+) -> dict:
     """Run one claimed task to its outcome. The claim is renewed throughout and the result discarded
-    if it is lost. Returns the outcome record (also written to the task's state directory)."""
+    if it is lost. Returns the outcome record (also written to the task's state directory).
+
+    ``stop`` is the worker's stop latch: when it is set while the agent runs, the agent is stopped and
+    the task recorded as ``interrupted`` with its claim and worktree kept, so ``resume_pending`` on
+    the next start renews the claim and continues the same session. A stop after validation lets the
+    push and submission finish; they are quick and end the task.
+    """
     state_dir = cfg.tasks_dir / task.task_id
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
-    resuming = resume_state is not None and resume_state.state == "agent_running"
+    resuming = resume_state is not None and resume_state.agent_started
     cancel = threading.Event()
+    if stop is not None:
+        stop.attach(cancel)
     lease = ClaimLease(client, task, cancel, retry_interval=cfg.lease_retry_interval)
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
@@ -828,6 +947,20 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
         outcome.update(status="claim_lost", detail=detail)
         state.write("claim_lost", detail=detail, outcome=outcome)
         return outcome
+
+    def stopping() -> bool:
+        return stop is not None and stop.is_set()
+
+    def cancelled(detail: str) -> dict:
+        """The agent was cancelled: by the worker stopping (keep the claim and checkpoint for a resume)
+        or by the claim being lost (discard)."""
+        if stopping() and not lease.lost.is_set():
+            phase = state.state
+            outcome.update(status="interrupted", detail=detail, phase=phase)
+            state.write("interrupted", phase=phase, detail=detail, outcome=outcome)
+            log(f"task {task.task_id}: interrupted while {phase}; claim kept for the next start to resume")
+            return outcome
+        return discard(lease.lost_reason or detail)
 
     try:
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
@@ -876,8 +1009,8 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
         resume_session = state.session() if resuming else None
         while True:
             attempt += 1
-            if cancel.is_set():
-                return discard(lease.lost_reason or "cancelled before the agent started")
+            if cancel.is_set() or stopping():
+                return cancelled("cancelled before the agent started")
             if resubmit:
                 resubmit = False  # the explanation turn already ran; check and submit its result
             else:
@@ -906,7 +1039,7 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                 agent_records.append(agent)
                 outcome["agent"] = agent_records
                 if agent["status"] == "cancelled":
-                    return discard(lease.lost_reason or "the agent was cancelled")
+                    return cancelled("the agent was cancelled")
                 if agent["status"] == "inference_unavailable":
                     return release_task(
                         cfg, client, task, state, "inference_unavailable", agent.get("reason"), outcome, lease
@@ -935,7 +1068,7 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                 )
                 agent_records.append(follow)
                 if follow["status"] == "cancelled":
-                    return discard(lease.lost_reason or "the explanation turn was cancelled")
+                    return cancelled("the explanation turn was cancelled")
                 if follow["status"] == "inference_unavailable":
                     return release_task(
                         cfg, client, task, state, "inference_unavailable", follow.get("reason"), outcome, lease
@@ -966,7 +1099,7 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-            if cancel.is_set():
+            if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
             push = push_result(cfg, task, worktree, tip, logdir, pushed)
             outcome["push"] = {k: v for k, v in push.items() if "load" not in k}
@@ -976,7 +1109,7 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                 )
             pushed = tip
             state.write("pushed", tip=tip, pushed_ref=push["ref"])
-            if cancel.is_set():
+            if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost after the push")
             notes = {
                 "worker": cfg.worker,
@@ -1026,7 +1159,7 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                 )
                 agent_records.append(follow)
                 if follow["status"] == "cancelled":
-                    return discard(lease.lost_reason or "the explanation turn was cancelled")
+                    return cancelled("the explanation turn was cancelled")
                 if follow["status"] == "inference_unavailable":
                     return release_task(
                         cfg, client, task, state, "inference_unavailable", follow.get("reason"), outcome, lease
@@ -1052,9 +1185,12 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
         raise
     finally:
         lease.stop()
+        if stop is not None:
+            stop.detach(cancel)
         outcome["seconds"] = round(time.monotonic() - started, 1)
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
-        if not cfg.keep_worktree and outcome.get("status") != "error":
+        # An interrupted task keeps its worktree: the next start resumes the agent in it.
+        if not cfg.keep_worktree and outcome.get("status") not in ("error", "interrupted"):
             with contextlib.suppress(Exception):
                 repair.remove_worktree(cfg.clone, worktree)
         with contextlib.suppress(Exception):
@@ -1083,7 +1219,9 @@ def make_client(cfg: RunnerConfig) -> TaskClient:
     return TaskClient(cfg.service, cfg.token or worker_token(), cfg.worker)
 
 
-def claim_and_run(cfg: RunnerConfig, client: TaskClient, admin: AdminCheck | None = None) -> dict | None:
+def claim_and_run(
+    cfg: RunnerConfig, client: TaskClient, admin: AdminCheck | None = None, *, stop: Stop | None = None
+) -> dict | None:
     """Verify the account, claim one task and run it. None when nothing was claimable."""
     (admin or AdminCheck(cfg)).ensure()
     task = with_retries(client.claim, attempts=cfg.service_attempts, delays=cfg.service_delays, what="claim")
@@ -1092,17 +1230,19 @@ def claim_and_run(cfg: RunnerConfig, client: TaskClient, admin: AdminCheck | Non
     log(
         f"claimed {task.kind} task {task.task_id} ({len(task.members)} members, expires in {task.expires_at - time.time():.0f}s)"
     )
-    outcome = run_task(cfg, task, client)
+    outcome = run_task(cfg, task, client, stop=stop)
     log(f"task {task.task_id}: {outcome['status']}" + (f" ({outcome.get('reason')})" if outcome.get("reason") else ""))
     return outcome
 
 
-def resume_pending(cfg: RunnerConfig, client: TaskClient) -> list[dict]:
-    """Continue tasks a previous runner left mid-agent while their claim is still live.
+def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None = None) -> list[dict]:
+    """Continue tasks a previous runner left mid-agent, or interrupted by a stop, while their claim is
+    still live.
 
     The checkpoint names the task, the claim token and the provider session; the claim is renewed
     first, and if the service refuses the task is recorded as lost. A live claim resumes the same
-    model session in the same worktree instead of restarting the attempt.
+    model session in the same worktree instead of restarting the attempt; a task interrupted before
+    its agent started is run again from its sources.
     """
     outcomes = []
     if not cfg.tasks_dir.is_dir():
@@ -1111,8 +1251,10 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient) -> list[dict]:
         from tauceti_worker.runtime_status import read_json
 
         record = read_json(directory / "task.json")
-        if record.get("state") != "agent_running" or not isinstance(record.get("task"), dict):
+        if record.get("state") not in ("agent_running", "interrupted") or not isinstance(record.get("task"), dict):
             continue
+        if stop is not None and stop.is_set():
+            break
         try:
             task = Task.from_json(record["task"])
         except (ValueError, KeyError) as error:
@@ -1129,27 +1271,252 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient) -> list[dict]:
             log(f"task {task.task_id}: renew failed during resume ({error}); will retry on the next start")
             continue
         log(f"resuming task {task.task_id} (session {state.session() or 'unknown'})")
-        outcomes.append(run_task(cfg, task, client, resume_state=state))
+        outcomes.append(run_task(cfg, task, client, resume_state=state, stop=stop))
     return outcomes
 
 
+# ----------------------------------------------------------------------------------------------
+# Serve: the long-running worker
+
+
+HEARTBEAT_SCHEMA = "tauceti-queue.repair-worker/v1"
+
+
+def heartbeat_path(cfg: RunnerConfig) -> Path:
+    return cfg.root / "worker.json"
+
+
+def write_heartbeat(cfg: RunnerConfig, summary: dict, state: str, **fields) -> None:
+    """``<root>/worker.json``: what the worker is doing, for the installer's check and the operator."""
+    from tauceti_worker.runtime_status import atomic_json
+
+    summary.update(fields)
+    summary["state"] = state
+    summary["updated_at"] = time.time()
+    with contextlib.suppress(Exception):
+        atomic_json(heartbeat_path(cfg), summary, durable=False)
+
+
+def inference_report_for(outcome: dict) -> tuple[bool, str] | None:
+    """What an outcome says about the provider, for ``report_inference``: the agent answered (even
+    with a chain the service or the worker refused) is a success that lifts a hold; a release for
+    ``inference_unavailable`` is already counted by the service unless the release never reached it."""
+    status = outcome.get("status")
+    reason = outcome.get("reason")
+    if status in ("adopted", "not_adopted") or reason == "agent_failed":
+        return True, ""
+    if reason == "inference_unavailable" and status in ("release_unsupported", "release_failed"):
+        return False, str(outcome.get("detail") or "")[:2000]
+    return None
+
+
+def report_inference(cfg: RunnerConfig, client: TaskClient, outcome: dict) -> None:
+    report = inference_report_for(outcome)
+    if report is None:
+        return
+    ok, error = report
+    try:
+        with_retries(
+            lambda: client.report_inference(ok, error),
+            attempts=cfg.service_attempts,
+            delays=cfg.service_delays,
+            what="inference",
+        )
+    except EndpointMissing:
+        log("the service has no inference endpoint; provider outcomes are not reported")
+    except (ClaimRefused, ServiceError) as error:
+        log(f"inference report failed: {error}")
+
+
+def serve(
+    cfg: RunnerConfig, client: TaskClient, stop: Stop, admin: AdminCheck | None = None, *, resume: bool = True
+) -> dict:
+    """Claim, run and submit tasks until ``stop`` is set; nothing a task does ends the loop.
+
+    Each pass verifies the account (cached), claims one task and runs it, reporting the provider
+    outcome to the service's inference hold; when nothing is claimable the loop sleeps ``poll_seconds``
+    (woken by ``stop``). A failure of the task, the service or the authorization check is logged,
+    counted and retried on the next pass: ``Restart=always`` in the unit is for crashes of the
+    interpreter, not the ordinary way out of a bad task.
+    """
+    from tauceti_worker.config import Die, NoProgress
+
+    admin = admin or AdminCheck(cfg)
+    summary: dict = {
+        "schema": HEARTBEAT_SCHEMA,
+        "pid": os.getpid(),
+        "worker": cfg.worker,
+        "service": cfg.service,
+        "root": str(cfg.root),
+        "started_at": time.time(),
+        "tasks": 0,
+        "outcomes": {},
+        "errors": 0,
+        "last_error": None,
+        "last_outcome": None,
+    }
+
+    def record(outcome: dict) -> None:
+        summary["tasks"] += 1
+        summary["outcomes"][outcome["status"]] = summary["outcomes"].get(outcome["status"], 0) + 1
+        summary["last_outcome"] = {
+            "task_id": outcome.get("task_id"),
+            "status": outcome.get("status"),
+            "reason": outcome.get("reason"),
+            "at": time.time(),
+        }
+        report_inference(cfg, client, outcome)
+
+    def failed(what: str, error: BaseException, *, trace: bool = False) -> None:
+        summary["errors"] += 1
+        summary["last_error"] = {"what": what, "error": f"{type(error).__name__}: {error}"[:2000], "at": time.time()}
+        detail = f"{type(error).__name__}: {error}"
+        if trace:
+            detail += "\n" + "".join(traceback.format_exception(error)).rstrip()
+        log(f"{what}: {detail}; next attempt in {cfg.poll_seconds:.0f}s")
+
+    write_heartbeat(cfg, summary, "starting")
+    log(f"serving {cfg.service} as {cfg.worker} (poll {cfg.poll_seconds:.0f}s, root {cfg.root})")
+    if resume:
+        try:
+            for outcome in resume_pending(cfg, client, stop=stop):
+                record(outcome)
+        except Exception as error:
+            failed("resume", error, trace=True)
+    while not stop.is_set():
+        outcome = None
+        try:
+            write_heartbeat(cfg, summary, "claiming")
+            outcome = claim_and_run(cfg, client, admin, stop=stop)
+        except (Die, NoProgress) as error:
+            failed("authorization", error)  # not admin, no token, or GitHub unreachable: not fatal
+        except ClaimRefused as error:
+            failed("claim", error)  # the service does not accept this account
+        except ServiceError as error:
+            failed("service", error)
+        except Exception as error:
+            failed("task", error, trace=True)
+        if outcome is not None:
+            record(outcome)
+            write_heartbeat(cfg, summary, "running" if not stop.is_set() else "stopping")
+            continue
+        write_heartbeat(cfg, summary, "idle")
+        stop.wait(cfg.poll_seconds)
+    write_heartbeat(cfg, summary, "stopped", stopped_at=time.time(), stop_reason=stop.reason)
+    return summary
+
+
+# ----------------------------------------------------------------------------------------------
+# Preflight
+
+
+def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
+    """What the host must have before serving, each ``{check, ok, detail}``; secrets are named, never
+    printed. Fails fast where the loop would otherwise retry forever."""
+    checks: list[dict] = []
+
+    def check(name: str, ok: bool, detail: str) -> None:
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+    for tool in ("git", "gh", "lake", "claude"):
+        where = shutil.which(tool)
+        check(f"tool {tool}", where is not None, where or "not on PATH")
+    try:
+        cfg.token or worker_token()
+        check("github token", True, f"from {token_source()}")
+    except Exception as error:
+        check("github token", False, str(error))
+    try:
+        from tauceti_worker.security_audit import api
+
+        login = str(api("user").get("login") or "")
+        admin = api(f"repos/{cfg.repository}").get("permissions", {}).get("admin") is True
+        check("repository admin", admin, f"{login or 'unknown login'} on {cfg.repository}")
+    except Exception as error:
+        check("repository admin", False, str(error))
+    try:
+        request = urllib.request.Request(f"{cfg.service.rstrip('/')}/healthz", headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read() or b"{}")
+        revision = payload.get("revision") or (payload.get("service") or {}).get("revision") or "?"
+        check("service", True, f"{cfg.service} answers (revision {str(revision)[:12]})")
+    except Exception as error:
+        check("service", False, f"{cfg.service}: {error}")
+    try:
+        remote = git(cfg.clone, "remote", "get-url", "origin").strip()
+        check("content clone", bool(remote), f"{cfg.clone} (origin {remote})")
+    except Exception as error:
+        check("content clone", False, f"{cfg.clone}: {error}")
+    try:
+        from tauceti_worker.quota import claude_dir
+
+        credentials = claude_dir(Path(os.environ.get("HOME", os.path.expanduser("~")))) / ".credentials.json"
+        check("claude credentials", credentials.is_file(), str(credentials))
+    except Exception as error:
+        check("claude credentials", False, str(error))
+    try:
+        cfg.root.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(cfg.root).free / 2**30
+        check("task root", free >= min_free_gib, f"{cfg.root}: {free:.0f} GiB free (need {min_free_gib:.0f})")
+    except OSError as error:
+        check("task root", False, f"{cfg.root}: {error}")
+    return checks
+
+
+def _env_path(key: str) -> Path | None:
+    value = os.environ.get(key)
+    return Path(value).expanduser() if value else None
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m tauceti_queue.repair_task", description=__doc__.split("\n\n")[0])
-    parser.add_argument("--service", required=True, help="queue service base URL")
+    parser = argparse.ArgumentParser(
+        prog="python -m tauceti_queue.repair_task",
+        description=__doc__.split("\n\n")[0]
+        + " Defaults come from the environment the service unit's EnvironmentFile sets: TAUCETI_QUEUE_SERVICE,"
+        " TAUCETI_QUEUE_WORKER, TAUCETI_QUEUE_CLONE, TAUCETI_QUEUE_TASK_ROOT, TAUCETI_QUEUE_POLL_SECONDS,"
+        " TAUCETI_QUEUE_SEED_PACKAGES, TAUCETI_QUEUE_TOKEN_FILE (or TAUCETI_QUEUE_TOKEN).",
+    )
+    parser.add_argument(
+        "--service",
+        default=os.environ.get("TAUCETI_QUEUE_SERVICE"),
+        help="queue service base URL ($TAUCETI_QUEUE_SERVICE)",
+    )
     parser.add_argument("--once", action="store_true", help="claim at most one task, then exit")
-    parser.add_argument("--worker", default=default_worker_identity(), help="worker identity string")
-    parser.add_argument("--clone", type=Path, help="content repository checkout (default: the worker's checkout)")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="print the host checks (tools, token, admin, service, clone, credentials, disk) and exit",
+    )
+    parser.add_argument(
+        "--worker", default=default_worker_identity(), help="worker identity string ($TAUCETI_QUEUE_WORKER)"
+    )
+    parser.add_argument(
+        "--clone",
+        type=Path,
+        default=_env_path("TAUCETI_QUEUE_CLONE"),
+        help="content repository checkout ($TAUCETI_QUEUE_CLONE; default: the worker's checkout)",
+    )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="task state, logs, worktrees and artifact pool")
     parser.add_argument("--repository", default=repair.DEFAULT_REPOSITORY)
-    parser.add_argument("--poll", type=float, default=60.0, help="seconds between claims when nothing is claimable")
+    parser.add_argument(
+        "--poll",
+        type=float,
+        default=float(os.environ.get("TAUCETI_QUEUE_POLL_SECONDS") or 60.0),
+        help="seconds between claims when nothing is claimable ($TAUCETI_QUEUE_POLL_SECONDS)",
+    )
     parser.add_argument("--agent-timeout", type=float, default=3 * 3600)
     parser.add_argument("--build-timeout", type=float, default=3 * 3600)
     parser.add_argument("--keep-worktree", action="store_true")
     parser.add_argument(
-        "--seed-packages", type=Path, help="share this extracted .lake/packages instead of lake exe cache get"
+        "--seed-packages",
+        type=Path,
+        default=_env_path("TAUCETI_QUEUE_SEED_PACKAGES"),
+        help="share this extracted .lake/packages instead of lake exe cache get ($TAUCETI_QUEUE_SEED_PACKAGES)",
     )
     parser.add_argument("--no-resume", action="store_true", help="do not continue checkpointed tasks on start")
     args = parser.parse_args(argv)
+    if not args.service:
+        parser.error("--service (or TAUCETI_QUEUE_SERVICE) is required")
 
     clone = args.clone
     if clone is None:
@@ -1168,24 +1535,29 @@ def main(argv: list[str] | None = None) -> int:
         seed_packages=args.seed_packages,
         poll_seconds=args.poll,
     )
+    if args.check:
+        checks = preflight(cfg)
+        for entry in checks:
+            print(f"{'ok  ' if entry['ok'] else 'FAIL'} {entry['check']}: {entry['detail']}")
+        return 0 if all(entry["ok"] for entry in checks) else 1
     client = make_client(cfg)
     admin = AdminCheck(cfg)
+    if not args.once:
+        stop = Stop()
+        install_signal_handlers(stop)
+        summary = serve(cfg, client, stop, admin, resume=not args.no_resume)
+        log(f"stopped ({stop.reason or 'loop ended'}) after {summary['tasks']} task(s)")
+        return 0
     admin.ensure()
     outcomes: list[dict] = []
     if not args.no_resume:
         outcomes += resume_pending(cfg, client)
-    while True:
-        outcome = claim_and_run(cfg, client, admin)
-        if outcome is not None:
-            outcomes.append(outcome)
-            print(json.dumps(outcome, indent=1, default=str))
-            if args.once:
-                break
-        elif args.once:
-            log("nothing claimable")
-            break
-        else:
-            time.sleep(cfg.poll_seconds)
+    outcome = claim_and_run(cfg, client, admin)
+    if outcome is not None:
+        outcomes.append(outcome)
+        print(json.dumps(outcome, indent=1, default=str))
+    else:
+        log("nothing claimable")
     if not outcomes:
         return 0
     return (

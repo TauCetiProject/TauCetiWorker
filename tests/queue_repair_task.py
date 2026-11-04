@@ -13,7 +13,10 @@ a locally invalid chain retried with the local report; a content change without 
 completed by a follow-up turn in the same session; artifacts unavailable (released, or left to expire
 when the service has no release endpoint); inference unavailable after bounded retries; an ordinary
 agent failure released as such; a second claimant refused; and a checkpointed task resumed in its
-recorded session.
+recorded session. The long-running worker (``serve``): the claim/run/submit cycle with the provider
+outcome reported to ``/tasks/inference`` and idle polling until stopped; a failing service and a
+failing task that do not end the loop; SIGTERM stopping the agent while keeping the claim and
+checkpoint, which the next start resumes; and the host preflight checks.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
@@ -87,9 +91,11 @@ sys.exit(2)
 '''
 
 GH = """#!/usr/bin/env bash
-# gh stub: the admin predicate reads repos/<owner>/<repo>; everything else is unexpected here.
+# gh stub: the admin predicate reads repos/<owner>/<repo> and the preflight reads user; everything
+# else is unexpected here.
 case "$*" in
   *repos/*) echo '{"permissions": {"admin": '"${STUB_GH_ADMIN:-true}"'}}' ;;
+  *" user") echo '{"login": "stub-worker"}' ;;
   *) echo "gh stub: unexpected call: $*" >&2; exit 1 ;;
 esac
 """
@@ -302,8 +308,11 @@ class FakeService:
         self.renewals = 0
         self.claim_attempts: list[dict] = []
         self.result_script: list[dict] = []
+        self.inference_reports: list[dict] = []
         self.renew_mode = "ok"  # ok | refuse | error
+        self.claim_mode = "ok"  # ok | error
         self.release_supported = True
+        self.inference_supported = True
         self.lock = threading.Lock()
         service = self
 
@@ -311,10 +320,7 @@ class FakeService:
             def log_message(self, *args):
                 pass
 
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length) or b"{}")
-                status, payload = service.handle(self.path, body, self.headers.get("Authorization"))
+            def respond(self, status, payload):
                 data = json.dumps(payload).encode() if payload is not None else b""
                 self.send_response(status)
                 if data:
@@ -323,6 +329,17 @@ class FakeService:
                 self.end_headers()
                 if data:
                     self.wfile.write(data)
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self.respond(200, {"ok": True, "revision": "fakefakefake"})
+                else:
+                    self.respond(404, {"error": "no such route"})
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                self.respond(*service.handle(self.path, body, self.headers.get("Authorization")))
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -478,7 +495,17 @@ class FakeService:
             return 401, {"error": "a GitHub token in `Authorization: Bearer` is required"}
         with self.lock:
             try:
+                if path == "/tasks/inference":
+                    if not self.inference_supported:
+                        return 404, {"error": "no such route"}
+                    self.inference_reports.append(
+                        {"worker": body.get("worker"), "ok": body.get("ok"), "error": body.get("error")}
+                    )
+                    return 204, None
                 if path == "/tasks/claim":
+                    if self.claim_mode == "error":
+                        self.claim_attempts.append({"worker": str(body.get("worker") or ""), "error": True})
+                        raise RuntimeError("database unavailable")
                     result = self.claim_task(str(body.get("worker") or ""))
                     return (204, None) if result is None else (200, result)
                 match = re.fullmatch(r"/tasks/([^/]+)/(renew|result|release)", path)
@@ -884,6 +911,177 @@ class Resume(Fixture):
         self.assertEqual(repair_task.resume_pending(cfg, self.client(cfg)), [])
         self.assertEqual(self.state()["state"], "claim_lost")
         self.assertEqual(self.agent_calls(), [])
+
+
+class Serve(Fixture):
+    """The long-running worker: ``serve`` in a thread (or, for the signal test, in the main thread)."""
+
+    def serve_in_thread(self, cfg: repair_task.RunnerConfig, stop: repair_task.Stop) -> tuple[threading.Thread, dict]:
+        result: dict = {}
+
+        def run():
+            result["summary"] = repair_task.serve(cfg, self.client(cfg), stop)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set, "cleanup")
+        return thread, result
+
+    def wait_for(self, predicate, message: str, timeout: float = 90) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.05)
+        self.fail(message)
+
+    def heartbeat(self, cfg: repair_task.RunnerConfig) -> dict:
+        return json.loads(repair_task.heartbeat_path(cfg).read_text())
+
+    def test_claim_run_submit_then_idle_until_stopped(self):
+        cfg = self.config(poll_seconds=0.2)
+        stop = repair_task.Stop()
+        thread, result = self.serve_in_thread(cfg, stop)
+        self.wait_for(
+            lambda: len(self.service.results) == 1 and len(self.service.claim_attempts) >= 3,
+            "the task was adopted and the loop went on polling for the next one",
+        )
+        self.assertEqual(self.heartbeat(cfg)["state"], "idle")
+        stop.set("test")
+        thread.join(30)
+        self.assertFalse(thread.is_alive(), "stop ends the loop")
+        summary = result["summary"]
+        self.assertEqual(summary["tasks"], 1)
+        self.assertEqual(summary["outcomes"], {"adopted": 1})
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(self.state()["state"], "adopted")
+        # The provider answered, so the service hears a success (which lifts any inference hold).
+        self.assertEqual(self.service.inference_reports, [{"worker": "worker-a@test", "ok": True, "error": ""}])
+        heartbeat = self.heartbeat(cfg)
+        self.assertEqual(heartbeat["state"], "stopped")
+        self.assertEqual(heartbeat["pid"], os.getpid())
+        self.assertEqual(heartbeat["stop_reason"], "test")
+        self.assertEqual(heartbeat["last_outcome"]["status"], "adopted")
+
+    def test_a_failing_service_and_a_failing_task_do_not_end_the_loop(self):
+        # Task 1's base is unknown to every repository, so its run raises before any inference;
+        # task 2 is the ordinary fixture.
+        broken = {**self.content.task(task_id=1), "base": "0" * 40, "onto": "0" * 40, "retained_refs": []}
+        self.service.tasks = {1: broken, 2: self.content.task(task_id=2)}
+        self.service.claim_mode = "error"
+        cfg = self.config(poll_seconds=0.1)
+        stop = repair_task.Stop()
+        thread, result = self.serve_in_thread(cfg, stop)
+        self.wait_for(
+            lambda: sum(1 for a in self.service.claim_attempts if a.get("error")) >= 4,
+            "claims keep being retried while the service answers 500",
+        )
+        self.assertTrue(thread.is_alive())
+        self.service.claim_mode = "ok"
+        self.wait_for(lambda: len(self.service.results) == 1, "task 2 was adopted after task 1 failed")
+        stop.set("test")
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        summary = result["summary"]
+        self.assertGreaterEqual(summary["errors"], 2, summary)
+        self.assertEqual(summary["outcomes"], {"adopted": 1})
+        self.assertEqual(self.service.results[0]["task_id"], 2)
+        self.assertEqual(self.state("1")["state"], "error")
+        self.assertIn("RuntimeError", self.state("1")["error"])
+        self.assertEqual(self.state("2")["state"], "adopted")
+        self.assertEqual(self.heartbeat(cfg)["last_error"]["what"], "task")
+
+    def test_sigterm_interrupts_the_agent_keeps_the_claim_and_the_next_start_resumes(self):
+        os.environ["STUB_AGENT_MODE"] = "sleep"
+        os.environ["STUB_SLEEP"] = "30"
+        cfg = self.config(poll_seconds=0.2)
+        stop = repair_task.Stop()
+        previous = repair_task.install_signal_handlers(stop)
+        self.addCleanup(lambda: [signal.signal(sig, handler) for sig, handler in previous.items()])
+        task_json = self.root / "state" / "tasks" / "1" / "task.json"
+
+        def terminate():
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if task_json.exists() and json.loads(task_json.read_text()).get("state") == "agent_running":
+                    time.sleep(1.0)  # the agent process is up and sleeping
+                    os.kill(os.getpid(), signal.SIGTERM)  # what systemd sends on stop
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(target=terminate, daemon=True).start()
+        started = time.monotonic()
+        summary = repair_task.serve(cfg, self.client(cfg), stop)  # the main thread: where the handler runs
+        self.assertLess(time.monotonic() - started, 25, "the sleeping agent was stopped promptly")
+        self.assertEqual(stop.reason, "SIGTERM")
+        self.assertEqual(summary["outcomes"], {"interrupted": 1}, summary)
+        state = self.state()
+        self.assertEqual(state["state"], "interrupted")
+        self.assertEqual(state["phase"], "agent_running")
+        # Nothing was submitted or released, the claim is still ours and the worktree is kept.
+        self.assertEqual(self.service.results, [])
+        self.assertEqual(self.service.releases, [])
+        self.assertEqual(self.service.inference_reports, [])
+        self.assertIsNotNone(self.service.live_claim(1), "the claim is kept for the next start")
+        self.assertTrue((self.root / "state" / "worktrees" / "task-1").is_dir())
+        self.assertEqual(self.heartbeat(cfg)["state"], "stopped")
+        # The next start renews the claim and resumes the recorded session in the kept worktree.
+        os.environ["STUB_AGENT_MODE"] = "resume-only"
+        outcomes = repair_task.resume_pending(cfg, self.client(cfg))
+        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["resume"], "sess-1")
+        self.assertIn("has resumed your session", calls[1]["prompt"])
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(self.state()["state"], "adopted")
+
+    def test_stop_before_a_claim_does_not_claim(self):
+        cfg = self.config(poll_seconds=0.1)
+        stop = repair_task.Stop()
+        stop.set("early")
+        summary = repair_task.serve(cfg, self.client(cfg), stop)
+        self.assertEqual(summary["tasks"], 0)
+        self.assertEqual(self.service.claim_attempts, [])
+        self.assertEqual(self.heartbeat(cfg)["state"], "stopped")
+
+
+class Preflight(Fixture):
+    def test_checks_name_their_sources_and_never_print_the_token(self):
+        claude_home = HOME / ".claude"
+        claude_home.mkdir(exist_ok=True)
+        (claude_home / ".credentials.json").write_text("{}")
+        self.addCleanup(lambda: (claude_home / ".credentials.json").unlink(missing_ok=True))
+        cfg = self.config()
+        checks = repair_task.preflight(cfg, min_free_gib=0)
+        by_name = {c["check"]: c for c in checks}
+        self.assertTrue(all(c["ok"] for c in checks), checks)
+        self.assertEqual(by_name["github token"]["detail"], "from $GH_TOKEN")
+        self.assertEqual(by_name["repository admin"]["detail"], f"stub-worker on {PROJECT}")
+        self.assertIn("revision fakefakefak", by_name["service"]["detail"])
+        self.assertIn(str(self.content.bare), by_name["content clone"]["detail"])
+        self.assertNotIn(TOKEN, json.dumps(checks))
+        # An unreachable service and a non-admin account are reported as failed checks, not raised.
+        os.environ["STUB_GH_ADMIN"] = "false"
+        self.addCleanup(os.environ.pop, "STUB_GH_ADMIN", None)
+        checks = repair_task.preflight(self.config(service="http://127.0.0.1:9/"), min_free_gib=0)
+        by_name = {c["check"]: c for c in checks}
+        self.assertFalse(by_name["service"]["ok"])
+        self.assertFalse(by_name["repository admin"]["ok"])
+        self.assertTrue(by_name["tool lake"]["ok"])
+
+    def test_token_file_is_read_and_named(self):
+        token_file = self.root / "token"
+        token_file.write_text("file-token\n")
+        os.environ["TAUCETI_QUEUE_TOKEN_FILE"] = str(token_file)
+        self.addCleanup(os.environ.pop, "TAUCETI_QUEUE_TOKEN_FILE", None)
+        self.assertEqual(repair_task.worker_token(), "file-token")
+        self.assertEqual(repair_task.token_source(), f"file {token_file}")
+        token_file.write_text("")
+        from tauceti_worker.config import Die
+
+        with self.assertRaises(Die):
+            repair_task.worker_token()
 
 
 class Records(unittest.TestCase):

@@ -92,6 +92,7 @@ build and how long each phase took, and makes placement decisions from those mea
 | `~/.config/tauceti-queue/github-app.json`, `github-private-key.pem`, `github-webhook-secret` | the App credentials (GitHub App section) |
 | `~/.config/systemd/user/tauceti-queue.service` | the service unit, copied from `services/queue/` by the installer |
 | `~/.config/systemd/user/tauceti-queue-backup.{service,timer}` | the daily backup |
+| `~/.config/systemd/user/tauceti-queue-repair.service`, `~/.config/tauceti-queue/repair-environment` | the repair worker unit and its environment file (Repair worker below), on the host that runs repair tasks |
 | `~/.local/state/tauceti-queue/queue.sqlite3` (+ `-wal`, `-shm`) | the database: approved inputs, batches, claims, CI attempts, pending side effects, settings |
 | `~/.local/state/tauceti-queue/backups/` | dated online backups |
 | `~/.local/state/tauceti-queue/logs/` | the service's own files (webhook delivery journal); process logs go to journald |
@@ -229,6 +230,94 @@ active.
    the three unit files from `~/.config/systemd/user/`, and `systemctl --user daemon-reload`. Keep
    `~/TauCetiQueue-data` until the new host has run for a day, then delete it together with
    `~/TauCetiQueue` and `~/.config/tauceti-queue`. Update this section and `status.md`.
+
+## Repair worker
+
+When a head's CI fails with attributable diagnostics the service creates a repair task (or a
+rebase-conflict task when a canonical advance conflicts); nothing happens to it until a worker claims
+it. `tauceti_queue/repair_task.py` ([repair-task.md](repair-task.md)) is that worker, and
+`services/queue/tauceti-queue-repair.service` runs it continuously as a systemd user unit: resume
+checkpointed tasks, claim, prepare warm artifacts, run the repair agent, push the chain to the task's
+submission ref, submit it, report the provider outcome to `/tasks/inference` (the inference hold),
+sleep the poll interval when nothing is claimable. A task's failure, a service outage or a refused
+authorization is logged and retried on the next pass; the loop never exits for them. The worker runs
+on the service host today; it only needs the service URL, so it can run on any host meeting the
+requirements below (the service's `repair_concurrency` setting bounds how many hold a task at once).
+
+### Host requirements
+
+- The account's systemd user services with lingering enabled, `git`, `uv` and `gh` on the unit's PATH
+  (`~/.local/bin`, `~/.elan/bin`, `~/.nix-profile/bin`, `/run/current-system/sw/bin`, `/usr/local/bin`,
+  `/usr/bin`, `/bin`), and outbound HTTPS to GitHub, the Lake artifact cache service and the inference
+  provider.
+- **Disk.** The task root holds a private Lake artifact pool (every build's outputs are stored there,
+  about 13 GB per build of a large candidate; the experiments needed tens of GB per base and were
+  stopped by a full disk), one worktree per running task (a full checkout plus its `.lake/build`) and
+  the extracted Mathlib (7.7 GB per task unless `TAUCETI_QUEUE_SEED_PACKAGES` shares one). Budget
+  50 GB free and prune the pool between bases with
+  `uv run python -m tauceti_queue.repair_experiment prune --root <task root>`; the worker's `--check`
+  fails below 20 GiB free.
+- **Toolchain.** `elan` with the toolchain the content repository pins (`lean-toolchain`, installed on
+  first use by the `lake` shim at `~/.elan/bin/lake`), and the fleet's Lake artifact cache reachable
+  (`lake cache get --service tauceti-public`). The worker never builds Mathlib: it restores the base's
+  outputs from the cache and builds the batch's own modules.
+- **Credentials**, by name; never print their values.
+  - The GitHub token of the worker's account, which must be a repository admin on
+    `TauCetiProject/TauCeti`: the service applies `security_audit.require_admin` to the login the
+    bearer token resolves to at claim and at submit, and the worker applies the same predicate before
+    claiming. Source order: `TAUCETI_QUEUE_TOKEN_FILE` (a mode 0600 file), `TAUCETI_QUEUE_TOKEN`,
+    `GH_TOKEN`, `GITHUB_TOKEN`, else `gh auth token` from the account's gh login. The same account's
+    git credentials push the submission ref (`gh auth setup-git`, or the token in the helper).
+  - Claude Code's credentials in `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`), copied
+    into the task's isolated config dir; `ANTHROPIC_API_KEY` stays unset so the subscription is billed,
+    as in the experiments. `claude` on PATH.
+- The content clone named by `TAUCETI_QUEUE_CLONE` (the installer creates it).
+
+### Install and update
+
+```sh
+git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue   # if not already present
+~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main
+~/TauCetiQueue/services/queue/install-repair.sh --revision <sha>  # a pinned revision
+```
+
+`install-repair.sh` is idempotent and live. It fast-forwards the checkout, runs `uv sync`, writes
+`~/.config/tauceti-queue/repair-environment` from `services/queue/repair-environment.example` when
+absent (then review it: service URL, worker name, clone, task root, credential locations), clones the
+content repository when absent, runs the worker's host checks, installs the unit, enables and
+restarts it, and verifies that the unit is active and that the restarted process (the unit's
+`MainPID`) reports itself serving in `<task root>/worker.json`. Exit 0 means the worker is serving;
+1 a setup or host-check failure; 2 an inactive or silent unit, and the next step is
+`journalctl --user -u tauceti-queue-repair -n 50`. `--no-restart` installs without interrupting a
+running task. The queue service, its backup timer and the fleet units are not touched.
+
+A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, its claim and
+checkpoint are kept (`tasks/<id>/task.json` in state `interrupted`, the worktree in place), and the
+restarted worker renews the claim and resumes the same model session. A task that has already
+validated its chain finishes the push and submission first. `TimeoutStopSec=300`; a worker killed
+beyond that leaves the claim to expire (`claim_ttl_seconds`, 900) and the task is re-exposed.
+
+### Verify, logs, stop
+
+```sh
+cd ~/TauCetiQueue && uv run python -m tauceti_queue.repair_task --check   # tools, token, admin, service, clone, credentials, disk
+systemctl --user status tauceti-queue-repair
+journalctl --user -u tauceti-queue-repair -f
+jq . "$(. ~/.config/tauceti-queue/repair-environment; echo "$TAUCETI_QUEUE_TASK_ROOT")/worker.json"
+```
+
+`--check` prints one line per host requirement and exits 1 when any fails, naming the token's source
+and the login, never the token. `worker.json` is the worker's heartbeat: `pid`, `state` (`starting`,
+`claiming`, `running`, `idle`, `stopping`, `stopped`), `tasks`, `outcomes` by status, `errors` and
+`last_error`, `last_outcome`, `started_at` and `updated_at`. The service side of the same facts is
+`status.head.claim` (the worker name and expiry while a task is claimed) and the task's outcome in
+the status document. Each task's record is `<task root>/tasks/<id>/` (`task.json`, `outcome.json`,
+`logs/` with the agent transcript, prompt, push and build logs).
+
+To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is interrupted and
+resumed at the next start, as above); to stop it from coming back, `systemctl --user disable --now
+tauceti-queue-repair`. To stop without interrupting a task (finish the current one, claim no more),
+stop it right after `worker.json` reports `idle`.
 
 ## Public endpoint
 

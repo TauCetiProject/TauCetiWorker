@@ -10,14 +10,24 @@ historical repair experiments so the experiment CLI (`python -m tauceti_queue.re
 and the task use one implementation.
 
 ```sh
-uv run python -m tauceti_queue.repair_task --service https://queue.example [--once] [--worker ID]
+uv run python -m tauceti_queue.repair_task --service https://queue.example [--once | --check] [--worker ID]
     [--clone PATH] [--root PATH] [--repository owner/repo] [--poll SECONDS]
     [--agent-timeout S] [--build-timeout S] [--keep-worktree] [--seed-packages PATH] [--no-resume]
 ```
 
-Without `--once` the runner loops: resume checkpointed tasks, claim, run, sleep `--poll` seconds when
-nothing is claimable. `--clone` defaults to the worker's content checkout (`Config.resolve().checkout`,
-the path `agents.prepare_checkout` maintains). `--root` defaults to `$TAUCETI_QUEUE_TASK_ROOT`, else
+Without `--once` the runner is the long-running worker (`serve`): resume checkpointed tasks, claim,
+run, submit, report the provider outcome to `POST /tasks/inference` (a success lifts the service's
+inference hold; a release for `inference_unavailable` counts toward it), sleep `--poll` seconds when
+nothing is claimable, and log and retry rather than exit when a task, the service or the
+authorization check fails. SIGTERM and SIGINT stop a running agent and record the task as
+`interrupted` with its claim and worktree kept; the next start resumes the session
+(`resume_pending`). It writes a heartbeat to `<root>/worker.json`. `--check` prints the host checks
+(tools, token source, repository admin, service, clone, Claude credentials, free disk) and exits.
+`--service`, `--worker`, `--clone`, `--poll` and `--seed-packages` default to `TAUCETI_QUEUE_SERVICE`,
+`TAUCETI_QUEUE_WORKER`, `TAUCETI_QUEUE_CLONE`, `TAUCETI_QUEUE_POLL_SECONDS` and
+`TAUCETI_QUEUE_SEED_PACKAGES`, which is how `services/queue/tauceti-queue-repair.service` configures
+it (`docs/queue/operations.md`, "Repair worker"). Otherwise `--clone` defaults to the worker's content
+checkout (`Config.resolve().checkout`, the path `agents.prepare_checkout` maintains). `--root` defaults to `$TAUCETI_QUEUE_TASK_ROOT`, else
 `$TAUCETI_ACTIVITY_DIR/queue-repair`, else `~/.local/state/tauceti/queue-repair`; it holds the task
 checkpoints and logs (`tasks/<task_id>/`), the private worktrees (`worktrees/task-<task_id>`), the
 private Lake artifact pool (`lake-cache/`, `lake.toml`) and the agent's isolated Claude config.
@@ -29,8 +39,9 @@ The semantics are the controller's (`tauceti_queue/controller.py`, `docs/queue/c
 `release_task(task_id, claim_token, reason, error)` and `submit_task(task_id, claim_token, tip_sha,
 worker_notes)`, exchanging the `Task` and `Adoption` records of `tauceti_queue/ports.py`. The HTTP
 surface is stream F's server (`tauceti_queue/server.py`, `docs/queue/github.md`): `POST` with a JSON
-body and `Authorization: Bearer <GitHub token of the worker's account>` (`$TAUCETI_QUEUE_TOKEN`,
-else `$GH_TOKEN`/`$GITHUB_TOKEN`, else `gh auth token`), the token resolved to a login, a `None`
+body and `Authorization: Bearer <GitHub token of the worker's account>` (the file named by
+`$TAUCETI_QUEUE_TOKEN_FILE`, else `$TAUCETI_QUEUE_TOKEN`, else `$GH_TOKEN`/`$GITHUB_TOKEN`, else
+`gh auth token`), the token resolved to a login, a `None`
 result as `204`, a bare JSON value as the body otherwise, and errors as `{"error": message}`. The
 worker identity is `body.worker` (the runner also sends it as `X-TauCeti-Worker`).
 

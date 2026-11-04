@@ -50,7 +50,9 @@ both Bors feeds and run `tauceti-queue import-bors` with the saved journals, ena
 restart, point `bors.taucetiproject.org` at the tunnel (`MERGE_BACKEND` stays `bors`), then watch the
 first three heads. Rollback is the mirror image. Known gaps at cutover: the first head is small by
 design; repair tasks need a worker running `tauceti_queue.repair_task` against the service, which the
-worker loop does not do yet (run one by hand until it does); tauchonki is temporary and the service
+worker loop does not do; `services/queue/tauceti-queue-repair.service` runs it continuously
+(`install-repair.sh`, operations.md "Repair worker") and must be installed on a host meeting its
+requirements before the first failing head; tauchonki is temporary and the service
 must move to a stable host before it counts as production (operator condition).
 
 ## Operator items outstanding
