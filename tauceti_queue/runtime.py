@@ -198,12 +198,29 @@ def status_document(
 # --- summary ---------------------------------------------------------------------------------------
 
 
-def _age(since: str | None, now: datetime | None = None) -> str:
-    if not since:
-        return "?"
+def _instant(value: Any) -> datetime | None:
+    """A status timestamp as a datetime: the controller reports epoch seconds, the envelope ISO 8601."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
     try:
-        then = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
+        return None
+
+
+def _when(value: Any) -> str:
+    then = _instant(value)
+    return then.strftime("%Y-%m-%dT%H:%M:%SZ") if then else "?"
+
+
+def _age(since: Any, now: datetime | None = None) -> str:
+    then = _instant(since)
+    if then is None:
         return "?"
     now = now or datetime.now(UTC)
     seconds = max(0, int((now - then).total_seconds()))
@@ -216,6 +233,10 @@ def _age(since: str | None, now: datetime | None = None) -> str:
 
 def _sha(value: Any) -> str:
     return str(value)[:12] if value else "-"
+
+
+def _count(value: Any) -> Any:
+    return len(value) if isinstance(value, list) else value
 
 
 def summarize(document: Mapping[str, Any], now: datetime | None = None) -> str:
@@ -240,56 +261,71 @@ def summarize(document: Mapping[str, Any], now: datetime | None = None) -> str:
         lines.append("CONDITIONS:")
         for item in conditions:
             if isinstance(item, Mapping):
-                lines.append(f"  ! {item.get('condition')} since {item.get('since', '?')}: {item.get('detail', '')}")
+                lines.append(f"  ! {item.get('condition')} since {_when(item.get('since'))}: {item.get('detail', '')}")
             else:
                 lines.append(f"  ! {item}")
     hold = document.get("hold")
     if hold:
         lines.append(
-            f"HOLD: inference unavailable since {hold.get('since')} ({_age(hold.get('since'), now)}): {hold.get('last_error', '')}"
-        )
-    stall = document.get("stall")
-    if stall:
-        lines.append(
-            f"STALL: phase {stall.get('phase')} silent {stall.get('silent_seconds', '?')}s "
-            f"(since {stall.get('since')}, interval {settings.get('stall_interval_seconds', '?')}s)"
+            f"HOLD: inference unavailable since {_when(hold.get('since'))} ({_age(hold.get('since'), now)}): {hold.get('last_error', '')}"
         )
     head = document.get("head")
+    stall = document.get("stall") or (head or {}).get("stall")
+    if stall:
+        silence = stall.get("silence_seconds", stall.get("silent_seconds"))
+        silence_text = f"{silence:.0f}" if isinstance(silence, (int, float)) else "?"
+        lines.append(
+            f"STALL: phase {stall.get('phase')} silent {silence_text}s "
+            f"(since {_when(stall.get('since'))}, interval {settings.get('stall_interval_seconds', '?')}s)"
+        )
     if head:
         claim = head.get("claim") or {}
         claim_text = (
             f"claimed by {claim.get('worker', '?')} for {claim.get('operation', '?')}" if claim else "unclaimed"
         )
+        size = head.get("size", _count(head.get("members")))
+        stage = head.get("stage") or head.get("waiting_for")
         lines.append(
-            f"head: batch {head.get('batch')} v{head.get('version', '?')}  {head.get('members', '?')} members  "
+            f"head: batch {head.get('id', head.get('batch'))} v{head.get('version', '?')}  {size if size is not None else '?'} members  "
             f"base {_sha(head.get('base'))}  tip {_sha(head.get('tip'))}  {claim_text}"
-            + (f"  waiting for {head['waiting_for']}" if head.get("waiting_for") else "")
+            + (f"  stage {stage}" if stage else "")
         )
         ci = head.get("ci") or {}
         if ci:
+            outcome = ci.get("outcome") or ci.get("status") or "?"
             lines.append(
-                f"  ci run {ci.get('run_id', '?')} on {ci.get('runner', '?')}@{ci.get('host', '?')} "
-                f"started {ci.get('started_at', '?')} ({_age(ci.get('started_at'), now)} ago)"
+                f"  ci run {ci.get('run_id') or '(not yet found)'} on {ci.get('runner') or '?'}@{ci.get('host') or '?'} "
+                f"{outcome}{(': ' + ci['outcome_detail']) if ci.get('outcome_detail') else ''}  "
+                f"started {_when(ci.get('started_at'))} ({_age(ci.get('started_at'), now)} ago)"
             )
-            for phase in ci.get("phases") or []:
-                mark = "*" if phase.get("updated_at") and not phase.get("finished_at") else " "
+            phases = list(ci.get("phases") or [])
+            if len(phases) > 6:
+                lines.append(f"    ({len(phases) - 6} earlier phases)")
+                phases = phases[-6:]
+            for phase in phases:
+                done = phase.get("status") == "completed" or bool(phase.get("finished_at") or phase.get("completed_at"))
+                mark = " " if done else "*"
+                updated = phase.get("completed_at") or phase.get("updated_at") or phase.get("started_at")
                 lines.append(
-                    f"   {mark} {phase.get('name', '?'):<14} {phase.get('progress', ''):<24} "
-                    f"updated {phase.get('updated_at', '?')} ({_age(phase.get('updated_at'), now)} ago)"
+                    f"   {mark} {str(phase.get('name', '?')):<40.40} {str(phase.get('detail') or phase.get('progress') or phase.get('status') or ''):<12.12} "
+                    f"updated {_when(updated)} ({_age(updated, now)} ago)"
                 )
     else:
         lines.append("head: none")
     open_batch = document.get("open_batch")
     if open_batch:
         age = open_batch.get("oldest_member_age_seconds")
+        age_text = f"{age:.0f}" if isinstance(age, (int, float)) else str(age)
         lines.append(
-            f"open batch: {open_batch.get('batch', '?')} size {open_batch.get('size', '?')}"
-            + (f", oldest member {age}s" if age is not None else "")
+            f"open batch: {open_batch.get('id', open_batch.get('batch', '?'))} size {open_batch.get('size', _count(open_batch.get('members')))}"
+            + (f", oldest member {age_text}s" if age is not None else "")
         )
     else:
         lines.append("open batch: none")
-    waiting = document.get("approved_waiting")
-    lines.append(f"approved waiting: {waiting if waiting is not None else '?'}")
+    waiting = document.get("waiting")
+    count = waiting.get("count") if isinstance(waiting, Mapping) else document.get("approved_waiting")
+    urgent = waiting.get("urgent") if isinstance(waiting, Mapping) else None
+    lines.append(f"approved waiting: {count if count is not None else '?'}" + (f" ({urgent} urgent)" if urgent else ""))
     task = document.get("pending_task")
     if task:
         lines.append(

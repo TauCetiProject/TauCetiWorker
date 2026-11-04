@@ -33,7 +33,7 @@ from tauceti_queue import config as cfg  # noqa: E402
 from tauceti_queue import runtime as rt  # noqa: E402
 
 FIXTURE = json.loads((REPO / "tests/fixtures/queue-status-fixture.json").read_text())
-NOW = datetime(2026, 11, 4, 8, 0, tzinfo=UTC)
+NOW = datetime(2026, 11, 5, 0, 0, tzinfo=UTC)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -167,7 +167,7 @@ class StatusDocument(unittest.TestCase):
         self.assertEqual(document["service"]["controller"], "running")
         self.assertEqual(document["service"]["revision"], "a" * 40)
         self.assertEqual(document["settings"], {"insertion_age_window": 4, "repair_concurrency": 1})
-        self.assertEqual(document["head"]["batch"], "batch-0042")
+        self.assertEqual(document["head"]["id"], 1)
         self.assertEqual(document["approved_waiting"], 9)
 
     def test_summary_from_the_fixture(self):
@@ -177,19 +177,27 @@ class StatusDocument(unittest.TestCase):
         self.assertIn("revision 0123456789ab", lines[0])
         self.assertIn("on chungus2", lines[0])
         self.assertIn("up 1h30m", lines[0])
-        self.assertIn("publication_enabled=false", lines[1])
-        self.assertIn("! stall_over_two_intervals since 2026-11-04T07:20:00Z", text)
-        self.assertIn("HOLD: inference unavailable since 2026-11-04T07:50:00Z (10m): anthropic: 529", text)
-        self.assertIn("STALL: phase build silent 2100s", text)
+        self.assertIn("publication_enabled=true", lines[1])
+        self.assertIn("! stall_over_two_intervals since 2026-11-04T23:20:00Z", text)
+        self.assertIn("HOLD: inference unavailable since 2026-11-04T23:50:00Z (10m): anthropic: 529", text)
+        self.assertIn("STALL: phase build silent 2100s (since 2026-11-04T23:25:00Z, interval 900s)", text)
+        self.assertIn("head: batch 1 v6  1 members  base 67aa17161ba1  tip e50a09636522  unclaimed  stage ci", text)
         self.assertIn(
-            "head: batch batch-0042 v7  23 members  base aaaaaaaaaaaa  tip bbbbbbbbbbbb  claimed by controller for ci  waiting for ci",
+            "ci run 41934607574 on nsc-runner-0cui8flmji4i2@nsc-runner-0cui8flmji4i2 pending  started 2026-11-04T23:33:09Z (26m ago)",
             text,
         )
-        self.assertIn("ci run 987654321 on chungus2-ci-3@chungus2", text)
-        self.assertIn("* build          412/900 modules", text)
-        self.assertIn("open batch: batch-0043 size 5, oldest member 1860s", text)
-        self.assertIn("approved waiting: 3", text)
+        self.assertIn("(2 earlier phases)", text)
+        self.assertIn("pick-runner / pick", text)
+        self.assertIn("open batch: 2 size 1197, oldest member 31614s", text)
+        self.assertIn("approved waiting: 190", text)
         self.assertIn("settings: insertion_age_window=16  repair_concurrency=1  stall_interval_seconds=900", text)
+
+    def test_age_accepts_epoch_seconds_and_iso_strings(self):
+        self.assertEqual(rt._age(1793836200.0, NOW), "10m")
+        self.assertEqual(rt._age("2026-11-04T23:50:00Z", NOW), "10m")
+        self.assertEqual(rt._age(None, NOW), "?")
+        self.assertEqual(rt._age("garbage", NOW), "?")
+        self.assertEqual(rt._when(1793836200.0), "2026-11-04T23:50:00Z")
 
     def test_summary_of_an_idle_service(self):
         document = rt.status_document(self.runtime(), {"insertion_age_window": 16}, {"approved_waiting": 0}, None)
@@ -252,11 +260,11 @@ class StatusCommand(Base):
         with captured() as (out, _err):
             self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
         self.assertEqual(calls, ["http://queue.local:1/status"])
-        self.assertIn("head: batch batch-0042", out.getvalue())
+        self.assertIn("head: batch 1 v6", out.getvalue())
         args = cli.build_parser().parse_args(["status", "--url", "http://queue.local:1", "--json"])
         with captured() as (out, _err):
             self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
-        self.assertEqual(json.loads(out.getvalue())["head"]["batch"], "batch-0042")
+        self.assertEqual(json.loads(out.getvalue())["head"]["id"], 1)
 
     def test_default_url_comes_from_the_configuration(self):
         path = self.config_file()
