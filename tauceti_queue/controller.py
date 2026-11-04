@@ -1410,7 +1410,11 @@ class Controller:
             return
         try:
             run = self.github.find_candidate_run(
-                self.repository, batch_id=str(head["id"]), head_sha=attempt["head_sha"], base_sha=attempt["base_sha"]
+                self.repository,
+                batch_id=str(head["id"]),
+                head_sha=attempt["head_sha"],
+                base_sha=attempt["base_sha"],
+                since=attempt["dispatched_at"],
             )
         except Exception as error:  # noqa: BLE001
             self._reasons.append(f"CI observation failed: {error}")
