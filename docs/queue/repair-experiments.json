@@ -1,28 +1,28 @@
 {
  "schema": "tauceti-queue.repair-experiments/v1",
- "generated_at": "2026-11-04T07:58:21+00:00",
+ "generated_at": "2026-11-04T08:59:41+00:00",
  "summary": {
   "candidates": 9,
-  "complete": 8,
-  "green": 8,
+  "complete": 9,
+  "green": 9,
   "lineages": 5,
   "agent_minutes": {
-   "count": 8,
+   "count": 9,
    "min": 1.0,
    "p25": 1.1,
    "median": 3.1,
-   "p75": 4.7,
+   "p75": 13.2,
    "max": 45.2,
-   "mean": 9.0
+   "mean": 12.8
   },
   "time_to_green_minutes": {
-   "count": 8,
+   "count": 9,
    "min": 1.1,
    "p25": 1.3,
    "median": 3.3,
-   "p75": 4.9,
+   "p75": 13.3,
    "max": 45.3,
-   "mean": 9.2
+   "mean": 13.0
   },
   "preparation_minutes": {
    "count": 9,
@@ -42,8 +42,8 @@
    "max": 4903,
    "mean": 2061.3
   },
-  "estimated_cost_usd_total": 6.47,
-  "total_tokens": 9465445,
+  "estimated_cost_usd_total": 7.48,
+  "total_tokens": 11036636,
   "shrink_events": 0,
   "messages_preserved_everywhere": true
  },
@@ -235,7 +235,7 @@
     26899,
     26902
    ],
-   "status": "agent_running",
+   "status": "complete",
    "error": null,
    "ci_modules_built": 3141,
    "preparation": {
@@ -255,32 +255,40 @@
    "chain_tool_tree_matches_retained": true,
    "chain_tree_matches_retained": true,
    "worktree_reused": true,
-   "agent_wall_seconds": null,
-   "agent_rc": null,
-   "agent_timed_out": null,
-   "agent_turns": null,
-   "model": null,
-   "tokens": {},
-   "estimated_cost_usd": null,
-   "claude_reported_cost_usd": null,
-   "green": null,
-   "confirm_build_seconds": null,
-   "confirm_modules_built": null,
-   "confirm_failed_modules": null,
-   "confirm_lint_rc": null,
-   "time_to_green_seconds": null,
-   "edited_prs": null,
-   "shrink_prs": null,
-   "emptied_prs": null,
-   "messages_preserved": null,
-   "edited_without_explanation": null,
-   "validation_problems": null,
-   "diffstat": null,
-   "load_1m_at_agent_start": null,
-   "load_1m_at_agent_end": null,
+   "agent_wall_seconds": 2588.0,
+   "agent_rc": 0,
+   "agent_timed_out": false,
+   "agent_turns": 32,
+   "model": "claude-opus-5-5",
+   "tokens": {
+    "input_tokens": 62,
+    "cache_creation_input_tokens": 53026,
+    "cache_read_input_tokens": 1503519,
+    "output_tokens": 14584,
+    "total_tokens": 1571191
+   },
+   "estimated_cost_usd": 1.0168,
+   "claude_reported_cost_usd": 1.0168398,
+   "green": true,
+   "confirm_build_seconds": 14.9,
+   "confirm_modules_built": 0,
+   "confirm_failed_modules": [],
+   "confirm_lint_rc": 0,
+   "time_to_green_seconds": 2602.9,
+   "edited_prs": [
+    26212
+   ],
+   "shrink_prs": [],
+   "emptied_prs": [],
+   "messages_preserved": true,
+   "edited_without_explanation": [],
+   "validation_problems": [],
+   "diffstat": "1 file changed, 5 insertions(+), 3 deletions(-)",
+   "load_1m_at_agent_start": 6.9,
+   "load_1m_at_agent_end": 151.6,
    "disk_free_gb_start": 18.1,
    "started_at": "2026-11-04T07:40:42+00:00",
-   "finished_at": null
+   "finished_at": "2026-11-04T08:59:14+00:00"
   },
   {
    "candidate": 1914,

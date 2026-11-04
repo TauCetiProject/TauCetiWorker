@@ -84,13 +84,13 @@ build had to compile on top of main's restored outputs; "agent" is wall time fro
 tokens and USD are from the transcript at API list prices.
 
 <!-- results-table -->
-9 candidates in 5 lineages; 8 complete, 8 green. Total 9,465,445 tokens, estimated USD 6.47 at API list prices; 0 shrink events; messages preserved as prefixes everywhere: yes.
+9 candidates in 5 lineages; 9 complete, 9 green. Total 11,036,636 tokens, estimated USD 7.48 at API list prices; 0 shrink events; messages preserved as prefixes everywhere: yes.
 
 | candidate | lineage | members | kind | failing modules | prep (min) | cache warmth | agent (min) | green | edited PRs | shrink | tokens | est. USD |
 | ---: | ---: | ---: | --- | --- | ---: | --- | ---: | --- | --- | --- | ---: | ---: |
 | 1843 | 1843 | 2 | compiler | Substitution | 10.4 | 214 built | 2.9 | yes | #25596 | - | 481202 | 0.54 |
 | 1862 | 1861 | 56 | compiler | LDU | 12.5 | 2810 built | 1.1 | yes | #26251 | - | 673922 | 0.58 |
-| 1863 | 1861 | 55 | lint | Slope | 0.2 | 0 built | - | - | - | - | - | - |
+| 1863 | 1861 | 55 | lint | Slope | 0.2 | 0 built | 43.1 | yes | #26212 | - | 1571191 | 1.02 |
 | 1914 | 1861 | 14 | lint | Slope | 15.0 | 1468 built | 13.2 | yes | #26212 | - | 945515 | 0.74 |
 | 1916 | 1867 | 111 | compiler | Diagonalization | 2.6 | 435 built | 3.1 | yes | #25202, #25416, #26269 | - | 1119556 | 0.82 |
 | 1918 | 1873 | 56 | compiler | Braiding | 11.7 | 4077 built | 45.2 | yes | #23638, #24902, #25391, #25667 | - | 4366931 | 2.17 |
@@ -100,8 +100,8 @@ tokens and USD are from the transcript at API list prices.
 
 Minutes:
 
-- agent wall time, handoff to exit (n=8): min 1.0, p25 1.1, median 3.1, p75 4.7, max 45.2, mean 9.0
-- time to green (agent plus confirming build) (n=8): min 1.1, p25 1.3, median 3.3, p75 4.9, max 45.3, mean 9.2
+- agent wall time, handoff to exit (n=9): min 1.0, p25 1.1, median 3.1, p75 13.2, max 45.2, mean 12.8
+- time to green (agent plus confirming build) (n=9): min 1.1, p25 1.3, median 3.3, p75 13.3, max 45.3, mean 13.0
 - preparation (base cache fetch plus incremental build) (n=9): min 0.2, p25 2.6, median 10.7, p75 12.5, max 15.0, mean 8.7
 - modules built in preparation (n=9): min 0, p25 214, median 1468, p75 4077, max 4903, mean 2061.3
 <!-- /results-table -->
