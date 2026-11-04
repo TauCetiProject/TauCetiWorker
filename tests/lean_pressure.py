@@ -101,7 +101,7 @@ class LeanPressure(unittest.TestCase):
             self.assertEqual(available, int(2.5 * gib))
             (cg / "user/worker/memory.high").write_text(str(4 * gib))
             with patch.object(gate, "Path", side_effect=lambda path: root / str(path).lstrip("/")):
-                self.assertEqual(gate.memory(), (4 * gib, int(0.5 * gib)))
+                self.assertEqual(gate.memory(), (6 * gib, int(2.5 * gib)))
             (proc / "self/cgroup").write_text("1:memory:/legacy\n")
             with patch.object(gate, "Path", side_effect=lambda path: root / str(path).lstrip("/")):
                 self.assertEqual(gate.memory(), (64 * gib, 48 * gib))

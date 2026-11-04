@@ -90,13 +90,12 @@ def memory():
     root = Path("/sys/fs/cgroup")
     group = root / relative.lstrip("/")
     while group.is_relative_to(root):
-        limits = []
-        for name in ("memory.max", "memory.high"):
-            maximum = group / name
-            if maximum.exists() and (value := maximum.read_text().strip()) != "max":
-                limits.append(int(value))
-        if limits:
-            limit = min(limits)
+        # memory.high triggers reclaim/throttling; it is not a capacity cap.
+        # Treating a dynamic soft threshold as total RAM can make every wrapper
+        # wait while spare host memory sits unused. Keep all hard ancestor caps.
+        maximum = group / "memory.max"
+        if maximum.exists() and (value := maximum.read_text().strip()) != "max":
+            limit = int(value)
             stats = dict(line.split() for line in (group / "memory.stat").read_text().splitlines())
             # Active clean file pages are reclaimable too. Counting them as
             # permanently used could stall every waiter on a warm artifact cache
