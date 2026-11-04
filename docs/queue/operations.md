@@ -164,6 +164,66 @@ uv run tauceti-queue status --json | jq .service
 uv run tauceti-queue status --url https://queue.taucetiproject.org   # through the tunnel
 ```
 
+## Current deployment
+
+Installed 2026-11-04 on `tauchonki` with publication disabled, revision
+`045c7e589c676ec3a0bee2900111d49d2ca4aabd` (`main` at the time), by `services/queue/install.sh` run as
+the fleet account `kim`. The App credentials were copied from `chungus2` (`scp -p`, checksums
+compared). Nothing of the cutover is done: no tunnel, no DNS record, the App webhook stays inactive,
+Bors is untouched.
+
+**tauchonki is a temporary host.** The operator's condition is that the service moves to a dedicated,
+stable host before it becomes the production merge backend: the tunnel, the webhook activation and the
+publication flag are all done on that host, never on tauchonki. The move procedure is below.
+
+Paths on tauchonki, where they differ from the layout table:
+
+| Path | Content |
+| --- | --- |
+| `~/TauCetiQueue` | the checkout; `tauceti_queue/_revision.py` baked by the installer |
+| `~/.config/tauceti-queue/config.toml` | `host = "tauchonki"`, `publication_enabled = false`, `review_app_id = 3947238`, settings 16 / 1 / 900, the data paths below |
+| `~/TauCetiQueue-data/clone` | the content clone of `TauCetiProject/TauCeti` (`content_clone`) |
+| `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | the database (`database`) |
+| `~/TauCetiQueue-data/logs` | the service's own files (`log_dir`) |
+| `~/.local/state/tauceti-queue/backups/` | daily backups (the backup script's default directory; it finds the database through `check-config`) |
+| `127.0.0.1:8780` | the listen address; the port was free, and no other unit on the host uses it |
+
+The host runs the fleet's `tauceti-fleet*`, `tauceti-worker-*` and `tauceti-cleanup` user units; the
+queue units are independent of them and the installer does not touch them.
+
+What this shadow deployment observes: every pass fetches the canonical branch into the clone and
+records canonical advances, drains the (empty) outbox and runs insertion over the approved inputs it
+holds. At this revision approval intake runs only from webhook deliveries
+(`tauceti_queue/webhook.py` calls `eligibility.reconcile` for the review App's `merge eligibility`
+check runs); the polling pass re-reads CI runs but does not list check runs. Until the webhook is
+active the service therefore holds no approved inputs and opens no batch, and `approved_waiting`
+stays at zero. Shadow agreement with Bors (the cutover precondition) starts counting only once the
+webhook delivers to the service.
+
+### Moving to the dedicated host
+
+1. On the new host, meet the Host requirements (account, lingering, `git`, `uv`, outbound HTTPS).
+   Create `~/.config/tauceti-queue/` with mode 0700 and copy the three credential files and
+   `config.toml` from tauchonki with `scp -p` (mode 0600; compare checksums, never print them). Set
+   `host` in the copied `config.toml` to the new host's name.
+2. On tauchonki, stop the service and the timer so the store is closed and the WAL checkpointed:
+   `systemctl --user stop tauceti-queue tauceti-queue-backup.timer`. Take a last backup
+   (`~/TauCetiQueue/services/queue/backup.sh`).
+3. Copy the data directory: `rsync -a ~/TauCetiQueue-data/ <newhost>:~/TauCetiQueue-data/` (the
+   database with its `-wal` and `-shm` files, the content clone and the logs). Copying the clone
+   saves the fresh clone the installer would otherwise make.
+4. On the new host, install at the revision tauchonki was running (or `main`, if a newer revision is
+   wanted; the store schema is migrated by the service):
+   `git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue && ~/TauCetiQueue/services/queue/install.sh --revision <sha>`.
+   The installer reports `content clone present`, runs `check-config` and verifies the revision.
+5. Verify as in "Verification after a deploy": `service.host` is the new host, `canonical_sha` equals
+   tauchonki's last value, `settings` are the persisted ones (the store wins over the file), and
+   `counters` carried over. Then run the Public endpoint steps on the new host.
+6. On tauchonki, `systemctl --user disable --now tauceti-queue tauceti-queue-backup.timer`, remove
+   the three unit files from `~/.config/systemd/user/`, and `systemctl --user daemon-reload`. Keep
+   `~/TauCetiQueue-data` until the new host has run for a day, then delete it together with
+   `~/TauCetiQueue` and `~/.config/tauceti-queue`. Update this section and `status.md`.
+
 ## Public endpoint
 
 `queue.taucetiproject.org` is served by a Cloudflare tunnel from the host to the local port. No
