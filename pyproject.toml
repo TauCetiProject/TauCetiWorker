@@ -21,7 +21,7 @@ tauceti-workflow-backstop = "tauceti_worker.workflow_backstop:main"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["tauceti_worker"]
+packages = ["tauceti_worker", "tauceti_queue"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "prompts" = "tauceti_worker/prompts"
