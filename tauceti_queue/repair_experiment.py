@@ -571,22 +571,26 @@ def _commit_fields(clone: Path, sha: str) -> tuple[str, str, str, str]:
     return parent_list[0], tree, subject, body
 
 
+TRAILER_LINE = re.compile(r"^(Source-PR|Accepted-Head):\s*(.+?)\s*$")
+
+
 def _split_trailers(clone: Path, message: str) -> tuple[str, dict[str, str]]:
-    parsed = git(clone, "interpret-trailers", "--parse", input=message)
+    """The message without its identity trailers, and the trailers.
+
+    The trailers are looked for on any line, not only in the final paragraph: an agent that appends
+    its explanation after the existing message leaves them mid-message, where git's own
+    `interpret-trailers` no longer recognises them (observed in candidate 1931's repair).
+    """
     trailers: dict[str, str] = {}
-    for line in parsed.splitlines():
-        if ":" in line:
-            key, value = line.split(":", 1)
-            trailers[key.strip()] = value.strip()
-    without = git(clone, "interpret-trailers", "--if-exists", "replace", "--unfold", input=message)
-    body = message
-    if "Source-PR" in trailers or "Accepted-Head" in trailers:
-        kept = []
-        for line in without.rstrip("\n").split("\n"):
-            if line.startswith(("Source-PR:", "Accepted-Head:")):
-                continue
-            kept.append(line)
-        body = "\n".join(kept).rstrip("\n") + "\n"
+    kept: list[str] = []
+    for line in message.split("\n"):
+        match = TRAILER_LINE.match(line)
+        if match:
+            trailers.setdefault(match.group(1), match.group(2))
+            continue
+        kept.append(line)
+    body = "\n".join(kept)
+    body = re.sub(r"\n{3,}", "\n\n", body).rstrip("\n") + "\n"
     return body, trailers
 
 
@@ -723,9 +727,11 @@ def compare_chains(clone: Path, before: list[ChainCommit], after: list[ChainComm
 
     Membership is compared by PR identity, not position.
     """
-    before_by_pr = {c.pr: c for c in before}
-    after_by_pr = {c.pr: c for c in after}
-    rows: list[dict] = []
+    before_by_pr = {c.pr: c for c in before if c.pr is not None}
+    after_by_pr = {c.pr: c for c in after if c.pr is not None}
+    rows: list[dict] = [
+        {"pr": None, "status": "unidentified", "after": c.sha, "subject": c.subject} for c in after if c.pr is None
+    ]
     for pr in sorted(set(before_by_pr) | set(after_by_pr)):
         old, new = before_by_pr.get(pr), after_by_pr.get(pr)
         if old is None or new is None:
@@ -1412,6 +1418,30 @@ def agent_usage(stream: Path, config_dir: Path | None = None) -> dict:
                                     bucket[f"cache_creation_{suffix}_input_tokens"] += int(value)
                 elif event.get("type") == "result":
                     result_event = event
+    # The result event's per-model totals are authoritative: assistant events report a message's usage
+    # as it streams, so the output count of the first event per message id is a lower bound.
+    reported = result_event.get("modelUsage") or {}
+    if isinstance(reported, dict) and reported:
+        per_model = {}
+        totals = collections.defaultdict(int)
+        for name, usage in reported.items():
+            if not isinstance(usage, dict):
+                continue
+            bucket = collections.defaultdict(int)
+            for source, key in (
+                ("inputTokens", "input_tokens"),
+                ("outputTokens", "output_tokens"),
+                ("cacheReadInputTokens", "cache_read_input_tokens"),
+                ("cacheCreationInputTokens", "cache_creation_input_tokens"),
+                ("cacheCreationEphemeral5mInputTokens", "cache_creation_5m_input_tokens"),
+                ("cacheCreationEphemeral1hInputTokens", "cache_creation_1h_input_tokens"),
+            ):
+                value = usage.get(source)
+                if isinstance(value, (int, float)):
+                    bucket[key] += int(value)
+                    totals[key] += int(value)
+            per_model[name] = bucket
+            model = model or name
     when = dt.datetime.now(dt.UTC)
     cost = 0.0
     priced = True
@@ -1676,6 +1706,34 @@ def run_experiment(
     return record
 
 
+def remeasure(
+    failure: Failure, *, root: Path = DEFAULT_ROOT, clone: Path = DEFAULT_CLONE, build_timeout: float = 3 * 3600
+) -> dict:
+    """Measure again from the retained result ref after a measurement failure, without a new agent run."""
+    experiment_dir = root / str(failure.candidate_id)
+    record_path = experiment_dir / "result.json"
+    record = json.loads(record_path.read_text())
+    worktree = root / "worktrees" / f"base-{failure.base_sha[:12]}"
+    seed_packages = root / "seed" / "packages"
+    result_tip = git(clone, "rev-parse", "--verify", f"{REF_PREFIX}/result/{failure.ref}").strip()
+    chain_before = read_chain(clone, failure.base_sha, record["sources"]["chain_tip"])
+    env = lake_env(root)
+    record["remeasured"] = (record.get("remeasured") or 0) + 1
+    record.pop("error", None)
+    try:
+        checkout_worktree(clone, result_tip, worktree)
+        link_shared_packages(worktree, seed_packages)
+        record["result"] = measure_repair(clone, worktree, failure, chain_before, env, experiment_dir, build_timeout)
+        record["status"] = "complete"
+    except Exception as error:
+        record["status"] = "error"
+        record["error"] = f"{type(error).__name__}: {error}"
+    record["finished_at"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+    record["host_end"] = host_state()
+    write_record(record_path, record)
+    return record
+
+
 # ----------------------------------------------------------------------------------------------
 # Report
 
@@ -1917,6 +1975,13 @@ def main(argv: list[str] | None = None) -> int:
     clean.add_argument("--clone", type=Path, default=DEFAULT_CLONE)
     prune = sub.add_parser("prune", help="drop built outputs from the private artifact pool")
     prune.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    measure = sub.add_parser("measure", help="measure a finished agent run again from its retained result ref")
+    measure.add_argument("--candidate", type=int, required=True)
+    measure.add_argument("--journal", action="append")
+    measure.add_argument("--include", type=int, action="append", default=[])
+    measure.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    measure.add_argument("--clone", type=Path, default=DEFAULT_CLONE)
+    measure.add_argument("--build-timeout", type=float, default=3 * 3600)
     report = sub.add_parser("report", help="aggregate result records into the results table and JSON")
     report.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     report.add_argument("--json", type=Path, help="write the per-candidate records here")
@@ -1952,6 +2017,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result_row(record), indent=1, default=str))
         return 0 if record.get("status") in {"complete", "prepared_only"} else 1
+    if args.command == "measure":
+        journal = load_journal(_journal_paths(args))
+        failures = {f.candidate_id: f for f in select_candidates(journal, tuple(args.include) + (args.candidate,))}
+        failure = failures.get(args.candidate)
+        if failure is None:
+            raise SystemExit(f"candidate {args.candidate} is not an eligible failure in the journal")
+        record = remeasure(failure, root=args.root, clone=args.clone, build_timeout=args.build_timeout)
+        print(json.dumps(result_row(record), indent=1, default=str))
+        return 0 if record.get("status") == "complete" else 1
     if args.command == "clean":
         for path in sorted((args.root / "worktrees").glob("*")):
             remove_worktree(args.clone, path)

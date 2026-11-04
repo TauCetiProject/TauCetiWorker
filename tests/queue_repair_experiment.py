@@ -292,6 +292,29 @@ with tempfile.TemporaryDirectory() as raw:
         "a rewritten message is flagged",
         rewritten_rows[0]["message_preserved"] is False and rewritten_rows[0]["explanation"] is None,
     )
+    # An explanation appended after the trailer block (what the plan's instruction produces) keeps the identity.
+    sh(repo, "checkout", "--quiet", "--detach", base)
+    appended = commit(
+        repo,
+        "feat: improve A (#1)\n\nBody of one.\n\nSource-PR: TauCetiProject/TauCeti#1\nAccepted-Head: "
+        + "a" * 40
+        + "\n\nBatch repair: use `trivial`.\n",
+        {"TauCeti/A.lean": "theorem a : True := trivial\n"},
+    )
+    appended_chain = rx.read_chain(repo, base, appended)
+    check(
+        "trailers followed by an appended explanation are still read",
+        appended_chain[0].pr == 1 and appended_chain[0].accepted_head == "a" * 40,
+    )
+    appended_rows = rx.compare_chains(repo, chain[:1], appended_chain)
+    check(
+        "the explanation after the trailers is collected",
+        appended_rows[0]["message_preserved"] and appended_rows[0]["explanation"] == "Batch repair: use `trivial`.",
+    )
+    check(
+        "the chain tool reads the same identity",
+        rx.chain_tool.validate(repo, base, appended, ["TauCetiProject/TauCeti#1"]).ok,
+    )
     # A merge commit is not a chain.
     sh(repo, "checkout", "--quiet", "--detach", base)
     side = commit(repo, "side", {"TauCeti/C.lean": "theorem c : True := trivial\n"})
@@ -445,6 +468,27 @@ with tempfile.TemporaryDirectory() as raw:
         "usage counted once per message id",
         accounted["tokens"]["output_tokens"] == 600 and accounted["tokens"]["cache_read_input_tokens"] == 100000,
     )
+    events[-1]["modelUsage"] = {
+        "claude-opus-5-5": {
+            "inputTokens": 44,
+            "outputTokens": 8294,
+            "cacheReadInputTokens": 1062044,
+            "cacheCreationInputTokens": 50570,
+            "cacheCreationEphemeral1hInputTokens": 50570,
+            "costUSD": 0.78,
+        }
+    }
+    stream.write_text("".join(json.dumps(e) + "\n" for e in events))
+    reported = rx.agent_usage(stream)
+    check(
+        "the result event's per-model totals win over streamed usage",
+        reported["tokens"]["output_tokens"] == 8294
+        and reported["models"]["claude-opus-5-5"]["cache_creation_1h_input_tokens"] == 50570
+        and reported["estimated_cost_usd"] > accounted["estimated_cost_usd"],
+    )
+    del events[-1]["modelUsage"]
+    stream.write_text("".join(json.dumps(e) + "\n" for e in events))
+    accounted = rx.agent_usage(stream)
     check(
         "model, turns and Claude's own cost are kept",
         accounted["model"] == "claude-opus-5-5"
