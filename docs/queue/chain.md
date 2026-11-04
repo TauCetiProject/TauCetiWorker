@@ -23,7 +23,7 @@ A chain is a linear sequence of single-parent commits on a recorded base, exactl
 member PR. Each commit's message is:
 
 ```text
-<title, or "owner/repo#N at <head sha prefix>" when the title is unknown>
+<title, or "owner/repo#N at <head sha prefix>" when the title is unknown> (#N)
 
 <description: the PR body, when known>
 
@@ -32,6 +32,8 @@ Source-PR: TauCetiProject/TauCeti#123
 Accepted-Head: <original accepted SHA>
 ```
 
+The subject ends in Bors's ` (#N)` suffix (added once; a title already ending in it is kept as is),
+so TauCetiTools `lint-scope.sh` and GitHub's commit-to-PR links attribute the commit to its PR.
 `Source-PR` and `Accepted-Head` are always present; they are the member's identity and survive every
 later rewrite. The commit author is the member record's author when known, otherwise the author of
 the accepted head commit. Co-authors are the record's list when given; when the record carries none

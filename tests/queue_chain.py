@@ -128,7 +128,7 @@ class Build(Fixture):
         # Message: title, description, then the trailers; author from the head commit.
         self.assertEqual(
             commits[1].message,
-            f"Change 102\n\nBody of PR 102.\n\n{c.SOURCE_PR_TRAILER}: {PROJECT}#102\n{c.ACCEPTED_HEAD_TRAILER}: {members[1].head_sha}\n",
+            f"Change 102 (#102)\n\nBody of PR 102.\n\n{c.SOURCE_PR_TRAILER}: {PROJECT}#102\n{c.ACCEPTED_HEAD_TRAILER}: {members[1].head_sha}\n",
         )
         self.assertEqual(commits[1].author, "Bob <bob@example.invalid>")
         self.assertEqual(commits[0].author, "Alice <alice@example.invalid>")
@@ -473,7 +473,11 @@ class Records(Fixture):
         self.assertEqual((second.title, second.author, second.description), ("Twelve", "bob", "Twelve's body"))
         # A member record with no title still gets a subject and both identity trailers.
         message = c.squash_message(first, [])
-        self.assertTrue(message.startswith(f"{PROJECT}#11 at {'a' * 12}\n\n"))
+        self.assertTrue(message.startswith(f"{PROJECT}#11 at {'a' * 12} (#11)\n\n"))
+        # The subject carries Bors's `(#N)` suffix exactly once.
+        self.assertTrue(c.squash_message(second, []).startswith("Twelve (#12)\n\n"))
+        suffixed = c.Member(PROJECT, 12, "b" * 40, title="Twelve  (#12)")
+        self.assertTrue(c.squash_message(suffixed, []).startswith("Twelve (#12)\n\n"))
         self.assertEqual(c.trailer_values(message, c.SOURCE_PR_TRAILER), [f"{PROJECT}#11"])
         self.assertEqual(c.trailer_values(message, c.ACCEPTED_HEAD_TRAILER), ["a" * 40])
         # Round trip through the dict form and the generic loader.
