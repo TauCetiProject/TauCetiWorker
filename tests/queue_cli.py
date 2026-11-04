@@ -153,7 +153,7 @@ class StatusDocument(unittest.TestCase):
         self.assertEqual(document["service"]["mode"], "shadow")
         self.assertIsNone(document["head"])
         self.assertEqual(document["conditions"], [])
-        self.assertEqual(document["feeds"]["observation"], "/api/observation")
+        self.assertEqual(document["feeds"]["observation"], "/repositories/1/active-batches")
         json.dumps(document)
 
     def test_controller_status_merges_under_the_service(self):

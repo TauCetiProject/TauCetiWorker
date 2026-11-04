@@ -75,6 +75,7 @@ class Service:
         self.stop = rt.StopSignal()
         self.store: Any = None
         self.github: Any = None
+        self.app: Any = None
         self.controller: Any = None
         self.server: Any = None
         self.loop_module: ModuleType | None = None
@@ -99,23 +100,40 @@ class Service:
                 self.unavailable_reason or "tauceti_queue.github_app/github_adapter are not installed"
             )
             return
-        app = app_module.GitHubApp.load(self.config.credentials_dir)
-        self.github = adapter_module.GitHubAdapter(app, self.config.repository)
+        try:
+            app = app_module.GitHubApp.load(self.config.credentials_dir)
+        except Exception as error:  # noqa: BLE001 - status reports the reason instead of the process dying
+            self.unavailable_reason = self.unavailable_reason or f"GitHub App credentials unavailable: {error}"
+            return
+        self.app = app
+        self.github = adapter_module.GitHubAdapter(app, self.config.repository, clone_dir=self.config.content_clone)
 
     def build_controller(self) -> None:
         module = _optional("controller")
         if module is None or self.store is None or self.github is None:
             self.unavailable_reason = self.unavailable_reason or "tauceti_queue.controller is not installed"
             return
+        clone = self.config.content_clone
+        if not (clone / "HEAD").exists() and not (clone / ".git").exists():
+            self.unavailable_reason = f"content clone missing at {clone}; see docs/queue/operations.md"
+            return
         self.controller = module.Controller(
-            store=self.store,
-            github=self.github,
-            repository=self.config.repository,
-            canonical_branch=self.config.canonical_branch,
-            settings=self.config.settings.as_dict(),
-            publication_enabled=self.config.publication_enabled,
-            host=self.config.host,
+            self.store,
+            self.github,
+            str(clone),
+            self.config.repository,
+            revision=self.runtime.revision.sha,
+            canonical_branch=self.config.canonical_branch or None,
         )
+        # Configuration supplies the initial runtime controls; the admin endpoint changes them later.
+        for key, value in {
+            **self.config.settings.as_dict(),
+            "publication_enabled": self.config.publication_enabled,
+        }.items():
+            try:
+                self.controller.set_setting(key, value, "configuration")
+            except Exception as error:  # noqa: BLE001 - an unknown key in the file is reported, not fatal
+                _log(f"configuration setting {key} not applied: {error}")
         self.loop_module = _optional("loop")
 
     def status_document(self) -> dict[str, Any]:
@@ -134,7 +152,9 @@ class Service:
     def start_server(self) -> None:
         module = _optional("server")
         if module is not None and self.controller is not None:
-            self.server = module.create_server(self.controller, self.config, status=self.status_document)
+            self.server = module.create_server(
+                self.controller, self.config, status=self.status_document, adapter=self.github, app=self.app
+            )
         else:
             self.server = rt.fallback_server(self.config, self.status_document, self.effective_settings)
         threading.Thread(target=self.server.serve_forever, name="http", daemon=True).start()
@@ -142,7 +162,13 @@ class Service:
     def run_loop(self) -> None:
         """Reconcile until stopped; the current step always completes before we return."""
         if self.loop_module is not None and self.controller is not None:
-            self.loop_module.run(self.controller, stop=self.stop, interval=self.config.reconcile_interval_seconds)
+            loop = self.loop_module.ReconciliationLoop(self.controller)
+            loop.start()
+            try:
+                while not self.stop.wait(self.config.reconcile_interval_seconds):
+                    pass
+            finally:
+                loop.stop(timeout=DEFAULT_STOP_GRACE)
             return
         while not self.stop.wait(self.config.reconcile_interval_seconds):
             pass

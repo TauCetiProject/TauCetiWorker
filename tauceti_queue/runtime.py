@@ -53,7 +53,7 @@ from typing import Any
 from .config import STATUS_SCHEMA, Config
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-OBSERVATION_FEED = "/api/observation"
+OBSERVATION_FEED = "/repositories/1/active-batches"
 CANDIDATES_FEED = "/repositories/1/candidates"
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
