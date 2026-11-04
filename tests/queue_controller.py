@@ -17,7 +17,9 @@ sys.path.insert(0, str(REPO))
 from tauceti_queue import chain, feeds  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
     DEFAULT_SETTINGS,
+    LOG_GRACE_SECONDS,
     MERGED_TITLE_PREFIX,
+    VERDICT_CONTEXTS,
     ControllerError,
     TaskError,
 )
@@ -48,6 +50,93 @@ class ControllerCase(unittest.TestCase):
         self.controller.handle_event("status", {"sha": self.github.runs[0].head_sha, "context": "build"})
         self.controller.tick()
         return self.controller.store.row("batches", {"state": "head"})
+
+
+class Verdicts(ControllerCase):
+    """The statuses Bors required on the staging commit, `build`, `bump-guard` and `scope`, decide an attempt together."""
+
+    def observe(self, verdict):
+        """Approve one PR, dispatch it, complete its run under `verdict` and let the controller observe the statuses."""
+        self.github.ci_policy = lambda *_: (verdict, [])
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": self.github.runs[0].head_sha, "context": context})
+        self.controller.tick()
+        return self.controller.store.row("batches", {"id": head["id"]}), self.attempt(head)
+
+    def attempt(self, head):
+        return self.controller.store.row("ci_attempts", {"batch_id": head["id"]}, order="id DESC")
+
+    def verdict_states(self):
+        verdicts = self.controller.status()["head"]["ci"]["verdicts"]
+        return {context: verdicts[context]["state"] for context in VERDICT_CONTEXTS}
+
+    def test_all_three_verdicts_green_land_the_head(self):
+        head, attempt = self.observe("pass")
+        self.assertEqual(attempt["outcome"], "pass")
+        verdicts = json.loads(attempt["verdicts"])
+        self.assertEqual({c: v["state"] for c, v in verdicts.items()}, dict.fromkeys(VERDICT_CONTEXTS, "success"))
+        self.assertTrue(all(v["bound"] for v in verdicts.values()))
+        self.assertEqual(self.repo.main_sha(), head["tip"], "the promotion is drained in the same tick")
+        self.assertEqual(head["state"], "landed")
+
+    def test_a_red_scope_beside_a_green_build_is_a_source_failure_that_does_not_land(self):
+        base = self.repo.main_sha()
+        head, attempt = self.observe("scope-fail")
+        self.assertEqual(attempt["outcome"], "source-failure")
+        description = "restricted paths changed with no valid current bors scope approval"
+        self.assertEqual(attempt["outcome_detail"], f"scope: {description}", "the status says why")
+        self.assertEqual(
+            json.loads(attempt["diagnostics"]),
+            [
+                {
+                    "kind": "status",
+                    "context": "scope",
+                    "module": "",
+                    "message": description,
+                    "target_url": self.github.runs[0].to_candidate_run().html_url,
+                }
+            ],
+            "the diagnostic carries the verdict and attributes it to no member",
+        )
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), base, "a red scope is never fast-forwarded")
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "promote"}), 0)
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        status = self.controller.status()
+        json.dumps(status)
+        self.assertEqual(status["head"]["stage"], "repair")
+        self.assertEqual(self.verdict_states(), {"build": "success", "bump-guard": "success", "scope": "failure"})
+        self.assertEqual(status["head"]["ci"]["verdicts"]["scope"]["description"], description)
+        self.assertEqual(status["counters"].get("ci_source_failures"), 1)
+
+    def test_a_red_bump_guard_beside_a_green_build_is_a_source_failure(self):
+        head, attempt = self.observe("bump-guard-fail")
+        self.assertEqual(attempt["outcome"], "source-failure")
+        self.assertEqual(attempt["outcome_detail"], "bump-guard: Lake pin change failed the trusted bump validator")
+        self.assertEqual(self.verdict_states(), {"build": "success", "bump-guard": "failure", "scope": "success"})
+        self.assertEqual(
+            self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})["kind"], "repair"
+        )
+
+    def test_build_alone_waits_for_the_other_verdicts_then_counts_as_a_missing_status(self):
+        head, attempt = self.observe("build-only")
+        self.assertEqual(attempt["outcome"], "pending", "a bound build with the others absent is not yet a verdict")
+        self.assertEqual(attempt["needs_observation"], 1)
+        self.assertEqual(self.verdict_states(), {"build": "success", "bump-guard": "absent", "scope": "absent"})
+        self.assertIn("waiting for bump-guard, scope", " ".join(self.controller.status()["reasons"]))
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.controller.tick()
+        attempt = self.attempt(head)
+        self.assertEqual(attempt["outcome"], "infrastructure")
+        self.assertEqual(
+            attempt["outcome_detail"], "missing-status: the completed run posted no bound bump-guard, scope status"
+        )
+        self.assertNotEqual(self.repo.main_sha(), head["tip"])
 
 
 class Settings(ControllerCase):
@@ -90,7 +179,15 @@ class Approvals(ControllerCase):
         self.assertEqual(self.repo.rev_parse(row["retained_ref"]), head, "retained on GitHub through the outbox")
 
     def test_approval_refusals(self):
-        head = self.github.create_pr(101, {"A.lean": "a\n"})
+        head = self.github.create_pr(101, {"A.lean": "a\n"}, labels=["stacked-pr"])
+        self.assertEqual(
+            self.controller.approve(PROJECT, 101, head, "r"),
+            {"accepted": False, "reason": "blocked-label: stacked-pr", "input": None},
+            "a PR carrying one of Bors's block labels is refused, as Bors refused it",
+        )
+        self.github.labels[101] = {"Hold", "stacked-pr"}
+        self.assertEqual(self.controller.approve(PROJECT, 101, head, "r")["reason"], "blocked-label: hold, stacked-pr")
+        self.github.labels[101] = set()
         self.assertEqual(self.controller.approve(PROJECT, 101, "0" * 40, "r")["reason"], "head-mismatch")
         self.github.prs[101]["draft"] = True
         self.assertEqual(self.controller.approve(PROJECT, 101, head, "r")["reason"], "draft")

@@ -29,7 +29,9 @@ NAME = "merge eligibility"
 SCHEMA = "tauceti-merge.eligibility/v1"
 REVIEW_APP_ID = 3947238
 REVIEWER = "tauceti-review-bot[bot]"
-KEEP = frozenset({"keep", "hold", "wip", "human", "do-not-close"})
+# Bors's `block_labels` in TauCeti's `bors.toml`; `stacked-pr` is applied by TauCetiTools' stack policy,
+# which relies on the merge backend refusing the labelled PR.
+KEEP = frozenset({"keep", "hold", "wip", "human", "do-not-close", "stacked-pr"})
 SHA = re.compile(r"[0-9a-f]{40}")
 
 

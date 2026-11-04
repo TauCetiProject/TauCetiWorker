@@ -91,8 +91,9 @@ CI: the attempt for the head's current version is dispatched with `dispatch_cand
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
 `base_sha`, `batch_id`, `members`, `base_ref`). Observation reads `find_candidate_run` when an event
 named the head or `polling_interval_seconds` elapsed, recording runner, host, phases and progress
-times. The verdict is the `build` commit status on the tip whose `run_id` is the run that completed
-for this attempt; anything else (no run within `dispatch_timeout_seconds`, no progress for
+times. The verdict is the `build`, `bump-guard` and `scope` commit statuses on the tip whose `run_id`
+is the run that completed for this attempt, all three `success` (a red `scope` or `bump-guard` beside
+a green `build` is a source failure carrying the status description); anything else (no run within `dispatch_timeout_seconds`, no progress for
 `lost_run_seconds`, a cancelled, timed out or skipped run, a completed run without a bound status, a
 status from another run, a failure whose description starts with `infrastructure` or whose findings
 are all of kind `infrastructure`) is an infrastructure outcome: the candidate is unchanged and is

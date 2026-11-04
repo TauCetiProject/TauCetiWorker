@@ -6,7 +6,8 @@ repository; the controller's clone fetches from it, promotion fast-forwards its 
 retained refs are pushed into it. PR metadata, statuses, comments, labels, runs and admin logins are
 plain in-memory records on `FakeGitHub`. CI is scripted: `FakeGitHub.ci_policy` decides, per
 candidate, whether the build passes, fails with diagnostics, suffers an infrastructure failure, is
-cancelled, is lost, or completes without a bound status. Agents are `ScriptedAgent`s that claim a
+cancelled, is lost, or completes without a bound status, and whether the `scope` or `bump-guard`
+verdict posted beside a green `build` is red. Agents are `ScriptedAgent`s that claim a
 task, construct a replacement chain from a script of per-member resolutions and submit it; they use
 no inference.
 """
@@ -170,7 +171,7 @@ class FakeRun:
     batch_id: str
     members: list[int]
     created_at: float
-    verdict: str  # pass, fail, infrastructure, cancel, lost, no-status
+    verdict: str  # pass, fail, infrastructure, scope-fail, bump-guard-fail, build-only, cancel, lost, no-status
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     status: str = "queued"
     conclusion: str | None = None
@@ -317,7 +318,7 @@ class FakeGitHub:
                     run.phases.append(CandidatePhase(phase, now, None, "in_progress", detail))
 
     def complete_runs(self) -> list[FakeRun]:
-        """Running (or queued) runs finish according to their verdict; the finalizer posts the bound status."""
+        """Running (or queued) runs finish according to their verdict; the finalizer posts the bound statuses."""
         with self.lock:
             now = self.clock()
             completed = []
@@ -333,25 +334,51 @@ class FakeGitHub:
                 ]
                 run.status = "completed"
                 run.completed_at = now
+                url = run.to_candidate_run().html_url
+
+                def post(context: str, state: str, description: str, target_url: str = url, run=run) -> None:
+                    self.statuses[(run.head_sha, context)] = Status(state, description, target_url, now, run.run_id)
+
+                # The finalizer posts `bump-guard`, `build` and `scope` in one step; every verdict but
+                # the one under test is green, as pr-build.yml posts them for an in-scope head.
+                policy = {
+                    "bump-guard": ("success", "no Lake pin change"),
+                    "scope": (
+                        "success",
+                        "changes are in scope (TauCeti/, the allowed root files, and the bibliography only)",
+                    ),
+                }
                 if run.verdict == "pass":
                     run.conclusion = "success"
-                    self.statuses[(run.head_sha, "build")] = Status(
-                        "success", "Build succeeded", run.to_candidate_run().html_url, now, run.run_id
-                    )
+                    post("build", "success", "Build succeeded")
                 elif run.verdict == "fail":
                     run.conclusion = "failure"
-                    self.statuses[(run.head_sha, "build")] = Status(
-                        "failure", "Build failed", run.to_candidate_run().html_url, now, run.run_id
-                    )
+                    post("build", "failure", "Build failed")
                 elif run.verdict == "infrastructure":
                     run.conclusion = "failure"
-                    self.statuses[(run.head_sha, "build")] = Status(
-                        "failure", "infrastructure: runner lost its cache volume", "", now, run.run_id
-                    )
+                    post("build", "failure", "infrastructure: runner lost its cache volume", "")
+                elif run.verdict == "scope-fail":
+                    # A green build whose merge-policy verdict is red (restricted paths without a current
+                    # admin approval, an oversized diff, a new file over 1000 lines).
+                    run.conclusion = "success"
+                    post("build", "success", "Build succeeded")
+                    policy["scope"] = ("failure", "restricted paths changed with no valid current bors scope approval")
+                elif run.verdict == "bump-guard-fail":
+                    run.conclusion = "success"
+                    post("build", "success", "Build succeeded")
+                    policy["bump-guard"] = ("failure", "Lake pin change failed the trusted bump validator")
+                elif run.verdict == "build-only":
+                    # The finalizer's step was cut short after `build`: the other two verdicts never appear.
+                    run.conclusion = "success"
+                    post("build", "success", "Build succeeded")
+                    policy = {}
                 elif run.verdict == "cancel":
                     run.conclusion = "cancelled"
                 elif run.verdict == "no-status":
                     run.conclusion = "failure"
+                if run.verdict in ("pass", "fail", "infrastructure", "scope-fail", "bump-guard-fail"):
+                    for context, (state, description) in policy.items():
+                        post(context, state, description)
                 completed.append(run)
             return completed
 

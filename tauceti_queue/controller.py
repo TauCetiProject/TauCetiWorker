@@ -28,6 +28,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from . import chain
+from .eligibility import KEEP as BLOCKING_LABELS
 from .ports import (
     AGENT_INSTRUCTION,
     Adoption,
@@ -39,6 +40,11 @@ from .store import Store, dumps, loads
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
 BUILD_CONTEXT = "build"
+# The commit statuses pr-build.yml's finalizer posts on the candidate head, every one of which Bors
+# required (`bors.toml` `status`): `build` is the build's result, `bump-guard` the Lake-pin validation
+# and `scope` the merge-policy verdict (restricted paths, diff size, oversized new files). A head
+# lands only when all three are bound to its run and `success`.
+VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
 LOG_GRACE_SECONDS = 600  # how long a failed run may go without a readable log before it counts as infrastructure
 DISPATCH_EVENT = "tauceti-bors-staging"
 MERGED_TITLE_PREFIX = "[Merged by Bors] - "  # what bors-ng writes when it closes a squash-landed member
@@ -266,7 +272,9 @@ class Controller:
 
         `approved_at` lets an import (the cutover) keep an input's original admission age; `pull` is
         the live PR when the caller has just read it (the import validates before approving, and
-        must not pay for a second read). Returns `{"accepted": bool, "reason": ..., "input": row | None}`.
+        must not pay for a second read). Returns `{"accepted": bool, "reason": ..., "input": row | None}`;
+        besides `validate_pull`'s reasons, a PR carrying one of Bors's blocking labels is refused with
+        `blocked-label: <labels>`.
         """
         with self._lock:
             self._check_repo(repo)
@@ -290,6 +298,10 @@ class Controller:
                 pull, reason = self.validate_pull(repo, pr, head_sha)
                 if reason is not None:
                     return {"accepted": False, "reason": reason, "input": None}
+            blocked = self._blocking_labels(pull)
+            if blocked:
+                self.store.journal(now, "approval-refused", number=pr, head=head_sha, labels=blocked)
+                return {"accepted": False, "reason": f"blocked-label: {', '.join(blocked)}", "input": None}
             if not self._fetch_head(pr, head_sha):
                 return {"accepted": False, "reason": "head-unavailable", "input": None}
             ref = self.input_ref(pr, head_sha)
@@ -337,6 +349,16 @@ class Controller:
         if pull.base_ref != self.canonical_branch:
             return pull, "base-branch"
         return pull, None
+
+    @staticmethod
+    def _blocking_labels(pull: Any) -> list[str]:
+        """The labels on a live PR that Bors's `block_labels` refused to merge under (`eligibility.KEEP`).
+
+        `stacked-pr` is among them: TauCetiTools' stack policy applies it and relies on the merge
+        backend refusing the labelled PR, so an approval of one is refused with the labels as the reason.
+        """
+        labels = {str(label).lower() for label in (getattr(pull, "labels", None) or ())}
+        return sorted(labels & BLOCKING_LABELS)
 
     def input_for(self, repo: str, pr: int) -> dict[str, Any] | None:
         """The PR's current input row (the newest that is not cancelled, else the newest), or None."""
@@ -1652,8 +1674,32 @@ class Controller:
             )
             self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
             return
-        status = self.github.commit_status(self.repository, attempt["head_sha"], BUILD_CONTEXT)
-        if status is None or status.run_id != run.run_id or status.state == "pending":
+        # Every verdict context is read and bound the same way: a status counts only when its
+        # `target_url` names the candidate's own run and it is no longer pending.
+        statuses = {
+            context: self.github.commit_status(self.repository, attempt["head_sha"], context)
+            for context in VERDICT_CONTEXTS
+        }
+        bound = {
+            context: status is not None and status.run_id == run.run_id and status.state != "pending"
+            for context, status in statuses.items()
+        }
+        values["verdicts"] = dumps(
+            {
+                context: {
+                    # `absent`: no status; `unbound`: a status from some other run; else the bound state.
+                    "state": "absent"
+                    if status is None
+                    else ("unbound" if status.run_id != run.run_id else status.state),
+                    "bound": bound[context],
+                    "description": status.description if bound[context] else "",
+                    "target_url": status.target_url if bound[context] else "",
+                }
+                for context, status in statuses.items()
+            }
+        )
+        status = statuses[BUILD_CONTEXT]
+        if status is None or not bound[BUILD_CONTEXT]:
             # No status from the candidate's own completed run: never a verdict (scenario 19).
             values.update(
                 outcome=OUTCOME_INFRASTRUCTURE,
@@ -1670,9 +1716,60 @@ class Controller:
             self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
             return
         if status.state == "success":
-            values.update(outcome=OUTCOME_PASS, outcome_detail=status.description)
-            self._count("ci_passes")
-            self.store.journal(now, "ci-pass", head["id"], attempt_id=attempt["id"], run_id=run.run_id)
+            unbound = [context for context in VERDICT_CONTEXTS if not bound[context]]
+            if unbound:
+                # The finalizer posts all three statuses in the one step that posts `build`; a bound
+                # `build` with the others absent is that step still in flight (or a post that failed).
+                # Look again for a little while, then treat it as the missing `build` case above.
+                if now - (run.completed_at or now) < LOG_GRACE_SECONDS:
+                    values.update(needs_observation=1)
+                    self._reasons.append(
+                        f"head {head['id']}: run {run.run_id} posted build, waiting for {', '.join(unbound)}"
+                    )
+                    self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
+                    return
+                values.update(
+                    outcome=OUTCOME_INFRASTRUCTURE,
+                    outcome_detail=f"missing-status: the completed run posted no bound {', '.join(unbound)} status",
+                )
+                self.store.journal(
+                    now, "ci-infrastructure", head["id"], attempt_id=attempt["id"], detail=values["outcome_detail"]
+                )
+                self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
+                return
+            failed = [context for context in VERDICT_CONTEXTS if statuses[context].state != "success"]
+            if failed:
+                # The build is green but a policy verdict is red: a property of the head's source (its
+                # paths, diff size, pin change), carried as the status said it, attributed to nobody.
+                findings = [
+                    {
+                        "kind": "status",
+                        "context": context,
+                        "module": "",
+                        "message": statuses[context].description,
+                        "target_url": statuses[context].target_url,
+                    }
+                    for context in failed
+                ]
+                values.update(
+                    outcome=OUTCOME_SOURCE_FAILURE,
+                    outcome_detail="; ".join(f"{context}: {statuses[context].description}" for context in failed),
+                    diagnostics=dumps(findings),
+                )
+                self._count("ci_source_failures")
+                self.store.journal(
+                    now,
+                    "ci-source-failure",
+                    head["id"],
+                    attempt_id=attempt["id"],
+                    run_id=run.run_id,
+                    findings=len(findings),
+                    contexts=failed,
+                )
+            else:
+                values.update(outcome=OUTCOME_PASS, outcome_detail=status.description)
+                self._count("ci_passes")
+                self.store.journal(now, "ci-pass", head["id"], attempt_id=attempt["id"], run_id=run.run_id)
         else:
             source = [d for d in run.diagnostics if d.get("kind") != "infrastructure"]
             infrastructure = [d for d in run.diagnostics if d.get("kind") == "infrastructure"]
@@ -2130,6 +2227,7 @@ class Controller:
                 "last_observed_at": attempt["last_observed_at"],
                 "outcome": attempt["outcome"],
                 "outcome_detail": attempt["outcome_detail"],
+                "verdicts": loads(attempt["verdicts"], {}),
                 "html_url": attempt["html_url"],
                 "infrastructure_retry": attempt["infrastructure_retry"],
             }
