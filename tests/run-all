@@ -124,6 +124,9 @@ RUN_STDLIB=(
   quota_wakeups.py
   quota_shared_usage.py
   queue_chain.py
+  queue_controller.py
+  queue_fixture.py
+  queue_store.py
   rebase_handoff.py
   scoped_repair_route.py
   rebase_budget.py
