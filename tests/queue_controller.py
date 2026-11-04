@@ -14,7 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue import chain  # noqa: E402
+from tauceti_queue import chain, feeds  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
     DEFAULT_SETTINGS,
     MERGED_TITLE_PREFIX,
@@ -179,6 +179,51 @@ class Draw(ControllerCase):
             self.controller._draw(sorted(rows, key=lambda r: (-r["urgent"], r["approved_at"])))["id"],
             11,
             "urgent first",
+        )
+
+
+class Dispatch(ControllerCase):
+    def test_dispatch_pushes_the_staging_candidate_branch_the_feed_names(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"]}, order="id DESC")
+        branch = f"staging-candidate-{attempt['id']}-{head['version']}"
+        self.assertTrue(attempt["dispatch_id"], "the dispatch id is recorded on the reserved attempt")
+        names = [name for name, _ in self.github.calls]
+        pushes = [args for name, args in self.github.calls if name == "update_ref"]
+        self.assertIn((f"refs/heads/{branch}", head["tip"]), pushes, "the branch carries the head")
+        self.assertIn((f"refs/tauceti-queue/batches/{head['id']}/v{head['version']}", head["tip"]), pushes)
+        branch_push = self.github.calls.index(("update_ref", (f"refs/heads/{branch}", head["tip"])))
+        self.assertLess(branch_push, names.index("dispatch_candidate"), "the branch is pushed before the dispatch")
+        self.assertEqual(self.repo.rev_parse(f"refs/heads/{branch}"), head["tip"])
+        requested = feeds.observation_feed(feeds.feed_source(self.controller), PROJECT, "main", head["id"])[
+            "requested_batch"
+        ]
+        self.assertEqual(requested["state"], "running")
+        self.assertEqual(
+            requested["train"],
+            {
+                "candidate_id": attempt["id"],
+                "generation": head["version"],
+                "predecessor_id": None,
+                "staging_ref": branch,
+            },
+        )
+
+    def test_failed_dispatch_leaves_no_attempt(self):
+        self.approve(101, {"A.lean": "a\n"})
+
+        def refuse(*_args, **_kwargs):
+            raise RuntimeError("dispatch refused")
+
+        self.github.dispatch_candidate = refuse
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.assertIsNone(self.controller.store.row("ci_attempts", {"batch_id": head["id"]}))
+        self.assertTrue(self.controller.store.journal_entries("dispatch-failed"))
+        self.assertIn(
+            "dispatch refused", self.controller.store.journal_entries("dispatch-failed")[-1]["detail"]["error"]
         )
 
 

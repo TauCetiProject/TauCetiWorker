@@ -213,6 +213,17 @@ class Controller:
         return f"{chain.REF_NAMESPACE}/inputs/{number}/{sha}"
 
     @staticmethod
+    def staging_candidate_ref(candidate_id: int, generation: int) -> str:
+        """The branch carrying a CI attempt's head, named as Bors names its train candidates.
+
+        `pr-build.yml` resolves the dispatch through the observation feed's `train` and requires
+        `staging_ref` to be the branch `staging-candidate-<candidate_id>-<generation>` whose tip is the
+        dispatched head (TauCetiTools `bors_train_identity.py`, `ci_git.py`); the candidate id is the
+        attempt's id and the generation the batch version, as the candidates feed reports them.
+        """
+        return f"staging-candidate-{candidate_id}-{generation}"
+
+    @staticmethod
     def submission_ref(task_id: int, claim_id: int) -> str:
         return f"{chain.REF_NAMESPACE}/submissions/{task_id}/{claim_id}"
 
@@ -1519,10 +1530,27 @@ class Controller:
             )
             return
         members = [m["number"] for m in self._members(head["id"])]
+        # The attempt row is reserved first because its id names the staging candidate branch that the
+        # feed reports and CI verifies; a failed push or dispatch removes the row again.
+        attempt_id = self.store.insert(
+            "ci_attempts",
+            batch_id=head["id"],
+            batch_version=head["version"],
+            head_sha=head["tip"],
+            base_sha=head["base"],
+            base_ref=self.canonical_branch,
+            dispatched_at=now,
+            infrastructure_retry=retry,
+            last_progress_at=now,
+        )
+        branch = self.staging_candidate_ref(attempt_id, head["version"])
         try:
             # The candidate exists only in the service's clone until it is retained on GitHub; CI checks it
             # out by SHA, so the retained ref is pushed before the dispatch rather than by the outbox later.
+            # The staging candidate branch is the same commit under the name pr-build.yml's train identity
+            # check fetches and compares with the dispatched head.
             self.github.update_ref(self.repository, self.batch_ref(head["id"], head["version"]), head["tip"])
+            self.github.update_ref(self.repository, f"refs/heads/{branch}", head["tip"])
             dispatch_id = self.github.dispatch_candidate(
                 self.repository,
                 head_sha=head["tip"],
@@ -1532,22 +1560,13 @@ class Controller:
                 members=members,
             )
         except Exception as error:  # noqa: BLE001
+            with self.store.transaction():
+                self.store.execute("DELETE FROM ci_attempts WHERE id = ?", (attempt_id,))
             self._reasons.append(f"dispatch of head {head['id']} failed: {error}")
             self.store.journal(now, "dispatch-failed", head["id"], error=str(error))
             return
         with self.store.transaction():
-            self.store.insert(
-                "ci_attempts",
-                batch_id=head["id"],
-                batch_version=head["version"],
-                head_sha=head["tip"],
-                base_sha=head["base"],
-                base_ref=self.canonical_branch,
-                dispatch_id=dispatch_id,
-                dispatched_at=now,
-                infrastructure_retry=retry,
-                last_progress_at=now,
-            )
+            self.store.update("ci_attempts", {"id": attempt_id}, dispatch_id=dispatch_id)
             if head["first_dispatch_at"] is None:
                 self.store.update("batches", {"id": head["id"]}, first_dispatch_at=now)
             self._count("ci_dispatches")

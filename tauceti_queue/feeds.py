@@ -694,8 +694,8 @@ class ControllerFeedSource:
             members=self._members(row["id"], inputs),
             candidate_id=int(latest["id"]) if latest else None,
             generation=int(latest["batch_version"]) if latest else None,
-            staging_ref=self.controller.batch_ref(row["id"], latest["batch_version"])
-            if latest and hasattr(self.controller, "batch_ref")
+            staging_ref=self.controller.staging_candidate_ref(int(latest["id"]), int(latest["batch_version"]))
+            if latest and hasattr(self.controller, "staging_candidate_ref")
             else None,
             promotion_failures=int(row.get("promotion_failures") or 0),
         )
