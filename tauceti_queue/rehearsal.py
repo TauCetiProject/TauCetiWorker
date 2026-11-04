@@ -1925,7 +1925,13 @@ class Rehearsal:
 
         def predicate(status: dict):
             head = status.get("head")
-            if not head or head["id"] != batch_id or not head.get("ci"):
+            if head is None or head["id"] != batch_id:
+                # Live builds can finish inside one service poll; waiting hours for a run of a head that
+                # already landed is the wrong failure.
+                raise Failure(
+                    f"head {batch_id} left the queue before its run was observed {'running' if started else 'bound'}"
+                )
+            if not head.get("ci"):
                 return None
             ci = head["ci"]
             if ci["outcome"] != "pending" or not ci["run_id"]:
@@ -2709,7 +2715,9 @@ class Rehearsal:
             self.rig.hold_ci()
             self.approve(romeo)
             head = self.wait_head_with(romeo)
-            head = self.wait_run(head["id"], started=True)
+            # A queued run is enough: the recovery property is the same, and a live build on a fast runner
+            # can finish inside one of the service's observation intervals.
+            head = self.wait_run(head["id"])
             before = self.status()
             service_before = before.get("service") or {}
             rec.evidence["before"] = {

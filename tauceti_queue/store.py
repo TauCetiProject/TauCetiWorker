@@ -285,7 +285,11 @@ class Store:
             sql += f" ORDER BY {order}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
-        return [dict(row) for row in self.execute(sql, params).fetchall()]
+        # The connection is shared by the controller loop and the HTTP threads (feeds read the store
+        # without the controller lock): the fetch must happen under the same lock as the execute, or a
+        # concurrent statement resets the cursor mid-read (seen as `IndexError` on `/status` live).
+        with self._lock:
+            return [dict(row) for row in self._connection.execute(sql, params).fetchall()]
 
     def row(self, table: str, where: Mapping[str, Any], order: str | None = None) -> dict[str, Any] | None:
         found = self.rows(table, where, order=order, limit=1)
@@ -293,7 +297,8 @@ class Store:
 
     def count(self, table: str, where: Mapping[str, Any] | None = None) -> int:
         clause, params = self._where(where or {})
-        return int(self.execute(f"SELECT COUNT(*) FROM {table}{clause}", params).fetchone()[0])
+        with self._lock:
+            return int(self._connection.execute(f"SELECT COUNT(*) FROM {table}{clause}", params).fetchone()[0])
 
     @staticmethod
     def _where(where: Mapping[str, Any]) -> tuple[str, list[Any]]:
