@@ -208,6 +208,8 @@ class Handler(BaseHTTPRequestHandler):
         except PermissionError as error:
             self._error(403, str(error) or "forbidden")
         except LookupError as error:
+            if isinstance(error, IndexError | KeyError):  # a bug, not a missing resource: keep the traceback
+                log.error("request %s %s raised %r:\n%s", self.command, self.path, error, traceback.format_exc())
             self._error(404, str(error) or "not found")
         except ValueError as error:
             self._error(400, str(error) or "bad request")

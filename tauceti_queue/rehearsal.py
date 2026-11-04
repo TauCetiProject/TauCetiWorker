@@ -48,7 +48,7 @@ from . import chain, feeds, webhook
 
 SCHEMA = "tauceti-queue.rehearsal/v1"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.36.0-rc2"  # TauCeti's pin
-SCAFFOLD_VERSION = "1"
+SCAFFOLD_VERSION = "2"
 SCRATCH_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 LOCAL_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 QUEUE_APP_ID = 5607007
@@ -192,12 +192,21 @@ jobs:
       - name: Install elan
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
-          curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-init.sh \
-            | sh -s -- -y --default-toolchain none
+          set -o pipefail
+          installer=https://elan.lean-lang.org/elan-init.sh
+          curl -sSfL "$installer" -o elan-init.sh \
+            || curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          rm -f elan-init.sh
       - name: Build
         id: build
         run: |
           export PATH="$HOME/.elan/bin:$PATH"
+          if ! command -v lake > /dev/null; then
+            echo "::error::lake is not installed on this runner"
+            echo "infra=1" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           lake build --iofail
       - name: Report the build status
         id: report
@@ -207,10 +216,13 @@ jobs:
           SHA: ${{ steps.candidate.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
+          BUILD_INFRA: ${{ steps.build.outputs.infra }}
         run: |
           case "$BUILD_OUTCOME" in
             success) state=success; desc="Build succeeded" ;;
-            failure) state=failure; desc="Build failed: lake build --iofail reported errors" ;;
+            failure)
+              state=failure; desc="Build failed: lake build --iofail reported errors"
+              [ "$BUILD_INFRA" = "1" ] && desc="infrastructure: lake is not installed on the runner" ;;
             *) state=failure; desc="infrastructure: the build step did not run ($BUILD_OUTCOME)" ;;
           esac
           { echo "build-state=$state"; echo "build-description=$desc"; } >> "$GITHUB_OUTPUT"
@@ -644,10 +656,18 @@ class Rig:
     # -- the service
 
     def status(self) -> dict:
-        code, document = fetch_json(self.service_url + "/status")
-        if code != 200 or not isinstance(document, dict):
-            raise Failure(f"GET /status answered {code}: {document}")
-        return document
+        last = None
+        for attempt in range(6):
+            try:
+                code, document = fetch_json(self.service_url + "/status")
+            except OSError as error:
+                code, document = 0, {"error": str(error)}
+            if code == 200 and isinstance(document, dict):
+                return document
+            last = f"GET /status answered {code}: {document}"
+            self.facts.setdefault("status_errors", []).append({"at": _now_iso(), "error": last})
+            time.sleep(min(5.0, 0.5 * 2**attempt))
+        raise Failure(str(last))
 
     def feed(self, which: str, **query: str) -> dict:
         params = "&".join([f"base={self.branch}"] + [f"{k}={v}" for k, v in query.items()])
