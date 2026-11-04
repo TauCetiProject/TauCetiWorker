@@ -1720,6 +1720,8 @@ def remeasure(
     env = lake_env(root)
     record["remeasured"] = (record.get("remeasured") or 0) + 1
     record.pop("error", None)
+    if record.get("agent"):
+        record["agent"].update(agent_usage(Path(record["agent"]["stream"])))
     try:
         checkout_worktree(clone, result_tip, worktree)
         link_shared_packages(worktree, seed_packages)
@@ -1928,6 +1930,48 @@ def summary(rows: list[dict]) -> dict:
     }
 
 
+DOC_START = "<!-- results-table -->"
+DOC_END = "<!-- /results-table -->"
+
+
+def _dist_line(label: str, dist: dict) -> str:
+    if not dist.get("count"):
+        return f"- {label}: no data"
+    return (
+        f"- {label} (n={dist['count']}): min {dist['min']}, p25 {dist['p25']}, median {dist['median']}, "
+        f"p75 {dist['p75']}, max {dist['max']}, mean {dist['mean']}"
+    )
+
+
+def results_section(rows: list[dict], summary_: dict) -> str:
+    """The generated part of docs/queue/repair-experiments.md: the table and the distributions."""
+    lines = [
+        f"{summary_['candidates']} candidates in {summary_['lineages']} lineages; {summary_['complete']} complete, "
+        f"{summary_['green']} green. Total {summary_['total_tokens']:,} tokens, estimated USD "
+        f"{summary_['estimated_cost_usd_total']:.2f} at API list prices; {summary_['shrink_events']} shrink events; "
+        f"messages preserved as prefixes everywhere: {'yes' if summary_['messages_preserved_everywhere'] else 'no'}.",
+        "",
+        results_table(rows),
+        "",
+        "Minutes:",
+        "",
+        _dist_line("agent wall time, handoff to exit", summary_["agent_minutes"]),
+        _dist_line("time to green (agent plus confirming build)", summary_["time_to_green_minutes"]),
+        _dist_line("preparation (base cache fetch plus incremental build)", summary_["preparation_minutes"]),
+        _dist_line("modules built in preparation", summary_["modules_built_in_preparation"]),
+    ]
+    return "\n".join(lines)
+
+
+def update_document(path: Path, rows: list[dict], summary_: dict) -> None:
+    text = path.read_text()
+    if DOC_START not in text or DOC_END not in text:
+        raise SystemExit(f"{path} has no {DOC_START} ... {DOC_END} markers")
+    head, rest = text.split(DOC_START, 1)
+    _, tail = rest.split(DOC_END, 1)
+    path.write_text(head + DOC_START + "\n" + results_section(rows, summary_) + "\n" + DOC_END + tail)
+
+
 # ----------------------------------------------------------------------------------------------
 # CLI
 
@@ -1986,6 +2030,7 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     report.add_argument("--json", type=Path, help="write the per-candidate records here")
     report.add_argument("--markdown", action="store_true", help="print the results table and summary")
+    report.add_argument("--doc", type=Path, help="rewrite the results section of this document between its markers")
     args = parser.parse_args(argv)
 
     if args.command == "select":
@@ -2046,7 +2091,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
             args.json.write_text(json.dumps(payload, indent=1) + "\n")
-        if args.markdown or not args.json:
+        if args.doc:
+            update_document(args.doc, rows, payload["summary"])
+        if args.markdown or not (args.json or args.doc):
             print(results_table(rows))
             print()
             print(json.dumps(payload["summary"], indent=1))

@@ -613,6 +613,18 @@ check(
     and summary["time_to_green_minutes"]["median"] == 28.3,
 )
 check("distribution of an empty list", rx.distribution([]) == {"count": 0})
+with tempfile.TemporaryDirectory() as raw:
+    doc = Path(raw) / "doc.md"
+    doc.write_text("# Title\n\n## Results\n\n<!-- results-table -->\nold\n<!-- /results-table -->\n\n## After\n")
+    rx.update_document(doc, [row], summary)
+    text = doc.read_text()
+    check(
+        "the document section is rewritten between its markers",
+        "old" not in text
+        and "| 1931 |" in text
+        and text.endswith("<!-- /results-table -->\n\n## After\n")
+        and "median 28.3" in text,
+    )
 check("host state has load and disk", {"load_1m", "disk_free_gb", "cpus"} <= set(rx.host_state()))
 
 print(f"\n{fails} failure(s)")

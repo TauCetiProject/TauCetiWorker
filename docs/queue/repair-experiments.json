@@ -1,0 +1,242 @@
+{
+ "schema": "tauceti-queue.repair-experiments/v1",
+ "generated_at": "2026-11-04T05:14:07+00:00",
+ "summary": {
+  "candidates": 3,
+  "complete": 1,
+  "green": 1,
+  "lineages": 2,
+  "agent_minutes": {
+   "count": 1,
+   "min": 4.7,
+   "p25": 4.7,
+   "median": 4.7,
+   "p75": 4.7,
+   "max": 4.7,
+   "mean": 4.7
+  },
+  "time_to_green_minutes": {
+   "count": 1,
+   "min": 4.9,
+   "p25": 4.9,
+   "median": 4.9,
+   "p75": 4.9,
+   "max": 4.9,
+   "mean": 4.9
+  },
+  "preparation_minutes": {
+   "count": 2,
+   "min": 0.4,
+   "p25": 0.4,
+   "median": 0.4,
+   "p75": 10.7,
+   "max": 10.7,
+   "mean": 5.5
+  },
+  "modules_built_in_preparation": {
+   "count": 2,
+   "min": 0,
+   "p25": 0,
+   "median": 0,
+   "p75": 4645,
+   "max": 4645,
+   "mean": 2322.5
+  },
+  "estimated_cost_usd_total": 0.78,
+  "total_tokens": 1120952,
+  "shrink_events": 0,
+  "messages_preserved_everywhere": true
+ },
+ "candidates": [
+  {
+   "candidate": 1843,
+   "generation": 1,
+   "batch": 2525,
+   "lineage": 1843,
+   "members": 2,
+   "base_sha": "aeaa11500f9c",
+   "kinds": [
+    "compiler"
+   ],
+   "failing_modules": [
+    "TauCeti/RingTheory/PowerSeries/Substitution.lean"
+   ],
+   "suspects": [],
+   "status": "sources_ready",
+   "error": null,
+   "ci_modules_built": 7,
+   "preparation": null,
+   "preparation_seconds": null,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": false,
+   "agent_wall_seconds": null,
+   "agent_rc": null,
+   "agent_timed_out": null,
+   "agent_turns": null,
+   "model": null,
+   "tokens": {},
+   "estimated_cost_usd": null,
+   "claude_reported_cost_usd": null,
+   "green": null,
+   "confirm_build_seconds": null,
+   "confirm_modules_built": null,
+   "confirm_failed_modules": null,
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": null,
+   "edited_prs": null,
+   "shrink_prs": null,
+   "emptied_prs": null,
+   "messages_preserved": null,
+   "edited_without_explanation": null,
+   "validation_problems": null,
+   "diffstat": null,
+   "load_1m_at_agent_start": null,
+   "load_1m_at_agent_end": null,
+   "disk_free_gb_start": 57.8,
+   "started_at": "2026-11-04T04:53:25+00:00",
+   "finished_at": null
+  },
+  {
+   "candidate": 1931,
+   "generation": 1,
+   "batch": 2615,
+   "lineage": 1867,
+   "members": 110,
+   "base_sha": "519af858c47a",
+   "kinds": [
+    "compiler"
+   ],
+   "failing_modules": [
+    "TauCeti/AlgebraicGeometry/Modules/PseudoCoherent/Pullback.lean"
+   ],
+   "suspects": [
+    26269
+   ],
+   "status": "complete",
+   "error": null,
+   "ci_modules_built": 1189,
+   "preparation": {
+    "base_cache_seconds": 7.0,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 4645,
+    "modules_replayed": 0,
+    "modules_fetched": 0,
+    "failed_modules_local": [
+     "TauCeti.AlgebraicGeometry.Modules.PseudoCoherent.Pullback",
+     "TauCeti.Algebra.Lie.Current.CompletedModules"
+    ],
+    "build_seconds": 633.0,
+    "build_rc": 1,
+    "load_1m_at_build": 96.5
+   },
+   "preparation_seconds": 642.5,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": true,
+   "agent_wall_seconds": 280.7,
+   "agent_rc": 0,
+   "agent_timed_out": false,
+   "agent_turns": 22,
+   "model": "claude-opus-5-5",
+   "tokens": {
+    "input_tokens": 44,
+    "cache_creation_input_tokens": 50570,
+    "cache_read_input_tokens": 1062044,
+    "output_tokens": 8294,
+    "total_tokens": 1120952
+   },
+   "estimated_cost_usd": 0.783,
+   "claude_reported_cost_usd": 0.7830248000000001,
+   "green": true,
+   "confirm_build_seconds": 15.6,
+   "confirm_modules_built": 0,
+   "confirm_failed_modules": [],
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": 296.3,
+   "edited_prs": [
+    25202,
+    26269
+   ],
+   "shrink_prs": [],
+   "emptied_prs": [],
+   "messages_preserved": true,
+   "edited_without_explanation": [],
+   "validation_problems": [],
+   "diffstat": "2 files changed, 4 insertions(+), 2 deletions(-)",
+   "load_1m_at_agent_start": 127.0,
+   "load_1m_at_agent_end": 66.3,
+   "disk_free_gb_start": 57.8,
+   "started_at": "2026-11-04T04:53:26+00:00",
+   "finished_at": "2026-11-04T05:12:55+00:00"
+  },
+  {
+   "candidate": 1932,
+   "generation": 1,
+   "batch": 2627,
+   "lineage": 1867,
+   "members": 109,
+   "base_sha": "519af858c47a",
+   "kinds": [
+    "compiler"
+   ],
+   "failing_modules": [
+    "TauCeti/Algebra/Lie/Current/CompletedModules.lean"
+   ],
+   "suspects": [
+    25202
+   ],
+   "status": "agent_running",
+   "error": null,
+   "ci_modules_built": 4645,
+   "preparation": {
+    "base_cache_seconds": 6.8,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 0,
+    "modules_replayed": 0,
+    "modules_fetched": 1,
+    "failed_modules_local": [
+     "TauCeti.Algebra.Lie.Current.CompletedModules"
+    ],
+    "build_seconds": 16.1,
+    "build_rc": 1,
+    "load_1m_at_build": 70.0
+   },
+   "preparation_seconds": 24.6,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": true,
+   "agent_wall_seconds": null,
+   "agent_rc": null,
+   "agent_timed_out": null,
+   "agent_turns": null,
+   "model": null,
+   "tokens": {},
+   "estimated_cost_usd": null,
+   "claude_reported_cost_usd": null,
+   "green": null,
+   "confirm_build_seconds": null,
+   "confirm_modules_built": null,
+   "confirm_failed_modules": null,
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": null,
+   "edited_prs": null,
+   "shrink_prs": null,
+   "emptied_prs": null,
+   "messages_preserved": null,
+   "edited_without_explanation": null,
+   "validation_problems": null,
+   "diffstat": null,
+   "load_1m_at_agent_start": null,
+   "load_1m_at_agent_end": null,
+   "disk_free_gb_start": 91.3,
+   "started_at": "2026-11-04T05:12:56+00:00",
+   "finished_at": null
+  }
+ ]
+}

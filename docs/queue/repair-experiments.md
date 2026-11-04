@@ -77,7 +77,28 @@ on what a dedicated host would show; the hosted CI runner built candidate 1931's
 
 ## Results
 
-_Results are appended here as the runs complete; see the PR for progress._
+One row per candidate. "prep" is the base cache fetch plus the incremental `lake build --iofail`
+that warms the batch's modules (and reproduces the failure); "cache warmth" counts the modules that
+build had to compile on top of main's restored outputs; "agent" is wall time from handoff to exit;
+"green" is the harness's own confirming build (plus lint or the duplicate check where relevant);
+tokens and USD are from the transcript at API list prices.
+
+<!-- results-table -->
+3 candidates in 2 lineages; 1 complete, 1 green. Total 1,120,952 tokens, estimated USD 0.78 at API list prices; 0 shrink events; messages preserved as prefixes everywhere: yes.
+
+| candidate | lineage | members | kind | failing modules | prep (min) | cache warmth | agent (min) | green | edited PRs | shrink | tokens | est. USD |
+| ---: | ---: | ---: | --- | --- | ---: | --- | ---: | --- | --- | --- | ---: | ---: |
+| 1843 | 1843 | 2 | compiler | Substitution | - | - | - | - | - | - | - | - |
+| 1931 | 1867 | 110 | compiler | Pullback | 10.7 | 4645 built | 4.7 | yes | #25202, #26269 | - | 1120952 | 0.78 |
+| 1932 | 1867 | 109 | compiler | CompletedModules | 0.4 | 0 built | - | - | - | - | - | - |
+
+Minutes:
+
+- agent wall time, handoff to exit (n=1): min 4.7, p25 4.7, median 4.7, p75 4.7, max 4.7, mean 4.7
+- time to green (agent plus confirming build) (n=1): min 4.9, p25 4.9, median 4.9, p75 4.9, max 4.9, mean 4.9
+- preparation (base cache fetch plus incremental build) (n=2): min 0.4, p25 0.4, median 0.4, p75 10.7, max 10.7, mean 5.5
+- modules built in preparation (n=2): min 0, p25 0, median 0, p75 4645, max 4645, mean 2322.5
+<!-- /results-table -->
 
 ## Warm-artifact decision
 
