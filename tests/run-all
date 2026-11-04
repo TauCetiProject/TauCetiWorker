@@ -45,6 +45,8 @@ RUN_STDLIB=(
   budget_recovery.py
   usage_accounting.py
   usage_supervisor.py
+  queue_repair_experiment.py
+  queue_repair_task.py
   expanded_cache.py
   cache_storage.py
   local_lint.py
