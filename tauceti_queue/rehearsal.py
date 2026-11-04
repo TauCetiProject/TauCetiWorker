@@ -1452,15 +1452,16 @@ class LiveRig(Rig):
             if time.monotonic() > deadline:
                 raise Failure(f"the service did not answer /status within 180 s; see {logfile.name}")
             time.sleep(2)
-        self.admin(
-            "/admin/settings",
-            {
-                "polling_interval_seconds": 15,
-                "infrastructure_retry_backoff_seconds": 5,
-                "outbox_retry_seconds": 5,
-                "dispatch_timeout_seconds": 900,
-            },
-        )
+        if fresh:  # the settings persist in the store, so a restart needs no admin call (and no token quota)
+            self.admin(
+                "/admin/settings",
+                {
+                    "polling_interval_seconds": 15,
+                    "infrastructure_retry_backoff_seconds": 5,
+                    "outbox_retry_seconds": 5,
+                    "dispatch_timeout_seconds": 900,
+                },
+            )
 
     def stop_service(self) -> None:
         if self.process is None:
