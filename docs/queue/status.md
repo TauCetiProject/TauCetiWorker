@@ -27,7 +27,7 @@ experiment sample and without a shadow period; the scratch-repository rehearsal 
 | F. GitHub adapters and Bors-compatible surface (`github_app.py`, `github_adapter.py`, `commands.py`, `eligibility.py`, `webhook.py`, `feeds.py`, `server.py`) | `queue/github-adapters` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/484 |
 | G. Repair task runner (`tauceti_queue/repair.py`, `repair_task.py`) | `queue/repair-task` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/483 |
 | H. Deployment (`config.py`, `__main__.py`, `runtime.py`, `services/queue/`, runbook) | `queue/deployment` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/482 |
-| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, `scripts/queue-rehearsal`, `docs/queue/rehearsal.md`) | `queue/rehearsal` | merged (https://github.com/TauCetiProject/TauCetiWorker/pull/491); the live run on `TauCetiProject/TauCetiQueueScratch` (created 2026-11-04, public since 13:40 UTC after GitHub's outage left it wedged for an hour) is in progress; its first heads found and fixed a real defect, https://github.com/TauCetiProject/TauCetiWorker/pull/495 (retained candidate refs must be pushed with their objects before dispatch) |
+| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, `scripts/queue-rehearsal`, `docs/queue/rehearsal.md`) | `queue/rehearsal` | merged (https://github.com/TauCetiProject/TauCetiWorker/pull/491); the live rehearsal on `TauCetiProject/TauCetiQueueScratch` passed every scenario the repository can express on 2026-11-04 (clean, eligibility via a `merge eligibility` check run, source failure repaired in place through the real worker runner, shrink to empty, admin advance plus rebase conflict plus re-probe, urgent, stale status, cancelled run, closed member, inference hold, restart, chain validation, feeds, status); report in [rehearsal-live.md](rehearsal-live.md) and [rehearsal-live-rerun.md](rehearsal-live-rerun.md), https://github.com/TauCetiProject/TauCetiWorker/pull/500; it found and fixed the dispatch-ref, log-race and store-cursor defects (https://github.com/TauCetiProject/TauCetiWorker/pull/495, https://github.com/TauCetiProject/TauCetiWorker/pull/497) |
 
 Storage is one SQLite file on the service host rather than PostgreSQL: a single-process service does
 not need a server database, and the operator prefers the simpler host.
@@ -41,19 +41,17 @@ keeps `MERGE_BACKEND=bors`, suspends the `tau-ceti-bors` App installation, point
 
 ## Next steps
 
-Increments 0 and 1 are code-complete on `main` as of 2026-11-04 10:30 UTC. In order: the operator
-creates the scratch repository and names the host; the live rehearsal runs against the scratch
-repository (`docs/queue/rehearsal.md`, 40 to 60 minutes); the service is installed on the host with
-publication disabled and its revision, feeds and a claimable task are verified
-(`docs/queue/operations.md`); then the cutover is one step for the operator to approve: suspend the
-`tau-ceti-bors` installation, point `bors.taucetiproject.org` at the service, enable publication.
-
-Landed after the streams, 2026-11-04 afternoon: https://github.com/TauCetiProject/TauCetiWorker/pull/494
-(tauchonki deployment record and installer clone fix), https://github.com/TauCetiProject/TauCetiWorker/pull/496
-(Bors state import for cutover and the approval poller, with a store locking fix),
-https://github.com/TauCetiProject/TauCetiWorker/pull/498 (trust the review App's check suite when GraphQL hides
-its App under the queue App's token; without it the poller approved nothing). tauchonki runs each merge within
-minutes through `services/queue/install.sh`.
+The cutover was brought to the operator on 2026-11-04 at 16:40 UTC with the shadow service on tauchonki
+holding 1,060 polled approvals, an open batch of 948 members and no failures. Before cutover (no
+production effect): the operator runs `cloudflared tunnel login` on tauchonki, then the tunnel,
+a temporary `queue.taucetiproject.org` hostname and the App webhook are activated and deliveries
+confirmed. Cutover: suspend the `tau-ceti-bors` installation after its running head lands, snapshot
+both Bors feeds and run `tauceti-queue import-bors` with the saved journals, enable publication and
+restart, point `bors.taucetiproject.org` at the tunnel (`MERGE_BACKEND` stays `bors`), then watch the
+first three heads. Rollback is the mirror image. Known gaps at cutover: the first head is small by
+design; repair tasks need a worker running `tauceti_queue.repair_task` against the service, which the
+worker loop does not do yet (run one by hand until it does); tauchonki is temporary and the service
+must move to a stable host before it counts as production (operator condition).
 
 ## Operator items outstanding
 
