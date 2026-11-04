@@ -3,18 +3,24 @@
 A worker claims a repair or rebase-conflict task from the queue service, prepares warm build
 artifacts, runs the repair agent in a private worktree and returns a validated attributed chain. The
 service alone adopts a chain; this module never publishes anything except the proposed tip under
-``refs/heads/queue/task-<task_id>`` in the content repository, which the service reads.
+the task's submission ref in the content repository, which the service fetches.
 
 Task protocol (``docs/queue/repair-task.md``), all JSON over HTTP with
 ``Authorization: Bearer <GitHub token of the worker's account>``:
 
-- ``POST /tasks/claim`` ``{worker}`` returns 204 when nothing is claimable, else a Task;
-- ``POST /tasks/<id>/renew`` ``{claim_token}`` returns ``{expires_at}``;
-- ``POST /tasks/<id>/result`` ``{claim_token, tip, pushed_ref, notes}`` returns
-  ``{adopted, reason, validation}``;
-- ``POST /tasks/<id>/release`` ``{claim_token, reason, notes}`` gives the task back unfinished with a
+- ``POST /tasks/claim`` ``{worker}`` returns 204 when nothing is claimable, else the controller's
+  ``Task`` record (``tauceti_queue/ports.py``: ``task_id``, ``kind``, ``base``, ``tip``, ``onto``,
+  ``members``, ``diagnostics``, ``retained_refs``, ``submission_ref``, ``claim_token``, ``expires_at``,
+  ``instruction``);
+- ``POST /tasks/<id>/renew`` ``{claim_token}`` returns the new ``expires_at``;
+- ``POST /tasks/<id>/result`` ``{claim_token, tip_sha, worker_notes}`` returns the ``Adoption``
+  record (``accepted``, ``reason``, ``violations``, ``retained_ref``, ``version``);
+- ``POST /tasks/<id>/release`` ``{claim_token, reason, error}`` gives the task back unfinished with a
   named reason (``artifacts_unavailable``, ``inference_unavailable``, ``agent_failed``,
   ``push_failed``); when the service has no such endpoint the worker lets the claim expire instead.
+
+The proposed chain is pushed to the task's ``submission_ref``
+(``refs/tauceti-queue/submissions/<task_id>/<claim_id>``) before ``result`` names its tip.
 
 Authorization is the security audit's predicate (``security_audit.require_admin``): the account must
 have admin permission on the repository, checked before any claim so a misconfigured worker fails
@@ -50,7 +56,7 @@ from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_cha
 
 SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
-PUSH_BRANCH = "queue/task-{task_id}"
+SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
 RELEASE_REASONS = ("artifacts_unavailable", "inference_unavailable", "agent_failed", "push_failed")
 HERE = Path(__file__).resolve().parent.parent
 GIT_SAFE_PUSH = HERE / "scripts" / "git-safe-push"
@@ -86,13 +92,24 @@ class EndpointMissing(Exception):
     """The service has no such endpoint (an older service without ``release``)."""
 
 
+CLAIM_CODES = ("unknown-task", "unknown-claim", "claim-expired", "claim-superseded", "not-authorized")
+TERMINAL_REJECTIONS = ("version-mismatch", "tip-unavailable", "not-authorized", "unknown-task")
+
+
 @dataclasses.dataclass
 class TaskMember:
+    """A member as the controller's ``ports.TaskMember`` describes it."""
+
     source_pr: str
-    pr: int
+    number: int
     accepted_head: str
     commit: str | None = None
     provenance: str | None = None
+    title: str = ""
+    description: str = ""
+    author: str = ""
+    explanation: str = ""
+    retained_ref: str = ""
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -100,6 +117,15 @@ class TaskMember:
 
 @dataclasses.dataclass
 class Task:
+    """The controller's ``ports.Task`` as the worker reads it from the claim response.
+
+    ``base`` and ``tip`` are the chain to start from; ``onto`` is the commit the replacement must be
+    based on (the canonical commit for a rebase conflict, ``base`` itself for a repair);
+    ``submission_ref`` is where the result is pushed; ``instruction`` is the agent instruction the
+    service sends (the plan's, verbatim). ``renew_after`` is not part of the controller's record: it
+    is ``extra.renew_after`` when the service sets it, else a third of the claim's lifetime.
+    """
+
     task_id: str
     kind: str  # repair | rebase_conflict
     repository: str
@@ -107,12 +133,17 @@ class Task:
     batch_version: int
     base: str
     tip: str
+    onto: str
     members: list[TaskMember]
-    diagnostics: dict
+    diagnostics: list | dict
     retained_refs: list[str]
+    submission_ref: str
     claim_token: str
     expires_at: float
     renew_after: float
+    instruction: str = ""
+    created_at: float | None = None
+    extra: dict = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_json(cls, data: dict) -> Task:
@@ -124,31 +155,61 @@ class Task:
         repository = str(data["repository"])
         members = []
         for raw in data["members"]:
-            source_pr = raw.get("source_pr") or f"{repository}#{raw['pr']}"
-            pr = int(raw.get("pr") or source_pr.rsplit("#", 1)[1])
+            number = raw.get("number", raw.get("pr"))
+            source_pr = raw.get("source_pr") or f"{repository}#{number}"
             members.append(
                 TaskMember(
                     source_pr=str(source_pr),
-                    pr=pr,
+                    number=int(number if number is not None else source_pr.rsplit("#", 1)[1]),
                     accepted_head=str(raw.get("accepted_head") or ""),
                     commit=raw.get("commit"),
                     provenance=raw.get("provenance"),
+                    title=str(raw.get("title") or ""),
+                    description=str(raw.get("description") or ""),
+                    author=str(raw.get("author") or ""),
+                    explanation=str(raw.get("explanation") or ""),
+                    retained_ref=str(raw.get("retained_ref") or ""),
                 )
             )
+        extra = dict(data.get("extra") or {})
+        expires_at = float(data["expires_at"])
+        diagnostics = data.get("diagnostics")
+        if not isinstance(diagnostics, (list, dict)):
+            diagnostics = []
+        conflict = (
+            next(
+                (d for d in diagnostics if isinstance(d, dict) and d.get("kind") == "conflict"),
+                None,
+            )
+            if isinstance(diagnostics, list)
+            else diagnostics.get("conflict")
+        )
+        onto = data.get("onto") or (conflict or {}).get("onto") or data["base"]
+        task_id = str(data["task_id"])
+        submission_ref = data.get("submission_ref") or (
+            f"{SUBMISSION_PREFIX}/{task_id}/{extra.get('claim_id', data['claim_token'])}"
+        )
         return cls(
-            task_id=str(data["task_id"]),
+            task_id=task_id,
             kind=str(data["kind"]),
             repository=repository,
             batch_id=str(data.get("batch_id", "")),
             batch_version=int(data.get("batch_version") or 0),
             base=str(data["base"]),
             tip=str(data["tip"]),
+            onto=str(onto),
             members=members,
-            diagnostics=dict(data.get("diagnostics") or {}),
+            diagnostics=diagnostics,
             retained_refs=list(data.get("retained_refs") or []),
+            submission_ref=str(submission_ref),
             claim_token=str(data["claim_token"]),
-            expires_at=float(data["expires_at"]),
-            renew_after=float(data.get("renew_after") or max(5.0, (float(data["expires_at"]) - time.time()) / 3)),
+            expires_at=expires_at,
+            renew_after=float(
+                data.get("renew_after") or extra.get("renew_after") or max(5.0, (expires_at - time.time()) / 3)
+            ),
+            instruction=str(data.get("instruction") or ""),
+            created_at=float(data["created_at"]) if data.get("created_at") is not None else None,
+            extra=extra,
         )
 
     def to_json(self) -> dict:
@@ -161,24 +222,19 @@ class Task:
         return [m.source_pr for m in self.members]
 
     @property
-    def conflict(self) -> dict | None:
-        conflict = self.diagnostics.get("conflict")
-        return dict(conflict) if isinstance(conflict, dict) else None
-
-    @property
     def validation_base(self) -> str:
-        """The base the result must sit on: for a rebase conflict the target base, else the batch base."""
-        if self.kind == "rebase_conflict" and self.conflict and self.conflict.get("onto"):
-            return str(self.conflict["onto"])
-        return self.base
-
-    @property
-    def push_branch(self) -> str:
-        return PUSH_BRANCH.format(task_id=self.task_id)
+        """The base the result must sit on: ``onto`` (the batch base itself for a repair)."""
+        return self.onto or self.base
 
 
 class TaskClient:
-    """The worker's side of the task protocol. Transport failures raise ``ServiceError``."""
+    """The worker's side of the task protocol. Transport failures raise ``ServiceError``.
+
+    Status codes: the service answers a claim that is no longer the caller's with 403/404/409/410, or
+    (through stream F's generic error mapping of ``TaskError``) with a JSON ``error``/``code`` naming
+    one of ``unknown-task``, ``unknown-claim``, ``claim-expired``, ``claim-superseded``,
+    ``not-authorized``; both are ``ClaimRefused``. 5xx without such a code is ``ServiceError``.
+    """
 
     def __init__(self, service: str, token: str, worker: str, timeout: float = 30.0):
         self.service = service.rstrip("/")
@@ -197,6 +253,7 @@ class TaskClient:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": f"tauceti-queue-repair-task/{self.worker}",
+                "X-TauCeti-Worker": self.worker,
             },
         )
         try:
@@ -207,58 +264,99 @@ class TaskClient:
             status = error.code
             with error:
                 payload = error.read()
-            if status >= 500:
-                raise ServiceError(f"{path}: HTTP {status}") from error
         except (urllib.error.URLError, OSError) as error:
             raise ServiceError(f"{path}: {error}") from error
-        if not payload:
-            return status, None
-        try:
-            return status, json.loads(payload)
-        except ValueError as error:
-            raise ServiceError(f"{path}: response is not JSON") from error
+        parsed = None
+        if payload:
+            try:
+                parsed = json.loads(payload)
+            except ValueError as error:
+                if status >= 500:
+                    raise ServiceError(f"{path}: HTTP {status}") from error
+                raise ServiceError(f"{path}: response is not JSON") from error
+        if status >= 400 and _claim_code(parsed):
+            raise ClaimRefused(f"{path}: HTTP {status} {_claim_code(parsed)}: {_error_text(parsed)}".strip())
+        if status >= 500:
+            raise ServiceError(f"{path}: HTTP {status} {_error_text(parsed)}".strip())
+        return status, parsed
 
     def claim(self) -> Task | None:
         status, payload = self._post("/tasks/claim", {"worker": self.worker})
         if status == 204 or (status == 200 and not payload):
             return None
         if status in (401, 403):
-            raise ClaimRefused(f"claim refused: HTTP {status} {(payload or {}).get('reason', '')}".strip())
+            raise ClaimRefused(f"claim refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200 or not isinstance(payload, dict):
-            raise ServiceError(f"claim: unexpected HTTP {status}")
+            raise ServiceError(f"claim: unexpected HTTP {status} {_error_text(payload)}".strip())
         return Task.from_json(payload)
 
     def renew(self, task: Task) -> float:
-        status, payload = self._post(f"/tasks/{task.task_id}/renew", {"claim_token": task.claim_token})
-        if status in (401, 403, 404, 409, 410):
-            raise ClaimRefused(f"renew refused: HTTP {status} {(payload or {}).get('reason', '')}".strip())
-        if status != 200 or not isinstance(payload, dict) or "expires_at" not in payload:
-            raise ServiceError(f"renew: unexpected HTTP {status}")
-        return float(payload["expires_at"])
-
-    def submit(self, task: Task, tip: str, pushed_ref: str, notes: dict | None) -> dict:
         status, payload = self._post(
-            f"/tasks/{task.task_id}/result",
-            {"claim_token": task.claim_token, "tip": tip, "pushed_ref": pushed_ref, "notes": notes or {}},
+            f"/tasks/{task.task_id}/renew", {"worker": self.worker, "claim_token": task.claim_token}
         )
         if status in (401, 403, 404, 409, 410):
-            raise ClaimRefused(f"result refused: HTTP {status} {(payload or {}).get('reason', '')}".strip())
+            raise ClaimRefused(f"renew refused: HTTP {status} {_error_text(payload)}".strip())
+        if status != 200:
+            raise ServiceError(f"renew: unexpected HTTP {status}")
+        # The controller returns the new expiry as a number; a dict form ``{expires_at}`` is accepted too.
+        value = payload.get("expires_at") if isinstance(payload, dict) else payload
+        if not isinstance(value, (int, float)):
+            raise ServiceError("renew: no expires_at in the response")
+        return float(value)
+
+    def submit(self, task: Task, tip: str, pushed_ref: str, notes: dict | None) -> dict:
+        """``submit_task(task_id, claim_token, tip_sha, worker_notes)``; returns the Adoption record."""
+        status, payload = self._post(
+            f"/tasks/{task.task_id}/result",
+            {
+                "worker": self.worker,
+                "claim_token": task.claim_token,
+                "tip_sha": tip,
+                "pushed_ref": pushed_ref,
+                "worker_notes": json.dumps(notes or {}, sort_keys=True, default=str),
+            },
+        )
+        if status in (401, 403, 404, 409, 410):
+            raise ClaimRefused(f"result refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200 or not isinstance(payload, dict):
             raise ServiceError(f"result: unexpected HTTP {status}")
+        if "accepted" not in payload and "adopted" in payload:
+            payload["accepted"] = bool(payload["adopted"])
         return payload
 
-    def release(self, task: Task, reason: str, notes: dict | None = None) -> dict:
+    def release(self, task: Task, reason: str, error: str = "") -> dict:
+        """``release_task(task_id, claim_token, reason, error)``."""
         status, payload = self._post(
             f"/tasks/{task.task_id}/release",
-            {"claim_token": task.claim_token, "reason": reason, "notes": notes or {}},
+            {"worker": self.worker, "claim_token": task.claim_token, "reason": reason, "error": error or ""},
         )
         if status in (404, 405, 501) and not (isinstance(payload, dict) and payload.get("task_id")):
             raise EndpointMissing(f"release: HTTP {status}")
         if status in (401, 403, 409, 410):
-            raise ClaimRefused(f"release refused: HTTP {status} {(payload or {}).get('reason', '')}".strip())
+            raise ClaimRefused(f"release refused: HTTP {status} {_error_text(payload)}".strip())
         if status not in (200, 204):
             raise ServiceError(f"release: unexpected HTTP {status}")
         return payload if isinstance(payload, dict) else {"released": True}
+
+
+def _claim_code(payload) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("code", "reason", "error"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            for code in CLAIM_CODES:
+                if code in value:
+                    return code
+    return None
+
+
+def _error_text(payload) -> str:
+    if isinstance(payload, dict):
+        for key in ("error", "reason", "detail"):
+            if isinstance(payload.get(key), str):
+                return payload[key]
+    return ""
 
 
 def with_retries(call, *, attempts: int, delays: tuple[float, ...], what: str):
@@ -474,12 +572,14 @@ def fetch_retained(clone: Path, task: Task) -> dict:
 
 
 def task_findings(task: Task) -> dict:
-    return repair.normalise_findings(task.diagnostics)
+    return repair.findings_from_diagnostics(task.diagnostics)
 
 
-def prompt_context(task: Task, feedback: str | None) -> PromptContext:
-    conflict = task.conflict
+def prompt_context(task: Task, feedback: str | None, findings: dict | None = None) -> PromptContext:
+    findings = findings if findings is not None else task_findings(task)
+    conflict = dict(findings.get("conflict") or {}) or None
     if conflict is not None:
+        conflict.setdefault("onto", task.onto)
         conflict.setdefault("previous_base", task.base)
     return PromptContext(
         repository=task.repository,
@@ -489,6 +589,7 @@ def prompt_context(task: Task, feedback: str | None) -> PromptContext:
         f"(batch {task.batch_id or '?'}, version {task.batch_version}).",
         conflict=conflict,
         feedback=feedback,
+        instruction=task.instruction or repair.AGENT_INSTRUCTION,
         members=[
             {"source_pr": m.source_pr, "accepted_head": m.accepted_head, "provenance": m.provenance}
             for m in task.members
@@ -510,18 +611,28 @@ def format_report(report: dict) -> str:
 
 
 def format_service_validation(response: dict) -> str:
+    """The Adoption record's ``violations`` (chain tool findings) as prompt text."""
+    violations = response.get("violations")
+    if isinstance(violations, list) and violations:
+        return "\n".join(
+            f"- {v.get('code', 'violation')}: {v.get('detail', '')}" if isinstance(v, dict) else f"- {v}"
+            for v in violations
+        )
     validation = response.get("validation")
-    if isinstance(validation, dict):
-        violations = validation.get("violations")
-        if isinstance(violations, list) and violations:
-            return "\n".join(
-                f"- {v.get('code', 'violation')}: {v.get('detail', '')}" if isinstance(v, dict) else f"- {v}"
-                for v in violations
-            )
-        return json.dumps(validation, indent=1, default=str)[:4000]
     if isinstance(validation, str):
         return validation
+    if isinstance(validation, dict):
+        return json.dumps(validation, indent=1, default=str)[:4000]
     return f"- {response.get('reason', 'the service did not adopt the chain')}"
+
+
+def rejected_members(response: dict) -> list[str]:
+    """The members an ``explanation-required`` rejection names."""
+    members = []
+    for violation in response.get("violations") or []:
+        if isinstance(violation, dict) and violation.get("source_pr"):
+            members.append(str(violation["source_pr"]))
+    return members
 
 
 def read_telemetry(logdir: Path, provider: str) -> dict:
@@ -632,16 +743,17 @@ def _expire_attempt(expired: threading.Event, cancel: threading.Event) -> None:
 
 
 def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir: Path, expect: str | None) -> dict:
-    """Push the proposed tip to ``refs/heads/queue/task-<id>`` through ``git-safe-push``.
+    """Push the proposed tip to the task's ``submission_ref`` through ``git-safe-push``.
 
-    ``expect`` is the oid this task last pushed (branch CAS); the first push of a task is create-only
-    and, when the branch already exists from an earlier claimant of the same task, is retried once
-    against the oid observed on the remote: the service re-exposed the task, so that chain is stale.
+    The ref is ``refs/tauceti-queue/submissions/<task_id>/<claim_id>``, private to this claim; the
+    controller fetches it when the result is submitted. ``expect`` is the oid this runner last pushed
+    there (ref CAS); the first push is create-only and, when the ref already exists (a previous
+    incarnation of this runner under the same claim), is retried once against the observed oid.
     """
     remote = cfg.push_remote or f"https://github.com/{task.repository}"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("TAUCETI_PUSH_", "TAUCETI_CLAIM_", "GIT_CONFIG_"))}
     env.update(
-        TAUCETI_PUSH_REF=task.push_branch,
+        TAUCETI_PUSH_REF=task.submission_ref,
         TAUCETI_PUSH_EXPECT=expect or "",
         TAUCETI_PUSH_REMOTE=remote,
         TAUCETI_PUSH_OID=tip,
@@ -650,12 +762,12 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
     env.pop("TAUCETI_RECOVERY_CONTINUATION", None)
     record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
     if record["rc"] == 78 and not expect:
-        observed = git(worktree, "ls-remote", remote, f"refs/heads/{task.push_branch}", check=False).split()
+        observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False).split()
         if observed:
             env["TAUCETI_PUSH_EXPECT"] = observed[0]
             record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
             record["superseded"] = observed[0]
-    record["ref"] = f"refs/heads/{task.push_branch}"
+    record["ref"] = task.submission_ref
     record["remote"] = remote
     record["ok"] = record["rc"] == 0
     return record
@@ -675,12 +787,12 @@ def release_task(
     assert reason in RELEASE_REASONS
     if lease is not None:
         lease.submitting.set()
-    notes = {"worker": cfg.worker, "detail": detail}
+    error = str(detail or "")[:2000]
     outcome = outcome if outcome is not None else {"task_id": task.task_id}
     outcome.update(status="released", reason=reason, detail=detail)
     try:
         outcome["response"] = with_retries(
-            lambda: client.release(task, reason, notes),
+            lambda: client.release(task, reason, error),
             attempts=cfg.service_attempts,
             delays=cfg.service_delays,
             what="release",
@@ -758,49 +870,56 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
         pushed: str | None = None
         attempt = 0
         validation_retries = 0
+        explanation_resubmits = 0
+        resubmit = False
         agent_records: list[dict] = []
         resume_session = state.session() if resuming else None
         while True:
             attempt += 1
             if cancel.is_set():
                 return discard(lease.lost_reason or "cancelled before the agent started")
-            if resume_session:
-                prompt = (
-                    "The worker running this task was interrupted and has resumed your session; the worktree is as "
-                    "you left it. Continue the task from where you were, and finish with the summary the original "
-                    "instructions ask for.\n\n"
-                    + repair.compose_prompt(prompt_context(task, feedback), findings, chain_before, cfg.clone)
-                )
+            if resubmit:
+                resubmit = False  # the explanation turn already ran; check and submit its result
             else:
-                prompt = repair.compose_prompt(prompt_context(task, feedback), findings, chain_before, cfg.clone)
-            agent = run_repair_agent(
-                cfg,
-                task,
-                worktree,
-                prompt,
-                logdir,
-                cancel,
-                state,
-                env_lake,
-                resume=resume_session,
-                label=f"attempt-{attempt}",
-            )
-            resume_session = None
-            agent_records.append(agent)
-            outcome["agent"] = agent_records
-            if agent["status"] == "cancelled":
-                return discard(lease.lost_reason or "the agent was cancelled")
-            if agent["status"] == "inference_unavailable":
-                return release_task(
-                    cfg, client, task, state, "inference_unavailable", agent.get("reason"), outcome, lease
+                prompt = repair.compose_prompt(
+                    prompt_context(task, feedback, findings), findings, chain_before, cfg.clone
                 )
-            if agent["status"] == "artifacts_unavailable":
-                return release_task(
-                    cfg, client, task, state, "artifacts_unavailable", agent.get("reason"), outcome, lease
+                if resume_session:
+                    prompt = (
+                        "The worker running this task was interrupted and has resumed your session; the worktree is "
+                        "as you left it. Continue the task from where you were, and finish with the summary the "
+                        "original instructions ask for.\n\n" + prompt
+                    )
+                agent = run_repair_agent(
+                    cfg,
+                    task,
+                    worktree,
+                    prompt,
+                    logdir,
+                    cancel,
+                    state,
+                    env_lake,
+                    resume=resume_session,
+                    label=f"attempt-{attempt}",
                 )
+                resume_session = None
+                agent_records.append(agent)
+                outcome["agent"] = agent_records
+                if agent["status"] == "cancelled":
+                    return discard(lease.lost_reason or "the agent was cancelled")
+                if agent["status"] == "inference_unavailable":
+                    return release_task(
+                        cfg, client, task, state, "inference_unavailable", agent.get("reason"), outcome, lease
+                    )
+                if agent["status"] == "artifacts_unavailable":
+                    return release_task(
+                        cfg, client, task, state, "artifacts_unavailable", agent.get("reason"), outcome, lease
+                    )
             tip = git(worktree, "rev-parse", "HEAD").strip()
             git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
-            report = repair.chain_report(cfg.clone, task.validation_base, task.tip, tip, task.member_keys)
+            report = repair.chain_report(
+                cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+            )
             if report["ok"] and report["unexplained"] and not cancel.is_set():
                 follow = run_repair_agent(
                     cfg,
@@ -823,7 +942,9 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                     )
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
-                report = repair.chain_report(cfg.clone, task.validation_base, task.tip, tip, task.member_keys)
+                report = repair.chain_report(
+                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                )
             report["dirty"] = bool(git(worktree, "status", "--porcelain", "--untracked-files=no").strip())
             report["unchanged"] = tip == task.tip
             report["agent_failed"] = agent["status"] == "failed"
@@ -878,20 +999,50 @@ def run_task(cfg: RunnerConfig, task: Task, client: TaskClient, *, resume_state:
                 return discard(f"result refused: {error}")
             state.write("submitted", attempt=attempt, response=response)
             outcome["response"] = response
-            if response.get("adopted"):
+            reason = str(response.get("reason") or "")
+            if response.get("accepted"):
                 lease.stop()
-                outcome.update(status="adopted", tip=tip, pushed_ref=push["ref"])
+                outcome.update(status="adopted", tip=tip, pushed_ref=push["ref"], version=response.get("version"))
                 state.write("adopted", outcome=outcome)
                 return outcome
-            if response.get("reason") == "validation" and validation_retries < cfg.validation_retries:
-                lease.submitting.clear()
+            if reason in CLAIM_CODES:
+                return discard(f"result rejected: {reason}")
+            lease.submitting.clear()
+            if reason == "explanation-required" and explanation_resubmits < cfg.validation_retries:
+                # The controller asks the same claim to add the explanation and resubmit.
+                explanation_resubmits += 1
+                named = rejected_members(response) or report.get("edited") or task.member_keys
+                follow = run_repair_agent(
+                    cfg,
+                    task,
+                    worktree,
+                    repair.explanation_prompt(named, chain_before),
+                    logdir,
+                    cancel,
+                    state,
+                    env_lake,
+                    resume=agent.get("session"),
+                    label=f"attempt-{attempt}-explanation-resubmit",
+                )
+                agent_records.append(follow)
+                if follow["status"] == "cancelled":
+                    return discard(lease.lost_reason or "the explanation turn was cancelled")
+                if follow["status"] == "inference_unavailable":
+                    return release_task(
+                        cfg, client, task, state, "inference_unavailable", follow.get("reason"), outcome, lease
+                    )
+                attempt -= 1  # the resubmission continues this attempt
+                feedback = None
+                resubmit = True
+                continue
+            if reason == "invalid-chain" and validation_retries < cfg.validation_retries:
                 validation_retries += 1
                 feedback = "The queue's validation of the previous attempt's chain:\n" + format_service_validation(
                     response
                 )
-                log(f"chain not adopted ({response.get('reason')}); retrying with the validation report")
+                log(f"chain not adopted ({reason}); retrying with the validation report")
                 continue
-            outcome.update(status="not_adopted", tip=tip, pushed_ref=push["ref"], reason=response.get("reason"))
+            outcome.update(status="not_adopted", tip=tip, pushed_ref=push["ref"], reason=reason)
             state.write("not_adopted", outcome=outcome)
             return outcome
     except Exception as error:  # the state record must say what happened

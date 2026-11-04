@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """The worker-side queue repair task (tauceti_queue.repair_task) against a fake service.
 
-No inference and no network: the queue service is an ``http.server`` in a thread, the content
+No inference and no network: the queue service is an ``http.server`` in a thread speaking the
+controller's task API (stream E's ``claim_task``/``renew_task``/``submit_task``/``release_task`` shapes
+and reason codes, served the way stream F's server encodes them), the content
 repository is a local bare repository with a three-member attributed chain whose second member breaks
 the build, ``lake`` is a stub on PATH that fails modules containing ``BROKEN``, ``gh`` is a stub that
 grants admin permission, and ``claude`` is a scripted stub that rewrites the constituent commits the
@@ -229,7 +231,18 @@ class Content:
         assert built.status == chain_tool.CLEAN, built
         self.tip = built.tip
         self.members = [
-            {"source_pr": f"{PROJECT}#{n}", "pr": n, "accepted_head": heads[n], "commit": c.sha, "provenance": "clean"}
+            {
+                "source_pr": f"{PROJECT}#{n}",
+                "number": n,
+                "accepted_head": heads[n],
+                "commit": c.sha,
+                "provenance": "clean",
+                "title": f"feat: add {n}",
+                "description": f"Body of {n}.",
+                "author": "alice",
+                "explanation": "",
+                "retained_ref": f"refs/tauceti-queue/inputs/{n}/{heads[n]}",
+            }
             for n, c in zip((1, 2, 3), built.commits, strict=True)
         ]
         sh(seed, "push", "--quiet", "origin", f"{self.base}:refs/heads/queue/batch-1/base")
@@ -239,23 +252,30 @@ class Content:
         sh(self.clone, "config", "user.name", "Worker")
         sh(self.clone, "config", "user.email", "worker@example.invalid")
 
-    def task(self, task_id: str = "t1", kind: str = "repair") -> dict:
+    def task(self, task_id: int = 1, kind: str = "repair") -> dict:
+        """The controller's Task record (``ports.Task.to_dict``) before the claim fields are added."""
         return {
             "task_id": task_id,
             "kind": kind,
             "repository": PROJECT,
-            "batch_id": "b1",
+            "batch_id": 7,
             "batch_version": 3,
             "base": self.base,
             "tip": self.tip,
+            "onto": self.base,
             "members": self.members,
-            "diagnostics": {
-                "compiler_errors": [
-                    {"path": "TauCeti/Two.lean", "line": 1, "column": 20, "message": "unknown identifier BROKEN"}
-                ],
-                "failed_modules": ["TauCeti.Two"],
-            },
+            "diagnostics": [
+                {
+                    "kind": "compiler",
+                    "module": "TauCeti/Two.lean",
+                    "message": "TauCeti/Two.lean:1:20: unknown identifier BROKEN",
+                },
+                {"kind": "build", "module": "TauCeti/Two.lean", "message": "module failed to build"},
+            ],
             "retained_refs": ["refs/heads/queue/batch-1/base", "refs/heads/queue/batch-1/tip"],
+            "instruction": repair.AGENT_INSTRUCTION,
+            "created_at": time.time(),
+            "extra": {"canonical_branch": "main"},
         }
 
 
@@ -263,16 +283,20 @@ class Content:
 
 
 class FakeService:
-    """Claims with expiry, renewals, results validated with the chain tool against the bare repository,
-    and an optional release endpoint. Scripted result responses override the validation."""
+    """The task API with the controller's semantics: claims with expiry within a concurrency of one,
+    renewals, submissions validated with the chain tool (``validate`` on ``onto``, ``compare`` against
+    the prior chain, ``explanation-required``), the ``release`` call, and the controller's reason codes
+    and ``Adoption`` shape, encoded the way stream F's server does (bare JSON results, ``{"error"}``
+    bodies, a ``TaskError`` as 409 with its code). Scripted ``Adoption`` responses override the
+    validation."""
 
     def __init__(self, bare: Path, tasks: list[dict], *, ttl: float = 5.0, renew_after: float = 0.2):
         self.bare = bare
-        self.tasks = {t["task_id"]: dict(t) for t in tasks}
+        self.tasks = {int(t["task_id"]): dict(t) for t in tasks}
         self.ttl = ttl
         self.renew_after = renew_after
-        self.claims: dict[str, dict] = {}
-        self.done: set[str] = set()
+        self.claims: dict[int, dict] = {}  # claim id -> record
+        self.done: set[int] = set()
         self.results: list[dict] = []
         self.releases: list[dict] = []
         self.renewals = 0
@@ -312,84 +336,171 @@ class FakeService:
         self.server.shutdown()
         self.server.server_close()
 
-    def preclaim(self, task_id: str, token: str, worker: str) -> dict:
-        with self.lock:
-            self.claims[task_id] = {"token": token, "worker": worker, "expires_at": time.time() + self.ttl}
-            return self.claims[task_id]
+    # -- controller semantics
 
-    def _claim_ok(self, task_id: str, token: str) -> bool:
-        claim = self.claims.get(task_id)
-        return bool(claim and claim["token"] == token and claim["expires_at"] > time.time())
+    def live_claim(self, task_id: int) -> dict | None:
+        now = time.time()
+        for claim in self.claims.values():
+            if claim["task_id"] == task_id and claim["released_at"] is None and claim["expires_at"] > now:
+                return claim
+        return None
+
+    def _claim_for(self, task_id: int, token: str) -> dict:
+        """E's ``_claim_for``: TaskError unknown-claim / claim-superseded / claim-expired."""
+        claim = next((c for c in self.claims.values() if c["task_id"] == task_id and c["token"] == token), None)
+        if claim is None:
+            raise LookupError("unknown-claim")
+        if claim["released_at"] is not None:
+            raise LookupError("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
+        if claim["expires_at"] <= time.time():
+            claim["released_at"] = time.time()
+            claim["release_reason"] = "expired"
+            raise LookupError("claim-expired")
+        return claim
+
+    def task_record(self, task_id: int, claim: dict) -> dict:
+        task = self.tasks[task_id]
+        return {
+            **task,
+            "submission_ref": f"refs/tauceti-queue/submissions/{task_id}/{claim['id']}",
+            "claim_token": claim["token"],
+            "expires_at": claim["expires_at"],
+            "extra": {**task.get("extra", {}), "claim_id": claim["id"], "renew_after": self.renew_after},
+        }
+
+    def preclaim(self, task_id: int, token: str, worker: str) -> dict:
+        claim = {
+            "id": len(self.claims) + 1,
+            "task_id": task_id,
+            "token": token,
+            "worker": worker,
+            "expires_at": time.time() + self.ttl,
+            "released_at": None,
+            "release_reason": None,
+        }
+        self.claims[claim["id"]] = claim
+        return claim
+
+    def claim_task(self, worker: str) -> dict | None:
+        self.claim_attempts.append({"worker": worker})
+        for task_id in self.tasks:
+            if task_id in self.done or self.live_claim(task_id) is not None:  # repair_concurrency = 1
+                continue
+            return self.task_record(task_id, self.preclaim(task_id, secrets.token_hex(16), worker))
+        return None
+
+    def renew_task(self, task_id: int, token: str) -> float:
+        claim = self._claim_for(task_id, token)
+        if self.renew_mode == "refuse":
+            claim["released_at"] = time.time()
+            claim["release_reason"] = "superseded"
+            raise LookupError("claim-superseded")
+        if self.renew_mode == "error":
+            raise RuntimeError("database unavailable")
+        self.renewals += 1
+        claim["expires_at"] = time.time() + self.ttl
+        return claim["expires_at"]
+
+    def release_task(self, task_id: int, token: str, reason: str, error: str) -> dict:
+        claim = self._claim_for(task_id, token)
+        claim["released_at"] = time.time()
+        claim["release_reason"] = reason
+        self.releases.append({"task_id": task_id, "reason": reason, "error": error, "worker": claim["worker"]})
+        return {"task_id": task_id, "released": True}
+
+    def submit_task(self, task_id: int, token: str, tip_sha: str, worker_notes: str) -> dict:
+        task = self.tasks[task_id]
+        claim = next((c for c in self.claims.values() if c["task_id"] == task_id and c["token"] == token), None)
+        if claim is None:
+            raise LookupError("unknown-claim")
+        record = {"task_id": task_id, "tip_sha": tip_sha, "worker_notes": worker_notes, "claim_id": claim["id"]}
+
+        def adoption(accepted: bool, reason: str, violations=(), version=None) -> dict:
+            response = {
+                "accepted": accepted,
+                "reason": reason,
+                "task_id": task_id,
+                "batch_id": task["batch_id"],
+                "version": version,
+                "tip": tip_sha,
+                "retained_ref": f"refs/tauceti-queue/batches/{task['batch_id']}/submissions/{tip_sha}",
+                "violations": [v.to_dict() if hasattr(v, "to_dict") else v for v in violations],
+                "provenance": {},
+            }
+            record["response"] = response
+            self.results.append(record)
+            return response
+
+        if self.result_script:
+            scripted = self.result_script.pop(0)
+            return adoption(scripted.get("accepted", False), scripted.get("reason", ""), scripted.get("violations", ()))
+        if claim["released_at"] is not None:
+            return adoption(False, "claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
+        if claim["expires_at"] <= time.time():
+            return adoption(False, "claim-expired")
+        ref = f"refs/tauceti-queue/submissions/{task_id}/{claim['id']}"
+        try:
+            pushed = sh(self.bare, "rev-parse", "--verify", ref)
+        except subprocess.CalledProcessError:
+            return adoption(False, "tip-unavailable")
+        if pushed != tip_sha:
+            return adoption(False, "tip-unavailable")
+        members = [m["source_pr"] for m in task["members"]]
+        report = chain_tool.validate(self.bare, task["onto"], tip_sha, members)
+        if not report.ok:
+            return adoption(False, "invalid-chain", report.violations)
+        comparison = chain_tool.compare(self.bare, task["base"], task["tip"], task["onto"], tip_sha)
+        if not comparison.ok:
+            return adoption(False, "invalid-chain", comparison.violations)
+        unexplained = [m for m in comparison.members if m.provenance == chain_tool.EDITED and not m.explanation.strip()]
+        if unexplained:
+            return adoption(
+                False,
+                "explanation-required",
+                [
+                    {
+                        "code": "explanation-required",
+                        "detail": f"{m.source_pr}: no explanation",
+                        "source_pr": m.source_pr,
+                    }
+                    for m in unexplained
+                ],
+            )
+        self.done.add(task_id)
+        claim["released_at"] = time.time()
+        claim["release_reason"] = "adopted"
+        return adoption(True, "adopted", version=task["batch_version"] + 1)
+
+    # -- F's encoding
 
     def handle(self, path: str, body: dict, auth: str | None):
         if auth != f"Bearer {TOKEN}":
-            return 401, {"reason": "unauthorized"}
+            return 401, {"error": "a GitHub token in `Authorization: Bearer` is required"}
         with self.lock:
-            if path == "/tasks/claim":
-                self.claim_attempts.append(body)
-                now = time.time()
-                for task_id, task in self.tasks.items():
-                    claim = self.claims.get(task_id)
-                    if task_id in self.done or (claim and claim["expires_at"] > now):
-                        continue
-                    token = secrets.token_hex(8)
-                    self.claims[task_id] = {"token": token, "worker": body.get("worker"), "expires_at": now + self.ttl}
-                    return 200, {
-                        **task,
-                        "claim_token": token,
-                        "expires_at": now + self.ttl,
-                        "renew_after": self.renew_after,
-                    }
-                return 204, None
-            match = re.fullmatch(r"/tasks/([^/]+)/(renew|result|release)", path)
-            if not match:
-                return 404, {"reason": "no such endpoint"}
-            task_id, verb = match.groups()
-            if verb == "release" and not self.release_supported:
-                return 404, {"reason": "no such endpoint"}
-            if task_id not in self.tasks:
-                return 404, {"reason": "no such task", "task_id": task_id}
-            if not self._claim_ok(task_id, body.get("claim_token", "")):
-                return 409, {"reason": "claim_invalid", "adopted": False}
-            if verb == "renew":
-                if self.renew_mode == "refuse":
-                    del self.claims[task_id]
-                    return 410, {"reason": "claim_expired"}
-                if self.renew_mode == "error":
-                    return 503, {"reason": "unavailable"}
-                self.renewals += 1
-                self.claims[task_id]["expires_at"] = time.time() + self.ttl
-                return 200, {"expires_at": self.claims[task_id]["expires_at"]}
-            if verb == "release":
-                self.releases.append({"task_id": task_id, **body})
-                del self.claims[task_id]
-                return 200, {"task_id": task_id, "released": True}
-            # result
-            record = {"task_id": task_id, **body}
-            if self.result_script:
-                response = self.result_script.pop(0)
-            else:
-                ref = body.get("pushed_ref", "")
-                task = self.tasks[task_id]
-                try:
-                    pushed = sh(self.bare, "rev-parse", "--verify", ref)
-                except subprocess.CalledProcessError:
-                    response = {"adopted": False, "reason": "pushed_ref_missing", "validation": None}
-                else:
-                    report = chain_tool.validate(
-                        self.bare, task["base"], pushed, [m["source_pr"] for m in task["members"]]
-                    )
-                    response = {
-                        "adopted": report.ok and pushed == body.get("tip"),
-                        "reason": "adopted" if report.ok else "validation",
-                        "validation": report.to_dict(),
-                    }
-            record["response"] = response
-            self.results.append(record)
-            if response.get("adopted"):
-                self.done.add(task_id)
-                del self.claims[task_id]
-            return 200, response
+            try:
+                if path == "/tasks/claim":
+                    result = self.claim_task(str(body.get("worker") or ""))
+                    return (204, None) if result is None else (200, result)
+                match = re.fullmatch(r"/tasks/([^/]+)/(renew|result|release)", path)
+                if not match:
+                    return 404, {"error": "no such route"}
+                task_id, verb = int(match.group(1)), match.group(2)
+                if verb == "release" and not self.release_supported:
+                    return 404, {"error": "no such route"}
+                if task_id not in self.tasks:
+                    raise LookupError("unknown-task")
+                token = str(body.get("claim_token") or "")
+                if verb == "renew":
+                    return 200, self.renew_task(task_id, token)
+                if verb == "release":
+                    return 200, self.release_task(task_id, token, str(body.get("reason")), str(body.get("error", "")))
+                return 200, self.submit_task(
+                    task_id, token, str(body.get("tip_sha") or ""), str(body.get("worker_notes", ""))
+                )
+            except LookupError as error:  # TaskError: a stable code in the body
+                return 409, {"error": str(error), "code": str(error)}
+            except RuntimeError as error:
+                return 500, {"error": str(error)}
 
 
 # ---- tests ---------------------------------------------------------------------------------------
@@ -439,8 +550,11 @@ class Fixture(unittest.TestCase):
         path = self.stub_dir / "lake-calls.log"
         return path.read_text().splitlines() if path.exists() else []
 
-    def state(self, task_id="t1") -> dict:
+    def state(self, task_id="1") -> dict:
         return json.loads((self.root / "state" / "tasks" / task_id / "task.json").read_text())
+
+    def submission_ref(self, claim_id: int = 1, task_id: int = 1) -> str:
+        return f"refs/tauceti-queue/submissions/{task_id}/{claim_id}"
 
 
 class HappyPath(Fixture):
@@ -451,14 +565,16 @@ class HappyPath(Fixture):
         # The service saw one claim, renewals while the agent ran, and one result with the pushed ref.
         self.assertEqual(len(self.service.results), 1)
         result = self.service.results[0]
-        self.assertEqual(result["pushed_ref"], "refs/heads/queue/task-t1")
-        self.assertEqual(result["tip"], outcome["tip"])
-        self.assertTrue(result["response"]["adopted"])
+        self.assertEqual(result["tip_sha"], outcome["tip"])
+        self.assertTrue(result["response"]["accepted"])
+        self.assertEqual(outcome["version"], 4)
+        self.assertEqual(json.loads(result["worker_notes"])["edited"], [f"{PROJECT}#2"])
         self.assertGreaterEqual(outcome["lease"]["renewals"], 1)
         self.assertFalse(outcome["lease"]["lost"])
         # The pushed chain is on the bare repository, validates, and member #2 is edited with an explanation.
-        pushed = sh(self.content.bare, "rev-parse", "refs/heads/queue/task-t1")
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
         self.assertEqual(pushed, outcome["tip"])
+        self.assertEqual(outcome["pushed_ref"], self.submission_ref())
         comparison = chain_tool.compare(
             self.content.bare, self.content.base, self.content.tip, self.content.base, pushed
         )
@@ -480,15 +596,17 @@ class HappyPath(Fixture):
         self.assertEqual(len(calls), 1)
         prompt = calls[0]["prompt"]
         self.assertTrue(prompt.startswith(repair.AGENT_INSTRUCTION))
-        self.assertIn("TauCeti/Two.lean:1:20", prompt)
+        self.assertIn("`TauCeti/Two.lean:1:20`", prompt)
+        self.assertIn("unknown identifier BROKEN", prompt)
         self.assertIn("changed by PR #2", prompt)
+        self.assertIn("- build in `TauCeti/Two.lean` (PR #2): module failed to build", prompt)
         self.assertIn(f"Source-PR: {PROJECT}#3", prompt)
         self.assertIn("do not push", prompt)
-        self.assertIn("repair task t1", prompt)
+        self.assertIn("repair task 1", prompt)
         self.assertIsNone(calls[0]["env"]["GH_TOKEN"])
         self.assertTrue(calls[0]["env"]["GIT_CONFIG_VALUE_0"].endswith("no-push"))
         self.assertTrue(calls[0]["env"]["CLAUDE_CONFIG_DIR"].startswith(str(self.root / "state")))
-        self.assertEqual(calls[0]["cwd"], str(self.root / "state" / "worktrees" / "task-t1"))
+        self.assertEqual(calls[0]["cwd"], str(self.root / "state" / "worktrees" / "task-1"))
         # Checkpoints, retained refs, cost accounting and cleanup.
         state = self.state()
         self.assertEqual(state["state"], "adopted")
@@ -503,12 +621,12 @@ class HappyPath(Fixture):
             "submitted",
         ):
             self.assertIn(expected, states)
-        self.assertEqual(sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/t1/attempt-1"), outcome["tip"])
-        self.assertEqual(sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/t1/input"), self.content.tip)
+        self.assertEqual(sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/1/attempt-1"), outcome["tip"])
+        self.assertEqual(sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/1/input"), self.content.tip)
         self.assertIsNotNone(outcome["agent"][0]["attempts"][0]["estimated_cost_usd"])
-        written = json.loads((self.root / "state" / "tasks" / "t1" / "outcome.json").read_text())
+        written = json.loads((self.root / "state" / "tasks" / "1" / "outcome.json").read_text())
         self.assertEqual(written["status"], "adopted")
-        self.assertFalse((self.root / "state" / "worktrees" / "task-t1").exists())
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
         self.assertIsNone(repair_task.claim_and_run(cfg, self.client(cfg)), "the adopted task is not claimable again")
 
     def test_second_claimant_and_stale_token_are_refused(self):
@@ -517,15 +635,22 @@ class HappyPath(Fixture):
         self.assertIsNotNone(first)
         second = self.client(cfg, "worker-b@test")
         self.assertIsNone(second.claim(), "a claimed task is not offered to a second worker")
+        self.assertEqual(first.submission_ref, self.submission_ref(1))
+        self.assertEqual(first.onto, self.content.base)
+        self.assertEqual(first.members[1].number, 2)
+        self.assertAlmostEqual(first.renew_after, 0.2)
         stale = repair_task.Task.from_json({**first.to_json(), "claim_token": "not-the-token"})
-        with self.assertRaises(repair_task.ClaimRefused):
-            second.submit(stale, first.tip, "refs/heads/queue/task-t1", {})
+        with self.assertRaises(repair_task.ClaimRefused) as refused:
+            second.submit(stale, first.tip, first.submission_ref, {})
+        self.assertIn("unknown-claim", str(refused.exception))
         with self.assertRaises(repair_task.ClaimRefused):
             second.renew(stale)
         self.assertEqual(self.service.results, [])
         # Once the first claim expires the task is claimable again, by anyone.
-        self.service.claims["t1"]["expires_at"] = time.time() - 1
-        self.assertIsNotNone(second.claim())
+        self.service.claims[1]["expires_at"] = time.time() - 1
+        third = second.claim()
+        self.assertIsNotNone(third)
+        self.assertEqual(third.submission_ref, self.submission_ref(2), "a new claim gets its own submission ref")
 
 
 class ClaimExpiry(Fixture):
@@ -542,7 +667,7 @@ class ClaimExpiry(Fixture):
         self.assertEqual(self.service.releases, [])
         self.assertTrue(outcome["lease"]["lost"])
         self.assertEqual(self.state()["state"], "claim_lost")
-        self.assertFalse(sh(self.content.bare, "rev-parse", "--verify", "-q", "refs/heads/queue/task-t1", check=False))
+        self.assertFalse(sh(self.content.bare, "rev-parse", "--verify", "-q", self.submission_ref(), check=False))
 
     def test_renew_errors_keep_the_agent_running(self):
         cfg = self.config()
@@ -557,12 +682,9 @@ class ValidationRetry(Fixture):
         cfg = self.config()
         self.service.result_script = [
             {
-                "adopted": False,
-                "reason": "validation",
-                "validation": {
-                    "ok": False,
-                    "violations": [{"code": "accepted-head-mismatch", "detail": "#2 head differs"}],
-                },
+                "accepted": False,
+                "reason": "invalid-chain",
+                "violations": [{"code": "accepted-head-mismatch", "detail": "#2 head differs"}],
             }
         ]
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
@@ -573,14 +695,50 @@ class ValidationRetry(Fixture):
         self.assertIn("A previous attempt was rejected", calls[1]["prompt"])
         self.assertIn("accepted-head-mismatch: #2 head differs", calls[1]["prompt"])
         self.assertIsNone(calls[1]["resume"], "a rejected attempt starts a fresh session")
-        # The second push updated the task branch in place (CAS against the first push).
-        self.assertEqual(sh(self.content.bare, "rev-parse", "refs/heads/queue/task-t1"), outcome["tip"])
+        # The second push updated the submission ref in place (CAS against the first push).
+        self.assertEqual(sh(self.content.bare, "rev-parse", self.submission_ref()), outcome["tip"])
+
+    def test_explanation_required_resubmits_in_the_same_session(self):
+        cfg = self.config()
+        self.service.result_script = [
+            {
+                "accepted": False,
+                "reason": "explanation-required",
+                "violations": [
+                    {"code": "explanation-required", "detail": "#2: no explanation", "source_pr": f"{PROJECT}#2"}
+                ],
+            }
+        ]
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.service.results), 2)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["resume"], "sess-1", "the same claim adds the explanation in its session")
+        self.assertIn(f"{PROJECT}#2", calls[1]["prompt"])
+        self.assertNotIn(repair.AGENT_INSTRUCTION, calls[1]["prompt"])
+
+    def test_a_terminal_rejection_ends_the_task(self):
+        cfg = self.config()
+        self.service.result_script = [{"accepted": False, "reason": "version-mismatch"}]
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "not_adopted", outcome)
+        self.assertEqual(outcome["reason"], "version-mismatch")
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(len(self.agent_calls()), 1)
+
+    def test_a_superseded_claim_at_submission_is_a_lost_claim(self):
+        cfg = self.config()
+        self.service.result_script = [{"accepted": False, "reason": "claim-superseded"}]
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "claim_lost", outcome)
+        self.assertIn("claim-superseded", outcome["detail"])
 
     def test_persistent_rejection_is_not_retried_again(self):
         cfg = self.config()
         self.service.result_script = [
-            {"adopted": False, "reason": "validation", "validation": "wrong base"},
-            {"adopted": False, "reason": "validation", "validation": "still wrong"},
+            {"accepted": False, "reason": "invalid-chain", "violations": [{"code": "wrong-base", "detail": "x"}]},
+            {"accepted": False, "reason": "invalid-chain", "violations": [{"code": "wrong-base", "detail": "x"}]},
         ]
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "not_adopted", outcome)
@@ -611,7 +769,7 @@ class MissingExplanation(Fixture):
         self.assertIn("without appending an explanation", calls[1]["prompt"])
         self.assertIn(f"{PROJECT}#2", calls[1]["prompt"])
         self.assertNotIn(repair.AGENT_INSTRUCTION, calls[1]["prompt"])
-        pushed = sh(self.content.bare, "rev-parse", "refs/heads/queue/task-t1")
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
         comparison = chain_tool.compare(
             self.content.bare, self.content.base, self.content.tip, self.content.base, pushed
         )
@@ -631,9 +789,10 @@ class ArtifactsUnavailable(Fixture):
         self.assertEqual(self.agent_calls(), [], "the agent never ran cold")
         self.assertEqual(len(self.service.releases), 1)
         self.assertEqual(self.service.releases[0]["reason"], "artifacts_unavailable")
+        self.assertIn("lake cache get", self.service.releases[0]["error"])
         self.assertEqual(self.service.results, [])
         self.assertEqual(self.state()["state"], "released")
-        self.assertNotIn("t1", self.service.claims, "the service freed the claim")
+        self.assertIsNone(self.service.live_claim(1), "the service freed the claim")
 
     def test_without_a_release_endpoint_the_claim_is_left_to_expire(self):
         os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
@@ -644,7 +803,7 @@ class ArtifactsUnavailable(Fixture):
         self.assertEqual(outcome["reason"], "artifacts_unavailable")
         self.assertEqual(self.service.releases, [])
         self.assertEqual(self.service.results, [])
-        self.assertIn("t1", self.service.claims, "the claim is held until it expires on its own")
+        self.assertIsNotNone(self.service.live_claim(1), "the claim is held until it expires on its own")
         self.assertFalse(outcome["lease"]["lost"])
 
 
@@ -694,14 +853,12 @@ class Resume(Fixture):
         cfg = self.config()
         client = self.client(cfg)
         # A previous runner claimed the task, prepared the worktree and was running the agent in sess-old.
-        claim = self.service.preclaim("t1", "old-token", cfg.worker)
-        task = repair_task.Task.from_json(
-            {**self.content.task(), "claim_token": "old-token", "expires_at": claim["expires_at"], "renew_after": 0.2}
-        )
+        claim = self.service.preclaim(1, "old-token", cfg.worker)
+        task = repair_task.Task.from_json(self.service.task_record(1, claim))
         repair_task.fetch_retained(cfg.clone, task)
-        worktree = cfg.root / "worktrees" / "task-t1"
+        worktree = cfg.root / "worktrees" / "task-1"
         repair.checkout_worktree(cfg.clone, task.tip, worktree)
-        state = repair_task.TaskState(cfg.tasks_dir / "t1", task)
+        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
         state.write("claimed")
         state.write("artifacts_ready")
         state.write("agent_running", agent_attempt=1)
@@ -722,7 +879,7 @@ class Resume(Fixture):
         task = repair_task.Task.from_json(
             {**self.content.task(), "claim_token": "gone", "expires_at": time.time() + 5, "renew_after": 0.2}
         )
-        state = repair_task.TaskState(cfg.tasks_dir / "t1", task)
+        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
         state.write("agent_running")
         self.assertEqual(repair_task.resume_pending(cfg, self.client(cfg)), [])
         self.assertEqual(self.state()["state"], "claim_lost")
@@ -733,13 +890,26 @@ class Records(unittest.TestCase):
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)
-        raw = content.task("t9", kind="rebase_conflict")
+        raw = content.task(9, kind="rebase_conflict")
         onto = commit(root / "seed", "main moved", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
-        raw["diagnostics"] = {"conflict": {"member": f"{PROJECT}#2", "paths": ["TauCeti/Two.lean"], "onto": onto}}
-        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
+        raw["onto"] = onto
+        raw["diagnostics"] = [
+            {
+                "kind": "conflict",
+                "source_pr": f"{PROJECT}#2",
+                "paths": ["TauCeti/Two.lean"],
+                "onto": onto,
+                "message": f"replaying the chain onto {onto[:12]} conflicts at {PROJECT}#2",
+                "pending": [f"{PROJECT}#3"],
+                "clean_prefix_tip": content.members[0]["commit"],
+            }
+        ]
+        task = repair_task.Task.from_json(
+            {**raw, "claim_token": "x", "expires_at": time.time() + 60, "extra": {"claim_id": 5}}
+        )
         self.assertEqual(task.validation_base, onto)
         self.assertEqual(task.member_keys, [f"{PROJECT}#1", f"{PROJECT}#2", f"{PROJECT}#3"])
-        self.assertEqual(task.push_branch, "queue/task-t9")
+        self.assertEqual(task.submission_ref, "refs/tauceti-queue/submissions/9/5")
         self.assertEqual(repair_task.Task.from_json(task.to_json()), task)
         chain = repair.read_chain(root / "seed", content.base, content.tip)
         prompt = repair.compose_prompt(
@@ -749,7 +919,13 @@ class Records(unittest.TestCase):
         self.assertIn("scripted rebase conflicted", prompt)
         self.assertIn(f"--onto {onto[:12]} {content.base[:12]}", prompt)
         self.assertIn("`TauCeti/Two.lean` is changed by PR #2", prompt)
+        self.assertIn(f"not yet replayed after it: {PROJECT}#3", prompt)
         self.assertIn(f"Source-PR: {PROJECT}#2`, `Accepted-Head: {content.members[1]['accepted_head']}", prompt)
+        custom = repair_task.Task.from_json({**task.to_json(), "instruction": "Custom instruction."})
+        custom_prompt = repair.compose_prompt(
+            repair_task.prompt_context(custom, None), repair_task.task_findings(custom), chain, root / "seed"
+        )
+        self.assertTrue(custom_prompt.startswith("Custom instruction."), "the service's instruction is used verbatim")
         with self.assertRaises(ValueError):
             repair_task.Task.from_json({**raw, "kind": "mystery", "claim_token": "x", "expires_at": 1})
 

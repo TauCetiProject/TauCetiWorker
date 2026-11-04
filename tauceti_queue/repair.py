@@ -117,6 +117,79 @@ def normalise_findings(raw: dict | None) -> dict:
     return findings
 
 
+DIAGNOSTIC_KINDS = {
+    "compiler": "compiler",
+    "compiler_error": "compiler",
+    "error": "compiler",
+    "audit": "audit",
+    "duplicate_declaration": "audit",
+    "import_collision": "audit",
+    "lint": "lint",
+    "environment_linter": "lint",
+}
+LOCATION = re.compile(r"^(?P<path>\S+?\.lean):(?P<line>\d+):(?P<column>\d+):?\s*(?P<rest>.*)$", re.S)
+
+
+def findings_from_diagnostics(entries: list | dict | None) -> dict:
+    """The findings structure from the controller's task diagnostics.
+
+    The controller hands the repair task a list of findings, each ``{kind, module, message}`` as the
+    CI adapter extracted them, and for a rebase conflict one ``{kind: "conflict", source_pr, paths,
+    onto, pending, clean_prefix_tip}`` entry. Compiler findings become ``compiler_errors`` (with the
+    line and column parsed from the message when it starts with ``path:line:col``), lint findings keep
+    their module and message, every other kind is kept under ``other``, and the conflict entry under
+    ``conflict``. A dict is taken as an already structured findings record.
+    """
+    if isinstance(entries, dict):
+        findings = normalise_findings(entries)
+        findings.setdefault("other", [])
+        findings.setdefault("conflict", entries.get("conflict") if isinstance(entries.get("conflict"), dict) else None)
+        return findings
+    findings = empty_findings()
+    findings["other"] = []
+    findings["conflict"] = None
+    for raw in entries or []:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("kind") or "")
+        module = str(raw.get("module") or raw.get("path") or "")
+        message = str(raw.get("message") or "")
+        if kind == "conflict":
+            findings["conflict"] = {
+                "member": raw.get("source_pr") or raw.get("member"),
+                "paths": list(raw.get("paths") or []),
+                "onto": raw.get("onto"),
+                "pending": list(raw.get("pending") or []),
+                "clean_prefix_tip": raw.get("clean_prefix_tip"),
+                "message": message,
+            }
+            continue
+        family = DIAGNOSTIC_KINDS.get(kind)
+        if family == "compiler":
+            entry = {"path": module, "line": raw.get("line", 0), "column": raw.get("column", 0), "message": message}
+            located = LOCATION.match(message)
+            if located and (
+                not module or located.group("path").endswith(module) or module.endswith(located.group("path"))
+            ):
+                entry.update(
+                    path=module or located.group("path"),
+                    line=int(located.group("line")),
+                    column=int(located.group("column")),
+                    message=located.group("rest").strip(),
+                )
+            if entry not in findings["compiler_errors"]:
+                findings["compiler_errors"].append(entry)
+            if module and module not in findings["failed_modules"]:
+                findings["failed_modules"].append(module)
+        elif family == "lint":
+            findings["lint"]["findings"].append(
+                {"linter": raw.get("linter") or kind, "declaration": raw.get("declaration") or message, "path": module}
+            )
+        else:
+            findings["other"].append({"kind": kind or "finding", "module": module, "message": message})
+    return findings
+
+
 def findings_modules(findings: dict) -> list[str]:
     modules: dict[str, None] = {}
     for error in findings["compiler_errors"]:
@@ -351,16 +424,20 @@ def pr_number(source_pr: str) -> int:
     return int(source_pr.rsplit("#", 1)[1])
 
 
-def chain_report(clone: Path, base: str, prior_tip: str | None, tip: str, members: list[str]) -> dict:
+def chain_report(
+    clone: Path, base: str, prior_tip: str | None, tip: str, members: list[str], *, prior_base: str | None = None
+) -> dict:
     """The queue's result checks on a proposed chain, as one JSON-ready record.
 
     ``validate`` is ``chain.validate`` (members by PR identity, single-parent history on ``base``,
-    trailers, count); ``compare`` is ``chain.compare`` against the prior chain (append-only messages,
-    provenance per member). ``unexplained`` lists the members whose content changed without an
-    appended explanation, which the plan says the same attempt must add. ``ok`` is the validation
-    verdict together with the append-only check; a missing explanation alone does not make it false.
+    trailers, count); ``compare`` is ``chain.compare`` against the prior chain ``prior_base..prior_tip``
+    (append-only messages, provenance per member), the controller's own order of checks. ``unexplained``
+    lists the members whose content changed without an appended explanation, which the plan says the
+    same attempt must add. ``ok`` is the validation verdict together with the append-only check; a
+    missing explanation alone does not make it false.
     """
-    record: dict = {"base": base, "tip": tip, "prior_tip": prior_tip}
+    prior_base = prior_base or base
+    record: dict = {"base": base, "tip": tip, "prior_base": prior_base, "prior_tip": prior_tip}
     problems: list[str] = []
     try:
         validation = chain_tool.validate(clone, base, tip, members)
@@ -373,7 +450,7 @@ def chain_report(clone: Path, base: str, prior_tip: str | None, tip: str, member
     edited: list[str] = []
     if prior_tip and prior_tip != tip:
         try:
-            comparison = chain_tool.compare(clone, base, prior_tip, base, tip)
+            comparison = chain_tool.compare(clone, prior_base, prior_tip, base, tip)
             record["compare"] = comparison.to_dict()
             problems += [f"{v.code}: {v.detail}" for v in comparison.violations]
             for member in comparison.members:
@@ -717,6 +794,7 @@ class PromptContext:
         default_factory=list
     )  # recorded members: source_pr, accepted_head, provenance
     lint_script: str = "scripts/lint-env.sh"
+    instruction: str = AGENT_INSTRUCTION  # the plan's instruction; the service sends it with the task
 
 
 def _pr_list(prs: list[int]) -> str:
@@ -726,7 +804,7 @@ def _pr_list(prs: list[int]) -> str:
 def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainCommit], clone: Path) -> str:
     """The plan's instruction, then the batch's real diagnostics and its constituent commits."""
     base_short = context.base[:12]
-    lines = [AGENT_INSTRUCTION, ""]
+    lines = [context.instruction or AGENT_INSTRUCTION, ""]
     conflict = context.conflict if context.kind == "rebase_conflict" else None
     if conflict:
         previous = (conflict.get("previous_base") or "")[:12] or "its previous base"
@@ -754,6 +832,12 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             owners = owners_of(clone, chain, path)
             if owners:
                 lines.append(f"  - `{path}` is changed by PR {_pr_list(owners)} in this batch")
+        if conflict.get("pending"):
+            lines.append("- not yet replayed after it: " + ", ".join(str(p) for p in conflict["pending"]))
+        if conflict.get("clean_prefix_tip"):
+            lines.append(
+                f"- the members before it replay cleanly; that prefix is commit `{conflict['clean_prefix_tip'][:12]}`"
+            )
         lines.append("")
     else:
         lines += [
@@ -824,6 +908,14 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             lines.append("Lint report excerpt:")
             lines.append("")
             lines += [f"    {text}" for text in findings["lint"]["report"][:40]]
+        lines.append("")
+    if findings.get("other"):
+        lines.append("Other CI findings:")
+        lines.append("")
+        for finding in findings["other"]:
+            owners = owners_of(clone, chain, finding["module"]) if finding.get("module") else []
+            where = f" in `{finding['module']}` (PR {_pr_list(owners) or 'unchanged'})" if finding.get("module") else ""
+            lines.append(f"- {finding['kind']}{where}: {finding['message']}")
         lines.append("")
     if context.named_modules:
         lines.append(

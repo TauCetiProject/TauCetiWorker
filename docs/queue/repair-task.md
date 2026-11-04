@@ -3,11 +3,11 @@
 `tauceti_queue/repair_task.py` is the worker-side task of the AI merge queue plan
 (`docs/redesign/specs/ai-merge-queue.md`, work plan stream G): a worker claims a repair or
 rebase-conflict task from the queue service, prepares warm build artifacts, runs the repair agent in
-a private worktree of the content repository, checks the chain it returns, pushes it to a task ref and
-submits it. The service alone adopts a chain. The shared machinery (artifact preparation, prompt,
-agent run, chain checks) is `tauceti_queue/repair.py`, factored out of the historical repair
-experiments so the experiment CLI (`python -m tauceti_queue.repair_experiment`) and the task use one
-implementation.
+a private worktree of the content repository, checks the chain it returns, pushes it to the task's
+submission ref and submits it. The service alone adopts a chain. The shared machinery (artifact
+preparation, prompt, agent run, chain checks) is `tauceti_queue/repair.py`, factored out of the
+historical repair experiments so the experiment CLI (`python -m tauceti_queue.repair_experiment`)
+and the task use one implementation.
 
 ```sh
 uv run python -m tauceti_queue.repair_task --service https://queue.example [--once] [--worker ID]
@@ -24,63 +24,94 @@ private Lake artifact pool (`lake-cache/`, `lake.toml`) and the agent's isolated
 
 ## Task protocol
 
-All calls are `POST` with a JSON body and `Authorization: Bearer <GitHub token of the worker's
-account>` (`$TAUCETI_QUEUE_TOKEN`, else `$GH_TOKEN`/`$GITHUB_TOKEN`, else `gh auth token`). The
-service checks that the token's account has admin permission on the repository, the predicate of
-`tauceti_worker/security_audit.py::require_admin`; the runner applies the same predicate itself
+The semantics are the controller's (`tauceti_queue/controller.py`, `docs/queue/controller.md`,
+"Task API"): `claim_task(worker_identity, github_login)`, `renew_task(task_id, claim_token)`,
+`release_task(task_id, claim_token, reason, error)` and `submit_task(task_id, claim_token, tip_sha,
+worker_notes)`, exchanging the `Task` and `Adoption` records of `tauceti_queue/ports.py`. The HTTP
+surface is stream F's server (`tauceti_queue/server.py`, `docs/queue/github.md`): `POST` with a JSON
+body and `Authorization: Bearer <GitHub token of the worker's account>` (`$TAUCETI_QUEUE_TOKEN`,
+else `$GH_TOKEN`/`$GITHUB_TOKEN`, else `gh auth token`), the token resolved to a login, a `None`
+result as `204`, a bare JSON value as the body otherwise, and errors as `{"error": message}`. The
+worker identity is `body.worker` (the runner also sends it as `X-TauCeti-Worker`).
+
+Authorization is the predicate of `tauceti_worker/security_audit.py::require_admin`, applied by the
+controller at claim and again at submit; the runner applies the same predicate itself
 (`verify_admin`, through `security_audit.api`) before claiming, so a misconfigured worker fails
 before it does any work. The check is cached for an hour to spare the account's shared API quota and
 repeated for a task whose repository differs from the configured one.
 
 | Call | Body | Response |
 | --- | --- | --- |
-| `POST /tasks/claim` | `{worker}` | `204` when nothing is claimable; else `200` with the Task below |
-| `POST /tasks/<id>/renew` | `{claim_token}` | `200 {expires_at}`; `401/403/404/409/410` when the claim is no longer the caller's |
-| `POST /tasks/<id>/result` | `{claim_token, tip, pushed_ref, notes}` | `200 {adopted, reason, validation}`; `409`/`410` for a stale claim |
-| `POST /tasks/<id>/release` | `{claim_token, reason, notes}` | `200 {task_id, released}`; `404` when the service has no such endpoint |
+| `POST /tasks/claim` | `{worker}` | `204` when nothing is claimable; else the `Task` record |
+| `POST /tasks/<id>/renew` | `{worker, claim_token}` | the new `expires_at` (a bare number; `{expires_at}` is accepted too) |
+| `POST /tasks/<id>/result` | `{worker, claim_token, tip_sha, pushed_ref, worker_notes}` | the `Adoption` record |
+| `POST /tasks/<id>/release` | `{worker, claim_token, reason, error}` | `{task_id, released}`; `404` when the service has no such route |
 
-Task JSON: `task_id`, `kind` (`repair` or `rebase_conflict`), `repository`, `batch_id`,
-`batch_version`, `base` (sha), `tip` (sha), `members` (list of `{source_pr, pr, accepted_head,
-commit, provenance}`), `diagnostics`, `retained_refs` (refs in the content repository holding base
-and tip), `claim_token`, `expires_at` (unix seconds), `renew_after` (seconds).
+`Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair` or `rebase_conflict`), `repository`,
+`batch_id`, `batch_version`, `base` and `tip` (the chain to start from), `onto` (the commit the
+replacement must be based on: the canonical commit for a rebase conflict, `base` itself for a
+repair), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
+`description`, `author`, `explanation`, `retained_ref`), `diagnostics`, `retained_refs`,
+`submission_ref`, `claim_token`, `expires_at`, `instruction` (the plan's agent instruction, used
+verbatim as the prompt's first paragraph), `created_at`, `extra`. The runner renews every
+`extra.renew_after` seconds when the service sets it, else every third of the claim's lifetime.
 
-`diagnostics` uses the findings structure of the repair experiments, every key optional:
-`compiler_errors` (`{path, line, column, message}`), `failed_modules`, `duplicate_declarations`
-(`{declaration, modules}`), `import_collisions` (`{module, declaration, other_module}`), `lint`
-(`{findings: [{linter, declaration, path}], report: [lines]}`). A rebase-conflict task carries
-`conflict: {member, paths, onto}`; `onto` is the target base the result must sit on, and the batch's
-recorded `base` is the base the chain is currently on.
+`diagnostics` is the controller's list of findings, each `{kind, module, message}` as the CI
+adapter extracted them (`repair.findings_from_diagnostics`): `compiler`/`compiler_error` entries
+become compiler errors with the line and column parsed from a `path:line:col` message prefix,
+`lint`/`environment_linter` entries lint findings, and every other kind is listed as it is, each with
+the file-level owners computed from the chain. A rebase-conflict task carries one
+`{kind: "conflict", source_pr, paths, onto, message, pending, clean_prefix_tip}` entry.
 
-### `release` (new; streams E and F add it)
+`Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
+`violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner
+handles the reasons as follows:
 
-`release` gives a claimed task back unfinished with a named reason, so the service can hold it or
-re-expose it without waiting for the claim to expire. Reasons the runner sends:
+| reason | runner |
+| --- | --- |
+| accepted | outcome `adopted`; the lease stops |
+| `explanation-required` | one follow-up turn in the same session asking only for the explanations of the named members, then a resubmission under the same claim |
+| `invalid-chain` | one retry (`validation_retries`) of the agent attempt with the violations appended to the prompt, then `not_adopted` |
+| `claim-expired`, `claim-superseded`, `unknown-claim`, `not-authorized`, `unknown-task` | the claim is no longer the runner's: outcome `claim_lost`, nothing more is submitted |
+| `version-mismatch`, `tip-unavailable`, anything else | outcome `not_adopted` |
+
+A `TaskError` from `renew`, `release` or `result` (`unknown-task`, `unknown-claim`, `claim-expired`,
+`claim-superseded`, `not-authorized`) is recognised by its code in the response body (`code`,
+`reason` or `error`) at any status, and by a 403/404/409/410 status; the server should answer it as
+`409 {"error": detail, "code": code}` rather than through its generic 500 mapping, so that a dead
+claim is not retried as a transport failure.
+
+### `release` (new; streams E and F serve it)
+
+`release_task` gives a claimed task back unfinished with a named reason, so the service can hold it or
+re-expose it without waiting for the claim to expire; reason `inference_unavailable` counts toward the
+controller's inference hold (`report_inference(worker, False, error)`), and `error` is the hold's
+"last provider error". Reasons the runner sends:
 
 | reason | meaning for the service |
 | --- | --- |
 | `artifacts_unavailable` | the worker could not prepare warm artifacts (no published cache mapping for the base, a fetch failure, an incomplete incremental build, or the worker's own cache preparation refusing to start inference); the task was not run cold |
 | `inference_unavailable` | every bounded attempt failed with a provider error, a transport failure or exhausted credentials (`agents.classify_agent_failure`); the queue holds the task and re-exposes it (plan, "Inference unavailability") |
 | `agent_failed` | the agent ran and exited on its own terms, or returned a chain that fails local validation, twice; the task is re-exposed to any worker |
-| `push_failed` | `git-safe-push` to the task ref failed; the chain is retained locally under `refs/tauceti-queue/task/<id>/attempt-<n>` in the worker's clone |
+| `push_failed` | `git-safe-push` to the submission ref failed; the chain is retained locally under `refs/tauceti-queue/task/<id>/attempt-<n>` in the worker's clone |
 
-`notes` carries the worker identity and a detail string. The service should free the claim on
-release and record the reason in status (the inference hold's "last provider error" comes from the
-`inference_unavailable` detail). When the endpoint answers `404` the runner records
-`release_unsupported`, stops renewing and lets the claim expire; the service then recovers the task
-the ordinary way.
+Stream F's server does not route `/tasks/<id>/release` yet; when the endpoint answers `404` the
+runner records `release_unsupported`, stops renewing and lets the claim expire, and the controller
+recovers the task the ordinary way. A successful task is not reported through `report_inference`;
+adoption lifts the hold.
 
 ### Result submission
 
-The proposed tip is pushed to `refs/heads/queue/task-<task_id>` in the content repository through
-the worker's own account and `scripts/git-safe-push` (branch compare-and-swap: create-only for the
-first push of a task, then against the oid this runner last pushed; a branch left by an earlier
-claimant of the same task is replaced once against its observed oid, since the service re-exposed
-the task). `result` then names that ref and the tip. `notes` carries the worker, the attempt number,
-the members whose provenance is `edited`, agent seconds and the estimated inference cost (from the
-host agent's telemetry and `cost_model`). The response is recorded in the checkpoint and the outcome.
-`adopted: false` with `reason: "validation"` is retried once (`validation_retries`) with the
-service's validation report appended to the prompt; any other refusal ends the task as
-`not_adopted`.
+The proposed tip is pushed to the task's `submission_ref`
+(`refs/tauceti-queue/submissions/<task_id>/<claim_id>`, private to the claim) in the content
+repository through the worker's own account and `scripts/git-safe-push` (ref compare-and-swap:
+create-only for the first push, then against the oid this runner last pushed; a ref left by a
+previous incarnation of the same claim is replaced once against its observed oid). `result` then
+names the tip; the controller fetches the ref when the tip is not in its clone and retains it under
+`refs/tauceti-queue/batches/<batch>/submissions/<sha>` whether or not it adopts it. `worker_notes` is
+a JSON string with the worker, the attempt number, the members whose provenance is `edited`, agent
+seconds and the estimated inference cost (from the host agent's telemetry and `cost_model`). The
+response is recorded in the checkpoint and the outcome.
 
 ## Claims and the renewal heartbeat
 
@@ -92,9 +123,9 @@ without a successful one. A lost claim sets the agent's cancellation event (`run
 the agent's process group), and the attempt's result is discarded rather than submitted late: the
 outcome is `claim_lost`, nothing is pushed or submitted after the loss, and the chain the agent had
 reached stays under the local attempt ref. `result` and `release` calls that the service refuses
-with a stale-claim status end the task the same way. While a `result` or `release` call is in
-flight the heartbeat treats a refused renewal as the service having already accepted the submission
-(it frees the claim on adoption and release) and simply ends; the submission's own response decides.
+with a stale-claim code end the task the same way. While a `result` or `release` call is in flight
+the heartbeat treats a refused renewal as the service having already accepted the submission (it
+frees the claim on adoption and release) and simply ends; the submission's own response decides.
 
 The worker also caps one agent attempt at `agent_timeout` (3 h by default, the experiment's cap).
 That cap is the worker's, not the task's: an attempt that exceeds it is an ordinary agent failure
@@ -105,7 +136,7 @@ has a time budget holds because the service re-exposes the task.
 
 1. **Claim.** `verify_admin`, `claim`, start the lease. Checkpoint `claimed`.
 2. **Sources.** Fetch `retained_refs` into `refs/tauceti-queue/task/<id>/retained/...` of the
-   worker's clone, check that base, tip and the target base are commits, retain the input tip under
+   worker's clone, check that base, tip and `onto` are commits, retain the input tip under
    `refs/tauceti-queue/task/<id>/input`, and check out the tip detached in
    `<root>/worktrees/task-<id>` (`repair.checkout_worktree`; an existing worktree is re-pointed so
    its `.lake` outputs stay warm). Checkpoint `sources_ready`.
@@ -117,29 +148,31 @@ has a time budget holds because the service re-exposes the task.
    fail on the failing modules; artifacts are unavailable only when the base mapping is missing, a
    fetch fails or the build does not complete. Unavailable artifacts release the task
    (`artifacts_unavailable`); the agent never runs cold. Checkpoint `artifacts_ready`.
-4. **Agent.** The prompt (`repair.compose_prompt`) opens with the plan's instruction verbatim, then
+4. **Agent.** The prompt (`repair.compose_prompt`) opens with the task's instruction verbatim, then
    the batch (where it came from, what it must not do: no push, no PRs, no comments, no `gh`, no
-   edits to the build configuration), the diagnostics with file-level owners computed from the chain,
-   the constituent commits with their PR identities, the recorded members with their `Source-PR` and
-   `Accepted-Head` trailers, the editing recipe (fixup commits and an autosquash rebase with
-   `--keep-empty --empty=keep`, or any method yielding a linear chain on the base with one commit per
-   member and every prior message preserved as a prefix; for a rebase conflict, `git rebase --onto`
-   with conflicts resolved inside the constituent commits), and local verification (`lake build
-   --iofail`, `scripts/lint-env.sh` for lint findings, no weakening). The agent runs through
-   `tauceti_worker.agents.run_agent_host` with the claude authoring profile the workers use for
-   repair, in the task's worktree, with `repair.isolation_env`: no `GH_TOKEN`/`GITHUB_TOKEN`, an empty
-   `GH_CONFIG_DIR`, `remote.origin.pushurl` pointed at a non-existent path, an isolated
-   `CLAUDE_CONFIG_DIR` seeded as the workers seed theirs, and the private artifact pool's `LAKE_*`
-   variables. The provider session id is written to `tasks/<id>/session.json` as the worker's
-   session identity. Checkpoint `agent_running`.
-5. **Checks.** `repair.chain_report`: `chain.validate` against the recorded members (identity by
-   `Source-PR`, single-parent history on the target base, both trailers, count) and `chain.compare`
-   against the input chain (append-only messages, provenance per member). A chain that validates but
-   changed a member's content without an appended explanation gets one short follow-up turn in the
-   same session (`--resume`, `repair.explanation_prompt`) asking only for the explanation, as the
-   plan requires of the same attempt. A chain that fails validation, a dirty worktree, or a HEAD still
-   at the input tip is not acceptable: one bounded retry (`agent_attempts`, 2) with the local report
-   and the retained input ref appended to the prompt, then `agent_failed`. Checkpoint `validated`.
+   edits to the build configuration), the diagnostics with file-level owners computed from the chain
+   (for a rebase conflict: the conflicting member, its paths and owners, the members not yet
+   replayed and the clean prefix), the constituent commits with their PR identities, the recorded
+   members with their `Source-PR` and `Accepted-Head` trailers, the editing recipe (fixup commits
+   and an autosquash rebase with `--keep-empty --empty=keep`, or any method yielding a linear chain
+   on `onto` with one commit per member and every prior message preserved as a prefix; for a rebase
+   conflict, `git rebase --onto` with conflicts resolved inside the constituent commits), and local
+   verification (`lake build --iofail`, `scripts/lint-env.sh` for lint findings, no weakening). The
+   agent runs through `tauceti_worker.agents.run_agent_host` with the claude authoring profile the
+   workers use for repair, in the task's worktree, with `repair.isolation_env`: no
+   `GH_TOKEN`/`GITHUB_TOKEN`, an empty `GH_CONFIG_DIR`, `remote.origin.pushurl` pointed at a
+   non-existent path, an isolated `CLAUDE_CONFIG_DIR` seeded as the workers seed theirs, and the
+   private artifact pool's `LAKE_*` variables. The provider session id is written to
+   `tasks/<id>/session.json` as the worker's session identity. Checkpoint `agent_running`.
+5. **Checks.** `repair.chain_report`, the controller's own checks in its order: `chain.validate`
+   against the recorded members on `onto` (identity by `Source-PR`, single-parent history, both
+   trailers, count) and `chain.compare` of the input chain `base..tip` against the result on `onto`
+   (append-only messages, provenance per member). A chain that validates but changed a member's
+   content without an appended explanation gets one short follow-up turn in the same session
+   (`--resume`, `repair.explanation_prompt`) asking only for the explanation, as the plan requires of
+   the same attempt. A chain that fails validation, a dirty worktree, or a HEAD still at the input
+   tip is not acceptable: one bounded retry (`agent_attempts`, 2) with the local report and the
+   retained input ref appended to the prompt, then `agent_failed`. Checkpoint `validated`.
 6. **Publish and submit.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
    then `adopted` or `not_adopted`). The worktree is removed afterwards unless `--keep-worktree`;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
@@ -154,9 +187,9 @@ transcript is nothing but a provider failure: a transient status (408, 429, 5xx,
 error, an exhausted credit balance or a subscription limit. Such a failure is retried up to
 `inference_attempts` (3) with `inference_delays` (30 s, 120 s) between attempts, continuing the
 recorded session when one exists; after the last attempt the task is released with
-`inference_unavailable`. An agent that produced a transcript and failed, or a chain that does not
-validate, is the agent's own failure and takes the `agent_failed` path; it is never reported as
-inference unavailability.
+`inference_unavailable` and the last provider error. An agent that produced a transcript and failed,
+or a chain that does not validate, is the agent's own failure and takes the `agent_failed` path; it
+is never reported as inference unavailability.
 
 ## Recovery
 
@@ -195,14 +228,18 @@ once; the runner itself claims one task at a time.
 ## Tests
 
 `tests/queue_repair_task.py` (registered in `tests/run-all`) runs the task against a fake service
-(`http.server` in a thread, with claims, expiry, renewals, results validated with the chain tool
-against the bare repository, scripted result responses and an optional `release` endpoint), a local
-bare content repository with a three-member attributed chain whose second member breaks the build,
-a `lake` stub that fails modules containing `BROKEN`, a `gh` stub for the admin predicate and a
-scripted `claude` stub that rewrites the constituent commits. It covers adoption on the happy path,
-claim expiry stopping the agent without a submission, renewal errors that do not stop it, service
-rejection retried once with its report, a locally invalid chain retried with the local report, the
-explanation follow-up turn in the same session, artifacts unavailable with and without a `release`
-endpoint, inference unavailable after bounded retries, an ordinary agent failure released as such,
-a second claimant and a stale token refused, resumption of a checkpointed session, and the task
-record and prompt for a rebase conflict. No real inference and no network.
+(`http.server` in a thread with the controller's task semantics: claims with expiry within a
+concurrency of one, renewals, submissions validated with the chain tool against the bare repository
+in the controller's order, `explanation-required`, the `release` call, the `Adoption` shape and
+reason codes, encoded as stream F's server does, with scripted responses where a scenario needs
+them), a local bare content repository with a three-member attributed chain whose second member
+breaks the build, a `lake` stub that fails modules containing `BROKEN`, a `gh` stub for the admin
+predicate and a scripted `claude` stub that rewrites the constituent commits. It covers adoption on
+the happy path, claim expiry stopping the agent without a submission, renewal errors that do not
+stop it, `invalid-chain` retried once with its violations, `explanation-required` resubmitted from
+the same session, a terminal rejection, a superseded claim at submission, a locally invalid chain
+retried with the local report, the local explanation follow-up turn, artifacts unavailable with and
+without a `release` route, inference unavailable after bounded retries, an ordinary agent failure
+and the worker's attempt cap released as `agent_failed`, a second claimant and a stale token refused,
+resumption of a checkpointed session, and the task record and prompt for a rebase conflict. No real
+inference and no network.
