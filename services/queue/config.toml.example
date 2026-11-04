@@ -21,6 +21,7 @@ listen_host = "127.0.0.1"
 listen_port = 8780
 public_url = "https://queue.taucetiproject.org"
 reconcile_interval_seconds = 30
+# review_app_id = 3947238       # the App whose `merge eligibility` checks approve; only the rehearsal changes it
 
 # Initial runtime controls. Once the store exists these are changed with
 # `tauceti-queue settings set <key> <value>`, not by editing this file.
