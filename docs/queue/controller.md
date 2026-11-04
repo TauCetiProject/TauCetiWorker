@@ -255,7 +255,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 12 restart recovers outbox, claims and CI state before repeating work | F `test_s12_restart_recovers_pending_outbox_expired_claim_and_repeats_no_work`, `test_s12_loop_runs_passes_on_wake_and_on_the_polling_interval` |
 | 13 inference hold | F `test_s13_inference_hold_stops_sealing_keeps_the_head_and_resumes_on_success`, `test_s13_hold_without_a_head_prevents_sealing_until_a_provider_call_succeeds`; C `Holds` |
 | 14 shrink to green | F `test_s14_shrink_to_green_lands_with_an_empty_commit_and_names_what_was_dropped` |
-| 15 live activation | not expressible locally (stream I) |
+| 15 live activation | not expressible locally; the rehearsal (`docs/queue/rehearsal.md`) covers the scratch-repository half of the transition |
 | 16 post-admission problem reports do not withdraw | F `test_s16_s21_problem_reports_closures_and_relabelling_do_not_withdraw_a_member` |
 | 17 two source failures, no singletons, at most three full runs | F `test_s17_two_source_failures_land_with_three_full_runs_and_no_singletons` (counts only; the 120-minute bound is a pilot measurement) |
 | 18 no PR waits more than the window in passes | F `test_s18_no_pr_waits_more_than_the_window_in_passes`; C `Draw` |
@@ -263,7 +263,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 20 urgent lane | F `test_s20_urgent_pr_is_in_the_next_head_without_cancelling_the_running_one` |
 | 21 closing or relabelling a member changes nothing | F `test_s16_s21_...`; C `test_waiting_inputs_react_to_events_and_members_do_not` |
 | 22 status names runner, host, phases, stall, revision | F `test_s22_status_names_runner_host_phase_progress_stall_and_revision`; C `StatusShape` |
-| 23, 24 increment 0 and transition | not expressible here |
+| 23, 24 increment 0 and transition | not expressible here; `tests/queue_rehearsal.py` runs the cutover rehearsal's scenario script over these fakes (`docs/queue/rehearsal.md`) |
 
 Also covered: infrastructure failures retried with backoff and bounded
 (`test_infrastructure_failures_are_retried_with_backoff_and_bounded`), shadow mode publishing
