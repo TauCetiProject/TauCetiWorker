@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -226,15 +227,19 @@ class FakeGitHub:
         self.lose_fast_forward_response = False
         self._run_counter = 0
         self._comment_counter = 0
+        # The controller loop thread and the test thread share this object; every method that reads
+        # or changes the records holds the lock, so a pass never sees a run half-way through a change.
+        self.lock = threading.RLock()
 
     # --- fixture controls -------------------------------------------------------------------------
 
     def _call(self, name: str, *args: Any) -> None:
-        self.calls.append((name, args))
-        remaining = self.fail_next.get(name, 0)
-        if remaining:
-            self.fail_next[name] = remaining - 1
-            raise RuntimeError(f"injected failure of {name}")
+        with self.lock:
+            self.calls.append((name, args))
+            remaining = self.fail_next.get(name, 0)
+            if remaining:
+                self.fail_next[name] = remaining - 1
+                raise RuntimeError(f"injected failure of {name}")
 
     def create_pr(
         self,
@@ -247,234 +252,256 @@ class FakeGitHub:
         start: str | None = None,
         labels: Sequence[str] = (),
     ) -> str:
-        head = self.repo.commit_branch(
-            files,
-            f"pr {number}",
-            start=start,
-            author=f"{author} <{author}@example.invalid>",
-            push_to=f"refs/pull/{number}/head",
-        )
-        self.prs[number] = {
-            "number": number,
-            "head_sha": head,
-            "base_ref": self.repo.branch,
-            "title": title or f"Change {number}",
-            "body": body or f"Body of PR {number}.",
-            "author_login": author,
-            "state": "open",
-            "draft": False,
-        }
-        self.labels.setdefault(number, set(labels))
-        return head
+        with self.lock:
+            head = self.repo.commit_branch(
+                files,
+                f"pr {number}",
+                start=start,
+                author=f"{author} <{author}@example.invalid>",
+                push_to=f"refs/pull/{number}/head",
+            )
+            self.prs[number] = {
+                "number": number,
+                "head_sha": head,
+                "base_ref": self.repo.branch,
+                "title": title or f"Change {number}",
+                "body": body or f"Body of PR {number}.",
+                "author_login": author,
+                "state": "open",
+                "draft": False,
+            }
+            self.labels.setdefault(number, set(labels))
+            return head
 
     def push_pr(self, number: int, files: dict[str, str | None]) -> str:
         """The author pushes a new head to an existing PR."""
-        current = self.prs[number]
-        head = self.repo.commit_branch(
-            files, f"pr {number} update", start=current["head_sha"], push_to=f"refs/pull/{number}/head"
-        )
-        current["head_sha"] = head
-        return head
+        with self.lock:
+            current = self.prs[number]
+            head = self.repo.commit_branch(
+                files, f"pr {number} update", start=current["head_sha"], push_to=f"refs/pull/{number}/head"
+            )
+            current["head_sha"] = head
+            return head
 
     def runs_for(self, head_sha: str) -> list[FakeRun]:
-        return [run for run in self.runs if run.head_sha == head_sha]
+        with self.lock:
+            return [run for run in self.runs if run.head_sha == head_sha]
 
     def start_runs(self) -> list[FakeRun]:
         """Queued runs begin: a runner picks them up and the preparation phase starts."""
-        started = []
-        now = self.clock()
-        for run in self.runs:
-            if run.status == "queued" and run.verdict != "lost":
-                run.status = "in_progress"
-                run.started_at = now
-                run.phases = [CandidatePhase("preparation", now, None, "in_progress")]
-                started.append(run)
-        return started
+        with self.lock:
+            started = []
+            now = self.clock()
+            for run in self.runs:
+                if run.status == "queued" and run.verdict != "lost":
+                    run.status = "in_progress"
+                    run.started_at = now
+                    run.phases = [CandidatePhase("preparation", now, None, "in_progress")]
+                    started.append(run)
+            return started
 
     def progress_runs(self, phase: str, detail: str = "") -> None:
-        now = self.clock()
-        for run in self.runs:
-            if run.status == "in_progress":
-                if run.phases and run.phases[-1].completed_at is None:
-                    last = run.phases[-1]
-                    run.phases[-1] = CandidatePhase(last.name, last.started_at, now, "completed", last.detail)
-                run.phases.append(CandidatePhase(phase, now, None, "in_progress", detail))
+        with self.lock:
+            now = self.clock()
+            for run in self.runs:
+                if run.status == "in_progress":
+                    if run.phases and run.phases[-1].completed_at is None:
+                        last = run.phases[-1]
+                        run.phases[-1] = CandidatePhase(last.name, last.started_at, now, "completed", last.detail)
+                    run.phases.append(CandidatePhase(phase, now, None, "in_progress", detail))
 
     def complete_runs(self) -> list[FakeRun]:
         """Running (or queued) runs finish according to their verdict; the finalizer posts the bound status."""
-        now = self.clock()
-        completed = []
-        for run in self.runs:
-            if run.status == "completed" or run.verdict == "lost":
-                continue
-            if run.status == "queued":
-                run.status = "in_progress"
-                run.started_at = now
-            run.phases = [
-                CandidatePhase(p.name, p.started_at, p.completed_at or now, "completed", p.detail) for p in run.phases
-            ]
-            run.status = "completed"
-            run.completed_at = now
-            if run.verdict == "pass":
-                run.conclusion = "success"
-                self.statuses[(run.head_sha, "build")] = Status(
-                    "success", "Build succeeded", run.to_candidate_run().html_url, now, run.run_id
-                )
-            elif run.verdict == "fail":
-                run.conclusion = "failure"
-                self.statuses[(run.head_sha, "build")] = Status(
-                    "failure", "Build failed", run.to_candidate_run().html_url, now, run.run_id
-                )
-            elif run.verdict == "infrastructure":
-                run.conclusion = "failure"
-                self.statuses[(run.head_sha, "build")] = Status(
-                    "failure", "infrastructure: runner lost its cache volume", "", now, run.run_id
-                )
-            elif run.verdict == "cancel":
-                run.conclusion = "cancelled"
-            elif run.verdict == "no-status":
-                run.conclusion = "failure"
-            completed.append(run)
-        return completed
+        with self.lock:
+            now = self.clock()
+            completed = []
+            for run in self.runs:
+                if run.status == "completed" or run.verdict == "lost":
+                    continue
+                if run.status == "queued":
+                    run.status = "in_progress"
+                    run.started_at = now
+                run.phases = [
+                    CandidatePhase(p.name, p.started_at, p.completed_at or now, "completed", p.detail)
+                    for p in run.phases
+                ]
+                run.status = "completed"
+                run.completed_at = now
+                if run.verdict == "pass":
+                    run.conclusion = "success"
+                    self.statuses[(run.head_sha, "build")] = Status(
+                        "success", "Build succeeded", run.to_candidate_run().html_url, now, run.run_id
+                    )
+                elif run.verdict == "fail":
+                    run.conclusion = "failure"
+                    self.statuses[(run.head_sha, "build")] = Status(
+                        "failure", "Build failed", run.to_candidate_run().html_url, now, run.run_id
+                    )
+                elif run.verdict == "infrastructure":
+                    run.conclusion = "failure"
+                    self.statuses[(run.head_sha, "build")] = Status(
+                        "failure", "infrastructure: runner lost its cache volume", "", now, run.run_id
+                    )
+                elif run.verdict == "cancel":
+                    run.conclusion = "cancelled"
+                elif run.verdict == "no-status":
+                    run.conclusion = "failure"
+                completed.append(run)
+            return completed
 
     def post_status(
         self, sha: str, state: str, run_id: str | None, description: str = "", context: str = "build"
     ) -> None:
         """A status from somewhere other than the candidate's own run (a stale callback, a PR build)."""
-        self.statuses[(sha, context)] = Status(state, description, "", self.clock(), run_id)
+        with self.lock:
+            self.statuses[(sha, context)] = Status(state, description, "", self.clock(), run_id)
 
     def cancel_runs(self, head_sha: str) -> None:
-        for run in self.runs_for(head_sha):
-            if run.status != "completed":
-                run.status = "completed"
-                run.conclusion = "cancelled"
-                run.completed_at = self.clock()
+        with self.lock:
+            for run in self.runs_for(head_sha):
+                if run.status != "completed":
+                    run.status = "completed"
+                    run.conclusion = "cancelled"
+                    run.completed_at = self.clock()
 
     def comments_for(self, number: int) -> list[dict[str, Any]]:
-        return [c for c in self.comments if c["number"] == number]
+        with self.lock:
+            return [c for c in self.comments if c["number"] == number]
 
     # --- GitHubPort -------------------------------------------------------------------------------
 
     def fetch_pr(self, repo: str, number: int) -> PullRequest:
-        self._call("fetch_pr", number)
-        pr = self.prs[number]
-        return PullRequest(
-            number=number,
-            head_sha=pr["head_sha"],
-            base_ref=pr["base_ref"],
-            title=pr["title"],
-            body=pr["body"],
-            author_login=pr["author_login"],
-            state=pr["state"],
-            draft=pr["draft"],
-            labels=tuple(sorted(self.labels.get(number, set()))),
-        )
+        with self.lock:
+            self._call("fetch_pr", number)
+            pr = self.prs[number]
+            return PullRequest(
+                number=number,
+                head_sha=pr["head_sha"],
+                base_ref=pr["base_ref"],
+                title=pr["title"],
+                body=pr["body"],
+                author_login=pr["author_login"],
+                state=pr["state"],
+                draft=pr["draft"],
+                labels=tuple(sorted(self.labels.get(number, set()))),
+            )
 
     def fetch_refs(self, repo: str, refspecs: Sequence[str]) -> None:
-        self._call("fetch_refs", tuple(refspecs))
-        run_git(self.repo.clone, "fetch", "-q", "--no-tags", str(self.repo.origin), *refspecs)
+        with self.lock:
+            self._call("fetch_refs", tuple(refspecs))
+            run_git(self.repo.clone, "fetch", "-q", "--no-tags", str(self.repo.origin), *refspecs)
 
     def dispatch_candidate(
         self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id: str, members: Sequence[int]
     ) -> str:
-        self._call("dispatch_candidate", head_sha, base_sha, batch_id)
-        self._run_counter += 1
-        verdict, diagnostics = self.ci_policy(head_sha, base_sha, members)
-        run = FakeRun(
-            run_id=str(1000 + self._run_counter),
-            attempt=1,
-            head_sha=head_sha,
-            base_sha=base_sha,
-            base_ref=base_ref,
-            batch_id=batch_id,
-            members=list(members),
-            created_at=self.clock(),
-            verdict=verdict,
-            diagnostics=list(diagnostics),
-        )
-        self.runs.append(run)
-        dispatch = {
-            "event_type": "tauceti-bors-staging",
-            "client_payload": {
-                "head_sha": head_sha,
-                "base_sha": base_sha,
-                "batch_id": batch_id,
-                "members": list(members),
-                "base_ref": base_ref,
-            },
-            "run_id": run.run_id,
-        }
-        self.dispatches.append(dispatch)
-        return f"dispatch-{self._run_counter}"
+        with self.lock:
+            self._call("dispatch_candidate", head_sha, base_sha, batch_id)
+            self._run_counter += 1
+            verdict, diagnostics = self.ci_policy(head_sha, base_sha, members)
+            run = FakeRun(
+                run_id=str(1000 + self._run_counter),
+                attempt=1,
+                head_sha=head_sha,
+                base_sha=base_sha,
+                base_ref=base_ref,
+                batch_id=batch_id,
+                members=list(members),
+                created_at=self.clock(),
+                verdict=verdict,
+                diagnostics=list(diagnostics),
+            )
+            self.runs.append(run)
+            dispatch = {
+                "event_type": "tauceti-bors-staging",
+                "client_payload": {
+                    "head_sha": head_sha,
+                    "base_sha": base_sha,
+                    "batch_id": batch_id,
+                    "members": list(members),
+                    "base_ref": base_ref,
+                },
+                "run_id": run.run_id,
+            }
+            self.dispatches.append(dispatch)
+            return f"dispatch-{self._run_counter}"
 
     def find_candidate_run(self, repo: str, *, batch_id: str, head_sha: str, base_sha: str) -> CandidateRun | None:
-        self._call("find_candidate_run", batch_id, head_sha, base_sha)
-        matching = [
-            r for r in self.runs if r.batch_id == batch_id and r.head_sha == head_sha and r.base_sha == base_sha
-        ]
-        if not matching:
-            return None
-        return matching[-1].to_candidate_run()
+        with self.lock:
+            self._call("find_candidate_run", batch_id, head_sha, base_sha)
+            matching = [
+                r for r in self.runs if r.batch_id == batch_id and r.head_sha == head_sha and r.base_sha == base_sha
+            ]
+            if not matching:
+                return None
+            return matching[-1].to_candidate_run()
 
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None:
-        self._call("commit_status", sha, context)
-        return self.statuses.get((sha, context))
+        with self.lock:
+            self._call("commit_status", sha, context)
+            return self.statuses.get((sha, context))
 
     def fast_forward(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
-        self._call("fast_forward", branch, expected_parent, tip)
-        current = self.repo.main_sha()
-        if current != expected_parent:
-            return FastForwardResult(False, current, "Update is not a fast forward")
-        run_git(self.repo.origin, "update-ref", f"refs/heads/{branch}", tip, expected_parent)
-        if self.lose_fast_forward_response:
-            self.lose_fast_forward_response = False
-            raise RuntimeError("connection reset while reading the push response")
-        return FastForwardResult(True, expected_parent)
+        with self.lock:
+            self._call("fast_forward", branch, expected_parent, tip)
+            current = self.repo.main_sha()
+            if current != expected_parent:
+                return FastForwardResult(False, current, "Update is not a fast forward")
+            run_git(self.repo.origin, "update-ref", f"refs/heads/{branch}", tip, expected_parent)
+            if self.lose_fast_forward_response:
+                self.lose_fast_forward_response = False
+                raise RuntimeError("connection reset while reading the push response")
+            return FastForwardResult(True, expected_parent)
 
     def update_ref(self, repo: str, ref: str, sha: str) -> None:
-        self._call("update_ref", ref, sha)
-        if not chain.object_exists(self.repo.origin, sha):
-            run_git(self.repo.clone, "push", "-q", "-f", str(self.repo.origin), f"{sha}:{ref}")
-        else:
-            run_git(self.repo.origin, "update-ref", ref, sha)
+        with self.lock:
+            self._call("update_ref", ref, sha)
+            if not chain.object_exists(self.repo.origin, sha):
+                run_git(self.repo.clone, "push", "-q", "-f", str(self.repo.origin), f"{sha}:{ref}")
+            else:
+                run_git(self.repo.origin, "update-ref", ref, sha)
 
     def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
-        self._call("post_comment", number, marker)
-        for comment in self.comments:
-            if comment["number"] == number and comment["marker"] == marker:
-                comment["body"] = body
-                comment["updates"] += 1
-                return comment["id"]
-        self._comment_counter += 1
-        comment = {
-            "id": f"c{self._comment_counter}",
-            "number": number,
-            "body": body,
-            "marker": marker,
-            "updates": 0,
-            "at": self.clock(),
-        }
-        self.comments.append(comment)
-        return comment["id"]
+        with self.lock:
+            self._call("post_comment", number, marker)
+            for comment in self.comments:
+                if comment["number"] == number and comment["marker"] == marker:
+                    comment["body"] = body
+                    comment["updates"] += 1
+                    return comment["id"]
+            self._comment_counter += 1
+            comment = {
+                "id": f"c{self._comment_counter}",
+                "number": number,
+                "body": body,
+                "marker": marker,
+                "updates": 0,
+                "at": self.clock(),
+            }
+            self.comments.append(comment)
+            return comment["id"]
 
     def set_labels(self, repo: str, number: int, add: Sequence[str], remove: Sequence[str]) -> None:
-        self._call("set_labels", number, tuple(add), tuple(remove))
-        labels = self.labels.setdefault(number, set())
-        labels.difference_update(remove)
-        labels.update(add)
+        with self.lock:
+            self._call("set_labels", number, tuple(add), tuple(remove))
+            labels = self.labels.setdefault(number, set())
+            labels.difference_update(remove)
+            labels.update(add)
 
     def close_pr(self, repo: str, number: int, title: str) -> None:
-        self._call("close_pr", number, title)
-        self.prs[number]["state"] = "closed"
-        self.prs[number]["title"] = title
-        self.closed[number] = title
+        with self.lock:
+            self._call("close_pr", number, title)
+            self.prs[number]["state"] = "closed"
+            self.prs[number]["title"] = title
+            self.closed[number] = title
 
     def repository_admin(self, login: str) -> bool:
-        self._call("repository_admin", login)
-        return login in self.admins
+        with self.lock:
+            self._call("repository_admin", login)
+            return login in self.admins
 
     def rate_limit(self) -> tuple[int, float]:
-        return 4800, self.clock() + 3600
+        with self.lock:
+            return 4800, self.clock() + 3600
 
 
 # --- scripted agents --------------------------------------------------------------------------------

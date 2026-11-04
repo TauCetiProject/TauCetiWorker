@@ -8,6 +8,7 @@ a controllable clock and no inference. The tests are named after the acceptance 
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -942,23 +943,27 @@ class Restart(QueueFixture):
         loop.start()
         try:
             self.approve(101, {"A.lean": "a\n"})
-            import time
-
-            deadline = time.time() + 5
-            while time.time() < deadline and not self.github.dispatches:
-                time.sleep(0.02)
-            self.assertEqual(len(self.github.dispatches), 1)
+            self.wait_for(lambda: len(self.github.dispatches) == 1, "the sealed head is dispatched by the loop")
             self.run_ci()
-            deadline = time.time() + 5
-            while time.time() < deadline and self.repo.main_sha() != self.head_tip_or_landed():
-                time.sleep(0.02)
-            self.assertEqual(self.controller.store.row("batches", {"id": 1})["state"], "landed")
+            self.wait_for(lambda: self.batch_state(1) == "landed", "the loop observes the pass and promotes the head")
+            self.assertEqual(self.repo.main_sha(), self.controller.store.row("batches", {"id": 1})["tip"])
+            self.wait_for(lambda: len(self.github.closed) == 1, "the loop drains the landing side effects")
         finally:
             loop.stop()
         self.assertGreater(loop.passes, 1)
+        self.assertIsNone(loop.last_error)
 
-    def head_tip_or_landed(self):
-        return self.controller.store.row("batches", {"id": 1})["tip"]
+    def batch_state(self, batch_id):
+        return self.controller.store.row("batches", {"id": batch_id})["state"]
+
+    def wait_for(self, condition, what, timeout=60.0):
+        """Poll `condition` until it holds; CI runners are slow and loaded, so the timeout is generous."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            time.sleep(0.02)
+        self.fail(f"timed out after {timeout:.0f}s waiting for {what}; reasons: {self.controller.status()['reasons']}")
 
 
 class StatusAndComments(QueueFixture):
