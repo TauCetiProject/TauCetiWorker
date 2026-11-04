@@ -48,7 +48,7 @@ from . import chain, feeds, webhook
 
 SCHEMA = "tauceti-queue.rehearsal/v1"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.36.0-rc2"  # TauCeti's pin
-SCAFFOLD_VERSION = "2"
+SCAFFOLD_VERSION = "3"
 SCRATCH_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 LOCAL_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 QUEUE_APP_ID = 5607007
@@ -156,7 +156,7 @@ jobs:
   # Deliberately named as in TauCeti: the service reads this job's log for diagnostics and its
   # runner for status, and never names a job `build` (that name is the required commit status).
   sandboxed-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # TauCeti pins this label too; the organisation's `ubuntu-latest` jobs can queue indefinitely
     timeout-minutes: 30
     outputs:
       status-sha: ${{ steps.candidate.outputs.sha }}
@@ -236,7 +236,7 @@ jobs:
   finalize-merge-group-build:
     needs: sandboxed-build
     if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # TauCeti pins this label too; the organisation's `ubuntu-latest` jobs can queue indefinitely
     timeout-minutes: 10
     permissions:
       contents: read
