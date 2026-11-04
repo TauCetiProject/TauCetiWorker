@@ -159,6 +159,7 @@ RUN_STDLIB=(
   extra_roadmap_prompt.py
   spread_candidates.py
   ssl_cert_file.py
+  staging_journal_report.py
   status_labels.py
   tend_bot_permissions.py
   worker_claude_config.py
