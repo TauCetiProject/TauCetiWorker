@@ -468,6 +468,10 @@ class GitHubAdapter:
             raise GitHubError("fetch_refs needs a clone directory")
         if self._tokens is None:
             raise GitHubError("fetch_refs needs the installation token source")
+        self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
+
+    def _git_with_token(self, repo: str, args: Sequence[str]) -> None:
+        """Run git in the clone with the installation token as an `http.extraheader` in the environment."""
         token = self._tokens.token()
         auth = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "SSL_CERT_FILE", "LANG")}
@@ -477,20 +481,11 @@ class GitHubAdapter:
             GIT_CONFIG_VALUE_0=f"AUTHORIZATION: basic {auth}",
             GIT_TERMINAL_PROMPT="0",
         )
-        command = [
-            "git",
-            "-C",
-            self.clone_dir,
-            "fetch",
-            "--no-tags",
-            "--quiet",
-            f"https://github.com/{repo}.git",
-            *refspecs,
-        ]
+        command = ["git", "-C", self.clone_dir, *args]
         result = self._git(command, env=env, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             # The header never appears in git's own output; the stderr is safe to surface.
-            raise GitHubError(f"git fetch failed for {repo}: {result.stderr.strip()}")
+            raise GitHubError(f"git {args[0]} failed for {repo}: {result.stderr.strip()}")
 
     def fast_forward(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         """Advance `branch` from `expected_parent` to `tip` without a merge commit.
@@ -518,8 +513,19 @@ class GitHubAdapter:
         return FastForwardResult(False, current, detail or "update is not a fast forward")
 
     def update_ref(self, repo: str, ref: str, sha: str) -> None:
-        """Create or force-update `refs/<ref>` (retained candidate refs, never the base branch)."""
+        """Create or force-update `refs/<ref>` (retained candidate refs, never the base branch).
+
+        Retained commits (squash chains, replacement tips) are built in the service's clone and
+        exist nowhere else, so with a clone the ref is pushed from it (`git push +<sha>:refs/<ref>`),
+        which uploads the objects as well; the Git Data API, used without a clone, can only point a
+        ref at an object GitHub already has.
+        """
         ref = ref.removeprefix("refs/")
+        if self.clone_dir is not None and self._tokens is not None:
+            self._git_with_token(
+                repo, ["push", "--quiet", "--no-verify", f"https://github.com/{repo}.git", f"+{sha}:refs/{ref}"]
+            )
+            return
         response = self.client.request(
             "PATCH", f"repos/{repo}/git/refs/{ref}", json_body={"sha": sha, "force": True}, tolerate=(404, 422)
         )
