@@ -387,3 +387,52 @@ class Generated(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OverTheController(unittest.TestCase):
+    """The feeds generated from the real controller's records (tauceti_queue.controller over the
+    end-to-end fakes): an approved PR inserted into the open batch, sealed into a head and built."""
+
+    def test_feeds_from_a_live_controller(self):
+        import tempfile
+
+        from tauceti_queue import fakes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, github, _repo, _clock = fakes.make_controller(tmp)
+            self.addCleanup(controller.store.close)
+            head = github.create_pr(101, {"A.lean": "a\n"})
+            evidence = {
+                "kind": "issue_comment",
+                "actor_login": "kim-em",
+                "actor_id": 477956,
+                "admin": True,
+                "merge_base_sha": "d" * 40,
+                "single": False,
+            }
+            controller.approve(TAUCETI, 101, head, "kim-em", 0, evidence)
+            controller.tick()
+            schema = feeds.load_schema()
+            source = feeds.feed_source(controller)
+            self.assertIsInstance(source, feeds.ControllerFeedSource)
+            doc = feeds.observation_feed(source, TAUCETI, "main")
+            self.assertEqual(feeds.validate_observation(doc, schema), [])
+            self.assertTrue(doc["batch_ids"], "the approved PR is in a batch")
+            members = [m for b in doc["batches"] for m in b["members"]]
+            self.assertIn({"pr": 101, "head_sha": head}, members)
+            self.assertEqual(
+                doc["scope_approvals"], [{"pr": 101, "actor_id": 477956, "head_sha": head, "merge_base_sha": "d" * 40}]
+            )
+            running = [b for b in doc["batches"] if b["state"] == "running"]
+            if running:
+                requested = feeds.observation_feed(source, TAUCETI, "main", running[0]["id"])["requested_batch"]
+                self.assertEqual(requested["id"], running[0]["id"])
+                self.assertEqual(requested["state"], "running")
+            cands = feeds.candidates_feed(source, TAUCETI, "main")
+            self.assertEqual(feeds.validate_candidates(cands, schema), [])
+            self.assertEqual(len(cands["admissions"]), 1)
+            self.assertEqual(cands["admissions"][0]["snapshot"]["reviewer"], "kim-em")
+            self.assertEqual(cands["admissions"][0]["snapshot"]["manual_approval"]["actor_id"], 477956)
+            if cands["candidates"]:
+                self.assertEqual(cands["candidates"][0]["snapshot"]["members"][0]["pr"], 101)
+            self.assertEqual(feeds.observation_feed(source, TAUCETI, "release")["batches"], [])

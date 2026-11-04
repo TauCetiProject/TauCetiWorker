@@ -4,8 +4,10 @@
 webhook secret over the raw request body. `WebhookReceiver.handle` then routes one delivery:
 
 - `issue_comment` (created, on a pull request) and `pull_request_review` (submitted, with a body)
-  are read for Bors commands by `commands.run_comment`; the review App's exact-head approvals are
-  recognised by the issuing App's id, as Bors recognises them;
+  are read for Bors commands by `commands.run_comment`; the review App's exact-head comment
+  approvals are recognised by the issuing App's id, as Bors recognises them;
+- `check_run` deliveries of the review App's `merge eligibility` check, the way TauCetiReview
+  approves today, are reconciled by `eligibility.reconcile`;
 - every subscribed event (`pull_request`, `pull_request_review`, `issue_comment`, `status`,
   `check_run`, `check_suite`, `push`, `workflow_run`) is passed to `controller.handle_event(kind,
   payload)` so the controller can bind statuses and runs to its candidates.
@@ -24,7 +26,7 @@ import logging
 import threading
 from collections.abc import Iterable
 
-from . import commands
+from . import commands, eligibility
 
 log = logging.getLogger("tauceti_queue.webhook")
 
@@ -108,8 +110,16 @@ class WebhookReceiver:
             self._issue_comment(repo, payload)
         elif delivery.event == "pull_request_review":
             self._review(repo, payload)
+        elif delivery.event == "check_run":
+            self._check_run(repo, payload)
         self.controller.handle_event(delivery.event, payload)
         return "ok"
+
+    def _check_run(self, repo: str, payload: dict) -> None:
+        """A `merge eligibility` check from the review App is the App's approval or revocation."""
+        pr = eligibility.notification_pr(payload.get("check_run") or {}, repo, review_app_id=self.review_app_id)
+        if pr is not None:
+            eligibility.reconcile(self.controller, self.adapter, repo, pr, review_app_id=self.review_app_id)
 
     def _issue_comment(self, repo: str, payload: dict) -> None:
         if payload.get("action") != "created":

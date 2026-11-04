@@ -47,7 +47,34 @@ log = logging.getLogger("tauceti_queue.server")
 
 MAX_BODY = 25 * 1024 * 1024
 REPOSITORY_ROUTE = re.compile(r"^/repositories/(\d+)/(active-batches|candidates)$")
-TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result)$")
+TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result|release)$")
+# `ControllerError.code` (tauceti_queue/controller.py) to HTTP status.
+ERROR_STATUS = {
+    "unknown-task": 404,
+    "unknown-claim": 404,
+    "unknown-repository": 404,
+    "unknown-pr": 404,
+    "unknown-setting": 400,
+    "claim-expired": 409,
+    "claim-superseded": 409,
+    "version-mismatch": 409,
+    "not-authorized": 403,
+}
+
+
+def error_status(code: str) -> int:
+    if code in ERROR_STATUS:
+        return ERROR_STATUS[code]
+    if code.startswith("unknown-"):
+        return 404
+    return 400
+
+
+def _jsonable(value):
+    """Controller results as JSON: dataclass-like records expose `to_dict`."""
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return value
 
 
 @dataclasses.dataclass
@@ -111,10 +138,13 @@ class QueueHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, handler, controller, config: ServerConfig) -> None:
+    def __init__(
+        self, address, handler, controller, config: ServerConfig, status: Callable[[], dict] | None = None
+    ) -> None:
         super().__init__(address, handler)
         self.controller = controller
         self.config = config
+        self.status_provider = status
         self.started_at = config.clock()
         self.receiver = webhook.WebhookReceiver(
             controller, config.adapter, repositories=config.repositories.values(), review_app_id=config.review_app_id
@@ -181,14 +211,18 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, str(error) or "not found")
         except ValueError as error:
             self._error(400, str(error) or "bad request")
-        except Exception:  # noqa: BLE001 - the service must answer every request
+        except Exception as error:  # noqa: BLE001 - the service must answer every request
+            code = getattr(error, "code", None)
+            if isinstance(code, str):
+                self._json(error_status(code), {"error": code, "detail": str(error)})
+                return
             log.error("request %s %s failed:\n%s", self.command, self.path, traceback.format_exc())
             self._error(500, "internal error")
         else:
             if result is None:
                 self._send(204, b"")
             else:
-                self._json(200, result)
+                self._json(200, _jsonable(result))
 
     def _authenticated(self) -> tuple[str, int] | None:
         identity = self.server.auth.resolve(self.headers.get("Authorization"))
@@ -207,8 +241,18 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         if path in ("/health", "/health/"):
             self._send(200, b"ok\n", "text/plain")
-        elif path == "/status":
+        elif path in ("/status", "/status/"):
             self._call(self._status)
+        elif path == "/healthz":
+            self._call(self._healthz)
+        elif path == "/settings":
+            self._call(self._settings)
+        elif path == "/api/observation":
+            repo = next(iter(self.server.config.repositories.values()), None)
+            if repo is None:
+                self._send(404, b"")
+                return
+            self._call(lambda: self._feed("active-batches", repo, query))
         elif match := REPOSITORY_ROUTE.match(path):
             repo = self.server.config.repositories.get(int(match.group(1)))
             if repo is None:
@@ -235,30 +279,60 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/urgent":
             self._admin_urgent()
             return
+        if path == "/admin/retry-ci":
+            self._admin_retry_ci()
+            return
+        if path == "/tasks/inference":
+            self._task_inference()
+            return
         self._error(404, "no such route")
 
-    def _status(self) -> dict:
-        controller = self.server.controller
-        status = controller.status() if hasattr(controller, "status") else {}
-        status = dict(status or {})
+    def _counters(self) -> dict:
         adapter = self.server.config.adapter
         client = getattr(adapter, "client", None)
-        status.update(
-            {
-                "revision": self.server.revision,
-                "started_at": feeds._iso(self.server.started_at),
-                "github": client.stats() if client is not None and hasattr(client, "stats") else {},
-                "webhooks": {
-                    "received": self.server.receiver.received,
-                    "duplicates": self.server.receiver.duplicates,
-                    "ignored": self.server.receiver.ignored,
-                },
-            }
-        )
+        return {
+            "github": client.stats() if client is not None and hasattr(client, "stats") else {},
+            "webhooks": {
+                "received": self.server.receiver.received,
+                "duplicates": self.server.receiver.duplicates,
+                "ignored": self.server.receiver.ignored,
+            },
+        }
+
+    def _status(self) -> dict:
+        """The status document: the entrypoint's provider (runtime envelope around the controller's
+        status) when given, else the controller's status with the service facts added."""
+        if self.server.status_provider is not None:
+            status = dict(self.server.status_provider())
+        else:
+            controller = self.server.controller
+            status = dict((controller.status() if hasattr(controller, "status") else None) or {})
+            status.update({"revision": self.server.revision, "started_at": feeds._iso(self.server.started_at)})
+        status.update(self._counters())
         return status
 
+    def _healthz(self) -> dict:
+        status = self._status()
+        return {
+            "ok": True,
+            "schema": status.get("schema"),
+            "service": status.get("service"),
+            "revision": status.get("revision", (status.get("service") or {}).get("revision")),
+        }
+
+    def _settings(self) -> dict:
+        controller = self.server.controller
+        status = (controller.status() if hasattr(controller, "status") else None) or {}
+        return {"settings": dict(status.get("settings") or {}), "source": "controller"}
+
+    def _admin(self, login: str) -> bool:
+        """The admin predicate the security audit uses: repository-admin permission for the caller."""
+        repo = next(iter(self.server.config.repositories.values()), None)
+        adapter = self.server.config.adapter
+        return bool(repo) and bool(adapter.repository_admin(login, repo))
+
     def _feed(self, which: str, repo: str, query: dict) -> dict:
-        source = self.server.controller
+        source = feeds.feed_source(self.server.controller)
         base = (query.get("base") or [None])[0]
         if not base:
             canonical = getattr(source, "canonical_branch", None)
@@ -316,16 +390,66 @@ class Handler(BaseHTTPRequestHandler):
         self._call(lambda: self.server.controller.claim_task(self._worker_identity(body), login))
 
     def _task(self, task_id: str, action: str) -> None:
+        """`renew`, `result` and `release` carry the claim token the claim handed out; the
+        controller's task API (`renew_task(task_id, claim_token)`, `submit_task(task_id, claim_token,
+        tip_sha, worker_notes)`, `release_task(task_id, claim_token, reason, error)`) checks it."""
         identity = self._authenticated()
         if identity is None:
             return
         body = self._read_json()
         if body is None:
             return
-        login = identity[0]
+        token = str(body.get("claim_token") or "")
+        if not token:
+            self._error(400, "`claim_token` is required")
+            return
+        tid = int(task_id) if task_id.isdigit() else task_id
         controller = self.server.controller
-        method = controller.renew_task if action == "renew" else controller.submit_task
-        self._call(lambda: method(task_id, self._worker_identity(body), login, body))
+        if action == "renew":
+            self._call(lambda: _renewal(tid, controller.renew_task(tid, token)))
+        elif action == "release":
+            self._call(
+                lambda: controller.release_task(
+                    tid, token, str(body.get("reason") or "released"), str(body.get("error") or "")
+                )
+            )
+        else:
+            tip = str(body.get("tip_sha") or "")
+            if not re.fullmatch(r"[0-9a-f]{40}", tip):
+                self._error(400, "`tip_sha` must be a full commit SHA")
+                return
+            self._call(lambda: controller.submit_task(tid, token, tip, str(body.get("worker_notes") or "")))
+
+    def _admin_retry_ci(self) -> None:
+        identity = self._authenticated()
+        if identity is None:
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        if not self._admin(identity[0]):
+            self._error(403, f"{identity[0]} is not a repository admin")
+            return
+        repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
+        self._call(lambda: self.server.controller.retry_ci(repo, identity[0]))
+
+    def _task_inference(self) -> None:
+        """A worker reports whether an inference call succeeded (`report_inference`), for the hold."""
+        identity = self._authenticated()
+        if identity is None:
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        ok = body.get("ok")
+        if not isinstance(ok, bool):
+            self._error(400, "`ok` must be a boolean")
+            return
+        self._call(
+            lambda: self.server.controller.report_inference(
+                self._worker_identity(body), ok, str(body.get("error") or "")
+            )
+        )
 
     def _admin_settings(self) -> None:
         identity = self._authenticated()
@@ -334,7 +458,19 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
-        self._call(lambda: self.server.controller.update_settings(identity[0], body))
+        if not self._admin(identity[0]):
+            self._error(403, f"{identity[0]} is not a repository admin")
+            return
+        self._call(lambda: self._apply_settings(identity[0], body))
+
+    def _apply_settings(self, login: str, body: dict) -> dict:
+        controller = self.server.controller
+        if hasattr(controller, "set_setting"):
+            for key, value in body.items():
+                controller.set_setting(key, value, login)
+            status = controller.status() if hasattr(controller, "status") else {}
+            return {"settings": dict((status or {}).get("settings") or {}), "actor": login}
+        return controller.update_settings(login, body)
 
     def _admin_urgent(self) -> None:
         identity = self._authenticated()
@@ -343,17 +479,58 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
-        repo = str(body.get("repo") or "")
+        repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
         pr = body.get("pr")
         if repo not in self.server.config.repositories.values() or not isinstance(pr, int) or pr <= 0:
             self._error(400, "`repo` must be a served repository and `pr` a positive integer")
             return
+        if not self._admin(identity[0]):
+            self._error(403, f"{identity[0]} is not a repository admin")
+            return
         self._call(lambda: self.server.controller.mark_urgent(repo, pr, identity[0]))
 
 
-def create_server(controller, config: ServerConfig) -> QueueHTTPServer:
-    """A server ready for `serve_forever()`; `server_address` carries the bound port."""
-    return QueueHTTPServer((config.host, config.port), Handler, controller, config)
+def _renewal(task_id, result) -> dict:  # noqa: E302
+    if isinstance(result, dict):
+        return result
+    return {"task_id": task_id, "expires_at": result}
+
+
+def server_config(config, *, adapter=None, app=None, controller=None) -> ServerConfig:
+    """A `ServerConfig` from the service's `tauceti_queue.config.Config` (the entrypoint's form).
+
+    The webhook secret comes from the loaded App when given, else from `credentials_dir`; the
+    adapter is the one passed, else the controller's `github`; repository id 1 is the configured
+    repository, as it is for Bors.
+    """
+    if isinstance(config, ServerConfig):
+        return config
+    adapter = adapter or getattr(controller, "github", None)
+    if adapter is None:
+        raise ValueError("create_server needs the GitHub adapter (`adapter=`) or a controller with `.github`")
+    if app is not None:
+        secret = app.webhook_secret
+    else:
+        secret = (pathlib.Path(config.credentials_dir).expanduser() / "github-webhook-secret").read_bytes().strip()
+    return ServerConfig(
+        webhook_secret=secret,
+        repositories={1: config.repository},
+        adapter=adapter,
+        host=config.listen_host,
+        port=config.listen_port,
+    )
+
+
+def create_server(
+    controller, config, *, status: Callable[[], dict] | None = None, adapter=None, app=None
+) -> QueueHTTPServer:
+    """A server ready for `serve_forever()`; `server_address` carries the bound port.
+
+    `config` is a `ServerConfig` or the service `Config`; `status` is the entrypoint's status
+    document provider (`Service.status_document`), used for `/status` and `/healthz` when given.
+    """
+    resolved = server_config(config, adapter=adapter, app=app, controller=controller)
+    return QueueHTTPServer((resolved.host, resolved.port), Handler, controller, resolved, status)
 
 
 def serve_in_thread(server: QueueHTTPServer) -> threading.Thread:

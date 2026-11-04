@@ -363,6 +363,14 @@ class CommentContext:
     review_head: str | None = None
 
 
+def live_pull_request(adapter, repo: str, number: int):
+    """The live PR, or None when GitHub does not know it (`fetch_pr` raises a `LookupError`)."""
+    try:
+        return adapter.fetch_pr(repo, number)
+    except LookupError:
+        return None
+
+
 PERMISSION_DENIED = (
     ":lock: Permission denied\n\nOnly collaborators with push access to the repository can run that command."
 )
@@ -379,9 +387,9 @@ def draft_reply(commands: Sequence[Command]) -> str:
 def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) -> list[str]:
     """Apply one comment's commands; returns the replies posted (for logs and tests).
 
-    `controller` provides `approve(repo, pr, head_sha, reviewer, priority, evidence)`,
-    `unapprove(repo, pr)`, `cancel(repo, pr)` and `set_priority(repo, pr, priority)`; `adapter` is
-    the GitHub port, used for the live PR, the reviewer check and replies.
+    `controller` provides `approve(repo, pr, head_sha, reviewer, priority, evidence)` (evidence as
+    a dict), `unapprove(repo, pr, actor)`, `cancel(repo, pr, actor)` and `set_priority(repo, pr,
+    priority)`; `adapter` is the GitHub port, used for the live PR, the reviewer check and replies.
     """
     commands = parse(context.body, review_app=context.review_app)
     if not commands:
@@ -397,7 +405,7 @@ def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) 
     reply_key = f"{context.kind}:{context.comment_id or context.created_at}"
 
     if level != "none":
-        pr = adapter.fetch_pr(repo, number)
+        pr = live_pull_request(adapter, repo, number)
         if pr is None:
             log.warning("command on %s#%s ignored: pull request unavailable", repo, number)
             return []
@@ -448,11 +456,11 @@ def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) 
                 command=f"{TRIGGER} {command.typed}",
             )
             reviewer = command.reviewer or context.actor_login
-            controller.approve(repo, number, head, reviewer, command.priority, evidence)
+            controller.approve(repo, number, head, reviewer, command.priority or 0, evidence.as_dict())
         elif command.kind == "unapprove":
-            controller.unapprove(repo, number)
+            controller.unapprove(repo, number, context.actor_login)
         elif command.kind == "cancel":
-            controller.cancel(repo, number)
+            controller.cancel(repo, number, context.actor_login)
         elif command.kind == "priority":
             controller.set_priority(repo, number, command.priority)
         elif command.kind == "single":

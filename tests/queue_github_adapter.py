@@ -297,7 +297,9 @@ class Adapter(unittest.TestCase):
             (42, HEAD, "main", "alice", "open", False, ("ready-to-merge",)),
         )
         self.assertEqual((pr.base_sha, pr.author_id, pr.head_repo), (BASE, 7, TAUCETI))
-        self.assertIsNone(a.fetch_pr(TAUCETI, 43))
+        with self.assertRaises(ga.PullRequestNotFound):
+            a.fetch_pr(TAUCETI, 43)
+        self.assertIsNone(a.fetch_pr_or_none(TAUCETI, 43))
 
     def test_pr_merge_base(self):
         transport = FakeTransport()
@@ -422,7 +424,7 @@ class Adapter(unittest.TestCase):
         finally:
             time.time = real_time
         self.assertEqual(
-            (found.run_id, found.attempt, found.status, found.conclusion), (41775740735, 2, "completed", "success")
+            (found.run_id, found.attempt, found.status, found.conclusion), ("41775740735", 2, "completed", "success")
         )
         self.assertEqual(
             (found.runner_name, found.host, found.runner_labels),
@@ -433,7 +435,13 @@ class Adapter(unittest.TestCase):
             ["pick-runner", "sandboxed-build", "sandboxed-build: Restore cache", "sandboxed-build: Build"],
         )
         self.assertEqual(found.phases[-1].status, "in_progress")
-        self.assertEqual(found.completed_at, "2026-11-04T04:40:00Z")
+        self.assertEqual(found.completed_at, app.parse_github_time("2026-11-04T04:40:00Z"))
+        self.assertEqual(found.diagnostics, (), "a successful run carries no diagnostics")
+        self.assertEqual(
+            ga.dispatch_members([7, {"pr": 8, "head_sha": HEAD}]), [{"pr": 7}, {"pr": 8, "head_sha": HEAD}]
+        )
+        self.assertEqual(found.phases[0].started_at, None, "fixture timestamps that are not ISO read as unknown")
+        self.assertEqual(found.diagnostics, (), "a successful run carries no diagnostics")
 
     def test_find_candidate_run_absent_and_ambiguous(self):
         transport = FakeTransport()
@@ -497,8 +505,8 @@ class Adapter(unittest.TestCase):
         a = adapter(transport)
         status = a.commit_status(TAUCETI, HEAD, "build")
         self.assertEqual(
-            (status.state, status.description, status.run_id, status.updated_at, status.creator_login),
-            ("failure", "3 modules failed", 41771236355, "t2", "tauceti-ci-status[bot]"),
+            (status.state, status.description, status.run_id, status.updated_at),
+            ("failure", "3 modules failed", "41771236355", None),
         )
         self.assertIsNone(a.commit_status(TAUCETI, HEAD, "bump-guard"))
         self.assertIsNone(a.commit_status(TAUCETI, HEAD, "scope").run_id)
@@ -515,14 +523,103 @@ class Adapter(unittest.TestCase):
         # The parent moved before the push: refused without a write.
         transport.responses.clear()
         transport.add("GET", ref_url, 200, {"object": {"sha": "e" * 40}})
-        self.assertEqual(a.fast_forward(TAUCETI, "main", BASE, TIP), ga.FastForwardResult(False, "e" * 40))
+        refused = a.fast_forward(TAUCETI, "main", BASE, TIP)
+        self.assertEqual((refused.ok, refused.actual_parent), (False, "e" * 40))
         self.assertEqual(transport.calls[-1][0], "GET")
         # The parent moved between the read and the push: GitHub refuses the non-fast-forward.
         transport.responses.clear()
         transport.add("GET", ref_url, 200, {"object": {"sha": BASE}})
         transport.add("GET", ref_url, 200, {"object": {"sha": "f" * 40}})
         transport.add("PATCH", patch_url, 422, {"message": "Update is not a fast forward"})
-        self.assertEqual(a.fast_forward(TAUCETI, "main", BASE, TIP), ga.FastForwardResult(False, "f" * 40))
+        refused = a.fast_forward(TAUCETI, "main", BASE, TIP)
+        self.assertEqual(
+            (refused.ok, refused.actual_parent, refused.error), (False, "f" * 40, "Update is not a fast forward")
+        )
+
+    def test_close_pr_as_bors_does(self):
+        transport = FakeTransport()
+        transport.add("PATCH", f"https://api.github.com/repos/{TAUCETI}/pulls/42", 200, {})
+        adapter(transport).close_pr(TAUCETI, 42, "[Merged by Bors] - feat: add")
+        self.assertEqual(
+            json.loads(transport.calls[-1][3]), {"state": "closed", "title": "[Merged by Bors] - feat: add"}
+        )
+
+    def test_failed_run_diagnostics_from_the_job_log(self):
+        transport = FakeTransport()
+        run = {
+            "id": 7,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "failure",
+            "created_at": "2026-11-04T04:07:11Z",
+            "updated_at": "2026-11-04T04:40:00Z",
+        }
+        jobs = {
+            "jobs": [
+                {
+                    "id": 70,
+                    "name": "sandboxed-build",
+                    "runner_name": "h7",
+                    "labels": [],
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "steps": [],
+                },
+                {
+                    "id": 71,
+                    "name": "finalize-merge-group-build",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "steps": [],
+                },
+            ]
+        }
+        transport.add(
+            "GET",
+            f"https://api.github.com/repos/{TAUCETI}/actions/runs/7/attempts/1/jobs?per_page=100&page=1",
+            200,
+            jobs,
+        )
+        transport.add(
+            "GET",
+            f"https://api.github.com/repos/{TAUCETI}/actions/jobs/70/logs",
+            302,
+            b"",
+            {"Location": "https://signed.example/log"},
+        )
+        log = (
+            "2026-11-04T04:20:00.1Z error: TauCeti/Algebra/Group/Basic.lean:12:3: error: unknown identifier 'foo'\n"
+            "2026-11-04T04:20:01.1Z audit-driver: import TauCeti.A.B failed, environment already contains 'x' from TauCeti.C.D\n"
+            '2026-11-04T04:20:02.1Z LINT-ENV-LOCATIONS {"version": 1, "complete": true, "findings": [{"linter": "docBlame", "declaration": "foo", "path": "TauCeti/Lint/Target.lean", "line": 3, "column": 1}]}\n'
+            "2026-11-04T04:21:00.1Z error: build failed\n"
+        )
+        transport.add("GET", "https://signed.example/log", 200, log.encode())
+        found = adapter(transport).candidate_run(TAUCETI, run)
+        self.assertEqual(
+            transport.calls[-1][2], {"User-Agent": ga.USER_AGENT}, "the signed URL is fetched without credentials"
+        )
+        kinds = [(d["kind"], d["module"]) for d in found.diagnostics]
+        self.assertEqual(
+            kinds,
+            [
+                ("compiler", "TauCeti.Algebra.Group.Basic"),
+                ("audit", "TauCeti.A.B"),
+                ("audit", "TauCeti.C.D"),
+                ("lint", "TauCeti.Lint.Target"),
+            ],
+        )
+        self.assertTrue(all("message" in d for d in found.diagnostics))
+        # A cancelled run is an infrastructure finding, not a source one.
+        transport.responses.clear()
+        cancelled = dict(run, conclusion="cancelled")
+        transport.add(
+            "GET",
+            f"https://api.github.com/repos/{TAUCETI}/actions/runs/7/attempts/1/jobs?per_page=100&page=1",
+            200,
+            {"jobs": [dict(jobs["jobs"][0], conclusion="cancelled")]},
+        )
+        found = adapter(transport).candidate_run(TAUCETI, cancelled)
+        self.assertEqual({d["kind"] for d in found.diagnostics}, {"infrastructure"})
 
     def test_update_ref_creates_when_missing(self):
         transport = FakeTransport()
@@ -543,7 +640,7 @@ class Adapter(unittest.TestCase):
         transport.add("GET", f"{comments_url}?per_page=100&page=1", 200, [{"id": 1, "body": "unrelated"}])
         transport.add("POST", comments_url, 201, {"id": 900})
         a = adapter(transport)
-        self.assertEqual(a.post_comment(TAUCETI, 42, "Merged.", "landed 2650"), 900)
+        self.assertEqual(a.post_comment(TAUCETI, 42, "Merged.", "landed 2650"), "900")
         posted = json.loads(transport.calls[-1][3])["body"]
         self.assertEqual(posted, "Merged.\n\n<!-- tauceti-queue landed 2650 -->\n")
         transport.responses.clear()
@@ -554,9 +651,9 @@ class Adapter(unittest.TestCase):
             [{"id": 1, "body": "unrelated"}, {"id": 900, "body": posted}],
         )
         transport.add("PATCH", f"https://api.github.com/repos/{TAUCETI}/issues/comments/900", 200, {"id": 900})
-        self.assertEqual(a.post_comment(TAUCETI, 42, "Merged.", "landed 2650"), 900)
+        self.assertEqual(a.post_comment(TAUCETI, 42, "Merged.", "landed 2650"), "900")
         self.assertEqual(transport.calls[-1][0], "GET", "an identical body is not rewritten")
-        self.assertEqual(a.post_comment(TAUCETI, 42, "Merged, then commented.", "landed 2650"), 900)
+        self.assertEqual(a.post_comment(TAUCETI, 42, "Merged, then commented.", "landed 2650"), "900")
         self.assertEqual(transport.calls[-1][0], "PATCH", "a changed body edits the marked comment")
 
     def test_set_labels(self):
@@ -609,7 +706,7 @@ class Adapter(unittest.TestCase):
             {"resources": {"core": {"remaining": 4999, "reset": 1800000600}}},
         )
         a = adapter(transport)
-        self.assertEqual(a.rate_limit(), (4999, 1800000600))
+        self.assertEqual(a.rate_limit(), (4999, 1800000600.0))
 
     def test_fetch_refs_keeps_the_token_out_of_argv(self):
         captured = {}

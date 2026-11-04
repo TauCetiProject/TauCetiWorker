@@ -128,6 +128,8 @@ RUN_STDLIB=(
   queue_github_adapter.py
   queue_feeds.py
   queue_server.py
+  queue_eligibility.py
+  queue_diagnostics.py
   queue_controller.py
   queue_fixture.py
   queue_store.py

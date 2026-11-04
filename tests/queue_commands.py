@@ -186,10 +186,10 @@ class FakeController:
     def approve(self, repo, pr, head_sha, reviewer, priority, evidence):
         self.calls.append(("approve", repo, pr, head_sha, reviewer, priority, evidence))
 
-    def unapprove(self, repo, pr):
+    def unapprove(self, repo, pr, actor=""):
         self.calls.append(("unapprove", repo, pr))
 
-    def cancel(self, repo, pr):
+    def cancel(self, repo, pr, actor=""):
         self.calls.append(("cancel", repo, pr))
 
     def set_priority(self, repo, pr, priority):
@@ -283,31 +283,32 @@ class Running(unittest.TestCase):
         (call,) = controller.calls
         self.assertEqual(call[:6], ("approve", "TauCetiProject/TauCeti", 42, HEAD, "alice", 4))
         evidence = call[6]
-        self.assertEqual(evidence.kind, "issue_comment")
-        self.assertEqual((evidence.actor_login, evidence.actor_id, evidence.comment_id), ("alice", 7, 1001))
-        self.assertEqual(evidence.head_sha, HEAD)
-        self.assertFalse(evidence.admin)
-        self.assertIsNone(evidence.merge_base_sha, "no merge base is read for a non-admin")
-        self.assertEqual(evidence.command, "bors r+ p=4")
+        self.assertEqual(evidence["kind"], "issue_comment")
+        self.assertEqual((evidence["actor_login"], evidence["actor_id"], evidence["comment_id"]), ("alice", 7, 1001))
+        self.assertIsInstance(evidence, dict, "the controller receives evidence as a plain dict")
+        self.assertEqual(evidence["head_sha"], HEAD)
+        self.assertFalse(evidence["admin"])
+        self.assertIsNone(evidence["merge_base_sha"], "no merge base is read for a non-admin")
+        self.assertEqual(evidence["command"], "bors r+ p=4")
 
     def test_admin_approval_carries_the_merge_base_for_scope_approvals(self):
         controller, adapter = FakeController(), FakeAdapter(pr(), permissions={"kim": "admin"})
         c.run_comment(controller, adapter, context("bors r+", login="kim"))
         evidence = controller.calls[0][6]
-        self.assertTrue(evidence.admin)
-        self.assertEqual(evidence.merge_base_sha, "c" * 40)
+        self.assertTrue(evidence["admin"])
+        self.assertEqual(evidence["merge_base_sha"], "c" * 40)
 
     def test_activation_by_names_the_reviewer(self):
         controller, adapter = FakeController(), FakeAdapter(pr(), permissions={"alice": "write"})
         c.run_comment(controller, adapter, context("bors r=bob"))
         self.assertEqual(controller.calls[0][4], "bob")
-        self.assertEqual(controller.calls[0][6].actor_login, "alice", "evidence names the actual commenter")
+        self.assertEqual(controller.calls[0][6]["actor_login"], "alice", "evidence names the actual commenter")
 
     def test_review_submission_approves_at_the_reviewed_head(self):
         controller, adapter = FakeController(), FakeAdapter(pr(), permissions={"alice": "write"})
         c.run_comment(controller, adapter, context("bors r+", kind="pull_request_review", review_head=OTHER))
         self.assertEqual(controller.calls[0][3], OTHER)
-        self.assertEqual(controller.calls[0][6].kind, "pull_request_review")
+        self.assertEqual(controller.calls[0][6]["kind"], "pull_request_review")
 
     def test_review_app_exact_head(self):
         controller, adapter = FakeController(), FakeAdapter(pr())
@@ -315,7 +316,7 @@ class Running(unittest.TestCase):
             controller, adapter, context(f"bors r+ sha={HEAD}", login="tauceti-review-bot[bot]", review_app=True)
         )
         self.assertEqual(controller.calls[0][3], HEAD)
-        self.assertEqual(controller.calls[0][6].kind, "review_app")
+        self.assertEqual(controller.calls[0][6]["kind"], "review_app")
         self.assertEqual(adapter.permission_lookups, 0, "the review App is the reviewer, not a collaborator lookup")
 
     def test_review_app_stale_head_is_ignored(self):

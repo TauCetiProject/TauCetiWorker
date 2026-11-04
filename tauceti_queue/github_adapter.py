@@ -5,10 +5,10 @@ installation (`github_app.InstallationTokenSource`), records the primary rate li
 response, retries secondary-limit and transient failures with bounded waits, and exposes those
 counters through `stats()` for the status endpoint.
 
-`GitHubAdapter` implements the controller's `GitHubPort` with the method list agreed with the
-controller stream (see docs/queue/github.md):
+`GitHubAdapter` implements the controller's `GitHubPort` (`tauceti_queue/ports.py`, the authoritative
+protocol and record shapes; timestamps are unix seconds, run ids strings):
 
-    fetch_pr(repo, number) -> PullRequest | None
+    fetch_pr(repo, number) -> PullRequest                 (raises PullRequestNotFound)
     fetch_refs(repo, refspecs)
     dispatch_candidate(repo, *, head_sha, base_sha, base_ref, batch_id, members) -> dispatch id
     find_candidate_run(repo, *, batch_id, head_sha, base_sha) -> CandidateRun | None
@@ -17,14 +17,17 @@ controller stream (see docs/queue/github.md):
     update_ref(repo, ref, sha)
     post_comment(repo, number, body, marker) -> comment id
     set_labels(repo, number, add, remove)
+    close_pr(repo, number, title)
     repository_admin(login) -> bool
     rate_limit() -> (remaining, reset_at)
 
 The conventions that keep the queue a drop-in replacement for Bors are encoded here: the dispatch
 is `repository_dispatch` of `pr-build.yml` with event type `tauceti-bors-staging` and the same
 client payload, the run is found by the `run-name` the workflow derives from that payload, the
-verdict is the `build` commit status whose target URL names the run, and promotion is a plain
-fast-forward update of the base branch through the Git Data API, as Bors's `push` is.
+verdict is the `build` commit status whose target URL names the run, a completed run's diagnostics
+are read from its job log with Bors's patterns (`diagnostics.py`), promotion is a plain
+fast-forward update of the base branch through the Git Data API, and a landed member is closed with
+the `[Merged by Bors] - ` title, as Bors's `close_merged_pr` does.
 """
 
 from __future__ import annotations
@@ -40,22 +43,26 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
-from . import github_app
+from . import diagnostics, github_app, ports
+from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
 
 API = github_app.API
 API_VERSION = "2022-11-28"
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
 STAGING_WORKFLOW = "pr-build.yml"
+BUILD_JOB = "sandboxed-build"
 SHA = re.compile(r"[0-9a-f]{40}")
 RUN_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 COMMENT_MARKER = "<!-- tauceti-queue {marker} -->"
 # Bors treats collaborators with push access as reviewers (`auto_reviewer_required_perm: :push`).
 REVIEWER_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+MAX_LOG_BYTES = 64 * 1024 * 1024
 
 Transport = github_app.Transport
+Phase = CandidatePhase
 
 
 class GitHubError(RuntimeError):
@@ -63,6 +70,10 @@ class GitHubError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+class PullRequestNotFound(GitHubError, LookupError):
+    """`fetch_pr` for a number GitHub does not know."""
 
 
 class RateLimited(GitHubError):
@@ -78,17 +89,9 @@ class AmbiguousCandidateRun(GitHubError):
 
 
 @dataclasses.dataclass(frozen=True)
-class PullRequest:
-    number: int
-    head_sha: str
-    base_ref: str
-    title: str
-    body: str
-    author_login: str
-    state: str
-    draft: bool
-    labels: tuple[str, ...]
-    # Beyond the agreed shape, carried because command handling and scope approvals need them.
+class PullRequest(ports.PullRequest):
+    """The port's record plus what command handling and scope approvals need."""
+
     base_sha: str = ""
     author_id: int = 0
     head_repo: str = ""
@@ -117,48 +120,6 @@ class PullRequest:
 
 
 @dataclasses.dataclass(frozen=True)
-class Phase:
-    name: str
-    started_at: str | None
-    completed_at: str | None
-    status: str
-
-
-@dataclasses.dataclass(frozen=True)
-class CandidateRun:
-    run_id: int
-    attempt: int
-    status: str
-    conclusion: str | None
-    created_at: str
-    started_at: str | None
-    completed_at: str | None
-    runner_name: str | None
-    runner_labels: tuple[str, ...]
-    host: str | None
-    phases: tuple[Phase, ...]
-    html_url: str = ""
-    display_title: str = ""
-
-
-@dataclasses.dataclass(frozen=True)
-class Status:
-    state: str
-    description: str
-    target_url: str | None
-    updated_at: str
-    run_id: int | None
-    context: str = ""
-    creator_login: str = ""
-
-
-@dataclasses.dataclass(frozen=True)
-class FastForwardResult:
-    ok: bool
-    actual_parent: str
-
-
-@dataclasses.dataclass(frozen=True)
 class Response:
     status: int
     headers: dict[str, str]
@@ -168,22 +129,46 @@ class Response:
         return json.loads(self.body) if self.body else None
 
 
+def _timestamp(text) -> float | None:
+    """Unix seconds for a GitHub ISO timestamp; None for a missing one."""
+    if not text or not isinstance(text, str):
+        return None
+    try:
+        return github_app.parse_github_time(text)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------------------------
 # Transport and client
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Return 3xx responses instead of following them: a job log redirect points at a signed URL
+    that must be fetched without the Authorization header."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class UrllibTransport:
-    """The real transport: stdlib urllib with the system-aware TLS context."""
+    """The real transport: stdlib urllib with the system-aware TLS context, no redirects."""
 
     def __init__(self, timeout: float = 30.0) -> None:
-        self._context = github_app.ssl_context()
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=github_app.ssl_context()), _NoRedirect()
+        )
         self._timeout = timeout
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, dict, bytes]:
         request = urllib.request.Request(url, data=body, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout, context=self._context) as response:
-                return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
+            with self._opener.open(request, timeout=self._timeout) as response:
+                return (
+                    response.status,
+                    {k.lower(): v for k, v in response.headers.items()},
+                    response.read(MAX_LOG_BYTES),
+                )
         except urllib.error.HTTPError as error:
             return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read()
 
@@ -277,11 +262,7 @@ class GitHubClient:
         attempt = 0
         while True:
             attempt += 1
-            headers = {
-                "Accept": accept,
-                "User-Agent": USER_AGENT,
-                "X-GitHub-Api-Version": API_VERSION,
-            }
+            headers = {"Accept": accept, "User-Agent": USER_AGENT, "X-GitHub-Api-Version": API_VERSION}
             if body is not None:
                 headers["Content-Type"] = "application/json"
             used_installation = False
@@ -366,12 +347,17 @@ class GitHubClient:
                 return items
             page += 1
 
+    def fetch_bare(self, url: str) -> tuple[int, bytes]:
+        """A GET without any credential, for signed URLs GitHub redirects to."""
+        status, _, body = self._transport("GET", url, {"User-Agent": USER_AGENT}, None)
+        return status, body
+
 
 # ---------------------------------------------------------------------------------------------
 # Adapter
 
 
-def dispatch_title(base_ref: str, batch_id: int, head_sha: str, base_sha: str) -> str:
+def dispatch_title(base_ref: str, batch_id, head_sha: str, base_sha: str) -> str:
     """The `run-name` pr-build.yml derives from a staging dispatch; the key for finding the run."""
     return f"bors branch={base_ref} batch={batch_id} head={head_sha} base={base_sha}"
 
@@ -380,53 +366,94 @@ def comment_marker(marker: str) -> str:
     return COMMENT_MARKER.format(marker=marker)
 
 
-def run_id_from_url(url: str | None) -> int | None:
+def run_id_from_url(url: str | None) -> str | None:
     if not url:
         return None
     match = RUN_URL.search(url)
-    return int(match.group(1)) if match else None
+    return match.group(1) if match else None
+
+
+def dispatch_members(members: Sequence) -> list[dict]:
+    """Bors's `members` payload, `[{pr, head_sha}]`; a bare PR number carries no head."""
+    out = []
+    for member in members:
+        if isinstance(member, Mapping):
+            entry = {"pr": int(member["pr"])}
+            if member.get("head_sha"):
+                entry["head_sha"] = str(member["head_sha"])
+            out.append(entry)
+        else:
+            out.append({"pr": int(member)})
+    return out
+
+
+def _batch_id(value):
+    return int(value) if str(value).isdigit() else value
 
 
 class GitHubAdapter:
-    """`GitHubPort` over `GitHubClient`; `repo` is the default repository for repo-less calls."""
+    """`GitHubPort` over `GitHubClient`.
+
+    Built either from a `github_app.GitHubApp` (`GitHubAdapter(app, repository, clone_dir=...)`, the
+    service entrypoint's form) or from a ready client (`GitHubAdapter(client, repository, tokens=...)`,
+    the tests' form). `repository` is the default for the repo-less `repository_admin(login)`.
+    """
 
     def __init__(
         self,
-        client: GitHubClient,
+        source,
+        repository: str | None = None,
         *,
-        repo: str,
+        repo: str | None = None,
         clone_dir: str | os.PathLike | None = None,
         tokens: github_app.InstallationTokenSource | None = None,
         git: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     ) -> None:
-        self.client = client
-        self.repo = repo
-        self.clone_dir = os.fspath(clone_dir) if clone_dir is not None else None
-        self._tokens = tokens
+        if isinstance(source, GitHubClient):
+            self.client = source
+            self._tokens = tokens
+        else:
+            self.client = GitHubClient(source.tokens, source.transport, api=source.api)
+            self._tokens = source.tokens
+        self.repo = repository or repo or ""
+        if not self.repo:
+            raise ValueError("GitHubAdapter needs the repository name")
+        self.clone_dir = os.fspath(os.path.expanduser(clone_dir)) if clone_dir is not None else None
         self._git = git
 
     # -- pull requests
 
-    def fetch_pr(self, repo: str, number: int) -> PullRequest | None:
+    def fetch_pr(self, repo: str, number: int) -> PullRequest:
         status, data = self.client.get_json(f"repos/{repo}/pulls/{number}", tolerate=(404,))
         if status == 404 or not isinstance(data, dict):
-            return None
+            raise PullRequestNotFound(f"{repo}#{number} not found", status)
         return PullRequest.from_json(data)
+
+    def fetch_pr_or_none(self, repo: str, number: int) -> PullRequest | None:
+        try:
+            return self.fetch_pr(repo, number)
+        except PullRequestNotFound:
+            return None
 
     def pr_merge_base(self, repo: str, number: int, head_sha: str) -> str | None:
         """The merge base of the PR head and its base branch, as Bors records for scope approvals."""
-        pr = self.fetch_pr(repo, number)
+        pr = self.fetch_pr_or_none(repo, number)
         if pr is None or pr.head_sha != head_sha or not SHA.fullmatch(pr.base_sha):
             return None
         status, data = self.client.get_json(f"repos/{repo}/compare/{pr.base_sha}...{head_sha}", params={"per_page": 1})
         base = ((data or {}).get("merge_base_commit") or {}).get("sha")
         return base if isinstance(base, str) and SHA.fullmatch(base) else None
 
-    def close_pr(self, repo: str, number: int, title: str | None = None) -> None:
-        body: dict = {"state": "closed"}
-        if title is not None:
-            body["title"] = title
-        self.client.request("PATCH", f"repos/{repo}/pulls/{number}", json_body=body)
+    def close_pr(self, repo: str, number: int, title: str) -> None:
+        """`PATCH pulls/<n> {state: closed, title}`: Bors's `close_merged_pr`, bookkeeping fields only."""
+        self.client.request("PATCH", f"repos/{repo}/pulls/{number}", json_body={"state": "closed", "title": title})
+
+    def labels(self, repo: str, number: int) -> list[str]:
+        return [
+            str(label.get("name"))
+            for label in self.client.paginate(f"repos/{repo}/issues/{number}/labels")
+            if isinstance(label, dict)
+        ]
 
     # -- git objects
 
@@ -476,14 +503,19 @@ class GitHubAdapter:
         """
         current = self.ref_sha(repo, f"heads/{branch}")
         if current != expected_parent:
-            return FastForwardResult(False, current or "")
+            return FastForwardResult(False, current, "parent changed before the push")
         response = self.client.request(
             "PATCH", f"repos/{repo}/git/refs/heads/{branch}", json_body={"sha": tip, "force": False}, tolerate=(422,)
         )
         if response.status == 200:
             return FastForwardResult(True, expected_parent)
         current = self.ref_sha(repo, f"heads/{branch}")
-        return FastForwardResult(False, current or "")
+        detail = ""
+        try:
+            detail = str((response.json() or {}).get("message") or "")
+        except ValueError:
+            pass
+        return FastForwardResult(False, current, detail or "update is not a fast forward")
 
     def update_ref(self, repo: str, ref: str, sha: str) -> None:
         """Create or force-update `refs/<ref>` (retained candidate refs, never the base branch)."""
@@ -504,7 +536,7 @@ class GitHubAdapter:
     # -- CI dispatch and observation
 
     def dispatch_candidate(
-        self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id: int, members: Sequence[dict]
+        self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id, members: Sequence
     ) -> str:
         """`repository_dispatch` of pr-build.yml exactly as Bors sends it; returns the run title."""
         payload = {
@@ -512,32 +544,34 @@ class GitHubAdapter:
             "client_payload": {
                 "head_sha": head_sha,
                 "base_sha": base_sha,
-                "batch_id": batch_id,
-                "members": [{"pr": int(m["pr"]), "head_sha": str(m["head_sha"])} for m in members],
+                "batch_id": _batch_id(batch_id),
+                "members": dispatch_members(members),
                 "base_ref": base_ref,
             },
         }
         self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,))
-        return dispatch_title(base_ref, batch_id, head_sha, base_sha)
+        return dispatch_title(base_ref, _batch_id(batch_id), head_sha, base_sha)
 
     def find_candidate_run(
         self,
         repo: str,
         *,
-        batch_id: int,
+        batch_id,
         head_sha: str,
         base_sha: str,
         base_ref: str = "main",
         since: float | None = None,
         with_jobs: bool = True,
+        with_diagnostics: bool = True,
     ) -> CandidateRun | None:
         """The pr-build.yml run dispatched for this candidate, by its derived `run-name`.
 
         One list call bounded to a creation window (a minute of skew either side of `since`, or the
-        last day), one jobs call for the phases. Two runs with the same identity make the verdict
-        ambiguous and are reported as such rather than guessed between.
+        last day), one jobs call for the phases, and for a completed unsuccessful run the build
+        job's log for the diagnostics. Two runs with the same identity make the verdict ambiguous
+        and are reported as such rather than guessed between.
         """
-        expected = dispatch_title(base_ref, batch_id, head_sha, base_sha)
+        expected = dispatch_title(base_ref, _batch_id(batch_id), head_sha, base_sha)
         now = time.time()
         start = (since if since is not None else now - 86400) - 60
         window = f"{_iso(start)}..{_iso(now + 60)}"
@@ -551,56 +585,100 @@ class GitHubAdapter:
             return None
         if len(matches) > 1:
             raise AmbiguousCandidateRun(f"{len(matches)} runs titled {expected!r}")
-        return self.candidate_run(repo, matches[0], with_jobs=with_jobs)
+        return self.candidate_run(repo, matches[0], with_jobs=with_jobs, with_diagnostics=with_diagnostics)
 
-    def candidate_run(self, repo: str, run: dict, *, with_jobs: bool = True) -> CandidateRun:
-        run_id = int(run["id"])
+    def candidate_run(
+        self, repo: str, run: dict, *, with_jobs: bool = True, with_diagnostics: bool = True
+    ) -> CandidateRun:
+        run_id = str(run["id"])
         attempt = int(run.get("run_attempt") or 1)
         jobs: list[dict] = []
         if with_jobs:
             jobs = self.client.paginate(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs", key="jobs")
-        phases: list[Phase] = []
+        phases: list[CandidatePhase] = []
         runner_name = None
         runner_labels: tuple[str, ...] = ()
         for job in jobs:
             name = str(job.get("name") or "")
-            if job.get("runner_name") and (runner_name is None or "build" in name):
+            if job.get("runner_name") and (runner_name is None or name == BUILD_JOB):
                 runner_name = str(job["runner_name"])
                 runner_labels = tuple(str(label) for label in job.get("labels") or [])
             phases.append(
-                Phase(
+                CandidatePhase(
                     name,
-                    job.get("started_at"),
-                    job.get("completed_at"),
-                    str(job.get("conclusion") or job.get("status") or ""),
+                    _timestamp(job.get("started_at")),
+                    _timestamp(job.get("completed_at")),
+                    _phase_status(job),
+                    str(job.get("conclusion") or ""),
                 )
             )
             for step in job.get("steps") or []:
                 phases.append(
-                    Phase(
+                    CandidatePhase(
                         f"{name}: {step.get('name')}",
-                        step.get("started_at"),
-                        step.get("completed_at"),
-                        str(step.get("conclusion") or step.get("status") or ""),
+                        _timestamp(step.get("started_at")),
+                        _timestamp(step.get("completed_at")),
+                        _phase_status(step),
+                        str(step.get("conclusion") or ""),
                     )
                 )
+        completed = run.get("status") == "completed"
+        findings: list[dict] = []
+        if completed and with_diagnostics and run.get("conclusion") != "success":
+            findings = self.run_diagnostics(repo, run, jobs)
         return CandidateRun(
             run_id=run_id,
             attempt=attempt,
             status=str(run.get("status") or ""),
             conclusion=run.get("conclusion"),
-            created_at=str(run.get("created_at") or ""),
-            started_at=run.get("run_started_at"),
-            completed_at=run.get("updated_at") if run.get("status") == "completed" else None,
+            created_at=_timestamp(run.get("created_at")),
+            started_at=_timestamp(run.get("run_started_at")),
+            completed_at=_timestamp(run.get("updated_at")) if completed else None,
             runner_name=runner_name,
             runner_labels=runner_labels,
             host=runner_name,
             phases=tuple(phases),
-            html_url=str(run.get("html_url") or ""),
+            diagnostics=tuple(findings),
             display_title=str(run.get("display_title") or ""),
+            html_url=str(run.get("html_url") or ""),
         )
 
-    def workflow_run(self, repo: str, run_id: int, *, with_jobs: bool = True) -> CandidateRun | None:
+    def run_diagnostics(self, repo: str, run: dict, jobs: Sequence[dict]) -> list[dict]:
+        """Source findings from the failed build job's log plus infrastructure findings of the run."""
+        findings: list[dict] = []
+        for job in jobs:
+            if job.get("conclusion") == "failure" and str(job.get("name") or "") == BUILD_JOB and job.get("id"):
+                log = self.job_log(repo, int(job["id"]))
+                if log is not None:
+                    findings.extend(diagnostics.parse_log(log.splitlines()))
+                else:
+                    findings.append(
+                        {
+                            "kind": "infrastructure",
+                            "module": "",
+                            "message": f"log of job {job['id']} unavailable",
+                            "reason": "log_unavailable",
+                        }
+                    )
+        findings.extend(diagnostics.infrastructure_findings(run, jobs))
+        return findings
+
+    def job_log(self, repo: str, job_id: int) -> str | None:
+        """A job's plain-text log: the API answers with a redirect to a signed URL fetched bare."""
+        response = self.client.request(
+            "GET", f"repos/{repo}/actions/jobs/{job_id}/logs", ok=(200,), tolerate=(301, 302, 307, 404, 410)
+        )
+        if response.status == 200:
+            return response.body[:MAX_LOG_BYTES].decode("utf-8", errors="replace")
+        location = response.headers.get("location")
+        if response.status in (404, 410) or not location:
+            return None
+        status, body = self.client.fetch_bare(location)
+        if status != 200:
+            return None
+        return body[:MAX_LOG_BYTES].decode("utf-8", errors="replace")
+
+    def workflow_run(self, repo: str, run_id, *, with_jobs: bool = True) -> CandidateRun | None:
         status, data = self.client.get_json(f"repos/{repo}/actions/runs/{run_id}", tolerate=(404,))
         if status == 404 or not isinstance(data, dict):
             return None
@@ -616,13 +694,19 @@ class GitHubAdapter:
                 return Status(
                     state=str(entry.get("state") or ""),
                     description=str(entry.get("description") or ""),
-                    target_url=entry.get("target_url"),
-                    updated_at=str(entry.get("updated_at") or ""),
+                    target_url=str(entry.get("target_url") or ""),
+                    updated_at=_timestamp(entry.get("updated_at")),
                     run_id=run_id_from_url(entry.get("target_url")),
-                    context=context,
-                    creator_login=str(((entry.get("creator") or {}).get("login")) or ""),
                 )
         return None
+
+    def eligibility_checks(self, repo: str, head: str) -> list[dict]:
+        """Every `merge eligibility` check run on `head`, any App (`filter=all`), as Bors lists them."""
+        return self.client.paginate(
+            f"repos/{repo}/commits/{head}/check-runs",
+            params={"check_name": "merge eligibility", "filter": "all"},
+            key="check_runs",
+        )
 
     def post_commit_status(
         self, repo: str, sha: str, *, context: str, state: str, description: str, target_url: str | None = None
@@ -634,22 +718,22 @@ class GitHubAdapter:
 
     # -- comments and labels
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> int:
+    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
         """Post `body` once per `marker`: a comment already carrying the marker is edited instead."""
         hidden = comment_marker(marker)
         existing = self.find_comment(repo, number, hidden)
         full = f"{body.rstrip()}\n\n{hidden}\n"
         if existing is not None:
             if existing.get("body") == full:
-                return int(existing["id"])
+                return str(existing["id"])
             response = self.client.request(
                 "PATCH", f"repos/{repo}/issues/comments/{existing['id']}", json_body={"body": full}
             )
-            return int(response.json()["id"])
+            return str(response.json()["id"])
         response = self.client.request(
             "POST", f"repos/{repo}/issues/{number}/comments", json_body={"body": full}, ok=(201,)
         )
-        return int(response.json()["id"])
+        return str(response.json()["id"])
 
     def find_comment(self, repo: str, number: int, needle: str) -> dict | None:
         for comment in self.client.paginate(f"repos/{repo}/issues/{number}/comments"):
@@ -689,13 +773,13 @@ class GitHubAdapter:
             return None
         return str(data["login"]), int(data.get("id") or 0)
 
-    def rate_limit(self) -> tuple[int | None, float | None]:
+    def rate_limit(self) -> tuple[int, float]:
         remaining, reset_at = self.client.rate_limit()
         if remaining is None:
             _, data = self.client.get_json("rate_limit")
             core = ((data or {}).get("resources") or {}).get("core") or {}
             remaining, reset_at = core.get("remaining"), core.get("reset")
-        return remaining, reset_at
+        return int(remaining or 0), float(reset_at or 0.0)
 
     def app(self) -> dict:
         """`GET /app` as the App itself; the read-only proof that the JWT path works."""
@@ -709,6 +793,14 @@ class GitHubAdapter:
         return [str(r.get("full_name")) for r in data if isinstance(r, dict)]
 
 
+def _phase_status(entry: dict) -> str:
+    """The port's phase status (`queued`, `in_progress`, `completed`, `skipped`)."""
+    status = str(entry.get("status") or "")
+    if status == "completed" and entry.get("conclusion") == "skipped":
+        return "skipped"
+    return status or "queued"
+
+
 def _iso(timestamp: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
 
@@ -720,7 +812,7 @@ def _iso(timestamp: float) -> str:
 @dataclasses.dataclass(frozen=True)
 class CandidateRef:
     repo: str
-    batch_id: int
+    batch_id: int | str
     head_sha: str
     base_sha: str
     base_ref: str = "main"
@@ -740,12 +832,12 @@ class CandidatePoller:
         self.interval = interval
         self.reserve = reserve
         self._clock = clock
-        self._last: dict[tuple[str, int, str], float] = {}
+        self._last: dict[tuple[str, str, str], float] = {}
         self.polls = 0
         self.skipped = 0
 
     def due(self, ref: CandidateRef) -> bool:
-        key = (ref.repo, ref.batch_id, ref.head_sha)
+        key = (ref.repo, str(ref.batch_id), ref.head_sha)
         return self._clock() - self._last.get(key, 0.0) >= self.interval
 
     def poll(
@@ -759,7 +851,7 @@ class CandidatePoller:
             if remaining is not None and remaining < self.reserve:
                 self.skipped += 1
                 continue
-            self._last[(ref.repo, ref.batch_id, ref.head_sha)] = self._clock()
+            self._last[(ref.repo, str(ref.batch_id), ref.head_sha)] = self._clock()
             self.polls += 1
             run = self.adapter.find_candidate_run(
                 ref.repo,

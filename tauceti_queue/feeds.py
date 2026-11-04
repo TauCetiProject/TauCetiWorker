@@ -593,3 +593,233 @@ def main(argv: Sequence[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
+
+
+# ---------------------------------------------------------------------------------------------
+# The controller's records as a FeedSource
+
+
+def feed_source(controller) -> FeedSource:
+    """`controller` itself when it implements `FeedSource`, else a view over its records."""
+    if hasattr(controller, "active_batches") and hasattr(controller, "candidates"):
+        return controller
+    return ControllerFeedSource(controller)
+
+
+BATCH_STATES = {"open": "waiting", "head": "waiting", "landed": "ok", "removed": "canceled"}
+
+
+def _micro(seconds) -> int:
+    return int(round(float(seconds or 0) * 1_000_000))
+
+
+class ControllerFeedSource:
+    """`FeedSource` over `tauceti_queue.controller.Controller`'s store (inputs, batches, members,
+    ci_attempts, journal), mapping its states to Bors's: the open batch is `waiting`, the head is
+    `running` while a CI attempt is pending and `waiting` otherwise, a landed batch `ok`, a removed
+    one `canceled`; a candidate is one CI attempt (generation = batch version); an admission is one
+    member row with its input's approval evidence."""
+
+    def __init__(self, controller) -> None:
+        self.controller = controller
+
+    @property
+    def store(self):
+        return self.controller.store
+
+    def repository(self, repo_id: int) -> str | None:
+        return self.controller.repository if repo_id == 1 else None
+
+    def started_at(self) -> float:
+        return float(getattr(self.controller, "started_at", 0.0) or 0.0)
+
+    def _branch(self) -> str:
+        return str(getattr(self.controller, "canonical_branch", "") or "main")
+
+    def _serves(self, repo: str, base: str) -> bool:
+        return repo == self.controller.repository and base == self._branch()
+
+    # -- members and inputs
+
+    def _inputs_by_id(self) -> dict[int, dict]:
+        return {row["id"]: row for row in self.store.rows("inputs", {"repository": self.controller.repository})}
+
+    def _member_view(self, member: dict, inputs: dict[int, dict]) -> MemberView:
+        source = inputs.get(member["input_id"]) or {}
+        evidence = _loads(source.get("evidence"), {})
+        scope = None
+        if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+            scope = {
+                "actor_id": evidence["actor_id"],
+                "head_sha": member["accepted_head"],
+                "merge_base_sha": evidence["merge_base_sha"],
+            }
+        return MemberView(
+            pr=int(member["number"]),
+            head_sha=str(member["accepted_head"]),
+            reviewer=str(source.get("reviewer") or evidence.get("actor_login") or ""),
+            admitted_at=_micro(source.get("approved_at")),
+            admission_id=int(member["id"]),
+            priority=int(source.get("priority") or 0),
+            labels=tuple(evidence.get("labels") or ()),
+            labels_observed_at=int(float(source.get("approved_at") or 0)),
+            scope_approval=scope,
+            single=bool(evidence.get("single")),
+            retry_reason=None,
+        )
+
+    def _members(self, batch_id: int, inputs: dict[int, dict]) -> tuple[MemberView, ...]:
+        rows = self.store.rows("members", {"batch_id": batch_id, "removed": 0}, order="position")
+        return tuple(self._member_view(m, inputs) for m in rows)
+
+    # -- batches
+
+    def _attempts(self, batch_id: int) -> list[dict]:
+        return self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id")
+
+    def _batch_view(self, row: dict, inputs: dict[int, dict]) -> BatchView:
+        attempts = self._attempts(row["id"])
+        latest = attempts[-1] if attempts else None
+        state = BATCH_STATES.get(row["state"], row["state"])
+        if row["state"] == "head" and latest is not None and latest.get("outcome") == "pending":
+            state = "running"
+        sealed = bool(row["sealed"])
+        return BatchView(
+            id=int(row["id"]),
+            base=self._branch(),
+            state=state,
+            sealed=sealed,
+            head_sha=row["tip"] if sealed else None,
+            base_sha=row["base"] if sealed else None,
+            members=self._members(row["id"], inputs),
+            candidate_id=int(latest["id"]) if latest else None,
+            generation=int(latest["batch_version"]) if latest else None,
+            staging_ref=self.controller.batch_ref(row["id"], latest["batch_version"])
+            if latest and hasattr(self.controller, "batch_ref")
+            else None,
+            promotion_failures=int(row.get("promotion_failures") or 0),
+        )
+
+    def active_batches(self, repo: str, base: str) -> Sequence[BatchView]:
+        if not self._serves(repo, base):
+            return []
+        inputs = self._inputs_by_id()
+        rows = [r for r in self.controller.batches() if r["state"] in ("open", "head")]
+        rows.sort(key=lambda r: r["id"], reverse=True)
+        return [self._batch_view(r, inputs) for r in rows]
+
+    def batch(self, repo: str, batch_id: int) -> BatchView | None:
+        if repo != self.controller.repository:
+            return None
+        row = self.store.row("batches", {"id": batch_id, "repository": repo})
+        return self._batch_view(row, self._inputs_by_id()) if row else None
+
+    def outcomes(self, repo: str, base: str) -> Sequence[OutcomeView]:
+        if not self._serves(repo, base):
+            return []
+        batches = {b["id"]: b for b in self.controller.batches()}
+        rows = self.store.rows("members", None, order="id DESC", limit=5000)
+        inputs = self._inputs_by_id()
+        out = []
+        for member in rows:
+            batch = batches.get(member["batch_id"])
+            if batch is None:
+                continue
+            state = BATCH_STATES.get(batch["state"], batch["state"])
+            if member["removed"]:
+                state = "canceled"
+            elif batch["state"] == "head":
+                attempts = self._attempts(batch["id"])
+                state = "running" if attempts and attempts[-1].get("outcome") == "pending" else "waiting"
+            source = inputs.get(member["input_id"]) or {}
+            if source.get("state") == "landed" and batch["state"] != "landed":
+                continue
+            out.append(OutcomeView(int(member["number"]), str(member["accepted_head"]), int(batch["id"]), state))
+        out.sort(key=lambda o: o.batch_id, reverse=True)
+        return out
+
+    def scope_approvals(self, repo: str) -> Sequence[dict]:
+        if repo != self.controller.repository:
+            return []
+        approvals = []
+        for row in self.store.rows("inputs", {"repository": repo}, order="id"):
+            if row["state"] not in ("waiting", "reserved", "inserted"):
+                continue
+            evidence = _loads(row.get("evidence"), {})
+            if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+                approvals.append(
+                    {
+                        "pr": int(row["number"]),
+                        "actor_id": int(evidence["actor_id"]),
+                        "head_sha": str(row["head_sha"]),
+                        "merge_base_sha": str(evidence["merge_base_sha"]),
+                    }
+                )
+        return approvals
+
+    # -- candidates and admissions
+
+    def _events(self, batch_id: int, attempt: dict) -> tuple[EventView, ...]:
+        entries = self.store.rows("journal", {"batch_id": batch_id}, order="id")
+        events = []
+        for entry in entries:
+            detail = _loads(entry.get("detail"), {})
+            if detail.get("attempt_id") not in (None, attempt["id"]):
+                continue
+            events.append(
+                EventView(int(entry["id"]), str(entry["kind"]), "queue.controller", _micro(entry["at"]), detail)
+            )
+        return tuple(events)
+
+    def candidates(self, repo: str, base: str, batch_id: int | None, *, promoted: bool) -> Sequence[CandidateView]:
+        if not self._serves(repo, base):
+            return []
+        inputs = self._inputs_by_id()
+        batches = {b["id"]: b for b in self.controller.batches()}
+        where = {"batch_id": batch_id} if batch_id is not None else None
+        rows = self.store.rows("ci_attempts", where, order="id DESC", limit=CANDIDATE_LIMIT)
+        out = []
+        for attempt in rows:
+            batch = batches.get(attempt["batch_id"])
+            if batch is None or (promoted and batch["state"] != "landed"):
+                continue
+            previous = self.store.rows("ci_attempts", {"batch_id": attempt["batch_id"]}, order="id")
+            earlier = [a["id"] for a in previous if a["id"] < attempt["id"]]
+            out.append(
+                CandidateView(
+                    id=int(attempt["id"]),
+                    batch_id=int(attempt["batch_id"]),
+                    generation=int(attempt["batch_version"]),
+                    base=self._branch(),
+                    base_sha=str(attempt["base_sha"]),
+                    members=self._members(attempt["batch_id"], inputs),
+                    observed_at=_micro(attempt["dispatched_at"]),
+                    events=self._events(attempt["batch_id"], attempt),
+                    previous_generation_id=earlier[-1] if earlier else None,
+                    runner_assigned_at=_micro(attempt["run_created_at"]) if attempt.get("run_created_at") else None,
+                    runner_started_at=_micro(attempt["run_started_at"]) if attempt.get("run_started_at") else None,
+                    runner_finished_at=_micro(attempt["run_completed_at"]) if attempt.get("run_completed_at") else None,
+                )
+            )
+        return out
+
+    def admissions(self, repo: str, base: str, batch_id: int | None) -> Sequence[AdmissionView]:
+        if not self._serves(repo, base):
+            return []
+        inputs = self._inputs_by_id()
+        where = {"batch_id": batch_id} if batch_id is not None else None
+        rows = self.store.rows("members", where, order="id DESC", limit=ADMISSION_LIMIT)
+        return [
+            AdmissionView(int(m["id"]), int(m["batch_id"]), _micro(m["added_at"]), self._member_view(m, inputs), base)
+            for m in rows
+        ]
+
+
+def _loads(text, default):
+    if not text:
+        return default
+    try:
+        value = json.loads(text) if isinstance(text, str) else text
+    except ValueError:
+        return default
+    return value if isinstance(value, type(default)) else default

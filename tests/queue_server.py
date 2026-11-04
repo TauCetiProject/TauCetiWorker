@@ -29,6 +29,20 @@ SECRET = b"webhook-secret"
 HEAD = "a" * 40
 
 
+class CodedError(Exception):
+    def __init__(self, code, detail=""):
+        super().__init__(detail or code)
+        self.code = code
+
+
+class Adoption:
+    def __init__(self, **fields):
+        self.fields = fields
+
+    def to_dict(self):
+        return dict(self.fields)
+
+
 class FakeController(FakeSource):
     def __init__(self):
         super().__init__()
@@ -43,12 +57,12 @@ class FakeController(FakeSource):
         self.events.append((kind, payload.get("action")))
 
     def approve(self, repo, pr, head_sha, reviewer, priority, evidence):
-        self.calls.append(("approve", repo, pr, head_sha, reviewer, priority, evidence.kind))
+        self.calls.append(("approve", repo, pr, head_sha, reviewer, priority, evidence["kind"]))
 
-    def unapprove(self, repo, pr):
+    def unapprove(self, repo, pr, actor=""):
         self.calls.append(("unapprove", repo, pr))
 
-    def cancel(self, repo, pr):
+    def cancel(self, repo, pr, actor=""):
         self.calls.append(("cancel", repo, pr))
 
     def set_priority(self, repo, pr, priority):
@@ -60,13 +74,34 @@ class FakeController(FakeSource):
             raise self.fail_with
         return {"task": "repair-2650", "claim_token": "t1"} if worker_identity != "idle" else None
 
-    def renew_task(self, task_id, worker_identity, github_login, body):
-        self.calls.append(("renew_task", task_id, worker_identity, github_login, body))
-        return {"renewed": True}
+    def renew_task(self, task_id, claim_token):
+        self.calls.append(("renew_task", task_id, claim_token))
+        if claim_token == "stale":
+            raise CodedError("claim-expired", "the claim expired")
+        return 1_793_776_000.0
 
-    def submit_task(self, task_id, worker_identity, github_login, body):
-        self.calls.append(("submit_task", task_id, worker_identity, github_login, body))
-        return {"accepted": True}
+    def submit_task(self, task_id, claim_token, tip_sha, worker_notes=""):
+        self.calls.append(("submit_task", task_id, claim_token, tip_sha, worker_notes))
+        return Adoption(
+            accepted=True,
+            reason="adopted",
+            task_id=task_id,
+            batch_id=2650,
+            version=3,
+            tip=tip_sha,
+            retained_ref="refs/x",
+        )
+
+    def release_task(self, task_id, claim_token, reason, error=""):
+        self.calls.append(("release_task", task_id, claim_token, reason, error))
+
+    def retry_ci(self, repo, actor):
+        self.calls.append(("retry_ci", repo, actor))
+        return {"retried": True}
+
+    def report_inference(self, worker_identity, ok, error=""):
+        self.calls.append(("report_inference", worker_identity, ok, error))
+        return None
 
     def update_settings(self, github_login, settings):
         self.calls.append(("update_settings", github_login, settings))
@@ -159,6 +194,11 @@ class ServerTest(unittest.TestCase):
 
     def test_health_and_unknown_routes(self):
         self.assertEqual(self.request("GET", "/health/"), (200, b"ok\n"))
+        status, body = self.request("GET", "/healthz")
+        self.assertEqual((status, body["ok"], body["revision"]), (200, True, "abc123"))
+        status, body = self.request("GET", "/settings")
+        self.assertEqual((status, body), (200, {"settings": {"insertion_age_window": 16}, "source": "controller"}))
+        self.assertEqual(self.request("GET", "/api/observation?base=main")[1]["schema"], "tauceti-bors.observation/v1")
         self.assertEqual(self.request("GET", "/health")[0], 200)
         self.assertEqual(self.request("GET", "/nope")[0], 404)
         self.assertEqual(self.request("POST", "/nope", {})[0], 404)
@@ -254,7 +294,7 @@ class ServerTest(unittest.TestCase):
         )
         self.deliver("issue_comment", review_app, delivery_id="d-c2")
         self.assertEqual(
-            self.controller.calls[-1], ("approve", TAUCETI, 42, HEAD, "tauceti-review-bot[bot]", None, "review_app")
+            self.controller.calls[-1], ("approve", TAUCETI, 42, HEAD, "tauceti-review-bot[bot]", 0, "review_app")
         )
         stranger = dict(
             payload, comment=dict(payload["comment"], id=1003, body="bors r+", user={"login": "stranger", "id": 8})
@@ -297,22 +337,43 @@ class ServerTest(unittest.TestCase):
         before = self.adapter.lookups
         self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "idle"}, self.bearer("ghp_worker"))[0], 204)
         self.assertEqual(self.adapter.lookups, before, "the login is cached by token digest")
-        status, body = self.request(
-            "POST", "/tasks/repair-2650/renew", {"worker": "w1", "claim_token": "t1"}, self.bearer("ghp_worker")
-        )
-        self.assertEqual((status, body), (200, {"renewed": True}))
+        status, body = self.request("POST", "/tasks/17/renew", {"claim_token": "t1"}, self.bearer("ghp_worker"))
+        self.assertEqual((status, body), (200, {"task_id": 17, "expires_at": 1_793_776_000.0}))
+        self.assertEqual(self.controller.calls[-1], ("renew_task", 17, "t1"))
+        self.assertEqual(self.request("POST", "/tasks/17/renew", {}, self.bearer("ghp_worker"))[0], 400)
+        status, body = self.request("POST", "/tasks/17/renew", {"claim_token": "stale"}, self.bearer("ghp_worker"))
+        self.assertEqual((status, body), (409, {"error": "claim-expired", "detail": "the claim expired"}))
         self.assertEqual(
-            self.controller.calls[-1],
-            ("renew_task", "repair-2650", "w1", "worker-login", {"worker": "w1", "claim_token": "t1"}),
+            self.request(
+                "POST", "/tasks/17/result", {"claim_token": "t1", "tip_sha": "short"}, self.bearer("ghp_worker")
+            )[0],
+            400,
         )
         status, body = self.request(
             "POST",
-            "/tasks/repair-2650/result",
-            {"worker": "w1", "claim_token": "t1", "chain": "refs/x"},
+            "/tasks/17/result",
+            {"claim_token": "t1", "tip_sha": "c" * 40, "worker_notes": "n"},
             self.bearer("ghp_worker"),
         )
-        self.assertEqual(body, {"accepted": True})
-        self.assertEqual(self.controller.calls[-1][0], "submit_task")
+        self.assertEqual((status, body["accepted"], body["tip"]), (200, True, "c" * 40))
+        self.assertEqual(self.controller.calls[-1], ("submit_task", 17, "t1", "c" * 40, "n"))
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/tasks/17/release",
+                {"claim_token": "t1", "reason": "inference_unavailable", "error": "429"},
+                self.bearer("ghp_worker"),
+            )[0],
+            204,
+        )
+        self.assertEqual(self.controller.calls[-1], ("release_task", 17, "t1", "inference_unavailable", "429"))
+        self.assertEqual(
+            self.request(
+                "POST", "/tasks/inference", {"worker": "w1", "ok": False, "error": "credits"}, self.bearer("ghp_worker")
+            )[0],
+            204,
+        )
+        self.assertEqual(self.controller.calls[-1], ("report_inference", "w1", False, "credits"))
         self.assertEqual(self.request("POST", "/tasks/claim", b"[1]", self.bearer("ghp_worker"))[0], 400)
 
     def test_controller_errors_map_to_statuses(self):
@@ -329,9 +390,20 @@ class ServerTest(unittest.TestCase):
     def test_admin_endpoints(self):
         self.assertEqual(self.request("POST", "/admin/settings", {"insertion_age_window": 8})[0], 401)
         status, body = self.request("POST", "/admin/settings", {"insertion_age_window": 8}, self.bearer("ghp_worker"))
-        self.assertEqual((status, body), (403, {"error": "repository admin permission is required"}))
+        self.assertEqual((status, body), (403, {"error": "worker-login is not a repository admin"}))
+        self.assertEqual(
+            [c for c in self.controller.calls if c[0] == "update_settings"],
+            [],
+            "the predicate runs before the controller",
+        )
         status, body = self.request("POST", "/admin/settings", {"insertion_age_window": 8}, self.bearer("ghp_kim"))
         self.assertEqual((status, body), (200, {"effective": {"insertion_age_window": 8}}))
+        status, body = self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_kim"))
+        self.assertEqual((status, body), (200, {"retried": True}))
+        self.assertEqual(self.controller.calls[-1], ("retry_ci", TAUCETI, "kim-em"))
+        status, body = self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_kim"))
+        self.assertEqual((status, body), (200, {"retried": True}))
+        self.assertEqual(self.controller.calls[-1], ("retry_ci", TAUCETI, "kim-em"))
         self.assertEqual(
             self.request("POST", "/admin/urgent", {"repo": "other/repo", "pr": 1}, self.bearer("ghp_kim"))[0], 400
         )
@@ -344,6 +416,58 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("POST", "/admin/urgent", {"repo": TAUCETI, "pr": 42}, self.bearer("ghp_kim"))
         self.assertEqual((status, body), (200, {"urgent": 42}))
         self.assertEqual(self.controller.calls[-1], ("mark_urgent", TAUCETI, 42, "kim-em"))
+
+
+class ServiceConfigForm(unittest.TestCase):
+    """`create_server(controller, Config, status=..., adapter=..., app=...)`, the entrypoint's call."""
+
+    def test_config_form(self):
+        import tempfile
+
+        from tauceti_queue import config as cfg
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "github-webhook-secret").write_bytes(SECRET + b"\n")
+            config = cfg.Config(credentials_dir=root, listen_host="127.0.0.1", listen_port=0)
+            controller = FakeController()
+            adapter = FakeAdapter()
+
+            def provider():
+                return {"schema": "tauceti-queue.status/v1", "service": {"revision": "deadbeef"}, "settings": {}}
+
+            srv = server.create_server(controller, config, status=provider, adapter=adapter)
+            server.serve_in_thread(srv)
+            try:
+                port = srv.server_address[1]
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                connection.request("GET", "/status")
+                document = json.loads(connection.getresponse().read())
+                self.assertEqual(document["service"]["revision"], "deadbeef")
+                self.assertIn("webhooks", document)
+                connection.request("GET", "/healthz")
+                self.assertEqual(json.loads(connection.getresponse().read())["service"]["revision"], "deadbeef")
+                body = json.dumps({"action": "opened", "repository": {"full_name": TAUCETI}}).encode()
+                connection.request(
+                    "POST",
+                    "/webhook/github",
+                    body,
+                    {
+                        "X-GitHub-Event": "pull_request",
+                        "X-GitHub-Delivery": "cf-1",
+                        "X-Hub-Signature-256": webhook.signature_for(SECRET, body),
+                        "Content-Type": "application/json",
+                    },
+                )
+                self.assertEqual(
+                    connection.getresponse().status, 202, "the secret is read from the credentials directory"
+                )
+                connection.close()
+            finally:
+                srv.shutdown()
+                srv.server_close()
+            with self.assertRaises(ValueError):
+                server.create_server(object(), config, status=provider)
 
 
 class Signature(unittest.TestCase):

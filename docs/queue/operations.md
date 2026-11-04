@@ -254,12 +254,16 @@ rehearsal on `TauCetiProject/TauCetiQueueScratch` passed. The cutover itself is 
 with two halves, made together, nothing drained:
 
 1. Take a backup (`backup.sh`).
-2. Set the TauCeti repository variable `MERGE_BACKEND` to the service's value. The workflow callers
-   already honour this variable (`pr-build.yml`, `retry-ci-status.yml`, `queue-release.yml` compare it
-   with `bors`; `queue` selects the GitHub merge queue), and the review App writes its `bors r+`
-   comments only while it is `bors`, so the exact value for the service is fixed with the GitHub
-   adapter stream and recorded here before the rehearsal. From then on the service's own approval
-   intake is authoritative.
+2. Leave the TauCeti repository variable `MERGE_BACKEND` at `bors`. The service is a drop-in for
+   Bors's commands, dispatch, statuses and feeds, and every workflow caller only distinguishes
+   `bors` from anything else (`docs/queue/github.md`, "MERGE_BACKEND"): `pr-build.yml` and
+   `retry-ci-status.yml` verify scope approvals against the observation feed under `bors`,
+   `queue-release.yml` is skipped under `bors`, and TauCetiReview's `merge-only.yml` and
+   `merge-sweep.yml` publish `merge eligibility` checks and leave admission to the selected backend
+   under `bors`. The cutover is therefore not a variable change: point the `bors.taucetiproject.org`
+   hostname (the feeds the workflows read) and the TauCeti webhook deliveries at the service by
+   suspending the `tau-ceti-bors` App installation, and enable the service's publication. Bors
+   receives no further deliveries from then on; the service's own approval intake is authoritative.
 3. Enable publication: set `publication_enabled = true` in `config.toml` and run
    `systemctl --user restart tauceti-queue`, then confirm `service.mode` is `production` in status.
    (A restart is needed because this flag is process configuration, not a runtime setting; it is the
@@ -272,8 +276,8 @@ with two halves, made together, nothing drained:
    inputs under `approved_waiting` and the first head when it seals.
 5. Watch the first three heads as the plan's "First week" says, and run the journal report daily.
 
-Rollback is the same two halves in reverse: set `MERGE_BACKEND` back to `bors` and
-`publication_enabled = false` (restart). The service returns to shadow mode with its records intact; Bors
+Rollback is the same two halves in reverse: restore the `tau-ceti-bors` installation and hostname and
+set `publication_enabled = false` (restart). The service returns to shadow mode with its records intact; Bors
 resumes approval intake. Approved inputs the service holds at that moment are re-approved under Bors by
 their authors or the review App; the service's observation feed lists them.
 

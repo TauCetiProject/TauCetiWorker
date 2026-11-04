@@ -214,3 +214,33 @@ class InstallationTokenSource:
             expires_at=parse_github_time(str(data["expires_at"])),
             permissions=dict(data.get("permissions") or {}),
         )
+
+
+class GitHubApp:
+    """The App as one object: credentials, transport and installation tokens.
+
+    `GitHubApp.load(credentials_dir)` is what the service entrypoint (`tauceti_queue/__main__.py`)
+    calls; `github_adapter.GitHubAdapter(app, repository)` builds the client from it.
+    """
+
+    def __init__(self, credentials: AppCredentials, transport: Transport | None = None, *, api: str = API) -> None:
+        if transport is None:
+            from .github_adapter import UrllibTransport
+
+            transport = UrllibTransport()
+        self.credentials = credentials
+        self.transport = transport
+        self.api = api
+        self.tokens = InstallationTokenSource(credentials, transport, api=api)
+
+    @classmethod
+    def load(cls, credentials_dir: pathlib.Path | str | None = None, transport: Transport | None = None) -> GitHubApp:
+        return cls(AppCredentials.load(credentials_dir), transport)
+
+    @property
+    def webhook_secret(self) -> bytes:
+        return self.credentials.webhook_secret
+
+    @property
+    def slug(self) -> str:
+        return self.credentials.slug
