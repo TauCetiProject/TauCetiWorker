@@ -4,17 +4,34 @@ Implement a scripted merge queue with AI assistance for merge conflicts and sour
 
 This is a standalone plan for the existing GitHub PR, agent, and CI workflow. All required behavior is described here. Examples describe interfaces to implement.
 
+## Increments
+
+The plan is delivered in three steps. Each is useful on its own and none depends on a later one.
+
+**Increment 0: risk reduction ahead of the queue.** The untested claim in this plan is that an agent, given a failed candidate with complete diagnostics and warm build artifacts, produces a green replacement chain faster than the author round-trip (observed in the [staging triage](staging-triage.md) deployment: 19 to 39 minutes from handoff to a repaired head, then hours behind the backlog). Test that claim before building the controller:
+
+- *Shadow repair task.* On each Bors `failure_partition`, a worker takes the immutable `staging-candidate-N-G` ref, the journal's diagnostics and attributed owners, and runs the repair agent of this plan in a private worktree against the batch's base, using the published `main` cache plus an incremental build of the batch's modules. It reports time to a green local build of the affected modules, which PRs it edited, whether it shrank a contribution, and the diff. Nothing is published. The repair time distribution and the warm-artifact question (whether `main`'s cache plus an incremental build is warm enough, or the failed candidate's own outputs are needed) are decided by this data.
+- *Attributed chain construction* as a standalone tool with Git fixtures: build the per-PR squash chain from member heads with the trailers below, validate single-parent history and the member bijection. The shadow repair task uses it to hand the agent a chain, so it is exercised long before the controller exists.
+- *Readmitted suspects keep their queue position* in Bors: a suspect handed to repair and re-approved at a new head inherits its original admission age once, instead of re-entering behind the backlog. This is the largest remaining latency win in the current system and a small change to `queue_age.ex` and the handoff record.
+- *Journal report* as a committed script producing the triage measurements (slot occupancy by category, failed rounds per landed large batch, singleton and bisection counts, suspects per partition, handoff-to-readmission time), so every change from here on has a before and after.
+- *The queue service's GitHub App*, created and installed now; the shadow task and the status endpoint run on its API budget.
+- *Dedicated staging runners*, independent of the queue: the same candidate has been observed to build in 13 minutes on a hosted runner and in 2 hours 50 minutes on a fleet host shared with worker agents.
+
+**Increment 1: one open batch and one head.** Approved PRs are inserted into a single open batch. When the head lands, the open batch seals and becomes the head, and a new open batch starts. The head is rebased, built, repaired in place and fast-forwarded. There are no successor batches, no background CI, no combination, no cap pressure, no agent-assisted insertion, and no clean-replay comparison for comments. This is the increment the rest of this document specifies unless a section says otherwise. The trade-off is that a repair round is dead time for the whole queue; there is no evidence yet that pipelining shortens the head cycle, and the head cycle is what the pilot measures first.
+
+**Later increments**, each adopted only when the measurements of increment 1 show the need: sealed successor batches with background CI and repair, lazy combination of open batches under a cap, cap-pressure sealing with its logging, agent-assisted insertion of PRs that do not replay cleanly, the clean-replay comparison for comment generation, and agents hosted in GitHub Actions. Their specifications are collected at the end of this document.
+
 ## Queue and source model
 
-Maintain a queue of approved PR revisions not yet inserted into a batch, and an ordered queue of batches. Each batch is a linear chain of single-parent commits based on a recorded canonical commit. Batches are independent branches, rather than descendants of earlier batches. A batch is never stacked on an unlanded predecessor: a red result on a stacked candidate cannot be assigned to the predecessor or the successor without another build, so it is not a repair task, and concurrent repair of both would invalidate each other's work. The cost is that a successor's background CI only finds its own failures early; it never shortens the head's critical path. Each contains exactly one squash commit per constituent PR, including an empty commit where appropriate.
+Maintain a queue of approved PR revisions not yet inserted into a batch, one open batch receiving insertions, and one sealed head being validated. Each batch is a linear chain of single-parent commits based on a recorded canonical commit, containing exactly one squash commit per constituent PR, including an empty commit where appropriate. A batch is never stacked on an unlanded predecessor: a red result on a stacked candidate cannot be assigned to the predecessor or the successor without another build, so it is not a repair task, and concurrent repair of both would invalidate each other's work.
 
-The batch queue consists of a sealed prefix followed by an unsealed suffix. Membership is not evicted during normal operation; sealed membership is fixed, while unsealed batches can receive approved PRs. Each batch separately records its borrow/claim state, source base/tip, and CI results. A sealed batch can be borrowed for repair; borrowing does not itself seal it.
+Sealed membership is fixed; the open batch receives approved PRs until it seals. Each batch records its claim state, source base/tip, and CI results. The sealed head can be claimed for repair.
 
 Once a PR enters staging, land the AI's best effort at merging/fixing its content through the scripted CI and publication process. There is no exceptional-withdrawal process. If the original author or a reviewer subsequently finds a problem, they address it in a follow-up PR to Tau Ceti. Such findings do not withdraw the staged contribution or reopen its admission review. The same holds for automation: review, repair and housekeeping pipelines must not close, relabel, re-review or withdraw a PR that is a batch member, and the queue publishes membership (a label and a status on the head) that those pipelines honour. A member PR closed after staging admission still lands; closure is not withdrawal.
 
-The head need not already be based on current `main` when it reaches the front. The controller establishes that condition before promotion. Discover the configured canonical branch rather than assuming its name; Tau Ceti currently uses `main`.
+The head need not already be based on current `main` when it seals. The controller establishes that condition before promotion. Discover the configured canonical branch rather than assuming its name; Tau Ceti currently uses `main`.
 
-There is no PR-count cap per batch. Process all approved waiting work as capacity permits instead of leaving it out to satisfy a preferred batch size. Limit the number of unsealed batches through runtime configuration. Multiple agent sessions may be required for a large batch; retain progress and complete inputs between sessions.
+There is no PR-count cap per batch. Process all approved waiting work instead of leaving it out to satisfy a preferred batch size. Multiple agent sessions may be required for a large batch; retain progress and complete inputs between sessions.
 
 ## Accepted inputs and attributed commits
 
@@ -33,7 +50,7 @@ Agents edit constituent commits instead of adding standalone repair commits. The
 
 A green batch takes priority over preserving any one contribution's intent. When an agent cannot make a constituent commit compile and pass CI within the batch, it shrinks that contribution to the part that does, down to an empty commit if necessary, and the appended message and the programmatic PR comment say what was dropped. This is the only exit from a repair task. Membership is never evicted and no repair has a time budget, because the agent can always reach green.
 
-Initially the batch tip is the unit that must pass CI. Intermediate constituent commits need not each pass independently.
+The batch tip is the unit that must pass CI. Intermediate constituent commits need not each pass independently.
 
 ## Explanations and PR comments
 
@@ -43,33 +60,29 @@ Agent instruction:
 
 > Resolve the reported conflicts or CI failures in this batch. Preserve the constituent PRs' intent as best you can; where they conflict, use your judgment to choose the best alternative or combination. Update the constituent commits, retaining their source PR identities. When you change a commit's content, append a very concise explanation of what changed and why to its existing message. If a contribution cannot be made to pass, reduce it to the part that does, down to an empty commit, and say so in its message.
 
-A mechanical rebase changing commit hashes does not by itself mean a PR's content was modified. The controller records machine-derived provenance for clean replay versus agent-edited content and compares candidate content with the clean scripted replay where that baseline exists. A conflict requiring agent resolution is an edited contribution. Replaying descendants after an earlier edit is not automatically an edit to every descendant.
+The controller records provenance per member commit: clean replay, or agent-edited in a named repair task. A mechanical rebase changing commit hashes does not by itself mean a PR's content was modified; replaying descendants after an earlier edit is not an edit to every descendant. A conflict requiring agent resolution is an edited contribution.
 
 Check append-only message preservation against the corresponding prior commit by PR identity. Collect explanations from the appended message text. If an agent has changed source without the required message addition, have the same attempt add the concise explanation; no new review phase is introduced.
 
-Post a PR comment when its final contribution differs from the clean result of rebasing/squashing its accepted branch onto its actual predecessor. Reuse commit-message explanations directly, with links to the relevant retained commits and conflicting PRs. Comment construction/publication is programmatic. Do not add a mandatory post-hoc AI analysis to reconstruct decisions already made. When a clean replay baseline cannot be produced, retain the conflict/agent-edit provenance rather than pretending to establish an exact clean comparison.
+Post a PR comment when the member's provenance is agent-edited. Reuse commit-message explanations directly, with links to the relevant retained commits and conflicting PRs. Comment construction/publication is programmatic. Do not add a mandatory post-hoc AI analysis to reconstruct decisions already made. Comparing the landed content with a clean replay of the accepted branch, to suppress comments on edits that turned out to be no-ops, is a later increment.
 
-Publish one concise consolidated comment per PR for the actual landed result. Failed comment publication is retried independently of source landing. Preserve modified commit objects under durable refs so comments and fallback links remain usable after further rewrites. A separate decision store is unnecessary; operational records can identify inputs, outputs, and modified commits without duplicating the reasons in their messages.
+Publish one concise consolidated comment per PR for the actual landed result. Failed comment publication is retried independently of source landing. Preserve modified commit objects under durable refs so comments and links remain usable after further rewrites. A separate decision store is unnecessary; operational records can identify inputs, outputs, and modified commits without duplicating the reasons in their messages.
 
-## Scripted insertion and combination
+## Scripted insertion
 
-For each insertion pass, draw the next PR at random from the `insertion_age_window` oldest approved PRs, and randomize the order in which eligible unsealed batches are tried. The age window prevents starvation; within it, randomness spreads conflicts across batches. Skip borrowed batches. For a chosen PR, use a private workspace to attempt a clean replay/squash onto a candidate batch. Borrow and recheck that batch's version before committing the insertion. Concurrent attempts must also reserve the approved PR so it cannot be inserted twice.
+For each insertion pass, draw the next PR at random from the `insertion_age_window` oldest approved PRs. The age window prevents starvation. For the chosen PR, use a private workspace to attempt a clean replay/squash onto the open batch. Claim and recheck the batch's version before committing the insertion. Concurrent attempts must also reserve the approved PR so it cannot be inserted twice.
 
 Commit the new batch tip, membership, and removal from the waiting queue through a recoverable operation. A failed or interrupted probe leaves the approved PR represented and the existing batch intact. PRs need not form a strict global FIFO beyond the age window.
 
-An operator can mark an approved PR urgent. An urgent PR is inserted into the first unsealed batch, which is then sealed immediately and ordered ahead of other sealed non-head batches; it never preempts or cancels the running head, and it never requires an administrative merge around the queue. Administrative merges that do happen are reconciled as canonical advances, as specified under head operations; they are an exception path, not the way infrastructure changes land.
+A PR that does not replay cleanly onto the open batch stays approved and waiting, and is probed again on later passes and after the head lands, since the conflicting content is usually a batch-mate that lands with the head. A PR whose head conflicts with `main` itself receives the ordinary conflict request. No agent is launched to insert a PR in this increment.
 
-If no unsealed batch exists, create an empty one when approved work is waiting. When all existing unsealed batches are borrowed, another may be created below the configured cap. If an insertion cannot be made cleanly on any available batch, an agent can borrow one unsealed batch and incorporate the PR as one additional constituent commit. It can edit other constituent commits where needed, with append-only explanations. A borrowed insertion reserves that PR until completion or recovery.
+An operator can mark an approved PR urgent. An urgent PR is inserted into the open batch, which is then sealed as soon as the head lands; it never preempts or cancels the running head, and it never requires an administrative merge around the queue. Administrative merges that do happen are reconciled as canonical advances, as specified under head operations; they are an exception path, not the way infrastructure changes land.
 
-Unsealed batches are combined programmatically only when the queue is up against its unsealed-batch cap. Borrow both batches without deadlock, attempt to combine their commit series cleanly, and adopt the combined result atomically. Preserve membership, attribution, and messages. If the combination conflicts, leave both original batches intact and available; do not launch an agent merely to combine batches. Claims and record updates must prevent partially completing a combination or duplicating its members.
+If no open batch exists, create one when approved work is waiting. Remove an idle empty open batch rather than sealing it or running empty staging CI.
 
-When the unsealed cap is reached and lazy clean combination cannot free a slot, seal the first unsealed batch when it is nonempty and available, even if this exceeds the normal sealed target. This frees an unsealed slot for further work. If that batch is borrowed, mark it to seal as soon as the borrow returns. Capacity pressure must not make approved work disappear or create an unlimited number of empty branches.
+## Claims and candidate adoption
 
-Clearly log every cap-pressure sealing operation, including batch identity, sealed/unsealed counts before and after, effective limits, current backlog observation/age, and the reason clean combination could not free capacity. Emit a distinct event/counter when the operation exceeds the sealed target, and expose the count and frequency in queue status/metrics. Count committed transitions rather than repeated reconciliation attempts. This is controller bookkeeping; agents provide no extra report. Sealing under this exception does not itself bypass the background-CI launch gate.
-
-## Borrowing and candidate adoption
-
-Use expiring renewable claims for scripted mutations and agent attempts. Borrowing records batch identity/version, starting tip, operation, worker/run identity, and a monotonically changing claim token. Take multiple claims in a consistent order or one transaction. Keep the queue's sealed-prefix invariant when sealing or moving batches.
+Use expiring renewable claims for scripted mutations and agent attempts. A claim records batch identity/version, starting tip, operation, worker/run identity, and a monotonically changing claim token. Take multiple claims in a consistent order or one transaction.
 
 Workers use private worktrees/refs and return proposed commit chains. Only the controller adopts an authoritative batch tip after validating membership, history, expected batch version, and current claim. Expiry makes work eligible for recovery; it is not proof that the old process stopped. A late result cannot overwrite newer state, but its commits remain retained and can be reused.
 
@@ -79,59 +92,47 @@ Keep an active tool call running through coordinator/network failure. The harnes
 
 The controller repeatedly reconciles the head:
 
-1. If it is unsealed and nonempty, seal it as soon as its current borrow is released. No collection window or additional insertion pass delays a wanted seal. Remove an idle empty placeholder with no reserved insertion instead of sealing it or running empty staging CI.
-2. If it is sealed but based on an older canonical commit, borrow it and attempt a scripted rebase onto current `main`. On conflict, restore the previous authoritative series and make that rebase-conflict task available to an agent, with the failed probe's evidence retained.
-3. Once it is sealed and based on current `main`, start or observe the required CI programmatically. Wait for a running check; recover infrastructure failures separately from source failures.
-4. If source-dependent CI fails, prioritize an agent repair of that batch. Adopt the updated series, then let the controller run CI on it again.
+1. When no head exists and the open batch is nonempty, seal the open batch as soon as its current claim is released and start a new open batch. No collection window or additional insertion pass delays the seal.
+2. If the head is based on an older canonical commit, claim it and attempt a scripted rebase onto current `main`. On conflict, restore the previous authoritative series and make that rebase-conflict task available to an agent, with the failed probe's evidence retained.
+3. Once it is based on current `main`, start or observe the required CI programmatically. Wait for a running check; recover infrastructure failures separately from source failures.
+4. If source-dependent CI fails, make the repair task available to an agent. Adopt the updated series, then let the controller run CI on it again.
 5. If required CI passes, fast-forward `main` from the recorded expected parent to the batch tip. Create no additional batch squash or merge commit. If the expected parent changed, return to rebase/validation. GitHub does not classify a PR as merged when its squash commit lands this way; PRs close by reference, as with Bors today, and landing evidence stays positive through the `Source-PR` trailer and retained refs.
 
 CI scheduling, result classification, retry, and promotion are controller operations. Agents can use local verification while editing, but do not decide whether required CI ran or which checks permit publication. A CI result is bound to the actual candidate, run and checking configuration; an old callback cannot mark a new source green, and a cancelled or superseded run cannot mark a candidate red. The controller owns the dispatch and the concurrency of candidate builds: a pull-request event, a push to a member branch, or a workflow's always-run reporting step must not cancel a candidate build or post a verdict in its place, and no status that did not come from the candidate's own completed run is read as its verdict. An approval is never consumed by a stale or cancelled status. Source-dependent checks and cancelled/lost runners or missing status publication take different recovery paths.
 
-A batch leaving the head exposes its successor for the same reconciliation. Keep accepted membership and useful source during admin merges or queue restarts. A canonical advance does not reset original PR review.
+Keep accepted membership and useful source during admin merges or queue restarts. A canonical advance does not reset original PR review.
 
-## Background sealed batches and runtime controls
+## Staging capacity and build progress
 
-Do no CI on unsealed batches. Sealed non-head batches can run CI and receive agent repair before reaching the head, controlled by an easy-to-change runtime flag. Background results apply to the source tested; after a new base is integrated, obtain the results required for that candidate.
+The head build is the serial resource, so its runner must be dedicated and isolated: a staging build placed on a host that also runs worker agents or other builds takes whatever is left. Staging capacity is reserved for staging; the controller records which runner and host executed each candidate build and how long each build phase took.
 
-Expose at least these runtime controls through the existing administration surface or protected service/repository settings, without a code PR:
-
-| Setting | Meaning |
-| --- | --- |
-| `max_unsealed_batches` | Maximum number of unsealed batches; initial value 4 |
-| `max_sealed_batches` | Normal target/limit on sealed batches, including the head; initial value 2, replenished immediately when work/capacity permit; logged cap-pressure sealing can exceed it |
-| `background_sealed_ci_and_repair` | Enable/disable CI and source repair for sealed non-head batches |
-| `background_ci_backlog_threshold` | Permit new proactive sealing/background CI when relevant queued CI jobs are below this threshold; initial value 100 |
-| `insertion_age_window` | Number of oldest approved PRs the random insertion draw is taken from; initial value 16 |
-
-Apply changes to new scheduling decisions and report effective values. Lowering a cap does not evict existing batches or interrupt useful attempts. Disabling background work stops new background launches while retaining current source/results. Head repair and validation take priority over background work. The backlog gate controls speculative work; it does not prevent necessary head validation or repair.
-
-Background CI/repair operates on independently based batches. It does not require stacking batches on their predecessors. Proactively rebase sealed non-head batches toward current `main` when background work is enabled. Coalesce repeated advances into a pending refresh rather than repeatedly restarting an active attempt. The same background capacity gate should apply when a refresh would launch more CI; retain useful work when the backlog rises.
-
-Measure backlog from jobs queued for execution on the runner pools used by staging, including ordinary PR jobs competing for the same capacity. Exclude running jobs and jobs using unrelated runner pools. Count jobs rather than PRs or workflow runs. Reuse an existing observation feed or cached/batched reads rather than adding per-batch GitHub polling. If the observation is stale or unavailable, use zero backlog for scheduling. Report observation age/availability and whether zero was assumed. Selecting the observation source and freshness interval is an implementation detail, not a prerequisite policy decision.
-
-### Staging capacity and build progress
-
-The head build is the serial resource, so its runner must be dedicated and isolated: a staging build placed on a host that also runs worker agents or other builds takes whatever is left, and the same candidate has been observed to build in 13 minutes on a hosted runner and in 2 hours 50 minutes on a shared fleet host. Staging capacity is reserved for staging; the controller records which runner and host executed each candidate build and how long each build phase took.
-
-Status distinguishes a slow build from a stalled one: the build publishes phase progress (preparation, cache restore, build with module counts, audits, lint) with timestamps, and the controller raises a visible stall condition when a phase makes no progress for a configured interval. Operators must be able to answer "which machine is this running on and is it moving" from queue status alone, without access to the runner host or to in-progress workflow logs.
+Status distinguishes a slow build from a stalled one: the build publishes phase progress (preparation, cache restore, build with module counts, audits, lint) with timestamps, and the controller raises a visible stall condition when a phase makes no progress for `stall_interval_seconds`. Operators must be able to answer "which machine is this running on and is it moving" from queue status alone, without access to the runner host or to in-progress workflow logs.
 
 The CI contract for a candidate is the one established by the staging triage work: the build runs to completion and reports every independently failing module, and audit and lint findings carry the defining module path. The repair agent's inputs depend on that contract.
 
+## Runtime controls
+
+Expose these runtime controls through the existing administration surface or protected service settings, without a code PR. Apply changes to new scheduling decisions and report effective values.
+
+| Setting | Meaning |
+| --- | --- |
+| `insertion_age_window` | Number of oldest approved PRs the random insertion draw is taken from; initial value 16 |
+| `repair_concurrency` | Maximum concurrent agent sessions on the head's repair task; initial value 1 |
+| `stall_interval_seconds` | Build phase silence after which status raises a stall condition; initial value 900 |
+
 ## Repair agent execution
 
-In the first increment, conflict and repair agents run only on the worker fleet through the existing `TauCetiWorker` harness, using each worker's own Opus API credentials or Claude subscription access. The queue exposes a named borrowed task; a worker claims it, receives the normal source and diagnostics, and returns a proposed attributed chain. Its output is never permission to bypass the subsequent scripted CI.
+Conflict and repair agents run on the worker fleet through the existing `TauCetiWorker` harness, using each worker's own Opus API credentials or Claude subscription access. The queue exposes a named claimed task; a worker claims it, receives the normal source and diagnostics, and returns a proposed attributed chain. Its output is never permission to bypass the subsequent scripted CI. The shadow repair task of increment 0 is this task without adoption or publication.
 
 Authorize worker execution using the existing security-audit rule. At the time of this plan, `tauceti_worker/security_audit.py::require_admin` requires repository-admin permission, rather than named-team membership. Reuse the actual predicate, verifying the selected GitHub account at claim and result adoption. A PR comment or local declaration of membership is not authorization.
 
-The agent must have the failed candidate's compiled artifacts. For a CI repair task the controller records where the exact failed commit's build outputs live (the staging cache the existing finalizer confirms, or the workflow run's artifacts) and the harness restores them before the agent starts, so that each repair iteration is an incremental build of the affected modules rather than a cold build longer than the CI run it is fixing. For a conflict task, the artifacts of the batch's recorded base serve the same purpose. A task whose artifacts cannot be restored is reported as such; it is not silently run cold.
-
-Running agents as GitHub Actions jobs with an API key stored as a repository secret is deferred. If adopted later, that job holds a credential while reading PR-authored text and running tools, so it needs an egress allowlist limited to the model API and GitHub, a spend-capped key, and the stated assumption that PR text is untrusted input. Credentials and trusted workflow code remain outside candidate-controlled builds; ordinary source checks keep their existing isolation.
+The agent must have warm build artifacts. The default source is the published `main` cache plus an incremental build of the batch's own modules, which is what workers already do for PR repair; the shadow repair measurements decide whether the failed candidate's own outputs (the staging cache the existing finalizer confirms, or the workflow run's artifacts) must be restored instead. For a conflict task, the artifacts of the batch's recorded base serve the same purpose. A task whose artifacts cannot be prepared is reported as such; it is not silently run cold.
 
 Every execution path shares the same claims. A delayed or duplicate attempt cannot create a competing authoritative writer.
 
 ## Inference unavailability
 
-When no execution path can obtain inference (provider errors or exhausted credentials across every configured path, after bounded retries), the queue holds: it stops sealing new batches, the head waits with its membership and retained source intact, and blocked repair tasks remain exposed to any authorized worker that can still run. The controller retries with backoff and resumes automatically when a task completes or a provider call succeeds. There is no conventional-splitting fallback, no return of members to authors, and no operator page. A difficult source problem or an ordinary infrastructure error is not evidence that inference is unavailable.
+When no execution path can obtain inference (provider errors or exhausted credentials across every configured path, after bounded retries), the queue holds: it stops sealing, the head waits with its membership and retained source intact, and blocked repair tasks remain exposed to any authorized worker that can still run. The controller retries with backoff and resumes automatically when a task completes or a provider call succeeds. There is no conventional-splitting fallback, no return of members to authors, and no operator page. A difficult source problem or an ordinary infrastructure error is not evidence that inference is unavailable.
 
 Queue status reports the hold, its start time, and the last provider error so the cause is visible after the fact.
 
@@ -144,7 +145,7 @@ Keeping the engine inside Bors would reuse its GitHub client, outbox, and candid
 Records are the service's own, in one database:
 
 - approved input: repository, PR, accepted head, description, author and coauthors, admission evidence, retained object ref;
-- batch: identity, version, base commit, tip commit, sealed flag, ordered member list with per-member commit and provenance (clean replay or agent-edited), claim state, CI attempts and results;
+- batch: identity, version, base commit, tip commit, sealed flag, ordered member list with per-member commit and provenance (clean replay or agent-edited), claim state, CI attempts and results with runner placement and phase timings;
 - claim: batch identity and version, operation, worker or run identity, token, expiry;
 - pending side effects: promotion, comments, label updates, each with an idempotency key and attempt history.
 
@@ -157,29 +158,17 @@ Inspect these effective implementations and their repository instructions before
 - `TauCetiProject/TauCetiReview`: existing admission/merge-policy evaluation and the representation of `awaiting-author` work.
 - `TauCetiProject/TauCetiWorker`: `work_units.py`, `round.py`, `repair_recovery.py`, and `security_audit.py` for harness execution, claims, retained source, and authorization.
 
-First build a local end-to-end fixture using real Git history and scripted stand-ins for AI/provider responses. It should demonstrate clean insertion/rebase without inference, conflict resolution and CI repair producing a replacement series, script-controlled checks, fast-forward publication, and retained membership/explanations. Exercise independent batches, borrowing, age-windowed random insertion probes, runtime flags, shrink-to-green repair, and the inference-unavailable hold.
+First build a local end-to-end fixture using real Git history and scripted stand-ins for AI/provider responses. It should demonstrate clean insertion/rebase without inference, conflict resolution and CI repair producing a replacement series, script-controlled checks, fast-forward publication, and retained membership/explanations. Exercise sealing, claims, age-windowed random insertion, the urgent lane, shrink-to-green repair, and the inference-unavailable hold.
 
 Then connect the existing admission, harness, CI, and publication paths, first in a shadow mode that constructs batches from the same approvals without publishing, so that its decisions can be compared with Bors before it takes ownership of a repository. Prepare a live activation plan accounting for legacy splitting, author-repair delegation, and publication ownership. Keep normal worker/CI admissions enabled and preserve in-flight useful work. Verify running revisions, actual completions, and interrupted/stranded tasks after rollout. No routine fleet drain is part of deployment.
 
-Expose queue/head status, effective settings, sealed/borrowed state, current source, pending task, CI state (including runner placement and phase progress), and reasons for waiting, as a JSON endpoint with a stable schema version, in the manner of the existing `tauceti-bors.observation/v1` feed. The same endpoint reports the service's running revision (git SHA) and start time, so a deployment can be verified directly rather than inferred from the next natural event. Measure contributions landed/hour, head rebase/CI/repair times, background useful versus discarded work, claim collisions, PR waiting age, repeated builds/model work, shrink-to-green occurrences, inference holds, and cap-pressure sealing/target-overflow counts and frequency. The head cycle time is CI plus, for each repair round, agent time plus CI; with 25-minute CI, 20-minute repair, and two repair rounds for a 110-PR batch, that is about 115 minutes per batch, so the sustained rate is set by batch size and repair rounds, not by CI duration alone. Record both so the pilot can be compared with this model. Use natural authorized work for a pilot; fixtures use no paid inference.
+Expose queue/head status, effective settings, claim state, current source, pending task, CI state (including runner placement and phase progress), and reasons for waiting, as a JSON endpoint with a stable schema version, in the manner of the existing `tauceti-bors.observation/v1` feed. The same endpoint reports the service's running revision (git SHA) and start time, so a deployment can be verified directly rather than inferred from the next natural event. Measure contributions landed/hour, head rebase/CI/repair times, claim collisions, PR waiting age, repeated builds/model work, shrink-to-green occurrences, and inference holds. The head cycle time is CI plus, for each repair round, agent time plus CI; with 25-minute CI, 20-minute repair, and two repair rounds for a 110-PR batch, that is about 115 minutes per batch, so the sustained rate is set by batch size and repair rounds, not by CI duration alone. Record both so the pilot can be compared with this model. Use natural authorized work for a pilot; fixtures use no paid inference.
 
 ## Policy status
 
-The policy choices needed for the initial implementation are settled: start with an unsealed cap of 4, a normal sealed target of 2, and a background CI backlog threshold of 100 queued jobs competing for staging runners. Assume zero backlog when observations are stale or unavailable. These capacity values are runtime-configurable without a PR.
+The policy choices for increment 1 are settled: one open batch and one sealed head, sealing immediately when the head lands, no stacking on unlanded predecessors, no membership eviction with shrink-to-green as the agent's only exit, age-windowed random insertion with no agent-assisted insertion, provenance-flagged comments, worker-only agent execution with warm artifacts, hold-and-retry on inference unavailability, verdicts bound to a candidate's own completed run only, membership that other automation cannot withdraw, an operator urgent lane that never preempts the head, dedicated staging capacity with recorded placement and phase progress, the controller's own GitHub App identity with a reported running revision, and the separate Python queue service. Problems discovered after staging admission are addressed through follow-up PRs to Tau Ceti; there is no exceptional-withdrawal process to implement.
 
-The initial target of two sealed batches and the separate Python queue service are decided, as are dedicated staging capacity with recorded placement and phase progress, the controller's own GitHub App identity, an operator urgent lane that never preempts the head, verdicts bound to a candidate's own completed run only, and membership that other automation cannot withdraw. Seal wanted batches immediately when available, with no collection delay. Cap pressure can exceed the sealed target through clearly logged sealing operations. Caps, age-windowed random insertion probes, creation below the cap while existing unsealed batches are borrowed, no membership eviction with shrink-to-green as the agent's only exit, no stacking on unlanded predecessors, no unsealed CI, runtime-controlled background sealed work and proactive rebasing, lazy clean combination, message-only explanations, worker-only agent execution in the first increment, and hold-and-retry on inference unavailability are established requirements. Problems discovered after staging admission are addressed through follow-up PRs to Tau Ceti; there is no exceptional-withdrawal process to implement.
-
-### Sealing policy
-
-Initially target two sealed batches: the head in validation/repair and one successor already sealed and available for background CI/repair. Unsealed assembly can continue behind them. When the head lands, promote the successor and replenish the sealed prefix as capacity permits. The successor can still require rebase and CI against the newly advanced canonical branch; prior sealing/background work reduces preparation time but does not establish that final candidate's green status.
-
-When a sealed batch is wanted, seal the first unsealed batch immediately when it is nonempty and available. There is no collection delay, age trigger, or requirement to finish an additional insertion pass. An existing borrow can finish, but new insertion work must not repeatedly postpone a wanted seal. A CI backlog threshold must not stop the queue from starting its necessary head build.
-
-For ordinary advance sealing, require space under `max_sealed_batches`, background work enabled, and a relevant CI backlog below the runtime threshold (initial value 100). Assume zero when the observation is stale or unavailable. Immediately fill the second sealed slot under these conditions when a batch is available. The cap-pressure exception can seal beyond the target; background CI launches remain subject to their capacity gate.
-
-Only the first unsealed batch may be sealed without moving queue positions. If it is borrowed, record that sealing is wanted and avoid repeatedly giving it new insertion work after the borrow returns. This does not cancel or preempt the current attempt. Sealing a later batch while an earlier one remains unsealed would violate the sealed-prefix invariant.
-
-After lazy clean combination fails under cap pressure, seal the first unsealed batch when it is nonempty and available even when the sealed target is reached, recording the operation as specified above. If it is borrowed, mark it for sealing on release and recover abandoned claims normally; do not exceed the unsealed cap while waiting or seal a later batch out of queue order.
+The increment 0 items precede the controller: shadow repair measurements, the attributed chain tool, readmission age in Bors, the journal report, the GitHub App, and dedicated staging runners.
 
 ## Acceptance scenarios
 
@@ -187,13 +176,13 @@ After lazy clean combination fails under cap pressure, seal the first unsealed b
 2. A conflict or source-dependent CI failure produces a narrowly identified AI task and a validated replacement chain; there is no staging review.
 3. Every final commit is single-parent and maps bijectively to a member PR, including empty contributions. Validation accepts a membership-equivalent replacement chain without comparing member positions.
 4. Agent edits preserve each previous message as a prefix and append concise reasons. Comments are generated from those messages; no extra agent decision file/report is required.
-5. A mechanical rebase does not create spurious content-modification comments, while agent-modified contributions get their final linked comment with independently retryable publication.
-6. PR reservation, borrowing, claim expiry, late results, and two-batch combination cannot duplicate or lose members or overwrite a newer candidate.
-7. The sealed-prefix invariant survives insertion, sealing, combination, promotion, and restart. Borrowed batches are protected from concurrent mutation. A wanted seal has no artificial collection delay. Cap pressure can exceed the sealed target, with one clearly logged/counted event per adopted overflow transition.
-8. Unsealed batches never launch CI. Initial runtime values are 4 unsealed batches, a normal target of 2 sealed batches, and a threshold of 100 queued jobs sharing staging capacity. Settings can change without a PR. Stale/unavailable backlog observations use zero and do not block background scheduling. Existing borrowed batches allow creation below the cap; no normal eviction occurs. Observed backlog pressure gates speculative work while necessary head work continues. Proactive rebasing coalesces canonical advances and preserves active work.
-9. Lazy clean combination is attempted under cap pressure, retains provenance, and leaves conflicting batches intact without an AI-combination task.
+5. A mechanical rebase does not create a content-modification comment, while agent-edited contributions get their final linked comment with independently retryable publication.
+6. PR reservation, claims, claim expiry and late results cannot duplicate or lose members or overwrite a newer candidate.
+7. Sealing, promotion and restart preserve exactly one open batch and at most one head; a claimed batch is protected from concurrent mutation; a seal has no artificial collection delay.
+8. The open batch never launches CI. Settings can change without a PR.
+9. A PR that does not replay cleanly onto the open batch is probed again after the head lands and inserts without an agent once its batch-mate has landed.
 10. Admin advances and lost promotion responses reconcile correctly; promotion adds no merge commit, and stale CI cannot approve changed source.
-11. An authorized worker claims a repair task, restores the failed commit's compiled artifacts before the agent starts, and returns a chain the controller validates; a second claimant or a late result cannot become a competing writer.
+11. An authorized worker claims a repair task, prepares warm artifacts before the agent starts, and returns a chain the controller validates; a second claimant or a late result cannot become a competing writer.
 12. Coordinator outages preserve active tool calls and useful source; restart recovers actual worker/CI/publication state before repeating work.
 13. When every inference path is unavailable, the queue holds with all membership and retained source intact, reports the hold and its cause in status, and resumes automatically on the first successful task or provider call. No member changes state during the hold.
 14. A contribution the agent cannot make pass is shrunk, down to an empty commit, and the batch still lands; its PR comment names what was dropped. No repair task is ever abandoned for lack of a time budget.
@@ -202,6 +191,31 @@ After lazy clean combination fails under cap pressure, seal the first unsealed b
 17. A sealed batch of 110 PRs containing two source failures lands with zero singleton CI runs and at most three full CI runs, and its head time from first dispatch to fast-forward is under 120 minutes with warm artifacts available to the repair agent.
 18. No approved PR waits more than `insertion_age_window` insertion passes without being drawn.
 19. A pull-request event or branch push during a candidate build neither cancels that build nor posts a verdict for it; a cancelled or superseded run leaves the candidate's state unchanged and its approval intact.
-20. An urgent PR is sealed and built next without cancelling the running head, and lands without an administrative merge.
+20. An urgent PR is in the next head and lands without an administrative merge and without cancelling the running head.
 21. A review or repair pipeline closing or relabelling a member PR does not change batch membership; the PR's content still lands.
 22. Queue status names the runner and host of the running head build, shows phase progress with timestamps, and raises a stall condition when progress stops; it also reports the service's running revision.
+23. Increment 0: the shadow repair task, run on at least ten natural Bors failures, reports time to a green local build, edited PRs and shrink events for each, without publishing anything; a suspect readmitted after repair is ordered by its original admission age.
+
+## Later increments
+
+These specifications are retained for adoption when increment 1's measurements show the need. They do not change the increment 1 behaviour above.
+
+### Sealed successor batches and background CI
+
+The batch queue becomes a sealed prefix followed by an unsealed suffix, with a runtime cap on unsealed batches (initial value 4) and a normal target on sealed batches including the head (initial value 2). Sealed non-head batches can run CI and receive agent repair before reaching the head, controlled by a runtime flag; background results apply to the source tested, and after a new base is integrated the candidate needs its own results. Background work operates on independently based batches and proactively rebases them toward current `main`, coalescing repeated advances into a pending refresh. Head repair and validation take priority over background work. A CI backlog threshold (initial value 100 queued jobs on the runner pools used by staging, counting jobs rather than PRs, with zero assumed when the observation is stale or unavailable and the assumption reported) permits new background launches; it never stops the head's necessary build. When the head lands, promote the successor and replenish the sealed prefix as capacity permits; prior background work reduces preparation time but does not establish the final candidate's green status. Only the first unsealed batch may be sealed, preserving the sealed-prefix invariant; a borrowed batch is marked to seal on release without preempting the current attempt.
+
+### Combination and cap pressure
+
+Unsealed batches are combined programmatically only when the queue is up against its unsealed cap: borrow both without deadlock, attempt a clean combination of their commit series, and adopt the result atomically, preserving membership, attribution and messages; on conflict leave both intact and launch no agent. When the cap is reached and combination cannot free a slot, seal the first unsealed batch even beyond the sealed target, logging batch identity, sealed/unsealed counts before and after, effective limits, the backlog observation and the reason combination failed, with a distinct counter for target overflow exposed in status. Capacity pressure must not make approved work disappear or create an unlimited number of empty branches.
+
+### Agent-assisted insertion
+
+If an insertion cannot be made cleanly on any available batch, an agent can borrow one unsealed batch and incorporate the PR as one additional constituent commit, editing other constituent commits where needed with append-only explanations. A borrowed insertion reserves that PR until completion or recovery.
+
+### Clean-replay comparison for comments
+
+Post a PR comment only when the final contribution differs from the clean result of rebasing/squashing its accepted branch onto its actual predecessor, so that an agent edit that turns out to be a no-op produces no comment. When a clean replay baseline cannot be produced, retain the agent-edit provenance rather than pretending to establish an exact comparison.
+
+### Agents in GitHub Actions
+
+Running agents as GitHub Actions jobs with an API key stored as a repository secret: that job holds a credential while reading PR-authored text and running tools, so it needs an egress allowlist limited to the model API and GitHub, a spend-capped key, and the stated assumption that PR text is untrusted input. Credentials and trusted workflow code remain outside candidate-controlled builds; ordinary source checks keep their existing isolation. A worker and an Actions job share the same claims.
