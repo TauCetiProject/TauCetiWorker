@@ -122,6 +122,7 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `[settings] insertion_age_window` | `16` | initial runtime control (plan, "Runtime controls") |
 | `[settings] repair_concurrency` | `1` | initial runtime control |
 | `[settings] stall_interval_seconds` | `900` | initial runtime control |
+| `[settings] approval_poll_interval_seconds` | `900` | how often the approval poll lists the open PRs' `merge eligibility` checks behind the webhooks (Approval polling below) |
 
 The `[settings]` values seed the store on first start. After that the persisted settings are the
 effective ones and are changed through the admin endpoint (Runtime settings below), not by editing the
@@ -292,12 +293,13 @@ After every `install.sh` (and after any restart), in this order:
 
 ## Runtime settings
 
-The three runtime controls change without a PR, through the admin endpoint:
+The runtime controls change without a PR, through the admin endpoint:
 
 ```sh
 uv run tauceti-queue settings show
 uv run tauceti-queue settings set insertion_age_window 8
 uv run tauceti-queue settings set repair_concurrency 2 --token "$(gh auth token)"
+uv run tauceti-queue settings set approval_poll_interval_seconds 600
 ```
 
 `settings set` posts `{"<key>": <value>}` to `/admin/settings` with the operator's GitHub token
@@ -308,11 +310,36 @@ is persisted in the store, and appears in `status.settings` immediately. Values 
 anything else is rejected before the request is sent. `--url` points the command at the public endpoint
 when run from another machine.
 
+## Approval polling
+
+Approvals arrive as TauCetiReview's `merge eligibility` check runs, reconciled on every `check_run`
+webhook delivery. Behind the webhooks, `tauceti_queue/approval_poll.py` runs a reconciliation pass at
+service start and every `approval_poll_interval_seconds` (default 900): it lists the open PRs with
+the review App's check runs on their heads (one GraphQL call per 100 PRs, on the GraphQL quota) and
+feeds through the same `eligibility.reconcile` path as a delivery exactly those whose decision the
+service has not recorded: an eligible check at a head without a live input (a missed approval), an
+unsafe review on a PR with one (a missed revocation), and a waiting input whose PR moved to another
+head, closed or became a draft. A pass costs the listing (12 GraphQL calls for 1,200 open PRs) plus
+at most four REST calls per difference found; it is skipped while the REST quota is below the loop's
+reserve (200) and stops early when the quota runs out, leaving the rest to the next pass.
+
+`status.approvals` reports `webhook` and `polled` (approvals discovered by deliveries and by the
+poll), `revoked_by_poll`, and `last_poll` (the last pass: `at`, `reason`, `listed`, `with_check`,
+`reconciled`, `approved`, `revoked`, `head_changed`, `closed`, `drafted`, `member_events`,
+`skipped`, `stopped_early`, `errors`, `duration_seconds`). A growing `polled` while the App's
+Advanced page shows no deliveries means the webhook is inactive or not reaching the service; a
+growing `polled` beside healthy deliveries means deliveries are being lost. Run a pass by hand:
+
+```sh
+uv run tauceti-queue reconcile-approvals            # prints the pass summary
+```
+
 ## Cutover
 
-Preconditions (plan, "Transition to production"): two days of shadow agreement with Bors and the
-rehearsal on `TauCetiProject/TauCetiQueueScratch` passed. The cutover itself is one setting change
-with two halves, made together, nothing drained:
+Preconditions (plan, "Transition to production"): the rehearsal on
+`TauCetiProject/TauCetiQueueScratch` passed. There is no shadow period (operator decision,
+2026-11-04): the live rehearsal on the scratch repository is the check before cutover. The cutover
+itself is one setting change with two halves, made together, nothing drained:
 
 1. Take a backup (`backup.sh`).
 2. Leave the TauCeti repository variable `MERGE_BACKEND` at `bors`. The service is a drop-in for
@@ -321,21 +348,51 @@ with two halves, made together, nothing drained:
    `retry-ci-status.yml` verify scope approvals against the observation feed under `bors`,
    `queue-release.yml` is skipped under `bors`, and TauCetiReview's `merge-only.yml` and
    `merge-sweep.yml` publish `merge eligibility` checks and leave admission to the selected backend
-   under `bors`. The cutover is therefore not a variable change: point the `bors.taucetiproject.org`
-   hostname (the feeds the workflows read) and the TauCeti webhook deliveries at the service by
-   suspending the `tau-ceti-bors` App installation, and enable the service's publication. Bors
-   receives no further deliveries from then on; the service's own approval intake is authoritative.
-3. Enable publication: set `publication_enabled = true` in `config.toml` and run
+   under `bors`. The cutover is therefore not a variable change: save Bors's two feeds first, then
+   point the `bors.taucetiproject.org` hostname (the feeds the workflows read) and the TauCeti
+   webhook deliveries at the service by suspending the `tau-ceti-bors` App installation, and enable
+   the service's publication. Bors receives no further deliveries from then on; the service's own
+   approval intake is authoritative.
+
+   ```sh
+   curl -s 'https://bors.taucetiproject.org/repositories/1/active-batches?base=main' > /tmp/bors-active-batches.json
+   curl -s 'https://bors.taucetiproject.org/repositories/1/candidates?base=main' > /tmp/bors-candidates.json
+   ```
+
+3. Import Bors's state, once, immediately after suspending the Bors installation and before
+   enabling publication (the service is still in shadow mode and admits nothing of its own yet):
+
+   ```sh
+   uv run tauceti-queue import-bors --feed /tmp/bors-active-batches.json \
+       --candidates /tmp/bors-candidates.json --candidates ~/tmp/bors-journal/candidates-*.json --dry-run
+   uv run tauceti-queue import-bors --feed /tmp/bors-active-batches.json \
+       --candidates /tmp/bors-candidates.json --candidates ~/tmp/bors-journal/candidates-*.json
+   ```
+
+   The dry run prints what the import would do: every member of a waiting batch, sealed or not,
+   becomes an approved input at its head with its original admission age (`original_admitted_at` from
+   the candidate journals; the journal is bounded to the 500 most recent admissions and 100 most
+   recent candidates, so pass every saved journal you have; a member no journal covers is aged from
+   the import time and its evidence says `age_source: import-time`), its reviewer and priority, with
+   evidence `{"source": "bors-import", "batch_id", "feed_observed_at", ...}`; the live PR is read
+   first and a closed, draft, moved-head or unknown PR is refused and listed with its reason. The
+   members of Bors's running head are recorded as the service's external head (`status.external_head`),
+   not as inputs: the service inserts into its open batch but seals no head until that head lands,
+   which it observes as Bors's `Source-PR`-less squash commits on `main`, as the head tip becoming an
+   ancestor of `main`, or as Bors closing the members with its `[Merged by Bors]` title. Re-running the
+   command imports nothing already present and reports the counts; if Bors's head is no longer running
+   in a fresh feed (it landed, failed or was cancelled) the re-run releases its unlanded members to
+   approved inputs with their ages, and `--release-head` does the same without a fresh feed. Note that
+   a suspended Bors installation cannot land its head: if the head is still running at cutover, wait
+   for its landing before suspending, or release it after.
+4. Enable publication: set `publication_enabled = true` in `config.toml` and run
    `systemctl --user restart tauceti-queue`, then confirm `service.mode` is `production` in status.
    (A restart is needed because this flag is process configuration, not a runtime setting; it is the
-   deliberate friction of the plan's "one setting change".)
-4. The service imports Bors's current state from the observation feed on the transition to
-   production: every approved PR waiting or in an unsealed batch becomes an approved input with its
-   original admission age; Bors's running head is left to finish and land under Bors, and the service
-   seals its first head only after observing that landing as a canonical advance. Bors's remaining
-   sealed batches are released back to approved inputs with their ages. Status shows the imported
-   inputs under `approved_waiting` and the first head when it seals.
-5. Watch the first three heads as the plan's "First week" says, and run the journal report daily.
+   deliberate friction of the plan's "one setting change".) Status shows the imported inputs under
+   `waiting`, Bors's head under `external_head` until it lands, and the first head when it seals.
+5. Watch the first three heads as the plan's "First week" says, run the journal report daily, and
+   watch `status.approvals.polled`: approvals the poll finds that no delivery brought mean the webhook
+   path is not reaching the service.
 
 Rollback is the same two halves in reverse: restore the `tau-ceti-bors` installation and hostname and
 set `publication_enabled = false` (restart). The service returns to shadow mode with its records intact; Bors
@@ -358,8 +415,9 @@ plan's "Production monitoring" stop the pipeline and page nothing; each becomes 
 
 Also in status: the head's batch, base, tip, claim, CI run with `runner` and `host`, phase progress with
 timestamps (`head.ci.phases`), the open batch's size and oldest member age (`open_batch`), approved
-inputs waiting (`approved_waiting`), the pending task (`pending_task`), the service's running revision
-and start time (`service.revision`, `service.started_at`), and the effective settings (`settings`).
+inputs waiting (`approved_waiting`), the pending task (`pending_task`), Bors's head awaited after the
+cutover (`external_head`), approvals by source and the last poll (`approvals`), the service's running
+revision and start time (`service.revision`, `service.started_at`), and the effective settings (`settings`).
 "Which machine is this running on and is it moving" is answered by `head.ci.runner`, `head.ci.host` and
 the newest `updated_at` among the phases; `tauceti-queue status` prints exactly these.
 

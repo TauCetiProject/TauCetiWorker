@@ -29,3 +29,5 @@ reconcile_interval_seconds = 30
 insertion_age_window = 16
 repair_concurrency = 1
 stall_interval_seconds = 900
+# How often the approval poll lists the open PRs' `merge eligibility` checks behind the webhooks.
+approval_poll_interval_seconds = 900

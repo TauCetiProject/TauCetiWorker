@@ -64,7 +64,12 @@ class Layers(Base):
         self.assertEqual(config.webhook_url, "https://queue.taucetiproject.org/webhook/github")
         self.assertEqual(
             config.settings.as_dict(),
-            {"insertion_age_window": 16, "repair_concurrency": 1, "stall_interval_seconds": 900},
+            {
+                "insertion_age_window": 16,
+                "repair_concurrency": 1,
+                "stall_interval_seconds": 900,
+                "approval_poll_interval_seconds": 900,
+            },
         )
         self.assertEqual(config.database, self.home / ".local/state/tauceti-queue/queue.sqlite3")
         self.assertEqual(config.credentials_dir, self.creds)

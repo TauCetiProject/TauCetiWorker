@@ -113,6 +113,17 @@ class Decoding(unittest.TestCase):
         )
 
 
+class ProductionRecords(unittest.TestCase):
+    def test_real_rest_check_runs_decode_with_the_highest_id_winning(self):
+        fixture = json.loads((REPO / "tests/fixtures/merge-eligibility-check-runs.json").read_text())
+        head = fixture["rest"][0]["head_sha"]
+        decision = e.latest(fixture["rest"], fixture["repo"], 24557, head, fixture["review_app_id"])
+        self.assertEqual((decision.check_id, decision.eligible, decision.single), (125149712005, True, False))
+        self.assertEqual(decision.merge_base_sha, "93af5b549b7d9ed44291d6ceb093a8013dda00f8")
+        self.assertEqual(e.notification_pr(fixture["rest"][1], fixture["repo"]), 24557)
+        self.assertEqual(e.decode(fixture["rest"][1], fixture["repo"], 24557, head).conclusion, "failure")
+
+
 class FakeController:
     canonical_branch = "main"
 

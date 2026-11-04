@@ -8,6 +8,8 @@ This package is being assembled in increments (see docs/redesign/specs/ai-merge-
 - `store`: the queue's records in one SQLite database.
 - `controller`: the increment 1 state machine (inputs, batches, claims, tasks, CI, promotion, status).
 - `loop`: the reconciliation loop with restart reconciliation and bounded polling.
+- `bors_import`: the cutover import of Bors's approved PRs and running head from its feeds.
+- `approval_poll`: the bounded reconciliation poll of `merge eligibility` checks behind the webhooks.
 - `fakes`: a fake GitHub over a bare repository, scripted CI and scripted agents for the fixture.
 - `repair`: the repair machinery shared by the experiments and the worker-side task (artifact
   preparation, prompt, agent run, chain checks).

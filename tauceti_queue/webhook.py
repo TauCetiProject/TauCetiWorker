@@ -119,7 +119,12 @@ class WebhookReceiver:
         """A `merge eligibility` check from the review App is the App's approval or revocation."""
         pr = eligibility.notification_pr(payload.get("check_run") or {}, repo, review_app_id=self.review_app_id)
         if pr is not None:
-            eligibility.reconcile(self.controller, self.adapter, repo, pr, review_app_id=self.review_app_id)
+            disposition = eligibility.reconcile(
+                self.controller, self.adapter, repo, pr, review_app_id=self.review_app_id
+            )
+            note = getattr(self.controller, "note_approval", None)
+            if disposition == "approved" and callable(note):
+                note("webhook")
 
     def _issue_comment(self, repo: str, payload: dict) -> None:
         if payload.get("action") != "created":

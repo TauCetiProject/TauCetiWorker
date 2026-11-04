@@ -25,7 +25,7 @@ Tables:
 
 | table | content |
 | --- | --- |
-| `settings` | runtime settings and controller state (`state:*` keys: canonical SHA, inference hold, counters) as JSON, with actor and time |
+| `settings` | runtime settings and controller state (`state:*` keys: canonical SHA, inference hold, counters, Bors's external head, the last approval poll) as JSON, with actor and time |
 | `inputs` | approved inputs: repository, PR, accepted head, title, description, author, evidence, reviewer, priority, urgent flag, state, age (`approved_at`), retained ref, probe history (`probes`, `last_probe`, `last_probe_tip`, `passes_waited`) |
 | `batches` | identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`), expected parent for promotion, urgent flag, first dispatch time |
 | `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA |
@@ -70,9 +70,9 @@ Every `tick()` (one reconciliation pass) does, under the controller lock:
    tip it conflicted with (it is not re-merged until the tip moves); a conflict against the
    canonical commit itself cancels the input and posts the conflict request. Any error returns the
    input to waiting and releases the claim.
-4. Seal: when there is no head, the open batch is nonempty, no claim is active on it and no
-   inference hold is in force, it becomes the head in the same pass and a new open batch is
-   created. There is no collection window.
+4. Seal: when there is no head, the open batch is nonempty, no claim is active on it, no
+   inference hold is in force and Bors's external head (below) is not awaited, it becomes the head
+   in the same pass and a new open batch is created. There is no collection window.
 5. Head reconciliation, in the plan's order: a head under a worker's task claim is left alone;
    a head not based on the canonical commit is claimed and replayed (`chain.replay`), a clean
    replay becoming the next version with provenance unchanged, a conflict becoming a
@@ -140,6 +140,36 @@ Urgent lane: `mark_urgent` flags the input (drawn next, ahead of the random draw
 already a member of the open batch, the batch. The open batch seals as soon as the head lands in
 any case; the running head is never cancelled.
 
+Bors's state at the cutover (`import_bors_state(observation, candidates, now=, dry_run=,
+release_head=)`, implemented in `tauceti_queue/bors_import.py`): every member of a non-running batch
+in Bors's observation feed is approved at its head through `approve(..., approved_at=, pull=)` with
+the age, reviewer and priority the candidate journals record for that (PR, head) (`original_admitted_at`
+in unix microseconds, `reviewer`, `scheduling.priority`; the import time and the review App when
+unknown) and evidence `{"source": "bors-import", "batch_id", "feed_observed_at", "batch_state",
+"sealed", "age_source", "reviewer_source", ...}`; an administrator's `manual_approval` becomes the
+`admin`, `actor_id` and `merge_base_sha` evidence the observation feed's `scope_approvals` reads.
+Each live PR is read once (`validate_pull`) and refused with `closed`, `draft`, `head-mismatch`,
+`base-branch`, `fetch-failed: ...` or `head-unavailable`; the heads are prefetched in chunks of pull
+refs. The members of the running batch are recorded as the external head (`state:external_head`:
+batch, head and base SHA, members, `landed_members`, state `running`, `landed` or `released`), not
+as inputs, and `_seal` refuses while it is `running`, with the reason in status. Landing is observed
+on a canonical advance: a commit without a `Source-PR` trailer whose subject ends in `(#N)` is Bors's
+squash of PR N, the head's tip becoming an ancestor of the canonical commit lands every member, and a
+`pull_request` `closed` event carrying Bors's `[Merged by Bors] - ` title lands that member; the head
+is `landed` once every member has. A re-import whose feed no longer runs the batch, or
+`release_head`, marks it `released` and approves its unlanded members with their ages. Re-running
+imports nothing already present at the same head (and reads no PR for it); a dry run validates and
+reports without writing. The import refuses to start when fewer REST calls remain than PRs to read.
+
+Approval intake by polling (`tauceti_queue/approval_poll.py`): `ApprovalPoller.run_once` lists the
+open PRs with their `merge eligibility` checks (`GitHubPort.list_open_pull_requests`) and calls
+`eligibility.reconcile` for each decision the controller has not recorded (an eligible check at a
+head without a live input, an unsafe review on a PR with one), `handle_event("pull_request", ...)`
+for a waiting input whose PR moved, closed or became a draft (the webhook path's actions, so members
+are journaled and kept), each decision once. `note_approval("webhook" | "polled")` counts the
+source; `record_approval_poll(summary)` keeps the last pass for status. `ApprovalPollLoop` runs a
+pass at start, every `approval_poll_interval_seconds` and on wake.
+
 Restart: `recover()` releases the controller's own in-process claims (`insert`, `rebase`), returns
 `reserved` inputs to `waiting`, expires overdue claims and leaves worker claims, tasks and the
 outbox as they are; the first pass then drains the outbox before any new work. `ReconciliationLoop`
@@ -167,6 +197,7 @@ and reported in status:
 | `inference_hold_backoff_seconds`, `inference_hold_backoff_max_seconds` | 60, 3600 | hold backoff |
 | `outbox_retry_seconds`, `outbox_retry_max_seconds` | 30, 900 | outbox retry backoff |
 | `polling_interval_seconds` | 60 | polling fallback interval |
+| `approval_poll_interval_seconds` | 900 | interval of the approval reconciliation poll behind the webhooks |
 | `membership_label` | `bors-staging` | label added to member PRs at insertion |
 
 ## Ports
@@ -174,15 +205,19 @@ and reported in status:
 `GitHubPort` (`tauceti_queue/ports.py`), implemented by stream F's adapter and by `FakeGitHub`:
 `fetch_pr`, `fetch_refs` (into the service's clone), `dispatch_candidate`, `find_candidate_run`,
 `commit_status`, `fast_forward`, `update_ref`, `post_comment` (idempotent on a marker),
-`set_labels`, `close_pr`, `repository_admin`, `rate_limit`. `close_pr` is the one method beyond the
-agreed list: Bors closes a squash-landed member with a title change, which no other method
-expresses. `CandidateRun.diagnostics` carries the findings the adapter extracted from the run
+`set_labels`, `close_pr`, `repository_admin`, `rate_limit`, and for approval intake
+`eligibility_checks(repo, head)`, `pr_merge_base(repo, number, head_sha)` (what
+`eligibility.reconcile` reads) and `list_open_pull_requests(repo, review_app_id=)` returning
+`OpenPullRequest` records (number, head, base, draft flag, the review App's check runs on the head)
+for the approval poll. `close_pr` is the one method beyond the agreed list: Bors closes a
+squash-landed member with a title change, which no other method expresses. `CandidateRun.diagnostics` carries the findings the adapter extracted from the run
 (dicts with `kind`, `module`, `message`); the controller passes them to the repair task and uses
 only `kind == "infrastructure"` for classification.
 
 Commands arrive from the adapter as `approve(repo, pr, head_sha, reviewer, priority, evidence,
-approved_at=None)`, `unapprove`, `cancel`, `set_priority`, `mark_urgent(repo, pr, actor)`;
-`approved_at` lets the cutover import keep an input's original age. Events arrive as
+approved_at=None, pull=None)`, `unapprove`, `cancel`, `set_priority`, `mark_urgent(repo, pr, actor)`;
+`approved_at` lets the cutover import keep an input's original age and `pull` a PR already read.
+`validate_pull(repo, pr, head_sha)` and `input_for(repo, pr)` serve the import and the poll. Events arrive as
 `handle_event(kind, payload)` with the raw webhook payload; they refresh what they describe
 (`push` to the canonical branch, member-head `synchronize`, closes, drafts, CI events naming the
 head) and wake the loop. `retry_ci(repo, actor)` and `set_setting` are the administrative calls.
@@ -227,7 +262,9 @@ oldest member age, members, claim, retained ref); `head` (the same plus `sealed_
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
 outcome and detail, plus `stall` with `since`, `silence_seconds` and the phase when the build has
-been silent for `stall_interval_seconds`); `tasks`; `outbox` (pending entries with attempt history);
+been silent for `stall_interval_seconds`); `external_head` (Bors's head awaited after the cutover:
+batch, head and base SHA, state, member counts, `pending_members`, timestamps); `approvals`
+(`webhook`, `polled`, `revoked_by_poll`, `last_poll`); `tasks`; `outbox` (pending entries with attempt history);
 `reasons` (why the last pass is waiting); `alerts` (the first-line conditions: a stall longer than
 two intervals, a hold older than an hour, two chain validation failures on one head, a failing
 promotion); `counters` (heads sealed and landed, PRs landed and edited, dispatches and
@@ -263,7 +300,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 20 urgent lane | F `test_s20_urgent_pr_is_in_the_next_head_without_cancelling_the_running_one` |
 | 21 closing or relabelling a member changes nothing | F `test_s16_s21_...`; C `test_waiting_inputs_react_to_events_and_members_do_not` |
 | 22 status names runner, host, phases, stall, revision | F `test_s22_status_names_runner_host_phase_progress_stall_and_revision`; C `StatusShape` |
-| 23, 24 increment 0 and transition | not expressible here; `tests/queue_rehearsal.py` runs the cutover rehearsal's scenario script over these fakes (`docs/queue/rehearsal.md`) |
+| 23, 24 increment 0 and transition | not expressible here; `tests/queue_rehearsal.py` runs the cutover rehearsal's scenario script over these fakes (`docs/queue/rehearsal.md`); `tests/queue_bors_import.py` covers the import of Bors's state over a reduced production feed and the first-head rule; `tests/queue_approval_poll.py` the approval poll |
 
 Also covered: infrastructure failures retried with backoff and bounded
 (`test_infrastructure_failures_are_retried_with_backoff_and_bounded`), shadow mode publishing

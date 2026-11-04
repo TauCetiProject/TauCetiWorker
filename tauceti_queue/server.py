@@ -151,6 +151,7 @@ class QueueHTTPServer(ThreadingHTTPServer):
         )
         self.auth = BearerAuth(config.adapter, ttl=config.auth_cache_seconds, clock=config.clock)
         self.revision = config.revision or running_revision()
+        self.poller = None  # the approval poller, set by `create_server(..., poller=)`
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -283,6 +284,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/admin/retry-ci":
             self._admin_retry_ci()
+            return
+        if path == "/admin/import-bors":
+            self._admin_import_bors()
+            return
+        if path == "/admin/reconcile-approvals":
+            self._admin_reconcile_approvals()
             return
         if path == "/tasks/inference":
             self._task_inference()
@@ -491,6 +498,51 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._call(lambda: self.server.controller.mark_urgent(repo, pr, identity[0]))
 
+    def _admin_import_bors(self) -> None:
+        """Bors's state at the cutover: `{"observation": feed, "candidates": journal | [journals], "dry_run", "release_head"}`."""
+        identity = self._authenticated()
+        if identity is None:
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        observation = body.get("observation")
+        if not isinstance(observation, dict):
+            self._error(400, "`observation` must be the observation feed document")
+            return
+        candidates = body.get("candidates")
+        if candidates is not None and not isinstance(candidates, dict | list):
+            self._error(400, "`candidates` must be a candidate journal document or a list of them")
+            return
+        if not self._admin(identity[0]):
+            self._error(403, f"{identity[0]} is not a repository admin")
+            return
+        self._call(
+            lambda: self.server.controller.import_bors_state(
+                observation,
+                candidates,
+                dry_run=bool(body.get("dry_run")),
+                release_head=bool(body.get("release_head")),
+            )
+        )
+
+    def _admin_reconcile_approvals(self) -> None:
+        """One approval reconciliation pass now (`tauceti-queue reconcile-approvals`)."""
+        identity = self._authenticated()
+        if identity is None:
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        if not self._admin(identity[0]):
+            self._error(403, f"{identity[0]} is not a repository admin")
+            return
+        poller = self.server.poller
+        if poller is None:
+            self._error(503, "the approval poller is not running in this service")
+            return
+        self._call(lambda: poller.run_once(reason=f"operator {identity[0]}"))
+
 
 def _renewal(task_id, result) -> dict:  # noqa: E302
     if isinstance(result, dict):
@@ -525,15 +577,18 @@ def server_config(config, *, adapter=None, app=None, controller=None) -> ServerC
 
 
 def create_server(
-    controller, config, *, status: Callable[[], dict] | None = None, adapter=None, app=None
+    controller, config, *, status: Callable[[], dict] | None = None, adapter=None, app=None, poller=None
 ) -> QueueHTTPServer:
     """A server ready for `serve_forever()`; `server_address` carries the bound port.
 
     `config` is a `ServerConfig` or the service `Config`; `status` is the entrypoint's status
-    document provider (`Service.status_document`), used for `/status` and `/healthz` when given.
+    document provider (`Service.status_document`), used for `/status` and `/healthz` when given;
+    `poller` is the `approval_poll.ApprovalPoller` behind `/admin/reconcile-approvals`.
     """
     resolved = server_config(config, adapter=adapter, app=app, controller=controller)
-    return QueueHTTPServer((resolved.host, resolved.port), Handler, controller, resolved, status)
+    server = QueueHTTPServer((resolved.host, resolved.port), Handler, controller, resolved, status)
+    server.poller = poller
+    return server
 
 
 def serve_in_thread(server: QueueHTTPServer) -> threading.Thread:

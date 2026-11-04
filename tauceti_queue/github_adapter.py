@@ -20,6 +20,9 @@ protocol and record shapes; timestamps are unix seconds, run ids strings):
     close_pr(repo, number, title)
     repository_admin(login) -> bool
     rate_limit() -> (remaining, reset_at)
+    eligibility_checks(repo, head) -> [check run records]
+    pr_merge_base(repo, number, head_sha) -> sha | None
+    list_open_pull_requests(repo, *, review_app_id) -> [OpenPullRequest]   (GraphQL, 100 PRs per call)
 
 The conventions that keep the queue a drop-in replacement for Bors are encoded here: the dispatch
 is `repository_dispatch` of `pr-build.yml` with event type `tauceti-bors-staging` and the same
@@ -254,8 +257,13 @@ class GitHubClient:
         accept: str = "application/vnd.github+json",
         ok: Iterable[int] = (200, 201, 202, 204),
         tolerate: Iterable[int] = (),
+        record_limit: bool = True,
     ) -> Response:
-        """One API call. Statuses in `ok` return; `tolerate` returns too (callers inspect); others raise."""
+        """One API call. Statuses in `ok` return; `tolerate` returns too (callers inspect); others raise.
+
+        `record_limit=False` keeps a GraphQL response's headers (its own, separate quota) out of the
+        REST counter `rate_limit()` reports.
+        """
         url = self.url(path, params)
         body = None if json_body is None else json.dumps(json_body).encode()
         accepted = set(ok) | set(tolerate)
@@ -275,7 +283,8 @@ class GitHubClient:
                 self.requests += 1
             status, response_headers, data = self._transport(method, url, headers, body)
             response_headers = {k.lower(): v for k, v in response_headers.items()}
-            self._record(response_headers)
+            if record_limit:
+                self._record(response_headers)
             if status in accepted:
                 return Response(status, response_headers, data)
             if status == 401 and used_installation and attempt == 1:
@@ -346,6 +355,22 @@ class GitHubClient:
             if len(batch) < per_page:
                 return items
             page += 1
+
+    def graphql(self, query: str, variables: dict | None = None) -> dict:
+        """One GraphQL call (`POST /graphql`); returns `data`, raising `GitHubError` on `errors`."""
+        response = self.request(
+            "POST", "graphql", json_body={"query": query, "variables": variables or {}}, record_limit=False
+        )
+        document = response.json()
+        if not isinstance(document, dict):
+            raise GitHubError("unexpected GraphQL response shape", response.status)
+        errors = document.get("errors")
+        if errors:
+            raise GitHubError(f"GraphQL: {errors[0].get('message') if isinstance(errors[0], dict) else errors[0]}")
+        data = document.get("data")
+        if not isinstance(data, dict):
+            raise GitHubError("GraphQL response without data", response.status)
+        return data
 
     def fetch_bare(self, url: str) -> tuple[int, bytes]:
         """A GET without any credential, for signed URLs GitHub redirects to."""
@@ -723,6 +748,57 @@ class GitHubAdapter:
             key="check_runs",
         )
 
+    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[ports.OpenPullRequest]:
+        """Every open PR with the review App's `merge eligibility` check runs on its head.
+
+        One GraphQL page per 100 PRs: the PR's head, draft flag and base, and from the head commit
+        the review App's check suite (`checkSuites(filterBy: {appId})`) with its `merge eligibility`
+        runs, mapped to the REST record shape `eligibility.latest` reads. Twelve calls for 1,200
+        open PRs, on the GraphQL quota rather than the REST one. The suite's `app` is null when read
+        with an installation token (observed on production, 2026-11-04), so the review App id the
+        filter selected by is what the mapped records carry.
+        """
+        owner, name = repo.split("/", 1)
+        listed: list[ports.OpenPullRequest] = []
+        cursor = None
+        while True:
+            data = self.client.graphql(
+                OPEN_PULLS_QUERY,
+                {"owner": owner, "name": name, "after": cursor, "appId": int(review_app_id)},
+            )
+            connection = ((data.get("repository") or {}).get("pullRequests")) or {}
+            for node in connection.get("nodes") or []:
+                if not isinstance(node, dict) or not isinstance(node.get("number"), int):
+                    continue
+                head = str(node.get("headRefOid") or "")
+                checks = []
+                for commit_node in ((node.get("commits") or {}).get("nodes")) or []:
+                    commit = (commit_node or {}).get("commit") or {}
+                    oid = str(commit.get("oid") or head)
+                    for suite in ((commit.get("checkSuites") or {}).get("nodes")) or []:
+                        # The suites were selected by `filterBy: {appId}`, so they are the review App's;
+                        # through an installation token GraphQL returns `app: null` on another App's
+                        # suite, and the REST record's `app.id` must still name it for `eligibility.trusted`.
+                        app_id = ((suite or {}).get("app") or {}).get("databaseId")
+                        if not isinstance(app_id, int):
+                            app_id = int(review_app_id)
+                        for run in (((suite or {}).get("checkRuns") or {}).get("nodes")) or []:
+                            if isinstance(run, dict) and run.get("name") == "merge eligibility":
+                                checks.append(_rest_check_run(run, oid, app_id))
+                listed.append(
+                    ports.OpenPullRequest(
+                        number=node["number"],
+                        head_sha=head,
+                        base_ref=str(node.get("baseRefName") or ""),
+                        draft=bool(node.get("isDraft")),
+                        eligibility_checks=tuple(checks),
+                    )
+                )
+            page = connection.get("pageInfo") or {}
+            if not page.get("hasNextPage") or not page.get("endCursor"):
+                return listed
+            cursor = page["endCursor"]
+
     def post_commit_status(
         self, repo: str, sha: str, *, context: str, state: str, description: str, target_url: str | None = None
     ):
@@ -806,6 +882,41 @@ class GitHubAdapter:
     def installation_repositories(self) -> list[str]:
         data = self.client.paginate("installation/repositories", key="repositories")
         return [str(r.get("full_name")) for r in data if isinstance(r, dict)]
+
+
+OPEN_PULLS_QUERY = """
+query($owner: String!, $name: String!, $after: String, $appId: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number isDraft baseRefName headRefOid
+        commits(last: 1) { nodes { commit { oid
+          checkSuites(first: 1, filterBy: {appId: $appId}) { nodes { app { databaseId }
+            checkRuns(last: 5, filterBy: {checkName: "merge eligibility"}) {
+              nodes { databaseId name status conclusion externalId completedAt permalink } } } } } } }
+      }
+    }
+  }
+}
+"""
+
+
+def _rest_check_run(run: dict, head_sha: str, app_id) -> dict:
+    """A GraphQL `CheckRun` node in the REST `check_runs[]` shape (`eligibility.decode` reads that)."""
+    conclusion = run.get("conclusion")
+    return {
+        "id": run.get("databaseId"),
+        "name": run.get("name"),
+        "app": {"id": app_id},
+        "head_sha": head_sha,
+        "status": str(run.get("status") or "").lower(),
+        "conclusion": str(conclusion).lower() if conclusion else None,
+        "external_id": run.get("externalId"),
+        "completed_at": run.get("completedAt") or "",
+        "html_url": run.get("permalink") or "",
+    }
 
 
 def _phase_status(entry: dict) -> str:
