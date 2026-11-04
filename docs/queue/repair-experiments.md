@@ -84,22 +84,26 @@ build had to compile on top of main's restored outputs; "agent" is wall time fro
 tokens and USD are from the transcript at API list prices.
 
 <!-- results-table -->
-5 candidates in 4 lineages; 4 complete, 4 green. Total 2,359,521 tokens, estimated USD 2.14 at API list prices; 0 shrink events; messages preserved as prefixes everywhere: yes.
+9 candidates in 5 lineages; 8 complete, 8 green. Total 9,465,445 tokens, estimated USD 6.47 at API list prices; 0 shrink events; messages preserved as prefixes everywhere: yes.
 
 | candidate | lineage | members | kind | failing modules | prep (min) | cache warmth | agent (min) | green | edited PRs | shrink | tokens | est. USD |
 | ---: | ---: | ---: | --- | --- | ---: | --- | ---: | --- | --- | --- | ---: | ---: |
 | 1843 | 1843 | 2 | compiler | Substitution | 10.4 | 214 built | 2.9 | yes | #25596 | - | 481202 | 0.54 |
-| 1914 | 1861 | 14 | lint | Slope | - | - | - | - | - | - | - | - |
+| 1862 | 1861 | 56 | compiler | LDU | 12.5 | 2810 built | 1.1 | yes | #26251 | - | 673922 | 0.58 |
+| 1863 | 1861 | 55 | lint | Slope | 0.2 | 0 built | - | - | - | - | - | - |
+| 1914 | 1861 | 14 | lint | Slope | 15.0 | 1468 built | 13.2 | yes | #26212 | - | 945515 | 0.74 |
+| 1916 | 1867 | 111 | compiler | Diagonalization | 2.6 | 435 built | 3.1 | yes | #25202, #25416, #26269 | - | 1119556 | 0.82 |
+| 1918 | 1873 | 56 | compiler | Braiding | 11.7 | 4077 built | 45.2 | yes | #23638, #24902, #25391, #25667 | - | 4366931 | 2.17 |
 | 1930 | 1886 | 116 | audit | Menger, Paths | 14.9 | 4903 built | 1.0 | yes | #24945 | - | 336391 | 0.40 |
 | 1931 | 1867 | 110 | compiler | Pullback | 10.7 | 4645 built | 4.7 | yes | #25202, #26269 | - | 1120952 | 0.78 |
 | 1932 | 1867 | 109 | compiler | CompletedModules | 0.4 | 0 built | 1.1 | yes | #25202 | - | 420976 | 0.42 |
 
 Minutes:
 
-- agent wall time, handoff to exit (n=4): min 1.0, p25 1.1, median 2.9, p75 2.9, max 4.7, mean 2.4
-- time to green (agent plus confirming build) (n=4): min 1.1, p25 1.3, median 3.1, p75 3.1, max 4.9, mean 2.6
-- preparation (base cache fetch plus incremental build) (n=4): min 0.4, p25 10.4, median 10.7, p75 10.7, max 14.9, mean 9.1
-- modules built in preparation (n=4): min 0, p25 214, median 4645, p75 4645, max 4903, mean 2440.5
+- agent wall time, handoff to exit (n=8): min 1.0, p25 1.1, median 3.1, p75 4.7, max 45.2, mean 9.0
+- time to green (agent plus confirming build) (n=8): min 1.1, p25 1.3, median 3.3, p75 4.9, max 45.3, mean 9.2
+- preparation (base cache fetch plus incremental build) (n=9): min 0.2, p25 2.6, median 10.7, p75 12.5, max 15.0, mean 8.7
+- modules built in preparation (n=9): min 0, p25 214, median 1468, p75 4077, max 4903, mean 2061.3
 <!-- /results-table -->
 
 ## Warm-artifact decision
@@ -115,5 +119,16 @@ _Pending the sample._
 - Candidates in one lineage differ by one removed PR, so later candidates on a shared base find more
   of their modules already built in the pool; the first candidate on each base is the clean
   measurement of main's cache plus an incremental build.
-- The lint and audit confirmations are partial: `scripts/lint-env.sh` runs for lint failures, but the
-  duplicate-declaration audit driver is replaced by a textual check.
+- The lint and audit confirmations are partial: `scripts/lint-env.sh` runs for lint failures, scoped to
+  the batch's changed modules as CI scopes it (candidate 1914's first confirming run was unscoped and
+  reported a `simpNF` violation already on `main` in a module the batch does not touch; its row is
+  judged on the build and the agent's scoped lint run), and the duplicate-declaration audit driver is
+  replaced by a textual check.
+- Disk, not time or inference, bounded the run. Restoring `main`'s cache at a base unpacks 14 GB into
+  the worktree, and Lake stores every artifact a build produces into the pool (hardlinked with the
+  worktree), about 13 GB for a 110-PR candidate, so one base group is live at a time and the pool is
+  pruned to the published mappings whenever a group ends. The host's free space moved between 14 GB
+  and 103 GB during the runs as other processes came and went; at 07:40 UTC it was 17 GB with 23 GB
+  of the pool belonging to the running group. From then on the lane required 25 GB free before and
+  after preparation (`--min-free-gb 25`) and stopped when the host could not provide it, which is why
+  the sample may be shorter than the 23 eligible candidates.

@@ -854,16 +854,27 @@ def lake_env(root: Path, base_env: dict | None = None) -> dict:
     return env
 
 
-def prune_pool(root: Path, shared: Path | None = None) -> dict:
+def prune_pool(
+    root: Path, shared: Path | None = None, *, drop_revisions: tuple[str, ...] = (), newer_than: float | None = None
+) -> dict:
     """Drop built outputs from the private artifact pool, keeping the published base mappings.
 
     Lake stores every artifact a build produces into ``LAKE_CACHE_DIR`` (hardlinked with the worktree's
     ``.lake/build``), so a 110-PR candidate adds about 13 GB per build. After a base group is finished
     the pool keeps only artifacts named by a ``revisions/*/*.jsonl`` mapping or shared by hardlink with
     the seed cache (``~/.cache/lake``), and ``outputs/`` entries whose artifact is gone are removed.
+    ``drop_revisions`` also forgets the mappings of bases that are finished with (their artifacts are
+    then pruned too); ``newer_than`` protects artifacts a running build may still be writing. Freed
+    bytes count only files with no other hardlink: a built output also linked from a worktree frees
+    nothing until that worktree goes.
     """
     pool = root / "lake-cache"
     shared = shared or Path.home() / ".cache" / "lake"
+    dropped = 0
+    for mapping in (pool / "revisions").glob("*/*.jsonl"):
+        if any(mapping.stem.startswith(rev) for rev in drop_revisions if rev):
+            mapping.unlink()
+            dropped += 1
     referenced: set[str] = set()
     for mapping in (pool / "revisions").glob("*/*.jsonl"):
         for line in mapping.read_text(errors="replace").splitlines():
@@ -885,10 +896,13 @@ def prune_pool(root: Path, shared: Path | None = None) -> dict:
                 if twin.exists() and os.path.samefile(path, twin):
                     kept += 1
                     continue
-                size = path.stat().st_size
+                stat = path.stat()
+                if newer_than is not None and stat.st_mtime >= newer_than:
+                    kept += 1
+                    continue
                 path.unlink()
                 removed += 1
-                removed_bytes += size
+                removed_bytes += stat.st_size if stat.st_nlink == 1 else 0
             except OSError:
                 continue
     stale = 0
@@ -904,9 +918,10 @@ def prune_pool(root: Path, shared: Path | None = None) -> dict:
                 stale += 1
     return {
         "removed": removed,
-        "removed_gb": round(removed_bytes / 1e9, 2),
+        "freed_gb": round(removed_bytes / 1e9, 2),
         "kept": kept,
         "stale_outputs_removed": stale,
+        "revisions_dropped": dropped,
     }
 
 
@@ -1560,9 +1575,23 @@ def measure_repair(
     kinds = effective_kinds(failure, json.loads(findings_path.read_text()) if findings_path.exists() else None)
     record["kinds"] = kinds
     if build["rc"] == 0 and run_lint and "lint" in kinds:
+        # CI lints the modules the batch changed (staging-triage.md: "linted 165 changed module(s)");
+        # an unscoped run also reports violations already on main outside the batch.
+        changed = [
+            path[: -len(".lean")].replace("/", ".")
+            for path in git(clone, "diff", "--name-only", failure.base_sha, tip).split()
+            if path.startswith("TauCeti/") and path.endswith(".lean") and (worktree / path).exists()
+        ]
+        modules_file = experiment_dir / "lint-modules.txt"
+        modules_file.write_text("".join(f"{m}\n" for m in changed))
         lint = run_logged(
-            ["bash", "scripts/lint-env.sh"], worktree, logdir / "confirm-lint-env.log", env=env, timeout=build_timeout
+            ["bash", "scripts/lint-env.sh"],
+            worktree,
+            logdir / "confirm-lint-env.log",
+            env={**env, "LINT_ONLY_MODULES": str(modules_file)},
+            timeout=build_timeout,
         )
+        lint["scoped_modules"] = len(changed)
         record["confirm_lint"] = lint
         record["green"] = lint["rc"] == 0
     if build["rc"] == 0 and "audit" in kinds:
@@ -1639,7 +1668,7 @@ def run_experiment(
     build_timeout: float = 3 * 3600,
     skip_agent: bool = False,
     keep_worktree: bool = True,
-    min_free_gb: float = 15.0,
+    min_free_gb: float = 25.0,
 ) -> dict:
     """One historical repair experiment, end to end, with a progressively written result record.
 
@@ -1670,7 +1699,15 @@ def run_experiment(
         chain_before = read_chain(clone, failure.base_sha, record["sources"]["chain_tip"])
         record["artifacts"] = prepare_artifacts(worktree, failure, env, experiment_dir / "logs", build_timeout)
         record["status"] = "artifacts_ready"
+        record["host_after_preparation"] = host_state()
         write_record(record_path, record)
+        if record["host_after_preparation"]["disk_free_gb"] < min_free_gb:
+            # The host is shared with the worker fleet: no agent starts unless the preparation left
+            # the agreed headroom. The worktree is removed so the next attempt starts clean.
+            record["status"] = "aborted_low_disk_after_preparation"
+            keep_worktree = False
+            write_record(record_path, record)
+            return record
         findings = record["sources"]["ci_findings"]
         prompt = compose_prompt(failure, findings, chain_before, clone, failure.base_sha[:12])
         (experiment_dir / "prompt.md").write_text(prompt)
@@ -1699,7 +1736,7 @@ def run_experiment(
         if not keep_worktree:
             try:
                 remove_worktree(clone, worktree)
-                record["pool_prune"] = prune_pool(root)
+                record["pool_prune"] = prune_pool(root, drop_revisions=(failure.base_sha,))
             except Exception as error:
                 record["cleanup_error"] = str(error)
             write_record(record_path, record)
@@ -2014,6 +2051,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--build-timeout", type=float, default=3 * 3600)
     run.add_argument("--skip-agent", action="store_true", help="prepare and measure artifacts only")
     run.add_argument("--remove-worktree", action="store_true", help="remove the base worktree afterwards")
+    run.add_argument("--min-free-gb", type=float, default=25.0, help="required free disk before and after preparation")
     clean = sub.add_parser("clean", help="remove every experiment worktree under the root and prune the pool")
     clean.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     clean.add_argument("--clone", type=Path, default=DEFAULT_CLONE)
@@ -2059,6 +2097,7 @@ def main(argv: list[str] | None = None) -> int:
             build_timeout=args.build_timeout,
             skip_agent=args.skip_agent,
             keep_worktree=not args.remove_worktree,
+            min_free_gb=args.min_free_gb,
         )
         print(json.dumps(result_row(record), indent=1, default=str))
         return 0 if record.get("status") in {"complete", "prepared_only"} else 1

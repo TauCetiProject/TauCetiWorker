@@ -555,19 +555,18 @@ with tempfile.TemporaryDirectory() as raw:
     (pool / "revisions" / "TauCeti" / "abc.jsonl").write_text('"2026-03-17"\n["0011", "base.ltar"]\n')
     (pool / "outputs" / "TauCeti" / "0011.json").write_text(json.dumps({"data": "base.ltar"}))
     (pool / "outputs" / "TauCeti" / "0022.json").write_text(json.dumps({"data": "built.ltar"}))
-    pruned = rx.prune_pool(root, shared)
+    (pool / "artifacts" / "fresh.ltar").write_bytes(b"f" * 10)
+    protected = rx.prune_pool(root, shared, newer_than=os.path.getmtime(pool / "artifacts" / "fresh.ltar"))
     check(
-        "pruning drops built outputs and keeps mapped and shared artifacts",
-        pruned["removed"] == 1
-        and pruned["kept"] == 2
-        and sorted(p.name for p in (pool / "artifacts").iterdir()) == ["base.ltar", "seed.ltar"],
+        "a build in progress keeps its fresh artifacts",
+        protected["removed"] == 1 and (pool / "artifacts" / "fresh.ltar").exists(),
     )
+    pruned = rx.prune_pool(root, shared, drop_revisions=("abc",))
     check(
-        "pruning removes stale output entries",
-        pruned["stale_outputs_removed"] == 1
-        and not (pool / "outputs" / "TauCeti" / "0022.json").exists()
-        and (pool / "outputs" / "TauCeti" / "0011.json").exists(),
+        "dropping a finished base prunes its artifacts too",
+        pruned["revisions_dropped"] == 1 and sorted(p.name for p in (pool / "artifacts").iterdir()) == ["seed.ltar"],
     )
+    check("pruning removes stale output entries", not (pool / "outputs" / "TauCeti" / "0022.json").exists())
 
 # ---- results table and summary ----------------------------------------------------------------
 
