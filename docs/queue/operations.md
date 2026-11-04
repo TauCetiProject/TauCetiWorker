@@ -11,7 +11,8 @@ increment 0 shadow repair task and the status endpoint run on its API budget, ne
 account's rate limit.
 
 The App exists: slug `tauceti-queue`, App ID `5607007`, created 2026-11-04, with the permissions and
-events below confirmed from `gh api /apps/tauceti-queue`. Its webhook address is
+events below confirmed from `gh api /apps/tauceti-queue`. It is installed on `TauCetiProject/TauCeti` only (installation `178451644`, verified on 2026-11-04 by
+authenticating with the stored key and listing the installation's repositories). Its webhook address is
 `https://queue.taucetiproject.org/webhook/github`, registered inactive until the service host and that
 Cloudflare hostname exist; the deployment stream uses the same name.
 
