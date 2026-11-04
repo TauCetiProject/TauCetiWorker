@@ -621,7 +621,25 @@ class Adapter(unittest.TestCase):
         found = adapter(transport).candidate_run(TAUCETI, cancelled)
         self.assertEqual({d["kind"] for d in found.diagnostics}, {"infrastructure"})
 
-    def test_update_ref_creates_when_missing(self):
+    def test_update_ref_pushes_the_object_with_the_ref_from_the_clone(self):
+        # Retained commits exist only in the service's clone: the ref is pushed from it, objects included.
+        captured = {}
+
+        def git(command, **kwargs):
+            captured["command"] = command
+            captured["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        transport = FakeTransport()
+        a = adapter(transport, git=git)
+        a.update_ref(TAUCETI, "refs/tauceti-queue/2650/tip", TIP)
+        self.assertEqual(captured["command"][:4], ["git", "-C", "/tmp/clone", "push"])
+        self.assertIn(f"https://github.com/{TAUCETI}.git", captured["command"])
+        self.assertEqual(captured["command"][-1], f"+{TIP}:refs/tauceti-queue/2650/tip")
+        self.assertEqual(captured["env"]["GIT_CONFIG_KEY_0"], "http.https://github.com/.extraheader")
+        self.assertEqual(transport.calls, [], "no API call when the clone can push")
+
+    def test_update_ref_without_a_clone_creates_through_the_api_when_missing(self):
         transport = FakeTransport()
         transport.add(
             "PATCH",
@@ -630,7 +648,8 @@ class Adapter(unittest.TestCase):
             {"message": "Reference does not exist"},
         )
         transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/git/refs", 201, {})
-        a = adapter(transport)
+        c, _ = client(transport)
+        a = ga.GitHubAdapter(c, repo=TAUCETI, tokens=c._tokens)
         a.update_ref(TAUCETI, "refs/tauceti-queue/2650/tip", TIP)
         self.assertEqual(json.loads(transport.calls[-1][3]), {"ref": "refs/tauceti-queue/2650/tip", "sha": TIP})
 

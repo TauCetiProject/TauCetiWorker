@@ -1359,6 +1359,9 @@ class Controller:
             return
         members = [m["number"] for m in self._members(head["id"])]
         try:
+            # The candidate exists only in the service's clone until it is retained on GitHub; CI checks it
+            # out by SHA, so the retained ref is pushed before the dispatch rather than by the outbox later.
+            self.github.update_ref(self.repository, self.batch_ref(head["id"], head["version"]), head["tip"])
             dispatch_id = self.github.dispatch_candidate(
                 self.repository,
                 head_sha=head["tip"],
