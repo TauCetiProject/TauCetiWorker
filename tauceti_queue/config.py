@@ -7,7 +7,7 @@ value came from, so `tauceti-queue check-config` can print the effective configu
 sources, and `validate()` lists the problems that would stop `serve`.
 
 The file is flat apart from one `[settings]` table holding the runtime controls of the plan
-(`docs/redesign/specs/ai-merge-queue.md`, "Runtime controls"). Those three values are only the
+(`docs/redesign/specs/ai-merge-queue.md`, "Runtime controls") and the approval poll interval. Those values are only the
 *initial* settings: once the store exists, the controller's persisted settings win and are changed
 through the admin endpoint (`tauceti-queue settings set`), never by editing this file.
 
@@ -29,6 +29,7 @@ through the admin endpoint (`tauceti-queue settings set`), never by editing this
     insertion_age_window = 16
     repair_concurrency = 1
     stall_interval_seconds = 900
+    approval_poll_interval_seconds = 900
 
 Environment overrides use the upper-cased key with the `TAUCETI_QUEUE_` prefix
 (`TAUCETI_QUEUE_LISTEN_PORT=8781`, `TAUCETI_QUEUE_PUBLICATION_ENABLED=true`,
@@ -75,6 +76,7 @@ class Settings:
     insertion_age_window: int = 16
     repair_concurrency: int = 1
     stall_interval_seconds: int = 900
+    approval_poll_interval_seconds: int = 900
 
     def as_dict(self) -> dict[str, int]:
         return dataclasses.asdict(self)

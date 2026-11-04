@@ -17,6 +17,13 @@
         Read or change the runtime controls through the service's admin endpoint. The token is the
         operator's GitHub token (`--token`, `GITHUB_TOKEN`, or `gh auth token`); the service checks
         repository-admin permission with the same predicate as the security audit.
+    tauceti-queue import-bors --feed URL|FILE [--candidates URL|FILE ...] [--dry-run] [--release-head]
+        The cutover import (`tauceti_queue.bors_import`): read Bors's observation feed and candidate
+        journals, post them to the service's `/admin/import-bors` endpoint, print what was (or, with
+        `--dry-run`, would be) imported, kept, refused and recorded as Bors's running head.
+    tauceti-queue reconcile-approvals [--url URL] [--token TOKEN]
+        One approval reconciliation pass now (`tauceti_queue.approval_poll`), through
+        `/admin/reconcile-approvals`; prints the pass summary.
 
 The controller, store, loop and GitHub adapters are the deliverables of other streams
 (`controller.py`, `store.py`, `loop.py`, `github_app.py`, `github_adapter.py`, `server.py`). They
@@ -78,6 +85,7 @@ class Service:
         self.app: Any = None
         self.controller: Any = None
         self.server: Any = None
+        self.poller: Any = None
         self.loop_module: ModuleType | None = None
         self.unavailable_reason: str | None = None
 
@@ -135,6 +143,11 @@ class Service:
             except Exception as error:  # noqa: BLE001 - an unknown key in the file is reported, not fatal
                 _log(f"configuration setting {key} not applied: {error}")
         self.loop_module = _optional("loop")
+        poll_module = _optional("approval_poll")
+        if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):
+            self.poller = poll_module.ApprovalPoller(
+                self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
+            )
 
     def status_document(self) -> dict[str, Any]:
         controller_status = None
@@ -153,7 +166,12 @@ class Service:
         module = _optional("server")
         if module is not None and self.controller is not None:
             self.server = module.create_server(
-                self.controller, self.config, status=self.status_document, adapter=self.github, app=self.app
+                self.controller,
+                self.config,
+                status=self.status_document,
+                adapter=self.github,
+                app=self.app,
+                poller=self.poller,
             )
         else:
             self.server = rt.fallback_server(self.config, self.status_document, self.effective_settings)
@@ -164,10 +182,17 @@ class Service:
         if self.loop_module is not None and self.controller is not None:
             loop = self.loop_module.ReconciliationLoop(self.controller)
             loop.start()
+            poll_loop = None
+            poll_module = _optional("approval_poll")
+            if self.poller is not None and poll_module is not None:
+                poll_loop = poll_module.ApprovalPollLoop(self.poller)
+                poll_loop.start()
             try:
                 while not self.stop.wait(self.config.reconcile_interval_seconds):
                     pass
             finally:
+                if poll_loop is not None:
+                    poll_loop.stop(timeout=DEFAULT_STOP_GRACE)
                 loop.stop(timeout=DEFAULT_STOP_GRACE)
             return
         while not self.stop.wait(self.config.reconcile_interval_seconds):
@@ -350,6 +375,52 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
         return 1
 
 
+# --- import-bors and reconcile-approvals -----------------------------------------------------------
+
+
+def cmd_import_bors(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
+    from . import bors_import
+
+    base = _status_url(args)
+    try:
+        observation = bors_import.load_document(args.feed)
+        candidates = [bors_import.reduce_candidates(bors_import.load_document(spec)) for spec in args.candidates or []]
+    except (OSError, ValueError) as exc:
+        _log(f"cannot read the feed: {exc}")
+        return 1
+    body = {
+        "observation": observation,
+        "candidates": candidates,
+        "dry_run": bool(args.dry_run),
+        "release_head": bool(args.release_head),
+    }
+    try:
+        report = fetch(
+            base + "/admin/import-bors", method="POST", body=body, token=_operator_token(args.token), timeout=3600
+        )
+    except RuntimeError as exc:
+        _log(str(exc))
+        return 1
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(bors_import.format_report(report))
+    return 0
+
+
+def cmd_reconcile_approvals(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
+    base = _status_url(args)
+    try:
+        summary = fetch(
+            base + "/admin/reconcile-approvals", method="POST", body={}, token=_operator_token(args.token), timeout=3600
+        )
+    except RuntimeError as exc:
+        _log(str(exc))
+        return 1
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
+
+
 # --- parser ----------------------------------------------------------------------------------------
 
 
@@ -383,6 +454,30 @@ def build_parser() -> argparse.ArgumentParser:
     setter.add_argument("key", choices=configuration.SETTING_FIELDS)
     setter.add_argument("value")
     setter.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+
+    importer = commands.add_parser("import-bors", help="import Bors's approved PRs and running head at the cutover")
+    importer.add_argument("--feed", required=True, help="Bors's observation feed (active-batches): a URL or a file")
+    importer.add_argument(
+        "--candidates",
+        action="append",
+        metavar="URL|FILE",
+        help="a candidate journal for admission ages, reviewers and priorities; may be repeated",
+    )
+    importer.add_argument("--dry-run", action="store_true", help="validate and report without recording anything")
+    importer.add_argument(
+        "--release-head",
+        action="store_true",
+        help="release the members of Bors's running head to approved inputs instead of waiting for its landing",
+    )
+    importer.add_argument("--url", help="service base URL (default: the configured listen address)")
+    importer.add_argument("--config", help="configuration file used to find the listen address")
+    importer.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    importer.add_argument("--json", action="store_true", help="print the full report instead of the summary")
+
+    reconcile = commands.add_parser("reconcile-approvals", help="run one approval reconciliation pass now")
+    reconcile.add_argument("--url", help="service base URL (default: the configured listen address)")
+    reconcile.add_argument("--config", help="configuration file used to find the listen address")
+    reconcile.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
     return parser
 
 
@@ -397,6 +492,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_check_config(args)
         if args.command == "settings":
             return cmd_settings(args)
+        if args.command == "import-bors":
+            return cmd_import_bors(args)
+        if args.command == "reconcile-approvals":
+            return cmd_reconcile_approvals(args)
     except ConfigError as exc:
         _log(str(exc))
         return 1

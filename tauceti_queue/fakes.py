@@ -30,6 +30,7 @@ from .ports import (
     CandidatePhase,
     CandidateRun,
     FastForwardResult,
+    OpenPullRequest,
     PullRequest,
     Status,
     Task,
@@ -225,6 +226,11 @@ class FakeGitHub:
         self.ci_policy: CIPolicy = always_pass
         self.fail_next: dict[str, int] = {}
         self.lose_fast_forward_response = False
+        # The review App's `merge eligibility` check runs by head SHA (REST-shaped records), and the
+        # remaining API quota `rate_limit` reports; tests script both.
+        self.checks: dict[str, list[dict[str, Any]]] = {}
+        self.remaining = 4800
+        self._check_counter = 0
         self._run_counter = 0
         self._comment_counter = 0
         # The controller loop thread and the test thread share this object; every method that reads
@@ -368,6 +374,49 @@ class FakeGitHub:
         with self.lock:
             return [c for c in self.comments if c["number"] == number]
 
+    def publish_check(
+        self,
+        number: int,
+        *,
+        eligible: bool = True,
+        review_safe: bool = True,
+        single: bool = False,
+        head: str | None = None,
+        app_id: int = 3947238,
+        merge_base: str | None = None,
+    ) -> dict[str, Any]:
+        """TauCetiReview publishes a `merge eligibility` decision on the PR's head (no webhook is delivered)."""
+        with self.lock:
+            import json
+
+            head = head or self.prs[number]["head_sha"]
+            if eligible and merge_base is None:
+                merge_base = self.pr_merge_base(self.repository, number, head)
+            self._check_counter += 1
+            check_id = 500 + self._check_counter
+            data = {
+                "schema": "tauceti-merge.eligibility/v1",
+                "repo": self.repository,
+                "pr": number,
+                "merge_base_sha": merge_base,
+                "eligible": eligible,
+                "review_safe": review_safe,
+                "single": single,
+            }
+            check = {
+                "id": check_id,
+                "name": "merge eligibility",
+                "app": {"id": app_id},
+                "head_sha": head,
+                "status": "completed",
+                "conclusion": "success" if eligible else ("neutral" if review_safe else "failure"),
+                "external_id": json.dumps(data, sort_keys=True, separators=(",", ":")),
+                "completed_at": "2026-11-04T07:00:00Z",
+                "html_url": f"https://github.invalid/{self.repository}/runs/{check_id}",
+            }
+            self.checks.setdefault(head, []).append(check)
+            return check
+
     # --- GitHubPort -------------------------------------------------------------------------------
 
     def fetch_pr(self, repo: str, number: int) -> PullRequest:
@@ -505,7 +554,41 @@ class FakeGitHub:
 
     def rate_limit(self) -> tuple[int, float]:
         with self.lock:
-            return 4800, self.clock() + 3600
+            return self.remaining, self.clock() + 3600
+
+    def eligibility_checks(self, repo: str, head: str) -> list[dict[str, Any]]:
+        with self.lock:
+            self._call("eligibility_checks", head)
+            return [dict(check) for check in self.checks.get(head, [])]
+
+    def pr_merge_base(self, repo: str, number: int, head_sha: str) -> str | None:
+        with self.lock:
+            self._call("pr_merge_base", number, head_sha)
+            pr = self.prs.get(number)
+            if pr is None or pr["head_sha"] != head_sha:
+                return None
+            result = subprocess.run(
+                ["git", "-C", str(self.repo.origin), "merge-base", f"refs/heads/{self.repo.branch}", head_sha],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.stdout.strip() or None if result.returncode == 0 else None
+
+    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[OpenPullRequest]:
+        with self.lock:
+            self._call("list_open_pull_requests", review_app_id)
+            listed = []
+            for number, pr in sorted(self.prs.items()):
+                if pr["state"] != "open":
+                    continue
+                checks = tuple(
+                    dict(c)
+                    for c in self.checks.get(pr["head_sha"], [])
+                    if c.get("name") == "merge eligibility" and (c.get("app") or {}).get("id") == review_app_id
+                )
+                listed.append(OpenPullRequest(number, pr["head_sha"], pr["base_ref"], pr["draft"], checks))
+            return listed
 
 
 # --- scripted agents --------------------------------------------------------------------------------

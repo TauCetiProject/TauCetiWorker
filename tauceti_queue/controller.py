@@ -61,6 +61,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "outbox_retry_seconds": 30,
     "outbox_retry_max_seconds": 900,
     "polling_interval_seconds": 60,
+    "approval_poll_interval_seconds": 900,
     "membership_label": "bors-staging",
 }
 
@@ -86,6 +87,12 @@ OUTCOME_INFRASTRUCTURE = "infrastructure"
 OUTCOME_SUPERSEDED = "superseded"
 
 _PR_MENTION_RE = re.compile(r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<number>\d+)")
+# The subject of a squash commit bors-ng lands: `<title> (#<number>)`, with no `Source-PR` trailer.
+_BORS_SUBJECT_RE = re.compile(r"\(#(?P<number>\d+)\)\s*$")
+
+EXTERNAL_HEAD_RUNNING = "running"
+EXTERNAL_HEAD_LANDED = "landed"
+EXTERNAL_HEAD_RELEASED = "released"
 
 
 class ControllerError(Exception):
@@ -241,11 +248,13 @@ class Controller:
         evidence: dict[str, Any] | None = None,
         *,
         approved_at: float | None = None,
+        pull: Any = None,
     ) -> dict[str, Any]:
         """Record an approved input for `head_sha`. Idempotent per (PR, head); a member PR is not re-approved.
 
-        `approved_at` lets an import (the cutover) keep an input's original admission age. Returns
-        `{"accepted": bool, "reason": ..., "input": row | None}`.
+        `approved_at` lets an import (the cutover) keep an input's original admission age; `pull` is
+        the live PR when the caller has just read it (the import validates before approving, and
+        must not pay for a second read). Returns `{"accepted": bool, "reason": ..., "input": row | None}`.
         """
         with self._lock:
             self._check_repo(repo)
@@ -265,19 +274,10 @@ class Controller:
                 self.store.update(
                     "inputs", {"id": existing["id"]}, state=INPUT_CANCELLED, reason="superseded-by-new-approval"
                 )
-            try:
-                pull = self.github.fetch_pr(repo, pr)
-            except Exception as error:  # noqa: BLE001
-                return {"accepted": False, "reason": f"fetch-failed: {error}", "input": None}
-            if pull.head_sha != head_sha:
-                self.store.journal(now, "approval-refused", number=pr, head=head_sha, live=pull.head_sha)
-                return {"accepted": False, "reason": "head-mismatch", "input": None}
-            if pull.state != "open":
-                return {"accepted": False, "reason": "closed", "input": None}
-            if pull.draft:
-                return {"accepted": False, "reason": "draft", "input": None}
-            if pull.base_ref != self.canonical_branch:
-                return {"accepted": False, "reason": "base-branch", "input": None}
+            if pull is None or pull.head_sha != head_sha:
+                pull, reason = self.validate_pull(repo, pr, head_sha)
+                if reason is not None:
+                    return {"accepted": False, "reason": reason, "input": None}
             if not self._fetch_head(pr, head_sha):
                 return {"accepted": False, "reason": "head-unavailable", "input": None}
             ref = self.input_ref(pr, head_sha)
@@ -302,6 +302,142 @@ class Controller:
                 self.store.journal(now, "approved", number=pr, head=head_sha, reviewer=reviewer, input_id=input_id)
             self._wake.set()
             return {"accepted": True, "reason": "approved", "input": self.store.row("inputs", {"id": input_id})}
+
+    def validate_pull(self, repo: str, pr: int, head_sha: str) -> tuple[Any, str | None]:
+        """Read the live PR and say why `head_sha` cannot be approved: `(pull, None)` when it can.
+
+        The reasons are the stable codes `approve` returns: `fetch-failed: ...`, `head-mismatch`
+        (the live head moved on), `closed`, `draft`, `base-branch`.
+        """
+        self._check_repo(repo)
+        try:
+            pull = self.github.fetch_pr(repo, pr)
+        except Exception as error:  # noqa: BLE001
+            return None, f"fetch-failed: {error}"
+        if pull.head_sha != head_sha:
+            with self._lock:
+                self.store.journal(self.clock(), "approval-refused", number=pr, head=head_sha, live=pull.head_sha)
+            return pull, "head-mismatch"
+        if pull.state != "open":
+            return pull, "closed"
+        if pull.draft:
+            return pull, "draft"
+        if pull.base_ref != self.canonical_branch:
+            return pull, "base-branch"
+        return pull, None
+
+    def input_for(self, repo: str, pr: int) -> dict[str, Any] | None:
+        """The PR's current input row (the newest that is not cancelled, else the newest), or None."""
+        with self._lock:
+            self._check_repo(repo)
+            return self._input_for(pr)
+
+    def note_approval(self, source: str) -> None:
+        """Count where an approval was discovered (`webhook` or `poll`); status reports both."""
+        with self._lock:
+            self._count(f"approvals_{source}")
+
+    def record_approval_poll(self, summary: dict[str, Any]) -> None:
+        """The approval poller's latest pass, kept in state for status; its approvals and revocations are counted."""
+        with self._lock:
+            self._set_state("approval_poll", summary)
+            if summary.get("revoked"):
+                self._count("approvals_revoked_by_poll", int(summary["revoked"]))
+
+    # --- Bors's state at cutover -------------------------------------------------------------------
+
+    def import_bors_state(
+        self,
+        observation: dict[str, Any],
+        candidates: Any = None,
+        *,
+        now: float | None = None,
+        dry_run: bool = False,
+        release_head: bool = False,
+    ) -> dict[str, Any]:
+        """Import Bors's approved PRs from its observation feed (`tauceti_queue.bors_import`)."""
+        from . import bors_import
+
+        # Not under the controller lock: the import reads one PR per member from GitHub (minutes for
+        # Bors's production queue) and the loop and the status endpoint must keep running meanwhile;
+        # every record change goes through the locking methods, and the external head is recorded
+        # before any input is approved, so no head can seal ahead of it.
+        return bors_import.run(
+            self,
+            observation,
+            candidates,
+            now=self.clock() if now is None else now,
+            dry_run=dry_run,
+            release_head=release_head,
+        )
+
+    def external_head(self) -> dict[str, Any] | None:
+        """Bors's running head at the cutover, while its landing is awaited (`state:external_head`)."""
+        with self._lock:
+            return self._state("external_head")
+
+    def record_external_head(self, head: dict[str, Any], now: float) -> None:
+        with self._lock:
+            record = dict(head, state=EXTERNAL_HEAD_RUNNING, recorded_at=now, landed_members=[])
+            with self.store.transaction():
+                self._set_state("external_head", record)
+                self.store.journal(
+                    now,
+                    "external-head",
+                    batch_id=record.get("batch_id"),
+                    head=record.get("head_sha"),
+                    members=[m["pr"] for m in record.get("members", [])],
+                )
+            self._wake.set()
+
+    def release_external_head(self, reason: str, now: float) -> dict[str, Any] | None:
+        """Stop waiting for Bors's head (it landed, was cancelled, or the operator released it)."""
+        with self._lock:
+            record = self._state("external_head")
+            if record is None or record["state"] != EXTERNAL_HEAD_RUNNING:
+                return record
+            record = dict(record, state=EXTERNAL_HEAD_RELEASED, released_at=now, release_reason=reason)
+            with self.store.transaction():
+                self._set_state("external_head", record)
+                self.store.journal(now, "external-head-released", batch_id=record.get("batch_id"), reason=reason)
+            self._wake.set()
+            return record
+
+    def _external_member_landed(self, numbers: set[int], how: str, now: float) -> None:
+        """Members of Bors's head seen landing: the head is landed once every member has."""
+        record = self._state("external_head")
+        if record is None or record["state"] != EXTERNAL_HEAD_RUNNING:
+            return
+        members = {int(m["pr"]) for m in record.get("members", [])}
+        landed = set(record.get("landed_members", [])) | (numbers & members)
+        if landed == set(record.get("landed_members", [])):
+            return
+        record = dict(record, landed_members=sorted(landed))
+        if landed >= members:
+            record.update(state=EXTERNAL_HEAD_LANDED, landed_at=now, landed_how=how)
+        with self.store.transaction():
+            self._set_state("external_head", record)
+            self.store.journal(
+                now,
+                "external-head-progress",
+                batch_id=record.get("batch_id"),
+                landed=sorted(landed),
+                pending=sorted(members - landed),
+                how=how,
+                state=record["state"],
+            )
+        self._wake.set()
+
+    def _external_head_blocks_sealing(self) -> str | None:
+        record = self._state("external_head")
+        if record is None or record["state"] != EXTERNAL_HEAD_RUNNING:
+            return None
+        members = record.get("members", [])
+        pending = len(members) - len(record.get("landed_members", []))
+        return (
+            f"Bors's head (batch {record.get('batch_id')}, {len(members)} members, {pending} not yet landed) "
+            "has not landed; the first head seals after that canonical advance or a release"
+        )
 
     def unapprove(self, repo: str, pr: int, actor: str = "") -> dict[str, Any]:
         """`bors r-`: a waiting input is withdrawn; a batch member is not (membership is fixed)."""
@@ -384,6 +520,8 @@ class Controller:
         number = int(payload.get("number") or pull.get("number") or 0)
         if not number:
             return
+        if action == "closed" and (pull.get("merged") or str(pull.get("title") or "").startswith(MERGED_TITLE_PREFIX)):
+            self._external_member_landed({number}, "closed-by-bors", now)
         current = self._input_for(number)
         if current is None:
             return
@@ -969,18 +1107,36 @@ class Controller:
             self._landed(head, how, now)
         if previous and chain.is_ancestor(self.clone, previous, canonical):
             landed_prs: set[int] = set()
+            bors_landed: set[int] = set()
             try:
                 for commit in chain.chain_commits(self.clone, previous, canonical):
                     source = commit.source_pr
                     if source and source.startswith(f"{self.repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
+                    elif not source:
+                        # Bors's squash commits carry no Source-PR trailer; the subject names the PR.
+                        lines = (commit.message or "").splitlines()
+                        match = _BORS_SUBJECT_RE.search(lines[0]) if lines else None
+                        if match:
+                            bors_landed.add(int(match["number"]))
             except chain.ChainError:
                 landed_prs = set()
-            for number in sorted(landed_prs):
+            for number in sorted(landed_prs | bors_landed):
                 row = self._input_for(number)
                 if row is not None and row["state"] in (INPUT_WAITING, INPUT_RESERVED):
                     self.store.update("inputs", {"id": row["id"]}, state=INPUT_CANCELLED, reason="landed-externally")
                     self.store.journal(now, "withdrawn", number=number, reason="landed-externally")
+            if bors_landed:
+                self._external_member_landed(bors_landed, "canonical-advance", now)
+        external = self._state("external_head")
+        if (
+            external is not None
+            and external["state"] == EXTERNAL_HEAD_RUNNING
+            and external.get("head_sha")
+            and chain.object_exists(self.clone, external["head_sha"])
+            and chain.is_ancestor(self.clone, external["head_sha"], canonical)
+        ):
+            self._external_member_landed({int(m["pr"]) for m in external.get("members", [])}, "head-ancestor", now)
 
     # --- insertion ---------------------------------------------------------------------------------
 
@@ -1190,6 +1346,10 @@ class Controller:
             return
         if self._state("inference_hold"):
             self._reasons.append("inference hold: not sealing")
+            return
+        blocked = self._external_head_blocks_sealing()
+        if blocked:
+            self._reasons.append(blocked)
             return
         if self._active_claims(batch["id"]):
             self._reasons.append(f"open batch {batch['id']} is claimed; sealing waits for the release")
@@ -1788,13 +1948,20 @@ class Controller:
                 "waiting": {
                     "count": len(waiting),
                     "urgent": sum(1 for row in waiting if row["urgent"]),
-                    "oldest_approved_at": waiting[-1]["approved_at"] if waiting else None,
+                    "oldest_approved_at": min(row["approved_at"] for row in waiting) if waiting else None,
                     "oldest_age_seconds": (now - min(row["approved_at"] for row in waiting)) if waiting else None,
                     "max_passes_waited": max((row["passes_waited"] for row in waiting), default=0),
                     "inputs": [self._input_status(row) for row in waiting],
                 },
                 "open_batch": None if open_batch is None else self._batch_status(open_batch, now),
                 "head": head_status,
+                "external_head": self._external_head_status(),
+                "approvals": {
+                    "webhook": counters.get("approvals_webhook", 0),
+                    "polled": counters.get("approvals_polled", 0),
+                    "revoked_by_poll": counters.get("approvals_revoked_by_poll", 0),
+                    "last_poll": self._state("approval_poll"),
+                },
                 "tasks": [self._task_status(task) for task in tasks],
                 "outbox": {"pending": len(pending), "entries": [self._outbox_status(e) for e in pending]},
                 "reasons": list(self._reasons),
@@ -1804,6 +1971,27 @@ class Controller:
                 "insertion_passes": self._state("insertion_passes", 0),
                 "max_passes_waited": self._state("max_passes_waited", 0),
             }
+
+    def _external_head_status(self) -> dict[str, Any] | None:
+        record = self._state("external_head")
+        if record is None:
+            return None
+        members = [int(m["pr"]) for m in record.get("members", [])]
+        landed = list(record.get("landed_members", []))
+        return {
+            "batch_id": record.get("batch_id"),
+            "head_sha": record.get("head_sha"),
+            "base_sha": record.get("base_sha"),
+            "state": record["state"],
+            "members": len(members),
+            "landed_members": len(landed),
+            "pending_members": sorted(set(members) - set(landed)),
+            "recorded_at": record.get("recorded_at"),
+            "feed_observed_at": record.get("feed_observed_at"),
+            "landed_at": record.get("landed_at"),
+            "released_at": record.get("released_at"),
+            "release_reason": record.get("release_reason"),
+        }
 
     def _input_status(self, row: dict[str, Any]) -> dict[str, Any]:
         return {

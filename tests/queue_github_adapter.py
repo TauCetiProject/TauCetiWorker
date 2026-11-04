@@ -697,6 +697,104 @@ class Adapter(unittest.TestCase):
         self.assertIsNone(a.user_for_token("bad"))
         self.assertEqual(a.client._tokens.invalidated, 0, "a worker's bad token does not invalidate the App's")
 
+    def test_list_open_pull_requests_over_graphql(self):
+        transport = FakeTransport()
+        rest_headers = {"x-ratelimit-remaining": "4321", "x-ratelimit-limit": "5000", "x-ratelimit-reset": "1800003600"}
+        transport.add("GET", f"https://api.github.com/repos/{TAUCETI}/pulls/42", 200, pr_json(), rest_headers)
+        external = json.dumps(
+            {
+                "schema": "tauceti-merge.eligibility/v1",
+                "repo": TAUCETI,
+                "pr": 7,
+                "merge_base_sha": BASE,
+                "eligible": True,
+                "review_safe": True,
+                "single": False,
+            }
+        )
+        run = {
+            "databaseId": 9001,
+            "name": "merge eligibility",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "externalId": external,
+            "completedAt": "2026-11-04T07:00:00Z",
+            "permalink": "https://github.com/TauCetiProject/TauCeti/runs/9001",
+        }
+
+        def page(nodes, cursor):
+            return {
+                "data": {
+                    "rateLimit": {"cost": 8, "remaining": 4990, "resetAt": "2026-11-04T08:00:00Z"},
+                    "repository": {
+                        "pullRequests": {
+                            "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
+                            "nodes": nodes,
+                        }
+                    },
+                }
+            }
+
+        with_check = {
+            "number": 7,
+            "isDraft": False,
+            "baseRefName": "main",
+            "headRefOid": HEAD,
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "oid": HEAD,
+                            "checkSuites": {
+                                "nodes": [
+                                    {
+                                        "app": {"databaseId": 3947238},
+                                        "checkRuns": {"nodes": [run, dict(run, name="other", databaseId=9002)]},
+                                    }
+                                ]
+                            },
+                        }
+                    }
+                ]
+            },
+        }
+        without = {
+            "number": 8,
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefOid": TIP,
+            "commits": {"nodes": [{"commit": {"oid": TIP, "checkSuites": {"nodes": []}}}]},
+        }
+        graphql_headers = {"x-ratelimit-remaining": "4990", "x-ratelimit-limit": "5000"}
+        transport.add("POST", "https://api.github.com/graphql", 200, page([with_check], "c1"), graphql_headers)
+        transport.add("POST", "https://api.github.com/graphql", 200, page([without], None), graphql_headers)
+        a = adapter(transport)
+        a.fetch_pr(TAUCETI, 42)
+        listed = a.list_open_pull_requests(TAUCETI, review_app_id=3947238)
+        self.assertEqual(
+            [(p.number, p.head_sha, p.draft, p.base_ref) for p in listed],
+            [(7, HEAD, False, "main"), (8, TIP, True, "main")],
+        )
+        (check,) = listed[0].eligibility_checks
+        self.assertEqual(
+            (check["id"], check["name"], check["app"]["id"], check["head_sha"], check["status"], check["conclusion"]),
+            (9001, "merge eligibility", 3947238, HEAD, "completed", "success"),
+        )
+        self.assertEqual((check["external_id"], check["html_url"]), (external, run["permalink"]))
+        self.assertEqual(listed[1].eligibility_checks, ())
+        bodies = [json.loads(body) for method, url, _h, body in transport.calls if url.endswith("/graphql")]
+        self.assertEqual([b["variables"]["after"] for b in bodies], [None, "c1"])
+        self.assertEqual(
+            bodies[0]["variables"], {"owner": "TauCetiProject", "name": "TauCeti", "after": None, "appId": 3947238}
+        )
+        self.assertEqual(a.rate_limit()[0], 4321, "the GraphQL quota headers do not overwrite the REST counter")
+        transport.add("POST", "https://api.github.com/graphql", 200, {"errors": [{"message": "bad query"}]})
+        transport.responses["POST https://api.github.com/graphql"] = transport.responses[
+            "POST https://api.github.com/graphql"
+        ][-1:]
+        with self.assertRaises(ga.GitHubError):
+            a.list_open_pull_requests(TAUCETI, review_app_id=3947238)
+
     def test_rate_limit_falls_back_to_the_endpoint(self):
         transport = FakeTransport()
         transport.add(

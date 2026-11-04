@@ -31,6 +31,22 @@ class PullRequest:
 
 
 @dataclass(frozen=True)
+class OpenPullRequest:
+    """One open PR from the repository listing, with the review App's `merge eligibility` check runs on its head.
+
+    `eligibility_checks` are check-run records in the REST shape `eligibility.latest` reads (`id`,
+    `name`, `app.id`, `head_sha`, `status`, `conclusion`, `external_id`, `completed_at`, `html_url`),
+    already restricted to the review App's checks of that name; empty when the head carries none.
+    """
+
+    number: int
+    head_sha: str
+    base_ref: str
+    draft: bool = False
+    eligibility_checks: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
 class CandidatePhase:
     """One build phase of a candidate run, as the workflow publishes it (preparation, cache restore, build, audits, lint)."""
 
@@ -148,6 +164,18 @@ class GitHubPort(Protocol):
 
     def rate_limit(self) -> tuple[int, float]:
         """(remaining calls, unix time of the reset)."""
+        ...
+
+    def eligibility_checks(self, repo: str, head: str) -> list[dict[str, Any]]:
+        """Every `merge eligibility` check run on `head`, any App, as Bors lists them (`filter=all`)."""
+        ...
+
+    def pr_merge_base(self, repo: str, number: int, head_sha: str) -> str | None:
+        """The merge base of the PR's head and its base branch, or None when the head is no longer live."""
+        ...
+
+    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[OpenPullRequest]:
+        """Every open PR with the review App's `merge eligibility` check runs on its head (the approval poll's listing)."""
         ...
 
 
