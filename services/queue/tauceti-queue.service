@@ -1,0 +1,38 @@
+# Tau Ceti AI merge queue service (docs/queue/operations.md).
+#
+# A systemd user unit on the service host. `services/queue/install.sh` installs it into
+# ~/.config/systemd/user/ from the checkout at ~/TauCetiQueue and verifies the running revision
+# through /status afterwards. The process reads ~/.config/tauceti-queue/config.toml and the
+# optional environment file below; secrets live in ~/.config/tauceti-queue/ (mode 0600), never in
+# this unit. Logs go to the journal: `journalctl --user -u tauceti-queue -f`.
+
+[Unit]
+Description=Tau Ceti AI merge queue service
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/queue/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/TauCetiQueue
+EnvironmentFile=-%h/.config/tauceti-queue/environment
+Environment=PATH=%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=UV_NO_SYNC=1
+ExecStart=/usr/bin/env uv run tauceti-queue serve
+# SIGTERM lets the loop finish its current reconciliation step and close the store; the
+# install script's restart and a host reboot both go through this path.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tauceti-queue
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
