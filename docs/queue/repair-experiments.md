@@ -72,8 +72,8 @@ A fleet host running worker agents: 96 CPUs, 125 GB RAM, a 3.5 TB array with 25 
 the runs (other processes create and delete tens of GB), 1-minute load average between 95 and 165
 throughout. Experiments ran at most two at a time, grouped by base commit so that candidates sharing
 a base reuse one worktree. Every timing below was taken under that contention and is an upper bound
-on what a dedicated host would show; the CI runner built candidate 1931's 1,189 modules in about 16
-minutes.
+on what a dedicated host would show; the hosted CI runner built candidate 1931's 1,189 modules in
+8 minutes (22:06:18 to the first error at 22:14:18, after its own cache restore).
 
 ## Results
 
