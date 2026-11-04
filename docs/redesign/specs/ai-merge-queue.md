@@ -15,7 +15,6 @@ The plan is delivered in three steps. Each is useful on its own and none depends
 - *Readmitted suspects keep their queue position* in Bors: a suspect handed to repair and re-approved at a new head inherits its original admission age once, instead of re-entering behind the backlog. This is the largest remaining latency win in the current system and a small change to `queue_age.ex` and the handoff record.
 - *Journal report* as a committed script producing the triage measurements (slot occupancy by category, failed rounds per landed large batch, singleton and bisection counts, suspects per partition, handoff-to-readmission time), so every change from here on has a before and after.
 - *The queue service's GitHub App*, created and installed now; the shadow task and the status endpoint run on its API budget.
-- *Dedicated staging runners*, independent of the queue: the same candidate has been observed to build in 13 minutes on a hosted runner and in 2 hours 50 minutes on a fleet host shared with worker agents.
 
 **Increment 1: one open batch and one head.** Approved PRs are inserted into a single open batch. When the head lands, the open batch seals and becomes the head, and a new open batch starts. The head is rebased, built, repaired in place and fast-forwarded. There are no successor batches, no background CI, no combination, no cap pressure, no agent-assisted insertion, and no clean-replay comparison for comments. This is the increment the rest of this document specifies unless a section says otherwise. The trade-off is that a repair round is dead time for the whole queue; there is no evidence yet that pipelining shortens the head cycle, and the head cycle is what the pilot measures first.
 
@@ -104,7 +103,7 @@ Keep accepted membership and useful source during admin merges or queue restarts
 
 ## Staging capacity and build progress
 
-The head build is the serial resource, so its runner must be dedicated and isolated: a staging build placed on a host that also runs worker agents or other builds takes whatever is left. Staging capacity is reserved for staging; the controller records which runner and host executed each candidate build and how long each build phase took.
+The head build is the serial resource. Staging builds keep running on the fleet hosts as they do today; the controller records which runner and host executed each candidate build and how long each build phase took, so placement decisions can be made from measurements.
 
 Status distinguishes a slow build from a stalled one: the build publishes phase progress (preparation, cache restore, build with module counts, audits, lint) with timestamps, and the controller raises a visible stall condition when a phase makes no progress for `stall_interval_seconds`. Operators must be able to answer "which machine is this running on and is it moving" from queue status alone, without access to the runner host or to in-progress workflow logs.
 
@@ -166,9 +165,9 @@ Expose queue/head status, effective settings, claim state, current source, pendi
 
 ## Policy status
 
-The policy choices for increment 1 are settled: one open batch and one sealed head, sealing immediately when the head lands, no stacking on unlanded predecessors, no membership eviction with shrink-to-green as the agent's only exit, age-windowed random insertion with no agent-assisted insertion, provenance-flagged comments, worker-only agent execution with warm artifacts, hold-and-retry on inference unavailability, verdicts bound to a candidate's own completed run only, membership that other automation cannot withdraw, an operator urgent lane that never preempts the head, dedicated staging capacity with recorded placement and phase progress, the controller's own GitHub App identity with a reported running revision, and the separate Python queue service. Problems discovered after staging admission are addressed through follow-up PRs to Tau Ceti; there is no exceptional-withdrawal process to implement.
+The policy choices for increment 1 are settled: one open batch and one sealed head, sealing immediately when the head lands, no stacking on unlanded predecessors, no membership eviction with shrink-to-green as the agent's only exit, age-windowed random insertion with no agent-assisted insertion, provenance-flagged comments, worker-only agent execution with warm artifacts, hold-and-retry on inference unavailability, verdicts bound to a candidate's own completed run only, membership that other automation cannot withdraw, an operator urgent lane that never preempts the head, recorded build placement and phase progress, the controller's own GitHub App identity with a reported running revision, and the separate Python queue service. Problems discovered after staging admission are addressed through follow-up PRs to Tau Ceti; there is no exceptional-withdrawal process to implement.
 
-The increment 0 items precede the controller: historical repair experiments, the attributed chain tool, readmission age in Bors, the journal report, the GitHub App, and dedicated staging runners.
+The increment 0 items precede the controller: historical repair experiments, the attributed chain tool, readmission age in Bors, the journal report, and the GitHub App.
 
 The service is a drop-in replacement for Bors's batch policy, not a new interface: it accepts the same approval commands (`bors merge`, `bors r+`, `p=`, `bors r-`, `bors cancel`) from the same actors, publishes the same `tauceti-bors.observation/v1` and `tauceti-bors.candidates/v1` feeds at the same paths, and keeps the same labels, statuses and PR comments, so TauCetiReview, the scope-approval check, the workers' activity accounting and the fleet continue unchanged across the cutover and back.
 
@@ -223,7 +222,7 @@ Return control to the operator, with the exact request and nothing else pending 
 
 1. Create and install the GitHub App for the service on `TauCetiProject/TauCeti` and the scratch repository: repository permissions contents write, pull requests write, issues write, checks read, statuses write, actions write, workflows write, metadata read; subscribed events pull request, pull request review, issue comment, status, check run, check suite, push, workflow run. Place the App ID and private key where `docs/queue/operations.md` says.
 2. Create the scratch repository `TauCetiProject/TauCetiQueueScratch` with the TauCeti workflow files and a small Lean library, for stream I.
-3. Provide the host for the service (a fleet host with Postgres and a public HTTPS endpoint for webhooks, through the existing Cloudflare account), and reserve dedicated staging runner capacity.
+3. Provide the host for the service (a fleet host with Postgres and a public HTTPS endpoint for webhooks, through the existing Cloudflare account).
 4. Approve the production cutover step below when it is reached; it is a single setting change.
 
 Progress is reported in the PRs and in a running `docs/queue/status.md`: what is merged, what is blocked on which operator item, and the latest experiment numbers. Admin-merge the service's PRs when they are green; this work has the operator's highest priority.
