@@ -793,12 +793,46 @@ def _foreground_shell_env(deadline: float) -> dict[str, str]:
     }
 
 
-def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
+def gilgai_shim_env(env: dict[str, str], logdir: Path | None = None) -> dict[str, str]:
+    """Opt-in build-server shim for host rounds (TAUCETI_GILGAI=1): put the gilgai `lake` shim first
+    on PATH and give it its server, token, repository and wait budget. The wait budget is the shell
+    cap minus a margin so a detaching build never trips the agent's own command timeout. Any missing
+    piece leaves the environment untouched, so builds silently stay local."""
+    if env.get("TAUCETI_GILGAI") != "1":
+        return {}
+    shim_dir = env.get("TAUCETI_GILGAI_SHIM_DIR", "")
+    url = env.get("TAUCETI_GILGAI_URL", "")
+    token_file = env.get("TAUCETI_GILGAI_TOKEN_FILE", "")
+    token = ""
+    with contextlib.suppress(OSError):
+        token = Path(token_file).read_text().strip() if token_file else ""
+    if not (shim_dir and os.access(Path(shim_dir) / "lake", os.X_OK) and url and token):
+        log(
+            "warning: TAUCETI_GILGAI=1 needs TAUCETI_GILGAI_SHIM_DIR with a lake shim, TAUCETI_GILGAI_URL and a readable TAUCETI_GILGAI_TOKEN_FILE; builds stay local"
+        )
+        return {}
+    cap_s = int(env.get("BASH_MAX_TIMEOUT_MS", "600000")) // 1000
+    out = {
+        "PATH": f"{shim_dir}:{env.get('PATH', '')}",
+        "GILGAI_URL": url,
+        "GILGAI_TOKEN": token,
+        "GILGAI_REPO": env.get("TAUCETI_GILGAI_REPO", TAUCETI),
+        "GILGAI_BASE_REF": env.get("TAUCETI_GILGAI_BASE_REF", "origin/main"),
+        "GILGAI_FALLBACK": env.get("TAUCETI_GILGAI_FALLBACK", "local"),
+        "GILGAI_WAIT_SEC": str(max(30, min(560, cap_s - 20))),
+    }
+    if logdir is not None:
+        out["GILGAI_LOG"] = str(logdir / "gilgai-shim.log")
+    return out
+
+
+def host_agent_argv(prompt: str, profile: AuthoringProfile | str, logdir: Path | None = None) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
+    env.update(gilgai_shim_env(env, logdir))
     profile = _authoring_profile(profile)
     if profile.provider == "codex":
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
@@ -869,7 +903,7 @@ def run_agent_host(
             " If TAUCETI_PR_CACHE_MISS=1, your PR history is uncached: merge/rebase onto current main "
             "and fetch again before building; if that cannot be done, report the cache miss and stop."
         )
-    argv, env = host_agent_argv(prompt, profile)
+    argv, env = host_agent_argv(prompt, profile, logdir)
     if resume:
         if profile.provider == "codex":
             # exec resume does not accept the fresh-run sandbox/repo-check flags.
@@ -2308,6 +2342,7 @@ def run_in_bubble(
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
+    # The gilgai build-server shim is host-only for now: it links against the host toolchain.
     tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
     if api_bridge and _uses_claude_credentials(cred_model):
         tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"

@@ -11,6 +11,8 @@ Verify once, at the end, scoped to what you actually changed:
   background job to notify or resume you: nothing will.
 - Claude shell commands have a ten-minute limit, or the shorter remaining round deadline.
   If an incremental `lake build` times out, rerun it in the same checkout; completed modules are kept.
+  `lake build` may run on a shared build server: if it reports `gilgai: build still running`, re-run
+  the identical command to reattach; lines prefixed `gilgai:` are infrastructure notes, not build output.
 - **No repeats.** Run `lake exe cache get` once per session, and again only after `lake-manifest.json`
   or `lean-toolchain` changes. Do not rerun a check that already passed unless its inputs (source,
   pins, or the integrated main) changed since. While iterating on a failure, rerun only the failing
