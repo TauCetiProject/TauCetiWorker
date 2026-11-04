@@ -9,7 +9,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=PATH=%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/env cloudflared tunnel --no-autoupdate --config %h/.cloudflared/config.yml run
 Restart=always
 RestartSec=5

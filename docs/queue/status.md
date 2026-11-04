@@ -42,10 +42,10 @@ keeps `MERGE_BACKEND=bors`, suspends the `tau-ceti-bors` App installation, point
 ## Next steps
 
 The cutover was brought to the operator on 2026-11-04 at 16:40 UTC with the shadow service on tauchonki
-holding 1,060 polled approvals, an open batch of 948 members and no failures. Before cutover (no
-production effect): the operator runs `cloudflared tunnel login` on tauchonki, then the tunnel,
-a temporary `queue.taucetiproject.org` hostname and the App webhook are activated and deliveries
-confirmed. Cutover: suspend the `tau-ceti-bors` installation after its running head lands, snapshot
+holding 1,060 polled approvals, an open batch of 948 members and no failures. The pre-cutover step is
+done (2026-11-04, 22:37 to 22:45 UTC): the operator ran `cloudflared tunnel login` on tauchonki, the
+tunnel `tauceti-queue` serves `queue.taucetiproject.org` to the service, and the App webhook is active
+with all eight events; the first 57 deliveries all answered 202. Cutover: suspend the `tau-ceti-bors` installation after its running head lands, snapshot
 both Bors feeds and run `tauceti-queue import-bors` with the saved journals, enable publication and
 restart, point `bors.taucetiproject.org` at the tunnel (`MERGE_BACKEND` stays `bors`), then watch the
 first three heads. Rollback is the mirror image. Known gaps at cutover: the first head is small by
@@ -58,12 +58,12 @@ must move to a stable host before it counts as production (operator condition).
 1. Done: the `tauceti-queue` App is created and installed on `TauCetiProject/TauCeti`.
 2. Create `TauCetiProject/TauCetiQueueScratch` (stream I) and add it to the `tauceti-queue` App installation; optionally grant the App `checks: write` so the rehearsal can approve through `merge eligibility` checks (`docs/queue/rehearsal.md`). The rehearsal pushes the content itself.
 3. Staging capacity: no action for now (operator decision, 2026-11-04). Revisit from the pilot's measurements.
-4. Service host: tauchonki, temporary, installed 2026-11-04 with publication disabled, revision `045c7e589c676ec3a0bee2900111d49d2ca4aabd` ([operations.md](operations.md), "Current deployment"). No tunnel, DNS record or webhook yet; Bors untouched. The dedicated, stable host is still to be named.
+4. Service host: tauchonki, temporary, installed 2026-11-04 with publication disabled, now at revision `cc5270bcad283ef4644dadb181d4ab1d2762fef6` ([operations.md](operations.md), "Current deployment"). Tunnel, DNS record and webhook done on 2026-11-04; Bors untouched. The dedicated, stable host is still to be named.
+5. Cutover approval (operator): "go", "go after X", or "not yet".
 
 ## Next steps
 
-- Move the service from tauchonki to a dedicated, stable host before it becomes the production merge backend (operator condition, 2026-11-04); the procedure is in [operations.md](operations.md), "Moving to the dedicated host". The tunnel, DNS record, webhook activation and publication flag are done on that host, not on tauchonki.
-- Until the webhook delivers, the shadow service sees canonical advances but no approvals (approval intake is webhook-only at this revision), so the two days of shadow agreement with Bors start after the move and the webhook activation.
+- Move the service from tauchonki to a dedicated, stable host as soon as it is the production merge backend (operator condition, 2026-11-04); the procedure is in [operations.md](operations.md), "Moving to the dedicated host".
 
 ## Latest numbers
 

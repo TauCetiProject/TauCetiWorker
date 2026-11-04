@@ -13,9 +13,9 @@ account's rate limit.
 
 The App exists: slug `tauceti-queue`, App ID `5607007`, created 2026-11-04, with the permissions and
 events below confirmed from `gh api /apps/tauceti-queue`. It is installed on `TauCetiProject/TauCeti` only (installation `178451644`, verified on 2026-11-04 by
-authenticating with the stored key and listing the installation's repositories). Its webhook address is
-`https://queue.taucetiproject.org/webhook/github`, registered inactive until the service host and that
-Cloudflare hostname exist; the deployment stream uses the same name.
+authenticating with the stored key and listing the installation's repositories). Its webhook is
+`https://queue.taucetiproject.org/webhook/github`, active since 2026-11-04 22:45 UTC (Public endpoint,
+step 7).
 
 Registration is prefilled by:
 
@@ -28,8 +28,9 @@ accept one through the URL), and create the App. The URL requests exactly these 
 permissions: contents write, pull requests write, issues write, checks read, statuses write,
 actions write, workflows write, metadata read; and subscribes to these events: pull request,
 pull request review, issue comment, status, check run, check suite, push, workflow run. Pass
-`--webhook-url https://<host>/webhook/github` once the service host exists; until then the webhook
-is registered inactive and switched on from the App settings later.
+`--webhook-url https://<host>/webhook/github` once the service host exists. Without it GitHub creates
+the App with no webhook and discards the event subscription, so both are added on the App's settings
+page later (Public endpoint, step 7); the API can edit an App webhook but not create one.
 
 After creation, generate a private key on the App's settings page and record it together with the
 App ID and slug:
@@ -170,12 +171,16 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 Installed 2026-11-04 on `tauchonki` with publication disabled, revision
 `045c7e589c676ec3a0bee2900111d49d2ca4aabd` (`main` at the time), by `services/queue/install.sh` run as
 the fleet account `kim`. The App credentials were copied from `chungus2` (`scp -p`, checksums
-compared). Nothing of the cutover is done: no tunnel, no DNS record, the App webhook stays inactive,
-Bors is untouched.
+compared). Updated live to `cc5270bcad283ef4644dadb181d4ab1d2762fef6` the same day. The Public endpoint
+steps were completed on tauchonki on 2026-11-04 at 22:37 to 22:45 UTC (operator decision, 2026-11-04:
+no shadow period, cutover from tauchonki): tunnel `tauceti-queue`
+(`be28d750-6092-4526-8aed-76a0d0bf7c66`), the proxied CNAME `queue.taucetiproject.org`, the
+`cloudflared-tauceti-queue` user unit, and the App webhook with all eight events. Deliveries answer
+202 and `status.webhooks.received` counts them. Bors is untouched until the cutover.
 
 **tauchonki is a temporary host.** The operator's condition is that the service moves to a dedicated,
-stable host before it becomes the production merge backend: the tunnel, the webhook activation and the
-publication flag are all done on that host, never on tauchonki. The move procedure is below.
+stable host as soon as it is the production merge backend. The move procedure is below; the tunnel
+moves with it (`~/.cloudflared/` is copied, or the tunnel is recreated by the Public endpoint steps).
 
 Paths on tauchonki, where they differ from the layout table:
 
@@ -188,18 +193,18 @@ Paths on tauchonki, where they differ from the layout table:
 | `~/TauCetiQueue-data/logs` | the service's own files (`log_dir`) |
 | `~/.local/state/tauceti-queue/backups/` | daily backups (the backup script's default directory; it finds the database through `check-config`) |
 | `127.0.0.1:8780` | the listen address; the port was free, and no other unit on the host uses it |
+| `~/.cloudflared/cert.pem`, `config.yml`, `<tunnel id>.json` | the Cloudflare origin certificate, tunnel configuration and tunnel credentials |
+| `~/.local/bin/cloudflared` | symlink to `~/.nix-profile/bin/cloudflared` for the tunnel unit's PATH (the unit now lists `~/.nix-profile/bin` itself) |
 
 The host runs the fleet's `tauceti-fleet*`, `tauceti-worker-*` and `tauceti-cleanup` user units; the
 queue units are independent of them and the installer does not touch them.
 
-What this shadow deployment observes: every pass fetches the canonical branch into the clone and
-records canonical advances, drains the (empty) outbox and runs insertion over the approved inputs it
-holds. At this revision approval intake runs only from webhook deliveries
-(`tauceti_queue/webhook.py` calls `eligibility.reconcile` for the review App's `merge eligibility`
-check runs); the polling pass re-reads CI runs but does not list check runs. Until the webhook is
-active the service therefore holds no approved inputs and opens no batch, and `approved_waiting`
-stays at zero. Shadow agreement with Bors (the cutover precondition) starts counting only once the
-webhook delivers to the service.
+What this deployment does while publication is disabled: every pass fetches the canonical branch into
+the clone and records canonical advances, drains the (empty) outbox and runs insertion over the
+approved inputs it holds. Approval intake comes from webhook deliveries (`tauceti_queue/webhook.py`
+calls `eligibility.reconcile` for the review App's `merge eligibility` check runs) and from the
+approval poll (Approval polling below), which found the existing approvals before the webhook was
+active.
 
 ### Moving to the dedicated host
 
@@ -247,9 +252,14 @@ Workers), so the steps are operator instructions in the `tauceti` Cloudflare acc
    systemctl --user daemon-reload && systemctl --user enable --now cloudflared-tauceti-queue`.
 6. Check `curl -s https://queue.taucetiproject.org/healthz` reports the same `service.revision` as the
    local `/status`.
-7. Activate the App webhook: on the App's settings page set the webhook URL to
-   `https://queue.taucetiproject.org/webhook/github` (already recorded there, inactive) and tick Active;
-   the secret is the one stored in `github-webhook-secret`.
+7. Create and activate the App webhook, as an organization owner on the App's settings page: tick
+   Active, set the webhook URL to `https://queue.taucetiproject.org/webhook/github`, paste the secret
+   from `github-webhook-secret` (content type JSON, SSL verification on) and save; then on "Permissions
+   & events" subscribe to the eight events the registration script lists (pull request, pull request
+   review, issue comment, status, check run, check suite, push, workflow run) and save. GitHub sends a
+   `ping` on the first save. Confirm with the App's JWT: `GET /app/hook/config` shows the URL, `GET /app`
+   lists the events, `GET /app/hook/deliveries` shows 2xx statuses, and `status.webhooks.received` on
+   the service grows.
 
 The tunnel carries only `/status`, the feeds, the webhook receiver and the admin endpoint; the admin
 endpoint authenticates the operator's GitHub token and the webhook receiver verifies the HMAC, so no
