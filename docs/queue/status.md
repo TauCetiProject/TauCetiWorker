@@ -23,14 +23,21 @@ experiment sample and without a shadow period; the scratch-repository rehearsal 
 
 | Stream | Branch | State |
 | --- | --- | --- |
-| E. Controller and state machine (`tauceti_queue/controller.py`, `store.py`, `loop.py`, `ports.py`, `fakes.py`, local end-to-end fixture) | `queue/controller` | in progress |
-| F. GitHub adapters and Bors-compatible surface (`github_app.py`, `github_adapter.py`, `commands.py`, `webhook.py`, `feeds.py`, `server.py`) | `queue/github-adapters` | in progress |
-| G. Repair task runner (`tauceti_queue/repair.py`, `repair_task.py`) | `queue/repair-task` | in progress; stacks on B |
-| H. Deployment (`config.py`, `__main__.py`, `services/queue/`, runbook) | `queue/deployment` | in progress |
+| E. Controller and state machine (`tauceti_queue/controller.py`, `store.py`, `loop.py`, `ports.py`, `fakes.py`, local end-to-end fixture) | `queue/controller` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/485 and https://github.com/TauCetiProject/TauCetiWorker/pull/486 |
+| F. GitHub adapters and Bors-compatible surface (`github_app.py`, `github_adapter.py`, `commands.py`, `eligibility.py`, `webhook.py`, `feeds.py`, `server.py`) | `queue/github-adapters` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/484 |
+| G. Repair task runner (`tauceti_queue/repair.py`, `repair_task.py`) | `queue/repair-task` | https://github.com/TauCetiProject/TauCetiWorker/pull/483 on CI |
+| H. Deployment (`config.py`, `__main__.py`, `runtime.py`, `services/queue/`, runbook) | `queue/deployment` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/482 |
 | I. Cutover rehearsal | | waits for E to H and the scratch repository |
 
 Storage is one SQLite file on the service host rather than PostgreSQL: a single-process service does
 not need a server database, and the operator prefers the simpler host.
+
+Cutover shape, from stream F's reading of the workflow callers and TauCetiReview: approvals arrive as
+TauCetiReview's `merge eligibility` check run (not `bors r+` comments), which the service consumes as
+Bors does; every workflow reader only distinguishes `MERGE_BACKEND == "bors"` from anything else, and
+the workers and TauCetiReview read the feeds at `https://bors.taucetiproject.org/...`. Cutover therefore
+keeps `MERGE_BACKEND=bors`, suspends the `tau-ceti-bors` App installation, points
+`bors.taucetiproject.org` at the service, and enables publication (`docs/queue/github.md`).
 
 ## Operator items outstanding
 
