@@ -493,7 +493,22 @@ itself is one setting change with two halves, made together, nothing drained:
    watch `status.approvals.polled`: approvals the poll finds that no delivery brought mean the webhook
    path is not reaching the service.
 
-Rollback is the same two halves in reverse: restore the `tau-ceti-bors` installation and hostname and
+### As executed on 2026-11-04
+
+The sequence and times are in [status.md](status.md), "Cutover". Two facts the steps above did not
+know: `bors.taucetiproject.org` was not a DNS record but a Workers Custom Domain of the `tauceti-bors`
+Worker (Bors runs as a Cloudflare container behind it), and a custom domain takes precedence over any
+DNS record, so the switch was `DELETE /accounts/ec2169bdf033f56b009956d4b64ba8ef/workers/domains/<id>`
+(the wrangler OAuth token on chungus2 has that scope; its definition is saved as
+`~/tmp/bors-journal/bors-worker-custom-domain-2026-11-04.json` there) followed by the CNAME `bors` to
+the tunnel, which `cloudflared tunnel route dns` had already added. And the queue App had to be added to
+`TauCetiProject/TauCeti`'s `merge-queue-main` ruleset bypass actors and to the classic protection's
+pull-request bypass allowances (both via the REST API as an organization owner), or the fast-forward of
+`main` is refused.
+
+Rollback is the same two halves in reverse: restore the `tau-ceti-bors` installation and hostname (the
+hostname by `POST /accounts/<account>/workers/domains` with the saved definition: `hostname`,
+`service: tauceti-bors`, `environment: production`, `zone_id`) and
 set `publication_enabled = false` (restart). The service returns to shadow mode with its records intact; Bors
 resumes approval intake. Approved inputs the service holds at that moment are re-approved under Bors by
 their authors or the review App; the service's observation feed lists them.
