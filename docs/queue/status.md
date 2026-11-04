@@ -10,7 +10,7 @@ orchestrating session as streams land.
 | Stream | Branch | State |
 | --- | --- | --- |
 | A. Attributed chain tool (`tauceti_queue/chain.py`) | `queue/chain-tool` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/474 |
-| B. Historical repair experiments (`tauceti_queue/repair_experiment.py`, `docs/queue/repair-experiments.md`) | `queue/repair-experiments` | lane stopped 2026-11-04 09:11 UTC after 9 of 23 candidates (1864 aborted) because the host ran out of disk; all 9 repaired to green; results and the resume procedure in [repair-experiments.md](repair-experiments.md), https://github.com/TauCetiProject/TauCetiWorker/pull/477 |
+| B. Historical repair experiments (`tauceti_queue/repair_experiment.py`, `docs/queue/repair-experiments.md`) | `queue/repair-experiments` | merged (https://github.com/TauCetiProject/TauCetiWorker/pull/477, https://github.com/TauCetiProject/TauCetiWorker/pull/490): 9 of 23 candidates before the disk stop, all green; results and the resume procedure in [repair-experiments.md](repair-experiments.md) |
 | C. Journal report (`scripts/staging_journal_report.py`, `docs/queue/journal-report.md`) | `queue/journal-report` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/475; baseline for candidates 1833 to 1932 in [journal-report.md](journal-report.md) |
 | D. Readmission age in Bors (`queue_age.ex`, handoff record) | bors-ng | merged: https://github.com/TauCetiProject/bors-ng/pull/99 (inherit the age once per handoff), https://github.com/TauCetiProject/bors-ng/pull/100 (same head after a lifted conflict request), https://github.com/TauCetiProject/bors-ng/pull/102 (a retired handoff parent no longer blocks the automatic re-offer); deployed: the handoffs on candidates 1948 (08:09 UTC) and 1949 (09:00 UTC) carry `original_admitted_at` and `queue_age_retries` for PRs 26351 and 26890; the inherited age itself is confirmed when one of them is re-approved (`suspect_readmitted` event, `inherited_handoff` in the admission) |
 | GitHub App | operator item 1 | created: `tauceti-queue`, App ID 5607007, credentials in `~/.config/tauceti-queue/` on chungus2; installed on `TauCetiProject/TauCeti` (installation 178451644), verified with the stored key |
@@ -27,7 +27,7 @@ experiment sample and without a shadow period; the scratch-repository rehearsal 
 | F. GitHub adapters and Bors-compatible surface (`github_app.py`, `github_adapter.py`, `commands.py`, `eligibility.py`, `webhook.py`, `feeds.py`, `server.py`) | `queue/github-adapters` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/484 |
 | G. Repair task runner (`tauceti_queue/repair.py`, `repair_task.py`) | `queue/repair-task` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/483 |
 | H. Deployment (`config.py`, `__main__.py`, `runtime.py`, `services/queue/`, runbook) | `queue/deployment` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/482 |
-| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, `scripts/queue-rehearsal`, `docs/queue/rehearsal.md`) | `queue/rehearsal` | the scenario script and the scratch content are written; the dry run over the fakes passes (`tests/queue_rehearsal.py`, every record); the live run waits for the scratch repository (operator item 2) and its addition to the App installation |
+| I. Cutover rehearsal (`tauceti_queue/rehearsal.py`, `scripts/queue-rehearsal`, `docs/queue/rehearsal.md`) | `queue/rehearsal` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/491; the dry run over the fakes passes (14 records); the live run on the scratch repository waits for the operator items below |
 
 Storage is one SQLite file on the service host rather than PostgreSQL: a single-process service does
 not need a server database, and the operator prefers the simpler host.
@@ -38,6 +38,15 @@ Bors does; every workflow reader only distinguishes `MERGE_BACKEND == "bors"` fr
 the workers and TauCetiReview read the feeds at `https://bors.taucetiproject.org/...`. Cutover therefore
 keeps `MERGE_BACKEND=bors`, suspends the `tau-ceti-bors` App installation, points
 `bors.taucetiproject.org` at the service, and enables publication (`docs/queue/github.md`).
+
+## Next steps
+
+Increments 0 and 1 are code-complete on `main` as of 2026-11-04 10:30 UTC. In order: the operator
+creates the scratch repository and names the host; the live rehearsal runs against the scratch
+repository (`docs/queue/rehearsal.md`, 40 to 60 minutes); the service is installed on the host with
+publication disabled and its revision, feeds and a claimable task are verified
+(`docs/queue/operations.md`); then the cutover is one step for the operator to approve: suspend the
+`tau-ceti-bors` installation, point `bors.taucetiproject.org` at the service, enable publication.
 
 ## Operator items outstanding
 
