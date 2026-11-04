@@ -10,7 +10,7 @@ orchestrating session as streams land.
 | Stream | Branch | State |
 | --- | --- | --- |
 | A. Attributed chain tool (`tauceti_queue/chain.py`) | `queue/chain-tool` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/474 |
-| B. Historical repair experiments (`tauceti_queue/repair_experiment.py`, `docs/queue/repair-experiments.md`) | `queue/repair-experiments` | lane stopped 2026-11-04 09:15 UTC at 10 of 23 candidates because the host ran out of disk (volume at 0 MB once, 13 GB free at the stop); all 10 repaired to green; results on https://github.com/TauCetiProject/TauCetiWorker/pull/477, the remaining 13 can be resumed on a host with disk |
+| B. Historical repair experiments (`tauceti_queue/repair_experiment.py`, `docs/queue/repair-experiments.md`) | `queue/repair-experiments` | lane stopped 2026-11-04 09:11 UTC after 9 of 23 candidates (1864 aborted) because the host ran out of disk; all 9 repaired to green; results and the resume procedure in [repair-experiments.md](repair-experiments.md), https://github.com/TauCetiProject/TauCetiWorker/pull/477 |
 | C. Journal report (`scripts/staging_journal_report.py`, `docs/queue/journal-report.md`) | `queue/journal-report` | merged, https://github.com/TauCetiProject/TauCetiWorker/pull/475; baseline for candidates 1833 to 1932 in [journal-report.md](journal-report.md) |
 | D. Readmission age in Bors (`queue_age.ex`, handoff record) | bors-ng | merged: https://github.com/TauCetiProject/bors-ng/pull/99 (inherit the age once per handoff), https://github.com/TauCetiProject/bors-ng/pull/100 (same head after a lifted conflict request), https://github.com/TauCetiProject/bors-ng/pull/102 (a retired handoff parent no longer blocks the automatic re-offer); deployed: the handoffs on candidates 1948 (08:09 UTC) and 1949 (09:00 UTC) carry `original_admitted_at` and `queue_age_retries` for PRs 26351 and 26890; the inherited age itself is confirmed when one of them is re-approved (`suspect_readmitted` event, `inherited_handoff` in the admission) |
 | GitHub App | operator item 1 | created: `tauceti-queue`, App ID 5607007, credentials in `~/.config/tauceti-queue/` on chungus2; installed on `TauCetiProject/TauCeti` (installation 178451644), verified with the stored key |
@@ -52,8 +52,12 @@ Journal baseline (candidates 1833 to 1932, 2026-11-03): 1394 slot minutes, 23 fa
 7 landed large batches (3.3), 10 conflict and 3 confirmation singletons, 11 handoffs of which 5 were
 readmitted (median 51 minutes). Full tables in [journal-report.md](journal-report.md).
 
-Repair experiments (2026-11-04, lane stopped at 10 of 23 for lack of disk): 10 of 10 completed
-candidates green; agent wall time 1 to 45 minutes, median about 3 minutes; estimated inference
-cost $0.40 to $0.82 per candidate; main's cache plus an incremental build was warm enough in every
-case (a candidate whose modules were already in the pool prepared in 16 s). Table and decision in
-`repair-experiments.md` with stream B.
+Repair experiments (2026-11-04, lane stopped after 9 of 23 for lack of disk): 9 of 9 completed
+candidates green, zero shrink events, every chain validated; time to green (agent plus confirming
+build) min 1.1, median 3.3, p75 13.3, max 45.3 minutes against the triage baseline of 19 to 39
+minutes plus backlog for the author round-trip; one repair (1916) fixed the three culprits Bors
+stripped over three rounds; inference cost $7.48 in total at API list prices (median $0.74, max
+$2.17). Warm-artifact decision: `main`'s cache at the base plus an incremental build is warm enough
+and is the only source (failed candidates publish no outputs); the cost is about 30 GB of disk per
+live base, so the repair worker keeps one pool per head and prunes on base change. Follow-up for the
+repair task: hand the agent CI's changed-module list for lint scoping (the two slow runs were lint).
