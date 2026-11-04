@@ -482,6 +482,19 @@ def extract_log_findings(text: str) -> dict:
     }
 
 
+def effective_kinds(failure: Failure, findings: dict | None) -> list[str]:
+    """Failure kinds from the journal, or from the CI log when the journal recorded no observation."""
+    kinds = set(failure.kinds)
+    if not kinds and findings:
+        if findings.get("compiler_errors"):
+            kinds.add("compiler")
+        if findings.get("duplicate_declarations") or findings.get("import_collisions"):
+            kinds.add("audit")
+        if (findings.get("lint") or {}).get("findings"):
+            kinds.add("lint")
+    return sorted(kinds, key=["compiler", "audit", "lint"].index)
+
+
 def module_to_path(module: str) -> str:
     return module.replace(".", "/") + ".lean"
 
@@ -1447,13 +1460,16 @@ def measure_repair(
     build.update(parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
     record["confirm_build"] = build
     record["green"] = build["rc"] == 0
-    if build["rc"] == 0 and run_lint and "lint" in failure.kinds:
+    findings_path = experiment_dir / "ci-findings.json"
+    kinds = effective_kinds(failure, json.loads(findings_path.read_text()) if findings_path.exists() else None)
+    record["kinds"] = kinds
+    if build["rc"] == 0 and run_lint and "lint" in kinds:
         lint = run_logged(
             ["bash", "scripts/lint-env.sh"], worktree, logdir / "confirm-lint-env.log", env=env, timeout=build_timeout
         )
         record["confirm_lint"] = lint
         record["green"] = lint["rc"] == 0
-    if build["rc"] == 0 and "audit" in failure.kinds:
+    if build["rc"] == 0 and "audit" in kinds:
         record["duplicate_check"] = duplicate_declaration_check(worktree, experiment_dir)
         record["green"] = record["green"] and record["duplicate_check"]["ok"]
     record["host"] = host_state()
@@ -1649,7 +1665,9 @@ def result_row(record: dict) -> dict:
         "lineage": candidate.get("lineage"),
         "members": len(candidate["members"]),
         "base_sha": candidate["base_sha"][:12],
-        "kinds": candidate.get("kinds"),
+        "kinds": candidate.get("kinds")
+        or (result.get("kinds") if result else None)
+        or _kinds_from_findings(sources.get("ci_findings")),
         "failing_modules": failing,
         "suspects": candidate.get("suspects"),
         "status": record.get("status"),
@@ -1688,6 +1706,19 @@ def result_row(record: dict) -> dict:
         "started_at": record.get("started_at"),
         "finished_at": record.get("finished_at"),
     }
+
+
+def _kinds_from_findings(findings: dict | None) -> list[str]:
+    if not findings:
+        return []
+    kinds = []
+    if findings.get("compiler_errors"):
+        kinds.append("compiler")
+    if findings.get("duplicate_declarations") or findings.get("import_collisions"):
+        kinds.append("audit")
+    if (findings.get("lint") or {}).get("findings"):
+        kinds.append("lint")
+    return kinds
 
 
 def results_table(rows: list[dict]) -> str:
