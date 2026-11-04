@@ -1,49 +1,49 @@
 {
  "schema": "tauceti-queue.repair-experiments/v1",
- "generated_at": "2026-11-04T05:33:02+00:00",
+ "generated_at": "2026-11-04T05:45:28+00:00",
  "summary": {
-  "candidates": 4,
-  "complete": 3,
-  "green": 3,
-  "lineages": 3,
+  "candidates": 5,
+  "complete": 4,
+  "green": 4,
+  "lineages": 4,
   "agent_minutes": {
-   "count": 3,
+   "count": 4,
    "min": 1.0,
-   "p25": 1.0,
-   "median": 1.1,
-   "p75": 4.7,
-   "max": 4.7,
-   "mean": 2.3
-  },
-  "time_to_green_minutes": {
-   "count": 3,
-   "min": 1.1,
    "p25": 1.1,
-   "median": 1.3,
-   "p75": 4.9,
-   "max": 4.9,
+   "median": 2.9,
+   "p75": 2.9,
+   "max": 4.7,
    "mean": 2.4
   },
+  "time_to_green_minutes": {
+   "count": 4,
+   "min": 1.1,
+   "p25": 1.3,
+   "median": 3.1,
+   "p75": 3.1,
+   "max": 4.9,
+   "mean": 2.6
+  },
   "preparation_minutes": {
-   "count": 3,
+   "count": 4,
    "min": 0.4,
-   "p25": 0.4,
+   "p25": 10.4,
    "median": 10.7,
-   "p75": 14.9,
+   "p75": 10.7,
    "max": 14.9,
-   "mean": 8.7
+   "mean": 9.1
   },
   "modules_built_in_preparation": {
-   "count": 3,
+   "count": 4,
    "min": 0,
-   "p25": 0,
+   "p25": 214,
    "median": 4645,
-   "p75": 4903,
+   "p75": 4645,
    "max": 4903,
-   "mean": 3182.7
+   "mean": 2440.5
   },
-  "estimated_cost_usd_total": 1.61,
-  "total_tokens": 1878319,
+  "estimated_cost_usd_total": 2.14,
+  "total_tokens": 2359521,
   "shrink_events": 0,
   "messages_preserved_everywhere": true
  },
@@ -62,9 +62,88 @@
     "TauCeti/RingTheory/PowerSeries/Substitution.lean"
    ],
    "suspects": [],
-   "status": "sources_ready",
+   "status": "complete",
    "error": null,
    "ci_modules_built": 7,
+   "preparation": {
+    "base_cache_seconds": 4.9,
+    "base_mapping_found": true,
+    "candidate_outputs_published": false,
+    "modules_built": 214,
+    "modules_replayed": 0,
+    "modules_fetched": 42016,
+    "failed_modules_local": [
+     "TauCeti.RingTheory.PowerSeries.Substitution"
+    ],
+    "build_seconds": 618.1,
+    "build_rc": 1,
+    "load_1m_at_build": 58.5
+   },
+   "preparation_seconds": 624.0,
+   "chain_source": "chain.build",
+   "chain_tool_tree_matches_retained": true,
+   "chain_tree_matches_retained": true,
+   "worktree_reused": false,
+   "agent_wall_seconds": 174.6,
+   "agent_rc": 0,
+   "agent_timed_out": false,
+   "agent_turns": 10,
+   "model": "claude-opus-5-5",
+   "tokens": {
+    "input_tokens": 20,
+    "cache_creation_input_tokens": 44416,
+    "cache_read_input_tokens": 432096,
+    "output_tokens": 4670,
+    "total_tokens": 481202
+   },
+   "estimated_cost_usd": 0.5352,
+   "claude_reported_cost_usd": 0.5352272,
+   "green": true,
+   "confirm_build_seconds": 8.7,
+   "confirm_modules_built": 0,
+   "confirm_failed_modules": [],
+   "confirm_lint_rc": null,
+   "time_to_green_seconds": 183.3,
+   "edited_prs": [
+    25596
+   ],
+   "shrink_prs": [],
+   "emptied_prs": [],
+   "messages_preserved": true,
+   "edited_without_explanation": [],
+   "validation_problems": [],
+   "diffstat": "1 file changed, 4 insertions(+), 16 deletions(-)",
+   "load_1m_at_agent_start": 66.6,
+   "load_1m_at_agent_end": 49.8,
+   "disk_free_gb_start": 110.1,
+   "started_at": "2026-11-04T05:31:25+00:00",
+   "finished_at": "2026-11-04T05:44:56+00:00"
+  },
+  {
+   "candidate": 1914,
+   "generation": 1,
+   "batch": 2561,
+   "lineage": 1861,
+   "members": 14,
+   "base_sha": "ddf649351572",
+   "kinds": [
+    "lint"
+   ],
+   "failing_modules": [
+    "TauCeti/LowDimTopology/DehnSurgery/Slope.lean"
+   ],
+   "suspects": [
+    25376,
+    26169,
+    26209,
+    26212,
+    26241,
+    26416,
+    26862
+   ],
+   "status": "sources_ready",
+   "error": null,
+   "ci_modules_built": 2250,
    "preparation": null,
    "preparation_seconds": null,
    "chain_source": "chain.build",
@@ -94,8 +173,8 @@
    "diffstat": null,
    "load_1m_at_agent_start": null,
    "load_1m_at_agent_end": null,
-   "disk_free_gb_start": 110.1,
-   "started_at": "2026-11-04T05:31:25+00:00",
+   "disk_free_gb_start": 81.9,
+   "started_at": "2026-11-04T05:45:12+00:00",
    "finished_at": null
   },
   {
