@@ -44,19 +44,28 @@ webhook delivery log.
    `leanprover/lean4:v4.36.0-rc2`), and `git` able to push to the scratch repository through `gh`'s
    credential helper. The scratch repository must be reachable by the organisation's Namespace runners
    (the scaffold's jobs run on `nscloud-ubuntu-24.04-amd64-2x4`; GitHub-hosted labels never got a runner
-   here):
+   here), and the service must be reachable from those runners over HTTPS: the scaffolded workflow
+   is TauCeti's staging path, whose train identity check and finalizer read the Bors observation feed
+   at the `services.bors.url` of the scratch repository's `tauceti.toml`, which the scaffold sets to
+   `--public-url` (default `https://queue-rehearsal.taucetiproject.org`, a Cloudflare tunnel hostname
+   forwarded to the service's local port on the host; TauCetiTools accepts HTTPS only, so the local
+   listener itself can never be configured). The same value is the service's `public_url`. While
+   nothing answers there, every candidate run fails closed in "Resolve PR head" with
+   `bors identity unavailable` and the `clean` scenario fails:
 
    ```sh
    cd ~/TauCetiWorker   # any checkout of this repository
    uv run scripts/queue-rehearsal live --repository TauCetiProject/TauCetiQueueScratch \
+       --public-url https://queue-rehearsal.taucetiproject.org \
        --port 8781 --workdir /tmp/queue-rehearsal-live --report /tmp/queue-rehearsal-report
    ```
 
    The rehearsal then: checks the repository, the installation, the App permissions and the operator's
-   admin permission; pushes the scaffold (the Lean library and `pr-build.yml`, see below) to `main`
-   when it is absent or out of date; starts `tauceti-queue serve` with a generated `config.toml`
-   (repository, `canonical_branch`, `publication_enabled = true`, a private content clone and
-   database under the work directory, the App credentials, port 8781) and lowers the polling and retry
+   admin permission; pushes the scaffold (the Lean library, `pr-build.yml`, `tauceti.toml` and the
+   `scripts/` entrypoints, see below) to `main` when it is absent or out of date; starts
+   `tauceti-queue serve` with a generated `config.toml` (repository, `canonical_branch`,
+   `publication_enabled = true`, a private content clone and database under the work directory, the
+   App credentials, port 8781, `public_url` from `--public-url`) and lowers the polling and retry
    intervals through the admin endpoint; installs the scripted `claude` and the `lake` wrapper on a
    private PATH; starts the webhook relay; and runs the scenarios. `--service URL` uses a service
    you started yourself instead (then the restart scenario is skipped), `--only a,b` runs a subset,
@@ -84,8 +93,15 @@ differs from this version (the shared module is scaffolded once and then evolves
   theorems), `TauCeti/Shared.lean` (the conflict target: a definition at the top, an append marker at
   the bottom). Every run adds its modules under `TauCeti/R<timestamp>/` in namespace `R<timestamp>`,
   so runs never collide.
-- `.github/workflows/pr-build.yml`, adapted from TauCeti's and read against it on 2026-11-04. What
-  the service relies on is identical: the `repository_dispatch` event `tauceti-bors-staging` with
+- `.github/workflows/pr-build.yml`, adapted from TauCeti's and read against it on 2026-11-04, with
+  TauCeti's staging path: the workflow-pinned tooling checkout into `gate/`, TauCetiTools' `setup`
+  and `ci-credentials` actions at the pin `tauceti.toml` names, `bors_train_identity.py` (the
+  observation feed's `train.staging_ref` must be `staging-candidate-<candidate_id>-<generation>`)
+  and `ci_git.py resolve` (that branch's tip must be the dispatched head) in "Resolve PR head", an
+  identity failure reported as infrastructure without building, and `finalize_batch.py` posting the
+  terminal status after revalidating the batch against the feed. The first production head failed in
+  that step while the earlier scaffold, which lacked it, passed. What the service relies on is
+  identical: the `repository_dispatch` event `tauceti-bors-staging` with
   `client_payload.head_sha`, `base_sha`, `batch_id`, `members`, `base_ref`; the same `run-name`
   (`bors branch=<ref> batch=<id> head=<sha> base=<sha>`) the adapter finds the run by; the same
   concurrency group; a build job named `sandboxed-build` (the job whose log the adapter reads for
@@ -94,10 +110,17 @@ differs from this version (the shared module is scaffolded once and then evolves
   `target_url` `https://github.com/<repo>/actions/runs/<run_id>`, which the service binds its verdict
   to. `pull_request` events build PR heads and post `build` on them, as TauCeti does, so statuses from
   PR builds exist beside candidate statuses. Dropped: bwrap, caches, cache publication, audits, lint,
-  scope checks, runner picking. Added, for one scenario only: a candidate carrying
+  scope and bump checks, runner picking. Added, for one scenario only: a candidate carrying
   `.rehearsal/suppress-build-status` with a number N keeps the finalizer silent while fewer than N
   `build` statuses exist on the candidate (and waits 150 s so a stale status can be planted); a
   candidate without the file is reported exactly as TauCeti's finalizer reports it.
+- `tauceti.toml` (the project configuration TauCetiTools reads in CI: this repository as content,
+  Lean root `TauCeti`, `merge.backend = "bors"`, `services.bors.url` from `--public-url` with
+  `repository_id = 1`, the TauCetiTools pin) and `scripts/bors_train_identity.py`,
+  `bors_observation.py`, `finalize_batch.py`, the compatibility entrypoints TauCeti's finalizer
+  sparse-checks-out; CI materializes the implementations over them. The workflow references the
+  `CI_READ_APP_*` and `CI_STATUS_APP_*` secrets as TauCeti's does; the scratch repository has none,
+  and the credentials action falls back to the workflow token.
 
 ## Synthetic agents
 
