@@ -1582,7 +1582,7 @@ def duplicate_declaration_check(worktree: Path, experiment_dir: Path) -> dict:
     for duplicate in findings.get("duplicate_declarations", []):
         short = duplicate["declaration"].rsplit(".", 1)[-1]
         pattern = re.compile(
-            r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:private|protected|noncomputable|scoped|nonrec)\s+)*(?:theorem|lemma|def|instance|abbrev|structure|class|inductive)\s+"
+            r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:private|protected|noncomputable|scoped|nonrec)\s+)*(?:theorem|lemma|def|instance|abbrev|structure|class|inductive)\s+(?:[\w'.]*\.)?"
             + re.escape(short)
             + r"\b"
         )
@@ -1600,7 +1600,7 @@ def duplicate_declaration_check(worktree: Path, experiment_dir: Path) -> dict:
     for collision in findings.get("import_collisions", []):
         short = collision["declaration"].rsplit(".", 1)[-1]
         pattern = re.compile(
-            r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:private|protected|noncomputable|scoped|nonrec)\s+)*(?:theorem|lemma|def|instance|abbrev|structure|class|inductive)\s+"
+            r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:private|protected|noncomputable|scoped|nonrec)\s+)*(?:theorem|lemma|def|instance|abbrev|structure|class|inductive)\s+(?:[\w'.]*\.)?"
             + re.escape(short)
             + r"\b"
         )

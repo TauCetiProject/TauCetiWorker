@@ -507,6 +507,38 @@ with tempfile.TemporaryDirectory() as raw:
         "a missing stream yields zero usage", rx.agent_usage(Path(raw) / "missing.jsonl")["tokens"]["total_tokens"] == 0
     )
 
+# ---- the textual duplicate-declaration check ------------------------------------------------------
+
+with tempfile.TemporaryDirectory() as raw:
+    wt = Path(raw) / "wt"
+    (wt / "TauCeti" / "A").mkdir(parents=True)
+    (wt / "TauCeti" / "A" / "Menger.lean").write_text("import X\n\ntheorem other : True := trivial\n")
+    (wt / "TauCeti" / "A" / "Paths.lean").write_text(
+        "namespace SimpleGraph.Walk\n\nlemma IsPath.start_notMem_tail_support (p : W) : True := trivial\n"
+    )
+    exp = Path(raw) / "exp"
+    exp.mkdir()
+    (exp / "ci-findings.json").write_text(
+        json.dumps(
+            {
+                "duplicate_declarations": [
+                    {
+                        "declaration": "SimpleGraph.Walk.IsPath.start_notMem_tail_support",
+                        "modules": ["TauCeti.A.Menger", "TauCeti.A.Paths"],
+                    }
+                ],
+                "import_collisions": [],
+            }
+        )
+    )
+    dup = rx.duplicate_declaration_check(wt, exp)
+    check(
+        "a dotted declaration head is counted in its remaining module",
+        dup["ok"] and dup["rows"][0]["declared_in"] == ["TauCeti.A.Paths"],
+    )
+    (wt / "TauCeti" / "A" / "Menger.lean").write_text("theorem IsPath.start_notMem_tail_support : True := trivial\n")
+    check("a name still declared on both sides fails the check", not rx.duplicate_declaration_check(wt, exp)["ok"])
+
 # ---- pool pruning --------------------------------------------------------------------------------
 
 with tempfile.TemporaryDirectory() as raw:
