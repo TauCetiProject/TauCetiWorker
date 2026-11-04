@@ -39,6 +39,7 @@ from .store import Store, dumps, loads
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
 BUILD_CONTEXT = "build"
+LOG_GRACE_SECONDS = 600  # how long a failed run may go without a readable log before it counts as infrastructure
 DISPATCH_EVENT = "tauceti-bors-staging"
 MERGED_TITLE_PREFIX = "[Merged by Bors] - "  # what bors-ng writes when it closes a squash-landed member
 COMMENT_MARKER = "tauceti-queue"
@@ -1496,6 +1497,20 @@ class Controller:
         else:
             source = [d for d in run.diagnostics if d.get("kind") != "infrastructure"]
             infrastructure = [d for d in run.diagnostics if d.get("kind") == "infrastructure"]
+            log_pending = (
+                not source
+                and infrastructure
+                and all(d.get("reason") == "log_unavailable" for d in infrastructure)
+                and not status.description.lower().startswith("infrastructure")
+                and now - (run.completed_at or now) < LOG_GRACE_SECONDS
+            )
+            if log_pending:
+                # GitHub publishes a job's log a little after the run completes; a failed build whose log
+                # cannot be read yet is neither a source nor an infrastructure verdict. Look again.
+                values.update(needs_observation=1)
+                self._reasons.append(f"head {head['id']}: run {run.run_id} failed, waiting for its log")
+                self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
+                return
             if status.description.lower().startswith("infrastructure") or (infrastructure and not source):
                 values.update(
                     outcome=OUTCOME_INFRASTRUCTURE, outcome_detail=f"infrastructure-failure: {status.description}"
