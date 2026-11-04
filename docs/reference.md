@@ -70,10 +70,12 @@ so nothing waits on anybody. The shared repository holds nothing but leases: no
 code, no Actions, and no relationship to write access on the canonical repo,
 which no worker ever needs.
 
-If you run several workers on one host or in several containers, they get the
-same answer and coordinate with no configuration. Set `CLAIM_REPO` when you want
-to pin a namespace of your own anyway, for instance to keep two fleets under
-different `gh` accounts from contending with each other.
+If you run several host or Docker workers, they get the same answer and
+coordinate with no configuration. Set `CLAIM_REPO` when you want to pin a
+namespace of your own anyway, for instance to keep two fleets under different
+`gh` accounts from contending with each other. (Inside `--bubble`, the roadmap
+container's Git proxy only permits pushes to `--allow-push <fork>`, so
+in-container `author/<roadmap>/<slug>` leases always write to that fork.)
 
 Claims are cooperative and fail-open. Honouring one only avoids duplicate work;
 the guarantee that two workers cannot clobber each other's branch is the

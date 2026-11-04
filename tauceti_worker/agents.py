@@ -2152,6 +2152,7 @@ def run_in_bubble(
     inner_cmd: str | None = None,
     cred_model: str | None = None,
     allow_push: str | None = None,
+    claim_repo: str | None = None,
     cancel_event=None,
 ) -> int:
     """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
@@ -2306,8 +2307,10 @@ def run_in_bubble(
 
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
-    # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
-    # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
+    # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (branch claims+heartbeats
+    # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim). Only roadmap
+    # authoring passes claim_repo explicitly, giving in-container claim.sh the --allow-push fork and a
+    # stable TAUCETI_WORKER_ID so acquire/release share one owner across subshells.
     tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
     if api_bridge and _uses_claude_credentials(cred_model):
         tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
@@ -2320,6 +2323,8 @@ def run_in_bubble(
             getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)
         ).items():
             tcenv += f" {key}={shlex.quote(value)}"
+        if claim_repo:
+            tcenv += f" CLAIM_REPO={shlex.quote(claim_repo)} TAUCETI_WORKER_ID={shlex.quote(cfg.wid)}"
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
