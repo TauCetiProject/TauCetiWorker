@@ -103,6 +103,7 @@ controller's inference hold (`report_inference(worker, False, error)`), and `err
 | --- | --- |
 | `artifacts_unavailable` | the worker could not prepare warm artifacts (no published cache mapping for the base or `onto`, a fetch failure, an incomplete incremental build, or the worker's own cache preparation refusing to start inference); the task was not run cold. After such a release `serve` waits `artifacts_backoff` (60 s, doubling to 600 s across consecutive releases) before its next claim, since the service re-exposes the same task at once |
 | `inference_unavailable` | every bounded attempt failed with a provider error, a transport failure or exhausted credentials (`agents.classify_agent_failure`); the queue holds the task and re-exposes it (plan, "Inference unavailability") |
+| `agent_launch_failed` | the agent process could not be created at all (`OSError` from `Popen`: a missing executable, an argv the kernel rejects); the artifacts were ready, so no `artifacts_backoff` applies, and the error names the launch as the cause. A prompt longer than `agents.PROMPT_ARGV_LIMIT` (64 KiB) is written to the agent's stdin rather than passed in argv, since Linux rejects a single argument above 128 KiB |
 | `agent_failed` | the agent ran and exited on its own terms, or returned a chain that fails local validation, twice; the task is re-exposed to any worker |
 | `push_failed` | `git-safe-push` to the submission ref failed; the chain is retained locally under `refs/tauceti-queue/task/<id>/attempt-<n>` in the worker's clone |
 

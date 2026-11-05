@@ -793,9 +793,38 @@ def _foreground_shell_env(deadline: float) -> dict[str, str]:
     }
 
 
-def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
+# Linux rejects any single argv string above MAX_ARG_STRLEN (128 KiB) with E2BIG, so a prompt longer
+# than this many UTF-8 bytes leaves argv and is written to the agent's stdin instead. Half the kernel
+# limit keeps a wide margin for multi-byte text and for wrapper commands that re-quote their arguments.
+PROMPT_ARGV_LIMIT = 64 * 1024
+
+# Providers whose CLI reads the prompt from stdin when the positional prompt is absent (`claude -p`
+# with no prompt argument) or is `-` (`codex exec -`). Kiro and the Pi runner only take argv.
+_STDIN_PROMPT_PROVIDERS = frozenset({"claude", "codex"})
+
+
+def prompt_on_stdin(prompt: str, profile: AuthoringProfile | str) -> bool:
+    """Whether this prompt must reach the agent on stdin rather than in argv."""
+    provider = _authoring_profile(profile).provider
+    return provider in _STDIN_PROMPT_PROVIDERS and len(prompt.encode("utf-8", errors="replace")) > PROMPT_ARGV_LIMIT
+
+
+def host_agent_launch(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict, str | None]:
+    """``host_agent_argv`` plus the text to write on the agent's stdin: the prompt itself when it is
+    too long for one argv string (``PROMPT_ARGV_LIMIT``), else None and the prompt stays in argv."""
+    on_stdin = prompt_on_stdin(prompt, profile)
+    argv, env = host_agent_argv(prompt, profile, prompt_on_stdin=on_stdin)
+    return argv, env, prompt if on_stdin else None
+
+
+def host_agent_argv(
+    prompt: str, profile: AuthoringProfile | str, *, prompt_on_stdin: bool = False
+) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
-    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
+    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`.
+
+    With ``prompt_on_stdin`` the prompt is left out of argv (Claude) or replaced by ``-`` (Codex) and
+    the caller writes it to the process's stdin; see ``host_agent_launch``."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
@@ -808,7 +837,7 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
         argv += ["-c", 'model_reasoning_summary="detailed"', "-c", "show_raw_agent_reasoning=false"]
-        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", "-" if prompt_on_stdin else prompt]
     elif profile.provider == "kiro":
         # --model is mandatory: Kiro's Auto router is never allowed to choose on
         # the worker's behalf. Isolate its platform credential store for API-key
@@ -833,7 +862,8 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
             os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
         )
         base = shlex_split(command) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
-        argv = [*base, "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", profile.model]
+        argv = [*base, "-p", *([] if prompt_on_stdin else [prompt])]
+        argv += ["--output-format", "stream-json", "--verbose", "--model", profile.model]
         if profile.effort:
             argv += ["--effort", profile.effort]
         argv += ["--dangerously-skip-permissions"]
@@ -869,7 +899,7 @@ def run_agent_host(
             " If TAUCETI_PR_CACHE_MISS=1, your PR history is uncached: merge/rebase onto current main "
             "and fetch again before building; if that cannot be done, report the cache miss and stop."
         )
-    argv, env = host_agent_argv(prompt, profile)
+    argv, env, stdin_text = host_agent_launch(prompt, profile)
     if resume:
         if profile.provider == "codex":
             # exec resume does not accept the fresh-run sandbox/repo-check flags.
@@ -884,7 +914,7 @@ def run_agent_host(
             ]
             if profile.effort:
                 argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
-            argv += [resume, prompt]
+            argv += [resume, "-" if stdin_text is not None else prompt]
         elif profile.provider == "claude":
             argv += ["--resume", resume]
     if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
@@ -930,6 +960,7 @@ def run_agent_host(
             cancel_event=cancel_event,
             session_path=session_path,
             quota_cfg=quota_cfg,
+            stdin_text=stdin_text,
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
@@ -1040,6 +1071,16 @@ def take_last_agent_infra_failure() -> str | None:
     return reason
 
 
+def _feed_stdin(proc: subprocess.Popen, text: str) -> None:
+    """Write ``text`` to ``proc.stdin`` and close it; an agent that exits first just closes the pipe."""
+    assert proc.stdin is not None
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdin.write(text)
+        proc.stdin.flush()
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdin.close()
+
+
 def run_agent_proc(
     argv: list[str],
     *,
@@ -1051,20 +1092,24 @@ def run_agent_proc(
     cancel_event=None,
     session_path=None,
     quota_cfg=None,
+    stdin_text: str | None = None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
     By default the normalized transcript goes to a timestamped file under logdir. ``--stream`` sends
     the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
-    failures aren't silent.
+    failures aren't silent. ``stdin_text`` (a prompt too long for argv, see ``host_agent_launch``) is
+    written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
+    cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
     """
     global _LAST_AGENT_FAILURE
     _LAST_AGENT_FAILURE = None
     telemetry_stamp = time.strftime("%Y%m%d-%H%M%S")
     cwds = str(cwd) if cwd is not None else None
-    # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
-    # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
-    # Codex then treats it as additional prompt input and waits forever for EOF.
+    # A prompt arrives in argv unless it is too long for one argv string, in which case it is the whole
+    # of stdin. Otherwise close stdin explicitly: Bubble reaches the agent through a non-PTY SSH
+    # channel, so an inherited terminal becomes a non-TTY stream there; Codex then treats it as
+    # additional prompt input and waits forever for EOF.
     renderer = AgentTranscriptRenderer(provider)
     quota_reader, launch_credential = None, None
     if (
@@ -1106,7 +1151,7 @@ def run_agent_proc(
                     argv,
                     cwd=cwds,
                     env=env,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -1119,6 +1164,10 @@ def run_agent_proc(
             raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
         assert proc.stdout is not None
         finished = threading.Event()
+        feeder = None
+        if stdin_text is not None:
+            feeder = threading.Thread(target=_feed_stdin, args=(proc, stdin_text), daemon=True)
+            feeder.start()
 
         def cancel_on_lease_loss():
             while not finished.wait(0.5):
@@ -1172,6 +1221,8 @@ def run_agent_proc(
                 finished.set()
                 if monitor is not None:
                     monitor.join(3)
+                if feeder is not None:
+                    feeder.join(3)
         from .overlap_support import atomic
 
         telemetry = {

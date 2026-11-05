@@ -1107,43 +1107,71 @@ def isolation_env(root: Path, env_lake: dict | None = None) -> dict:
     return changes
 
 
-def agent_environment(prompt: str, root: Path, env_lake: dict, deadline_seconds: float) -> tuple[list[str], dict]:
-    """The worker's exact argv for a Claude host round, plus the experiment's isolation."""
+def agent_environment(
+    prompt: str, root: Path, env_lake: dict, deadline_seconds: float
+) -> tuple[list[str], dict, str | None]:
+    """The worker's exact argv for a Claude host round, plus the experiment's isolation, plus the text
+    for the agent's stdin: the prompt when it is too long for argv (``agents.PROMPT_ARGV_LIMIT``), else
+    None because the prompt is in argv."""
     os.environ["TAUCETI_ROUND_DEADLINE"] = str(time.time() + deadline_seconds)
-    from tauceti_worker.agents import host_agent_argv
+    from tauceti_worker.agents import host_agent_launch
 
-    argv, env = host_agent_argv(prompt, claude_profile())
+    argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
     for key, value in isolation_env(root, env_lake).items():
         if value is None:
             env.pop(key, None)
         else:
             env[key] = value
-    return argv, env
+    return argv, env, stdin_text
 
 
-def run_agent(worktree: Path, argv: list[str], env: dict, logdir: Path, timeout: float) -> dict:
-    """Run the agent with its stream-json transcript captured; wall time from handoff to exit."""
+def run_agent(
+    worktree: Path, argv: list[str], env: dict, logdir: Path, timeout: float, stdin_text: str | None = None
+) -> dict:
+    """Run the agent with its stream-json transcript captured; wall time from handoff to exit.
+
+    ``stdin_text`` is written to the agent's stdin and then closed (a prompt too long for argv); without
+    it stdin is closed at once. A process that cannot be created at all (``OSError`` from ``Popen``: a
+    missing executable, an argv the kernel rejects) is reported as ``"outcome": "agent_launch_failed"``
+    with ``rc`` None, rather than raised, so the record names the launch as the cause.
+    """
     logdir.mkdir(parents=True, exist_ok=True)
     stream = logdir / "agent-stream.jsonl"
     stderr = logdir / "agent-stderr.log"
     before = host_state(worktree)
     started = time.monotonic()
     timed_out = False
+    launch_error = None
     with stream.open("wb") as out, stderr.open("wb") as err:
-        proc = subprocess.Popen(argv, cwd=worktree, env=env, stdout=out, stderr=err, start_new_session=True)
+        stdin = subprocess.DEVNULL if stdin_text is None else subprocess.PIPE
         try:
-            rc = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            os.killpg(proc.pid, 15)
+            proc = subprocess.Popen(
+                argv, cwd=worktree, env=env, stdin=stdin, stdout=out, stderr=err, start_new_session=True
+            )
+        except OSError as error:
+            launch_error = f"{type(error).__name__}: {error}"
+            err.write(f"agent process could not start: {launch_error}\n".encode())
+            rc = None
+        else:
             try:
-                proc.wait(timeout=30)
+                # communicate() writes the whole prompt and closes stdin; stdout/stderr are files, so
+                # nothing here waits on the agent's output.
+                proc.communicate(input=None if stdin_text is None else stdin_text.encode(), timeout=timeout)
+                rc = proc.returncode
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, 9)
-                proc.wait()
-            rc = 124
+                timed_out = True
+                os.killpg(proc.pid, 15)
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, 9)
+                    proc.wait()
+                rc = 124
     record = {
         "rc": rc,
+        "outcome": "agent_launch_failed" if launch_error else ("timed_out" if timed_out else "exited"),
+        "launch_error": launch_error,
+        "prompt_via": "argv" if stdin_text is None else "stdin",
         "timed_out": timed_out,
         "wall_seconds": round(time.monotonic() - started, 1),
         "stream": str(stream),

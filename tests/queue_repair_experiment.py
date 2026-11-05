@@ -410,6 +410,38 @@ with tempfile.TemporaryDirectory() as raw:
     )
     check("the tree difference is recorded", "B.lean" in outcome2["tree_difference"])
 
+# ---- the agent launch: a long prompt on stdin, a process that cannot start -----------------------
+
+ECHO_STDIN = (
+    "import json, sys; text = sys.stdin.read(); "
+    "print(json.dumps({'type': 'result', 'subtype': 'success', 'result': f'stdin {len(text)} chars',"
+    " 'session_id': 's1', 'usage': {'input_tokens': 1, 'output_tokens': 1}}))"
+)
+with tempfile.TemporaryDirectory() as raw:
+    logs = Path(raw) / "logs"
+    long_prompt = "y" * 200_000
+    record = rx.run_agent(Path(raw), [sys.executable, "-c", ECHO_STDIN], dict(os.environ), logs, 60, long_prompt)
+    check("run_agent delivers a stdin prompt and exits cleanly", (record["rc"], record["outcome"]) == (0, "exited"))
+    check("run_agent records the prompt channel", record["prompt_via"] == "stdin")
+    check(
+        "the whole prompt reached the agent",
+        f"stdin {len(long_prompt)} chars" in (logs / "agent-stream.jsonl").read_text(),
+    )
+    record = rx.run_agent(Path(raw), [sys.executable, "-c", ECHO_STDIN], dict(os.environ), logs, 60)
+    check(
+        "without a stdin prompt the agent reads an empty, closed stdin",
+        "stdin 0 chars" in (logs / "agent-stream.jsonl").read_text(),
+    )
+    check("an argv prompt is recorded as such", record["prompt_via"] == "argv")
+    record = rx.run_agent(Path(raw), [str(Path(raw) / "no-such-agent")], dict(os.environ), logs, 60)
+    check(
+        "a process that cannot start is agent_launch_failed, not an exception",
+        record["outcome"] == "agent_launch_failed",
+    )
+    check("the launch error is named", record["rc"] is None and "FileNotFoundError" in record["launch_error"])
+    check("the launch error is in the stderr log", "could not start" in (logs / "agent-stderr.log").read_text())
+
+
 # ---- agent usage accounting from a stream-json transcript --------------------------------------
 
 with tempfile.TemporaryDirectory() as raw:

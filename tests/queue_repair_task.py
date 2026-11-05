@@ -21,6 +21,7 @@ checkpoint, which the next start resumes; and the host preflight checks.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -35,6 +36,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -113,11 +115,19 @@ stub_dir = Path(os.environ["STUB_DIR"])
 calls = stub_dir / "agent-calls.jsonl"
 previous = sum(1 for _ in calls.open()) if calls.exists() else 0
 call = previous + 1
-prompt = args[args.index("-p") + 1] if "-p" in args else ""
+# Like Claude Code: `-p <prompt>` takes the prompt from argv; a bare `-p` (the next argument is an
+# option, or there is none) reads the whole of stdin as the prompt.
+prompt, prompt_via = "", None
+if "-p" in args:
+    after = args[args.index("-p") + 1 :]
+    if after and not after[0].startswith("--"):
+        prompt, prompt_via = after[0], "argv"
+    else:
+        prompt, prompt_via = sys.stdin.read(), "stdin"
 resume = args[args.index("--resume") + 1] if "--resume" in args else None
 mode = os.environ.get("STUB_AGENT_MODE", "repair")
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR")}}) + "\n")
+    handle.write(json.dumps({"call": call, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR")}}) + "\n")
 session = "sess-" + str(call)
 print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
 
@@ -617,6 +627,22 @@ class Fixture(unittest.TestCase):
     def submission_ref(self, claim_id: int = 1, task_id: int = 1) -> str:
         return f"refs/tauceti-queue/submissions/{task_id}/{claim_id}"
 
+    @staticmethod
+    def padded_prompts(chars: int) -> contextlib.AbstractContextManager:
+        """Every composed prompt grows by ``chars`` of trailing context the scripted agent ignores."""
+        compose = repair.compose_prompt
+        padding = "\n\nContext the agent may ignore:\n" + ("x" * 99 + "\n") * (chars // 100 + 1)
+        return patch.object(repair, "compose_prompt", lambda *a, **k: compose(*a, **k) + padding)
+
+    @staticmethod
+    def prompt_too_long_for_argv() -> contextlib.AbstractContextManager:
+        """The production failure: with the stdin path disabled, a prompt above Linux's 128 KiB limit on one
+        argv string (MAX_ARG_STRLEN) makes the kernel reject the exec with E2BIG, "Argument list too long"."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch("tauceti_worker.agents.PROMPT_ARGV_LIMIT", 1 << 40))
+        stack.enter_context(Fixture.padded_prompts(129 * 1024))
+        return stack
+
 
 class HappyPath(Fixture):
     def test_claim_renew_push_submit_adopt(self):
@@ -977,6 +1003,56 @@ class InferenceUnavailable(Fixture):
         self.assertEqual(self.service.results, [])
 
 
+class LongPrompt(Fixture):
+    def test_a_prompt_too_long_for_argv_is_delivered_on_stdin(self):
+        # Linux rejects a single argv string above 128 KiB (MAX_ARG_STRLEN); a 1,197-member head built a
+        # prompt that size in production and Popen failed with "Argument list too long". Past the
+        # worker's 64 KiB limit the prompt leaves argv and is the whole of the agent's stdin.
+        from tauceti_worker.agents import PROMPT_ARGV_LIMIT
+
+        with self.padded_prompts(PROMPT_ARGV_LIMIT + 1024):
+            cfg = self.config()
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["prompt_via"], "stdin")
+        self.assertGreater(calls[0]["prompt_chars"], PROMPT_ARGV_LIMIT)
+        self.assertTrue(calls[0]["prompt"].endswith("x" * 99 + "\n"), "the whole prompt arrived, in order")
+        self.assertIn(repair.AGENT_INSTRUCTION, calls[0]["prompt"])
+        self.assertEqual(calls[0]["argv"][:3], ["-p", "--output-format", "stream-json"])
+        self.assertEqual(len(self.service.results), 1)
+
+    def test_a_short_prompt_stays_in_argv(self):
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual([c["prompt_via"] for c in calls], ["argv"])
+        self.assertEqual(calls[0]["argv"][:2], ["-p", "--output-format"])
+
+
+class AgentLaunchFailed(Fixture):
+    """The agent process could not be created: not the cache's fault, so not ``artifacts_unavailable``."""
+
+    def test_a_process_that_cannot_start_is_released_under_its_own_reason(self):
+        with self.prompt_too_long_for_argv():
+            cfg = self.config()
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "agent_launch_failed")
+        self.assertIn("could not start", outcome["detail"])
+        self.assertIn("Argument list too long", outcome["detail"], "the record names the real cause")
+        self.assertEqual(self.agent_calls(), [])
+        self.assertEqual([r["reason"] for r in self.service.releases], ["agent_launch_failed"])
+        self.assertIn("could not start", self.service.releases[0]["error"])
+        self.assertEqual(self.service.results, [])
+        self.assertEqual(self.state()["state"], "released")
+        history = [h["state"] for h in self.state()["history"]]
+        self.assertIn("artifacts_ready", history, "the artifacts were prepared; the launch is what failed")
+        self.assertIsNone(self.service.live_claim(1), "the service freed the claim")
+
+
 class AgentTimeout(Fixture):
     def test_the_worker_cap_is_an_agent_failure_not_a_lost_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
@@ -1134,6 +1210,19 @@ class Serve(Fixture):
         self.assertGreaterEqual(gaps[1], 0.6, gaps)
         self.assertGreaterEqual(gaps[2], 0.6, gaps)
         self.assertEqual(result["summary"]["artifacts_backoff"], 0.6)
+        self.assertEqual(self.agent_calls(), [])
+
+    def test_a_launch_failure_does_not_back_off_as_if_the_cache_were_missing(self):
+        cfg = self.config(poll_seconds=0.05, artifacts_backoff=(5.0, 5.0))
+        stop = repair_task.Stop()
+        with self.prompt_too_long_for_argv():
+            thread, result = self.serve_in_thread(cfg, stop)
+            self.wait_for(lambda: len(self.service.releases) >= 2, "the task is released and re-claimed")
+            stop.set("test")
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(all(r["reason"] == "agent_launch_failed" for r in self.service.releases))
+        self.assertNotIn("artifacts_backoff", result["summary"])
         self.assertEqual(self.agent_calls(), [])
 
     def test_sigterm_interrupts_the_agent_keeps_the_claim_and_the_next_start_resumes(self):

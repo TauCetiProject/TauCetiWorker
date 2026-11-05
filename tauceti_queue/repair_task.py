@@ -16,8 +16,9 @@ Task protocol (``docs/queue/repair-task.md``), all JSON over HTTP with
 - ``POST /tasks/<id>/result`` ``{claim_token, tip_sha, worker_notes}`` returns the ``Adoption``
   record (``accepted``, ``reason``, ``violations``, ``retained_ref``, ``version``);
 - ``POST /tasks/<id>/release`` ``{claim_token, reason, error}`` gives the task back unfinished with a
-  named reason (``artifacts_unavailable``, ``inference_unavailable``, ``agent_failed``,
-  ``push_failed``); when the service has no such endpoint the worker lets the claim expire instead.
+  named reason (``artifacts_unavailable``, ``inference_unavailable``, ``agent_launch_failed``,
+  ``agent_failed``, ``push_failed``); when the service has no such endpoint the worker lets the claim
+  expire instead.
 
 The proposed chain is pushed to the task's ``submission_ref``
 (``refs/tauceti-queue/submissions/<task_id>/<claim_id>``) before ``result`` names its tip.
@@ -65,7 +66,15 @@ from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_cha
 SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
 SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
-RELEASE_REASONS = ("artifacts_unavailable", "inference_unavailable", "agent_failed", "push_failed")
+RELEASE_REASONS = (
+    "artifacts_unavailable",
+    "inference_unavailable",
+    "agent_launch_failed",
+    "agent_failed",
+    "push_failed",
+)
+# ``run_repair_agent`` statuses that release the task under the same name.
+RELEASED_AGENT_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
 # Checkpoint states before the agent has run: an error there is released as ``artifacts_unavailable``.
 PRE_AGENT_PHASES = (None, "claimed", "sources_ready", "artifacts_ready", "artifacts_unavailable")
 HERE = Path(__file__).resolve().parent.parent
@@ -903,10 +912,17 @@ def run_repair_agent(
     """One agent run through the worker's host path, with bounded retries on inference unavailability.
 
     Returns ``{"status": "ok"}`` on a clean exit, ``"cancelled"`` when the claim was lost, ``"failed"``
-    for the agent's own failure, ``"inference_unavailable"`` after the bounded retries, and
-    ``"artifacts_unavailable"`` when the worker's cache preparation refused to start inference.
+    for the agent's own failure, ``"inference_unavailable"`` after the bounded retries,
+    ``"agent_launch_failed"`` when the agent process could not be created at all (a missing executable,
+    an argv the kernel rejects), and ``"artifacts_unavailable"`` when the worker's cache preparation
+    refused to start inference.
     """
-    from tauceti_worker.agents import BuildCacheUnavailable, run_agent_host, take_last_agent_infra_failure
+    from tauceti_worker.agents import (
+        AgentLaunchUnavailable,
+        BuildCacheUnavailable,
+        run_agent_host,
+        take_last_agent_infra_failure,
+    )
     from tauceti_worker.config import NoProgress
     from tauceti_worker.repair_recovery import environment
 
@@ -942,6 +958,10 @@ def run_repair_agent(
                     session_actor="queue-repair-task",
                     session_scope=task.task_id,
                 )
+        except AgentLaunchUnavailable as error:
+            # Its own outcome, not the cache's: the artifacts were ready and the process never existed,
+            # so neither the artifacts backoff nor a retry with the same argv is the right response.
+            return {"status": "agent_launch_failed", "reason": str(error), "attempts": attempts}
         except BuildCacheUnavailable as error:
             return {"status": "artifacts_unavailable", "reason": str(error), "attempts": attempts}
         except NoProgress as error:
@@ -1218,14 +1238,8 @@ def run_task(
                 outcome["agent"] = agent_records
                 if agent["status"] == "cancelled":
                     return cancelled("the agent was cancelled")
-                if agent["status"] == "inference_unavailable":
-                    return release_task(
-                        cfg, client, task, state, "inference_unavailable", agent.get("reason"), outcome, lease
-                    )
-                if agent["status"] == "artifacts_unavailable":
-                    return release_task(
-                        cfg, client, task, state, "artifacts_unavailable", agent.get("reason"), outcome, lease
-                    )
+                if agent["status"] in RELEASED_AGENT_STATUSES:
+                    return release_task(cfg, client, task, state, agent["status"], agent.get("reason"), outcome, lease)
             tip = git(worktree, "rev-parse", "HEAD").strip()
             git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
             report = repair.chain_report(
@@ -1247,9 +1261,9 @@ def run_task(
                 agent_records.append(follow)
                 if follow["status"] == "cancelled":
                     return cancelled("the explanation turn was cancelled")
-                if follow["status"] == "inference_unavailable":
+                if follow["status"] in RELEASED_AGENT_STATUSES:
                     return release_task(
-                        cfg, client, task, state, "inference_unavailable", follow.get("reason"), outcome, lease
+                        cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
@@ -1338,9 +1352,9 @@ def run_task(
                 agent_records.append(follow)
                 if follow["status"] == "cancelled":
                     return cancelled("the explanation turn was cancelled")
-                if follow["status"] == "inference_unavailable":
+                if follow["status"] in RELEASED_AGENT_STATUSES:
                     return release_task(
-                        cfg, client, task, state, "inference_unavailable", follow.get("reason"), outcome, lease
+                        cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
                 attempt -= 1  # the resubmission continues this attempt
                 feedback = None
