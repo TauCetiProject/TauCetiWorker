@@ -1435,7 +1435,10 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
     except Exception as error:
         check("repository admin", False, str(error))
     try:
-        request = urllib.request.Request(f"{cfg.service.rstrip('/')}/healthz", headers={"Accept": "application/json"})
+        request = urllib.request.Request(
+            f"{cfg.service.rstrip('/')}/healthz",
+            headers={"Accept": "application/json", "User-Agent": f"tauceti-queue-repair-task/{cfg.worker}"},
+        )
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.loads(response.read() or b"{}")
         revision = payload.get("revision") or (payload.get("service") or {}).get("revision") or "?"
