@@ -48,6 +48,7 @@ import dataclasses
 import functools
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -90,6 +91,10 @@ IN_FLIGHT_STATES = (
 RESUMABLE_STATES = ("agent_running", "interrupted")
 # ``run_repair_agent`` statuses that release the task under the same name.
 RELEASED_AGENT_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
+
+PROVIDERS = repair.PROVIDERS  # claude | codex | api, as the chain names them
+DEFAULT_PROVIDERS = ("claude", "codex", "api")
+SUBSCRIPTION_PROVIDERS = ("claude", "codex")  # paced by the fleet's quota reader; ``api`` is not
 # Checkpoint states before the agent has run: an error there is released as ``artifacts_unavailable``.
 PRE_AGENT_PHASES = (None, "claimed", "sources_ready", "artifacts_ready", "artifacts_unavailable")
 HERE = Path(__file__).resolve().parent.parent
@@ -606,7 +611,16 @@ class RunnerConfig:
     root: Path = DEFAULT_ROOT  # task state, logs, worktrees and the private artifact pool
     worker: str = dataclasses.field(default_factory=default_worker_identity)
     repository: str = repair.DEFAULT_REPOSITORY
-    profile: object = "claude"  # the claude authoring profile the workers use for repair
+    profile: object = "claude"  # the claude authoring profile the workers use for repair (claude and api)
+    # The provider chain, in the order tried (``TAUCETI_QUEUE_PROVIDERS`` / ``--providers``): ``claude``
+    # (the Claude subscription), ``codex`` (the Codex subscription), ``api`` (Claude billed to the API
+    # with ``api_key``). A subscription is eligible for a task only while the pacer says it is under
+    # pace; a provider that fails before doing any work hands the task to the next one.
+    providers: tuple[str, ...] = DEFAULT_PROVIDERS
+    # The pacing curve the eligibility check applies (``TAUCETI_QUEUE_RATE`` / ``--rate``, the fleet's
+    # ``--pace`` spec, ``time%:budget%`` points); None keeps the pacer's default (``60:40``).
+    rate: str | None = None
+    api_key: str | None = dataclasses.field(default=None, repr=False)  # ANTHROPIC_API_KEY for ``api``
     token: str | None = None
     agent_timeout: float = 3 * 3600
     # The agent's foreground shell limit (``TAUCETI_SHELL_LIMIT_SECONDS``): a repair runs whole-library
@@ -692,6 +706,19 @@ class TaskState:
 
         value = read_json(self.session_path).get("session")
         return str(value) if value else None
+
+    def session_provider(self) -> str:
+        """The chain provider (``claude``, ``codex`` or ``api``) whose session the checkpoint records. A
+        checkpoint from before the chain existed names none; its session is the Claude subscription's,
+        the only provider there was, unless ``session.json``'s profile says otherwise."""
+        from tauceti_worker.runtime_status import read_json
+
+        value = self.record.get("provider")
+        if value in PROVIDERS:
+            return str(value)
+        profile = read_json(self.session_path).get("profile")
+        provider = profile.get("provider") if isinstance(profile, dict) else None
+        return str(provider) if provider in SUBSCRIPTION_PROVIDERS else "claude"
 
 
 # ----------------------------------------------------------------------------------------------
@@ -952,6 +979,144 @@ def read_telemetry(logdir: Path, provider: str) -> dict:
     return read_json(logdir / f"agent-{provider}-telemetry.json")
 
 
+# ----------------------------------------------------------------------------------------------
+# Providers
+
+
+def parse_providers(spec: str | None) -> tuple[str, ...]:
+    """The provider chain from a comma list (``TAUCETI_QUEUE_PROVIDERS`` / ``--providers``): names from
+    ``PROVIDERS`` in the order given, each at most once. An empty spec is the default chain."""
+    names = [token.strip().lower() for token in (spec or "").split(",") if token.strip()]
+    if not names:
+        if (spec or "").strip():
+            raise ValueError(f"no providers in {spec!r} (want a comma list of {', '.join(PROVIDERS)})")
+        return DEFAULT_PROVIDERS
+    for name in names:
+        if name not in PROVIDERS:
+            raise ValueError(f"unknown provider {name!r} (one of {', '.join(PROVIDERS)})")
+    if len(set(names)) != len(names):
+        raise ValueError(f"a provider is repeated in {spec!r}")
+    return tuple(names)
+
+
+def provider_profile(cfg: RunnerConfig, provider: str):
+    """The authoring profile a chain provider runs: the repository's Claude profile for ``claude`` and
+    ``api`` (``cfg.profile`` when the caller pinned one), the repository's Codex profile for ``codex``."""
+    if provider == "codex":
+        return repair.codex_profile()
+    return repair.claude_profile() if cfg.profile == "claude" else cfg.profile
+
+
+@dataclasses.dataclass(frozen=True)
+class _QuotaHome:
+    """What ``tauceti_worker.quota.Quota`` reads of a worker configuration: whose credentials (the login
+    home, through ``$CLAUDE_CONFIG_DIR`` / ``$CODEX_HOME``) and where to cache usage responses."""
+
+    home: Path
+    quota_cache: Path
+
+
+def _window_summary(windows: list) -> str:
+    parts = []
+    for window in windows:
+        used = "?" if window.used is None else f"{window.used:.0f}%"
+        budget = "" if window.budget is None else f" of {window.budget:.0f}% budget"
+        parts.append(f"{window.name} {used} used{budget}")
+    return "; ".join(parts) or "no windows reported"
+
+
+def subscription_status(cfg: RunnerConfig, provider: str) -> tuple[bool, str]:
+    """Whether a subscription provider may start a task now, and why: the fleet pacer's verdict for the
+    credential on this host (``Quota.claude`` / ``Quota.codex``: the usage endpoint's session and weekly
+    windows against the pacing curve), under ``cfg.rate`` when the operator set one. The read never
+    spends a request and never rotates a token. An unreadable or missing credential, a telemetry failure
+    and a malformed usage response are all "not eligible", with the pacer's reason."""
+    from tauceti_worker.quota import Quota, _unavail_reason
+    from tauceti_worker.repair_recovery import environment
+
+    home = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    cache = cfg.root / "quota-cache"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        with environment(TAUCETI_PACE=cfg.rate):
+            quota = Quota(_QuotaHome(home, cache))
+            verdict = quota.codex() if provider == "codex" else quota.claude()
+    except Exception as error:  # the pacer must never take the task down with it
+        return False, f"usage unmeasurable: {type(error).__name__}: {error}"
+    if verdict.available:
+        return True, f"under pace ({_window_summary(verdict.windows)})"
+    if verdict.error:
+        return False, str(verdict.error)
+    _soft, reason = _unavail_reason(verdict)
+    return False, reason
+
+
+def select_providers(cfg: RunnerConfig, *, pinned: str | None = None) -> tuple[list[str], list[dict]]:
+    """The providers of ``cfg.providers`` that may run a task now, in chain order, and the records of
+    the ones skipped (``{provider, status: "skipped", reason, seconds: 0}``): a subscription whose
+    rate-limit status is not under the pace the worker's ``--pace`` flag uses, or cannot be measured,
+    and the ``api`` provider without a key. ``pinned`` is the provider of a session being resumed: it
+    goes first and is not re-checked, since it continues work the pacer already admitted."""
+    eligible: list[str] = [pinned] if pinned in PROVIDERS else []
+    skipped: list[dict] = []
+    for provider in cfg.providers:
+        if provider == pinned:
+            continue
+        if provider in SUBSCRIPTION_PROVIDERS:
+            ok, reason = subscription_status(cfg, provider)
+        elif provider == "api":
+            ok, reason = bool(cfg.api_key), "ANTHROPIC_API_KEY set" if cfg.api_key else "no ANTHROPIC_API_KEY"
+        else:
+            ok, reason = False, f"unknown provider {provider!r}"
+        if ok:
+            eligible.append(provider)
+            continue
+        log(f"provider {provider} skipped: {reason}")
+        skipped.append({"provider": provider, "status": "skipped", "reason": reason, "seconds": 0.0})
+    return eligible, skipped
+
+
+# Codex reports a refused request as a structured ``error`` / ``turn.failed`` event whose message names
+# the condition; these are its usage-limit, rate-limit and authentication conditions.
+_CODEX_REFUSAL = re.compile(
+    r"usage_limit|rate_limit|quota_exceeded|credits_depleted|usage limit|rate limit|too many requests"
+    r"|\b(?:401|403|429)\b|unauthori[sz]ed|not logged in|sign in again|access token could not be refreshed"
+    r"|invalid (?:api key|token|authentication)",
+    re.I,
+)
+_CLAUDE_REFUSAL = re.compile(r"API Error:\s*(401|403|429|5\d\d)\b|hit your .*limit|usage limit reached", re.I)
+# The agent runs under the worker's parent-bound guardian, so an executable that is not on PATH is the
+# guardian's traceback and exit 1 rather than an OSError from Popen (which is ``AgentLaunchUnavailable``).
+_NO_EXECUTABLE = re.compile(
+    r"(?:FileNotFoundError|PermissionError|OSError):.*(?:No such file or directory|Permission denied)"
+)
+LAUNCH_FAILURE = "could not start"
+
+
+def prework_failure(provider: str, rc: int, run: dict | None, infra_reason: str | None) -> str | None:
+    """Why a provider refused the task before any work, or None when the agent did work (its exit, good
+    or bad, is then the task's). For Claude: a ``rate_limit_event`` status other than ``allowed`` /
+    ``allowed_warning``, or an API error on the first turn; for Codex: a usage-limit, rate-limit or
+    authentication error event; for either: an infrastructure failure the fleet classifier names."""
+    if rc == 0 or run is None or run.get("saw_work"):
+        return None
+    for line in run.get("tail") or []:
+        if _NO_EXECUTABLE.search(str(line)):
+            return f"{LAUNCH_FAILURE}: {str(line).strip()[:200]}"
+    status = run.get("rate_limit_status")
+    if provider != "codex" and status not in (None, "allowed", "allowed_warning"):
+        return f"rate limit status {status}"
+    failure = str(run.get("terminal_failure") or "")
+    refusal = _CODEX_REFUSAL if provider == "codex" else _CLAUDE_REFUSAL
+    if failure and refusal.search(failure):
+        return f"refused before any work: {failure.strip().splitlines()[0][:200]}"
+    if infra_reason:
+        return infra_reason
+    if failure:
+        return f"failed before any work: {failure.strip().splitlines()[0][:200]}"
+    return f"exited {rc} before any work"
+
+
 def run_repair_agent(
     cfg: RunnerConfig,
     task: Task,
@@ -963,101 +1128,183 @@ def run_repair_agent(
     env_lake: dict,
     *,
     resume: str | None = None,
+    resume_provider: str | None = None,
     label: str = "repair",
 ) -> dict:
-    """One agent run through the worker's host path, with bounded retries on inference unavailability.
+    """One agent run through the worker's host path, over the task's provider chain, with bounded
+    retries on inference unavailability.
+
+    The chain is ``select_providers``: each eligible provider in order, a resumed session's provider
+    first. A provider that fails to launch, or exits before doing any work with a rate-limit,
+    authentication or infrastructure error (``prework_failure``), hands the task to the next provider
+    at once; every provider tried or skipped is recorded in ``provider_attempts`` (``provider``,
+    ``status``, ``reason``, ``seconds``). When the whole chain fails before any work the pass is retried
+    after ``inference_delays`` up to ``inference_attempts`` times.
 
     Returns ``{"status": "ok"}`` on a clean exit, ``"cancelled"`` when the claim was lost, ``"failed"``
     for the agent's own failure, ``"inference_unavailable"`` after the bounded retries,
-    ``"agent_launch_failed"`` when the agent process could not be created at all (a missing executable,
+    ``"agent_launch_failed"`` when no provider's process could be created at all (a missing executable,
     an argv the kernel rejects), and ``"artifacts_unavailable"`` when the worker's cache preparation
-    refused to start inference.
+    refused to start inference. ``provider`` names the provider whose agent ran last.
     """
     from tauceti_worker.agents import (
         AgentLaunchUnavailable,
         BuildCacheUnavailable,
         run_agent_host,
         take_last_agent_infra_failure,
+        take_last_agent_run,
     )
     from tauceti_worker.config import NoProgress
     from tauceti_worker.repair_recovery import environment
 
-    profile = repair.claude_profile() if cfg.profile == "claude" else cfg.profile
-    provider = getattr(profile, "provider", "claude")
+    if resume and resume_provider not in PROVIDERS:
+        log("the recorded session names no provider; starting afresh")
+        resume = None
+    eligible, provider_attempts = select_providers(cfg, pinned=resume_provider if resume else None)
+    sessions: dict[str, str | None] = {resume_provider: resume} if resume else {}
     attempts: list[dict] = []
     reason = None
+    provider = None
     prompt_path = logdir / f"prompt-{label}-{time.strftime('%Y%m%d-%H%M%S')}.md"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt)
-    for index in range(1, cfg.inference_attempts + 1):
-        if cancel.is_set():
-            return {"status": "cancelled", "attempts": attempts}
-        changes = repair.isolation_env(cfg.root, env_lake)
-        changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_timeout)
-        changes["TAUCETI_SHELL_LIMIT_SECONDS"] = str(int(cfg.shell_limit))
-        started = time.monotonic()
-        state.write("agent_running", agent_label=label, agent_attempt=index, prompt=str(prompt_path), resume=resume)
-        # The worker's cap on one attempt; the plan gives the task itself no time budget.
-        expired = threading.Event()
-        timer = threading.Timer(cfg.agent_timeout, _expire_attempt, args=(expired, cancel))
-        timer.daemon = True
-        timer.start()
-        try:
-            with environment(**changes):
-                rc = run_agent_host(
-                    worktree,
-                    prompt,
-                    profile,
-                    logdir,
-                    cancel_event=cancel,
-                    resume=resume,
-                    session_path=state.session_path,
-                    session_actor="queue-repair-task",
-                    session_scope=task.task_id,
-                )
-        except AgentLaunchUnavailable as error:
-            # Its own outcome, not the cache's: the artifacts were ready and the process never existed,
-            # so neither the artifacts backoff nor a retry with the same argv is the right response.
-            return {"status": "agent_launch_failed", "reason": str(error), "attempts": attempts}
-        except BuildCacheUnavailable as error:
-            return {"status": "artifacts_unavailable", "reason": str(error), "attempts": attempts}
-        except NoProgress as error:
-            if cancel.is_set() and not expired.is_set():
-                return {"status": "cancelled", "attempts": attempts}
-            rc, reason = 75, f"agent could not start: {error}"
-        else:
-            reason = take_last_agent_infra_failure()
-        finally:
-            timer.cancel()
-        if expired.is_set():
-            cancel.clear()  # the lease is still live; only this attempt is over
-        session = state.session()
-        record = {
-            "rc": rc,
-            "seconds": round(time.monotonic() - started, 1),
-            "session": session,
-            "infrastructure_failure": reason,
-            "telemetry": read_telemetry(logdir, provider),
+    if not eligible:
+        reason = "no eligible provider: " + "; ".join(f"{s['provider']} {s['reason']}" for s in provider_attempts)
+        return {
+            "status": "inference_unavailable",
+            "reason": reason,
+            "attempts": attempts,
+            "provider_attempts": provider_attempts,
         }
-        usage = (record["telemetry"] or {}).get("usage") or {}
-        record["estimated_cost_usd"] = repair.price_usage(provider, getattr(profile, "model", None), usage)
-        attempts.append(record)
-        if expired.is_set():
-            record["timed_out"] = True
-            return {"status": "failed", "attempts": attempts, "session": session, "rc": rc, "timed_out": True}
-        if cancel.is_set():
-            return {"status": "cancelled", "attempts": attempts, "session": session}
-        if rc == 0:
-            return {"status": "ok", "attempts": attempts, "session": session}
-        if not reason:
-            return {"status": "failed", "attempts": attempts, "session": session, "rc": rc}
-        log(f"inference unavailable ({reason}); attempt {index}/{cfg.inference_attempts}")
-        resume = session or resume  # a session that exists is continued, not restarted
+
+    def result(status: str, **fields) -> dict:
+        return {
+            "status": status,
+            "attempts": attempts,
+            "provider": provider,
+            "provider_attempts": provider_attempts,
+            **fields,
+        }
+
+    for index in range(1, cfg.inference_attempts + 1):
+        launch_failures = 0
+        for provider in eligible:
+            if cancel.is_set():
+                return result("cancelled")
+            profile = provider_profile(cfg, provider)
+            telemetry_provider = getattr(profile, "provider", "claude")
+            changes = repair.isolation_env(cfg.root, env_lake, provider, api_key=cfg.api_key)
+            changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_timeout)
+            changes["TAUCETI_SHELL_LIMIT_SECONDS"] = str(int(cfg.shell_limit))
+            started = time.monotonic()
+            session_resume = sessions.get(provider)
+            state.write(
+                "agent_running",
+                agent_label=label,
+                agent_attempt=index,
+                provider=provider,
+                prompt=str(prompt_path),
+                resume=session_resume,
+            )
+            # The worker's cap on one attempt; the plan gives the task itself no time budget.
+            expired = threading.Event()
+            timer = threading.Timer(cfg.agent_timeout, _expire_attempt, args=(expired, cancel))
+            timer.daemon = True
+            timer.start()
+            run = None
+            prework = None
+            try:
+                with environment(**changes):
+                    rc = run_agent_host(
+                        worktree,
+                        prompt,
+                        profile,
+                        logdir,
+                        cancel_event=cancel,
+                        resume=session_resume,
+                        session_path=state.session_path,
+                        session_actor="queue-repair-task",
+                        session_scope=task.task_id,
+                    )
+            except AgentLaunchUnavailable as error:
+                # Its own outcome, not the cache's: the artifacts were ready and the process never existed,
+                # so neither the artifacts backoff nor a retry with the same argv is the right response.
+                rc, reason, prework = None, str(error), f"{LAUNCH_FAILURE}: {error}"
+            except BuildCacheUnavailable as error:
+                return result("artifacts_unavailable", reason=str(error))
+            except NoProgress as error:
+                if cancel.is_set() and not expired.is_set():
+                    return result("cancelled")
+                rc, reason = 75, f"agent could not start: {error}"
+                prework = reason
+            else:
+                reason = take_last_agent_infra_failure()
+                run = take_last_agent_run()
+                prework = prework_failure(provider, rc, run, reason)
+            finally:
+                timer.cancel()
+            seconds = round(time.monotonic() - started, 1)
+            if expired.is_set():
+                cancel.clear()  # the lease is still live; only this attempt is over
+            if prework is not None and not expired.is_set():
+                if prework.startswith(LAUNCH_FAILURE):
+                    launch_failures += 1
+                    reason = prework
+                log(f"provider {provider} failed before any work ({prework}); trying the next provider")
+                provider_attempts.append(
+                    {"provider": provider, "status": "failed", "reason": prework, "seconds": seconds}
+                )
+                if rc is not None:
+                    attempts.append(
+                        {
+                            "provider": provider,
+                            "rc": rc,
+                            "seconds": seconds,
+                            "session": None,
+                            "infrastructure_failure": reason,
+                            "telemetry": read_telemetry(logdir, telemetry_provider),
+                        }
+                    )
+                continue
+            provider_attempts.append({"provider": provider, "status": "ran", "reason": None, "seconds": seconds})
+            session = state.session()
+            sessions[provider] = session
+            record = {
+                "provider": provider,
+                "rc": rc,
+                "seconds": seconds,
+                "session": session,
+                "infrastructure_failure": reason,
+                "telemetry": read_telemetry(logdir, telemetry_provider),
+            }
+            usage = (record["telemetry"] or {}).get("usage") or {}
+            record["estimated_cost_usd"] = repair.price_usage(
+                telemetry_provider, getattr(profile, "model", None), usage
+            )
+            attempts.append(record)
+            if expired.is_set():
+                record["timed_out"] = True
+                return result("failed", session=session, rc=rc, timed_out=True)
+            if cancel.is_set():
+                return result("cancelled", session=session)
+            if rc == 0:
+                return result("ok", session=session)
+            if not reason:
+                return result("failed", session=session, rc=rc)
+            # The agent worked and then the provider failed under it: continue its session with the same
+            # provider on the next pass, ahead of the rest of the chain.
+            log(f"inference unavailable ({reason}); attempt {index}/{cfg.inference_attempts}")
+            eligible = [provider, *(p for p in eligible if p != provider)]
+            break
+        else:
+            if launch_failures == len(eligible):
+                return result("agent_launch_failed", reason=reason)
+            log(f"every provider failed before any work; attempt {index}/{cfg.inference_attempts}")
         if index < cfg.inference_attempts:
             delay = cfg.inference_delays[min(index - 1, len(cfg.inference_delays) - 1)] if cfg.inference_delays else 0
             if cancel.wait(delay):
-                return {"status": "cancelled", "attempts": attempts, "session": session}
-    return {"status": "inference_unavailable", "reason": reason, "attempts": attempts}
+                return result("cancelled")
+    return result("inference_unavailable", reason=reason)
 
 
 def _expire_attempt(expired: threading.Event, cancel: threading.Event) -> None:
@@ -1282,6 +1529,7 @@ def run_task(
         resubmit = False
         agent_records: list[dict] = []
         resume_session = state.session() if resuming else None
+        resume_provider = state.session_provider() if resuming else None
         while True:
             attempt += 1
             if cancel.is_set() or stopping():
@@ -1314,6 +1562,7 @@ def run_task(
                     state,
                     env_lake,
                     resume=resume_session,
+                    resume_provider=resume_provider,
                     label=f"attempt-{attempt}",
                 )
                 resume_session = None
@@ -1339,6 +1588,7 @@ def run_task(
                     state,
                     env_lake,
                     resume=agent.get("session"),
+                    resume_provider=agent.get("provider"),
                     label=f"attempt-{attempt}-explanation",
                 )
                 agent_records.append(follow)
@@ -1430,6 +1680,7 @@ def run_task(
                     state,
                     env_lake,
                     resume=agent.get("session"),
+                    resume_provider=agent.get("provider"),
                     label=f"attempt-{attempt}-explanation-resubmit",
                 )
                 agent_records.append(follow)
@@ -1636,6 +1887,19 @@ def write_heartbeat(cfg: RunnerConfig, summary: dict, state: str, **fields) -> N
         atomic_json(heartbeat_path(cfg), summary, durable=False)
 
 
+def provider_attempts_of(outcome: dict) -> list[dict]:
+    """Every provider tried or skipped across the task's agent runs, in order."""
+    return [dict(entry) for run in outcome.get("agent") or [] for entry in run.get("provider_attempts") or []]
+
+
+def provider_of(outcome: dict) -> str | None:
+    """The provider whose agent ran last for the task, if any did."""
+    for run in reversed(outcome.get("agent") or []):
+        if run.get("provider"):
+            return run["provider"]
+    return None
+
+
 def inference_report_for(outcome: dict) -> tuple[bool, str] | None:
     """What an outcome says about the provider, for ``report_inference``: the agent answered (even
     with a chain the service or the worker refused) is a success that lifts a hold; a release for
@@ -1760,15 +2024,22 @@ def serve(
         "errors": 0,
         "last_error": None,
         "last_outcome": None,
+        "providers": {},  # per provider: how often it ran, was skipped, or failed before any work
     }
 
     def record(outcome: dict) -> None:
         summary["tasks"] += 1
         summary["outcomes"][outcome["status"]] = summary["outcomes"].get(outcome["status"], 0) + 1
+        provider_attempts = provider_attempts_of(outcome)
+        for entry in provider_attempts:
+            counts = summary["providers"].setdefault(entry["provider"], {"ran": 0, "skipped": 0, "failed": 0})
+            counts[entry["status"]] = counts.get(entry["status"], 0) + 1
         summary["last_outcome"] = {
             "task_id": outcome.get("task_id"),
             "status": outcome.get("status"),
             "reason": outcome.get("reason"),
+            "provider": provider_of(outcome),
+            "provider_attempts": provider_attempts,
             "at": time.time(),
         }
         report_inference(cfg, client, outcome)
@@ -1847,9 +2118,21 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
     def check(name: str, ok: bool, detail: str) -> None:
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
-    for tool in ("git", "gh", "lake", "claude"):
+    tools = ["git", "gh", "lake"]
+    if {"claude", "api"} & set(cfg.providers):
+        tools.append("claude")
+    if "codex" in cfg.providers:
+        tools.append("codex")
+    for tool in tools:
         where = shutil.which(tool)
         check(f"tool {tool}", where is not None, where or "not on PATH")
+    try:
+        from tauceti_worker.quota import parse_pace_curve
+
+        curve = parse_pace_curve(cfg.rate)
+        check("providers", bool(cfg.providers), ", ".join(cfg.providers) + f"; rate {cfg.rate or 'default'} ({curve})")
+    except ValueError as error:
+        check("providers", False, f"rate {cfg.rate!r}: {error}")
     try:
         cfg.token or worker_token()
         check("github token", True, f"from {token_source()}")
@@ -1879,13 +2162,25 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
         check("content clone", bool(remote), f"{cfg.clone} (origin {remote})")
     except Exception as error:
         check("content clone", False, f"{cfg.clone}: {error}")
-    try:
-        from tauceti_worker.quota import claude_dir
+    home = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    if "claude" in cfg.providers:
+        try:
+            from tauceti_worker.quota import claude_dir
 
-        credentials = claude_dir(Path(os.environ.get("HOME", os.path.expanduser("~")))) / ".credentials.json"
-        check("claude credentials", credentials.is_file(), str(credentials))
-    except Exception as error:
-        check("claude credentials", False, str(error))
+            credentials = claude_dir(home) / ".credentials.json"
+            check("claude credentials", credentials.is_file(), str(credentials))
+        except Exception as error:
+            check("claude credentials", False, str(error))
+    if "codex" in cfg.providers:
+        try:
+            from tauceti_worker.quota import codex_dir
+
+            credentials = codex_dir(home) / "auth.json"
+            check("codex credentials", credentials.is_file(), str(credentials))
+        except Exception as error:
+            check("codex credentials", False, str(error))
+    if "api" in cfg.providers:
+        check("anthropic api key", bool(cfg.api_key), "ANTHROPIC_API_KEY " + ("set" if cfg.api_key else "not set"))
     try:
         cfg.root.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(cfg.root).free / 2**30
@@ -1906,7 +2201,23 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__.split("\n\n")[0]
         + " Defaults come from the environment the service unit's EnvironmentFile sets: TAUCETI_QUEUE_SERVICE,"
         " TAUCETI_QUEUE_WORKER, TAUCETI_QUEUE_CLONE, TAUCETI_QUEUE_TASK_ROOT, TAUCETI_QUEUE_POLL_SECONDS,"
-        " TAUCETI_QUEUE_SEED_PACKAGES, TAUCETI_QUEUE_TOKEN_FILE (or TAUCETI_QUEUE_TOKEN).",
+        " TAUCETI_QUEUE_SEED_PACKAGES, TAUCETI_QUEUE_TOKEN_FILE (or TAUCETI_QUEUE_TOKEN), TAUCETI_QUEUE_PROVIDERS,"
+        " TAUCETI_QUEUE_RATE and ANTHROPIC_API_KEY (the api provider's key).",
+    )
+    parser.add_argument(
+        "--providers",
+        default=os.environ.get("TAUCETI_QUEUE_PROVIDERS") or ",".join(DEFAULT_PROVIDERS),
+        metavar="NAME[,NAME...]",
+        help="the provider chain, tried in order for each task: claude (the Claude subscription), codex "
+        "(the Codex subscription), api (Claude through ANTHROPIC_API_KEY); a subscription over its pace is "
+        f"skipped ($TAUCETI_QUEUE_PROVIDERS; default {','.join(DEFAULT_PROVIDERS)})",
+    )
+    parser.add_argument(
+        "--rate",
+        default=os.environ.get("TAUCETI_QUEUE_RATE") or None,
+        metavar="T:B[,T:B...]",
+        help="the pacing curve a subscription must be under to take a task, as the fleet's --pace spec "
+        "(time%%:budget%% points, e.g. 60:40) ($TAUCETI_QUEUE_RATE; default: the pacer's default curve)",
     )
     parser.add_argument(
         "--service",
@@ -1949,6 +2260,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.service:
         parser.error("--service (or TAUCETI_QUEUE_SERVICE) is required")
+    try:
+        providers = parse_providers(args.providers)
+    except ValueError as error:
+        parser.error(f"--providers: {error}")
+    if args.rate:
+        from tauceti_worker.quota import parse_pace_curve
+
+        try:
+            parse_pace_curve(args.rate)
+        except ValueError as error:
+            parser.error(f"--rate: {error}")
+    # The api provider's key, from the environment file; taken out of this process's environment so
+    # only the api provider's agent ever sees it (and nothing logs it).
+    api_key = (os.environ.pop("ANTHROPIC_API_KEY", "") or "").strip() or None
 
     clone = args.clone
     if clone is None:
@@ -1966,6 +2291,9 @@ def main(argv: list[str] | None = None) -> int:
         keep_worktree=args.keep_worktree,
         seed_packages=args.seed_packages,
         poll_seconds=args.poll,
+        providers=providers,
+        rate=args.rate or None,
+        api_key=api_key,
     )
     if args.check:
         checks = preflight(cfg)
