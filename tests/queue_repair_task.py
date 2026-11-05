@@ -2131,10 +2131,22 @@ class Serve(Fixture):
 
     def test_claim_run_submit_then_idle_until_stopped(self):
         cfg = self.config(poll_seconds=0.2)
-        stop = repair_task.Stop()
+        idle = threading.Event()
+        service = self.service
+
+        class IdleStop(repair_task.Stop):
+            def wait(self, timeout=None):
+                if timeout == cfg.poll_seconds and len(service.results) == 1 and len(service.claim_attempts) >= 3:
+                    # Hold the observed idle interval until the test stops the worker. A claim
+                    # being recorded alone does not mean its request has returned to idle yet.
+                    idle.set()
+                    return super().wait()
+                return super().wait(timeout)
+
+        stop = IdleStop()
         thread, result = self.serve_in_thread(cfg, stop)
         self.wait_for(
-            lambda: len(self.service.results) == 1 and len(self.service.claim_attempts) >= 3,
+            idle.is_set,
             "the task was adopted and the loop went on polling for the next one",
         )
         self.assertEqual(self.heartbeat(cfg)["state"], "idle")
