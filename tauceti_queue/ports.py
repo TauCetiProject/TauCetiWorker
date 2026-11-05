@@ -273,6 +273,10 @@ class Task:
     instruction: str
     created_at: float
     extra: dict[str, Any] = field(default_factory=dict)
+    # `pre_rebase` and `prepare`: the revisions whose published repair outputs the worker restores
+    # before the agent runs, in order (the head's tips then its base, or the batch's previous tips
+    # then its base).
+    warm_revs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -293,6 +297,7 @@ class Task:
             "instruction": self.instruction,
             "created_at": self.created_at,
             "extra": self.extra,
+            "warm_revs": list(self.warm_revs),
         }
 
 

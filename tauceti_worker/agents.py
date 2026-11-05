@@ -898,10 +898,18 @@ def run_agent_host(
     session_actor=None,
     session_scope=None,
     quota_cfg=None,
+    cache_note: bool = True,
 ) -> int:
+    """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
+    ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
+    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache."""
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
-    if TAUCETI_CACHE_SERVICE and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+    if (
+        cache_note
+        and TAUCETI_CACHE_SERVICE
+        and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
+    ):
         prompt += (
             "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
             "checkout and current main. The public `tauceti-public` Lake service remains configured "
@@ -966,6 +974,8 @@ def run_agent_host(
         return 0
     _LAST_AGENT_FAILURE = None
     with host_build_cache_context(cwd, env, logdir) as prefix:
+        if not cache_note:
+            env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
             [*(prefix or []), *argv],
             env=env,

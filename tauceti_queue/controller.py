@@ -1520,6 +1520,7 @@ class Controller:
             instruction=AGENT_INSTRUCTION,
             created_at=task["created_at"],
             extra=extra,
+            warm_revs=self._warm_revs(task, batch),
         )
 
     def _create_task(
@@ -1652,24 +1653,74 @@ class Controller:
         first, at most `REPAIR_OUTPUTS_PREVIOUS_TIPS`), then its base, then the canonical commit when it
         differs. No revision appears twice and the head's own tip, which CI is given separately, is left out.
         """
-        previous = self.store.rows(
-            "batch_tips",
-            {"batch_id": head["id"]},
-            order="version DESC",
-        )
-        revs: list[str] = []
+        revs = self._previous_tips(head)
 
         def add(sha: str | None) -> None:
             if sha and sha != head["tip"] and sha not in revs:
                 revs.append(sha)
 
-        for row in previous:
-            if len(revs) >= REPAIR_OUTPUTS_PREVIOUS_TIPS:
-                break
-            if row["version"] < head["version"]:
-                add(row["tip"])
         add(head["base"])
         add(self._canonical)
+        return revs
+
+    def _previous_tips(self, batch: dict[str, Any], version: int | None = None) -> list[str]:
+        """The batch's tips before `version` (default its current version), newest first, at most
+        `REPAIR_OUTPUTS_PREVIOUS_TIPS`, without repeats and without its tip at `version`."""
+        version = batch["version"] if version is None else version
+        current = self.store.row("batch_tips", {"batch_id": batch["id"], "version": version})
+        exclude = {batch["tip"] if version == batch["version"] else None, current["tip"] if current else None}
+        tips: list[str] = []
+        for row in self.store.rows("batch_tips", {"batch_id": batch["id"]}, order="version DESC"):
+            if len(tips) >= REPAIR_OUTPUTS_PREVIOUS_TIPS:
+                break
+            if row["version"] < version and row["tip"] and row["tip"] not in exclude and row["tip"] not in tips:
+                tips.append(row["tip"])
+        return tips
+
+    def _warm_revs(self, task: dict[str, Any], batch: dict[str, Any]) -> list[str]:
+        """The revisions whose published repair outputs the worker restores before the agent runs.
+
+        A `pre_rebase` task builds on the head's tip, which is never in the public cache: the head's
+        current tip (the task's `onto` first should the head have moved since), its previous tips
+        (newest first, at most `REPAIR_OUTPUTS_PREVIOUS_TIPS`), then the head's base. A `prepare` task
+        of the pre-rebased chain builds there too: the head's tips, then the batch's own tips (the one
+        the pre-rebase covers, then the earlier ones). A `prepare` task on the batch's own base: the
+        batch's previous tips, then that base. Lake reuses
+        artifacts by content trace, so a nearly identical tree's outputs serve nearly completely.
+        Empty for the other kinds, whose artifacts the worker finds from the task's own revisions.
+        """
+        revs: list[str] = []
+
+        def add(sha: str | None) -> None:
+            if sha and sha not in revs:
+                revs.append(sha)
+
+        def head_tips() -> dict[str, Any] | None:
+            add(task["onto"])
+            ahead = self._head()
+            if ahead is None or ahead["id"] == batch["id"]:
+                return None
+            add(ahead["tip"])
+            for tip in self._previous_tips(ahead):
+                add(tip)
+            return ahead
+
+        if task["kind"] == TASK_PRE_REBASE:
+            ahead = head_tips()
+            if ahead is not None:
+                add(ahead["base"])
+        elif self._pre_rebased_prepare(task):
+            # The pre-rebased chain sits on the head's tip: the head's tips, then the batch's own tips
+            # (the one the pre-rebase covers first), whose outputs a preparation on its own base published.
+            head_tips()
+            add(task["pre_rebase_source"])
+            for tip in self._previous_tips(batch, task["batch_version"]):
+                add(tip)
+        elif task["kind"] == TASK_PREPARE:
+            for tip in self._previous_tips(batch, task["batch_version"]):
+                if tip != task["tip"]:
+                    add(tip)
+            add(task["base"])
         return revs
 
     def _create_open_batch(self, base: str, now: float) -> dict[str, Any]:
