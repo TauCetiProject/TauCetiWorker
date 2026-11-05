@@ -112,7 +112,7 @@ Repair task 5, claimed by worker 1 at 09:08:
 - the lead agent restored the lemma in `Paths.lean` within PR 27672's commit and finished at 09:18:58 (16 turns, about 3 minutes); the worker ran no verification build of its own after the lead agent (fixed by https://github.com/TauCetiProject/TauCetiWorker/pull/545);
 - publishing the outputs (25,918 artifacts, 734 MiB) took 990 s and ran before submission; the chain was submitted at 09:36:18 as version 1200, tip `89293a361f`. CI attempt 10 is run 42003719651.
 
-Lessons: the worker must run CI's audits itself, since a green build is not a green CI (https://github.com/TauCetiProject/TauCetiWorker/pull/545), and publishing must not delay submission (https://github.com/TauCetiProject/TauCetiWorker/pull/548, open).
+Lessons: the worker must run CI's audits itself, since a green build is not a green CI (https://github.com/TauCetiProject/TauCetiWorker/pull/545), and publishing must not delay submission (https://github.com/TauCetiProject/TauCetiWorker/pull/548, merged later the same day).
 
 Batch 3 (207 members): pre-rebase task 3 adopted at 09:08:26; prepare task 4 claimed by worker 2 at 09:13:53, still running at the time of writing.
 
@@ -141,6 +141,40 @@ Remedy: `systemctl --user stop tauceti-queue.service` and `systemctl --user disa
 - CI's audits and changed-module lint run in the repair worker: https://github.com/TauCetiProject/TauCetiWorker/pull/545;
 - the portable tests green without bubblewrap: https://github.com/TauCetiProject/TauCetiWorker/pull/546.
 
+## Head 2 landing (2026-11-05)
+
+All times UTC. Head 2 landed at about 14:09 on CI attempt 13 (run 42037197161): 1,197 PRs, `main` now `482d8ed159aba195ef10855ef14986d48f2277c4`. The rounds after attempt 10:
+
+- attempt 10 (run 42003719651) was cancelled by the replay when https://github.com/TauCetiProject/TauCeti/pull/28186 merged at 10:59;
+- attempt 11 (run 42015500147), dispatched at 11:01, had only the base as fetch candidate because the new `batch_tips` table was empty; the operator backfilled the tips and cancelled it at 11:04;
+- attempt 12 (run 42016336692) ran from 11:05 to 12:52, built from scratch and failed in `lint-env` with 8 new simpNF violations (the audits passed);
+- repair task 10 (worker 1, Codex `gpt-6-astra`; the Claude subscription was skipped as ahead of pace) was adopted at 13:34:57 as tip `1a5349d2`, and the replay onto `main` `b3b0334a` (https://github.com/TauCetiProject/TauCeti/pull/28264) gave version 1203, tip `482d8ed1`;
+- attempt 13 was dispatched at 13:35 with fetch candidates `1a5349d2`, `3477e48a`, `89293a36`, `6d0442e5` and `b3b0334a`; fetching the repair outputs took 7 minutes (13:43 to 13:50) and the build, audits and lint 18.5 minutes (13:50 to 14:09), and it succeeded.
+
+The outbox then held 2,394 landed comments and closes to drain.
+
+## Cache findings (2026-11-05)
+
+The rounds took about three hours because CI's base-cache lookup walks at most 1,000 first-parent ancestors, and a 1,197-commit head puts `main` beyond that walk: CI discarded the base cache and compiled everything from source, and the repair-output fetch then skipped itself because `LAKE_ARTIFACT_CACHE=false`. Fixes, all merged on 2026-11-05:
+
+- TauCetiTools: several candidate revisions (https://github.com/TauCetiProject/TauCetiTools/pull/168), the fetch even when the base cache was discarded and the miss regex (https://github.com/TauCetiProject/TauCetiTools/pull/169), and the exact base lookup `LAKE_CACHE_BASE_REV` (https://github.com/TauCetiProject/TauCetiTools/pull/170);
+- TauCeti: CI consumes the repair outputs (https://github.com/TauCetiProject/TauCeti/pull/28186, merged at 10:59 as `d0b6fe9d`), and the pin bump with the base revision (https://github.com/TauCetiProject/TauCeti/pull/28264, merged between 13:20 and 13:30 as `b3b0334a`);
+- TauCetiWorker: `repair_outputs_revs` in the dispatch payload and the `batch_tips` table (https://github.com/TauCetiProject/TauCetiWorker/pull/550); publishing after submission (https://github.com/TauCetiProject/TauCetiWorker/pull/548); the pre-rebase warmed and prepared from the repair cache (https://github.com/TauCetiProject/TauCetiWorker/pull/553); head repairs warmed from the head's published tips (https://github.com/TauCetiProject/TauCetiWorker/pull/554); the pre-rebased chain prepared (https://github.com/TauCetiProject/TauCetiWorker/pull/551).
+
+Incidents on the way:
+
+- The fleet harness's "Build cache preparation" prompt appendix in `tauceti_worker/agents.py` told the Codex agent to stop on a public-cache miss, which aborted batch 3's pre-rebase twice; fixed with https://github.com/TauCetiProject/TauCetiWorker/pull/553.
+- The new `ci_attempts` column from https://github.com/TauCetiProject/TauCetiWorker/pull/550 was not added to the live store, and status failed for four minutes from 10:33 until the operator ran the `ALTER TABLE`; https://github.com/TauCetiProject/TauCetiWorker/pull/552 derives the column migration from the schema.
+- From 12:40 to 12:51 a service restart during GitHub rate limiting left both workers refused with 401, and one claim expired; https://github.com/TauCetiProject/TauCetiWorker/pull/555 persists the identities across restarts.
+
+## Batch 3 (2026-11-05)
+
+Batch 3 held 234 PRs after insertions. Its own-base prepare task 8 was adopted at 12:25; pre-rebase tasks 6, 7 and 9 were each superseded by a change of head 2; task 11, onto `482d8ed1`, was running on worker 1 at 13:36.
+
+## Provider chain in production (2026-11-05)
+
+The Claude subscription was skipped all day as ahead of its weekly pace (55% used at 33% of the week). Codex through the ChatGPT account needs `TAUCETI_AUTHORING_CODEX_MODEL=gpt-6-astra`, because `gpt-6.1-sol` is API-only there; without that pin the task falls through to the API key.
+
 ## Operator items outstanding
 
 0. Repair worker host: chungus for now (96 CPUs, 400 GB free), with the Claude Code credentials and the API key the operator placed there; it moves with the service to the dedicated host.
@@ -154,9 +188,11 @@ Remedy: `systemctl --user stop tauceti-queue.service` and `systemctl --user disa
 
 ## Next steps
 
-- Watch head 2's CI attempt 10 (run 42003719651) and its landing.
+- Watch batch 3 seal as head 3, and its CI reuse the outputs of the pre-rebased prepare.
+- Watch the outbox drain the 2,394 landed comments and closes of head 2.
+- The Zulip reply to Christian is pending the operator's review.
+- The fresh machine for the service (below).
 - Restart worker 2 onto `9d2643f` after prepare task 4 finishes, and verify its revision.
-- Land https://github.com/TauCetiProject/TauCetiWorker/pull/548 so publishing no longer delays submission.
 - Move the service and the repair worker from chungus to the dedicated machine when it arrives, restoring the systemd units and the backup timer ([operations.md](operations.md), "Moving to the dedicated host").
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
 - Give Bors's admission-time checks (declaration collisions, merge-selection overlaps) to the agent as diagnostics, as described in the plan; streaming repair, the other follow-up there, is done (https://github.com/TauCetiProject/TauCetiWorker/pull/531).
