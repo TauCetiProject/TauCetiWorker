@@ -232,6 +232,9 @@ pgrep -af 'run-service.sh|run-tunnel.sh|tauceti-queue serve|cloudflared tunnel|r
 
 Consequences:
 
+- **File-descriptor limit.** Detached processes do not get the units' `LimitNOFILE=65536`; they
+  inherit the login's limit of 1,024, which a large repair exhausts. The supervisor scripts run
+  `ulimit -n 65536` first; start the repair worker from a shell that has done the same.
 - **No restart after a reboot.** After a reboot of chungus, or whenever `pgrep` shows a process
   missing, the operator or an agent starts the three again by hand as above. The repair worker has no
   loop around it, so a crash leaves it down until restarted.
@@ -323,8 +326,16 @@ requirements below (the service's `repair_concurrency` setting bounds how many h
     `codex login`), copied into the task's isolated `CODEX_HOME` as the fleet seeds its isolated
     workers'; `codex` on PATH. `api`: `ANTHROPIC_API_KEY` in the environment file itself (mode 0600),
     which the worker takes out of its own environment at start and gives only to that provider's agent.
+    The `claude` binary first on PATH must be recent enough for the configured model; on chungus the
+    managed install (2.1.318 on 2026-11-05) must come before any older copy on PATH.
     Leave a provider out of the chain when the host has no credential for it; `--check` reports each
     one named in the chain.
+- **Worker cache** (optional): `TAUCETI_REPAIR_CACHE_URL`, `TAUCETI_REPAIR_CACHE_UPLOAD_URL` and
+  `TAUCETI_REPAIR_CACHE_KEY_FILE` ([repair-task.md](repair-task.md), "Repair cache publication").
+  The bucket and `repair-cache.taucetiproject.org` exist; the R2 write token does not yet, so
+  repairs read the namespace and publish nothing.
+- **Parallel agents.** `TAUCETI_QUEUE_PARALLEL_AGENTS` (default 3) bounds the concurrent agents within
+  one task ([repair-task.md](repair-task.md), "Parallel agents within one task").
 - The content clone named by `TAUCETI_QUEUE_CLONE` (the installer creates it).
 
 The chain is tried in order for each task. A subscription provider is eligible only while the fleet

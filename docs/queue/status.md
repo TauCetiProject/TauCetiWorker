@@ -52,6 +52,8 @@ The service is the production merge backend since 22:58 UTC. Sequence, all times
 7. 23:00 to 23:25: head 1's four staging runs failed before building with "bors identity unavailable": TauCeti's `pr-build.yml` resolves a dispatch through the feed's `train` and fetches the branch `staging-candidate-<candidate>-<generation>`, which the service neither named nor pushed (the scratch repository's workflow lacked that step, so the rehearsal never exercised it). Fixed by https://github.com/TauCetiProject/TauCetiWorker/pull/503, deployed 23:32 as `fc4f5e7b`; `retry-ci` at 23:33; run 41934607574 passed the identity step and built.
 8. 23:27: the `merge-queue-main` ruleset's bypass actors and the classic protection's pull-request bypass allowances on `TauCetiProject/TauCeti` gained the queue App (5607007) beside the Bors App (5172678); without it the fast-forward promotion would have been refused.
 9. 2026-11-05, 01:10 to 01:13: service moved from tauchonki to chungus. tauchonki's load sat between 150 and 490 (it also runs the fleet's staging builds and many Claude sessions), one controller pass took ten minutes and the public endpoints timed out. Service and backup timer stopped on tauchonki (backup `queue-20261105T011003Z.sqlite3`), `~/TauCetiQueue-data`, the App credentials, `config.toml` and the tunnel files copied, `install.sh --revision d84649118232 --no-restart`, then the service and the tunnel started on chungus as detached processes (no root, no lingering); both hostnames report host chungus since 01:13:33. tauchonki's units are disabled and its data directory kept for a day.
+10. 2026-11-05, 00:33: head 1 landed (00:33:19) and head 2 (batch 2, 1,197 members) sealed (00:33:23). Its scripted rebase onto `main` conflicted at PR 24255 and became rebase-conflict task 2.
+11. 2026-11-05, 03:13: the repair worker on chungus claimed task 2 for real, after the plumbing defects listed under "First repair run" were fixed.
 
 Compatibility audit after the first failure (every Bors consumer in TauCeti, TauCetiTools at the pinned `8bad7a00`, TauCetiReview, the workers and bors-ng, against the service): the remaining findings and their fixes are
 
@@ -60,15 +62,50 @@ Compatibility audit after the first failure (every Bors consumer in TauCeti, Tau
 - squash commit subjects lacked the ` (#N)` suffix TauCetiTools' lint attribution and GitHub's commit linking use: https://github.com/TauCetiProject/TauCetiWorker/pull/506;
 - not blocking, to do: no `tauceti-merge-reconcile` dispatch (TauCetiReview's focused sweep now runs hourly only), no cancellation of a superseded staging run after a rebase, no `tauceti-bors-pr-approved` dispatch after an admin scope approval, and a missing-status run is classified as an infrastructure failure immediately although the finalizer may defer publication for up to an hour.
 
-Head 1's first complete run (23:55 UTC) failed the whole-library environment lint on seven simpNF findings in modules the PR never touched: without the subject suffix the lint could not scope to changed modules, so the findings were inherited from `main`. Rather than send an agent to fix unrelated lints, https://github.com/TauCetiProject/TauCetiWorker/pull/510 added `POST /admin/rebuild-head`, and head 1 was rebuilt with the suffixed subject at 00:41 UTC on 2026-11-05 (version 8, attempt 7).
+Head 1's first complete run (23:55 UTC) failed the whole-library environment lint on seven simpNF findings in modules the PR never touched: without the subject suffix the lint could not scope to changed modules, so the findings were inherited from `main`. Rather than send an agent to fix unrelated lints, https://github.com/TauCetiProject/TauCetiWorker/pull/510 added `POST /admin/rebuild-head`, and head 1 was rebuilt with the suffixed subject at about 00:17 UTC on 2026-11-05 (version 8, attempt 7, run 41940173478).
 
-Also landed or opened on the day: the status summary read the real status document (https://github.com/TauCetiProject/TauCetiWorker/pull/504; the installer's verification had failed on it), the rehearsal repository carries the production staging path and the rehearsal driver scaffolds it with `--public-url` (https://github.com/TauCetiProject/TauCetiWorker/pull/505; hostname `queue-rehearsal.taucetiproject.org` forwards to port 8781 on the service host), and the continuous repair worker unit (https://github.com/TauCetiProject/TauCetiWorker/pull/507; `services/queue/tauceti-queue-repair.service`, `install-repair.sh`, operations.md "Repair worker"), being installed on `chungus` (96 CPUs, 400 GB free) against the production service.
+Also landed or opened on the day: the status summary read the real status document (https://github.com/TauCetiProject/TauCetiWorker/pull/504; the installer's verification had failed on it), the rehearsal repository carries the production staging path and the rehearsal driver scaffolds it with `--public-url` (https://github.com/TauCetiProject/TauCetiWorker/pull/505; hostname `queue-rehearsal.taucetiproject.org` forwards to port 8781 on the service host), and the continuous repair worker unit (https://github.com/TauCetiProject/TauCetiWorker/pull/507; `services/queue/tauceti-queue-repair.service`, `install-repair.sh`, operations.md "Repair worker"), running on `chungus` against the production service since 2026-11-05.
 
 Found 2026-11-05 03:20 UTC: 94 of the 1,197 members of open batch 2 had been landed by Bors during the shadow period with exactly the head the batch holds, and the scripted rebase of the head conflicted at its 14th commit because landed and unlanded changes interleave in the same files. Members are never withdrawn; since https://github.com/TauCetiProject/TauCetiWorker/pull/526 the chain tool recognises a member the new base already carries (subject ` (#N)` or `Source-PR` trailer in the commits since the old base) and writes an empty commit with a note instead of cherry-picking it, and the rebase-conflict diagnostics list such members under `landed_on_base`.
 
+## First repair run (head 2, task 2)
+
+Defects found between the seal and the claim, each fixed before the worker could start:
+
+- refs retained during shadow mode were not republished: https://github.com/TauCetiProject/TauCetiWorker/pull/516;
+- claim release and resume across restarts, batched ref fetches: https://github.com/TauCetiProject/TauCetiWorker/pull/518, https://github.com/TauCetiProject/TauCetiWorker/pull/520, https://github.com/TauCetiProject/TauCetiWorker/pull/524;
+- artifacts prepared for the rebase target, and the stale cache log: https://github.com/TauCetiProject/TauCetiWorker/pull/521, https://github.com/TauCetiProject/TauCetiWorker/pull/529;
+- the 291 KB prompt exceeded the argument limit and now goes on stdin: https://github.com/TauCetiProject/TauCetiWorker/pull/522;
+- a short prompt, rewritten after operator review: https://github.com/TauCetiProject/TauCetiWorker/pull/523, https://github.com/TauCetiProject/TauCetiWorker/pull/525;
+- the detached processes ran with a file-descriptor limit of 1,024: raised to 65,536 in the supervisor scripts;
+- the Claude Code binary on PATH was too old for the model: the managed install was updated to 2.1.318 and the PATH order fixed.
+
+The agent (Claude Code 2.1.316, `claude-opus-5-5`, effort high, Max subscription) finished the rebase of all 1,197 commits by about 03:50 UTC: the 94 members Bors had landed during shadow became empty commits and 36 messages were extended. It then repaired the first build pass's 42 failing modules (duplicate declarations between members, rename ripples such as PR 25195's Killing-form API, a missing instance, API changes on `main`), committing each fix into the owning member. At about 05:00 UTC it was in the second pass, fixing dependents and sweeping cross-module duplicates, after more than 950 tool calls.
+
+## Repair improvements (2026-11-05)
+
+Operator decisions recorded in the plan ([ai-merge-queue.md](../redesign/specs/ai-merge-queue.md)): no head-size cap, and the five improvements from the first repair plus items 6 and 7 implemented at once. All merged on 2026-11-05:
+
+- file ownership and declaration context for the agent: https://github.com/TauCetiProject/TauCetiWorker/pull/532;
+- repair while the build streams: https://github.com/TauCetiProject/TauCetiWorker/pull/531;
+- artifacts from the newest cached revision: https://github.com/TauCetiProject/TauCetiWorker/pull/529;
+- parallel agents within a task, orchestrated by the worker and provider-neutral: https://github.com/TauCetiProject/TauCetiWorker/pull/534;
+- a scoped build helper (`.tauceti-repair/build`): https://github.com/TauCetiProject/TauCetiWorker/pull/528;
+- repair outputs published to the worker cache `tauceti-repair` (R2 bucket created, `repair-cache.taucetiproject.org` attached, write credential not yet created): https://github.com/TauCetiProject/TauCetiWorker/pull/530;
+- repair builds in CI's `bwrap` sandbox: https://github.com/TauCetiProject/TauCetiWorker/pull/533;
+- provider chain `claude`, `codex` (`gpt-6.1-sol`), `api`, admitted by the fleet's pace curve: https://github.com/TauCetiProject/TauCetiWorker/pull/527;
+- members already on `main` replayed as empty commits automatically: https://github.com/TauCetiProject/TauCetiWorker/pull/526;
+- worker and operator identities cached through GitHub rate limits: https://github.com/TauCetiProject/TauCetiWorker/pull/519;
+- bounded controller passes, batched ref pushes and a status snapshot: https://github.com/TauCetiProject/TauCetiWorker/pull/515;
+- a second open batch: https://github.com/TauCetiProject/TauCetiWorker/pull/514.
+
+Undecided: whether CI may consume the repair's published outputs instead of recompiling (candidate: a `lean4checker` replay in CI over the published oleans); to be decided after head 2 lands.
+
 ## Operator items outstanding
 
-0. A host for the repair worker and the remaining repair experiments: about 50 GB free, the Lean toolchain, Claude Code credentials, a GitHub login with admin on TauCeti. tauchonki's array is nearly full (staging builds share it) and chungus2 is the operator's development machine.
+0. Repair worker host: chungus for now (96 CPUs, 400 GB free), with the Claude Code credentials and the API key the operator placed there; it moves with the service to the dedicated host.
+6. Create the R2 write token for the `tauceti-repair` bucket and place it on the repair host as `TAUCETI_REPAIR_CACHE_KEY_FILE`; until then repairs read the worker cache but publish nothing.
+7. Agree to pausing the `tauceti-bors` Worker's cron (it still runs against the suspended installation).
 1. Done: the `tauceti-queue` App is created and installed on `TauCetiProject/TauCeti`.
 2. Create `TauCetiProject/TauCetiQueueScratch` (stream I) and add it to the `tauceti-queue` App installation; optionally grant the App `checks: write` so the rehearsal can approve through `merge eligibility` checks (`docs/queue/rehearsal.md`). The rehearsal pushes the content itself.
 3. Staging capacity: no action for now (operator decision, 2026-11-04). Revisit from the pilot's measurements.
@@ -77,10 +114,11 @@ Found 2026-11-05 03:20 UTC: 94 of the 1,197 members of open batch 2 had been lan
 
 ## Next steps
 
-- Watch the first three heads land (head 1 is one PR; head 2 is the whole open batch of about 1,200 members, the first large head, with repair tasks run by hand and their transcripts read live until the repair worker host exists).
-- Land the verdict-contexts PR and the TauCetiTools pin bump before head 2 reaches its verdict.
-- Move the service from chungus to the dedicated machine when it arrives (about eight hours after the 2026-11-05 01:13 UTC move), restoring the systemd units and the backup timer; the procedure is in [operations.md](operations.md), "Moving to the dedicated host".
+- Let task 2 finish and submit, then watch head 2's CI round and landing.
+- After the current run submits, deploy the merged worker and service code on chungus (both were deliberately not restarted mid-run) and verify the running revisions.
+- Move the service and the repair worker from chungus to the dedicated machine when it arrives, restoring the systemd units and the backup timer ([operations.md](operations.md), "Moving to the dedicated host").
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
+- Give Bors's admission-time checks (declaration collisions, merge-selection overlaps) to the agent as diagnostics, as described in the plan; streaming repair, the other follow-up there, is done (https://github.com/TauCetiProject/TauCetiWorker/pull/531).
 - The `staging-candidate-*` branches the service pushes accumulate as Bors's did; add deletion after the attempt's verdict.
 - Decide whether PRs that modify `scripts/` or `.github/` should enter batches at all: the repair
   agent is told not to introduce changes there, but a constituent PR that modifies such files keeps
