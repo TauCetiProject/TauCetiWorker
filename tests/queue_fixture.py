@@ -574,6 +574,53 @@ class HeadOperations(QueueFixture):
             [f"{PROJECT}#101", f"{PROJECT}#102"],
         )
 
+    def test_member_landed_by_an_admin_merge_rebases_to_an_empty_commit_and_the_head_lands(self):
+        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        head = self.head()
+        before = self.chain_commits(head)
+        self.github.start_runs()
+        # An admin squash-merges PR 101 on GitHub (subject suffix, no trailer) and then edits the same
+        # line again; the plain cherry-pick of 101's commit cannot take that.
+        landing = self.repo.advance_main(
+            {"Shared.lean": "line one\nline two changed by 101\nline three\n"}, message="Change 101 (#101)"
+        )
+        admin = self.repo.advance_main(
+            {"Shared.lean": "line one\nline two changed by 101, then by admin\nline three\n"},
+            message="admin edits line two",
+        )
+        self.github.complete_runs()
+        self.tick()
+        prior = next(c for c in before if c.source_pr == f"{PROJECT}#101")
+        self.assertFalse(chain.merge_trees(self.repo.clone, admin, prior.sha, merge_base=prior.parents[0]).clean)
+        head = self.head()
+        self.assertEqual(head["base"], admin)
+        self.assertEqual(self.controller.store.count("tasks"), 0, "no rebase-conflict task")
+        self.assertNotEqual(self.controller.status()["head"]["stage"], "rebase_conflict")
+        commits = self.chain_commits(head)
+        self.assertEqual([c.source_pr for c in commits], [c.source_pr for c in before], "same members, same order")
+        landed_member = next(c for c in commits if c.source_pr == f"{PROJECT}#101")
+        self.assertEqual(landed_member.tree, chain.tree_of(self.repo.clone, landed_member.parents[0]), "101 is empty")
+        self.assertEqual(landed_member.message.splitlines()[0], prior.message.splitlines()[0])
+        self.assertIn(f"Landed on main as {landing} outside the queue; nothing left to apply.", landed_member.message)
+        other = next(c for c in commits if c.source_pr == f"{PROJECT}#102")
+        self.assertEqual(other.message, next(c for c in before if c.source_pr == f"{PROJECT}#102").message)
+        rebased = self.controller.store.journal_entries("rebased", head["id"])[-1]
+        self.assertEqual(rebased["detail"]["landed_on_base"], [{"source_pr": f"{PROJECT}#101", "commit": landing}])
+        self.assertEqual([m["provenance"] for m in self.members(head)], ["clean", "clean"])
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(
+            self.repo.file_at("main", "Shared.lean"), "line one\nline two changed by 101, then by admin\nline three\n"
+        )
+        self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
+        self.assertEqual(
+            sorted(c.source_pr for c in self.first_parent_chain(admin, self.repo.main_sha())),
+            [f"{PROJECT}#101", f"{PROJECT}#102"],
+        )
+
     def test_s10_promotion_refused_after_an_advance_between_pass_and_push(self):
         self.approve(101, {"A.lean": "a\n"})
         self.tick()

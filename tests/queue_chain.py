@@ -184,6 +184,32 @@ class Build(Fixture):
         self.assertEqual(commits[0].source_pr, f"{PROJECT}#301")
         self.assertTrue(c.validate(self.repo, advanced, result.tip, [landed, first, twin, fresh]).ok)
 
+    def test_member_landed_on_the_base_outside_the_queue_is_not_squashed(self):
+        landed = self.pr(821, {"Shared.lean": "line one\nline two by 821\nline three\n"})
+        other = self.pr(822, {"B.lean": "b\n"})
+        # Main takes 821 as a squash commit and an admin change to the next line of the same file.
+        self.write({"Shared.lean": "line one\nline two by 821\nline three by admin\n"})
+        landing = self.commit("Change 821 (#821)")
+        self.assertFalse(c.merge_trees(self.repo, landing, landed.head_sha).clean, "a squash of 821 would conflict")
+        result = c.build(self.repo, landing, [landed, other], chain_id="built")
+        self.assertEqual(result.status, c.CLEAN)
+        self.assertEqual([r.empty for r in result.commits], [True, False])
+        self.assertEqual([r.landed_on_base for r in result.commits], [landing, None])
+        self.assertEqual(result.landed_on_base, [{"source_pr": f"{PROJECT}#821", "commit": landing}])
+        commits = c.chain_commits(self.repo, landing, result.tip)
+        self.assertEqual(commits[0].tree, c.tree_of(self.repo, landing))
+        self.assertEqual(commits[0].message.splitlines()[0], "Change 821 (#821)")
+        self.assertEqual(commits[0].source_pr, landed.source_pr)
+        self.assertEqual(commits[0].accepted_head, landed.head_sha)
+        self.assertTrue(commits[0].message.rstrip().endswith(c.LANDED_NOTE.format(sha=landing)))
+        self.assertEqual(commits[0].author, "Alice <alice@example.invalid>")
+        self.assertTrue(c.validate(self.repo, landing, result.tip, [landed, other]).ok)
+        # An explicit `since` that excludes the landing commit squashes as before (and conflicts here).
+        self.assertEqual(
+            c.build(self.repo, landing, [landed, other], chain_id="plain", since=landing).status, c.CONFLICT
+        )
+        self.assertIn("landed on the base as", c._summary(result))
+
     def test_conflict_reports_member_and_paths_and_keeps_the_clean_prefix(self):
         one = self.pr(401, {"A.lean": "a\n"})
         left = self.pr(402, {"Shared.lean": "line one\nLEFT\nline three\n"})
@@ -276,6 +302,84 @@ class Replay(Fixture):
         self.assertEqual(self.git("status", "--porcelain"), "")
         with self.assertRaises(c.ChainError):
             c.replay(self.repo, prior.tip, self.base, advanced)  # base is not an ancestor of tip
+
+    def test_member_landed_outside_the_queue_replays_as_an_empty_commit_with_a_note(self):
+        members = [
+            self.pr(801, {"Shared.lean": "line one\nline two by 801\nline three\n"}),
+            self.pr(802, {"B.lean": "b\n"}),
+            self.pr(803, {"C.lean": "c\n"}),
+        ]
+        prior = c.build(self.repo, self.base, members, chain_id="prior")
+        before = c.chain_commits(self.repo, self.base, prior.tip)
+        # Bors squash-lands 801 (subject suffix, no trailer), an admin edits the next line of the same
+        # file, and 803 lands as a queue-style commit known only by its Source-PR trailer.
+        self.write({"Shared.lean": "line one\nline two by 801\nline three\n"})
+        bors = self.commit("Change 801 (#801)")
+        self.write({"Shared.lean": "line one\nline two by 801\nline three by admin\n"})
+        self.commit("admin edits line three")
+        self.write({"C.lean": "c\n"})
+        trailer = self.commit(f"Another subject\n\nSource-PR: {PROJECT}#803\n")
+        advanced = self.git("rev-parse", "HEAD")
+        self.assertFalse(
+            c.merge_trees(self.repo, advanced, before[0].sha, merge_base=self.base).clean,
+            "the plain cherry-pick of 801 conflicts with the admin's edit beside it",
+        )
+        replayed = c.replay(self.repo, self.base, prior.tip, advanced, chain_id="replayed")
+        self.assertEqual(replayed.status, c.CLEAN)
+        self.assertEqual([r.status for r in replayed.commits], [c.CLEAN] * 3)
+        self.assertEqual([r.empty for r in replayed.commits], [True, False, True])
+        self.assertEqual([r.landed_on_base for r in replayed.commits], [bors, None, trailer])
+        self.assertEqual(
+            replayed.landed_on_base,
+            [{"source_pr": f"{PROJECT}#801", "commit": bors}, {"source_pr": f"{PROJECT}#803", "commit": trailer}],
+        )
+        self.assertEqual(replayed.to_dict()["landed_on_base"], replayed.landed_on_base)
+        after = c.chain_commits(self.repo, advanced, replayed.tip)
+        note = c.LANDED_NOTE.format(sha=bors)
+        self.assertEqual(after[0].message, before[0].message.rstrip("\n") + "\n\n" + note + "\n")
+        self.assertEqual(after[1].message, before[1].message)
+        self.assertEqual(
+            after[2].message, before[2].message.rstrip("\n") + "\n\n" + c.LANDED_NOTE.format(sha=trailer) + "\n"
+        )
+        self.assertEqual([x.source_pr for x in after], [m.source_pr for m in members])
+        self.assertEqual([x.accepted_head for x in after], [m.head_sha for m in members])
+        self.assertEqual(after[0].message.splitlines()[0], before[0].message.splitlines()[0])
+        self.assertEqual([(x.author, x.author_date) for x in after], [(x.author, x.author_date) for x in before])
+        self.assertEqual(after[0].tree, c.tree_of(self.repo, advanced))
+        self.assertTrue(c.validate(self.repo, advanced, replayed.tip, members).ok)
+        self.assertTrue(c.message_preserved(before[0].message, after[0].message))
+        self.assertEqual(
+            self.git("show", f"{replayed.tip}:Shared.lean"), "line one\nline two by 801\nline three by admin"
+        )
+        # A later replay keeps the note once and the commit empty.
+        self.write({"Other.lean": "other\n"})
+        further = self.commit("advance again")
+        again = c.replay(self.repo, advanced, replayed.tip, further, chain_id="again")
+        self.assertEqual(again.status, c.CLEAN)
+        self.assertEqual([r.empty for r in again.commits], [True, False, True])
+        final = c.chain_commits(self.repo, further, again.tip)
+        self.assertEqual(final[0].message.count("Landed on main as"), 1)
+        self.assertEqual(final[0].message, after[0].message)
+        self.assertEqual(c.landed_message(after[0].message, "0" * 40), after[0].message)
+
+    def test_replay_conflict_reports_landed_members_still_pending(self):
+        members = [
+            self.pr(811, {"A.lean": "a\n"}),
+            self.pr(812, {"Shared.lean": "line one\nTWO\nline three\n"}),
+            self.pr(813, {"C.lean": "c\n"}),
+        ]
+        prior = c.build(self.repo, self.base, members, chain_id="prior")
+        self.write({"Shared.lean": "line one\nMAIN\nline three\n", "C.lean": "c\n"})
+        landing = self.commit("Change 813 (#813)")
+        replayed = c.replay(self.repo, self.base, prior.tip, landing, chain_id="replayed")
+        self.assertEqual(replayed.status, c.CONFLICT)
+        self.assertEqual([r.status for r in replayed.commits], [c.CLEAN, c.CONFLICT, c.PENDING])
+        self.assertEqual([r.landed_on_base for r in replayed.commits], [None, None, landing])
+        self.assertEqual(replayed.landed_on_base, [{"source_pr": f"{PROJECT}#813", "commit": landing}])
+        self.assertEqual(replayed.to_dict()["conflict"]["source_pr"], f"{PROJECT}#812")
+        self.assertEqual(c.landed_prs(self.repo, self.base, landing), {"#813": landing})
+        self.assertEqual(c.landed_commit({"#813": landing}, f"{PROJECT}#813"), landing)
+        self.assertIsNone(c.landed_commit({"#813": landing}, f"{PROJECT}#812"))
 
 
 class Validate(Fixture):

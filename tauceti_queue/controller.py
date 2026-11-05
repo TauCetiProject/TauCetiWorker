@@ -1650,7 +1650,15 @@ class Controller:
                 self._retain(self.batch_ref(head["id"], version), result.tip)
                 self._release_claim(claim, "rebased", now)
                 self._count("head_rebases")
-                self.store.journal(now, "rebased", head["id"], version=version, base=canonical, tip=result.tip)
+                self.store.journal(
+                    now,
+                    "rebased",
+                    head["id"],
+                    version=version,
+                    base=canonical,
+                    tip=result.tip,
+                    landed_on_base=result.landed_on_base,
+                )
             return True
         conflict = result.conflict
         diagnostics = [
@@ -1662,12 +1670,20 @@ class Controller:
                 "message": f"replaying the chain onto {canonical[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
                 "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
                 "clean_prefix_tip": result.tip,
+                # Members the new base already carries (landed outside the queue): empty commits in the
+                # clean prefix, or still pending; the agent keeps them empty rather than replaying them.
+                "landed_on_base": result.landed_on_base,
             }
         ]
         with self.store.transaction():
             self._release_claim(claim, "conflict", now)
             self.store.journal(
-                now, "rebase-conflict", head["id"], onto=canonical, source_pr=conflict.source_pr if conflict else None
+                now,
+                "rebase-conflict",
+                head["id"],
+                onto=canonical,
+                source_pr=conflict.source_pr if conflict else None,
+                landed_on_base=result.landed_on_base,
             )
         self._create_task(head, "rebase_conflict", canonical, diagnostics, now)
         self._reasons.append(f"head {head['id']} needs an agent to resolve the rebase conflict")
@@ -1774,9 +1790,16 @@ class Controller:
                     version=version,
                     tip=result.tip,
                     tasks_superseded=superseded,
+                    landed_on_base=result.landed_on_base,
                 )
             self._wake.set()
-            return {"rebuilt": True, "version": version, "tip": result.tip, "tasks_superseded": superseded}
+            return {
+                "rebuilt": True,
+                "version": version,
+                "tip": result.tip,
+                "tasks_superseded": superseded,
+                "landed_on_base": result.landed_on_base,
+            }
 
     def retry_ci(self, repo: str, actor: str) -> dict[str, Any]:
         """Operator: forget the head's exhausted infrastructure failures so the next tick re-dispatches."""

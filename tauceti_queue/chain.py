@@ -12,6 +12,11 @@ Operations (importable functions and a CLI, `python -m tauceti_queue.chain <op> 
 - `build`: squash each member head onto the chain in order, as an explicit empty commit when the
   member adds nothing, stopping at the first conflict with the chain built so far.
 - `replay`: rebase an existing chain onto a new base, keeping empty commits, messages and authorship.
+- A member whose PR the base already carries (a commit in the base's new history whose subject ends
+  in ` (#N)` or whose `Source-PR` trailer names it: an admin merge, or Bors landing it during the
+  shadow period) is not cherry-picked by either: it becomes an empty commit with the same subject
+  and trailers plus a one-line note naming the landing commit, so the chain keeps exactly one commit
+  per member and never conflicts on changes that are already in the base.
 - `validate`: check single-parent history from the declared base, the trailers, and the bijection
   between commits and recorded members (by PR identity, not position).
 - `compare`: pair a prior and a replacement chain by PR identity and report provenance per member
@@ -51,7 +56,12 @@ EDITED = "edited"
 MISSING = "missing"  # in the prior chain, absent from the replacement
 ADDED = "added"  # in the replacement chain, absent from the prior
 
+# Appended to the message of a member that landed outside the queue; `{sha}` is the landing commit.
+LANDED_NOTE = "Landed on main as {sha} outside the queue; nothing left to apply."
+
 _IDENT_RE = re.compile(r"^\s*(?P<name>[^<>]*?)\s*<(?P<email>[^<>]*)>\s*$")
+_SUBJECT_PR_RE = re.compile(r"\(#(?P<number>\d+)\)\s*$")  # Bors's and GitHub's squash subject suffix
+_LANDED_NOTE_RE = re.compile(r"^Landed on main as [0-9a-f]{7,40} outside the queue; nothing left to apply\.$", re.M)
 _TRAILER_RE = re.compile(r"^(?P<token>[A-Za-z][A-Za-z0-9-]*):[ \t]+(?P<value>\S.*?)\s*$")
 _CHAIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -282,6 +292,46 @@ def squash_message(member: Member, coauthors: Sequence[str]) -> str:
     return "\n\n".join(paragraphs) + "\n"
 
 
+def landed_prs(repo: str | os.PathLike[str], since: str, until: str) -> dict[str, str]:
+    """PRs landed by the commits in `since..until`, as `owner/repo#N` or `#N` -> the landing commit.
+
+    A queue commit names its PR in the Source-PR trailer (`owner/repo#N`); a Bors or GitHub squash
+    commit carries no trailer and is known by its ` (#N)` subject suffix, recorded as `#N`. The
+    newest commit naming a PR wins. Every commit in the range is scanned, not only the first-parent
+    line, so a squash commit reached through a merge counts.
+    """
+    landed: dict[str, str] = {}
+    for record in git(repo, "log", "--format=%x1e%H%x1f%s%x1f%B", f"{since}..{until}").split("\x1e"):
+        if not record.strip():
+            continue
+        sha, _, rest = record.partition("\x1f")
+        subject, _, body = rest.partition("\x1f")
+        sources = set(trailer_values(body, SOURCE_PR_TRAILER))
+        if sources:
+            for source in sources:
+                landed.setdefault(source, sha.strip())
+            continue
+        match = _SUBJECT_PR_RE.search(subject)
+        if match:
+            landed.setdefault(f"#{match['number']}", sha.strip())
+    return landed
+
+
+def landed_commit(landed: dict[str, str], source_pr: str) -> str | None:
+    """The commit from `landed_prs` that landed `owner/repo#N`, by trailer identity or subject number."""
+    sha = landed.get(source_pr)
+    if sha is None and "#" in source_pr:
+        sha = landed.get("#" + source_pr.rsplit("#", 1)[1])
+    return sha
+
+
+def landed_message(message: str, sha: str) -> str:
+    """The message with the landing note appended once; a message that already carries one is returned as is."""
+    if _LANDED_NOTE_RE.search(message):
+        return message
+    return message.rstrip("\n") + "\n\n" + LANDED_NOTE.format(sha=sha) + "\n"
+
+
 def message_preserved(prior: str, current: str) -> bool:
     """Append-only preservation: the prior message, modulo trailing whitespace, prefixes the current one."""
     return current.rstrip().startswith(prior.rstrip())
@@ -452,6 +502,7 @@ class CommitRecord:
     status: str  # CLEAN, CONFLICT or PENDING
     empty: bool = False
     conflict_paths: tuple[str, ...] = ()
+    landed_on_base: str | None = None  # the base's own commit that landed this PR outside the queue
 
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
@@ -465,7 +516,8 @@ class ChainResult:
 
     `status` is CLEAN when every member was committed, CONFLICT otherwise; the conflicting member's
     record carries the paths, and the members after it are PENDING. The chain up to `tip` is
-    retained under `ref`.
+    retained under `ref`. A member the base already carries is recorded with `landed_on_base`,
+    whether it was committed (as an empty commit) or is still pending behind a conflict.
     """
 
     status: str
@@ -483,6 +535,15 @@ class ChainResult:
     def shas(self) -> list[str]:
         return [record.sha for record in self.commits if record.sha]
 
+    @property
+    def landed_on_base(self) -> list[dict[str, str]]:
+        """The members the base already carries, in chain order: `{source_pr, commit}` per member."""
+        return [
+            {"source_pr": record.source_pr, "commit": record.landed_on_base}
+            for record in self.commits
+            if record.landed_on_base
+        ]
+
     def to_dict(self) -> dict[str, Any]:
         conflict = self.conflict
         return {
@@ -493,6 +554,7 @@ class ChainResult:
             "tip": self.tip,
             "commits": [record.to_dict() for record in self.commits],
             "conflict": None if conflict is None else conflict.to_dict(),
+            "landed_on_base": self.landed_on_base,
         }
 
 
@@ -523,12 +585,17 @@ def build(
     members: Sequence[Member],
     chain_id: str | None = None,
     committer: tuple[str, str] = DEFAULT_COMMITTER,
+    since: str | None = None,
 ) -> ChainResult:
     """Squash each member onto the chain in order, as one explicit commit each, under a private ref.
 
     A member whose squash changes nothing (already in the base or an earlier member) becomes an empty
-    commit, never a dropped one. At the first conflict the result records the member and its paths
-    and returns the chain built so far; nothing partial is left behind.
+    commit, never a dropped one. A member whose PR a commit in `since..base` names (see `landed_prs`)
+    is not squashed at all: it becomes an empty commit carrying the landing note, so a PR that
+    landed outside the queue cannot conflict with the other changes that landed beside it. `since`
+    defaults to the common ancestor of the base and every member head. At the first conflict the
+    result records the member and its paths and returns the chain built so far; nothing partial is
+    left behind.
     """
     chain_id = chain_id or new_chain_id()
     ref = chain_ref(chain_id)
@@ -540,18 +607,36 @@ def build(
     for member in members:
         if not object_exists(repo, member.head_sha):
             raise ChainError(f"accepted head of {member.source_pr} is not in the repository: {member.head_sha}")
+    if since is None and members:
+        since = git(repo, "merge-base", "--octopus", base, *(member.head_sha for member in members)).strip() or None
+    landed = landed_prs(repo, since, base) if since else {}
 
     records: list[CommitRecord] = []
     tip = base
     tip_tree = tree_of(repo, tip)
     status = CLEAN
     for index, member in enumerate(members):
+        landing = landed_commit(landed, member.source_pr)
+        if landing:
+            author, coauthors = _author_and_coauthors(
+                repo, member, since=git(repo, "merge-base", tip, member.head_sha).strip()
+            )
+            message = landed_message(squash_message(member, coauthors), landing)
+            sha = commit_tree(repo, tip_tree, tip, message, author, committer=committer)
+            records.append(
+                CommitRecord(member.source_pr, member.head_sha, sha, CLEAN, empty=True, landed_on_base=landing)
+            )
+            tip = sha
+            continue
         outcome = merge_trees(repo, tip, member.head_sha)
         if not outcome.clean:
             records.append(
                 CommitRecord(member.source_pr, member.head_sha, None, CONFLICT, conflict_paths=outcome.conflict_paths)
             )
-            records.extend(CommitRecord(m.source_pr, m.head_sha, None, PENDING) for m in members[index + 1 :])
+            records.extend(
+                CommitRecord(m.source_pr, m.head_sha, None, PENDING, landed_on_base=landed_commit(landed, m.source_pr))
+                for m in members[index + 1 :]
+            )
             status = CONFLICT
             break
         author, coauthors = _author_and_coauthors(
@@ -575,8 +660,11 @@ def replay(
     """Rebase the chain `base..tip` onto `onto`, one commit per commit, under a new private ref.
 
     Messages, authorship and trailers are copied; an empty commit stays an empty commit, and a commit
-    whose change is already in the new base becomes one. Conflicts are reported like `build`'s.
-    The chain must already be linear (see `validate`); a merge commit is a ChainError.
+    whose change is already in the new base becomes one. A commit whose PR the new base's history
+    `base..onto` names (see `landed_prs`) is not cherry-picked: it becomes an empty commit with the
+    same message plus the landing note, so a member that landed outside the queue cannot conflict with
+    the changes that landed beside it. Conflicts are reported like `build`'s. The chain must already
+    be linear (see `validate`); a merge commit is a ChainError.
     """
     chain_id = chain_id or new_chain_id()
     ref = chain_ref(chain_id)
@@ -585,6 +673,10 @@ def replay(
     for commit in commits:
         if len(commit.parents) != 1:
             raise ChainError(f"{commit.sha} has {len(commit.parents)} parents; replay needs a linear chain")
+    landed = landed_prs(repo, commits[0].parents[0], onto) if commits else {}
+
+    def landing_of(commit: ChainCommit) -> str | None:
+        return landed_commit(landed, commit.source_pr) if commit.source_pr else None
 
     records: list[CommitRecord] = []
     new_tip = onto
@@ -592,13 +684,20 @@ def replay(
     status = CLEAN
     for index, commit in enumerate(commits):
         key = commit.source_pr or commit.sha
-        outcome = merge_trees(repo, new_tip, commit.sha, merge_base=commit.parents[0])
+        landing = landing_of(commit)
+        if landing:
+            outcome = MergeOutcome(tree=new_tip_tree)
+            message = landed_message(commit.message, landing)
+        else:
+            outcome = merge_trees(repo, new_tip, commit.sha, merge_base=commit.parents[0])
+            message = commit.message
         if not outcome.clean:
             records.append(
                 CommitRecord(key, commit.accepted_head, None, CONFLICT, conflict_paths=outcome.conflict_paths)
             )
             records.extend(
-                CommitRecord(c.source_pr or c.sha, c.accepted_head, None, PENDING) for c in commits[index + 1 :]
+                CommitRecord(c.source_pr or c.sha, c.accepted_head, None, PENDING, landed_on_base=landing_of(c))
+                for c in commits[index + 1 :]
             )
             status = CONFLICT
             break
@@ -606,12 +705,16 @@ def replay(
             repo,
             outcome.tree,
             new_tip,
-            commit.message,
+            message,
             (commit.author_name, commit.author_email),
             author_date=commit.author_date,
             committer=committer,
         )
-        records.append(CommitRecord(key, commit.accepted_head, sha, CLEAN, empty=outcome.tree == new_tip_tree))
+        records.append(
+            CommitRecord(
+                key, commit.accepted_head, sha, CLEAN, empty=outcome.tree == new_tip_tree, landed_on_base=landing
+            )
+        )
         new_tip, new_tip_tree = sha, outcome.tree
     update_chain_ref(repo, chain_id, new_tip)
     return ChainResult(status=status, chain_id=chain_id, ref=ref, base=onto, tip=new_tip, commits=records)
@@ -914,6 +1017,8 @@ def _summary(result: ChainResult | ValidationReport | ComparisonReport) -> str:
         lines = [f"{result.status}: chain {result.chain_id} base {result.base} tip {result.tip} ({result.ref})"]
         for record in result.commits:
             note = " (empty)" if record.empty else ""
+            if record.landed_on_base:
+                note = f" (empty; landed on the base as {record.landed_on_base[:12]})"
             if record.status == CONFLICT:
                 note = f" conflicts in: {', '.join(record.conflict_paths) or '(unknown paths)'}"
             lines.append(f"  {record.status:8} {record.sha or '-':40} {record.source_pr}{note}")
@@ -947,6 +1052,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--repository", help="owner/repo for snapshot members that do not name one")
     p.add_argument("--chain-id", help="ref component under refs/tauceti-queue/; random when omitted")
+    p.add_argument(
+        "--since",
+        help="commits in since..base that name a member PR make it an empty commit; "
+        "defaults to the common ancestor of the base and the member heads",
+    )
 
     p = sub.add_parser("replay", parents=[common], help="rebase an existing chain onto a new base")
     p.add_argument("--base", required=True)
@@ -976,7 +1086,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not base:
                 raise ChainError("no --base given and the members file has no base_sha")
             result: ChainResult | ValidationReport | ComparisonReport = build(
-                args.repo, base, candidate.members, args.chain_id
+                args.repo, base, candidate.members, args.chain_id, since=args.since
             )
             ok = result.status == CLEAN
         elif args.command == "replay":
