@@ -3114,6 +3114,69 @@ class ErrorParsing(unittest.TestCase):
 
 
 class Records(unittest.TestCase):
+    def test_task_record_and_prompt_for_a_pre_rebase(self):
+        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        content = Content(root)
+        raw = content.task(11, kind="pre_rebase")
+        seed = root / "seed"
+        onto = commit(seed, "head tip", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        raw["onto"] = onto
+        raw["diagnostics"] = [
+            {
+                "kind": "conflict",
+                "source_pr": f"{PROJECT}#2",
+                "paths": ["TauCeti/Two.lean"],
+                "onto": onto,
+                "message": "replaying the open batch onto the head's tip conflicts",
+                "pending": [f"{PROJECT}#3"],
+                "clean_prefix_tip": content.members[0]["commit"],
+            },
+            {
+                "kind": "cross_batch",
+                "approximate": True,
+                "removed_used": [
+                    {
+                        "name": "foo_bar",
+                        "removed_by": [{"position": 4, "pr": 40, "file": "TauCeti/X.lean", "renamed_to": "foo_baz"}],
+                        "references": [{"file": "TauCeti/Two.lean", "position": 2, "pr": 2, "lines": [3]}],
+                    }
+                ],
+                "added_by_both": [
+                    {
+                        "name": "both_add",
+                        "head": [{"position": 1, "pr": 41, "file": "TauCeti/Y.lean"}],
+                        "next": [{"position": 3, "pr": 3, "file": "TauCeti/Three.lean"}],
+                    }
+                ],
+            },
+        ]
+        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
+        self.assertEqual((task.kind, task.validation_base), ("pre_rebase", onto))
+        self.assertEqual(repair_task.artifact_revisions(task), [onto, content.base])
+        chain = repair.read_chain(seed, content.base, content.tip)
+        context = repair_task.prompt_context(task, None, listings=repair.listings_path(seed))
+        prompt = repair.compose_prompt(context, repair_task.task_findings(task), chain, seed)
+        self.assertIn(f"onto the tip `{onto[:12]}` of the head batch ahead of it with git", prompt)
+        self.assertIn(f"The target is not `main`: `{onto[:12]}` is what `main` becomes when the head lands", prompt)
+        self.assertIn(f"- target, the head's tip: `{onto[:12]}`", prompt)
+        self.assertIn(f"--onto {onto[:12]} {content.base[:12]}", prompt)
+        self.assertIn("## Predicted ripples from the head", prompt)
+        self.assertIn(
+            "- `foo_bar` is removed by the head's position 4 (PR #40, `TauCeti/X.lean`, renamed to `foo_baz`) and used "
+            "in this batch's `TauCeti/Two.lean` (position 2, PR #2)",
+            prompt,
+        )
+        self.assertIn(
+            "- `both_add` is added by the head's position 1 (PR #41, `TauCeti/Y.lean`) and by this batch's position 3 "
+            "(PR #3, `TauCeti/Three.lean`)",
+            prompt,
+        )
+        rebase = repair_task.Task.from_json({**raw, "kind": "rebase_conflict", "claim_token": "x", "expires_at": 1e10})
+        context = repair_task.prompt_context(rebase, None, listings=repair.listings_path(seed))
+        self.assertNotIn(
+            "Predicted ripples", repair.compose_prompt(context, repair_task.task_findings(rebase), chain, seed)
+        )
+
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)

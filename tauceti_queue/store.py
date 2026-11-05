@@ -13,11 +13,12 @@ Tables:
   landed/cancelled state, priority, urgency and the retained ref of the accepted head.
 - `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`),
   the expected parent recorded for promotion and, for an open batch, the version a `prepare` task
-  last built (and repaired) on its own base.
+  last built (and repaired) on its own base and its pre-rebase onto the head's tip
+  (`pre_rebase_state`, `_tip`, `_onto`, `_source`, `_edits`, `_at`).
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it and the explanation collected from its message.
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
-- `tasks`: repair, rebase-conflict and prepare tasks with their diagnostics and state.
+- `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state.
 - `ci_attempts`: every candidate dispatch with the run it was bound to, placement, phases, outcome.
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
@@ -83,7 +84,13 @@ CREATE TABLE IF NOT EXISTS batches (
     expected_parent TEXT,
     urgent INTEGER NOT NULL DEFAULT 0,
     first_dispatch_at REAL,
-    prepared_version INTEGER
+    prepared_version INTEGER,
+    pre_rebase_state TEXT NOT NULL DEFAULT '',
+    pre_rebase_tip TEXT,
+    pre_rebase_onto TEXT,
+    pre_rebase_source TEXT,
+    pre_rebase_edits TEXT NOT NULL DEFAULT '{}',
+    pre_rebase_at REAL
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
@@ -238,6 +245,12 @@ class Store:
         ("inputs", "last_probe_base", "TEXT NOT NULL DEFAULT ''"),
         ("inputs", "probe_conflicts", "TEXT NOT NULL DEFAULT '{}'"),
         ("batches", "prepared_version", "INTEGER"),
+        ("batches", "pre_rebase_state", "TEXT NOT NULL DEFAULT ''"),
+        ("batches", "pre_rebase_tip", "TEXT"),
+        ("batches", "pre_rebase_onto", "TEXT"),
+        ("batches", "pre_rebase_source", "TEXT"),
+        ("batches", "pre_rebase_edits", "TEXT NOT NULL DEFAULT '{}'"),
+        ("batches", "pre_rebase_at", "REAL"),
     )
 
     def _add_missing_columns(self) -> None:

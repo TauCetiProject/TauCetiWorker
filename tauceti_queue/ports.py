@@ -220,14 +220,16 @@ class Task:
 
     `base` and `tip` are the chain the agent starts from. For a `rebase_conflict` task `onto` is
     the canonical commit the replacement chain must be based on and `tip` the chain that failed to
-    replay; for a `repair` task `onto` equals `base`, and so for a `prepare` task, which builds and
-    repairs an open batch on its own base before it seals and carries no diagnostics. `diagnostics` are the CI findings (repair) or
-    the failed replay's conflict evidence (rebase conflict). `retained_refs` name the refs under
+    replay; a `pre_rebase` task is the same for the oldest open batch with `onto` the head's tip; for
+    a `repair` task `onto` equals `base`, and so for a `prepare` task, which builds and repairs an open
+    batch on its own base before it seals and carries no diagnostics. `diagnostics` are the CI findings
+    (repair) or the failed replay's conflict evidence (rebase conflict, pre-rebase, the latter with a
+    `cross_batch` entry). `retained_refs` name the refs under
     which the inputs and the current chain can be fetched.
     """
 
     task_id: int
-    kind: str  # "repair", "rebase_conflict" or "prepare"
+    kind: str  # "repair", "rebase_conflict", "pre_rebase" or "prepare"
     repository: str
     batch_id: int
     batch_version: int

@@ -90,6 +90,11 @@ def module_to_path(module: str) -> str:
     return module.replace(".", "/") + ".lean"
 
 
+# Task kinds whose agent finishes a replay of the chain onto ``onto``: the head's rebase onto `main`, and
+# the next open batch's pre-rebase onto the head's tip (the next head's expected base).
+REBASE_KINDS = ("rebase_conflict", "pre_rebase")
+
+
 def empty_findings() -> dict:
     """The diagnostics structure the prompt consumes; every producer fills a copy of this."""
     return {
@@ -143,8 +148,9 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
     onto, pending, clean_prefix_tip, landed_on_base}`` entry (``landed_on_base`` lists the members the
     target already carries, ``{source_pr, commit}`` each). Compiler findings become ``compiler_errors`` (with the
     line and column parsed from the message when it starts with ``path:line:col``), lint findings keep
-    their module and message, every other kind is kept under ``other``, and the conflict entry under
-    ``conflict``. A dict is taken as an already structured findings record.
+    their module and message, every other kind is kept under ``other``, the conflict entry under
+    ``conflict``, and a pre-rebase's ``{kind: "cross_batch", removed_used, added_by_both}`` entry (the
+    predicted ripples from the head, ``repair_context.cross_batch``) under ``cross_batch``. A dict is taken as an already structured findings record.
     """
     if isinstance(entries, dict):
         findings = normalise_findings(entries)
@@ -158,6 +164,9 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         if not isinstance(raw, dict):
             continue
         kind = str(raw.get("kind") or "")
+        if kind == "cross_batch":
+            findings["cross_batch"] = raw
+            continue
         module = str(raw.get("module") or raw.get("path") or "")
         message = str(raw.get("message") or "")
         if kind == "conflict":
@@ -932,13 +941,13 @@ class PromptContext:
 
     repository: str
     base: str  # the base the result must be on (for a rebase conflict: the target base)
-    kind: str = "repair"  # repair | rebase_conflict | prepare
+    kind: str = "repair"  # repair | rebase_conflict | pre_rebase | prepare
     origin: str = ""  # one sentence: where this batch came from and why it is here
     suspects: list[int] = dataclasses.field(default_factory=list)
     suspect_heads: dict[int, str] = dataclasses.field(default_factory=dict)
     named_modules: list[str] = dataclasses.field(default_factory=list)
     conflict: dict | None = (
-        None  # rebase_conflict: {member, paths, onto, previous_base, pending, clean_prefix_tip, landed_on_base}
+        None  # rebase_conflict, pre_rebase: {member, paths, onto, previous_base, pending, clean_prefix_tip, landed_on_base}
     )
     feedback: str | None = None  # a validation report from a rejected attempt
     members: list[dict] = dataclasses.field(
@@ -995,7 +1004,7 @@ def _members_by_number(context: PromptContext) -> dict[int, dict]:
 
 def conflict_position(context: PromptContext, chain: list[ChainCommit]) -> int | None:
     """The chain index of the conflicting member of a rebase conflict, None when there is none."""
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     member = (conflict or {}).get("member")
     if not member or "#" not in str(member):
         return None
@@ -1014,7 +1023,7 @@ def landed_on_main(context: PromptContext, chain: list[ChainCommit], clone: Path
     the target whose subject ends in ``(#N)`` for a member's PR number. Empty for a repair, whose base
     is the target."""
     conflict = context.conflict or {}
-    previous = conflict.get("previous_base") if context.kind == "rebase_conflict" else None
+    previous = conflict.get("previous_base") if context.kind in REBASE_KINDS else None
     numbers = {c.pr for c in chain if c.pr is not None}
     landed: dict[int, str | None] = {}
     flagged = False
@@ -1212,7 +1221,7 @@ def write_listings(
     check.write_text(check_script(context.base, context.repository))
     check.chmod(0o755)
     repair_tools.write_build_script(directory)
-    if context.kind == "rebase_conflict" and (context.conflict or {}).get("previous_base"):
+    if context.kind in REBASE_KINDS and (context.conflict or {}).get("previous_base"):
         step = directory / STEP_FILE
         step.write_text(step_script(context.base, str(context.conflict["previous_base"]), context.rebase_options))
         step.chmod(0o755)
@@ -1301,7 +1310,7 @@ def _hours_text(seconds: int) -> str:
 def _verification_section(
     context: PromptContext, findings: dict, base_short: str, check_command: str | None
 ) -> list[str]:
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
     if check_command:
         lines += [
@@ -1400,12 +1409,22 @@ def _rebase_sections(
         cleanly = " It is the first commit of the batch, so nothing replayed before it."
     else:
         cleanly = f" The commits before it replayed cleanly and are at commit `{prefix}`." if prefix else ""
+    pre = context.kind == "pre_rebase"
+    target = (
+        f"the tip `{base_short}` of the head batch ahead of it" if pre else f"the current `main` commit `{base_short}`"
+    )
     happened = [
         "## What happened",
         "",
         f"The queue replayed this batch of {len(chain)} squash commits, one per pull request, from its base `{previous}` "
-        f"onto the current `main` commit `{base_short}` with git. The replay stopped at {commit_text}{in_paths}.{cleanly} "
+        f"onto {target} with git. The replay stopped at {commit_text}{in_paths}.{cleanly} "
         f"Your job is to finish that replay so the whole batch sits on `{base_short}`."
+        + (
+            f" The target is not `main`: `{base_short}` is what `main` becomes when the head lands, so this is the next "
+            "head's expected base, and the head's CI round may still change it."
+            if pre
+            else ""
+        )
         + (f" {context.origin}" if context.origin else ""),
         "",
         f"You are in a private, detached Git worktree of {context.repository}; HEAD is the batch's tip on `{previous}`, "
@@ -1416,7 +1435,7 @@ def _rebase_sections(
         "## Conflict evidence",
         "",
         f"- base, the batch's previous base: `{previous}`",
-        f"- target, the current `main`: `{base_short}`",
+        f"- target, the head's tip: `{base_short}`" if pre else f"- target, the current `main`: `{base_short}`",
     ]
     if stop is not None:
         title = member_records(context, chain)[stop]["title"]
@@ -1498,7 +1517,7 @@ def _autosquash(base_short: str) -> str:
 
 
 def _editing_section(context: PromptContext, chain: list[ChainCommit], base_short: str, where: str | None) -> list[str]:
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     if conflict:
         previous = (conflict.get("previous_base") or (chain[0].parent if chain else "") or "")[:12]
         stop = conflict_position(context, chain)
@@ -1554,7 +1573,7 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     """
     base_short = context.base[:12]
     lines = [context.instruction or AGENT_INSTRUCTION, ""]
-    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    conflict = context.conflict if context.kind in REBASE_KINDS else None
     landed = landed_on_main(context, chain, clone)
     where = write_listings(context, chain, landed) if context.listings_path is not None else None
     check_command = f"python3 {LISTINGS_DIR}/{CHECK_FILE}" if where else None
@@ -1691,6 +1710,10 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     lines += _landed_section(context, chain, landed, where)
     if context.repair_context is not None and where:
         lines += context.repair_context.prompt_lines()
+    if context.kind == "pre_rebase":
+        from tauceti_queue.repair_context import cross_batch_lines  # repair_context imports this module
+
+        lines += cross_batch_lines(findings.get("cross_batch"))
     lines += _result_section(base_short)
     lines += _editing_section(context, chain, base_short, where)
     lines += _verification_section(context, findings, base_short, check_command)

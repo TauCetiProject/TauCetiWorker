@@ -431,6 +431,87 @@ class Rebuild(ControllerCase):
         self.assertEqual(self.controller.rebuild_head(PROJECT, "kim-em"), {"rebuilt": False, "reason": "no-head"})
 
 
+class PreRebase(ControllerCase):
+    """The next open batch is replayed onto the head only once the head's chain is submitted."""
+
+    def open_batch(self):
+        return self.controller.store.row("batches", {"state": "open"})
+
+    def pre_rebased(self):
+        return self.controller.store.journal_entries("pre-rebased")
+
+    def test_never_before_the_heads_chain_is_submitted(self):
+        blocked = self.controller._pre_rebase_blocked
+        self.assertEqual(blocked(None), "no head")
+        # Unpublished: the head is sealed but never dispatched, so it is not waiting for a verdict.
+        self.controller.set_setting("publication_enabled", False, "kim")
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.assertEqual(blocked(head), f"head {head['id']} v{head['version']} is not dispatched")
+        self.assertEqual((self.open_batch()["pre_rebase_state"], self.pre_rebased()), ("", []))
+        self.assertIsNone(self.controller.status()["open_batches"][0]["pre_rebase"])
+        # Dispatched and waiting for CI: now it is replayed.
+        self.controller.set_setting("publication_enabled", True, "kim")
+        self.controller.tick()
+        self.assertIsNone(blocked(head))
+        self.assertEqual([e["detail"]["onto"] for e in self.pre_rebased()], [head["tip"]])
+        # Main moves past the head's base: the head must be rebased (and its CI rerun) first.
+        self.repo.advance_main({"Z.lean": "z\n"})
+        self.controller._observe_canonical(self.controller._fetch_canonical(), self.clock())
+        self.assertEqual(blocked(head), f"head {head['id']} is not yet based on main")
+
+    def test_never_while_the_head_has_an_open_task(self):
+        head = self.failing_head()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        self.assertEqual(self.controller._pre_rebase_blocked(head), f"head {head['id']} has an open task")
+        self.assertEqual(self.open_batch()["pre_rebase_state"], "")
+        self.assertEqual(self.pre_rebased(), [])
+        self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "repair")
+
+    def test_rebuilding_the_head_discards_the_pre_rebase_and_it_is_redone(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        self.assertEqual(self.open_batch()["pre_rebase_state"], "clean")
+        self.assertTrue(self.controller.rebuild_head(PROJECT, "kim")["rebuilt"])
+        batch = self.open_batch()
+        self.assertEqual((batch["pre_rebase_state"], batch["pre_rebase_tip"]), ("", None))
+        self.assertEqual(
+            self.controller.store.journal_entries("pre-rebase-discarded")[0]["detail"]["reason"], "head-rebuilt"
+        )
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.assertEqual(self.open_batch()["pre_rebase_onto"], head["tip"])
+        self.assertEqual(len(self.pre_rebased()), 2)
+
+    def test_a_pre_rebase_task_is_claimed_after_the_heads_and_before_a_preparation(self):
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.controller.tick()
+        batch = self.open_batch()
+        kinds = {t["kind"] for t in self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})}
+        self.assertEqual(kinds, {"pre_rebase", "prepare"}, "neither background task replaces the other")
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual((task.kind, task.batch_id), ("pre_rebase", batch["id"]))
+        self.assertIsNone(self.controller.claim_task("w2", "admin-worker"), "one background claim per batch")
+
+    def test_the_setting_turns_it_off(self):
+        self.controller.set_setting("pre_rebase_enabled", False, "kim")
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        self.assertEqual(self.pre_rebased(), [])
+
+
 class Tasks(ControllerCase):
     def test_task_record_carries_members_diagnostics_refs_and_instruction(self):
         head = self.failing_head()

@@ -69,7 +69,7 @@ SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
 SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
 # ``prepare`` builds an open batch on its own base and repairs what fails before the batch is the head.
-TASK_KINDS = ("repair", "rebase_conflict", "prepare")
+TASK_KINDS = ("repair", *repair.REBASE_KINDS, "prepare")
 RELEASE_REASONS = (
     "artifacts_unavailable",
     "inference_unavailable",
@@ -170,7 +170,7 @@ class Task:
     """
 
     task_id: str
-    kind: str  # repair | rebase_conflict | prepare
+    kind: str  # repair | rebase_conflict | pre_rebase | prepare
     repository: str
     batch_id: str
     batch_version: int
@@ -893,7 +893,7 @@ def artifact_revisions(task: Task) -> list[str]:
     a repair builds on its base and falls back to ``onto`` when that differs. ``prepare_artifacts``
     walks the first one's first-parent ancestors (``ARTIFACT_ANCESTORS`` of them) before a fallback
     off that walk, so the artifacts come from the newest revision the cache has."""
-    order = [task.onto, task.base] if task.kind == "rebase_conflict" else [task.base, task.onto]
+    order = [task.onto, task.base] if task.kind in repair.REBASE_KINDS else [task.base, task.onto]
     revisions: list[str] = []
     for revision in order:
         if revision and revision not in revisions:
@@ -906,7 +906,7 @@ def describe_cache_revision(task: Task, artifacts: dict) -> str:
     target)``, ``5f78b5307b93 (the batch base)``, ``67aa17161ba1 (3 commits behind the rebase target
     85f3eb5579df)``."""
     revision = artifacts["cache_revision"]
-    rebase = task.kind == "rebase_conflict"
+    rebase = task.kind in repair.REBASE_KINDS
     if revision == task.base:
         role = "the batch base" if rebase else "the base"
     elif revision == task.onto:
@@ -927,7 +927,7 @@ def artifacts_cold(task: Task, artifacts: dict | None) -> bool:
     cache (a repair without artifacts is released instead, so it never gets this far)."""
     if not artifacts:
         return False
-    return bool(artifacts.get("cold")) or (task.kind == "rebase_conflict" and not artifacts.get("available", True))
+    return bool(artifacts.get("cold")) or (task.kind in repair.REBASE_KINDS and not artifacts.get("available", True))
 
 
 def prompt_context(
@@ -1623,7 +1623,7 @@ def run_task(
             if stopping() and not lease.lost.is_set():
                 return cancelled("the worker stopped while the artifacts were prepared")
             if not artifacts["available"]:
-                if task.kind != "rebase_conflict":
+                if task.kind not in repair.REBASE_KINDS:
                     return release_task(
                         cfg,
                         client,
