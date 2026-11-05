@@ -287,6 +287,96 @@ def adapter(transport, git=None):
 
 
 class Adapter(unittest.TestCase):
+    def test_declaration_names_uses_exact_successful_status_run_attempt_and_job(self):
+        from tauceti_queue import declaration_names as dn
+
+        raw = dict(
+            version=1,
+            head=HEAD,
+            base=BASE,
+            tested=TIP,
+            complete=True,
+            added={"TauCeti.A": ["Ns.shared", "Ns.shared", "Ns.α"]},
+        )
+
+        def setup(url=None, workflow=".github/workflows/pr-build.yml", log=None, jobs=None):
+            t = FakeTransport()
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/commits/{HEAD}/statuses?per_page=100",
+                200,
+                [
+                    {
+                        "context": "build",
+                        "state": "success",
+                        "target_url": url or f"https://github.com/{TAUCETI}/actions/runs/123",
+                    }
+                ],
+            )
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/actions/runs/123",
+                200,
+                {"path": workflow, "run_attempt": 2},
+            )
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/actions/runs/123/attempts/2/jobs?per_page=100",
+                200,
+                {
+                    "total_count": 1,
+                    "jobs": jobs
+                    if jobs is not None
+                    else [{"id": 55, "name": "sandboxed-build", "status": "completed", "conclusion": "success"}],
+                },
+            )
+            t.add(
+                "GET",
+                f"https://api.github.com/repos/{TAUCETI}/actions/jobs/55/logs",
+                200,
+                (log if log is not None else "2026-11-05T01:00:00.000Z DECLARATION-NAMES " + json.dumps(raw)).encode(),
+            )
+            return adapter(t), t
+
+        a, t = setup()
+        record = a.declaration_names(TAUCETI, HEAD)
+        self.assertEqual(record["added"], {"TauCeti.A": ["Ns.shared", "Ns.α"]})
+        self.assertEqual(
+            (record["head"], record["base"], record["tested"], record["job_id"], record["run_attempt"]),
+            (HEAD, BASE, TIP, 55, 2),
+        )
+        self.assertEqual(len(t.calls), 4)
+        for url in [
+            f"https://evil.test/{TAUCETI}/actions/runs/123",
+            "https://github.com/other/repo/actions/runs/123",
+            f"https://github.com/{TAUCETI}/actions/runs/123?x=1",
+        ]:
+            a, t = setup(url=url)
+            self.assertEqual(a.declaration_names(TAUCETI, HEAD)["state"], "unknown")
+            self.assertEqual(len(t.calls), 1)
+        a, t = setup(workflow=".github/workflows/untrusted.yml")
+        self.assertEqual(a.declaration_names(TAUCETI, HEAD)["state"], "unknown")
+        self.assertEqual(len(t.calls), 2)
+        a, _ = setup(jobs=[{"id": 55, "name": "sandboxed-build"}, {"id": 56, "name": "sandboxed-build"}])
+        self.assertEqual(a.declaration_names(TAUCETI, HEAD)["reason"], "build_job_ambiguous")
+        self.assertEqual(dn.parse_log("DECLARATION-NAMES " + json.dumps(raw), BASE)["reason"], "head_mismatch")
+        for invalid in [
+            dict(raw, complete=False, added={}),
+            dict(raw, base="not-a-sha"),
+            dict(raw, added={"../oops": ["x"]}),
+            dict(raw, added={"TauCeti.A": ["bad name"]}),
+        ]:
+            self.assertNotIn(
+                dn.parse_log("DECLARATION-NAMES " + json.dumps(invalid), HEAD)["state"], ("known", "empty")
+            )
+        line = "DECLARATION-NAMES " + json.dumps(raw)
+        self.assertEqual(dn.parse_log(line + "\n" + line, HEAD)["reason"], "multiple_records")
+        self.assertEqual(
+            dn.parse_log(line.replace('"version": 1', '"version": 1, "version": 1'), HEAD)["reason"], "invalid_json"
+        )
+        self.assertEqual(dn.parse_log("nothing", HEAD)["reason"], "record_missing")
+        self.assertEqual(dn.parse_log("DECLARATION-NAMES " + json.dumps(dict(raw, added={})), HEAD)["state"], "empty")
+
     def test_fetch_pr(self):
         transport = FakeTransport()
         transport.add("GET", f"https://api.github.com/repos/{TAUCETI}/pulls/42", 200, pr_json())

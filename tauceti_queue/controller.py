@@ -19,6 +19,7 @@ Documentation of the records, state machine, task API and status schema: `docs/q
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import logging
 import random
@@ -29,7 +30,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from . import chain
+from . import chain, declaration_names
 from .eligibility import KEEP as BLOCKING_LABELS
 from .ports import (
     AGENT_INSTRUCTION,
@@ -560,6 +561,115 @@ class Controller:
             raise ControllerError("unknown-repository", repo)
 
     # --- approvals ---------------------------------------------------------------------------------
+
+    def _fetch_declaration_names(self, now: float) -> bool:
+        """Poll/start at most two background reads, without delaying a reconciliation pass.
+
+        Only this method mutates the store, while holding the controller lock; background
+        threads only use the App adapter. Recheck accepted revision and active input state on
+        completion, so late evidence cannot revive a cancelled input or follow a changed head.
+        Unknown/missing producer evidence is final for this revision; transport exceptions have
+        three attempts with backoff. Persisted attempts bound retries across service restarts.
+        """
+        if not hasattr(self.github, "declaration_names"):
+            return False
+        if not hasattr(self, "_declaration_fetches"):
+            self._declaration_fetches: dict[str, concurrent.futures.Future] = {}
+        changed = False
+        active = (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED)
+        for head, future in list(self._declaration_fetches.items()):
+            if not future.done():
+                continue
+            del self._declaration_fetches[head]
+            rows = [
+                r
+                for r in self.store.rows("inputs", {"repository": self.repository, "head_sha": head})
+                if r["state"] in active
+            ]
+            try:
+                record = future.result()
+                if not isinstance(record, dict) or record.get("state") not in (
+                    "known",
+                    "empty",
+                    "unknown",
+                    "incomplete",
+                ):
+                    record = declaration_names.unknown("invalid_record")
+                if record.get("state") in ("known", "empty") and declaration_names.accepted(record, head) is None:
+                    record = declaration_names.unknown("invalid_record")
+            except Exception as error:  # bounded retry of transport/provider failure only
+                for row in rows:
+                    attempts = row["declaration_fetch_attempts"]
+                    if attempts < 3:
+                        self.store.update(
+                            "inputs", {"id": row["id"]}, declaration_retry_at=now + 60 * 2 ** (attempts - 1)
+                        )
+                    else:
+                        record = declaration_names.unknown("fetch_failed")
+                        self.store.update("inputs", {"id": row["id"]}, declaration_names=dumps(record))
+                        changed = True
+                    self.store.journal(
+                        now,
+                        "declaration-names-fetch-failed",
+                        input_id=row["id"],
+                        number=row["number"],
+                        head=head,
+                        attempt=attempts,
+                        error=str(error)[:500],
+                    )
+                continue
+            for row in rows:
+                self.store.update("inputs", {"id": row["id"]}, declaration_names=dumps(record), declaration_retry_at=0)
+                self.store.journal(
+                    now,
+                    "declaration-names",
+                    input_id=row["id"],
+                    number=row["number"],
+                    head=head,
+                    state=record["state"],
+                    reason=record.get("reason"),
+                    names=sum(len(n) for n in record.get("added", {}).values()),
+                )
+                changed = True
+        head_batch = self._head()
+        rows = [
+            r
+            for r in self.store.rows("inputs", {"repository": self.repository})
+            if r["state"] in active and not loads(r["declaration_names"], {}) and r["declaration_retry_at"] <= now
+        ]
+        rows.sort(key=lambda r: (r["batch_id"] != (head_batch or {}).get("id"), r["approved_at"], r["id"]))
+        for row in rows:
+            head = row["head_sha"]
+            if len(self._declaration_fetches) >= 2:
+                break
+            if head in self._declaration_fetches:
+                continue
+            # A process may have stopped mid-read on its third attempt. That remains unknown,
+            # rather than starting another request forever after each restart.
+            if row["declaration_fetch_attempts"] >= 3:
+                self.store.update(
+                    "inputs",
+                    {"id": row["id"]},
+                    declaration_names=dumps(declaration_names.unknown("fetch_attempts_exhausted")),
+                )
+                changed = True
+                continue
+            for matching in rows:
+                if matching["head_sha"] == head:
+                    self.store.update(
+                        "inputs",
+                        {"id": matching["id"]},
+                        declaration_fetch_attempts=matching["declaration_fetch_attempts"] + 1,
+                    )
+            if not hasattr(self, "_declaration_pool"):
+                self._declaration_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="queue-declarations"
+                )
+            self._declaration_fetches[head] = self._declaration_pool.submit(
+                self.github.declaration_names, self.repository, head
+            )
+            self._declaration_fetches[head].add_done_callback(lambda _future: self._wake.set())
+        return changed
 
     def approve(
         self,
@@ -1620,6 +1730,7 @@ class Controller:
                     retained_ref=self.input_ref(member["number"], member["accepted_head"]),
                     no_repair=bool(member["no_repair"] or member["withdrawn"]),
                     withdrawn=bool(member["withdrawn"]),
+                    declaration_names=loads(input_row.get("declaration_names"), {}),
                 )
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
@@ -3168,7 +3279,25 @@ class Controller:
             behind = repair.read_chain(clone, batch["base"], batch["tip"])
         except Exception as error:  # noqa: BLE001 - the task goes out without the prediction
             return {"kind": "cross_batch", "removed_used": [], "added_by_both": [], "error": str(error)}
-        return {"kind": "cross_batch", **repair_context.cross_batch(clone, ahead, behind)}
+
+        def records(batch_id: int) -> dict[int, dict]:
+            return {
+                m["number"]: loads((self.store.row("inputs", {"id": m["input_id"]}) or {}).get("declaration_names"), {})
+                for m in self._members(batch_id)
+            }
+
+        edited = {m["number"] for b in (head, batch) for m in self._members(b["id"]) if m["provenance"] != "clean"}
+        return {
+            "kind": "cross_batch",
+            **repair_context.cross_batch(
+                clone,
+                ahead,
+                behind,
+                head_declaration_names=records(head["id"]),
+                following_declaration_names=records(batch["id"]),
+                edited_prs=edited,
+            ),
+        }
 
     def _seal_from_pre_rebase(self, head: dict[str, Any], canonical: str, now: float) -> bool:
         """Base a newly sealed head on `canonical` from its pre-rebase, without replaying it again.

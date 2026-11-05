@@ -128,6 +128,10 @@ class GitHubPort(Protocol):
 
     def fetch_pr(self, repo: str, number: int) -> PullRequest: ...
 
+    def declaration_names(self, repo: str, head_sha: str) -> dict:
+        """Compiled added names from the exact accepted revision's trusted PR-build log, or unknown."""
+        ...
+
     def fetch_refs(self, repo: str, refspecs: Sequence[str]) -> None:
         """Bring the named objects into the service's local clone (`git fetch origin <refspec>...`)."""
         ...
@@ -248,6 +252,7 @@ class TaskMember:
     retained_ref: str = ""
     no_repair: bool = False
     withdrawn: bool = False
+    declaration_names: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
