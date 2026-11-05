@@ -393,6 +393,58 @@ class SettingsCommand(Base):
         self.assertIn("HTTP 403", err.getvalue())
 
 
+class ConfigurationSeeds(Base):
+    """`serve` seeds the store with the file's runtime controls; `check-config` only reads them."""
+
+    def service(self, path):
+        from tauceti_queue import fakes
+
+        config = cfg.load(path)
+        controller, _github, _repo, _clock = fakes.make_controller(
+            self.root / "fixture", publication=False, db_name=str(config.database)
+        )
+        self.addCleanup(controller.store.close)
+        service = cli.Service(config, mock.Mock())
+        service.controller = controller
+        return service, controller
+
+    def test_serve_seeds_and_keeps_operator_values(self):
+        path = self.config_file("[settings]\nrepair_concurrency = 1\n")
+        service, controller = self.service(path)
+        service.seed_settings()
+        record = controller.store.setting_record("repair_concurrency")
+        self.assertEqual((record["value"], record["actor"]), (1, "configuration"))
+        self.assertEqual(controller.store.setting_record("publication_enabled")["actor"], "configuration")
+        controller.set_setting("repair_concurrency", 2, "kim-em")
+        rows = len(controller.store.journal_entries("setting"))
+        for _ in range(5):
+            service.seed_settings()
+        self.assertEqual(controller.setting("repair_concurrency"), 2)
+        self.assertEqual(len(controller.store.journal_entries("setting")), rows)
+
+        with captured() as (out, _err):
+            self.assertEqual(cli.main(["check-config", "--config", str(path)]), 0)
+        line = next(line for line in out.getvalue().splitlines() if "repair_concurrency" in line)
+        self.assertIn("2", line)
+        self.assertIn("store, set by kim-em; file 1", line)
+        with captured() as (out, _err):
+            self.assertEqual(cli.main(["check-config", "--config", str(path), "--json"]), 0)
+        effective = json.loads(out.getvalue())["effective_settings"]
+        self.assertEqual(
+            effective["repair_concurrency"], {"value": 2, "source": "store", "actor": "kim-em", "file_value": 1}
+        )
+        self.assertEqual(controller.setting("repair_concurrency"), 2, "check-config writes no setting")
+        self.assertEqual(len(controller.store.journal_entries("setting")), rows)
+
+    def test_check_config_without_a_store_shows_file_values(self):
+        path = self.config_file("[settings]\nrepair_concurrency = 3\n")
+        with captured() as (out, _err):
+            self.assertEqual(cli.main(["check-config", "--config", str(path), "--json"]), 0)
+        effective = json.loads(out.getvalue())["effective_settings"]
+        self.assertEqual(effective["repair_concurrency"], {"value": 3, "source": "file"})
+        self.assertFalse((self.root / "queue.sqlite3").exists(), "check-config creates no store")
+
+
 class ServeProcess(Base):
     """The real entrypoint in a subprocess, in fallback mode (no controller installed)."""
 

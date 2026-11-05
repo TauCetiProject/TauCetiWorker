@@ -126,9 +126,15 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `[settings] stall_interval_seconds` | `900` | initial runtime control |
 | `[settings] approval_poll_interval_seconds` | `900` | how often the approval poll lists the open PRs' `merge eligibility` checks behind the webhooks (Approval polling below) |
 
-The `[settings]` values seed the store on first start. After that the persisted settings are the
-effective ones and are changed through the admin endpoint (Runtime settings below), not by editing the
-file; status reports the effective values.
+The `[settings]` values and `publication_enabled` are seeds: `serve` writes a file value into the
+store (actor `configuration`) only when the store has no value for the key, or when the stored value is
+itself an earlier seed and the file now says something else. A value set through the admin endpoint
+(Runtime settings below) records the operator as its actor and is never replaced by the file, so once
+the store exists the settings are changed with `settings set`, not by editing the file. Read-only
+commands never write settings. Writing a setting's current value journals nothing. `check-config`
+reads the store without writing and shows each runtime control's effective value with its source:
+the store (and the actor that wrote it, beside the file's value) or the file; status reports the
+effective values.
 
 ## Install and update
 
@@ -607,6 +613,8 @@ itself is one setting change with two halves, made together, nothing drained:
    for its landing before suspending, or release it after.
 4. Enable publication: set `publication_enabled = true` in `config.toml` and run
    `systemctl --user restart tauceti-queue`, then confirm `service.mode` is `production` in status.
+   (The file's value is a seed: if an operator has set `publication_enabled` through
+   `settings set`, that value stands and is changed the same way.)
    (A restart is needed because this flag is process configuration, not a runtime setting; it is the
    deliberate friction of the plan's "one setting change".) Status shows the imported inputs under
    `waiting`, Bors's head under `external_head` until it lands, and the first head when it seals.

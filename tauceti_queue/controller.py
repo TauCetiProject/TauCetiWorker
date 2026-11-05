@@ -97,6 +97,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "no_repair_labels": ["dont-repair-in-queue"],
 }
 
+# The actor of the values `seed_setting` writes from the configuration file's `[settings]`.
+SEED_ACTOR = "configuration"
+
 # How long `status()` waits for the controller lock before serving the last snapshot instead.
 STATUS_LOCK_WAIT_SECONDS = 2.0
 # How long one `repository_admin(login)` answer stands; served stale while GitHub cannot answer.
@@ -245,7 +248,11 @@ class Controller:
         return {key: self.setting(key) for key in DEFAULT_SETTINGS}
 
     def set_setting(self, key: str, value: Any, actor: str) -> dict[str, Any]:
-        """Change a runtime setting; applies to the next scheduling decision. Returns the effective settings."""
+        """Change a runtime setting; applies to the next scheduling decision. Returns the effective settings.
+
+        Writing the value a setting already has journals nothing and does not wake the loop; the
+        store then only records the actor, when it held no value for the key or the value was a
+        configuration seed, so an operator's explicit choice is not replaced by a later seed."""
         with self._lock:
             if key not in DEFAULT_SETTINGS:
                 raise ControllerError("unknown-setting", key)
@@ -263,6 +270,11 @@ class Controller:
                 raise ControllerError("bad-setting-value", f"{key} must be a {type(expected).__name__}")
             now = self.clock()
             previous = self.setting(key)
+            if value == previous:
+                record = self.store.setting_record(key)
+                if record is None or (record["actor"] == SEED_ACTOR and actor != SEED_ACTOR):
+                    self.store.set_setting(key, value, actor, now)
+                return self.effective_settings()
             with self.store.transaction():
                 self.store.set_setting(key, value, actor, now)
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
@@ -271,6 +283,19 @@ class Controller:
             self._wake.set()
             self._refresh_snapshot()
             return self.effective_settings()
+
+    def seed_setting(self, key: str, value: Any, actor: str = SEED_ACTOR) -> bool:
+        """Apply a configuration file's value of `key` as a seed: written when the store has no value
+        for the key, or when the stored value was itself written by `actor` and differs; a value an
+        operator set (any other actor) is kept. Returns whether the seed was written."""
+        with self._lock:
+            if key not in DEFAULT_SETTINGS:
+                raise ControllerError("unknown-setting", key)
+            record = self.store.setting_record(key)
+            if record is not None and (record["actor"] != actor or record["value"] == value):
+                return False
+            self.set_setting(key, value, actor)
+            return True
 
     def _state(self, key: str, default: Any = None) -> Any:
         return self.store.get_setting(f"state:{key}", default)

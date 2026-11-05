@@ -2,7 +2,9 @@
 
     tauceti-queue serve [--config FILE]
         Load the configuration, open the store, authenticate the GitHub App, build the controller,
-        start the HTTP server and the reconciliation loop; record the running revision and start
+        seed the store with the file's runtime controls (only for keys the store has no value for,
+        or whose stored value is an earlier seed; an operator's value is never replaced), start the
+        HTTP server and the reconciliation loop; record the running revision and start
         time for `/status`. SIGTERM or SIGINT finishes the current reconciliation step, stops the
         server and closes the store before exiting 0.
     tauceti-queue status [--url URL] [--json] [--wait SECONDS] [--expect-revision SHA]
@@ -11,7 +13,9 @@
         `services/queue/install.sh` verifies a deployment.
     tauceti-queue check-config [--config FILE] [--json] [--print KEY]
         Print the effective configuration with the source of every value and the problems that
-        would stop `serve`; exit 1 when there are any.
+        would stop `serve`; exit 1 when there are any. For the runtime controls (`[settings]` and
+        `publication_enabled`) it reads the store without writing and shows the effective value:
+        the store's, with the actor that wrote it, or the file's while the store has none.
     tauceti-queue settings show [--url URL]
     tauceti-queue settings set KEY VALUE [--url URL] [--token TOKEN]
         Read or change the runtime controls through the service's admin endpoint. KEY is any key of
@@ -137,21 +141,27 @@ class Service:
             revision=self.runtime.revision.sha,
             canonical_branch=self.config.canonical_branch or None,
         )
-        # Configuration supplies the initial runtime controls; the admin endpoint changes them later.
-        for key, value in {
-            **self.config.settings.as_dict(),
-            "publication_enabled": self.config.publication_enabled,
-        }.items():
-            try:
-                self.controller.set_setting(key, value, "configuration")
-            except Exception as error:  # noqa: BLE001 - an unknown key in the file is reported, not fatal
-                _log(f"configuration setting {key} not applied: {error}")
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
         if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):
             self.poller = poll_module.ApprovalPoller(
                 self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
             )
+
+    def seed_settings(self) -> None:
+        """Seed the store with the configuration file's runtime controls (`serve` only).
+
+        A file value is written only when the store has no value for the key, or when the stored
+        value is an earlier seed the file has since changed; a value an operator set through
+        `/admin/settings` or `tauceti-queue settings set` is kept (`Controller.seed_setting`)."""
+        if self.controller is None:
+            return
+        for key, value in configuration.runtime_settings(self.config).items():
+            try:
+                if self.controller.seed_setting(key, value):
+                    _log(f"configuration seeded {key} = {value!r}")
+            except Exception as error:  # noqa: BLE001 - an unknown key in the file is reported, not fatal
+                _log(f"configuration setting {key} not applied: {error}")
 
     def status_document(self, *, wait: float | None = None) -> dict[str, Any]:
         """The status envelope; `wait` bounds the wait for the controller lock (`Controller.status`)."""
@@ -243,6 +253,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     service.open_store()
     service.open_github()
     service.build_controller()
+    service.seed_settings()
     if service.controller is None:
         _log(f"controller unavailable: {service.unavailable_reason}; serving status only")
     service.start_server()
@@ -315,6 +326,15 @@ def cmd_status(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = 
 # --- check-config ----------------------------------------------------------------------------------
 
 
+def _stored_settings(config: Config) -> dict[str, dict[str, Any]] | None:
+    """The store's settings rows, read without writing; None when there is no store yet."""
+    module = _optional("store")
+    reader = getattr(module, "read_settings", None)
+    if reader is None or not config.database.is_file():
+        return None
+    return reader(str(config.database))
+
+
 def cmd_check_config(args: argparse.Namespace) -> int:
     try:
         config = configuration.load(args.config)
@@ -322,6 +342,7 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         _log(str(exc))
         return 1
     problems = configuration.validate(config)
+    stored = _stored_settings(config)
     if args.print:
         values = config.as_dict()
         if args.print not in values:
@@ -331,9 +352,14 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         print(json.dumps(value) if isinstance(value, dict | list | bool) or value is None else value)
         return 0
     if args.json:
-        print(json.dumps({**config.as_dict(), "problems": problems}, indent=2, sort_keys=True))
+        document = {
+            **config.as_dict(),
+            "effective_settings": configuration.effective_runtime_settings(config, stored),
+            "problems": problems,
+        }
+        print(json.dumps(document, indent=2, sort_keys=True))
     else:
-        print(configuration.format_effective(config, problems))
+        print(configuration.format_effective(config, problems, stored))
     return 1 if problems else 0
 
 

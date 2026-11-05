@@ -167,6 +167,63 @@ class Settings(ControllerCase):
         entry = self.controller.store.journal_entries("setting")[-1]
         self.assertEqual((entry["detail"]["key"], entry["detail"]["actor"]), ("repair_concurrency", "kim"))
 
+    def setting_rows(self, key):
+        return [e for e in self.controller.store.journal_entries("setting") if e["detail"]["key"] == key]
+
+    def test_configuration_seeds_an_empty_store(self):
+        self.assertIsNone(self.controller.store.setting_record("repair_concurrency"))
+        self.assertTrue(self.controller.seed_setting("repair_concurrency", 3))
+        record = self.controller.store.setting_record("repair_concurrency")
+        self.assertEqual((record["value"], record["actor"]), (3, "configuration"))
+        self.assertEqual(self.controller.setting("repair_concurrency"), 3)
+        # A seed equal to the default records its provenance without a journal row.
+        self.assertTrue(self.controller.seed_setting("stall_interval_seconds", 900))
+        self.assertEqual(self.controller.store.setting_record("stall_interval_seconds")["actor"], "configuration")
+        self.assertEqual(self.setting_rows("stall_interval_seconds"), [])
+        with self.assertRaises(ControllerError):
+            self.controller.seed_setting("nope", 1)
+
+    def test_configuration_never_overwrites_an_operator_value(self):
+        self.controller.seed_setting("repair_concurrency", 1)
+        self.controller.set_setting("repair_concurrency", 2, "kim-em")
+        rows = len(self.setting_rows("repair_concurrency"))
+        for _ in range(3):
+            self.assertFalse(self.controller.seed_setting("repair_concurrency", 1))
+            self.assertFalse(self.controller.seed_setting("repair_concurrency", 4))
+        record = self.controller.store.setting_record("repair_concurrency")
+        self.assertEqual((record["value"], record["actor"]), (2, "kim-em"))
+        self.assertEqual(len(self.setting_rows("repair_concurrency")), rows)
+        # An operator choosing the value a seed already holds also takes ownership of it.
+        self.controller.seed_setting("insertion_age_window", 16)
+        self.controller.set_setting("insertion_age_window", 16, "kim-em")
+        self.assertEqual(self.controller.store.setting_record("insertion_age_window")["actor"], "kim-em")
+        self.assertFalse(self.controller.seed_setting("insertion_age_window", 8))
+        self.assertEqual(self.controller.setting("insertion_age_window"), 16)
+
+    def test_configuration_overwrites_its_own_stale_seed(self):
+        self.controller.seed_setting("repair_concurrency", 1)
+        self.assertFalse(self.controller.seed_setting("repair_concurrency", 1))
+        self.assertTrue(self.controller.seed_setting("repair_concurrency", 2))
+        record = self.controller.store.setting_record("repair_concurrency")
+        self.assertEqual((record["value"], record["actor"]), (2, "configuration"))
+        [entry] = self.setting_rows("repair_concurrency")
+        self.assertEqual(entry["detail"], {"key": "repair_concurrency", "value": 2, "actor": "configuration"})
+
+    def test_unchanged_value_is_not_journaled_and_does_not_wake(self):
+        self.controller.set_setting("repair_concurrency", 2, "kim-em")
+        rows = len(self.controller.store.journal_entries("setting"))
+        wake = self.controller.wake_event()
+        wake.clear()
+        for actor in ("kim-em", "configuration", "someone-else"):
+            self.controller.set_setting("repair_concurrency", 2, actor)
+        self.controller.set_setting("publication_enabled", True, "operator")
+        self.assertFalse(wake.is_set())
+        self.assertEqual(len(self.controller.store.journal_entries("setting")), rows)
+        self.assertEqual(self.controller.store.setting_record("repair_concurrency")["actor"], "kim-em")
+        self.controller.set_setting("repair_concurrency", 3, "kim-em")
+        self.assertTrue(wake.is_set())
+        self.assertEqual(len(self.controller.store.journal_entries("setting")), rows + 1)
+
     def test_canonical_branch_is_discovered_from_the_clone(self):
         self.assertEqual(self.controller.canonical_branch, "main")
 
