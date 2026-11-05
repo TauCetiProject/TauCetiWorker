@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     run_created_at REAL,
     run_started_at REAL,
     run_completed_at REAL,
+    run_updated_at REAL,
     runner_name TEXT,
     runner_labels TEXT NOT NULL DEFAULT '[]',
     host TEXT,
@@ -242,6 +243,7 @@ class Store:
     # EXISTS` leaves those databases alone, so each is added here when absent.
     ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
         ("ci_attempts", "verdicts", "TEXT NOT NULL DEFAULT '{}'"),
+        ("ci_attempts", "run_updated_at", "REAL"),
         ("inputs", "last_probe_base", "TEXT NOT NULL DEFAULT ''"),
         ("inputs", "probe_conflicts", "TEXT NOT NULL DEFAULT '{}'"),
         ("batches", "prepared_version", "INTEGER"),

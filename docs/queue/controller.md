@@ -211,14 +211,26 @@ CI: the attempt for the head's current version is dispatched with `dispatch_cand
 named the head or `polling_interval_seconds` elapsed, recording runner, host, phases and progress
 times. The verdict is the `build`, `bump-guard` and `scope` commit statuses on the tip whose `run_id`
 is the run that completed for this attempt, all three `success` (a red `scope` or `bump-guard` beside
-a green `build` is a source failure carrying the status description); anything else (no run within `dispatch_timeout_seconds`, no progress for
-`lost_run_seconds`, a cancelled, timed out or skipped run, a completed run without a bound status, a
+a green `build` is a source failure carrying the status description); anything else (no run within `dispatch_timeout_seconds`, a lost run, a cancelled, timed out or skipped run, a completed run without a bound status, a
 status from another run, a failure whose description starts with `infrastructure` or whose findings
 are all of kind `infrastructure`) is an infrastructure outcome: the candidate is unchanged and is
 re-dispatched after `infrastructure_retry_backoff_seconds * 2^n`, at most
 `infrastructure_retry_limit` times, after which the head waits and status says so (`retry_ci` is the
 operator's reset). A failing status with source findings is a source failure and opens a `repair`
 task carrying the findings. A pass enqueues the promotion.
+
+A run GitHub reports `queued` or `in_progress` is never re-dispatched over. It is lost only when it
+can no longer be found (neither in the listing nor by a direct read of the run), or when it is
+`in_progress`, nothing in its jobs moved for `lost_run_seconds` (progress is any phase or step
+appearing, starting or completing, or the run's `updated_at` moving), and a direct read
+(`GET /repos/{repo}/actions/runs/{id}`) still says `in_progress` with an `updated_at` at least that
+old; a silence short of that is a `stall:` reason line, never a verdict. A second dispatch for a tip
+whose run is live is never issued, because pr-build.yml's concurrency group would cancel the live run:
+before any re-dispatch of a tip dispatched before, the controller asks `find_candidate_run` for the
+newest run for it since its first attempt, and when that run is still `queued` or `in_progress` it
+re-adopts it whatever the attempt was classified as: the newest attempt row becomes pending again,
+bound to the run, and `run-readopted` is journaled. `retry_ci` refuses with reason `live-run` while
+such a run exists; cancel the run on GitHub first to force a fresh dispatch.
 
 Promotion: an outbox entry `promote:<batch>:<version>:<tip>` that fast-forwards the canonical
 branch from the recorded expected parent to the tip (no merge commit). Before pushing, and on every
@@ -311,7 +323,7 @@ and reported in status:
 | `publication_enabled` | false | shadow mode when false: no dispatch, promotion, comment, label, close or ref push; status says what would happen |
 | `claim_ttl_seconds` | 900 | claim lifetime between renewals |
 | `dispatch_timeout_seconds` | 600 | no run found after a dispatch: infrastructure |
-| `lost_run_seconds` | 3600 | no progress in a run: lost runner |
+| `lost_run_seconds` | 14400 | an in-progress run whose jobs and `updated_at` have not moved for this long is lost (CI section above) |
 | `infrastructure_retry_limit` | 3 | re-dispatches per head version after infrastructure failures |
 | `infrastructure_retry_backoff_seconds` | 60 | base of the re-dispatch backoff |
 | `inference_failure_threshold` | 3 | consecutive provider failures that start a hold |

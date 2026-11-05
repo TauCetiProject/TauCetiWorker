@@ -352,6 +352,36 @@ class SettingsCommand(Base):
         with captured(), self.assertRaises(SystemExit):
             parser.parse_args(["settings", "set", "batch_cap", "4"])
 
+    def test_accepts_every_controller_setting(self):
+        from tauceti_queue.controller import DEFAULT_SETTINGS
+
+        parser = cli.build_parser()
+        for key, initial in DEFAULT_SETTINGS.items():
+            if isinstance(initial, bool):
+                raw, expected = ("false", False) if initial else ("true", True)
+            elif isinstance(initial, int):
+                raw, expected = str(initial + 1), initial + 1
+            else:
+                raw, expected = f"{initial}-x", f"{initial}-x"
+            fetch = mock.Mock(return_value={"settings": {key: expected}})
+            with self.subTest(key=key), captured():
+                args = parser.parse_args(["settings", "--url", "http://q", "set", key, raw, "--token", "t"])
+                self.assertEqual(cli.cmd_settings(args, fetch=fetch), 0)
+                self.assertEqual(fetch.call_args.kwargs["body"], {key: expected})
+
+    def test_controller_only_integer_settings_accept_zero_and_booleans_reject_text(self):
+        parser = cli.build_parser()
+        fetch = mock.Mock(return_value={})
+        with captured():
+            args = parser.parse_args(["settings", "--url", "http://q", "set", "infrastructure_retry_limit", "0"])
+            args.token = "t"
+            self.assertEqual(cli.cmd_settings(args, fetch=fetch), 0)
+        self.assertEqual(fetch.call_args.kwargs["body"], {"infrastructure_retry_limit": 0})
+        with captured() as (_out, err):
+            args = parser.parse_args(["settings", "--url", "http://q", "set", "publication_enabled", "maybe"])
+            self.assertEqual(cli.cmd_settings(args, fetch=mock.Mock()), 1)
+        self.assertIn("true or false", err.getvalue())
+
     def test_http_errors_are_reported(self):
         parser = cli.build_parser()
         args = parser.parse_args(["settings", "--url", "http://q", "set", "repair_concurrency", "2", "--token", "t"])

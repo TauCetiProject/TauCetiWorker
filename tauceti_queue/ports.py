@@ -89,6 +89,7 @@ class CandidateRun:
     diagnostics: tuple[dict[str, Any], ...] = ()
     display_title: str = ""
     html_url: str = ""
+    updated_at: float | None = None  # the run's `updated_at`, which GitHub moves as its jobs report
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,14 @@ class GitHubPort(Protocol):
         `since` is the dispatch time of the attempt being observed: an infrastructure re-dispatch
         of the same head, base and batch produces a second run with the same title, and the newest
         run created at or after `since` (less a minute of skew) is the one that answers for it.
+        """
+        ...
+
+    def read_run(self, repo: str, run_id: str, *, with_jobs: bool = False) -> CandidateRun | None:
+        """A direct read of one run (`GET /repos/{repo}/actions/runs/{run_id}`); `None` when GitHub has no such run.
+
+        The controller reads a run directly before it declares an in-progress run lost, and when a run
+        it was bound to no longer appears in the listing `find_candidate_run` reads.
         """
         ...
 

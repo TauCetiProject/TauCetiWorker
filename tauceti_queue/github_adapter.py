@@ -637,6 +637,13 @@ class GitHubAdapter:
             raise AmbiguousCandidateRun(f"{len(matches)} runs titled {expected!r}")
         return self.candidate_run(repo, matches[0], with_jobs=with_jobs, with_diagnostics=with_diagnostics)
 
+    def read_run(self, repo: str, run_id: str, *, with_jobs: bool = False) -> CandidateRun | None:
+        """`GET repos/{repo}/actions/runs/{run_id}`: the run as GitHub reports it now, `None` on 404."""
+        status, data = self.client.get_json(f"repos/{repo}/actions/runs/{run_id}", tolerate=(404,))
+        if status == 404 or not isinstance(data, dict) or not data.get("id"):
+            return None
+        return self.candidate_run(repo, data, with_jobs=with_jobs, with_diagnostics=with_jobs)
+
     def candidate_run(
         self, repo: str, run: dict, *, with_jobs: bool = True, with_diagnostics: bool = True
     ) -> CandidateRun:
@@ -691,6 +698,7 @@ class GitHubAdapter:
             diagnostics=tuple(findings),
             display_title=str(run.get("display_title") or ""),
             html_url=str(run.get("html_url") or ""),
+            updated_at=_timestamp(run.get("updated_at")),
         )
 
     def run_diagnostics(self, repo: str, run: dict, jobs: Sequence[dict]) -> list[dict]:

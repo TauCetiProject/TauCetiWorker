@@ -485,17 +485,50 @@ uv run tauceti-queue settings set insertion_age_window 8
 uv run tauceti-queue settings set repair_concurrency 2 --token "$(gh auth token)"
 uv run tauceti-queue settings set approval_poll_interval_seconds 600
 uv run tauceti-queue settings set insertion_probe_budget_seconds 10
+uv run tauceti-queue settings set lost_run_seconds 14400
+uv run tauceti-queue settings set pre_rebase_enabled false
 ```
 
 `settings set` posts `{"<key>": <value>}` to `/admin/settings` with the operator's GitHub token
 (`--token`, else `GITHUB_TOKEN`, else `gh auth token`) as a bearer token; the service checks
 repository-admin permission on `TauCetiProject/TauCeti` with the same predicate as the security audit
 (`tauceti_worker/security_audit.py::require_admin`). A change applies to new scheduling decisions,
-is persisted in the store, and appears in `status.settings` immediately. Values are positive integers;
-anything else is rejected before the request is sent. `--url` points the command at the public endpoint
-when run from another machine. The full list with initial values is the settings table in
-[controller.md](controller.md); `insertion_probe_budget_seconds` and `outbox_drain_budget_seconds`
-(20 each) bound one pass's insertion probes and outbox pushes in wall-clock seconds (Monitoring below).
+is persisted in the store, and appears in `status.settings` immediately. Every key of the controller's
+`DEFAULT_SETTINGS` can be set, and the value is parsed by the type of its initial value (below);
+anything else is rejected before the request is sent. `/admin/settings` itself takes one JSON object
+of keys to values, refuses the whole request when any key is unknown, and checks each value's type.
+`--url` points the command at the public endpoint when run from another machine. What each setting
+means is in the settings table of [controller.md](controller.md); `insertion_probe_budget_seconds` and
+`outbox_drain_budget_seconds` bound one pass's insertion probes and outbox pushes in wall-clock seconds
+(Monitoring below).
+
+| setting | initial | value |
+| --- | --- | --- |
+| `insertion_age_window` | `16` | integer, at least 1 |
+| `open_batch_limit` | `2` | integer, at least 0 |
+| `repair_concurrency` | `1` | integer, at least 1 |
+| `stall_interval_seconds` | `900` | integer, at least 1 |
+| `publication_enabled` | `false` | `true` or `false` |
+| `claim_ttl_seconds` | `900` | integer, at least 0 |
+| `dispatch_timeout_seconds` | `600` | integer, at least 0 |
+| `lost_run_seconds` | `14400` | integer, at least 0 |
+| `infrastructure_retry_limit` | `3` | integer, at least 0 |
+| `infrastructure_retry_backoff_seconds` | `60` | integer, at least 0 |
+| `inference_failure_threshold` | `3` | integer, at least 0 |
+| `inference_hold_backoff_seconds` | `60` | integer, at least 0 |
+| `inference_hold_backoff_max_seconds` | `3600` | integer, at least 0 |
+| `outbox_retry_seconds` | `30` | integer, at least 0 |
+| `outbox_retry_max_seconds` | `900` | integer, at least 0 |
+| `polling_interval_seconds` | `60` | integer, at least 0 |
+| `approval_poll_interval_seconds` | `900` | integer, at least 1 |
+| `membership_label` | `bors-staging` | text |
+| `insertion_probe_budget_seconds` | `20` | integer, at least 0 |
+| `outbox_drain_budget_seconds` | `20` | integer, at least 0 |
+| `prepare_open_batches` | `true` | `true` or `false` |
+| `prepare_min_members` | `20` | integer, at least 0 |
+| `prepare_quiet_seconds` | `600` | integer, at least 0 |
+| `pre_rebase_enabled` | `true` | `true` or `false` |
+
 
 ## Approval polling
 

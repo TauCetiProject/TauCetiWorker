@@ -14,9 +14,13 @@
         would stop `serve`; exit 1 when there are any.
     tauceti-queue settings show [--url URL]
     tauceti-queue settings set KEY VALUE [--url URL] [--token TOKEN]
-        Read or change the runtime controls through the service's admin endpoint. The token is the
-        operator's GitHub token (`--token`, `GITHUB_TOKEN`, or `gh auth token`); the service checks
-        repository-admin permission with the same predicate as the security audit.
+        Read or change the runtime controls through the service's admin endpoint. KEY is any key of
+        the controller's `DEFAULT_SETTINGS`; VALUE is parsed by the type of that key's initial value
+        (a non-negative integer, at least 1 for the `[settings]` keys of the configuration file,
+        `true`/`false`, or text). The command posts `{"KEY": VALUE}` to `/admin/settings`, whose body
+        is one JSON object of setting keys to values. The token is the operator's GitHub token
+        (`--token`, `GITHUB_TOKEN`, or `gh auth token`); the service checks repository-admin
+        permission with the same predicate as the security audit.
     tauceti-queue import-bors --feed URL|FILE [--candidates URL|FILE ...] [--dry-run] [--release-head]
         The cutover import (`tauceti_queue.bors_import`): read Bors's observation feed and candidate
         journals, post them to the service's `/admin/import-bors` endpoint, print what was (or, with
@@ -348,6 +352,41 @@ def _operator_token(explicit: str | None) -> str:
     return token.strip()
 
 
+def settable_settings() -> dict[str, Any]:
+    """Every runtime setting `settings set` may change, with its initial value: the controller's
+    `DEFAULT_SETTINGS` (the configuration file's `[settings]` when the controller is not installed)."""
+    try:
+        from .controller import DEFAULT_SETTINGS
+    except ImportError:
+        return configuration.Settings().as_dict()
+    return dict(DEFAULT_SETTINGS)
+
+
+_TRUE = ("true", "yes", "on", "1")
+_FALSE = ("false", "no", "off", "0")
+
+
+def parse_setting_value(key: str, raw: str) -> Any:
+    """`raw` as the type of `key`'s initial value; raises ValueError with a message for the operator."""
+    initial = settable_settings()[key]
+    if isinstance(initial, bool):
+        if raw.lower() in _TRUE:
+            return True
+        if raw.lower() in _FALSE:
+            return False
+        raise ValueError(f"{key} takes true or false, got {raw!r}")
+    if isinstance(initial, int):
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{key} takes an integer, got {raw!r}") from None
+        minimum = 1 if key in configuration.SETTING_FIELDS else 0
+        if value < minimum:
+            raise ValueError(f"{key} must be at least {minimum}")
+        return value
+    return raw
+
+
 def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
     base = _status_url(args)
     try:
@@ -355,16 +394,14 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
             document = fetch(base + "/settings")
             print(json.dumps(document, indent=2, sort_keys=True))
             return 0
-        if args.key not in configuration.SETTING_FIELDS:
-            _log(f"unknown setting {args.key!r}; known: {', '.join(configuration.SETTING_FIELDS)}")
+        known = settable_settings()
+        if args.key not in known:
+            _log(f"unknown setting {args.key!r}; known: {', '.join(known)}")
             return 1
         try:
-            value = int(args.value)
-        except ValueError:
-            _log(f"{args.key} takes an integer, got {args.value!r}")
-            return 1
-        if value < 1:
-            _log(f"{args.key} must be at least 1")
+            value = parse_setting_value(args.key, args.value)
+        except ValueError as exc:
+            _log(str(exc))
             return 1
         document = fetch(
             base + "/admin/settings", method="POST", body={args.key: value}, token=_operator_token(args.token)
@@ -451,9 +488,14 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--config", help="configuration file used to find the listen address")
     actions = settings.add_subparsers(dest="action", required=True)
     actions.add_parser("show", help="print the effective settings")
-    setter = actions.add_parser("set", help="change one setting through the admin endpoint")
-    setter.add_argument("key", choices=configuration.SETTING_FIELDS)
-    setter.add_argument("value")
+    setter = actions.add_parser(
+        "set",
+        help="change one setting through the admin endpoint",
+        description="Post {KEY: VALUE} to /admin/settings. KEY is any controller setting; VALUE is parsed "
+        "by the type of its initial value (integer, true/false, or text).",
+    )
+    setter.add_argument("key", choices=sorted(settable_settings()), metavar="KEY", help="the setting to change")
+    setter.add_argument("value", metavar="VALUE", help="the new value")
     setter.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
 
     importer = commands.add_parser("import-bors", help="import Bors's approved PRs and running head at the cutover")
