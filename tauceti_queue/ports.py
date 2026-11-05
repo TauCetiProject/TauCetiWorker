@@ -200,7 +200,12 @@ class GitHubPort(Protocol):
 
 @dataclass
 class TaskMember:
-    """A member as the repair task sees it: identity, accepted source, current commit and provenance."""
+    """A member as the repair task sees it: identity, accepted source, current commit and provenance.
+
+    `no_repair`: the PR carries a `no_repair_labels` label, so the agent must not edit it; if its content
+    needs a change the agent reduces it to an empty commit and names the interacting PR, file and finding
+    in the appended message. `withdrawn`: the queue already withdrew it that way; it stays an empty commit.
+    """
 
     source_pr: str
     number: int
@@ -212,6 +217,8 @@ class TaskMember:
     author: str = ""
     explanation: str = ""
     retained_ref: str = ""
+    no_repair: bool = False
+    withdrawn: bool = False
 
 
 @dataclass
@@ -275,7 +282,7 @@ class Adoption:
     `accepted` means the chain is now the batch's authoritative tip at `version`. A rejected
     submission keeps its commits retained under `retained_ref` so they can be reused; `reason` is a
     stable code (`claim-expired`, `claim-superseded`, `version-mismatch`, `not-authorized`,
-    `invalid-chain`, `explanation-required`, `unknown-task`) and `violations` carries the chain
+    `invalid-chain`, `explanation-required`, `no-repair-edited`, `unknown-task`) and `violations` carries the chain
     tool's findings when there are any.
     """
 

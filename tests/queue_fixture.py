@@ -1340,6 +1340,183 @@ class Lanes(QueueFixture):
         self.assertEqual({i["number"]: i["state"] for i in self.controller.inputs()}[104], "cancelled")
 
 
+class RepairOrReject(QueueFixture):
+    """Repair or reject, the author's choice: edit summaries, the `queue-no-repair` label, `problem-anticipated`."""
+
+    NOTE = (
+        "Emptied: this PR's lemma duplicates one #101 adds.\n"
+        "Interacting-PR: #101\n"
+        "Interacting-File: Dup.lean\n"
+        "Finding: duplicate declaration: `foo` is declared by both"
+    )
+
+    def test_landing_comment_carries_the_edit_summary_and_the_diff(self):
+        self.github.ci_policy = fail_members(102)
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"Broken.lean": "line one\nbroken\nline three\n"})
+        self.tick()
+        head = self.head()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Broken.lean": "line one\nfixed\nline three\n", "Extra.lean": "extra\n"},
+                    explanation="Fixed the broken line against #101.",
+                )
+            }
+        )
+        self.github.ci_policy = verdicts()
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        landed = self.controller.store.row("members", {"batch_id": head["id"], "number": 102})
+        comment = self.github.comments_for(102)[0]["body"]
+        self.assertIn("> Fixed the broken line against #101.", comment)
+        self.assertIn("Diff of the landed commit against the accepted head", comment)
+        self.assertIn("```diff\n", comment)
+        self.assertIn("-broken\n+fixed", comment)
+        self.assertIn("+extra", comment, "a file the agent added to the PR's commit is shown")
+        self.assertIn(f"/commit/{landed['commit_sha']}", comment)
+        # The clean member's comment is the plain notice.
+        self.assertNotIn("Diff of the landed commit", self.github.comments_for(101)[0]["body"])
+        summary = self.controller.store.journal_entries("edit-summary")
+        self.assertEqual([(e["detail"]["number"], e["detail"]["truncated"]) for e in summary], [(102, False)])
+        self.assertEqual(self.controller.status()["counters"]["edit_summaries"], 1)
+
+    def withdrawn_head(self, interacting=101):
+        """A head of #101 and #102, #102 labelled `queue-no-repair`; CI fails on #102 and the agent empties it."""
+        self.github.ci_policy = fail_members(102)
+        self.approve(101, {"Dup.lean": "theorem foo : True := trivial\n"})
+        self.approve(102, {"Other.lean": "theorem foo : True := trivial\n"}, labels=["queue-no-repair"])
+        self.assertEqual(self.controller.status()["counters"]["no_repair_opt_outs"], 1)
+        self.tick()
+        head = self.head()
+        self.run_ci()
+        self.tick()
+        seen = {}
+
+        def script(task):
+            seen.update({m.number: (m.no_repair, m.withdrawn) for m in task.members})
+            return {f"{PROJECT}#102": Resolution(empty=True, explanation=self.NOTE.replace("#101", f"#{interacting}"))}
+
+        agent = self.agent(script=script)
+        self.github.ci_policy = verdicts()
+        adoption = agent.run(self.controller)
+        self.assertTrue(adoption.accepted, adoption)
+        self.assertEqual(seen, {101: (False, False), 102: (True, False)})
+        self.assertEqual(adoption.provenance[f"{PROJECT}#102"], "withdrawn")
+        return head
+
+    def test_a_labelled_member_the_agent_empties_is_withdrawn_and_not_closed_as_merged(self):
+        head = self.withdrawn_head()
+        row = {i["number"]: i for i in self.controller.inputs()}[102]
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "problem-anticipated"))
+        member = self.controller.store.row("members", {"batch_id": head["id"], "number": 102})
+        self.assertEqual((member["withdrawn"], member["removed"]), (1, 0), "the empty commit stays in the chain")
+        entry = self.controller.store.journal_entries("problem-anticipated")[0]["detail"]
+        self.assertEqual(
+            (entry["interacting"], entry["file"], entry["finding"]),
+            (101, "Dup.lean", "duplicate declaration: `foo` is declared by both"),
+        )
+        self.tick()
+        comment = self.github.comments_for(102)[0]["body"]
+        self.assertIn("carries `queue-no-repair`, so the merge queue does not edit it", comment)
+        self.assertIn("- Interacting PR: #101\n- File: `Dup.lean`\n- Finding: duplicate declaration", comment)
+        self.assertIn("You cannot reproduce this on your branch yet: #101 is still in staging", comment)
+        self.assertEqual(self.github.labels[102], {"queue-no-repair", "bors-staging"}, "no label change yet")
+        self.assertEqual(self.controller.status()["anticipated"][0]["interacting"], 101)
+        # A later task on the head sees it withdrawn; an edit giving it content back is refused.
+        self.assertEqual(self.controller.status()["counters"]["no_repair_withdrawals"], 1)
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.main_sha(), self.controller.store.row("batches", {"id": head["id"]})["tip"])
+        self.assertIsNone(self.repo.file_at("main", "Other.lean"))
+        self.assertEqual(self.github.prs[102]["state"], "open")
+        self.assertNotIn(102, self.github.closed)
+        self.assertIsNone(self.controller.store.row("outbox", {"key": f"landed-close:{head['id']}:102"}))
+        self.assertEqual(self.controller.store.journal_entries("landed")[0]["detail"]["withdrawn"], [102])
+        self.assertEqual({i["number"]: i["state"] for i in self.controller.inputs()}[102], "cancelled")
+
+    def test_the_interacting_pr_landing_converts_the_withdrawal_to_needs_rebase(self):
+        head = self.withdrawn_head()
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertEqual([e["detail"]["number"] for e in self.controller.store.journal_entries("needs-rebase")], [102])
+        bodies = [c["body"] for c in self.github.comments_for(102)]
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("#101 has landed on `main`, so the problem the merge queue anticipated", bodies[1])
+        self.assertIn("now reproducible", bodies[1])
+        self.assertIn("needs-rebase", self.github.labels[102])
+        self.assertEqual(self.controller.status()["anticipated"], [])
+        self.assertEqual(self.controller.status()["counters"]["problem_anticipated_needs_rebase"], 1)
+        # The PR re-enters through ordinary re-approval: the author rebases and is approved again.
+        new_head = self.github.push_pr(102, {"Other.lean": "theorem foo' : True := trivial\n"})
+        self.assertTrue(self.controller.approve(PROJECT, 102, new_head, "reviewer")["accepted"])
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.file_at("main", "Other.lean"), "theorem foo' : True := trivial\n")
+        self.assertIn(102, self.github.closed)
+
+    def test_the_interacting_pr_leaving_the_queue_readmits_the_withdrawn_pr_at_its_original_age(self):
+        approved_at = None
+        self.github.ci_policy = fail_members(102)
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"Other.lean": "other\n"}, labels=["queue-no-repair"])
+        approved_at = {i["number"]: i for i in self.controller.inputs()}[102]["approved_at"]
+        self.tick()
+        head = self.head()
+        self.run_ci()
+        self.tick()
+        self.approve(105, {"E.lean": "e\n"})  # waiting: the agent names it as the other side
+        agent = self.agent(
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution(empty=True, explanation=self.NOTE.replace("#101", "#105"))
+            }
+        )
+        self.github.ci_policy = verdicts()
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.assertTrue(self.controller.cancel(PROJECT, 105, "author")["withdrawn"])
+        self.clock.advance(60)
+        self.tick()
+        row = {i["number"]: i for i in self.controller.inputs()}[102]
+        self.assertIn(row["state"], ("waiting", "inserted"))
+        self.assertEqual(row["approved_at"], approved_at)
+        self.assertEqual([e["detail"]["number"] for e in self.controller.store.journal_entries("readmitted")], [102])
+        self.assertIn("left the merge queue without landing", self.github.comments_for(102)[-1]["body"])
+        self.assertEqual(self.controller.status()["counters"]["problem_anticipated_readmitted"], 1)
+        # The head lands with #102's empty commit; the re-admitted #102 lands with its content afterwards
+        # (the empty commit on `main` does not count as #102 having landed) and is closed once.
+        for _ in range(4):
+            self.tick()
+            if self.head() is not None and self.controller.status()["head"]["stage"] == "ci":
+                self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertEqual(self.repo.file_at("main", "Other.lean"), "other\n")
+        self.assertEqual({i["number"]: i["state"] for i in self.controller.inputs()}[102], "landed")
+        self.assertIn(102, self.github.closed)
+
+    def test_an_edit_that_gives_a_no_repair_member_content_is_refused(self):
+        self.github.ci_policy = fail_members(102)
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"Broken.lean": "broken\n"}, labels=["queue-no-repair"])
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {f"{PROJECT}#102": Resolution({"Broken.lean": "fixed\n"}, explanation="Fixed it.")}
+        )
+        adoption = agent.run(self.controller)
+        self.assertFalse(adoption.accepted)
+        self.assertEqual(adoption.reason, "no-repair-edited")
+        self.assertEqual(adoption.violations[0]["source_pr"], f"{PROJECT}#102")
+
+
 class Holds(QueueFixture):
     def test_s13_inference_hold_stops_sealing_keeps_the_head_and_resumes_on_success(self):
         self.github.ci_policy = verdicts("fail")

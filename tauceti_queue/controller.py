@@ -88,6 +88,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Replay the oldest open batch onto the head's tip once the head's chain is submitted and waits
     # for its CI verdict, so the next head seals from the result without a replay (`_pre_rebase`).
     "pre_rebase_enabled": True,
+    # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
+    # edited; when it would need an edit the agent empties it and the queue withdraws it as
+    # `problem-anticipated` (`_anticipate`).
+    "no_repair_labels": ["queue-no-repair"],
 }
 
 # How long `status()` waits for the controller lock before serving the last snapshot instead.
@@ -100,6 +104,16 @@ INPUT_RESERVED = "reserved"
 INPUT_INSERTED = "inserted"
 INPUT_LANDED = "landed"
 INPUT_CANCELLED = "cancelled"
+# The cancellation reason of a `no_repair` member the agent emptied: withdrawn until the PR it
+# interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
+PROBLEM_ANTICIPATED = "problem-anticipated"
+NEEDS_REBASE_LABEL = "needs-rebase"
+# `inputs.anticipated.stage` of a `problem-anticipated` input: `pending` while the interacting PR is
+# followed, `unattributed` when the agent named none, then `needs-rebase`, `readmitted`,
+# `readmit-refused` (the PR could not be re-admitted as it stands) or `superseded` (approved again).
+ANTICIPATED_PENDING = "pending"
+# The most diff lines a landing comment shows for an edited member; longer diffs link the commit.
+EDIT_DIFF_LINES = 400
 
 BATCH_OPEN = "open"
 BATCH_HEAD = "head"
@@ -149,6 +163,12 @@ OUTCOME_SUPERSEDED = "superseded"
 _PR_MENTION_RE = re.compile(r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<number>\d+)")
 # The subject of a squash commit bors-ng lands: `<title> (#<number>)`, with no `Source-PR` trailer.
 _BORS_SUBJECT_RE = re.compile(r"\(#(?P<number>\d+)\)\s*$")
+# What the agent appends to an emptied `no_repair` member's message (the repair prompt's "Do not edit").
+_INTERACTING_PR_RE = re.compile(
+    r"^\s*Interacting-PR:\s*(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<number>\d+)", re.M | re.I
+)
+_INTERACTING_FILE_RE = re.compile(r"^\s*Interacting-File:\s*`?(?P<file>[^`\n]+?)`?\s*$", re.M | re.I)
+_FINDING_RE = re.compile(r"^\s*Finding:\s*(?P<finding>\S.*?)\s*$", re.M | re.I)
 
 EXTERNAL_HEAD_RUNNING = "running"
 EXTERNAL_HEAD_LANDED = "landed"
@@ -227,6 +247,9 @@ class Controller:
             elif isinstance(expected, int):
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise ControllerError("bad-setting-value", f"{key} must be a non-negative integer")
+            elif isinstance(expected, list):
+                if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                    raise ControllerError("bad-setting-value", f"{key} must be a list of strings")
             elif not isinstance(value, type(expected)):
                 raise ControllerError("bad-setting-value", f"{key} must be a {type(expected).__name__}")
             now = self.clock()
@@ -416,6 +439,7 @@ class Controller:
                 return {"accepted": False, "reason": f"blocked-label: {', '.join(blocked)}", "input": None}
             if not self._fetch_head(pr, head_sha):
                 return {"accepted": False, "reason": "head-unavailable", "input": None}
+            no_repair = self._carries_no_repair(getattr(pull, "labels", None))
             ref = self.input_ref(pr, head_sha)
             with self.store.transaction():
                 self._retain(ref, head_sha)
@@ -434,8 +458,19 @@ class Controller:
                     state=INPUT_WAITING,
                     approved_at=approved_at if approved_at is not None else now,
                     retained_ref=ref,
+                    no_repair=int(no_repair),
                 )
-                self.store.journal(now, "approved", number=pr, head=head_sha, reviewer=reviewer, input_id=input_id)
+                self.store.journal(
+                    now,
+                    "approved",
+                    number=pr,
+                    head=head_sha,
+                    reviewer=reviewer,
+                    input_id=input_id,
+                    **({"no_repair": True} if no_repair else {}),
+                )
+                if no_repair:
+                    self._count("no_repair_opt_outs")
             self._wake.set()
             self._refresh_snapshot()
             return {"accepted": True, "reason": "approved", "input": self.store.row("inputs", {"id": input_id})}
@@ -472,6 +507,13 @@ class Controller:
         """
         labels = {str(label).lower() for label in (getattr(pull, "labels", None) or ())}
         return sorted(labels & BLOCKING_LABELS)
+
+    def _no_repair_labels(self) -> set[str]:
+        return {str(label).lower() for label in self.setting("no_repair_labels") or ()}
+
+    def _carries_no_repair(self, labels: Any) -> bool:
+        """Whether a PR's labels include one of `no_repair_labels` (case-insensitive)."""
+        return bool({str(label).lower() for label in labels or ()} & self._no_repair_labels())
 
     def input_for(self, repo: str, pr: int) -> dict[str, Any] | None:
         """The PR's current input row (the newest that is not cancelled, else the newest), or None."""
@@ -677,6 +719,8 @@ class Controller:
         current = self._input_for(number)
         if current is None:
             return
+        if action in ("labeled", "unlabeled") and self._no_repair_event(current, payload, now):
+            return
         if current["state"] == INPUT_INSERTED:
             # Scenario 21: closing, relabelling, re-reviewing a member changes nothing; the content lands.
             self.store.journal(now, "member-event-ignored", number=number, action=action, batch_id=current["batch_id"])
@@ -695,6 +739,45 @@ class Controller:
         elif action == "converted_to_draft":
             self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason="draft")
             self.store.journal(now, "withdrawn", number=number, reason="draft")
+
+    def _no_repair_event(self, current: dict[str, Any], payload: dict[str, Any], now: float) -> bool:
+        """A `labeled`/`unlabeled` event that changes the PR's `no_repair` opt-out, applied to a waiting
+        input and to an inserted member's record (so the next task's prompt and the submission check see
+        it); True when the event concerned a `no_repair_labels` label. A withdrawn member is not changed:
+        its commit stays empty until its head lands."""
+        if current["state"] not in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
+            return False
+        names = self._no_repair_labels()
+        changed = str((payload.get("label") or {}).get("name") or "").lower()
+        pull = payload.get("pull_request") or {}
+        if changed not in names:
+            return False
+        if isinstance(pull.get("labels"), list):
+            labels = [label.get("name") if isinstance(label, dict) else label for label in pull["labels"]]
+            no_repair = self._carries_no_repair(labels)
+        else:
+            no_repair = payload.get("action") == "labeled"
+        if no_repair == bool(current["no_repair"]):
+            return True
+        with self.store.transaction():
+            self.store.update("inputs", {"id": current["id"]}, no_repair=int(no_repair))
+            if current["state"] == INPUT_INSERTED:
+                self.store.update(
+                    "members",
+                    {"input_id": current["id"], "batch_id": current["batch_id"], "withdrawn": 0},
+                    no_repair=int(no_repair),
+                )
+            if no_repair:
+                self._count("no_repair_opt_outs")
+            self.store.journal(
+                now,
+                "no-repair",
+                current["batch_id"] if current["state"] == INPUT_INSERTED else None,
+                number=current["number"],
+                no_repair=no_repair,
+                state=current["state"],
+            )
+        return True
 
     def _push_to_member_branch(self, payload: dict[str, Any], now: float) -> None:
         # A push to a member's branch during a candidate build never touches the build (scenario 19);
@@ -1045,9 +1128,57 @@ class Controller:
                     for m in unexplained
                 ]
                 return reject("explanation-required", violations)
+            edited_no_repair = self._no_repair_edits(task, members, comparison)
+            if edited_no_repair:
+                violations = [
+                    chain.Violation(
+                        "no-repair-edited",
+                        f"{m.source_pr} opted out of repair: leave its content alone, or reduce it to an empty commit "
+                        "naming the interacting PR, file and finding",
+                        commit=m.new_sha,
+                        source_pr=m.source_pr,
+                    )
+                    for m in edited_no_repair
+                ]
+                return reject("no-repair-edited", violations)
             if task["kind"] == TASK_PRE_REBASE:
                 return self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
             return self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
+
+    def _commit_empty(self, sha: str | None) -> bool:
+        """A single-parent commit whose tree is its parent's."""
+        if not sha:
+            return False
+        commit = chain.read_commit(self.clone, sha)
+        return len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
+
+    def _landed_between(self, base: str, onto: str) -> dict[str, str]:
+        """The PRs a task's new base carries that its old base did not (`chain.landed_prs`): a member
+        emptied because it is already on `main` is not an opt-out withdrawal."""
+        if base == onto:
+            return {}
+        try:
+            return chain.landed_prs(self.clone, base, onto)
+        except chain.ChainError:
+            return {}
+
+    def _no_repair_edits(
+        self, task: dict[str, Any], members: list[dict[str, Any]], comparison: chain.ComparisonReport
+    ) -> list[chain.MemberProvenance]:
+        """Edited members that opted out of repair (or were withdrawn) and are not empty commits: an
+        agent may only reduce such a member to an empty commit, never change its content otherwise."""
+        guarded = {m["source_pr"] for m in members if m["no_repair"] or m["withdrawn"]}
+        if not guarded:
+            return []
+        landed = self._landed_between(task["base"], task["onto"])
+        return [
+            m
+            for m in comparison.members
+            if m.source_pr in guarded
+            and m.provenance == chain.EDITED
+            and not self._commit_empty(m.new_sha)
+            and not chain.landed_commit(landed, m.source_pr)
+        ]
 
     def _retain_submission(self, task: dict[str, Any], claim: dict[str, Any], tip_sha: str) -> str | None:
         ref = self.submission_ref(task["id"], claim["id"])
@@ -1083,6 +1214,7 @@ class Controller:
         by_pr = {record.source_pr: record for record in report.commits}
         provenance: dict[str, str] = {}
         shrunk = False
+        landed = self._landed_between(task["base"], task["onto"])
         with self.store.transaction():
             for member in self._members(batch["id"]):
                 outcome = next((m for m in comparison.members if m.source_pr == member["source_pr"]), None)
@@ -1096,6 +1228,15 @@ class Controller:
                         provenance="edited", task_id=task["id"], explanation=explanation, edited_shas=dumps(edited)
                     )
                     if record is not None and record.empty:
+                        if (
+                            member["no_repair"]
+                            and not member["withdrawn"]
+                            and not chain.landed_commit(landed, member["source_pr"])
+                        ):
+                            self.store.update("members", {"id": member["id"]}, **values)
+                            self._anticipate(batch, dict(member, **values), outcome.explanation.strip(), now)
+                            provenance[member["source_pr"]] = "withdrawn"
+                            continue
                         self._count("shrink_to_empty")
                         shrunk = True
                 self.store.update("members", {"id": member["id"]}, **values)
@@ -1275,6 +1416,8 @@ class Controller:
                     author=input_row.get("author", ""),
                     explanation=member["explanation"],
                     retained_ref=self.input_ref(member["number"], member["accepted_head"]),
+                    no_repair=bool(member["no_repair"] or member["withdrawn"]),
+                    withdrawn=bool(member["withdrawn"]),
                 )
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
@@ -1449,6 +1592,7 @@ class Controller:
             self._reasons.append(f"canonical branch unavailable: {error}")
             return list(self._reasons)
         self._observe_canonical(canonical, now)
+        self._follow_anticipated(now)
         hold = self._state("inference_hold")
         if hold:
             self._reasons.append(f"inference hold since {hold['since']:.0f}: {hold['last_error']}")
@@ -1529,9 +1673,14 @@ class Controller:
         if previous and chain.is_ancestor(self.clone, previous, canonical):
             landed_prs: set[int] = set()
             bors_landed: set[int] = set()
+            withdrawn = {
+                m["commit_sha"] for m in self.store.rows("members", {"withdrawn": 1, "removed": 0}) if m["commit_sha"]
+            }
             try:
                 for commit in chain.chain_commits(self.clone, previous, canonical):
                     source = commit.source_pr
+                    if commit.sha in withdrawn:
+                        continue  # a withdrawn member's empty commit lands nothing
                     if source and source.startswith(f"{self.repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
                     elif not source:
@@ -1547,6 +1696,7 @@ class Controller:
                 if row is not None and row["state"] in (INPUT_WAITING, INPUT_RESERVED):
                     self.store.update("inputs", {"id": row["id"]}, state=INPUT_CANCELLED, reason="landed-externally")
                     self.store.journal(now, "withdrawn", number=number, reason="landed-externally")
+            self._interacting_landed(landed_prs | bors_landed, now)
             if bors_landed:
                 self._external_member_landed(bors_landed, "canonical-advance", now)
         external = self._state("external_head")
@@ -1787,6 +1937,7 @@ class Controller:
                 commit_sha=record.sha,
                 provenance="clean",
                 added_at=now,
+                no_repair=row["no_repair"],
             )
             self.store.update(
                 "batches", {"id": batch["id"]}, version=version, tip=result.tip, urgent=batch["urgent"] or row["urgent"]
@@ -2411,6 +2562,7 @@ class Controller:
             return False
         edits = loads(head["pre_rebase_edits"], {})
         version = head["version"] + 1
+        landed = self._landed_between(head["base"], canonical) if edits else {}
         with self.store.transaction():
             for member in members:
                 sha = by_pr[member["source_pr"]].sha
@@ -2424,6 +2576,14 @@ class Controller:
                         edited_shas=dumps(loads(member["edited_shas"], []) + [sha]),
                     )
                 self.store.update("members", {"id": member["id"]}, **values)
+                if (
+                    edit
+                    and member["no_repair"]
+                    and not member["withdrawn"]
+                    and self._commit_empty(sha)
+                    and not chain.landed_commit(landed, member["source_pr"])
+                ):
+                    self._anticipate(head, dict(member, **values), edit.get("explanation", ""), now)
             self.store.update(
                 "batches", {"id": head["id"]}, version=version, base=canonical, tip=tip, expected_parent=None
             )
@@ -2880,7 +3040,11 @@ class Controller:
         batch = self.store.row("batches", {"id": batch["id"]}) or batch
         if batch["state"] == BATCH_LANDED:
             return
-        members = self._members(batch["id"])
+        # A withdrawn member's empty commit lands with the head but the PR does not: it is not marked
+        # landed, commented on or closed (`_anticipate` told its author why).
+        everyone = self._members(batch["id"])
+        withdrawn = [m["number"] for m in everyone if m["withdrawn"]]
+        members = [m for m in everyone if not m["withdrawn"]]
         with self.store.transaction():
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
             for member in members:
@@ -2905,16 +3069,37 @@ class Controller:
                 cycles.append(round(now - batch["first_dispatch_at"], 1))
                 self._set_state("head_cycle_seconds", cycles[-50:])
             self.store.journal(
-                now, "landed", batch["id"], how=how, tip=batch["tip"], members=[m["number"] for m in members]
+                now,
+                "landed",
+                batch["id"],
+                how=how,
+                tip=batch["tip"],
+                members=[m["number"] for m in members],
+                **({"withdrawn": withdrawn} if withdrawn else {}),
             )
             if self.setting("publication_enabled"):
                 for member in members:
                     self._enqueue_landing_effects(batch, member)
+            self._interacting_landed({m["number"] for m in members}, now)
         self._wake.set()
 
     def _enqueue_landing_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
         number = member["number"]
         body = self.member_comment(batch, member)
+        if member["provenance"] != "clean":
+            diff = self._landed_diff(member)
+            self._count("edit_summaries")
+            self.store.journal(
+                self.clock(),
+                "edit-summary",
+                batch["id"],
+                number=number,
+                commit=member["commit_sha"],
+                accepted_head=member["accepted_head"],
+                diff_lines=diff["lines"],
+                truncated=diff["truncated"],
+                error=diff["error"],
+            )
         marker = f"<!-- {COMMENT_MARKER} landed:{self.repository}#{number}:{batch['id']}:{member['commit_sha']} -->"
         self._enqueue(
             "comment",
@@ -2939,7 +3124,7 @@ class Controller:
             "",
             f"Merged revision: `{member['accepted_head']}`.",
         ]
-        if member["provenance"] == "edited":
+        if member["provenance"] != "clean":
             commit_url = f"https://github.com/{self.repository}/commit/{member['commit_sha']}"
             lines += [
                 "",
@@ -2947,6 +3132,7 @@ class Controller:
                 "",
             ]
             lines += [f"> {line}" if line else ">" for line in member["explanation"].splitlines()]
+            lines += self._diff_lines(member, commit_url)
             edited = [sha for sha in loads(member["edited_shas"], []) if sha and sha != member["commit_sha"]]
             if edited:
                 lines += [
@@ -2966,6 +3152,57 @@ class Controller:
             lines += ["", f"The source is retained under `{self.batch_ref(batch['id'], batch['version'])}`."]
         return "\n".join(lines)
 
+    def _landed_diff(self, member: dict[str, Any]) -> dict[str, Any]:
+        """`git diff <accepted head> <landed commit>` restricted to the PR's own files: those its branch
+        changes (since its merge base with the landed commit) and those its landed commit changes.
+        `text` is at most `EDIT_DIFF_LINES` lines; `lines` the full count; `error` when git could not say."""
+        accepted, landed = member["accepted_head"], member["commit_sha"]
+        try:
+            base = chain.git(self.clone, "merge-base", accepted, landed).strip()
+            files = set(chain.git(self.clone, "diff", "--name-only", "-z", base, accepted).split("\0"))
+            files |= set(chain.git(self.clone, "diff", "--name-only", "-z", f"{landed}^", landed).split("\0"))
+            files.discard("")
+            text = chain.git(self.clone, "diff", accepted, landed, "--", *sorted(files)) if files else ""
+        except chain.ChainError as error:
+            return {"text": "", "lines": 0, "truncated": False, "error": str(error)[:200]}
+        lines = text.splitlines()
+        return {
+            "text": "\n".join(lines[:EDIT_DIFF_LINES]),
+            "lines": len(lines),
+            "truncated": len(lines) > EDIT_DIFF_LINES,
+            "error": None,
+        }
+
+    def _diff_lines(self, member: dict[str, Any], commit_url: str) -> list[str]:
+        """The landing comment's diff of the landed commit against the accepted head, in a collapsed block."""
+        diff = self._landed_diff(member)
+        if diff["error"] is not None:
+            return [
+                "",
+                f"The diff against the accepted head is not available here; see [the landed commit]({commit_url}).",
+            ]
+        if not diff["lines"]:
+            return ["", "The landed commit does not differ from the accepted head in this PR's files."]
+        fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", diff["text"])), default=0))
+        lines = [
+            "",
+            "<details><summary>Diff of the landed commit against the accepted head, in this PR's files "
+            f"({diff['lines']} lines)</summary>",
+            "",
+            f"{fence}diff",
+            diff["text"],
+            fence,
+            "",
+            "</details>",
+        ]
+        if diff["truncated"]:
+            lines += [
+                "",
+                f"The diff is {diff['lines']} lines; the first {EDIT_DIFF_LINES} are shown. "
+                f"The whole change is [the landed commit]({commit_url}).",
+            ]
+        return lines
+
     def _mentioned_prs(self, text: str, exclude: int) -> list[int]:
         found: list[int] = []
         for match in _PR_MENTION_RE.finditer(text):
@@ -2974,6 +3211,281 @@ class Controller:
             if (repo is None or repo == self.repository) and number != exclude and number not in found:
                 found.append(number)
         return found
+
+    # --- the no-repair opt-out: problem-anticipated withdrawals ----------------------------------
+
+    def _attribution(self, explanation: str, exclude: int) -> dict[str, Any]:
+        """The interacting PR, file and finding the agent appended to an emptied `no_repair` member's
+        message (`Interacting-PR:`, `Interacting-File:`, `Finding:` lines); the PR falls back to the
+        first other PR the text mentions. Missing parts are None."""
+        number = None
+        match = _INTERACTING_PR_RE.search(explanation)
+        if match and int(match["number"]) != exclude:
+            number = int(match["number"])
+        if number is None:
+            mentioned = self._mentioned_prs(explanation, exclude=exclude)
+            number = mentioned[0] if mentioned else None
+        file_match = _INTERACTING_FILE_RE.search(explanation)
+        finding_match = _FINDING_RE.search(explanation)
+        return {
+            "interacting": number,
+            "file": file_match["file"].strip() if file_match else None,
+            "finding": finding_match["finding"] if finding_match else None,
+        }
+
+    def _on_canonical(self, number: int) -> bool:
+        """Whether a non-empty commit on the canonical branch names PR `number` (` (#N)` subject or `Source-PR`)."""
+        if self._canonical is None:
+            return False
+        repository = self.repository.replace(".", "\\.")
+        pattern = rf"(\(#{number}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$)"
+        result = chain._git(
+            self.clone, "log", "-n", "5", "--format=%H", "-E", f"--grep={pattern}", self._canonical, "--"
+        )
+        if result.returncode != 0:
+            return False
+        return any(not self._commit_empty(sha) for sha in result.stdout.split())
+
+    def _interacting_state(self, number: int) -> str:
+        """`landed` (on `main`), `queued` (an input waiting or a member), `gone` (left the queue without
+        landing) or `unknown` (never queued and not on `main`: followed through canonical advances)."""
+        row = self._input_for(number)
+        if row is None:
+            return "landed" if self._on_canonical(number) else "unknown"
+        if row["state"] == INPUT_LANDED or (
+            row["state"] == INPUT_CANCELLED and row["reason"] in ("landed-externally", "merged-externally")
+        ):
+            return "landed"
+        if row["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
+            return "queued"
+        return "gone"
+
+    def _anticipate(self, batch: dict[str, Any], member: dict[str, Any], explanation: str, now: float) -> None:
+        """Withdraw a `no_repair` member the agent reduced to an empty commit (`problem-anticipated`).
+
+        The member stays in the chain as that empty commit, so the chain keeps its bijection, but is
+        `withdrawn`: when the head lands it is not marked landed, commented on or closed. Its input is
+        cancelled with the interacting PR, file and finding parsed from the agent's message, and the
+        author is told the problem is not yet reproducible on their branch. The approval is not reused:
+        the PR comes back through `needs-rebase` and re-approval once the other side lands, or is
+        re-admitted at its original age if the other side leaves the queue without landing (`_follow_anticipated`).
+        """
+        attribution = self._attribution(explanation, member["number"])
+        interacting = attribution["interacting"]
+        record = {
+            "batch_id": batch["id"],
+            "member_id": member["id"],
+            "commit": member["commit_sha"],
+            **attribution,
+            "explanation": explanation,
+            "stage": ANTICIPATED_PENDING if interacting is not None else "unattributed",
+            "withdrawn_at": now,
+        }
+        self.store.update("members", {"id": member["id"]}, withdrawn=1)
+        self.store.update(
+            "inputs",
+            {"id": member["input_id"]},
+            state=INPUT_CANCELLED,
+            reason=PROBLEM_ANTICIPATED,
+            anticipated=dumps(record),
+        )
+        self._count("no_repair_withdrawals")
+        self.store.journal(
+            now,
+            PROBLEM_ANTICIPATED,
+            batch["id"],
+            number=member["number"],
+            commit=member["commit_sha"],
+            attributed=interacting is not None,
+            **attribution,
+        )
+        landed = interacting is not None and self._interacting_state(interacting) == "landed"
+        if self.setting("publication_enabled"):
+            self._enqueue(
+                "comment",
+                f"anticipated:{member['input_id']}",
+                {
+                    "number": member["number"],
+                    "body": self._anticipated_comment(batch, member, record, landed),
+                    "marker": f"<!-- {COMMENT_MARKER} anticipated:{member['input_id']} -->",
+                },
+            )
+        if landed:
+            row = self.store.row("inputs", {"id": member["input_id"]})
+            assert row is not None
+            self._needs_rebase(row, record, now, comment=False)
+
+    def _anticipated_lines(self, record: dict[str, Any]) -> list[str]:
+        interacting = record.get("interacting")
+        if interacting is None:
+            return [
+                "The queue could not attribute the change to another PR, file or finding; the agent's note is quoted below."
+            ]
+        lines = [f"- Interacting PR: #{interacting}"]
+        lines.append(f"- File: `{record['file']}`" if record.get("file") else "- File: not named")
+        lines.append(f"- Finding: {record['finding']}" if record.get("finding") else "- Finding: not named")
+        return lines
+
+    def _anticipated_comment(
+        self, batch: dict[str, Any], member: dict[str, Any], record: dict[str, Any], landed: bool
+    ) -> str:
+        labels = ", ".join(f"`{label}`" for label in self.setting("no_repair_labels")) or "`queue-no-repair`"
+        interacting = record.get("interacting")
+        lines = [
+            f"This PR carries {labels}, so the merge queue does not edit it. Integrating it in batch {batch['id']} "
+            "needed a change to it, so the queue withdrew it from the batch instead: its commit there is empty and "
+            "the PR will not be closed as merged.",
+            "",
+            *self._anticipated_lines(record),
+            "",
+        ]
+        if interacting is None:
+            lines.append(f"Rebase onto `{self.canonical_branch}` and approve it again when ready.")
+        elif landed:
+            lines.append(
+                f"#{interacting} is already on `{self.canonical_branch}`, so the problem is reproducible on your "
+                f"branch now: the queue applies `{NEEDS_REBASE_LABEL}`. Rebase, fix it and approve again."
+            )
+        else:
+            lines.append(
+                f"You cannot reproduce this on your branch yet: #{interacting} is still in staging, not on "
+                f"`{self.canonical_branch}`. When it lands the queue comments again and applies `{NEEDS_REBASE_LABEL}`; "
+                f"if it leaves the queue without landing, this PR is re-admitted at its original age."
+            )
+        if record.get("explanation"):
+            lines += ["", "The agent's note:", ""]
+            lines += [f"> {line}" if line else ">" for line in record["explanation"].splitlines()]
+        return "\n".join(lines)
+
+    def _anticipated_rows(self) -> list[dict[str, Any]]:
+        rows = self.store.rows(
+            "inputs",
+            {"repository": self.repository, "state": INPUT_CANCELLED, "reason": PROBLEM_ANTICIPATED},
+            order="id",
+        )
+        return [row for row in rows if loads(row["anticipated"], {}).get("stage") == ANTICIPATED_PENDING]
+
+    def _needs_rebase(self, row: dict[str, Any], record: dict[str, Any], now: float, *, comment: bool = True) -> None:
+        """The interacting PR is on `main`: the problem is reproducible on the author's branch. Comment
+        (unless the withdrawal comment already said so), apply `needs-rebase`; the PR re-enters through
+        ordinary re-approval."""
+        record = dict(record, stage=NEEDS_REBASE_LABEL, converted_at=now)
+        self.store.update("inputs", {"id": row["id"]}, anticipated=dumps(record))
+        self._count("problem_anticipated_needs_rebase")
+        self.store.journal(
+            now, NEEDS_REBASE_LABEL, record.get("batch_id"), number=row["number"], interacting=record["interacting"]
+        )
+        if not self.setting("publication_enabled"):
+            return
+        if comment:
+            body = "\n".join(
+                [
+                    f"#{record['interacting']} has landed on `{self.canonical_branch}`, so the problem the merge queue "
+                    "anticipated for this PR is now reproducible on your branch:",
+                    "",
+                    *self._anticipated_lines(record),
+                    "",
+                    f"The queue applied `{NEEDS_REBASE_LABEL}`. Rebase onto `{self.canonical_branch}`, fix it and "
+                    "approve again.",
+                ]
+            )
+            self._enqueue(
+                "comment",
+                f"needs-rebase:{row['id']}",
+                {
+                    "number": row["number"],
+                    "body": body,
+                    "marker": f"<!-- {COMMENT_MARKER} needs-rebase:{row['id']} -->",
+                },
+            )
+        self._enqueue(
+            "labels",
+            f"needs-rebase-label:{row['id']}",
+            {"number": row["number"], "add": [NEEDS_REBASE_LABEL], "remove": []},
+        )
+
+    def _readmit(self, row: dict[str, Any], record: dict[str, Any], now: float) -> None:
+        """The interacting PR left the queue without landing: the withdrawn input waits again at its
+        original age, when its PR is still open at the accepted head; otherwise it needs a new approval."""
+        pull, reason = self.validate_pull(self.repository, row["number"], row["head_sha"])
+        if reason is not None and reason.startswith("fetch-failed"):
+            self._note_reason(f"re-admission of #{row['number']} waits for GitHub: {reason}")
+            return
+        if reason is None:
+            blocked = self._blocking_labels(pull)
+            reason = f"blocked-label: {', '.join(blocked)}" if blocked else None
+        interacting = record["interacting"]
+        if reason is not None:
+            record = dict(record, stage="readmit-refused", readmit_reason=reason, converted_at=now)
+            self.store.update("inputs", {"id": row["id"]}, anticipated=dumps(record))
+            self.store.journal(
+                now,
+                "readmit-refused",
+                record.get("batch_id"),
+                number=row["number"],
+                interacting=interacting,
+                reason=reason,
+            )
+            body = (
+                f"#{interacting} left the merge queue without landing, so the problem the queue anticipated for this PR "
+                f"no longer applies, but the PR could not be re-admitted as approved ({reason}). Approve it again."
+            )
+        else:
+            record = dict(record, stage="readmitted", converted_at=now)
+            self.store.update(
+                "inputs",
+                {"id": row["id"]},
+                state=INPUT_WAITING,
+                reason="",
+                batch_id=None,
+                anticipated=dumps(record),
+                no_repair=int(self._carries_no_repair(getattr(pull, "labels", None))),
+                passes_waited=0,
+                last_probe="readmitted",
+                last_probe_tip="",
+                last_probe_base="",
+                probe_conflicts="{}",
+            )
+            self._count("problem_anticipated_readmitted")
+            self.store.journal(now, "readmitted", record.get("batch_id"), number=row["number"], interacting=interacting)
+            self._wake.set()
+            body = (
+                f"#{interacting} left the merge queue without landing, so the problem the queue anticipated for this PR "
+                "no longer applies: the PR is back in the queue at its original age."
+            )
+        if self.setting("publication_enabled"):
+            self._enqueue(
+                "comment",
+                f"readmitted:{row['id']}",
+                {"number": row["number"], "body": body, "marker": f"<!-- {COMMENT_MARKER} readmitted:{row['id']} -->"},
+            )
+
+    def _interacting_landed(self, numbers: set[int], now: float) -> None:
+        """PRs seen landing on `main` (a head landing, or a canonical advance naming them): convert the
+        withdrawals waiting on them to `needs-rebase`."""
+        if not numbers:
+            return
+        for row in self._anticipated_rows():
+            record = loads(row["anticipated"], {})
+            if record.get("interacting") in numbers:
+                self._needs_rebase(row, record, now)
+
+    def _follow_anticipated(self, now: float) -> None:
+        """Each pass: a withdrawal whose interacting PR has landed becomes `needs-rebase`; one whose
+        interacting PR left the queue without landing is re-admitted; one whose PR was approved again
+        meanwhile is `superseded` (the new approval answers for it)."""
+        for row in self._anticipated_rows():
+            record = loads(row["anticipated"], {})
+            current = self._input_for(row["number"])
+            if current is not None and current["id"] != row["id"]:
+                record = dict(record, stage="superseded", converted_at=now)
+                self.store.update("inputs", {"id": row["id"]}, anticipated=dumps(record))
+                continue
+            state = self._interacting_state(int(record["interacting"]))
+            if state == "landed":
+                self._needs_rebase(row, record, now)
+            elif state == "gone":
+                self._readmit(row, record, now)
 
     # --- outbox ------------------------------------------------------------------------------------
 
@@ -3212,6 +3724,16 @@ class Controller:
                     "revoked_by_poll": counters.get("approvals_revoked_by_poll", 0),
                     "last_poll": self._state("approval_poll"),
                 },
+                "anticipated": [
+                    {
+                        "number": row["number"],
+                        **{
+                            key: loads(row["anticipated"], {}).get(key)
+                            for key in ("batch_id", "interacting", "file", "finding", "withdrawn_at")
+                        },
+                    }
+                    for row in self._anticipated_rows()
+                ],
                 "tasks": [self._task_status(task) for task in tasks],
                 "outbox": {"pending": len(pending), "entries": [self._outbox_status(e) for e in pending]},
                 "reasons": list(self._reasons),
@@ -3348,6 +3870,8 @@ class Controller:
                     "commit": m["commit_sha"],
                     "provenance": m["provenance"],
                     "task_id": m["task_id"],
+                    "no_repair": bool(m["no_repair"]),
+                    "withdrawn": bool(m["withdrawn"]),
                 }
                 for m in members
             ],

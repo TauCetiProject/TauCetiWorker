@@ -3313,6 +3313,26 @@ class Records(unittest.TestCase):
             "Predicted ripples", repair.compose_prompt(context, repair_task.task_findings(rebase), chain, seed)
         )
 
+    def test_a_no_repair_member_is_listed_under_do_not_edit(self):
+        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        content = Content(root)
+        raw = content.task(12)
+        raw["members"] = [dict(m, no_repair=m["number"] == 2) for m in raw["members"]]
+        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
+        self.assertEqual([m.no_repair for m in task.members], [False, True, False])
+        seed = root / "seed"
+        chain = repair.read_chain(seed, content.base, content.tip)
+        context = repair_task.prompt_context(task, None, listings=repair.listings_path(seed))
+        prompt = repair.compose_prompt(context, repair_task.task_findings(task), chain, seed)
+        self.assertIn("## Do not edit", prompt)
+        self.assertIn("- #2 ", prompt.split("## Do not edit", 1)[1])
+        self.assertIn("    Interacting-PR: #<the other PR>", prompt)
+        listings = [json.loads(line) for line in repair.listings_path(seed).read_text().splitlines()]
+        self.assertEqual([r.get("no_repair", False) for r in listings], [False, True, False])
+        plain = repair_task.Task.from_json({**content.task(13), "claim_token": "x", "expires_at": time.time() + 60})
+        context = repair_task.prompt_context(plain, None, listings=repair.listings_path(seed))
+        self.assertNotIn("Do not edit", repair.compose_prompt(context, repair_task.task_findings(plain), chain, seed))
+
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)

@@ -156,6 +156,8 @@ class TaskMember:
     author: str = ""
     explanation: str = ""
     retained_ref: str = ""
+    no_repair: bool = False  # the PR opted out of repair: never edited, only emptied with an attribution
+    withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -215,6 +217,8 @@ class Task:
                     author=str(raw.get("author") or ""),
                     explanation=str(raw.get("explanation") or ""),
                     retained_ref=str(raw.get("retained_ref") or ""),
+                    no_repair=bool(raw.get("no_repair")),
+                    withdrawn=bool(raw.get("withdrawn")),
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -980,6 +984,8 @@ def prompt_context(
                 # The service's flag for a PR that landed on ``main`` outside the queue, once the member
                 # record carries it; without it the prompt derives the list from the target's history.
                 "landed_externally": getattr(m, "landed_externally", None),
+                "no_repair": m.no_repair,
+                "withdrawn": m.withdrawn,
             }
             for m in task.members
         ],
@@ -1931,7 +1937,7 @@ def run_task(
                 feedback = None
                 resubmit = True
                 continue
-            if reason == "invalid-chain" and validation_retries < cfg.validation_retries:
+            if reason in ("invalid-chain", "no-repair-edited") and validation_retries < cfg.validation_retries:
                 validation_retries += 1
                 feedback = "The queue's validation of the previous attempt's chain:\n" + format_service_validation(
                     response

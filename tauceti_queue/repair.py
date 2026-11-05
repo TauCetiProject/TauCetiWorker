@@ -1085,6 +1085,8 @@ def member_records(
             "provenance": (member or {}).get("provenance"),
             "landed_on_main": (landed.get(commit.pr) or "landed") if commit.pr in landed else None,
         }
+        if (member or {}).get("no_repair"):
+            record["no_repair"] = True
         if stop is not None:
             record["state"] = (
                 MEMBER_STATES[0] if index < stop else MEMBER_STATES[1] if index == stop else MEMBER_STATES[2]
@@ -1501,6 +1503,39 @@ def _landed_section(
     return lines
 
 
+def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list[str]:
+    """The "Do not edit" section: members whose authors opted out of repair (``no_repair``), and those
+    the queue already withdrew that way (``withdrawn``), which stay empty commits."""
+    by_number = _members_by_number(context)
+    titles = {c.pr: c.subject for c in chain if c.pr is not None}
+    guarded = [n for n, m in by_number.items() if m.get("no_repair") and n in titles]
+    if not guarded:
+        return []
+    lines = [
+        "## Do not edit",
+        "",
+        "The authors of these PRs opted out of repair (`queue-no-repair`). Do not change their content or their messages:",
+        "",
+    ]
+    for number in guarded:
+        state = " (withdrawn: keep it an empty commit)" if by_number[number].get("withdrawn") else ""
+        lines.append(f"- #{number} {by_number[number].get('title') or titles[number]}{state}")
+    lines += [
+        "",
+        "If making the batch build needs a change to one of them, do not make it: reduce that member to an empty "
+        "commit instead (its content removed, its message kept) and append to its message, as its explanation, which "
+        "other PR, file and finding made the change necessary, one per line:",
+        "",
+        "    Interacting-PR: #<the other PR>",
+        "    Interacting-File: <path of the file>",
+        "    Finding: <conflict, duplicate declaration, rename ripple or build error>: <one sentence>",
+        "",
+        "The queue withdraws such a PR and tells its author; repair the rest of the batch as usual, without it.",
+        "",
+    ]
+    return lines
+
+
 def _result_section(base_short: str) -> list[str]:
     return [
         "",
@@ -1713,6 +1748,7 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     if where is None:
         lines += _inline_listing(context, chain, landed)
     lines += _landed_section(context, chain, landed, where)
+    lines += _no_repair_section(context, chain)
     if context.repair_context is not None and where:
         lines += context.repair_context.prompt_lines()
     if context.kind == "pre_rebase":
