@@ -637,6 +637,19 @@ def cached_metadata(args, fetch, *, env=None):
     path = args[1]
     match = re.fullmatch(r"/?repos/([^/]+/[^/]+)/(?:commits|git/commits|git/trees)/[a-f0-9]{40}", path)
     immutable = match is not None
+    recent_commits = False
+    if match is None:
+        # Only the advisory Roadmap cadence check during worker discovery.
+        # Planning and arbitrary agent commit reads keep their fresh behavior.
+        from tauceti_worker.constants import ROADMAP
+
+        effective = os.environ if env is None else env
+        match = re.fullmatch(r"/?repos/([^/]+/[^/]+)/commits\?per_page=30", path)
+        if match and (
+            match[1].lower() != ROADMAP.lower() or effective.get("TAUCETI_GITHUB_PHASE", "survey") != "survey"
+        ):
+            match = None
+        recent_commits = match is not None
     if match is None:
         # This check only adds a drift warning; main can change between reviews.
         match = re.fullmatch(r"/?repos/([^/]+/[^/]+)/git/trees/main\?recursive=1", path)
@@ -658,7 +671,7 @@ def cached_metadata(args, fetch, *, env=None):
         ["cli_metadata", match[1].lower(), *args[1:]],
         read,
         identity=identity,
-        ttl=86400 if immutable else 60,
+        ttl=86400 if immutable else 300 if recent_commits else 60,
         immutable=immutable,
     )
     return subprocess.CompletedProcess(["gh", *args], 0, **value) if value is not None else attempted
