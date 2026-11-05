@@ -1607,6 +1607,30 @@ def run_task(
     def stopping() -> bool:
         return stop is not None and stop.is_set()
 
+    background: dict = {}  # the launch record of a publication that owns the worktree once started
+
+    def publish_after(revision: str) -> None:
+        """``TAUCETI_REPAIR_PUBLISH=after``: publish ``revision``'s outputs in the background now that the
+        result is in; the publisher removes the worktree when done. Never fails the task. Under ``off``
+        the record says so and nothing starts."""
+        if cfg.publish.when == "before":
+            return
+        record = repair_publish.start_background(
+            worktree,
+            revision,
+            settings=cfg.publish,
+            env=env_lake,
+            logdir=logdir,
+            task_id=task.task_id,
+            repository=task.repository,
+            lake=cfg.lake,
+            clone=cfg.clone,
+            remove_worktree=not cfg.keep_worktree,
+        )
+        outcome["publish"] = record
+        if record.get("launched"):
+            background.update(record)
+
     def cancelled(detail: str) -> dict:
         """The agent was cancelled: by the claim being lost (discard), or by the worker stopping. A
         stop with the agent's session in hand renews the claim and checkpoints the task for the next
@@ -1747,21 +1771,24 @@ def run_task(
                 and not stream.errors
                 and not stream.findings
             ):
-                # The batch builds on its base as assembled: publish the outputs for the head's later
-                # rounds and give the task back as prepared, without an agent.
-                outcome["publish"] = repair_publish.publish_outputs(
-                    worktree,
-                    task.tip,
-                    settings=cfg.publish,
-                    env=env_lake,
-                    logdir=logdir,
-                    repository=task.repository,
-                    lake=cfg.lake,
-                )
+                # The batch builds on its base as assembled: give the task back as prepared, without an
+                # agent, and publish the outputs for the head's later rounds.
+                if cfg.publish.when == "before":
+                    outcome["publish"] = repair_publish.publish_outputs(
+                        worktree,
+                        task.tip,
+                        settings=cfg.publish,
+                        env=env_lake,
+                        logdir=logdir,
+                        repository=task.repository,
+                        lake=cfg.lake,
+                    )
                 log(f"task {task.task_id}: the open batch builds on its base; nothing to prepare")
-                return release_task(
+                released = release_task(
                     cfg, client, task, state, "prepared_clean", "the batch built without errors", outcome, lease
                 )
+                publish_after(task.tip)
+                return released
         findings = task_findings(task)
         feedback: str | None = None
         pushed: str | None = None
@@ -1932,7 +1959,7 @@ def run_task(
                     return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
-            if (outcome.get("publish") or {}).get("revision") != tip:
+            if cfg.publish.when == "before" and (outcome.get("publish") or {}).get("revision") != tip:
                 outcome["publish"] = repair_publish.publish_outputs(
                     worktree,
                     tip,
@@ -1980,6 +2007,7 @@ def run_task(
                 lease.stop()
                 outcome.update(status="adopted", tip=tip, pushed_ref=push["ref"], version=response.get("version"))
                 state.write("adopted", outcome=outcome)
+                publish_after(tip)
                 return outcome
             if reason in CLAIM_CODES:
                 return discard(f"result rejected: {reason}")
@@ -2021,6 +2049,7 @@ def run_task(
                 continue
             outcome.update(status="not_adopted", tip=tip, pushed_ref=push["ref"], reason=reason)
             state.write("not_adopted", outcome=outcome)
+            publish_after(tip)
             return outcome
     except Exception as error:  # the state record must say what happened
         phase = state.state
@@ -2049,8 +2078,9 @@ def run_task(
             outcome["stream_build"] = stream.summary()
         outcome["seconds"] = round(time.monotonic() - started, 1)
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
-        # An interrupted task keeps its worktree: the next start resumes the agent in it.
-        if not cfg.keep_worktree and outcome.get("status") not in ("error", "interrupted"):
+        # An interrupted task keeps its worktree: the next start resumes the agent in it. A background
+        # publication owns it from its start and removes it when done.
+        if not cfg.keep_worktree and outcome.get("status") not in ("error", "interrupted") and not background:
             with contextlib.suppress(Exception):
                 repair.remove_worktree(cfg.clone, worktree)
         with contextlib.suppress(Exception):
@@ -2277,6 +2307,10 @@ def write_heartbeat(cfg: RunnerConfig, summary: dict, state: str, **fields) -> N
     summary.update(fields)
     summary["state"] = state
     summary["updated_at"] = time.time()
+    with contextlib.suppress(Exception):
+        publications = repair_publish.background_status()
+        if publications is not None:
+            summary["publish"] = publications
     with contextlib.suppress(Exception):
         atomic_json(heartbeat_path(cfg), summary, durable=False)
 
