@@ -52,6 +52,8 @@ LOG_GRACE_SECONDS = 600  # how long a failed run may go without a readable log b
 DISPATCH_EVENT = "tauceti-bors-staging"
 # How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
+# How many of the most recently landed heads lend their published tips as fetch candidates.
+REPAIR_OUTPUTS_LANDED_HEADS = 2
 MERGED_TITLE_PREFIX = "[Merged by Bors] - "  # what bors-ng writes when it closes a squash-landed member
 COMMENT_MARKER = "tauceti-queue"
 
@@ -1658,8 +1660,9 @@ class Controller:
         The repair worker publishes Lake outputs keyed by the tip it verified, and CI fetches them for
         the exact head, which a rebase replaces. Lake reuses artifacts by content trace, so the outputs
         of a nearly identical tree are safe and nearly complete: the batch's previous tips (newest
-        first, at most `REPAIR_OUTPUTS_PREVIOUS_TIPS`), then its base, then the canonical commit when it
-        differs. No revision appears twice and the head's own tip, which CI is given separately, is left out.
+        first, at most `REPAIR_OUTPUTS_PREVIOUS_TIPS`), then the tips of the most recently landed heads
+        (`_landed_tips`), then its base, then the canonical commit when it differs. No revision appears
+        twice and the head's own tip, which CI is given separately, is left out.
         """
         revs = self._previous_tips(head)
 
@@ -1667,6 +1670,8 @@ class Controller:
             if sha and sha != head["tip"] and sha not in revs:
                 revs.append(sha)
 
+        for tip in self._landed_tips(head["id"]):
+            add(tip)
         add(head["base"])
         add(self._canonical)
         return revs
@@ -1685,6 +1690,32 @@ class Controller:
                 tips.append(row["tip"])
         return tips
 
+    def _landed_tips(self, exclude: int | None = None) -> list[str]:
+        """The published tips of the last `REPAIR_OUTPUTS_LANDED_HEADS` landed batches, newest batch
+        first and each batch's tips newest first (at most `REPAIR_OUTPUTS_PREVIOUS_TIPS` per batch),
+        without repeats and without batch `exclude`.
+
+        A landed head's tip is published to the repair cache by the worker that verified it, but the
+        `main` commit it lands as reaches the public cache only once main's own CI has built it, and
+        the next head is based on that commit, whose tree differs from the landed tip's only in CI files.
+        """
+        tips: list[str] = []
+        landed = self.store.rows(
+            "batches",
+            {"repository": self.repository, "state": BATCH_LANDED},
+            order="landed_at DESC, id DESC",
+            limit=REPAIR_OUTPUTS_LANDED_HEADS + (exclude is not None),
+        )
+        for batch in [b for b in landed if b["id"] != exclude][:REPAIR_OUTPUTS_LANDED_HEADS]:
+            own: list[str] = []
+            for row in self.store.rows("batch_tips", {"batch_id": batch["id"]}, order="version DESC"):
+                if len(own) >= REPAIR_OUTPUTS_PREVIOUS_TIPS:
+                    break
+                if row["tip"] and row["tip"] not in own:
+                    own.append(row["tip"])
+            tips.extend(tip for tip in own if tip not in tips)
+        return tips
+
     def _warm_revs(self, task: dict[str, Any], batch: dict[str, Any]) -> list[str]:
         """The revisions whose published repair outputs the worker restores before the agent runs.
 
@@ -1694,8 +1725,10 @@ class Controller:
         of the pre-rebased chain builds there too: the head's tips, then the batch's own tips (the one
         the pre-rebase covers, then the earlier ones). A `prepare` task on the batch's own base: the
         batch's previous tips, then that base. A `repair` or `rebase_conflict` task on the head: the
-        head's current tip, its previous tips, then its base and the canonical commit. Lake reuses
-        artifacts by content trace, so a nearly identical tree's outputs serve nearly completely.
+        head's current tip, its previous tips, then its base and the canonical commit. Every kind also
+        names the tips of the most recently landed heads (`_landed_tips`) after the batch tips and
+        before the base. Lake reuses artifacts by content trace, so a nearly identical tree's outputs
+        serve nearly completely.
         """
         revs: list[str] = []
 
@@ -1713,8 +1746,13 @@ class Controller:
                 add(tip)
             return ahead
 
+        def landed() -> None:
+            for tip in self._landed_tips(batch["id"]):
+                add(tip)
+
         if task["kind"] == TASK_PRE_REBASE:
             ahead = head_tips()
+            landed()
             if ahead is not None:
                 add(ahead["base"])
         elif self._pre_rebased_prepare(task):
@@ -1724,10 +1762,12 @@ class Controller:
             add(task["pre_rebase_source"])
             for tip in self._previous_tips(batch, task["batch_version"]):
                 add(tip)
+            landed()
         elif task["kind"] == TASK_PREPARE:
             for tip in self._previous_tips(batch, task["batch_version"]):
                 if tip != task["tip"]:
                     add(tip)
+            landed()
             add(task["base"])
         elif task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT):
             # The head's tip is never in the public cache, but a worker that verified it, or one of its
@@ -1736,6 +1776,7 @@ class Controller:
             add(batch["tip"])
             for tip in self._previous_tips(batch):
                 add(tip)
+            landed()
             add(task["base"])
             add(self._canonical)
         return revs

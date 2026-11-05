@@ -195,7 +195,8 @@ has a time budget holds because the service re-exposes the task.
    head's current tip and its previous tips (newest first, up to `REPAIR_OUTPUTS_PREVIOUS_TIPS`, from
    `batch_tips`), then the head's base; for a `prepare` of the pre-rebased chain, the head's tips, then
    the batch's own tips (the one the pre-rebase covers first); for a `prepare` on its own base, the
-   batch's previous tips, then that base. Before the agent runs, the worker fetches the repair namespace's outputs for every one
+   batch's previous tips, then that base. Every kind also lists the tips of the last two landed heads
+   (`Controller._landed_tips`, see controller.md) after those batch tips and before the base. Before the agent runs, the worker fetches the repair namespace's outputs for every one
    of them, then for the task's `tip`, `onto` and `base` (`repair_publish.warm`, without repeats). All
    are tried, not only the first that answers: Lake keys outputs by input trace, so each mapping adds
    the artifacts of its own tree and a nearly identical tree's outputs serve nearly completely. A
