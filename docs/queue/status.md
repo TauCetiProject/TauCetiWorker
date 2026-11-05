@@ -175,6 +175,22 @@ Batch 3 held 234 PRs after insertions. Its own-base prepare task 8 was adopted a
 
 The Claude subscription was skipped all day as ahead of its weekly pace (55% used at 33% of the week). Codex through the ChatGPT account needs `TAUCETI_AUTHORING_CODEX_MODEL=gpt-6-astra`, because `gpt-6.1-sol` is API-only there; without that pin the task falls through to the API key.
 
+## Heads 3 and 4 landing (2026-11-05)
+
+All times UTC.
+
+- Head 3 (batch 3, 237 PRs after insertions) sealed at 15:27:24 on tip `99310cef` (version 239) and was dispatched as attempt 14 (run 42055229481) with eight fetch candidates, among them head 2's published tips `1a5349d2` and `89293a36` (https://github.com/TauCetiProject/TauCetiWorker/pull/557, admin-merged and deployed at 14:27, before the seal); the repair-output fetch took 9.5 minutes (15:37:34 to 15:47:07).
+- An unrelated landing moved `main` under it (base `83b84968`), so the controller replayed it to tip `28b669f8` and dispatched attempt 15 at 15:37:42; that run passed and head 3 landed at 17:01:27 by promotion.
+- The superseded run 42055229481 kept running until the operator cancelled it at 17:03: the workflow's concurrency group did not displace it, to be investigated.
+- Head 4 (batch 4, 9 PRs) was the first batch to go through the pre-rebased prepare of https://github.com/TauCetiProject/TauCetiWorker/pull/551: task 13 on worker 2 (Claude agent at 16:41:03, adopted at 16:41:31, outputs for tip `946de93f` published in the background). It sealed at 17:01:33 on that exact tip, was dispatched as attempt 16 (run 42070564972) and landed at about 17:25; the whole round took about 25 minutes.
+
+Totals for the day: four heads landed through the queue (head 1 at 00:33, head 2 with 1,197 PRs at 14:09, head 3 with 237 at 17:01, head 4 with 9 at about 17:25). At 17:30 no approved PR was waiting and the open batch was empty.
+
+## Afternoon deploys (2026-11-05)
+
+- The service ran `64dadc13` from 14:27 (https://github.com/TauCetiProject/TauCetiWorker/pull/557) and `ac2f078d` from 15:12 (https://github.com/TauCetiProject/TauCetiWorker/pull/558: worker endpoints prioritised over the tick, and the outbox's GitHub calls and the insertion probes taken off the controller lock).
+- Between 14:21 and 14:52 worker renewals and claims timed out behind the tick while the outbox drained about 2,400 landing comments and closes. The operator lowered `outbox_drain_budget_seconds` and `insertion_probe_budget_seconds` to 5 through the admin endpoint (the CLI itself timed out), and restored 20 after https://github.com/TauCetiProject/TauCetiWorker/pull/558 deployed.
+
 ## Operator items outstanding
 
 0. Repair worker host: chungus for now (96 CPUs, 400 GB free), with the Claude Code credentials and the API key the operator placed there; it moves with the service to the dedicated host.
@@ -188,11 +204,11 @@ The Claude subscription was skipped all day as ahead of its weekly pace (55% use
 
 ## Next steps
 
-- Watch batch 3 seal as head 3, and its CI reuse the outputs of the pre-rebased prepare.
-- Watch the outbox drain the 2,394 landed comments and closes of head 2.
-- The Zulip reply to Christian is pending the operator's review.
+- Watch new approvals flow through the queue.
+- Investigate why the concurrency group did not cancel the superseded run 42055229481.
+- The Zulip reply to Christian still awaits the operator.
 - The fresh machine for the service (below).
-- Both workers and the service run `c5cc444` (PR 555) since 13:38; the next deploy needs only the ordinary scripts.
+- The service runs `ac2f078d` (PR 558) since 15:12; the next deploy needs only the ordinary scripts.
 - Move the service and the repair worker from chungus to the dedicated machine when it arrives, restoring the systemd units and the backup timer ([operations.md](operations.md), "Moving to the dedicated host").
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
 - Give Bors's admission-time checks (declaration collisions, merge-selection overlaps) to the agent as diagnostics, as described in the plan; streaming repair, the other follow-up there, is done (https://github.com/TauCetiProject/TauCetiWorker/pull/531).
