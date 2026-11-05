@@ -226,6 +226,8 @@ class FakeGitHub:
         self.unavailable: str | None = None
         self.comments: list[dict[str, Any]] = []
         self.labels: dict[int, set[str]] = {}
+        # Repository labels by name: (color, description).
+        self.repository_labels: dict[str, tuple[str, str]] = {}
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
         self.runs: list[FakeRun] = []
@@ -634,6 +636,11 @@ class FakeGitHub:
             labels = self.labels.setdefault(number, set())
             labels.difference_update(remove)
             labels.update(add)
+
+    def ensure_label(self, repo: str, name: str, color: str, description: str) -> None:
+        with self.lock:
+            self._call("ensure_label", name, color, description)
+            self.repository_labels.setdefault(name, (color, description))
 
     def close_pr(self, repo: str, number: int, title: str) -> None:
         with self.lock:

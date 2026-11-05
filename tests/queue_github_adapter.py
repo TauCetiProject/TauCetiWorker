@@ -705,6 +705,21 @@ class Adapter(unittest.TestCase):
         self.assertEqual(json.loads(transport.calls[0][3]), {"labels": ["on-queue"]})
         self.assertEqual(len(transport.calls), 3)
 
+    def test_ensure_label(self):
+        transport = FakeTransport()
+        transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/labels", 201, {"name": "repaired-in-queue"})
+        transport.add(
+            "POST", f"https://api.github.com/repos/{TAUCETI}/labels", 422, {"errors": [{"code": "already_exists"}]}
+        )
+        a = adapter(transport)
+        a.ensure_label(TAUCETI, "repaired-in-queue", "d4c5f9", "Modified by the queue")
+        self.assertEqual(
+            json.loads(transport.calls[0][3]),
+            {"name": "repaired-in-queue", "color": "d4c5f9", "description": "Modified by the queue"},
+        )
+        a.ensure_label(TAUCETI, "repaired-in-queue", "d4c5f9", "Modified by the queue")
+        self.assertEqual(len(transport.calls), 2, "an existing label is not an error")
+
     def test_permissions(self):
         transport = FakeTransport()
         base = f"https://api.github.com/repos/{TAUCETI}/collaborators"

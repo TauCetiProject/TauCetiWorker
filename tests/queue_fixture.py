@@ -620,6 +620,12 @@ class HeadOperations(QueueFixture):
         self.assertEqual(
             self.repo.file_at("main", "Shared.lean"), "line one\nline two changed by 101, then by admin\nline three\n"
         )
+        # An emptied member is not labelled as repaired, even when an agent's edit marks it `edited`.
+        self.assertTrue(self.controller._landed_outside_queue({"commit_sha": landed_member.sha}))
+        self.assertFalse(self.controller._landed_outside_queue({"commit_sha": other.sha}))
+        self.assertFalse(
+            self.controller.store.rows("outbox", {"kind": "labels", "key": f"repaired-label:{head['id']}:101"})
+        )
         self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
         self.assertEqual(
             sorted(c.source_pr for c in self.first_parent_chain(admin, self.repo.main_sha())),
@@ -1372,7 +1378,8 @@ class RepairOrReject(QueueFixture):
         "Finding: duplicate declaration: `foo` is declared by both"
     )
 
-    def test_landing_comment_carries_the_edit_summary_and_the_diff(self):
+    def edited_landing(self):
+        """A head of #101 and #102; CI fails on #102, the agent fixes it, and the head lands."""
         self.github.ci_policy = fail_members(102)
         self.approve(101, {"A.lean": "a\n"})
         self.approve(102, {"Broken.lean": "line one\nbroken\nline three\n"})
@@ -1393,6 +1400,10 @@ class RepairOrReject(QueueFixture):
         self.tick()
         self.run_ci()
         self.tick(2)
+        return head
+
+    def test_landing_comment_carries_the_edit_summary_and_the_diff(self):
+        head = self.edited_landing()
         landed = self.controller.store.row("members", {"batch_id": head["id"], "number": 102})
         comment = self.github.comments_for(102)[0]["body"]
         self.assertIn("> Fixed the broken line against #101.", comment)
@@ -1406,6 +1417,28 @@ class RepairOrReject(QueueFixture):
         summary = self.controller.store.journal_entries("edit-summary")
         self.assertEqual([(e["detail"]["number"], e["detail"]["truncated"]) for e in summary], [(102, False)])
         self.assertEqual(self.controller.status()["counters"]["edit_summaries"], 1)
+
+    def test_edited_member_is_labelled_repaired_in_queue(self):
+        head = self.edited_landing()
+        keys = [e["key"] for e in self.controller.store.rows("outbox", {"kind": "labels"})]
+        self.assertIn(f"repaired-label:{head['id']}:102", keys)
+        self.assertNotIn(f"repaired-label:{head['id']}:101", keys, "a clean member is not labelled")
+        self.assertIn("repaired-in-queue", self.github.labels[102])
+        self.assertNotIn("repaired-in-queue", self.github.labels.get(101, set()))
+        self.assertEqual(
+            self.github.repository_labels["repaired-in-queue"][1],
+            "The merge queue modified this contribution while integrating it; see the landing comment",
+        )
+        self.assertEqual([c for c, _ in self.github.calls].count("ensure_label"), 1)
+
+    def test_empty_repaired_label_disables_it(self):
+        self.controller.set_setting("repaired_label", "", "operator")
+        head = self.edited_landing()
+        keys = [e["key"] for e in self.controller.store.rows("outbox", {"kind": "labels"})]
+        self.assertFalse([k for k in keys if k.startswith("repaired-label:")])
+        self.assertNotIn("repaired-in-queue", self.github.labels.get(102, set()))
+        self.assertNotIn("ensure_label", [c for c, _ in self.github.calls])
+        self.assertTrue(self.controller.store.journal_entries("edit-summary"), f"head {head['id']} still summarised")
 
     def withdrawn_head(self, interacting=101):
         """A head of #101 and #102, #102 labelled `dont-repair-in-queue`; CI fails on #102 and the agent empties it."""
@@ -1744,7 +1777,16 @@ class StatusAndComments(QueueFixture):
         writes = [
             c
             for c, _ in self.github.calls
-            if c in ("dispatch_candidate", "fast_forward", "post_comment", "set_labels", "close_pr", "update_ref")
+            if c
+            in (
+                "dispatch_candidate",
+                "fast_forward",
+                "post_comment",
+                "set_labels",
+                "ensure_label",
+                "close_pr",
+                "update_ref",
+            )
         ]
         self.assertEqual(writes, [])
         # Bors lands the same PR; the service observes the canonical advance and records its head as landed.

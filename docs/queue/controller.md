@@ -422,6 +422,7 @@ and reported in status:
 | `polling_interval_seconds` | 60 | polling fallback interval |
 | `approval_poll_interval_seconds` | 900 | interval of the approval reconciliation poll behind the webhooks |
 | `membership_label` | `bors-staging` | label added to member PRs at insertion |
+| `repaired_label` | `repaired-in-queue` | label added to a landed member whose commit the queue modified (one with an edit summary), created in the repository on first use; empty disables it |
 | `insertion_probe_budget_seconds` | 20 | wall-clock budget of one tick's insertion probes; the rest wait for the next tick, which follows at once |
 | `outbox_drain_budget_seconds` | 20 | wall-clock budget of one tick's outbox drain; the rest wait for the next tick, which follows at once |
 | `prepare_open_batches` | true | create `prepare` tasks for quiet open batches, and pre-rebase such a batch with an agent only once it is prepared |
