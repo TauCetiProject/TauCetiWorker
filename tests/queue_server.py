@@ -48,9 +48,11 @@ class FakeController(FakeSource):
         super().__init__()
         self.events = []
         self.calls = []
+        self.status_waits = []
         self.fail_with = None
 
-    def status(self):
+    def status(self, *, wait=None):
+        self.status_waits.append(wait)
         return {"queue": {"approved_waiting": 3}, "settings": {"insertion_age_window": 16}}
 
     def handle_event(self, kind, payload):
@@ -204,6 +206,9 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.request("GET", "/health/"), (200, b"ok\n"))
         status, body = self.request("GET", "/healthz")
         self.assertEqual((status, body["ok"], body["revision"]), (200, True, "abc123"))
+        self.assertEqual(self.controller.status_waits[-1], server.HEALTHZ_LOCK_WAIT_SECONDS, "healthz waits briefly")
+        self.request("GET", "/status")
+        self.assertIsNone(self.controller.status_waits[-1], "status waits the controller's default")
         status, body = self.request("GET", "/settings")
         self.assertEqual((status, body), (200, {"settings": {"insertion_age_window": 16}, "source": "controller"}))
         self.assertEqual(self.request("GET", "/api/observation?base=main")[1]["schema"], "tauceti-bors.observation/v1")

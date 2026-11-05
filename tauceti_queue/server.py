@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import pathlib
@@ -132,6 +133,17 @@ class BearerAuth:
                 for key in [k for k, (expiry, _) in self._cache.items() if expiry <= now]:
                     del self._cache[key]
         return identity
+
+
+HEALTHZ_LOCK_WAIT_SECONDS = 0.5
+
+
+def _accepts_wait(callable_: Callable[..., object]) -> bool:
+    """Whether a status provider takes the `wait` keyword (`Controller.status`, `Service.status_document`)."""
+    try:
+        return "wait" in inspect.signature(callable_).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 class QueueHTTPServer(ThreadingHTTPServer):
@@ -311,20 +323,29 @@ class Handler(BaseHTTPRequestHandler):
             },
         }
 
-    def _status(self) -> dict:
+    def _status(self, *, wait: float | None = None) -> dict:
         """The status document: the entrypoint's provider (runtime envelope around the controller's
-        status) when given, else the controller's status with the service facts added."""
-        if self.server.status_provider is not None:
-            status = dict(self.server.status_provider())
+        status) when given, else the controller's status with the service facts added. `wait` bounds
+        the wait for the controller lock (`Controller.status`) where the provider or controller takes it."""
+        provider = self.server.status_provider
+        if provider is not None:
+            status = dict(provider(wait=wait) if wait is not None and _accepts_wait(provider) else provider())
         else:
             controller = self.server.controller
-            status = dict((controller.status() if hasattr(controller, "status") else None) or {})
+            status_of = getattr(controller, "status", None)
+            if status_of is None:
+                status = {}
+            elif wait is not None and _accepts_wait(status_of):
+                status = dict(status_of(wait=wait) or {})
+            else:
+                status = dict(status_of() or {})
             status.update({"revision": self.server.revision, "started_at": feeds._iso(self.server.started_at)})
         status.update(self._counters())
         return status
 
     def _healthz(self) -> dict:
-        status = self._status()
+        # The liveness probe must answer within a second even while a tick holds the controller lock.
+        status = self._status(wait=HEALTHZ_LOCK_WAIT_SECONDS)
         return {
             "ok": True,
             "schema": status.get("schema"),
