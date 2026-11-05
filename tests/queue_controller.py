@@ -283,6 +283,84 @@ class Draw(ControllerCase):
         )
 
 
+class Republication(ControllerCase):
+    """Refs retained while publication was disabled reach GitHub once it is enabled, each pushed once."""
+
+    def retained_pushes(self):
+        pushes = []
+        for name, args in self.github.calls:
+            if name == "update_ref" and args[0].startswith("refs/tauceti-queue/"):
+                pushes.append(args)
+            elif name == "update_refs":
+                pushes.extend(update for update in args[0] if update[0].startswith("refs/tauceti-queue/"))
+        return pushes
+
+    def retain_entries(self):
+        return self.controller.store.rows("outbox", {"kind": "retain_ref"}, order="id")
+
+    def test_refs_retained_in_shadow_mode_are_published_once_at_cutover(self):
+        self.controller.set_setting("publication_enabled", False, "operator")
+        heads = {}
+        for number in (101, 102):
+            heads[number], _ = self.approve(number, {f"Pr{number}.lean": "x\n"})
+        self.controller.tick()  # 101 and 102 inserted and sealed as the head; nothing dispatched
+        head = self.controller.store.row("batches", {"state": "head"})
+        heads[103], _ = self.approve(103, {"Pr103.lean": "x\n"})
+        self.controller.tick()  # 103 goes into the open batch behind the head
+        open_batch = self.controller.store.row("batches", {"state": "open"})
+        self.assertEqual(sorted(m["number"] for m in self.controller.members(head["id"])), [101, 102])
+        self.assertEqual([m["number"] for m in self.controller.members(open_batch["id"])], [103])
+        self.assertEqual(self.retained_pushes(), [], "shadow mode pushes nothing")
+        self.assertEqual(self.retain_entries(), [], "shadow mode enqueues nothing")
+        expected = {
+            (self.controller.batch_ref(head["id"], head["version"]), head["tip"]),
+            (self.controller.batch_ref(open_batch["id"], open_batch["version"]), open_batch["tip"]),
+            *((self.controller.input_ref(n, sha), sha) for n, sha in heads.items()),
+        }
+        for ref, sha in expected:
+            self.assertEqual(chain.resolve_commit(self.controller.clone, ref), sha, "retained locally")
+
+        self.controller.set_setting("publication_enabled", True, "operator")
+        self.assertEqual(
+            {(json.loads(e["payload"])["ref"], json.loads(e["payload"])["sha"]) for e in self.retain_entries()},
+            expected,
+            "switching publication on enqueues every missing ref",
+        )
+        self.controller.tick()
+        pushes = self.retained_pushes()
+        self.assertEqual(sorted(pushes), sorted(expected), "every ref is pushed exactly once")
+        for ref, sha in expected:
+            self.assertEqual(self.repo.rev_parse(ref), sha, "the ref is on GitHub")
+        self.assertEqual({e["state"] for e in self.retain_entries()}, {"done"})
+        self.assertEqual(
+            self.controller.store.count("ci_attempts", {"batch_id": head["id"]}), 1, "the head was dispatched"
+        )
+        self.assertEqual(self.controller.store.count("journal", {"kind": "republish"}), 1)
+
+        entries = len(self.controller.store.rows("outbox"))
+        self.controller.tick()
+        self.assertEqual(len(self.controller.store.rows("outbox")), entries, "a second pass enqueues nothing")
+        self.assertEqual(self.retained_pushes(), pushes, "and pushes nothing")
+
+    def test_restart_republishes_and_dispatch_pushes_a_published_batch_ref_once(self):
+        self.controller.set_setting("publication_enabled", False, "operator")
+        head_sha, _ = self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.controller.store.set_setting("publication_enabled", True, "configuration", self.clock())
+        recovered = self.controller.recover()
+        self.assertEqual(recovered["republished_refs"], 2)
+        self.assertEqual(recovered["outbox_pending"], 2)
+        self.controller.tick()
+        batch_ref = self.controller.batch_ref(head["id"], head["version"])
+        self.assertEqual(
+            sorted(self.retained_pushes()),
+            sorted([(batch_ref, head["tip"]), (self.controller.input_ref(101, head_sha), head_sha)]),
+        )
+        self.assertEqual(self.controller.store.count("ci_attempts", {"batch_id": head["id"]}), 1)
+        self.assertEqual(self.controller.recover()["republished_refs"], 0)
+
+
 class Dispatch(ControllerCase):
     def test_dispatch_pushes_the_staging_candidate_branch_the_feed_names(self):
         self.approve(101, {"A.lean": "a\n"})

@@ -42,6 +42,14 @@ Retained refs in the clone and, when publication is enabled, on GitHub through t
 `refs/tauceti-queue/batches/<batch>/v<version>` for every adopted tip,
 `refs/tauceti-queue/batches/<batch>/submissions/<sha>` for every submitted chain (accepted or not),
 and `refs/tauceti-queue/submissions/<task>/<claim>` is where a worker pushes its result.
+Retained refs are pushed through the outbox only while `publication_enabled` is true, so a ref
+retained in shadow mode exists in the clone alone; `_republish_retained_refs` (at restart, when
+publication is switched on, and once per tick) enqueues, for the head and every open batch, the
+batch's tip under its current version and each non-removed member's accepted head when the clone
+holds the ref and the outbox has no entry for that ref and SHA (done entries are kept, so the check
+is one indexed lookup per ref and no GitHub call). The outbox pushes several retained refs in one
+`git push` (`update_refs`), falling back to one push each when the batched push fails, and a
+dispatch pushes the head's batch ref itself only when the outbox has not already done so.
 
 ## State machine
 
@@ -85,7 +93,7 @@ Every `tick()` (one reconciliation pass) does, under the controller lock:
    `rebase_conflict` task with the conflicting member, paths and the clean prefix as evidence;
    a head with an open task waits for a worker; otherwise CI (below) and, on a pass, promotion
    through the outbox.
-6. Drain the outbox again.
+6. Enqueue the live batches' retained refs that never reached GitHub (above); drain the outbox again.
 
 Insertion draw: inputs are ordered urgent first, then priority, then age. The window is the
 `insertion_age_window` first. An urgent input in the window is drawn; else an input that has waited
@@ -190,8 +198,9 @@ source; `record_approval_poll(summary)` keeps the last pass for status. `Approva
 pass at start, every `approval_poll_interval_seconds` and on wake.
 
 Restart: `recover()` releases the controller's own in-process claims (`insert`, `rebase`), returns
-`reserved` inputs to `waiting`, expires overdue claims and leaves worker claims, tasks and the
-outbox as they are; the first pass then drains the outbox before any new work. `ReconciliationLoop`
+`reserved` inputs to `waiting`, expires overdue claims, enqueues the live batches' retained refs
+that never reached GitHub and leaves worker claims, tasks and the outbox as they are; the first pass
+then drains the outbox before any new work. `ReconciliationLoop`
 calls it once, then runs a pass whenever the controller's wake event is set (webhooks, commands,
 task calls) and otherwise every `polling_interval_seconds`, skipping polling passes while the API
 quota is below `rate_limit_reserve`.
