@@ -43,6 +43,8 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import feeds, webhook
+from .ports import GitHubUnavailable
+from .stale_cache import StaleCache
 
 log = logging.getLogger("tauceti_queue.server")
 
@@ -87,7 +89,7 @@ class ServerConfig:
     port: int = 8080
     review_app_id: int | None = webhook.REVIEW_APP_ID
     revision: str = ""
-    auth_cache_seconds: float = 300.0
+    auth_cache_seconds: float = 6 * 3600.0
     clock: Callable[[], float] = time.time
 
 
@@ -103,14 +105,15 @@ def running_revision(package_dir: pathlib.Path | None = None) -> str:
 
 
 class BearerAuth:
-    """Resolve `Authorization: Bearer <GitHub token>` to a login, caching by token digest."""
+    """Resolve `Authorization: Bearer <GitHub token>` to a login, caching by token digest.
+
+    The cache keeps expired entries: when `GET /user` cannot answer (a rate-limited 403, 5xx, a
+    network error) the identity resolved earlier is served, so a quota outage does not log workers
+    out of their claims. A 401 from GitHub still evicts the entry and refuses the token.
+    """
 
     def __init__(self, adapter, *, ttl: float, clock: Callable[[], float]) -> None:
-        self._adapter = adapter
-        self._ttl = ttl
-        self._clock = clock
-        self._cache: dict[str, tuple[float, tuple[str, int]]] = {}
-        self._lock = threading.Lock()
+        self._cache = StaleCache(adapter.user_for_token, ttl=ttl, clock=clock, logger=log, what="bearer identity")
 
     def resolve(self, header: str | None) -> tuple[str, int] | None:
         if not header or not header.startswith("Bearer "):
@@ -119,20 +122,11 @@ class BearerAuth:
         if not token:
             return None
         digest = hashlib.sha256(token.encode()).hexdigest()
-        now = self._clock()
-        with self._lock:
-            cached = self._cache.get(digest)
-            if cached and cached[0] > now:
-                return cached[1]
-        identity = self._adapter.user_for_token(token)
-        if identity is None:
+        try:
+            return self._cache.get(digest, token)
+        except GitHubUnavailable as error:
+            log.warning("bearer identity lookup failed with nothing cached for %s: %s", digest[:12], error)
             return None
-        with self._lock:
-            self._cache[digest] = (now + self._ttl, identity)
-            if len(self._cache) > 1024:
-                for key in [k for k, (expiry, _) in self._cache.items() if expiry <= now]:
-                    del self._cache[key]
-        return identity
 
 
 HEALTHZ_LOCK_WAIT_SECONDS = 0.5
@@ -162,6 +156,9 @@ class QueueHTTPServer(ThreadingHTTPServer):
             controller, config.adapter, repositories=config.repositories.values(), review_app_id=config.review_app_id
         )
         self.auth = BearerAuth(config.adapter, ttl=config.auth_cache_seconds, clock=config.clock)
+        self.admins = StaleCache(
+            config.adapter.repository_admin, ttl=config.auth_cache_seconds, clock=config.clock, logger=log, what="admin"
+        )
         self.revision = config.revision or running_revision()
         self.poller = None  # the approval poller, set by `create_server(..., poller=)`
 
@@ -359,10 +356,24 @@ class Handler(BaseHTTPRequestHandler):
         return {"settings": dict(status.get("settings") or {}), "source": "controller"}
 
     def _admin(self, login: str) -> bool:
-        """The admin predicate the security audit uses: repository-admin permission for the caller."""
+        """The admin predicate the security audit uses: repository-admin permission for the caller.
+
+        The answer is cached per login with the bearer cache's lifetime and served stale while GitHub
+        cannot answer; a login never checked before is refused (503) during such an outage. Sends the
+        error response itself when refusing.
+        """
         repo = next(iter(self.server.config.repositories.values()), None)
-        adapter = self.server.config.adapter
-        return bool(repo) and bool(adapter.repository_admin(login, repo))
+        if not repo:
+            self._error(403, f"{login} is not a repository admin")
+            return False
+        try:
+            admin = bool(self.server.admins.get(login, login, repo))
+        except GitHubUnavailable:
+            self._error(503, f"GitHub could not confirm whether {login} is a repository admin")
+            return False
+        if not admin:
+            self._error(403, f"{login} is not a repository admin")
+        return admin
 
     def _feed(self, which: str, repo: str, query: dict) -> dict:
         source = feeds.feed_source(self.server.controller)
@@ -461,7 +472,6 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         if not self._admin(identity[0]):
-            self._error(403, f"{identity[0]} is not a repository admin")
             return
         repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
         self._call(lambda: self.server.controller.rebuild_head(repo, identity[0]))
@@ -474,7 +484,6 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         if not self._admin(identity[0]):
-            self._error(403, f"{identity[0]} is not a repository admin")
             return
         repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
         self._call(lambda: self.server.controller.retry_ci(repo, identity[0]))
@@ -505,7 +514,6 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         if not self._admin(identity[0]):
-            self._error(403, f"{identity[0]} is not a repository admin")
             return
         self._call(lambda: self._apply_settings(identity[0], body))
 
@@ -531,7 +539,6 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "`repo` must be a served repository and `pr` a positive integer")
             return
         if not self._admin(identity[0]):
-            self._error(403, f"{identity[0]} is not a repository admin")
             return
         self._call(lambda: self.server.controller.mark_urgent(repo, pr, identity[0]))
 
@@ -552,7 +559,6 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "`candidates` must be a candidate journal document or a list of them")
             return
         if not self._admin(identity[0]):
-            self._error(403, f"{identity[0]} is not a repository admin")
             return
         self._call(
             lambda: self.server.controller.import_bors_state(
@@ -572,7 +578,6 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         if not self._admin(identity[0]):
-            self._error(403, f"{identity[0]} is not a repository admin")
             return
         poller = self.server.poller
         if poller is None:

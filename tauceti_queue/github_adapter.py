@@ -852,9 +852,15 @@ class GitHubAdapter:
     # -- people and limits
 
     def collaborator_permission(self, repo: str, login: str) -> str | None:
-        """GitHub's effective permission for `login` (`admin`, `maintain`, `write`, `triage`, `read`), or None."""
+        """GitHub's effective permission for `login` (`admin`, `maintain`, `write`, `triage`, `read`), or None.
+
+        Raises `ports.GitHubUnavailable` when GitHub could not answer (rate limit, 5xx, network error).
+        """
         encoded = urllib.parse.quote(login, safe="")
-        status, data = self.client.get_json(f"repos/{repo}/collaborators/{encoded}/permission", tolerate=(404,))
+        try:
+            status, data = self.client.get_json(f"repos/{repo}/collaborators/{encoded}/permission", tolerate=(404,))
+        except (GitHubError, OSError) as error:
+            raise ports.GitHubUnavailable(f"permission lookup for {login}: {error}") from error
         if status == 404 or not isinstance(data, dict):
             return None
         role = data.get("role_name") or data.get("permission")
@@ -868,8 +874,15 @@ class GitHubAdapter:
         return self.collaborator_permission(repo or self.repo, login) in REVIEWER_PERMISSIONS
 
     def user_for_token(self, token: str) -> tuple[str, int] | None:
-        """The login and id a bearer token authenticates as, or None when GitHub rejects it."""
-        status, data = self.client.get_json("user", token=token, tolerate=(401, 403))
+        """The login and id a bearer token authenticates as, or None when GitHub rejects it (401).
+
+        Raises `ports.GitHubUnavailable` when GitHub could not answer (a rate-limited 403, 5xx, network
+        error), so `server.BearerAuth` can keep serving the identity it already resolved.
+        """
+        try:
+            status, data = self.client.get_json("user", token=token, tolerate=(401,))
+        except (GitHubError, OSError) as error:
+            raise ports.GitHubUnavailable(f"GET /user: {error}") from error
         if status != 200 or not isinstance(data, dict) or not data.get("login"):
             return None
         return str(data["login"]), int(data.get("id") or 0)

@@ -15,6 +15,14 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
+class GitHubUnavailable(RuntimeError):
+    """GitHub could not answer (rate limit, 5xx, network error), as opposed to answering no.
+
+    Raised by `repository_admin` and the adapter's `user_for_token` so callers can keep serving a
+    cached answer instead of refusing or granting anything new during a quota outage.
+    """
+
+
 @dataclass(frozen=True)
 class PullRequest:
     """A pull request as read from GitHub at one moment."""
@@ -164,7 +172,10 @@ class GitHubPort(Protocol):
         ...
 
     def repository_admin(self, login: str) -> bool:
-        """Whether `login` has admin permission on the repository (the `security_audit.require_admin` predicate)."""
+        """Whether `login` has admin permission on the repository (the `security_audit.require_admin` predicate).
+
+        Raises `GitHubUnavailable` when GitHub could not answer; the controller then serves its cached answer.
+        """
         ...
 
     def rate_limit(self) -> tuple[int, float]:

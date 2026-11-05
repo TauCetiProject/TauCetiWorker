@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO))
 
 from tauceti_queue import github_adapter as ga  # noqa: E402
 from tauceti_queue import github_app as app  # noqa: E402
+from tauceti_queue import ports  # noqa: E402
 
 TAUCETI = "TauCetiProject/TauCeti"
 HEAD = "a" * 40
@@ -715,6 +716,25 @@ class Adapter(unittest.TestCase):
         transport.add("GET", "https://api.github.com/user", 401, {"message": "Bad credentials"})
         self.assertIsNone(a.user_for_token("bad"))
         self.assertEqual(a.client._tokens.invalidated, 0, "a worker's bad token does not invalidate the App's")
+        # An exhausted user quota is not a verdict on the token: the server keeps its cached identity.
+        transport.responses.clear()
+        transport.add(
+            "GET", "https://api.github.com/user", 403, {"message": "API rate limit exceeded"}, {"Retry-After": "3600"}
+        )
+        with self.assertRaises(ports.GitHubUnavailable):
+            a.user_for_token("ghp_x")
+        transport.responses.clear()
+        transport.add("GET", "https://api.github.com/user", 502, b"bad gateway")
+        with self.assertRaises(ports.GitHubUnavailable):
+            a.user_for_token("ghp_x")
+
+    def test_repository_admin_reports_an_outage(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET", f"https://api.github.com/repos/{TAUCETI}/collaborators/kim-em/permission", 502, b"bad gateway"
+        )
+        with self.assertRaises(ports.GitHubUnavailable):
+            adapter(transport).repository_admin("kim-em")
 
     def test_list_open_pull_requests_over_graphql(self):
         transport = FakeTransport()

@@ -23,6 +23,7 @@ from queue_feeds import FakeSource  # noqa: E402
 
 from tauceti_queue import feeds, server, webhook  # noqa: E402
 from tauceti_queue.github_adapter import PullRequest  # noqa: E402
+from tauceti_queue.ports import GitHubUnavailable  # noqa: E402
 
 TAUCETI = "TauCetiProject/TauCeti"
 SECRET = b"webhook-secret"
@@ -133,12 +134,17 @@ class FakeAdapter:
             return {"requests": 12, "rate_limit_remaining": 4800}
 
     def __init__(self):
-        self.tokens = {"ghp_worker": ("worker-login", 5), "ghp_kim": ("kim-em", 477956)}
+        self.tokens = {"ghp_worker": ("worker-login", 5), "ghp_kim": ("kim-em", 477956), "ghp_guest": ("guest", 7)}
         self.lookups = 0
+        self.admin_checks = 0
         self.comments = []
+        # When set, `user_for_token` and `repository_admin` raise `GitHubUnavailable` with this message.
+        self.unavailable = None
 
     def user_for_token(self, token):
         self.lookups += 1
+        if self.unavailable:
+            raise GitHubUnavailable(self.unavailable)
         return self.tokens.get(token)
 
     def fetch_pr(self, repo, number):
@@ -148,6 +154,9 @@ class FakeAdapter:
         return login in ("alice", "kim-em")
 
     def repository_admin(self, login, repo=None):
+        self.admin_checks += 1
+        if self.unavailable:
+            raise GitHubUnavailable(self.unavailable)
         return login == "kim-em"
 
     def pr_merge_base(self, repo, number, head):
@@ -399,6 +408,52 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             self.request("POST", "/tasks/claim", {}, self.bearer("ghp_worker")), (500, {"error": "internal error"})
         )
+
+    def github_outage(self):
+        """Six hours on (every cached answer expired) and GitHub rate limited; restored after the test."""
+        start, tokens = self.clock[0], dict(self.adapter.tokens)
+
+        def restore():
+            self.clock[0] = start
+            self.adapter.tokens = tokens
+            self.adapter.unavailable = None
+
+        self.addCleanup(restore)
+        self.clock[0] += 7 * 3600
+        self.adapter.unavailable = "rate limited for 2400s"
+
+    def test_stale_identity_is_served_while_github_cannot_answer(self):
+        self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "idle"}, self.bearer("ghp_worker"))[0], 204)
+        self.github_outage()
+        before = self.adapter.lookups
+        self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "idle"}, self.bearer("ghp_worker"))[0], 204)
+        self.assertEqual(self.adapter.lookups, before + 1, "the expired entry is refreshed, and kept when that fails")
+        status, body = self.request("POST", "/tasks/17/renew", {"claim_token": "t1"}, self.bearer("ghp_worker"))
+        self.assertEqual((status, body), (200, {"task_id": 17, "expires_at": 1_793_776_000.0}))
+        self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "idle"}, self.bearer("ghp_never"))[0], 401)
+        # GitHub answers again and rejects the token: evicted, so the next outage has nothing to serve.
+        self.adapter.unavailable = None
+        del self.adapter.tokens["ghp_worker"]
+        self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "idle"}, self.bearer("ghp_worker"))[0], 401)
+        self.adapter.unavailable = "rate limited for 2400s"
+        self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "idle"}, self.bearer("ghp_worker"))[0], 401)
+
+    def test_admin_answers_are_cached_and_survive_an_outage(self):
+        self.assertEqual(self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_kim"))[0], 200)
+        self.assertEqual(self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_worker"))[0], 403)
+        self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "idle"}, self.bearer("ghp_guest"))[0], 204)
+        before = self.adapter.admin_checks
+        self.assertEqual(self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_kim"))[0], 200)
+        self.assertEqual(self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_worker"))[0], 403)
+        self.assertEqual(self.adapter.admin_checks, before, "both answers are cached per login")
+        self.github_outage()
+        status, body = self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_kim"))
+        self.assertEqual((status, body), (200, {"retried": True}), "the stale admin answer stands")
+        self.assertEqual(self.controller.calls[-1], ("retry_ci", TAUCETI, "kim-em"))
+        self.assertEqual(self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_worker"))[0], 403)
+        status, body = self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_guest"))
+        self.assertEqual(status, 503, "a login never checked before is neither granted nor refused")
+        self.assertIn("could not confirm", body["error"])
 
     def test_admin_endpoints(self):
         self.assertEqual(self.request("POST", "/admin/settings", {"insertion_age_window": 8})[0], 401)

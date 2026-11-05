@@ -464,15 +464,44 @@ class Tasks(ControllerCase):
             self.controller.submit_task(99, task.claim_token, head["tip"])
         with self.assertRaises(TaskError):
             self.controller.submit_task(task.task_id, "wrong-token", head["tip"])
-        # Admin permission revoked between claim and submit.
+        # Admin permission revoked between claim and submit (the cached answer forgotten).
         self.github.admins.discard("admin-worker")
+        self.controller.admins.invalidate("admin-worker")
         result = self.controller.submit_task(task.task_id, task.claim_token, head["tip"])
         self.assertEqual(result.reason, "not-authorized")
         self.github.admins.add("admin-worker")
+        self.controller.admins.invalidate("admin-worker")
         # An unchanged chain resubmitted is a valid (if pointless) adoption: nothing edited.
         result = self.controller.submit_task(task.task_id, task.claim_token, head["tip"])
         self.assertTrue(result.accepted)
         self.assertEqual(result.provenance, {f"{PROJECT}#101": "clean"})
+
+    def test_admin_answers_are_cached_and_served_stale_during_an_outage(self):
+        head = self.failing_head()
+
+        def checks():
+            return [c for c in self.github.calls if c[0] == "repository_admin"]
+
+        self.assertIsNotNone(self.controller.claim_task("worker-1", "admin-worker"))
+        self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"), "refused by concurrency")
+        self.assertEqual(len(checks()), 1, "one GitHub call per login, not per claim")
+        self.assertIsNone(self.controller.claim_task("worker-3", "stranger"))
+        self.assertIsNone(self.controller.claim_task("worker-3", "stranger"))
+        self.assertEqual(len(checks()), 2, "a refusal is cached too")
+        # Seven hours on every answer has expired and GitHub is rate limited: the stale answers
+        # stand, and a login never checked before is neither granted nor refused as a non-admin.
+        self.clock.advance(7 * 3600)
+        self.github.unavailable = "rate limited for 2400s"
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertIsNotNone(task, "the stale admin answer keeps the worker claiming")
+        self.assertEqual(len(checks()), 3, "the refresh was attempted")
+        self.assertIsNone(self.controller.claim_task("worker-3", "stranger"))
+        self.assertIsNone(self.controller.claim_task("worker-4", "newcomer"))
+        refusals = self.controller.store.journal_entries("claim-refused")
+        self.assertEqual(refusals[-2]["detail"]["reason"], "not-admin")
+        self.assertEqual(refusals[-1]["detail"]["reason"], "github-unavailable")
+        result = self.controller.submit_task(task.task_id, task.claim_token, head["tip"])
+        self.assertTrue(result.accepted, "the submission's admin check serves the same stale answer")
 
     def test_invalid_chains_are_rejected_with_the_tool_violations(self):
         head = self.failing_head()
