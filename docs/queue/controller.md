@@ -83,7 +83,8 @@ or `readmit-refused` when the PR is no longer open at its accepted head or carri
 Batches: `open` -> `head` (sealed) -> `landed`; an empty open batch whose base is stale is
 `removed` and recreated on demand. There is at most one open and at most one head batch.
 
-Every `tick()` (one reconciliation pass) does, under the controller lock:
+Every `tick()` (one reconciliation pass) does, under the controller lock (except around its GitHub
+I/O, below):
 
 1. Expire claims; drain the outbox.
 2. Fetch the canonical branch into the clone. If it advanced: a head whose tip is now an ancestor
@@ -475,6 +476,24 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
   emptied `no_repair` member, above), supersedes other claims and tasks on the batch, retains the tip under
   `.../v<version>`, lifts any inference hold, and the next pass dispatches CI. A rejected chain stays
   retained under `.../submissions/<sha>`.
+
+The worker endpoints answer while a tick runs. The controller lock (`ControllerLock`) is reentrant
+with a priority lane: `claim_task`, `renew_task`, `release_task`, `submit_task` and
+`report_inference` take it ahead of every ordinary acquirer that is waiting (the tick, webhooks,
+operator commands, `status()`). The tick lets go of the lock entirely around its GitHub I/O: each
+outbox entry is re-read under the lock, its GitHub call made without it, and its outcome (done, or
+failed with the usual backoff) recorded under the lock again, so a drain of thousands of entries (a
+landing comment and a close per member of a large head) delays a worker request by one entry at
+most; a `promote` entry reads and changes the records and is performed under the lock. Each
+insertion probe likewise reserves its input and takes the batch's `insert` claim under the lock,
+fetches the head and replays it without the lock, and records the outcome only if the input is
+still reserved and the batch neither moved nor was claimed by a `prepare` task meanwhile (else the
+input waits for the next pass). The canonical fetch also runs without the lock, and between its
+other steps the tick offers the lock to waiting worker requests. Ticks are serialized by a lock of
+their own. A renewal's claim expiry is judged at the request's arrival, so a renewal that arrived
+in time extends the claim even if it then waited past `expires_at`, and the tick's claim expiry
+spares a claim while such a renewal waits. `insertion_probe_budget_seconds` and
+`outbox_drain_budget_seconds` still bound how much of each a tick does before the rest of the pass.
 
 ## Status
 

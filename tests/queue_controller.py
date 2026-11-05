@@ -27,6 +27,7 @@ from tauceti_queue.controller import (  # noqa: E402
     STATUS_SCHEMA,
     VERDICT_CONTEXTS,
     ControllerError,
+    ControllerLock,
     TaskError,
 )
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
@@ -2042,6 +2043,129 @@ class StatusSnapshot(ControllerCase):
         self.hold_lock()
         status = self.controller.status(wait=0.2)
         self.assertEqual((status["waiting"]["count"], status["settings"]["insertion_age_window"]), (1, 4))
+
+
+class WorkerEndpointsDuringTick(ControllerCase):
+    """A tick's GitHub I/O runs without the controller lock, and worker requests go ahead of the tick."""
+
+    def slow_comments(self, delay):
+        """Make each `post_comment` take `delay` seconds; returns an event set once the first call starts."""
+        started = threading.Event()
+        original = self.github.post_comment
+
+        def slow(*args, **kwargs):
+            started.set()
+            time.sleep(delay)
+            return original(*args, **kwargs)
+
+        self.github.post_comment = slow
+        return started
+
+    def test_a_renewal_answers_while_a_tick_drains_many_entries_through_a_slow_github(self):
+        self.failing_head()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.set_setting("outbox_drain_budget_seconds", 600, "t")
+        entries = 30
+        for index in range(entries):
+            self.controller._enqueue(
+                "comment", f"comment:{index}", {"number": 101, "body": f"landed {index}", "marker": f"m{index}"}
+            )
+        self.github.fail_next["post_comment"] = 1  # the first entry fails and is retried as before
+        started = self.slow_comments(0.1)
+        tick = threading.Thread(target=self.controller.tick)
+        tick.start()
+        self.addCleanup(tick.join)
+        self.assertTrue(started.wait(5))
+        latencies = []
+        for _ in range(3):
+            began = time.monotonic()
+            expires = self.controller.renew_task(task.task_id, task.claim_token)
+            latencies.append(time.monotonic() - began)
+            time.sleep(0.2)
+        self.assertTrue(tick.is_alive(), "the renewals were answered while the drain was still running")
+        self.assertLess(max(latencies), 1.0, "a renewal waits for one entry at most, not the whole drain")
+        self.assertEqual(expires, self.clock() + self.controller.setting("claim_ttl_seconds"))
+        tick.join(30)
+        self.assertFalse(tick.is_alive())
+        keys = {f"comment:{index}" for index in range(entries)}
+        rows = [row for row in self.controller.store.rows("outbox", {"kind": "comment"}) if row["key"] in keys]
+        done = [row for row in rows if row["state"] == "done"]
+        pending = [row for row in rows if row["state"] == "pending"]
+        self.assertEqual(len(done), entries - 1, "the drain completes")
+        self.assertEqual([(row["key"], row["attempts"]) for row in pending], [("comment:0", 1)])
+        self.assertGreater(pending[0]["next_attempt_at"], self.clock(), "the failed entry backs off")
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
+        self.controller._drain_outbox(self.clock())
+        self.assertEqual(self.controller.store.row("outbox", {"key": "comment:0"})["state"], "done")
+
+    def test_a_renewal_kept_waiting_past_the_expiry_still_extends_the_claim(self):
+        self.failing_head()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        held = threading.Event()
+        proceed = threading.Event()
+
+        def busy_tick():
+            with self.controller._lock:
+                held.set()
+                proceed.wait(10)
+                self.controller._expire_claims(self.clock())  # the tick sees the claim past its expiry
+
+        holder = threading.Thread(target=busy_tick)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.assertTrue(held.wait(5))
+        answer = {}
+        renewal = threading.Thread(
+            target=lambda: answer.update(expires=self.controller.renew_task(task.task_id, task.claim_token))
+        )
+        renewal.start()
+        deadline = time.monotonic() + 5
+        while not self.controller._lock.waiting() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.controller._lock.waiting(), 1, "the renewal arrived before the expiry and waits")
+        self.clock.advance(self.controller.setting("claim_ttl_seconds") + 60)
+        proceed.set()
+        renewal.join(5)
+        self.assertEqual(answer.get("expires"), self.clock() + self.controller.setting("claim_ttl_seconds"))
+        claim = self.controller.store.row("claims", {"token": task.claim_token})
+        self.assertIsNone(claim["released_at"], "the waiting renewal kept the claim")
+        self.clock.advance(self.controller.setting("claim_ttl_seconds") + 1)
+        with self.assertRaises(TaskError) as caught:
+            self.controller.renew_task(task.task_id, task.claim_token)
+        self.assertEqual(caught.exception.code, "claim-expired", "a renewal arriving after the expiry is refused")
+
+    def test_priority_acquirers_go_ahead_of_ordinary_waiters(self):
+        lock = ControllerLock()
+        order = []
+        lock.acquire()
+        ordinary = threading.Thread(target=lambda: (lock.acquire(), order.append("tick"), lock.release()))
+        ordinary.start()
+        time.sleep(0.1)
+
+        def worker():
+            with lock.priority():
+                order.append("worker")
+
+        priority = threading.Thread(target=worker)
+        priority.start()
+        deadline = time.monotonic() + 5
+        while not lock.waiting() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        lock.release()
+        ordinary.join(5)
+        priority.join(5)
+        self.assertEqual(order, ["worker", "tick"])
+        lock.acquire()
+        lock.acquire()  # reentrant
+        with lock.unlocked():
+            other = threading.Thread(target=lambda: (lock.acquire(), order.append("other"), lock.release()))
+            other.start()
+            other.join(5)
+        self.assertEqual(order[-1], "other", "`unlocked` lets go of every level")
+        lock.release()
+        lock.release()
+        self.assertTrue(lock.acquire(blocking=False))
+        lock.release()
 
 
 if __name__ == "__main__":
