@@ -15,7 +15,8 @@ artifacts and measure what comes back. The pieces they share live here:
   words, the evidence with the git refs the agent needs (owning commits, the conflicting commit, the
   clean prefix, base and target), the result the queue expects, the editing instruction and the
   local verification; the member listings go to ``.tauceti-repair/members.jsonl`` in the worktree
-  with the agent's one check command, ``.tauceti-repair/check``, beside them (``write_listings``);
+  with the agent's one check command, ``.tauceti-repair/check``, and its scoped build,
+  ``.tauceti-repair/build`` (``repair_tools``), beside them (``write_listings``);
 - the agent run through the worker's host agent path (``agent_environment``, ``run_agent``) and
   the usage accounting from its stream-json transcript (``agent_usage``);
 - the result checks (``chain_report``): ``chain.validate`` for membership, history and trailers,
@@ -40,6 +41,7 @@ import time
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
+from tauceti_queue import repair_tools
 
 DEFAULT_REPOSITORY = "TauCetiProject/TauCeti"
 CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
@@ -824,6 +826,7 @@ LISTINGS_DIR = ".tauceti-repair"
 LISTINGS_FILE = "members.jsonl"  # one JSON object per member, in chain order
 CHECK_FILE = "check"  # the agent's one validation command, written beside the listings
 STEP_FILE = "step"  # steps the rebase through members already on main, stopping at real conflicts
+BUILD_FILE = repair_tools.BUILD_FILE  # builds only the named modules, one Lake build at a time
 LANDED_SHOWN = 30  # members already on main listed in the prompt itself; the rest are in the listings file
 SHELL_LIMIT_SECONDS = 2 * 3600  # a repair agent's foreground shell limit (the fleet's rounds keep ten minutes)
 MEMBER_STATES = ("replayed", "conflicting", "pending")
@@ -1111,7 +1114,7 @@ def step_script(target: str, base: str, options: str) -> str:
 def write_listings(
     context: PromptContext, chain: list[ChainCommit], landed: dict[int, str | None] | None = None
 ) -> str:
-    """Write the member listings, the check script and the step script beside
+    """Write the member listings, the check script, the build script and the step script beside
     ``context.listings_path``; the display path of the listings for the prompt."""
     assert context.listings_path is not None
     directory = context.listings_path.parent
@@ -1122,6 +1125,7 @@ def write_listings(
     check = directory / CHECK_FILE
     check.write_text(check_script(context.base, context.repository))
     check.chmod(0o755)
+    repair_tools.write_build_script(directory)
     if context.kind == "rebase_conflict" and (context.conflict or {}).get("previous_base"):
         step = directory / STEP_FILE
         step.write_text(step_script(context.base, str(context.conflict["previous_base"]), context.rebase_options))
@@ -1221,6 +1225,16 @@ def _verification_section(
             "finish.",
             "",
         ]
+    scoped = (
+        [
+            "",
+            f"Check a fix with `{LISTINGS_DIR}/{BUILD_FILE} <Module.Name>` first (add `--dependents` to include the "
+            "modules that import it): it builds only those modules and waits for any other build in this checkout "
+            "to finish. Run the whole-library `lake build --iofail` only as the final verdict.",
+        ]
+        if check_command
+        else []
+    )
     limit = _hours_text(context.shell_limit)
     foreground = (
         f"Long builds are fine to run in the foreground: shell commands have a {limit} limit, and if one times out, "
@@ -1249,6 +1263,7 @@ def _verification_section(
             + foreground
             + " Do not run `lake exe cache get` or `lake cache get` (the worker already tried); do not use "
             "`--fail-fast`.",
+            *scoped,
         ]
     else:
         lines += [
@@ -1257,6 +1272,7 @@ def _verification_section(
             "dependents. Run it and judge it by its exit status. "
             + foreground
             + " Do not run `lake exe cache get` or `lake cache get`; do not use `--fail-fast`.",
+            *scoped,
         ]
     lines += [
         "",

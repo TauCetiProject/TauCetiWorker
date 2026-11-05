@@ -211,7 +211,19 @@ has a time budget holds because the service re-exposes the task.
    the artifacts outcome: with warm artifacts it describes the incremental whole-library build; when a
    rebase conflict runs without them (`cold`) it says so, gives the reason, warns that
    `lake build --iofail` starts from nothing and may take hours, and asks for the touched modules
-   (`lake build <Module>`) to be built first. Either way long builds run in the foreground: the task
+   (`lake build <Module>`) to be built first. Either way the prompt tells the agent to check a fix
+   with the scoped build first and to run the whole-library `lake build --iofail` only as the final
+   verdict: `.tauceti-repair/build` (written by `repair_tools.write_build_script` beside the check
+   script, a Python script of under sixty lines) takes module names (`TauCeti.Foo.Bar`) or paths
+   (`TauCeti/Foo/Bar.lean`), with `--dependents` every module importing them transitively (from the
+   library's `import` lines, read in one pass and cached in `.tauceti-repair/imports.json`, which the
+   worker drops whenever it rewrites the script), and runs `lake build --iofail` on them in the
+   foreground, exiting with Lake's status; with no arguments it builds the whole library. Every build
+   in the worktree holds the lock directory `.tauceti-repair/build.lock`, taken atomically by `mkdir`
+   with the holder's pid in `pid` inside: a waiter polls every 2 s, prints a line every 30 s, and
+   clears a lock whose holder has died. The worker's own builds hold the same lock through
+   `repair_tools.build_lock`, so exactly one `lake build` runs in a worktree at a time whoever
+   started it. Long builds run in the foreground: the task
    sets `TAUCETI_SHELL_LIMIT_SECONDS` to `RunnerConfig.shell_limit` (two hours;
    `repair.SHELL_LIMIT_SECONDS`) for the agent's shell limit, where the fleet's authoring rounds keep
    ten minutes, and the prompt says so. The prompt states the aim (every constituent PR's mathematics
