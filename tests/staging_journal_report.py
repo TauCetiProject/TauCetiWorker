@@ -16,6 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
+import queue_pilot_report as qpr  # noqa: E402
 import staging_journal_report as sjr  # noqa: E402
 
 FIXTURE = REPO / "tests/fixtures/staging-journal-fixture.json"
@@ -331,6 +332,300 @@ def test_markdown_and_json_outputs():
         assert rc == 0
         reduced = json.loads(fixture_out.read_text())
         assert [c["id"] for c in reduced["candidates"]] == [1929, 1843] and reduced["admissions"] == []
+
+
+def queue_candidate(attempt=2):
+    def ev(kind, at, **detail):
+        return {"id": at, "kind": kind, "source": "queue.controller", "observed_at": at * 1_000_000, "details": detail}
+
+    return {
+        "id": attempt,
+        "batch_id": 1,
+        "generation": attempt,
+        "observed_at": attempt * 100 * 1_000_000,
+        "snapshot": {"members": [{"pr": 9}]},
+        "events": [
+            ev("dispatched", 100, version=1, tip="old"),
+            ev("ci-source-failure", 150, attempt_id=1),
+            ev("dispatched", 200, version=2, tip="new"),
+            ev("ci-pass", 250, attempt_id=2),
+            ev("landed", 260, tip="new", members=[9]),
+        ],
+    }
+
+
+def test_queue_verdicts_bind_attempt_and_landed_tip():
+    old = sjr.describe(queue_candidate(1))
+    new = sjr.describe(queue_candidate(2))
+    assert old["outcome"] == "failed" and old["dispatched_at"] == 100_000_000, old
+    assert new["outcome"] == "promoted" and new["dispatched_at"] == 200_000_000, new
+    candidate = queue_candidate(2)
+    candidate["events"][-1]["details"]["tip"] = "different"
+    assert sjr.describe(candidate)["outcome"] == "passed"
+    candidate["events"][2]["details"]["version"] = 99
+    assert sjr.describe(candidate)["unclassified_reason"] == "queue dispatch identity missing or ambiguous"
+    candidate = queue_candidate(2)
+    reduced = sjr.reduce_candidate(candidate)
+    assert sjr.describe(reduced)["outcome"] == "promoted"
+
+
+def test_queue_infrastructure_and_readoption():
+    candidate = queue_candidate(2)
+    candidate["events"] = [e for e in candidate["events"] if e["kind"] not in ("landed", "ci-pass")]
+    candidate["events"] += [
+        {
+            "kind": "ci-infrastructure",
+            "source": "queue.controller",
+            "observed_at": 220_000_000,
+            "details": {"attempt_id": 2},
+        },
+        {
+            "kind": "run-readopted",
+            "source": "queue.controller",
+            "observed_at": 230_000_000,
+            "details": {"attempt_id": 2},
+        },
+    ]
+    assert sjr.describe(candidate)["outcome"] is None
+    candidate["events"].pop()
+    assert sjr.describe(candidate)["outcome"] == "infrastructure"
+    candidate["events"][-1]["details"]["attempt_id"] = 1
+    assert sjr.describe(candidate)["outcome"] is None
+
+
+def pilot_snapshot():
+    return {
+        "schema": qpr.SNAPSHOT_SCHEMA,
+        "captured_at": 5000,
+        "tables": {
+            "batches": [
+                {
+                    "id": 1,
+                    "state": "landed",
+                    "first_dispatch_at": 1000,
+                    "sealed_at": 900,
+                    "landed_at": 4000,
+                    "tip": "tip",
+                }
+            ],
+            "ci_attempts": [
+                {
+                    "id": 1,
+                    "batch_id": 1,
+                    "batch_version": 1,
+                    "head_sha": "old",
+                    "dispatched_at": 1000,
+                    "run_started_at": 1100,
+                    "run_completed_at": 2000,
+                    "outcome": "source-failure",
+                    "diagnostics": [],
+                },
+                {
+                    "id": 2,
+                    "batch_id": 1,
+                    "batch_version": 2,
+                    "head_sha": "tip",
+                    "dispatched_at": 2500,
+                    "run_started_at": 2600,
+                    "run_completed_at": 3900,
+                    "outcome": "pass",
+                    "diagnostics": [],
+                },
+            ],
+            "members": [
+                {
+                    "id": 1,
+                    "batch_id": 1,
+                    "input_id": 1,
+                    "number": 9,
+                    "commit_sha": "c1",
+                    "added_at": 950,
+                    "provenance": "edited",
+                },
+                {
+                    "id": 2,
+                    "batch_id": 1,
+                    "input_id": 2,
+                    "number": 10,
+                    "commit_sha": "c2",
+                    "added_at": 950,
+                    "provenance": "clean",
+                },
+            ],
+            "inputs": [
+                {"id": 1, "approved_at": 800, "state": "landed"},
+                {"id": 2, "approved_at": 850, "state": "landed"},
+            ],
+            "tasks": [
+                {
+                    "id": 1,
+                    "batch_id": 1,
+                    "kind": "repair",
+                    "state": "submitted",
+                    "created_at": 2000,
+                    "resolved_at": 2400,
+                }
+            ],
+            "claims": [{"id": 1, "batch_id": 1, "task_id": 1, "created_at": 2100, "released_at": 2400}],
+            "journal": [
+                {"id": 1, "kind": "landed", "batch_id": 1, "at": 4000, "detail": {"members": [9, 10]}},
+                {"id": 2, "kind": "inference-hold", "batch_id": None, "at": 4100, "detail": {}},
+                {"id": 3, "kind": "inference-resumed", "batch_id": None, "at": 4400, "detail": {}},
+            ],
+        },
+        "worker_outcomes": [
+            {
+                "task_id": "1",
+                "path": "worker/tasks/1/outcome.json",
+                "agent": [
+                    {
+                        "attempts": [
+                            {
+                                "provider": "test",
+                                "estimated_cost_usd": 2.5,
+                                "telemetry": {"usage": {"input_tokens": 10}},
+                            }
+                        ]
+                    }
+                ],
+            }
+        ],
+        "commit_facts": {
+            "c1": {"empty": False, "already_landed_note": False},
+            "c2": {"empty": True, "already_landed_note": True},
+        },
+    }
+
+
+def test_pilot_deduplicates_attempts_and_separates_empty_members():
+    snapshot = pilot_snapshot()
+    report = qpr.analyse(snapshot, {"landed_prs_per_hour": 1})
+    p = report["pilot"]
+    h = report["heads"][0]
+    assert p["landed_prs"] == 2 and p["nonempty_unique_prs"] == 1, p
+    assert p["empty_member_occurrences"] == 1 and p["already_landed_empty_occurrences"] == 1
+    assert h["first_dispatch_to_landing_minutes"] == 50 and h["seal_to_landing_minutes"] == 3100 / 60, h
+    assert h["ci_observed_minutes"] == 40 and h["claimed_task_minutes"] == 5, h
+    assert p["known_estimated_cost_usd"] == 2.5 and p["total_estimated_cost_usd"] == 2.5, p
+    assert p["inference_hold_minutes"] == 5
+    assert (
+        report["exit_criteria"]["week_above_baseline_without_comment_or_attribution_regression"]["status"]
+        == "not_yet_observable"
+    )
+    snapshot["worker_outcomes"][0]["agent"][0]["attempts"][0]["estimated_cost_usd"] = None
+    assert qpr.analyse(snapshot, {"landed_prs_per_hour": 1})["pilot"]["total_estimated_cost_usd"] is None
+
+
+def test_pilot_clips_window_and_does_not_sum_overlapping_work():
+    snapshot = pilot_snapshot()
+    snapshot["tables"]["ci_attempts"].append(
+        {"id": 3, "batch_id": 1, "dispatched_at": 1500, "run_completed_at": 3500, "outcome": "superseded"}
+    )
+    snapshot["tables"]["claims"][0].update(created_at=1600, released_at=3000)
+    h = qpr.analyse(snapshot, {"landed_prs_per_hour": 1})["heads"][0]
+    assert h["ci_observed_minutes"] == 2900 / 60, h
+    assert h["ci_task_overlap_minutes"] == 1400 / 60, h
+    assert h["other_or_unobserved_minutes"] == 200 / 60, h
+    report = qpr.analyse(snapshot, {"landed_prs_per_hour": 1}, since=4050, until=4300)
+    assert report["pilot"]["landed_prs"] == 0
+    assert report["pilot"]["inference_hold_minutes"] == 200 / 60
+
+
+def test_prediction_measurements_require_real_completion_and_verification():
+    attempts = [
+        {
+            "id": 1,
+            "batch_id": 3,
+            "run_completed_at": 100,
+            "diagnostics": [
+                {"kind": "audit", "declaration": "duplicate", "message": "duplicate-declarations: duplicate"}
+            ],
+        }
+    ]
+    events = [
+        {"kind": "admission-predicted", "batch_id": 3, "at": 20, "detail": {"collisions": [{"name": "duplicate"}]}},
+        {
+            "kind": "admission-repair-result",
+            "batch_id": 3,
+            "at": 90,
+            "detail": {"attempt_id": 1, "edited": ["repo#1"], "verified_fixed": None},
+        },
+    ]
+    measured = qpr.prediction_metrics(events, attempts)
+    assert measured["predicted_also_discovered_in_ci"] == 1 and measured["repair_results_before_verdict"] == 1
+    assert measured["verified_fixed_before_verdict"] is None
+    attempts[0]["run_completed_at"] = None
+    assert qpr.prediction_metrics(events, attempts)["repair_results_before_verdict"] == 0
+
+
+def test_export_omits_credentials_and_source_text_and_never_writes_database():
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "queue.sqlite3"
+        with sqlite3.connect(db) as c:
+            for table, fields in qpr.COLUMNS.items():
+                c.execute(f"CREATE TABLE {table} (" + ",".join(x + " TEXT" for x in fields.split()) + ")")
+            c.execute("ALTER TABLE claims ADD COLUMN token TEXT")
+            c.execute("INSERT INTO claims (id,token) VALUES ('1','secret-claim-token')")
+            c.execute("CREATE TABLE settings (key TEXT,value TEXT)")
+            c.execute("INSERT INTO settings VALUES (?,?)", ("admin-token", json.dumps("secret-admin-token")))
+            c.execute("CREATE TABLE journal (id INTEGER,at REAL,kind TEXT,batch_id INTEGER,detail TEXT)")
+        before = db.read_bytes()
+        data = qpr.export(db, [])
+        assert db.read_bytes() == before
+        assert "secret" not in json.dumps(data), data
+        assert "token" not in data["tables"]["claims"][0]
+        sanitized = qpr.compact_agent(
+            {
+                "prompt": "secret",
+                "session": "secret",
+                "telemetry": {"usage": {"input_tokens": 5}},
+                "estimated_cost_usd": 1,
+            }
+        )
+        assert "secret" not in json.dumps(sanitized) and sanitized["telemetry"]["usage"]["input_tokens"] == 5
+
+
+def test_retained_commit_emptiness_from_git_objects():
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+        git("init", "-q")
+        git("config", "user.email", "fixture@example.invalid")
+        git("config", "user.name", "Fixture")
+        git("commit", "--allow-empty", "-qm", "base")
+        git("commit", "--allow-empty", "-qm", "Landed on main as 123 outside the queue; nothing left to apply.")
+        empty = git("rev-parse", "HEAD")
+        (root / "file").write_text("change")
+        git("add", "file")
+        git("commit", "-qm", "source contribution")
+        nonempty = git("rev-parse", "HEAD")
+        facts = qpr.commit_facts(root, [{"commit_sha": empty}, {"commit_sha": nonempty}])
+        assert facts[empty] == {"empty": True, "already_landed_note": True}, facts
+        assert facts[nonempty] == {"empty": False, "already_landed_note": False}, facts
+
+
+def test_daily_command_preserves_inputs_and_reports():
+    from unittest.mock import patch
+
+    snapshot = pilot_snapshot()
+    snapshot.update(database="fixture.sqlite3", worker_roots=[])
+    with tempfile.TemporaryDirectory() as tmp, patch.object(qpr, "export", return_value=snapshot):
+        assert qpr.main(["daily", "--database", "unused", "--directory", tmp, "--baseline", str(FIXTURE)]) == 0
+        directories = list(Path(tmp).iterdir())
+        assert len(directories) == 1
+        archive = directories[0]
+        assert json.loads((archive / "snapshot.json").read_text()) == snapshot
+        report = json.loads((archive / "report.json").read_text())
+        assert report["pilot"]["landed_prs"] == 2
+        assert report["provenance"]["snapshot"] == str(archive / "snapshot.json")
+        assert (archive / "report.md").read_text().startswith("# Queue pilot measurements")
 
 
 def main():
