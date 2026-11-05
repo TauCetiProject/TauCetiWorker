@@ -99,6 +99,10 @@ class FakeController(FakeSource):
         self.calls.append(("retry_ci", repo, actor))
         return {"retried": True}
 
+    def rebuild_head(self, repo, actor):
+        self.calls.append(("rebuild_head", repo, actor))
+        return {"rebuilt": True}
+
     def report_inference(self, worker_identity, ok, error=""):
         self.calls.append(("report_inference", worker_identity, ok, error))
         return None
@@ -420,6 +424,10 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("POST", "/admin/urgent", {"repo": TAUCETI, "pr": 42}, self.bearer("ghp_kim"))
         self.assertEqual((status, body), (200, {"urgent": 42}))
         self.assertEqual(self.controller.calls[-1], ("mark_urgent", TAUCETI, 42, "kim-em"))
+
+        status, body = self.request("POST", "/admin/rebuild-head", {}, self.bearer("ghp_kim"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.controller.calls[-1], ("rebuild_head", TAUCETI, "kim-em"))
 
     def test_import_bors_and_reconcile_approvals_endpoints(self):
         feed = {"schema": "tauceti-bors.observation/v1", "repo": TAUCETI, "batches": []}

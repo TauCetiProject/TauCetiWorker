@@ -227,6 +227,31 @@ class Dispatch(ControllerCase):
         )
 
 
+class Rebuild(ControllerCase):
+    def test_rebuild_head_regenerates_the_chain_supersedes_the_task_and_redispatches(self):
+        head = self.failing_head()
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertIsNotNone(task)
+        result = self.controller.rebuild_head(PROJECT, "kim-em")
+        self.assertTrue(result["rebuilt"], result)
+        self.assertEqual(result["version"], head["version"] + 1)
+        self.assertEqual(result["tasks_superseded"], 1)
+        rebuilt = self.controller.store.row("batches", {"id": head["id"]})
+        self.assertEqual((rebuilt["version"], rebuilt["tip"]), (head["version"] + 1, result["tip"]))
+        self.assertEqual(self.controller.store.row("tasks", {"id": task["id"]})["state"], "superseded")
+        self.assertEqual(
+        dispatches = len(self.github.dispatches)
+        self.controller.tick()
+        self.assertEqual(len(self.github.dispatches), dispatches + 1, "the rebuilt head is dispatched again")
+            self.repo.rev_parse(f"refs/tauceti-queue/batches/{head['id']}/v{rebuilt['version']}"), result["tip"]
+        )
+        attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"]}, order="id DESC")
+        self.assertEqual((attempt["batch_version"], attempt["head_sha"]), (rebuilt["version"], rebuilt["tip"]))
+
+    def test_rebuild_head_is_refused_without_a_head(self):
+        self.assertEqual(self.controller.rebuild_head(PROJECT, "kim-em"), {"rebuilt": False, "reason": "no-head"})
+
+
 class Tasks(ControllerCase):
     def test_task_record_carries_members_diagnostics_refs_and_instruction(self):
         head = self.failing_head()
