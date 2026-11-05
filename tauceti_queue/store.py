@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import urllib.parse
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -382,6 +383,13 @@ class Store:
                 (key, dumps(value), actor, at),
             )
 
+    def setting_record(self, key: str) -> dict[str, Any] | None:
+        """The stored `value`, `actor` and `updated_at` of `key`; None when the store has no value."""
+        row = self.row("settings", {"key": key})
+        if row is None:
+            return None
+        return {"value": loads(row["value"]), "actor": row["actor"], "updated_at": row["updated_at"]}
+
     def settings(self) -> dict[str, dict[str, Any]]:
         return {
             row["key"]: {"value": loads(row["value"]), "actor": row["actor"], "updated_at": row["updated_at"]}
@@ -403,3 +411,23 @@ class Store:
         for entry in entries:
             entry["detail"] = loads(entry["detail"], {})
         return entries
+
+
+def read_settings(path: str) -> dict[str, dict[str, Any]] | None:
+    """The `settings` rows of the database at `path`, read without writing; None when there is no
+    database or no `settings` table yet. For read-only commands such as `check-config`."""
+    try:
+        connection = sqlite3.connect(f"file:{urllib.parse.quote(str(path))}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return None
+    try:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT key, value, actor, updated_at FROM settings ORDER BY key").fetchall()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        connection.close()
+    return {
+        row["key"]: {"value": loads(row["value"]), "actor": row["actor"], "updated_at": row["updated_at"]}
+        for row in rows
+    }
