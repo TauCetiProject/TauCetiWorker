@@ -2213,6 +2213,7 @@ class Controller:
         with self.store.transaction():
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_REMOVED)
             self.store.journal(now, "batch-removed", batch["id"], reason=reason)
+        self._cancel_superseded_runs(batch["id"], now, reason=f"batch removed ({reason})")
 
     def _probe(self, row: dict[str, Any], batch: dict[str, Any], now: float) -> bool:
         """Reserve the input, claim the open batch, replay the squash onto its tip; commit or roll back.
@@ -3358,6 +3359,7 @@ class Controller:
                     tasks_superseded=superseded,
                     landed_on_base=result.landed_on_base,
                 )
+            self._cancel_superseded_runs(head["id"], now, reason=f"head rebuilt as version {version}")
             self._wake.set()
             return {
                 "rebuilt": True,
@@ -3422,7 +3424,10 @@ class Controller:
             base_sha=head["base"],
             since=min(a["dispatched_at"] for a in attempts),
         )
-        return run if run is not None and run.status in LIVE_RUN_STATUSES else None
+        if run is None or run.status not in LIVE_RUN_STATUSES:
+            return None
+        # A run the controller cancelled may still read as live for a moment; it is not re-adopted.
+        return None if run.run_id in self._cancelled_run_ids(head["id"]) else run
 
     def _readopt_live_run(self, head: dict[str, Any], now: float) -> bool:
         """Before any re-dispatch of a tip that was dispatched before: re-adopt a run for it that GitHub
@@ -3484,6 +3489,70 @@ class Controller:
         if reader is None:
             raise ControllerError("no-read-run", "the GitHub port cannot read a run directly")
         return reader(self.repository, run_id, with_jobs=with_jobs)
+
+    def _cancelled_run_ids(self, batch_id: int) -> set[str]:
+        """The runs of the batch's attempts that the controller cancelled itself."""
+        return {
+            str(a["run_id"])
+            for a in self.store.rows("ci_attempts", {"batch_id": batch_id})
+            if a["cancelled_at"] is not None and a["run_id"]
+        }
+
+    def _cancel_superseded_runs(self, batch_id: int, now: float, *, reason: str, by: int | None = None) -> None:
+        """Cancel the run of every attempt of the batch other than `by` that is still live as last observed.
+
+        Called after a new attempt `by` is dispatched, and after the batch lands, is removed or has its
+        head rebuilt: an earlier attempt's run would otherwise keep a runner busy verifying a candidate
+        nobody will use. A still pending attempt becomes `superseded`; one already classified (an
+        infrastructure failure whose run lingers) keeps its outcome, so the retry count stands. A failed
+        cancel request is logged and retried once through the outbox (`cancel_run`); it never holds
+        anything back. The attempt is recorded as cancelled either way, so observation and the
+        re-adoption of live runs leave its run alone.
+        """
+        cancel = getattr(self.github, "cancel_run", None)
+        if cancel is None:
+            return
+        for attempt in self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id"):
+            if attempt["id"] == by or attempt["cancelled_at"] is not None:
+                continue
+            if not attempt["run_id"] or attempt["run_status"] == "completed":
+                continue
+            run_id = str(attempt["run_id"])
+            try:
+                result = cancel(self.repository, run_id)
+                error = None
+            except Exception as caught:  # noqa: BLE001 - a failed cancel is retried once, never blocks
+                result, error = "failed", caught
+            values: dict[str, Any] = {
+                "cancelled_at": now,
+                "cancelled_by": by,
+                "cancel_reason": reason,
+                "cancel_result": result if error is None else f"failed: {str(error)[:200]}",
+            }
+            if attempt["outcome"] == OUTCOME_PENDING:
+                values.update(outcome=OUTCOME_SUPERSEDED, outcome_detail=f"ci-cancelled: {reason}")
+            with self.store.transaction():
+                self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
+                self._count("ci_runs_cancelled")
+                self.store.journal(
+                    now,
+                    "ci-cancelled",
+                    batch_id,
+                    attempt_id=attempt["id"],
+                    run_id=run_id,
+                    superseded_by=by,
+                    reason=reason,
+                    result=values["cancel_result"],
+                )
+                if error is not None:
+                    self._enqueue("cancel_run", f"cancel-run:{run_id}", {"run_id": run_id, "attempt_id": attempt["id"]})
+            if error is not None:
+                self.log.warning(
+                    "head %s: cancelling superseded CI run %s failed, retrying once via the outbox: %s",
+                    batch_id,
+                    run_id,
+                    error,
+                )
 
     def _dispatch(self, head: dict[str, Any], now: float, retry: int) -> None:
         if not self.setting("publication_enabled"):
@@ -3557,6 +3626,7 @@ class Controller:
                 retry=retry,
                 repair_outputs_revs=repair_outputs_revs,
             )
+        self._cancel_superseded_runs(head["id"], now, reason=f"superseded by attempt {attempt_id}", by=attempt_id)
 
     def _check_lost_run(
         self, head: dict[str, Any], attempt: dict[str, Any], run: CandidateRun, values: dict[str, Any], now: float
@@ -3621,6 +3691,9 @@ class Controller:
         except Exception as error:  # noqa: BLE001
             self._reasons.append(f"CI observation failed: {error}")
             return
+        if run is not None and run.run_id != attempt["run_id"] and run.run_id in self._cancelled_run_ids(head["id"]):
+            # A run the controller cancelled for an earlier attempt never answers for this one.
+            run = None
         values: dict[str, Any] = {"last_observed_at": now, "needs_observation": 0}
         if run is None and attempt["run_id"]:
             # The run this attempt was bound to is missing from the listing: read it by id before
@@ -3898,6 +3971,7 @@ class Controller:
                 for member in members:
                     self._enqueue_landing_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
+        self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
 
     def _enqueue_landing_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
@@ -4444,6 +4518,13 @@ class Controller:
             return "closed"
         if kind == "promote":
             return self._perform_promotion(payload, now)
+        if kind == "cancel_run":
+            # The one retry of a cancel that failed inline: a second failure is recorded, not retried.
+            try:
+                return self.github.cancel_run(repo, payload["run_id"])
+            except Exception as error:  # noqa: BLE001
+                self.log.warning("retry of cancelling CI run %s failed, giving up: %s", payload["run_id"], error)
+                return f"gave-up: {str(error)[:200]}"
         raise ControllerError("unknown-outbox-kind", kind)
 
     def _perform_promotion(self, payload: dict[str, Any], now: float) -> str:
@@ -4845,6 +4926,21 @@ class Controller:
                         alerts.append(
                             f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
                         )
+        info["cancelled_runs"] = [
+            {
+                "attempt_id": a["id"],
+                "version": a["batch_version"],
+                "head_sha": a["head_sha"],
+                "run_id": a["run_id"],
+                "html_url": a["html_url"],
+                "cancelled_at": a["cancelled_at"],
+                "superseded_by": a["cancelled_by"],
+                "reason": a["cancel_reason"],
+                "result": a["cancel_result"],
+            }
+            for a in self.store.rows("ci_attempts", {"batch_id": head["id"]}, order="id")
+            if a["cancelled_at"] is not None
+        ]
         failures = self.store.count("journal", {"kind": "chain-invalid", "batch_id": head["id"]})
         if failures >= 2:
             alerts.append(f"head {head['id']}: a submitted chain failed validation {failures} times")

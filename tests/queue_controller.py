@@ -753,6 +753,139 @@ class LostRuns(ControllerCase):
         self.assertEqual(self.attempt()["run_id"], self.github.runs[0].run_id)
 
 
+class SupersededRuns(ControllerCase):
+    """A run left verifying a candidate the queue no longer uses is cancelled by the controller."""
+
+    def setUp(self):
+        super().setUp()
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()  # dispatch
+        self.head = self.controller.store.row("batches", {"state": "head"})
+
+    def attempts(self):
+        return self.controller.store.rows("ci_attempts", {"batch_id": self.head["id"]}, order="id")
+
+    def observe(self, seconds=0):
+        self.clock.advance(seconds or self.controller.setting("polling_interval_seconds") + 1)
+        return self.controller.tick()
+
+    def replay(self):
+        """Bind the first attempt to its running run, then move main so the head is replayed and dispatched again."""
+        self.github.start_runs()
+        self.observe()
+        self.assertEqual(self.attempts()[0]["run_status"], "in_progress")
+        self.repo.advance_main({"Z.lean": "z\n"})
+        self.observe()
+        first, second = self.attempts()
+        self.assertEqual(second["batch_version"], first["batch_version"] + 1)
+        return first, second
+
+    def cancel_calls(self):
+        return [args for name, args in self.github.calls if name == "cancel_run"]
+
+    def test_dispatch_after_replay_cancels_the_previous_live_run(self):
+        first, second = self.replay()
+        run = self.github.runs[0]
+        self.assertEqual((run.status, run.conclusion), ("completed", "cancelled"))
+        self.assertEqual(self.github.runs[1].status, "queued", "the new run is left alone")
+        self.assertEqual((first["outcome"], first["cancelled_by"]), ("superseded", second["id"]))
+        self.assertEqual(first["cancel_result"], "cancelled")
+        self.assertEqual(second["outcome"], "pending")
+        entry = self.controller.store.journal_entries("ci-cancelled")[-1]["detail"]
+        self.assertEqual(
+            (entry["attempt_id"], entry["run_id"], entry["superseded_by"]), (first["id"], run.run_id, second["id"])
+        )
+        listed = self.controller.status()["head"]["cancelled_runs"]
+        self.assertEqual(
+            [(c["attempt_id"], c["run_id"], c["superseded_by"]) for c in listed],
+            [(first["id"], run.run_id, second["id"])],
+        )
+        self.assertEqual(self.controller.status()["head"]["ci"]["attempt_id"], second["id"])
+
+    def test_no_cancel_when_the_previous_run_has_completed(self):
+        self.github.start_runs()
+        self.observe()
+        run = self.github.runs[0]
+        run.status, run.conclusion, run.completed_at = "completed", "cancelled", self.clock()
+        self.observe()
+        self.assertEqual(self.attempts()[0]["run_status"], "completed")
+        self.repo.advance_main({"Z.lean": "z\n"})
+        self.observe()
+        self.assertEqual(len(self.attempts()), 2)
+        self.assertEqual(self.cancel_calls(), [])
+        self.assertEqual(self.controller.store.journal_entries("ci-cancelled"), [])
+        self.assertIsNone(self.attempts()[0]["cancelled_at"])
+        self.assertEqual(self.controller.status()["head"]["cancelled_runs"], [])
+
+    def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_once(self):
+        self.github.fail_next["cancel_run"] = 5
+        first, second = self.replay()
+        self.assertEqual(len(self.github.dispatches), 2, "the new attempt was dispatched")
+        self.assertEqual(second["dispatch_id"], "dispatch-2")
+        self.assertEqual(first["outcome"], "superseded")
+        self.assertTrue(first["cancel_result"].startswith("failed:"), first["cancel_result"])
+        for _ in range(4):
+            self.observe(self.controller.setting("outbox_retry_max_seconds") + 1)
+        self.assertEqual(len(self.cancel_calls()), 2, "one inline call and one retry from the outbox")
+        entry = self.controller.store.row("outbox", {"kind": "cancel_run"})
+        self.assertEqual(entry["state"], "done")
+        self.assertTrue(entry["result"].startswith("gave-up:"), entry["result"])
+        self.assertEqual(self.attempts()[1]["outcome"], "pending")
+
+    def test_a_failed_cancel_succeeds_on_its_outbox_retry(self):
+        self.github.fail_next["cancel_run"] = 1
+        self.replay()
+        self.observe()
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.controller.store.row("outbox", {"kind": "cancel_run"})["result"], "cancelled")
+
+    def test_a_landed_batch_cancels_a_straggler(self):
+        # A controller unable to cancel at dispatch (as before this was added) leaves the old run going.
+        self.github.cancel_run = None
+        first, second = self.replay()
+        del self.github.cancel_run
+        self.assertEqual(self.github.runs[0].status, "in_progress")
+        self.assertIsNone(first["cancelled_at"])
+        head = self.controller.store.row("batches", {"id": self.head["id"]})
+        self.github.runs[0].verdict = "lost"  # `complete_runs` leaves it running
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": head["tip"], "context": context})
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        straggler = self.attempts()[0]
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual((straggler["cancel_reason"], straggler["cancelled_by"]), ("batch landed", None))
+        self.assertEqual(self.attempts()[1]["outcome"], "pass")
+
+    def test_rebuilding_the_head_cancels_its_live_run(self):
+        self.github.start_runs()
+        self.observe()
+        result = self.controller.rebuild_head(PROJECT, "kim-em")
+        self.assertTrue(result["rebuilt"], result)
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["cancel_reason"], f"head rebuilt as version {result['version']}")
+
+    def test_the_lost_run_detector_ignores_a_superseded_attempt(self):
+        # GitHub accepts the cancel but the run lingers in progress, silent.
+        lingering = []
+        self.github.cancel_run = lambda repo, run_id: lingering.append(run_id) or "cancelled"
+        first, second = self.replay()
+        self.assertEqual(lingering, [first["run_id"]])
+        self.assertEqual(self.github.runs[0].status, "in_progress")
+        self.github.start_runs()
+        self.observe()
+        self.observe(self.controller.setting("lost_run_seconds") + 1)
+        first, second = self.attempts()
+        self.assertEqual(first["outcome"], "superseded")
+        verdicts = [e["detail"]["attempt_id"] for e in self.controller.store.journal_entries("ci-infrastructure")]
+        self.assertNotIn(first["id"], verdicts)
+        self.assertEqual(self.controller.status()["head"]["cancelled_runs"][0]["attempt_id"], first["id"])
+        # Nor is it re-adopted as the live run for the tip it built.
+        head = self.controller.store.row("batches", {"id": self.head["id"]})
+        self.assertIsNone(self.controller._live_run(dict(head, tip=first["head_sha"], base=first["base_sha"]), [first]))
+
+
 class Rebuild(ControllerCase):
     def test_rebuild_head_regenerates_the_chain_supersedes_the_task_and_redispatches(self):
         head = self.failing_head()

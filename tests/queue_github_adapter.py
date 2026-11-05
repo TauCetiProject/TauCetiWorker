@@ -315,6 +315,18 @@ class Adapter(unittest.TestCase):
         self.assertEqual(a.pr_merge_base(TAUCETI, 42, HEAD), "d" * 40)
         self.assertIsNone(a.pr_merge_base(TAUCETI, 42, "e" * 40), "a moved head gets no merge base")
 
+    def test_cancel_run(self):
+        transport = FakeTransport()
+        base = f"https://api.github.com/repos/{TAUCETI}/actions/runs"
+        transport.add("POST", f"{base}/1/cancel", 202, {})
+        transport.add("POST", f"{base}/2/cancel", 409, {"message": "Cannot cancel a workflow run that is completed."})
+        transport.add("POST", f"{base}/3/cancel", 403, {"message": "Resource not accessible by integration"})
+        a = adapter(transport)
+        self.assertEqual(a.cancel_run(TAUCETI, "1"), "cancelled")
+        self.assertEqual(a.cancel_run(TAUCETI, "2"), "already-completed")
+        with self.assertRaises(ga.GitHubError):
+            a.cancel_run(TAUCETI, "3")
+
     def test_dispatch_candidate_sends_the_bors_payload(self):
         transport = FakeTransport()
         transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/dispatches", 204)

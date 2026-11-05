@@ -305,6 +305,22 @@ re-adopts it whatever the attempt was classified as: the newest attempt row beco
 bound to the run, and `run-readopted` is journaled. `retry_ci` refuses with reason `live-run` while
 such a run exists; cancel the run on GitHub first to force a fresh dispatch.
 
+A run for a candidate the queue no longer uses is cancelled by the controller, not left to the
+workflow's concurrency group (which keys on the head and base, so a replayed head's new run never
+cancels the old one). After a new attempt is dispatched, and after a batch lands, is removed or has
+its head rebuilt, every other attempt of the batch whose run is known and not last observed
+`completed` gets `POST /repos/{repo}/actions/runs/{id}/cancel` (`cancel_run` on the port; the App's
+`actions: write` covers it). The attempt records `cancelled_at`, the superseding attempt in
+`cancelled_by` (empty for a landing, removal or rebuild), `cancel_reason` and GitHub's answer in
+`cancel_result` (`cancelled`, `already-completed` for a 409, or the failure), a pending attempt
+becomes `superseded` with detail `ci-cancelled: <reason>` (an attempt already classified keeps its
+outcome, so infrastructure retries still count), and `ci-cancelled` is journaled with the attempt,
+run, `superseded_by` and reason. A failed request (403, 404, 5xx) is logged and retried once through
+the outbox (`cancel_run`, key `cancel-run:<run id>`); the second failure is recorded as `gave-up:`
+and dropped, and neither holds back the dispatch or the landing. A cancelled run is never treated as
+lost or as an infrastructure failure: its attempt is no longer observed, the re-adoption of live
+runs skips it, and observation of a newer attempt never binds to it.
+
 Promotion: an outbox entry `promote:<batch>:<version>:<tip>` that fast-forwards the canonical
 branch from the recorded expected parent to the tip (no merge commit). Before pushing, and on every
 retry after a transport failure, the canonical branch is re-read: if it already contains the tip
@@ -515,7 +531,9 @@ prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` 
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
 outcome and detail, plus `stall` with `since`, `silence_seconds` and the phase when the build has
-been silent for `stall_interval_seconds`); `external_head` (Bors's head awaited after the cutover:
+been silent for `stall_interval_seconds`, and `cancelled_runs`, the batch's attempts whose runs the
+controller cancelled: attempt id, version, head SHA, run id and URL, `cancelled_at`,
+`superseded_by`, `reason` and `result`); `external_head` (Bors's head awaited after the cutover:
 batch, head and base SHA, state, member counts, `pending_members`, timestamps); `approvals`
 (`webhook`, `polled`, `revoked_by_poll`, `last_poll`); `anticipated` (the `problem-anticipated`
 withdrawals still followed: `number`, `batch_id`, `interacting`, `file`, `finding`, `withdrawn_at`);

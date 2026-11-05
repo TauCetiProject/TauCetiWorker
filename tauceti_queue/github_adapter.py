@@ -657,6 +657,12 @@ class GitHubAdapter:
             return None
         return self.candidate_run(repo, data, with_jobs=with_jobs, with_diagnostics=with_jobs)
 
+    def cancel_run(self, repo: str, run_id: str) -> str:
+        """`POST repos/{repo}/actions/runs/{run_id}/cancel`: `cancelled` when GitHub accepted the request,
+        `already-completed` when the run had finished (409). Other failures (403, 404, 5xx) raise."""
+        response = self.client.request("POST", f"repos/{repo}/actions/runs/{run_id}/cancel", ok=(202,), tolerate=(409,))
+        return "already-completed" if response.status == 409 else "cancelled"
+
     def candidate_run(
         self, repo: str, run: dict, *, with_jobs: bool = True, with_diagnostics: bool = True
     ) -> CandidateRun:

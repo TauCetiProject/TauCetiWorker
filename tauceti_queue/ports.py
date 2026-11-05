@@ -169,6 +169,14 @@ class GitHubPort(Protocol):
         """
         ...
 
+    def cancel_run(self, repo: str, run_id: str) -> str:
+        """Cancel a queued or in-progress run (`POST /repos/{repo}/actions/runs/{run_id}/cancel`).
+
+        Returns `cancelled`, or `already-completed` when the run had finished; raises on any other failure.
+        The controller cancels the runs of attempts a newer dispatch, a landing or a rebuild superseded.
+        """
+        ...
+
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None: ...
 
     def fast_forward(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult: ...

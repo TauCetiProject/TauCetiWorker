@@ -561,6 +561,18 @@ class FakeGitHub:
                     return run.to_candidate_run()
             return None
 
+    def cancel_run(self, repo: str, run_id: str) -> str:
+        with self.lock:
+            self._call("cancel_run", run_id)
+            for run in self.runs:
+                if run.run_id == run_id and not run.vanished:
+                    if run.status == "completed":
+                        return "already-completed"
+                    run.status, run.conclusion = "completed", "cancelled"
+                    run.completed_at = run.updated_at = self.clock()
+                    return "cancelled"
+            raise RuntimeError(f"HTTP 404 on POST repos/{repo}/actions/runs/{run_id}/cancel")
+
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None:
         with self.lock:
             self._call("commit_status", sha, context)
