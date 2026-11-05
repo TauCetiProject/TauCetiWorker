@@ -1469,10 +1469,6 @@ class Controller:
                     for m in edited_no_repair
                 ]
                 return reject("no-repair-edited", violations)
-            if task["kind"] == TASK_PRE_REBASE:
-                return self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
-            if self._pre_rebased_prepare(task):
-                return self._adopt_prepared_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
             knowledge = next(
                 (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
             )
@@ -1489,6 +1485,10 @@ class Controller:
                 )
             if self._predicted_collisions(knowledge):
                 self._record_prediction_result(task, batch, comparison, tip_sha, worker_notes, now)
+            if task["kind"] == TASK_PRE_REBASE:
+                return self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
+            if self._pre_rebased_prepare(task):
+                return self._adopt_prepared_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
             if self._prediction_task(task) and tip_sha == task["tip"]:
                 return self._adopt_prediction_noop(task, claim, batch, tip_sha, retained, worker_notes, now)
             return self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
@@ -3457,7 +3457,11 @@ class Controller:
             return
         tip = batch["pre_rebase_tip"]
         self._retain(self.pre_rebased_ref(batch["id"], tip), tip)
-        self._create_task(batch, TASK_PREPARE, batch["pre_rebase_onto"], [], now, pre_rebased=(tip, batch["tip"]))
+        head = self._head()
+        diagnostics = [self._cross_batch(head, batch)] if head is not None else []
+        self._create_task(
+            batch, TASK_PREPARE, batch["pre_rebase_onto"], diagnostics, now, pre_rebased=(tip, batch["tip"])
+        )
         self._note_reason(f"open batch {batch['id']} waits for a worker to prepare its pre-rebased chain")
 
     def _settle_pre_rebased_release(
