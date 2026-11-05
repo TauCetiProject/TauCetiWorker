@@ -4667,6 +4667,64 @@ class RepairContextTests(unittest.TestCase):
         sh(repo, "checkout", "--quiet", "--detach", tip)
         return repo, base, repair.read_chain(repo, base, tip)
 
+    def test_compiled_added_names_override_only_clean_accepted_source(self):
+        import dataclasses
+
+        from tauceti_queue import declaration_names as dn
+
+        repo, base, chain = self.chain_repo(
+            "compiled-context-",
+            {},
+            {
+                1: {"TauCeti/One.lean": "namespace Foo\nclass One where\n  x : Nat\nend Foo\n"},
+                2: {"TauCeti/Two.lean": "theorem repaired : True := trivial\n"},
+            },
+        )
+        first_head, second_head = "a" * 40, "b" * 40
+        chain = [
+            dataclasses.replace(chain[0], accepted_head=first_head),
+            dataclasses.replace(chain[1], accepted_head=second_head),
+        ]
+
+        def record(head, module):
+            return dn.validate(
+                dict(
+                    version=1, head=head, base=base, tested=chain[-1].sha, complete=True, added={module: ["Foo.One.x"]}
+                ),
+                head,
+            )
+
+        records = {1: record(first_head, "TauCeti.One"), 2: record(second_head, "TauCeti.Two")}
+        context = repair_context.compute(repo, chain, base, repo, declaration_names=records)
+        self.assertIsNone(context.error)
+        self.assertEqual(context.members[0].added, {"Foo.One.x": "TauCeti/One.lean"})
+        self.assertEqual(context.collisions[0]["name"], "Foo.One.x")
+        self.assertFalse(context.members[0].decls_record()["added_approximate"])
+        self.assertTrue(context.members[0].decls_record()["removed_approximate"])
+        self.assertIn("compiled `DECLARATION-NAMES`", "\n".join(context.prompt_lines()))
+        # Existing agent changes supersede the accepted additions, preserving them only as evidence.
+        context = repair_context.compute(repo, chain, base, repo, declaration_names=records, edited_prs={2})
+        self.assertEqual(context.members[1].added, {"repaired": "TauCeti/Two.lean"})
+        self.assertTrue(context.members[1].decls_record()["added_approximate"])
+        self.assertEqual(context.members[1].decls_record()["compiled_added"], {"TauCeti.Two": ["Foo.One.x"]})
+        self.assertEqual(context.collisions, [])
+        for missing in [
+            {},
+            {1: dict(records[1], head=second_head)},
+            {1: {"state": "incomplete", "reason": "producer_incomplete"}},
+        ]:
+            context = repair_context.compute(repo, chain, base, repo, declaration_names=missing)
+            self.assertTrue(context.members[0].added_approximate)
+            self.assertIn("Foo.One", context.members[0].added)
+        cross = repair_context.cross_batch(
+            repo,
+            chain[:1],
+            chain[1:],
+            head_declaration_names={1: records[1]},
+            following_declaration_names={2: records[2]},
+        )
+        self.assertEqual(cross["added_by_both"][0]["name"], "Foo.One.x")
+
     def test_declarations_follow_namespaces_and_skip_comments(self):
         text = (
             "import TauCeti.A\n/-! module doc with theorem fake_one : True -/\nnamespace Foo.Bar\nsection\n"

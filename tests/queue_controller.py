@@ -60,6 +60,111 @@ class ControllerCase(unittest.TestCase):
         return self.controller.store.row("batches", {"state": "head"})
 
 
+class DeclarationNames(ControllerCase):
+    def test_declaration_fetch_is_background_head_bound_retry_bounded_and_in_task(self):
+        from tauceti_queue import declaration_names as dn
+
+        head, _ = self.approve(101, {"TauCeti/A.lean": "theorem one : True := trivial\n"})
+        record = dn.validate(
+            dict(version=1, head=head, base=head, tested=head, complete=True, added={"TauCeti.A": ["one"]}), head
+        )
+        entered, release = threading.Event(), threading.Event()
+        original = self.github.declaration_names
+
+        def slow(repo, accepted):
+            entered.set()
+            release.wait(5)
+            return record
+
+        self.github.declaration_names = slow
+        with self.controller._lock:
+            self.assertFalse(self.controller._fetch_declaration_names(self.clock()))
+        self.assertTrue(entered.wait(1))
+        self.assertEqual(self.controller.store.row("inputs", {"number": 101})["declaration_names"], "{}")
+        # Admission and sealing proceed while the read is blocked.
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("batches", {"state": "head"})["version"], 1)
+        future = self.controller._declaration_fetches[head]
+        release.set()
+        future.result(timeout=2)
+        with self.controller._lock:
+            self.assertTrue(self.controller._fetch_declaration_names(self.clock()))
+        self.assertEqual(
+            loads(self.controller.store.row("inputs", {"number": 101})["declaration_names"], {})["head"], head
+        )
+        # New tasks include evidence fetched after insertion.
+        batch = self.controller.store.row("batches", {"state": "head"})
+        taskid = self.controller._create_task(
+            batch, "repair", batch["base"], [{"kind": "compiler", "message": "boom"}], self.clock()
+        )
+        taskrow = self.controller.store.row("tasks", {"id": taskid})
+        # Task serialization uses the input, independently of the task creation time.
+        task = self.controller._task_record(taskrow, batch, 1, "token", self.clock() + 60)
+        self.assertEqual(task.members[0].declaration_names, record)
+        self.assertEqual(task.to_dict()["members"][0]["declaration_names"], record)
+        self.github.declaration_names = original
+
+    def test_declaration_fetch_bounds_inflight_and_records_unknown_once(self):
+        heads = [self.approve(n, {f"A{n}.lean": "one\n"})[0] for n in (101, 102, 103)]
+        release = threading.Event()
+
+        def slow(_repo, _head):
+            release.wait(5)
+            return {"state": "unknown", "reason": "record_missing"}
+
+        self.github.declaration_names = slow
+        try:
+            with self.controller._lock:
+                self.controller._fetch_declaration_names(self.clock())
+            self.assertEqual(set(self.controller._declaration_fetches), set(heads[:2]))
+            with self.controller._lock:
+                self.controller._fetch_declaration_names(self.clock())
+            self.assertEqual(len(self.controller._declaration_fetches), 2)
+            release.set()
+            for f in list(self.controller._declaration_fetches.values()):
+                f.result(timeout=2)
+            with self.controller._lock:
+                self.controller._fetch_declaration_names(self.clock())
+            self.assertEqual(set(self.controller._declaration_fetches), {heads[2]})
+            self.controller._declaration_fetches[heads[2]].result(timeout=2)
+            with self.controller._lock:
+                self.controller._fetch_declaration_names(self.clock())
+            self.assertFalse(self.controller._declaration_fetches)
+            self.assertTrue(all(r["declaration_fetch_attempts"] == 1 for r in self.controller.store.rows("inputs")))
+        finally:
+            release.set()
+
+    def test_declaration_late_result_does_not_update_a_changed_revision(self):
+        head, _ = self.approve(101, {"A.lean": "one\n"})
+        with self.controller._lock:
+            self.controller._fetch_declaration_names(self.clock())
+        future = self.controller._declaration_fetches[head]
+        future.result(timeout=2)
+        self.controller.store.update("inputs", {"number": 101}, state="cancelled", head_sha="f" * 40)
+        with self.controller._lock:
+            self.assertFalse(self.controller._fetch_declaration_names(self.clock()))
+        self.assertEqual(self.controller.store.row("inputs", {"number": 101})["declaration_names"], "{}")
+
+    def test_declaration_transport_errors_retry_three_times_and_missing_once(self):
+        head, _ = self.approve(101, {"A.lean": "one\n"})
+        self.github.fail_next["declaration_names"] = 3
+        for _attempt in range(3):
+            with self.controller._lock:
+                self.controller._fetch_declaration_names(self.clock())
+            future = self.controller._declaration_fetches[head]
+            with self.assertRaises(RuntimeError):
+                future.result(timeout=2)
+            with self.controller._lock:
+                self.controller._fetch_declaration_names(self.clock())
+            self.clock.advance(300)
+        row = self.controller.store.row("inputs", {"number": 101})
+        self.assertEqual(row["declaration_fetch_attempts"], 3)
+        self.assertEqual(loads(row["declaration_names"], {})["reason"], "fetch_failed")
+        with self.controller._lock:
+            self.controller._fetch_declaration_names(self.clock())
+        self.assertFalse(self.controller._declaration_fetches)
+
+
 class Verdicts(ControllerCase):
     """The statuses Bors required on the staging commit, `build`, `bump-guard` and `scope`, decide an attempt together."""
 

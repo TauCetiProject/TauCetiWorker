@@ -9,6 +9,23 @@ preparation, prompt, agent run, chain checks) is `tauceti_queue/repair.py`, fact
 historical repair experiments so the experiment CLI (`python -m tauceti_queue.repair_experiment`)
 and the task use one implementation.
 
+Each task member can also carry its accepted PR build's compiled `DECLARATION-NAMES` record.
+The service fetches this with its own App in the background (at most two reads in flight), from
+the accepted head's newest successful `build` status, the trusted `pr-build.yml` run and its
+exact attempt's `sandboxed-build` job. The log must contain one complete, bounded record naming
+that head and valid base/tested revisions. Unknown, missing, incomplete and stale records leave
+the text-derived context in place; transient reads have three attempts with persisted backoff.
+Admission, insertion and CI never wait for a record. The scheduling integration invokes
+`Controller._fetch_declaration_names(now)` once per pass and uses its changed result to refresh
+predictions.
+
+`.tauceti-repair/decls.jsonl` retains the compiled accepted snapshot and build identity. Clean
+members use its exact added names, including generated constants a source scan misses. After an
+agent edits a member, its current additions come from the approximate scan, with the original
+compiled additions beside them as evidence. Removals, renames and reference ripples remain
+explicitly approximate. Cross-batch predictions use the same rules. These are navigation and
+admission predictions; the worker's verification audits and the candidate's CI remain authoritative.
+
 ```sh
 uv run python -m tauceti_queue.repair_task --service https://queue.example [--once | --check] [--worker ID]
     [--clone PATH] [--root PATH] [--repository owner/repo] [--poll SECONDS]

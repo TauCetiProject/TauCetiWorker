@@ -84,7 +84,10 @@ CREATE TABLE IF NOT EXISTS inputs (
     landed_at REAL,
     landed_sha TEXT,
     no_repair INTEGER NOT NULL DEFAULT 0,
-    anticipated TEXT NOT NULL DEFAULT '{}'
+    anticipated TEXT NOT NULL DEFAULT '{}',
+    declaration_names TEXT NOT NULL DEFAULT '{}',
+    declaration_fetch_attempts INTEGER NOT NULL DEFAULT 0,
+    declaration_retry_at REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS inputs_state ON inputs (repository, state);
 CREATE TABLE IF NOT EXISTS batches (

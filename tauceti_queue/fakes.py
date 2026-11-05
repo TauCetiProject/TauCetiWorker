@@ -230,6 +230,7 @@ class FakeGitHub:
         self.repository_labels: dict[str, tuple[str, str]] = {}
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
+        self.declaration_records: dict[str, dict] = {}
         self.runs: list[FakeRun] = []
         # pr-build.yml's concurrency group with cancel-in-progress: a new dispatch for a candidate
         # cancels any queued or in-progress run for the same batch and head.
@@ -574,6 +575,10 @@ class FakeGitHub:
                     run.completed_at = run.updated_at = self.clock()
                     return "cancelled"
             raise RuntimeError(f"HTTP 404 on POST repos/{repo}/actions/runs/{run_id}/cancel")
+
+    def declaration_names(self, repo: str, head_sha: str) -> dict:
+        self._call("declaration_names", repo, head_sha)
+        return self.declaration_records.get(head_sha, {"state": "unknown", "reason": "record_missing"})
 
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None:
         with self.lock:

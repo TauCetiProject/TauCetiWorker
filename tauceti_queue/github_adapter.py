@@ -49,7 +49,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 
-from . import diagnostics, github_app, ports
+from . import declaration_names, diagnostics, github_app, ports
 from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
 
 API = github_app.API
@@ -777,6 +777,53 @@ class GitHubAdapter:
                     run_id=run_id_from_url(entry.get("target_url")),
                 )
         return None
+
+    def declaration_names(self, repo: str, head_sha: str) -> dict:
+        """The exact accepted head's latest successful build, its trusted workflow and one job.
+
+        The status URL must name this repository, and only the recorded run attempt's
+        `sandboxed-build` log supplies evidence. No search over unrelated runs or candidate logs.
+        Transient API failures raise for the controller's bounded background retry; absent
+        evidence is explicitly unknown and never delays admission or dispatch.
+        """
+        _, statuses = self.client.get_json(f"repos/{repo}/commits/{head_sha}/statuses", params={"per_page": 100})
+        build = (
+            next((s for s in statuses if isinstance(s, dict) and s.get("context") == "build"), None)
+            if isinstance(statuses, list)
+            else None
+        )
+        if not build or build.get("state") != "success":
+            return declaration_names.unknown("successful_build_unavailable")
+        url = str(build.get("target_url") or "")
+        match = re.fullmatch(r"https://github\.com/" + re.escape(repo) + r"/actions/runs/([1-9][0-9]*)", url)
+        if match is None:
+            return declaration_names.unknown("untrusted_build_url")
+        run_id = match.group(1)
+        code, run = self.client.get_json(f"repos/{repo}/actions/runs/{run_id}", tolerate=(404,))
+        if code == 404 or not isinstance(run, dict) or run.get("path") != ".github/workflows/pr-build.yml":
+            return declaration_names.unknown("untrusted_build_workflow")
+        attempt = run.get("run_attempt")
+        if type(attempt) is not int or attempt < 1:
+            return declaration_names.unknown("invalid_run_attempt")
+        _, result = self.client.get_json(
+            f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs", params={"per_page": 100}
+        )
+        jobs = result.get("jobs") if isinstance(result, dict) else None
+        matching = (
+            [j for j in jobs if isinstance(j, dict) and j.get("name") == BUILD_JOB] if isinstance(jobs, list) else []
+        )
+        if len(matching) != 1 or (result.get("total_count") or len(jobs or [])) > 100:
+            return declaration_names.unknown("build_job_ambiguous")
+        job = matching[0]
+        if type(job.get("id")) is not int or job.get("status") != "completed" or job.get("conclusion") != "success":
+            return declaration_names.unknown("successful_build_job_unavailable")
+        log = self.job_log(repo, job["id"])
+        if log is None:
+            return declaration_names.unknown("log_unavailable")
+        if len(log.encode("utf-8")) >= MAX_LOG_BYTES:
+            return declaration_names.unknown("log_limit")
+        record = declaration_names.parse_log(log, head_sha)
+        return {**record, "run_id": run_id, "run_attempt": attempt, "job_id": job["id"]}
 
     def eligibility_checks(self, repo: str, head: str) -> list[dict]:
         """Every `merge eligibility` check run on `head`, any App (`filter=all`), as Bors lists them."""

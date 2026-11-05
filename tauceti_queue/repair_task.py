@@ -166,6 +166,7 @@ class TaskMember:
     retained_ref: str = ""
     no_repair: bool = False  # the PR opted out of repair: never edited, only emptied with an attribution
     withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
+    declaration_names: dict = dataclasses.field(default_factory=dict)
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -228,6 +229,9 @@ class Task:
                     retained_ref=str(raw.get("retained_ref") or ""),
                     no_repair=bool(raw.get("no_repair")),
                     withdrawn=bool(raw.get("withdrawn")),
+                    declaration_names=raw.get("declaration_names")
+                    if isinstance(raw.get("declaration_names"), dict)
+                    else {},
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -1796,7 +1800,14 @@ def run_task(
                 cfg, client, task, state, "agent_failed", "resume: the worktree is gone", outcome, lease
             )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
-        ownership = repair_context.compute(cfg.clone, chain_before, task.validation_base, worktree)
+        ownership = repair_context.compute(
+            cfg.clone,
+            chain_before,
+            task.validation_base,
+            worktree,
+            declaration_names={m.number: m.declaration_names for m in task.members},
+            edited_prs={m.number for m in task.members if m.provenance == "edited"},
+        )
         outcome["repair_context"] = ownership.summary()
         tools_root = cfg.root / repair_audit.TOOLS_DIR
         if cfg.worker_audits:
