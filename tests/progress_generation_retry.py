@@ -63,6 +63,7 @@ class GenerationRetryTests(unittest.TestCase):
         assert Path(docs_cache).is_dir()
         self.caches.append((stage, docs_cache))
         if stage == "plan":
+            self.assertEqual(args[args.index("--roadmap-ref") + 1], "origin/main")
             Path(args[args.index("--out") + 1]).write_text(json.dumps(PLAN))
         else:
             Path(args[args.index("--out") + 1]).write_text(json.dumps(FACTS))
