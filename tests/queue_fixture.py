@@ -1450,5 +1450,197 @@ class StatusAndComments(QueueFixture):
         self.assertEqual((landed["state"], landed["landed_how"]), ("landed", "external"))
 
 
+class PreRebase(QueueFixture):
+    """The next open batch is replayed onto the head's tip once the head's chain is submitted (item 9)."""
+
+    def journal(self, kind):
+        return self.controller.store.journal_entries(kind)
+
+    def test_pre_rebase_follows_the_submitted_head_is_redone_on_a_tip_change_and_seals_without_a_replay(self):
+        self.github.ci_policy = verdicts("fail")
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        head = self.head()
+        self.assertEqual(self.controller.status()["head"]["stage"], "ci")
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        batch = self.open_batch()
+        # The head is dispatched (its chain is the controller's clean build): the open batch is replayed onto it.
+        self.assertEqual(batch["base"], self.repo.main_sha(), "the open batch stays on its own base")
+        self.assertEqual((batch["pre_rebase_state"], batch["pre_rebase_onto"]), ("clean", head["tip"]))
+        self.assertEqual(batch["pre_rebase_source"], batch["tip"])
+        self.assertEqual(
+            [c.source_pr for c in chain.chain_commits(self.repo.clone, head["tip"], batch["pre_rebase_tip"])],
+            [f"{PROJECT}#102"],
+        )
+        self.assertEqual(
+            self.controller.status()["open_batches"][0]["pre_rebase"]["state"], "clean", "status reports it"
+        )
+        self.assertTrue(self.controller.status()["open_batches"][0]["pre_rebase"]["current"])
+        # CI fails: while the head is being repaired nothing is replayed onto it, though insertion goes on.
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+        self.approve(103, {"C.lean": "c\n"})
+        self.tick()
+        batch = self.open_batch()
+        self.assertEqual([m["number"] for m in self.members(batch)], [102, 103])
+        self.assertNotEqual(batch["pre_rebase_source"], batch["tip"], "not extended while the head has a task")
+        self.assertEqual(len(self.journal("pre-rebased")), 1)
+        agent = self.agent(
+            script=lambda task: {f"{PROJECT}#101": Resolution({"A.lean": "a fixed\n"}, explanation="Fixed A.")}
+        )
+        self.assertEqual(agent.run(self.controller).accepted, True)
+        self.tick()
+        repaired = self.head()
+        self.assertNotEqual(repaired["tip"], head["tip"])
+        # The head's tip changed: the pre-rebase is redone onto it, carrying the earlier one forward.
+        batch = self.open_batch()
+        self.assertEqual((batch["pre_rebase_onto"], batch["pre_rebase_source"]), (repaired["tip"], batch["tip"]))
+        self.assertEqual([e["detail"]["onto"] for e in self.journal("pre-rebased")], [head["tip"], repaired["tip"]])
+        self.assertTrue(self.journal("pre-rebased")[-1]["detail"]["carried"])
+        pre_tip = batch["pre_rebase_tip"]
+        # The head lands; the next head seals from the pre-rebased chain without replaying it.
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.main_sha(), repaired["tip"])
+        sealed = self.head()
+        self.assertEqual(sealed["id"], batch["id"])
+        self.assertEqual((sealed["base"], sealed["tip"]), (repaired["tip"], pre_tip))
+        rebased = self.journal("rebased")[-1]
+        self.assertTrue(rebased["detail"]["pre_rebased"])
+        self.assertEqual([m["commit_sha"] for m in self.members(sealed)], [c.sha for c in self.chain_commits(sealed)])
+        self.assertEqual(self.controller.status()["counters"]["pre_rebases_used"], 1)
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.main_sha(), pre_tip)
+        self.assertEqual(
+            [self.repo.file_at("main", name) for name in ("A.lean", "B.lean", "C.lean")], ["a fixed\n", "b\n", "c\n"]
+        )
+        self.assertEqual({row["state"] for row in self.controller.inputs()}, {"landed"})
+
+    def test_pre_rebase_conflict_is_a_task_with_cross_batch_ripples_resolved_and_sealed_from(self):
+        self.repo.advance_main({"TauCeti/Basic.lean": "theorem foo_bar : True := trivial\n"}, "declare foo_bar")
+        self.approve(
+            101,
+            {
+                "Shared.lean": "line one\nline two changed by 101\nline three\n",
+                "TauCeti/Basic.lean": "theorem foo_baz : True := trivial\n\ntheorem both_add : True := trivial\n",
+            },
+        )
+        self.tick()
+        head = self.head()
+        self.approve(
+            102,
+            {
+                "Shared.lean": "line one\nline two changed by 102\nline three\n",
+                "TauCeti/Use.lean": "theorem uses : True := foo_bar\n",
+            },
+        )
+        self.approve(103, {"TauCeti/Also.lean": "theorem both_add : True := trivial\n"})
+        self.tick()
+        batch = self.open_batch()
+        self.assertEqual([m["number"] for m in self.members(batch)], [102, 103])
+        self.assertEqual((batch["pre_rebase_state"], batch["pre_rebase_tip"]), ("conflict", None))
+        status = self.controller.status()
+        self.assertEqual(status["head"]["stage"], "ci", "the head's CI round is not disturbed")
+        task = next(t for t in status["tasks"] if t["kind"] == "pre_rebase")
+        self.assertEqual(
+            (task["batch_id"], status["open_batches"][0]["pre_rebase"]["task_id"]), (batch["id"], task["task_id"])
+        )
+        conflict, cross = task["diagnostics"]
+        self.assertEqual((conflict["kind"], conflict["source_pr"]), ("conflict", f"{PROJECT}#102"))
+        self.assertEqual((conflict["paths"], conflict["onto"]), (["Shared.lean"], head["tip"]))
+        # The head renames foo_bar, which 102 uses, and adds both_add, which 103 adds too.
+        self.assertEqual(cross["kind"], "cross_batch")
+        self.assertEqual(
+            [
+                (r["name"], r["removed_by"][0]["renamed_to"], [u["file"] for u in r["references"]])
+                for r in cross["removed_used"]
+            ],
+            [("foo_bar", "foo_baz", ["TauCeti/Use.lean"])],
+        )
+        self.assertEqual(
+            [(a["name"], [w["pr"] for w in a["head"]], [w["pr"] for w in a["next"]]) for a in cross["added_by_both"]],
+            [("both_add", [101], [103])],
+        )
+
+        def script(task):
+            self.assertEqual((task.kind, task.onto, task.base), ("pre_rebase", head["tip"], batch["base"]))
+            self.assertEqual([m.number for m in task.members], [102, 103])
+            return {
+                f"{PROJECT}#102": Resolution(
+                    {
+                        "Shared.lean": "line one\nline two changed by 101 and 102\nline three\n",
+                        "TauCeti/Use.lean": "theorem uses : True := foo_baz\n",
+                    },
+                    explanation="Merged the line two edits of #101 and this PR; foo_bar is foo_baz after #101.",
+                ),
+                f"{PROJECT}#103": Resolution(
+                    {"TauCeti/Also.lean": None}, empty=True, explanation="#101 adds both_add."
+                ),
+            }
+
+        agent = self.agent(script=script)
+        adoption = agent.run(self.controller)
+        self.assertTrue(adoption.accepted, adoption)
+        self.assertEqual(adoption.provenance, {f"{PROJECT}#102": "edited", f"{PROJECT}#103": "edited"})
+        adopted = self.open_batch()
+        self.assertEqual(
+            (adopted["state"], adopted["base"], adopted["tip"], adopted["version"]),
+            ("open", batch["base"], batch["tip"], batch["version"]),
+            "the batch stays open on its own base with its own chain",
+        )
+        self.assertEqual((adopted["pre_rebase_state"], adopted["pre_rebase_tip"]), ("adopted", adoption.tip))
+        # Insertion goes on; the next pass replays the new member onto the adopted chain.
+        self.approve(104, {"D.lean": "d\n"})
+        self.tick()
+        extended = self.open_batch()
+        self.assertEqual([m["number"] for m in self.members(extended)], [102, 103, 104])
+        self.assertEqual((extended["pre_rebase_state"], extended["pre_rebase_source"]), ("adopted", extended["tip"]))
+        self.assertTrue(chain.is_ancestor(self.repo.clone, adoption.tip, extended["pre_rebase_tip"]))
+        self.run_ci()
+        self.tick(2)
+        sealed = self.head()
+        self.assertEqual(sealed["id"], batch["id"])
+        self.assertEqual((sealed["base"], sealed["tip"]), (head["tip"], extended["pre_rebase_tip"]))
+        self.assertTrue(self.journal("rebased")[-1]["detail"]["pre_rebased"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        self.assertEqual(
+            {m["number"]: m["provenance"] for m in self.members(sealed)}, {102: "edited", 103: "edited", 104: "clean"}
+        )
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(
+            self.repo.file_at("main", "Shared.lean"), "line one\nline two changed by 101 and 102\nline three\n"
+        )
+        self.assertEqual(self.repo.file_at("main", "TauCeti/Use.lean"), "theorem uses : True := foo_baz\n")
+        self.assertIn("edited this contribution", self.github.comments_for(102)[0]["body"])
+        self.assertNotIn("edited this contribution", self.github.comments_for(104)[0]["body"])
+
+    def test_a_head_tip_change_supersedes_the_open_pre_rebase_task_and_redoes_it(self):
+        self.github.ci_policy = verdicts("fail")
+        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.tick()
+        first = self.controller.store.row("tasks", {"kind": "pre_rebase", "state": "open"})
+        self.assertIsNotNone(first)
+        self.run_ci()
+        self.tick()
+        # The head's repair task comes first for a worker; its adoption moves the head's tip.
+        agent = self.agent(
+            script=lambda task: {f"{PROJECT}#101": Resolution({"A.lean": "a\n"}, explanation="Added A.")}
+        )
+        self.assertEqual(agent.run(self.controller).accepted, True)
+        self.assertEqual(agent.tasks[-1].kind, "repair")
+        self.tick()
+        tip = self.head()["tip"]
+        self.assertEqual(self.controller.store.row("tasks", {"id": first["id"]})["state"], "superseded")
+        second = self.controller.store.row("tasks", {"kind": "pre_rebase", "state": "open"})
+        self.assertEqual(second["onto"], tip)
+        self.assertEqual([e["detail"]["onto"] for e in self.journal("pre-rebase-conflict")][-1], tip)
+
+
 if __name__ == "__main__":
     unittest.main()

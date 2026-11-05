@@ -62,14 +62,18 @@ repeated for a task whose repository differs from the configured one.
 | `POST /tasks/<id>/result` | `{worker, claim_token, tip_sha, pushed_ref, worker_notes}` | the `Adoption` record |
 | `POST /tasks/<id>/release` | `{worker, claim_token, reason, error}` | `{task_id, released}`; `404` when the service has no such route |
 
-`Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair`, `rebase_conflict` or `prepare`),
+`Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair`, `rebase_conflict`, `pre_rebase` or `prepare`),
 `repository`, `batch_id`, `batch_version`, `base` and `tip` (the chain to start from), `onto` (the
-commit the replacement must be based on: the canonical commit for a rebase conflict, `base` itself
-for a repair or a preparation), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
+commit the replacement must be based on: the canonical commit for a rebase conflict, the head's tip
+for a pre-rebase of the next open batch, `base` itself for a repair or a preparation), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
 `description`, `author`, `explanation`, `retained_ref`), `diagnostics`, `retained_refs`,
 `submission_ref`, `claim_token`, `expires_at`, `instruction` (the plan's agent instruction, used
 verbatim as the prompt's first paragraph), `created_at`, `extra`. The runner renews every
-`extra.renew_after` seconds when the service sets it, else every third of the claim's lifetime.
+`extra.renew_after` seconds when the service sets it, else every third of the claim's lifetime. A
+`pre_rebase` task is run like a `rebase_conflict` (warm artifacts from `onto` first, run cold rather
+than released); its prompt says that the target is the next head's expected base, not `main`, and
+lists the `cross_batch` diagnostic's predicted ripples from the head under "Predicted ripples from the
+head".
 
 `diagnostics` is the controller's list of findings, each `{kind, module, message}` as the CI
 adapter extracted them (`repair.findings_from_diagnostics`): `compiler`/`compiler_error` entries

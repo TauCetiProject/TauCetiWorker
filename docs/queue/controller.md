@@ -95,16 +95,20 @@ Every `tick()` (one reconciliation pass) does, under the controller lock:
    in the same pass; the other open batches stay open and keep receiving insertions, and a new open
    batch is created only when none remains. There is no collection window. A `prepare` task on the
    batch is superseded (resolution `sealed`) and its claim released; the batch seals with what its
-   preparations adopted.
+   preparations adopted. A worker's claim on the batch's `pre_rebase` task holds the seal instead
+   (its result is the replay the new head needs); an unclaimed one is superseded (`sealed`).
 5. Head reconciliation, in the plan's order: a head under a worker's task claim is left alone;
-   a head not based on the canonical commit is claimed and replayed (`chain.replay`), a clean
+   a head not based on the canonical commit is claimed and, when its pre-rebase (below) was made on
+   exactly that commit, based there from the pre-rebased chain without a replay; otherwise replayed (`chain.replay`), a clean
    replay becoming the next version with provenance unchanged, a conflict becoming a
    `rebase_conflict` task with the conflicting member, paths and the clean prefix as evidence;
    a head with an open task waits for a worker; otherwise CI (below) and, on a pass, promotion
    through the outbox.
-6. Background preparation (below): supersede `prepare` tasks whose batch sealed or changed, or all
+6. Pre-rebase (below): supersede stale `pre_rebase` tasks; once the head's chain is submitted and
+   waits for its verdict, replay the oldest open batch onto the head's tip.
+7. Background preparation (below): supersede `prepare` tasks whose batch sealed or changed, or all
    of them while the head has an open task; otherwise create the `prepare` tasks that are due.
-7. Enqueue the live batches' retained refs that never reached GitHub (above); drain the outbox again.
+8. Enqueue the live batches' retained refs that never reached GitHub (above); drain the outbox again.
 
 Insertion draw: inputs are ordered urgent first, then priority, then age. The window is the
 `insertion_age_window` first. An urgent input in the window is drawn; else an input that has waited
@@ -146,6 +150,34 @@ provenance and explanations are adopted, the version advances, the batch stays o
 after preparation advances the version, so the batch is prepared again (as a whole) once it is quiet.
 A green background build is never a verdict: the head's CI round, after the rebase onto the
 canonical commit of that time, remains the only one.
+
+Pre-rebase (item 9 of "Pipeline acceleration behind the head" in the plan): once the head's chain is
+submitted and validated and waits for its CI verdict (`_pre_rebase_blocked` is None: the head is based
+on the canonical commit, has no open task and no claim, and its current version has a dispatched
+attempt that is pending, passed, or failed on infrastructure), the oldest open batch is replayed onto
+the head's tip with `chain.replay`, never earlier, since the head's unsettled conflicts and build
+would leak into the replay; `pre_rebase_enabled` turns it off. The batch stays open on its own base
+and keeps its own chain (insertion appends there); the result is recorded beside it
+(`pre_rebase_state` `clean`, `adopted` or `conflict`, `pre_rebase_tip`, `pre_rebase_onto` the head's
+tip, `pre_rebase_source` the batch tip covered, the members edited) and kept under the clone-only ref
+`refs/tauceti-queue/batches/<id>/pre/<onto>`. A later pass carries a usable pre-rebase forward by
+replay alone: onto the head's new tip when another repair round or a rebase moved it, and with the
+members inserted since appended; when that conflicts the batch's own chain is replayed afresh. A
+conflict becomes a `pre_rebase` task on the open batch (`base` and `tip` the batch's, `onto` the
+head's tip) with the conflict evidence of a `rebase_conflict` task and a `cross_batch` entry from
+`repair_context.cross_batch`: the names a head member removes or renames that a member of this batch
+uses (`removed_used`) and the names both batches add (`added_by_both`), text-derived and approximate,
+which the worker's prompt lists as predicted ripples. The worker handles it like a rebase conflict,
+told that the target is the next head's expected base rather than `main`. `claim_task` offers it
+after the head's tasks and before `prepare`; insertion goes on during the claim, and the submission
+is validated against the members the task covers and adopted as the batch's pre-rebase (`adopted`)
+with base, tip, version and members unchanged. A task whose `onto` is no longer the head's tip, or
+whose batch's chain was rewritten (a preparation adopted), is superseded and its claims released. A
+rebuild of the head or a repair that empties a head member discards every pre-rebase. When the head
+lands and the canonical commit equals `pre_rebase_onto`, the sealed head takes the pre-rebased chain
+directly (the `rebased` journal entry carries `pre_rebased`), recording the members edited in the
+task as edited; otherwise it is replayed as before. The stacked pair is never built by the
+controller and nothing about the pre-rebase is a verdict.
 
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
@@ -267,6 +299,7 @@ and reported in status:
 | `prepare_open_batches` | true | create `prepare` tasks for quiet open batches while the head has no task |
 | `prepare_min_members` | 20 | members an open batch needs before it is prepared |
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
+| `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
 
 ## Ports
 
@@ -301,8 +334,9 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
 - `claim_task(worker_identity, github_login) -> Task | None`: an open task under a new claim
   (`claim_token`, `expires_at` = now + `claim_ttl_seconds`) when the login is an admin. Tasks are
   ordered by kind priority, then age: the head's `repair` or `rebase_conflict` task first, while
-  fewer than `repair_concurrency` claims are active on it; a `prepare` task (above) only when the
-  head has none. The `Task` carries kind, batch and version,
+  fewer than `repair_concurrency` claims are active on it; then the oldest open batch's
+  `pre_rebase` task (above), within the same bound; a `prepare` task (above) only when the head has
+  none. The `Task` carries kind, batch and version,
   `base` and `tip` (the chain to start from), `onto` (the commit the replacement must be based on:
   the canonical commit for a rebase conflict, the base itself for a repair or a preparation), members with accepted
   head, current commit, provenance, title, description, author, explanation and retained ref,
@@ -331,7 +365,8 @@ count, oldest age, max passes waited, the inputs); `open_batch` (the first open 
 base, tip, size, oldest member age, members, claim, retained ref); `open_batches` (every open batch
 in id order: id, version, base, tip, size, urgent, oldest member age, and the preparation:
 `prepared_version`, `prepared`, the open `prepare_task`, `quiet_seconds` since the last insertion;
-`open_batch` carries the same preparation fields); `head` (the same plus `sealed_at`,
+and `pre_rebase` (null, or `state`, `onto`, `tip`, `source`, `at`, `current`, `edited` and the open
+`task_id`); `open_batch` carries the same preparation and `pre_rebase` fields); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
@@ -391,4 +426,8 @@ Background preparation is F `Preparation` (a prepared batch seals with its repai
 a failed CI round where the same batch unprepared fails one; insertion during preparation goes to the
 next batch; the head's repair task is claimed first) and C `Preparation` (the quiet period and size,
 the setting, kind priority then age, the head task superseding a running preparation, adoption
-keeping the batch open, sealing superseding a preparation, clean and failed releases).
+keeping the batch open, sealing superseding a preparation, clean and failed releases). The pre-rebase
+is F `PreRebase` (made once the head is dispatched, held while it has a task, redone on its new tip,
+used by the seal with no replay; a conflict task with cross-batch ripples resolved by the agent and
+sealed from; a head tip change superseding an open task) and C `PreRebase` (never before the head's
+chain is submitted, never while it has a task, discarded by a rebuild, the setting).
