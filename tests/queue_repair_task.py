@@ -55,7 +55,7 @@ for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CO
     os.environ.pop(key, None)
 
 from tauceti_queue import chain as chain_tool  # noqa: E402
-from tauceti_queue import repair, repair_task, repair_tools  # noqa: E402
+from tauceti_queue import repair, repair_context, repair_task, repair_tools  # noqa: E402
 
 PROJECT = "TauCetiProject/TauCeti"
 TOKEN = "worker-token"
@@ -760,6 +760,7 @@ class HappyPath(Fixture):
         self.assertIn("## What happened", prompt)
         self.assertIn("nothing to push, publish or report anywhere else, and `gh` is not needed", prompt)
         self.assertIn(".tauceti-repair/members.jsonl", prompt)
+        self.assertIn("## Likely collisions and renames", prompt)
         self.assertNotIn("repair task 1", prompt, "task identifiers are not in the prompt")
         self.assertNotIn(f"Source-PR: {PROJECT}#3", prompt, "the member listings are in the file")
         self.assertIsNone(calls[0]["env"]["GH_TOKEN"])
@@ -2787,6 +2788,206 @@ class BuildScript(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn("building TauCeti.C", out, "Lake's output streams through")
         self.assertFalse((self.root / ".tauceti-repair" / "build.lock").exists(), "released on failure too")
+
+
+class RepairContextTests(unittest.TestCase):
+    """``repair_context.compute``: the files and declarations of each member, the collisions and rename
+    ripples between them, and the prompt section, on small repositories built here with
+    ``(#N)``-suffixed squash commits (what ``read_chain`` reads)."""
+
+    def chain_repo(self, prefix: str, base_files: dict[str, str], members: dict[int, dict[str, str]]):
+        """A repository whose ``main`` is ``base_files`` and then one squash commit per member, in
+        number order, checked out detached at the tip; ``(repo, base, chain)``."""
+        repo = Path(tempfile.mkdtemp(prefix=prefix, dir=TMP)) / "repo"
+        subprocess.run(["git", "init", "--quiet", "-b", "main", str(repo)], check=True)
+        sh(repo, "config", "user.name", "Fixture")
+        sh(repo, "config", "user.email", "fixture@example.invalid")
+        base = commit(repo, "base", base_files)
+        for number, files in members.items():
+            commit(repo, f"feat: member {number} (#{number})\n\nSource-PR: {PROJECT}#{number}", files)
+        tip = sh(repo, "rev-parse", "HEAD")
+        sh(repo, "checkout", "--quiet", "--detach", tip)
+        return repo, base, repair.read_chain(repo, base, tip)
+
+    def test_declarations_follow_namespaces_and_skip_comments(self):
+        text = (
+            "import TauCeti.A\n/-! module doc with theorem fake_one : True -/\nnamespace Foo.Bar\nsection\n"
+            "/-- doc -/\n@[simp] protected theorem one (n : Nat) : n = n := rfl\n-- theorem fake_two : True\n"
+            "noncomputable def two.{u} : Type u := PUnit\ninstance : Inhabited Nat := ⟨0⟩\n"
+            "instance (priority := 100) three : Inhabited Nat := ⟨0⟩\nprivate def hidden := 1\n"
+            "theorem _root_.four : True := trivial\nend\nclass inductive Five | a\nend Foo.Bar\n"
+            "structure Six where\n  x : Nat\nmutual\ndef seven : Nat := 0\nend\n/- a /- nested -/ theorem fake_three -/\n"
+        )
+        self.assertEqual(
+            repair_context.declarations(text),
+            {
+                "Foo.Bar.one": "one",
+                "Foo.Bar.two": "two",
+                "Foo.Bar.three": "three",
+                "four": "_root_.four",
+                "Foo.Bar.Five": "Five",
+                "Six": "Six",
+                "seven": "seven",
+            },
+        )
+        self.assertEqual(
+            repair_context.rename_pairs({"Foo.b_old", "unrelated_zzz"}, {"Foo.b_new", "Bar.b_old", "fresh"}),
+            [("Foo.b_old", "Bar.b_old")],  # the shared suffix outscores the shared prefix; one use per name
+        )
+
+    def test_collision_and_rename_ripple_are_reported_with_their_members(self):
+        repo, base, chain = self.chain_repo(
+            "context-",
+            {
+                "TauCeti/A.lean": "theorem a : True := trivial\n",
+                "TauCeti/B.lean": "namespace Foo\n/-- doc -/\ntheorem b_old : True := trivial\nend Foo\n",
+                "TauCeti/C.lean": "import TauCeti.B\ntheorem c : True := Foo.b_old\n",
+                "TauCeti/D.lean": "-- Foo.b_old only in a comment\ntheorem d : True := trivial\n",
+            },
+            {
+                1: {
+                    "TauCeti/One.lean": "namespace Foo\ntheorem shared : True := trivial\nend Foo\n",
+                    "README.md": "1\n",
+                },
+                2: {"TauCeti/B.lean": "namespace Foo\n/-- doc -/\ntheorem b_new : True := trivial\nend Foo\n"},
+                3: {
+                    "TauCeti/Three.lean": "import TauCeti.B\nnamespace Foo\ntheorem shared : True := trivial\n"
+                    "theorem three : True := b_old\nend Foo\n"
+                },
+                4: {"TauCeti/A.lean": "theorem a : True := by trivial\n"},  # a changed signature is not an addition
+            },
+        )
+        context = repair_context.compute(repo, chain, base, repo)
+        self.assertIsNone(context.error)
+        self.assertEqual(
+            [m.files for m in context.members],
+            [["README.md", "TauCeti/One.lean"], ["TauCeti/B.lean"], ["TauCeti/Three.lean"], ["TauCeti/A.lean"]],
+        )
+        self.assertEqual(
+            context.collisions,
+            [
+                {
+                    "kind": "collision",
+                    "name": "Foo.shared",
+                    "added_by": [
+                        {"position": 1, "pr": 1, "file": "TauCeti/One.lean"},
+                        {"position": 3, "pr": 3, "file": "TauCeti/Three.lean"},
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(
+            context.ripples,
+            [
+                {
+                    "kind": "ripple",
+                    "name": "Foo.b_old",
+                    "removed_by": [{"position": 2, "pr": 2, "file": "TauCeti/B.lean", "renamed_to": "Foo.b_new"}],
+                    "references": [
+                        {"file": "TauCeti/Three.lean", "position": 3, "pr": 3, "lines": [4]},
+                        {"file": "TauCeti/C.lean", "main": True, "lines": [2]},
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(context.summary()["added"], 4)  # Foo.shared twice, Foo.b_new, Foo.three; not `a`
+        # The files, one object per member in chain order, ignored by Git once the listings path is set up.
+        where = repo / ".tauceti-repair"
+        files = [json.loads(line) for line in (where / "files.jsonl").read_text().splitlines()]
+        self.assertEqual([f["position"] for f in files], [1, 2, 3, 4])
+        self.assertEqual(
+            files[0], {"position": 1, "pr": 1, "commit": chain[0].sha, "files": ["README.md", "TauCeti/One.lean"]}
+        )
+        decls = [json.loads(line) for line in (where / "decls.jsonl").read_text().splitlines()]
+        self.assertEqual(
+            decls[1],
+            {
+                "position": 2,
+                "pr": 2,
+                "commit": chain[1].sha,
+                "approximate": True,
+                "added": ["Foo.b_new"],
+                "removed": ["Foo.b_old"],
+                "renamed": [["Foo.b_old", "Foo.b_new"]],
+            },
+        )
+        self.assertEqual(decls[3]["added"], [])
+        records = [json.loads(line) for line in (where / "collisions.jsonl").read_text().splitlines()]
+        self.assertEqual([r["kind"] for r in records], ["collision", "ripple"])
+        # The prompt section, next to the landed members, naming positions, PRs and files.
+        lines = context.prompt_lines()
+        self.assertEqual(lines[1], "## Likely collisions and renames")
+        self.assertIn(
+            "- `Foo.shared` is added by position 1 (PR #1, `TauCeti/One.lean`) and position 3 (PR #3, `TauCeti/Three.lean`)",
+            lines,
+        )
+        self.assertIn(
+            "- `Foo.b_old` is removed by position 2 (PR #2, `TauCeti/B.lean`, renamed to `Foo.b_new`) and still "
+            "referenced in `TauCeti/Three.lean` (position 3, PR #3) and `main`'s `TauCeti/C.lean` (changed by no member)",
+            lines,
+        )
+        task = repair_task.Task.from_json(
+            {**Content(repo.parent).task(), "claim_token": "x", "expires_at": time.time() + 60}
+        )
+        prompt_context = repair_task.prompt_context(task, None, listings=repair.listings_path(repo))
+        prompt_context.repair_context = context
+        prompt = repair.compose_prompt(prompt_context, repair_task.task_findings(task), chain, repo)
+        self.assertIn("\n".join(lines), prompt)
+        self.assertLess(prompt.index("## Likely collisions and renames"), prompt.index("## The result"))
+        self.assertIn("!! .tauceti-repair/", sh(repo, "status", "--ignored", "--porcelain"))
+        # Without the context (a prompt composed before the worktree exists) the section is absent.
+        prompt_context.repair_context = None
+        self.assertNotIn(
+            "Likely collisions", repair.compose_prompt(prompt_context, repair_task.task_findings(task), chain, repo)
+        )
+
+    def test_a_clean_batch_says_so_and_a_large_one_stays_under_the_cap(self):
+        repo, base, chain = self.chain_repo(
+            "clean-",
+            {"TauCeti/A.lean": "theorem a : True := trivial\n"},
+            {
+                1: {"TauCeti/One.lean": "theorem one : True := trivial\n"},
+                2: {"TauCeti/Two.lean": "theorem two : True := a\n"},
+            },
+        )
+        context = repair_context.compute(repo, chain, base, repo)
+        self.assertEqual((context.collisions, context.ripples), ([], []))
+        self.assertIn("No declaration name is added by two members", "\n".join(context.prompt_lines()))
+        # 120 members, each adding a module; pairs declare the same name (60 collisions) and every
+        # sixth member drops a base theorem another member and `main` still use (20 ripples).
+        base_files = {f"TauCeti/Old{r}.lean": f"theorem old_{r} : True := trivial\n" for r in range(20)}
+        base_files["TauCeti/Uses.lean"] = "".join(f"theorem uses_{r} : True := old_{r}\n" for r in range(20))
+        members: dict[int, dict[str, str]] = {}
+        for i in range(1, 121):
+            text = f"namespace M{i}\ntheorem own_{i} : True := trivial\nend M{i}\ntheorem dup_{(i - 1) // 2} : True := trivial\n"
+            if i % 3 == 0:
+                text += f"theorem ref_{i} : True := old_{i % 20}\n"
+            files = {f"TauCeti/M{i}.lean": text}
+            if i % 6 == 0:
+                files[f"TauCeti/Old{(i // 6) - 1}.lean"] = f"theorem renamed_{(i // 6) - 1} : True := trivial\n"
+            members[i] = files
+        repo, base, chain = self.chain_repo("large-", base_files, members)
+        started = time.monotonic()
+        context = repair_context.compute(repo, chain, base, repo)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(context.error)
+        self.assertEqual((len(context.collisions), len(context.ripples)), (60, 20))
+        self.assertLess(elapsed, 20.0, f"compute took {elapsed:.1f}s for 120 members")
+        lines = context.prompt_lines()
+        bullets = [line for line in lines if line.startswith("- ")]
+        self.assertEqual(len(bullets), repair_context.SECTION_LINES + 1)
+        self.assertEqual(bullets[-1], "- and 40 more in `.tauceti-repair/collisions.jsonl`")
+        self.assertLess(len("\n".join(lines)), 8_000)
+        records = (repo / ".tauceti-repair" / "collisions.jsonl").read_text().splitlines()
+        self.assertEqual(len(records), 80)
+        ripple = json.loads(records[-1])
+        self.assertEqual(ripple["name"], "old_19")
+        self.assertEqual(
+            ripple["removed_by"],
+            [{"position": 120, "pr": 120, "file": "TauCeti/Old19.lean", "renamed_to": "renamed_19"}],
+        )
+        self.assertIn({"file": "TauCeti/Uses.lean", "main": True, "lines": [20]}, ripple["references"])
+        self.assertTrue(all(r.get("pr") in (39, 99) for r in ripple["references"] if not r.get("main")))
 
 
 if __name__ == "__main__":

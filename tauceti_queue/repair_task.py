@@ -61,7 +61,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from tauceti_queue import repair
+from tauceti_queue import repair, repair_context
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 
 SCHEMA = "tauceti-queue.repair-task/v1"
@@ -1553,6 +1553,8 @@ def run_task(
                 cfg, client, task, state, "agent_failed", "resume: the worktree is gone", outcome, lease
             )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
+        ownership = repair_context.compute(cfg.clone, chain_before, task.validation_base, worktree)
+        outcome["repair_context"] = ownership.summary()
         findings = task_findings(task)
         feedback: str | None = None
         pushed: str | None = None
@@ -1578,6 +1580,7 @@ def run_task(
                     listings=repair.listings_path(worktree),
                     shell_limit=int(cfg.shell_limit),
                 )
+                context.repair_context = ownership
                 prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
                 if resume_session:
                     prompt = (
