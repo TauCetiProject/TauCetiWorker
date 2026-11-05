@@ -150,7 +150,9 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
     line and column parsed from the message when it starts with ``path:line:col``), lint findings keep
     their module and message, every other kind is kept under ``other``, the conflict entry under
     ``conflict``, and a pre-rebase's ``{kind: "cross_batch", removed_used, added_by_both}`` entry (the
-    predicted ripples from the head, ``repair_context.cross_batch``) under ``cross_batch``. A dict is taken as an already structured findings record.
+    predicted ripples from the head, ``repair_context.cross_batch``) under ``cross_batch``, and its
+    ``{kind: "prepare_errors", task_id, errors}`` entry (the errors the batch's preparation left) under
+    ``prepare_errors``. A dict is taken as an already structured findings record.
     """
     if isinstance(entries, dict):
         findings = normalise_findings(entries)
@@ -166,6 +168,9 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         kind = str(raw.get("kind") or "")
         if kind == "cross_batch":
             findings["cross_batch"] = raw
+            continue
+        if kind == "prepare_errors":
+            findings["prepare_errors"] = raw
             continue
         module = str(raw.get("module") or raw.get("path") or "")
         message = str(raw.get("message") or "")
@@ -1714,10 +1719,39 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
         from tauceti_queue.repair_context import cross_batch_lines  # repair_context imports this module
 
         lines += cross_batch_lines(findings.get("cross_batch"))
+        lines += prepare_errors_lines(findings.get("prepare_errors"))
     lines += _result_section(base_short)
     lines += _editing_section(context, chain, base_short, where)
     lines += _verification_section(context, findings, base_short, check_command)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+
+
+PREPARE_ERRORS_SHOWN = 20
+
+
+def prepare_errors_lines(record: dict | None) -> list[str]:
+    """The prompt's section for a pre-rebase of a prepared batch: the errors its preparation's build
+    reported that no later worker build showed fixed; empty when there were none."""
+    errors = [e for e in (record or {}).get("errors") or [] if isinstance(e, dict)]
+    if not errors:
+        return []
+    lines = [
+        "",
+        "## Errors the batch's preparation left",
+        "",
+        f"Before this task the batch was built and repaired on its own base (prepare task {record.get('task_id')}). "
+        "Its build reported these errors, which no later worker build showed fixed. Check them once the chain is on "
+        "the head's tip and fix those that remain in the member that owns the file:",
+        "",
+    ]
+    for error in errors[:PREPARE_ERRORS_SHOWN]:
+        where = f"{error.get('path') or error.get('file') or '?'}:{error.get('line', 0)}:{error.get('column', 0)}"
+        message = str(error.get("message") or "").strip().splitlines()
+        lines.append(f"- `{where}`" + (f": {message[0]}" if message else ""))
+    omitted = len(errors) - PREPARE_ERRORS_SHOWN + int(record.get("omitted") or 0)
+    if omitted > 0:
+        lines.append(f"- and {omitted} more in the task's `prepare_errors` diagnostics")
+    return lines
 
 
 def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:

@@ -1420,6 +1420,32 @@ def run_parallel_groups(
     return record, record.get("remaining")
 
 
+PREPARE_REMAINING_LIMIT = 100
+
+
+def prepare_remaining_errors(parallel: dict | None, findings: dict, worktree: Path) -> list[dict]:
+    """The errors a ``prepare`` task leaves for its batch's later ``pre_rebase`` task (the submission's
+    ``remaining_errors`` note): none when the parallel path's verification build passed; otherwise
+    the compiler errors handed to the last agent, the streaming build's ``errors.jsonl`` included
+    unless the parallel path already narrowed them, since no worker build showed those fixed."""
+    status = (parallel or {}).get("status")
+    if status == "ok":
+        return []
+    if status != "partial":
+        errors = repair_parallel.read_errors(repair.listings_path(worktree).parent)
+        if errors:
+            findings = repair_parallel.merge_errors(findings, errors)
+    return [
+        {
+            "path": e.get("path"),
+            "line": e.get("line", 0),
+            "column": e.get("column", 0),
+            "message": str(e.get("message") or "")[:1000],
+        }
+        for e in findings.get("compiler_errors") or []
+    ][:PREPARE_REMAINING_LIMIT]
+
+
 def _parallel_summary(record: dict) -> dict:
     return {k: v for k, v in record.items() if k not in ("remaining", "report", "attempts")}
 
@@ -1838,6 +1864,8 @@ def run_task(
                     a.get("estimated_cost_usd") or 0 for r in agent_records for a in r.get("attempts", [])
                 ),
             }
+            if task.kind == "prepare":
+                notes["remaining_errors"] = prepare_remaining_errors(outcome.get("parallel"), findings, worktree)
             lease.submitting.set()
             try:
                 response = with_retries(

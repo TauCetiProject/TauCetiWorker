@@ -3114,6 +3114,47 @@ class ErrorParsing(unittest.TestCase):
 
 
 class Records(unittest.TestCase):
+    def test_a_pre_rebase_prompt_lists_the_errors_its_preparation_left(self):
+        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        content = Content(root)
+        raw = content.task(12, kind="pre_rebase")
+        seed = root / "seed"
+        raw["onto"] = commit(seed, "head tip", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        left = [{"path": "TauCeti/Two.lean", "line": 3, "column": 5, "message": "unknown identifier `x`\n  more"}]
+        raw["diagnostics"] = [{"kind": "prepare_errors", "task_id": 7, "resolution": "adopted", "errors": left}]
+        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
+        findings = repair_task.task_findings(task)
+        self.assertEqual(findings["prepare_errors"]["errors"], left)
+        self.assertEqual(findings["compiler_errors"], [], "not errors of this task's own build")
+        chain = repair.read_chain(seed, content.base, content.tip)
+        context = repair_task.prompt_context(task, None, listings=repair.listings_path(seed))
+        prompt = repair.compose_prompt(context, findings, chain, seed)
+        self.assertIn("## Errors the batch's preparation left", prompt)
+        self.assertIn("(prepare task 7)", prompt)
+        self.assertIn("- `TauCeti/Two.lean:3:5`: unknown identifier `x`", prompt)
+
+    def test_a_preparation_reports_the_errors_no_worker_build_showed_fixed(self):
+        worktree = Path(tempfile.mkdtemp(prefix="remaining-", dir=TMP))
+        listings = repair.listings_path(worktree).parent
+        listings.mkdir(parents=True)
+        (listings / repair_stream.ERRORS_FILE).write_text(
+            json.dumps({"module": "TauCeti.B", "file": "TauCeti/B.lean", "line": 2, "column": 1, "message": "boom"})
+            + "\n"
+            + json.dumps({"event": "finished", "rc": 1})
+            + "\n"
+        )
+        findings = repair.findings_from_diagnostics([])
+        self.assertEqual(repair_task.prepare_remaining_errors({"status": "ok"}, findings, worktree), [])
+        self.assertEqual(
+            repair_task.prepare_remaining_errors(None, findings, worktree),
+            [{"path": "TauCeti/B.lean", "line": 2, "column": 1, "message": "boom"}],
+        )
+        narrowed = {**findings, "compiler_errors": [{"path": "TauCeti/C.lean", "line": 1, "column": 1, "message": "x"}]}
+        self.assertEqual(
+            [e["path"] for e in repair_task.prepare_remaining_errors({"status": "partial"}, narrowed, worktree)],
+            ["TauCeti/C.lean"],
+        )
+
     def test_task_record_and_prompt_for_a_pre_rebase(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)

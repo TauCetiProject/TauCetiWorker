@@ -434,6 +434,10 @@ class Rebuild(ControllerCase):
 class PreRebase(ControllerCase):
     """The next open batch is replayed onto the head only once the head's chain is submitted."""
 
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 2, "kim")  # room for one background claim
+
     def open_batch(self):
         return self.controller.store.row("batches", {"state": "open"})
 
@@ -489,19 +493,108 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.open_batch()["pre_rebase_onto"], head["tip"])
         self.assertEqual(len(self.pre_rebased()), 2)
 
-    def test_a_pre_rebase_task_is_claimed_after_the_heads_and_before_a_preparation(self):
-        self.controller.set_setting("prepare_min_members", 1, "kim")
-        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+    def conflicting_batch(self):
+        """A head waiting on CI and an open batch whose member 102 conflicts with it on `Shared.lean`."""
         self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
         self.controller.tick()
         self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
-        self.controller.tick()
+        return self.controller.tick()
+
+    def open_tasks(self, batch):
+        return self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"}, order="id")
+
+    def test_no_pre_rebase_task_until_prepared_and_then_one_from_the_prepared_chain(self):
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+        reasons = self.conflicting_batch()
         batch = self.open_batch()
-        kinds = {t["kind"] for t in self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})}
-        self.assertEqual(kinds, {"pre_rebase", "prepare"}, "neither background task replaces the other")
+        self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"], "one background kind per batch")
+        self.assertEqual(batch["pre_rebase_state"], "conflict", "the conflict is recorded, its task waits")
+        prepare = self.open_tasks(batch)[0]
+        waits = f"open batch {batch['id']}: pre_rebase task waits for its preparation (prepare task {prepare['id']} is open)"
+        reasons = self.controller.tick()
+        self.assertIn(waits, reasons)
+        background = self.controller.status()["open_batches"][0]["background"]
+        self.assertEqual(background["active"], {"kind": "prepare", "task_id": prepare["id"], "claimed": False})
+        self.assertEqual(background["waiting"]["kind"], "pre_rebase")
         task = self.controller.claim_task("w", "admin-worker")
-        self.assertEqual((task.kind, task.batch_id), ("pre_rebase", batch["id"]))
-        self.assertIsNone(self.controller.claim_task("w2", "admin-worker"), "one background claim per batch")
+        self.assertEqual(task.kind, "prepare")
+        self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"])
+        # The preparation edits 102 (so the chain is rewritten) and reports an error it left.
+        agent = ScriptedAgent(
+            "preparer",
+            "admin-worker",
+            self.repo,
+            self.root / "preparer",
+            lambda _task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Shared.lean": "line one\nline two by 102\nline three\n", "Extra.lean": "extra\n"},
+                    explanation="Added Extra.",
+                )
+            },
+        )
+        tip = agent.produce(task)
+        left = [{"path": "Extra.lean", "line": 1, "column": 1, "message": "unknown identifier `extra`"}]
+        notes = json.dumps({"worker": "w", "remaining_errors": left})
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, tip, worker_notes=notes)
+        self.assertTrue(adoption.accepted, adoption)
+        prepared = self.open_batch()
+        self.assertEqual(prepared["prepared_version"], prepared["version"])
+        self.controller.tick()
+        [pre_rebase] = self.open_tasks(prepared)
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.assertEqual(
+            (pre_rebase["kind"], pre_rebase["base"], pre_rebase["tip"], pre_rebase["onto"]),
+            ("pre_rebase", prepared["base"], tip, head["tip"]),
+            "replayed from the prepared chain",
+        )
+        diagnostics = loads(pre_rebase["diagnostics"])
+        self.assertEqual([d["kind"] for d in diagnostics], ["conflict", "cross_batch", "prepare_errors"])
+        self.assertEqual(
+            (diagnostics[2]["task_id"], diagnostics[2]["resolution"], diagnostics[2]["errors"]),
+            (task.task_id, "adopted", left),
+        )
+        background = self.controller.status()["open_batches"][0]["background"]
+        self.assertEqual((background["active"]["kind"], background["waiting"]), ("pre_rebase", None))
+        self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
+
+    def test_a_clean_preparation_hands_the_recorded_conflict_to_a_pre_rebase_task(self):
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+        self.conflicting_batch()
+        batch = self.open_batch()
+        task = self.controller.claim_task("w", "admin-worker")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.controller.tick()
+        [pre_rebase] = self.open_tasks(batch)
+        self.assertEqual((pre_rebase["kind"], pre_rebase["tip"]), ("pre_rebase", batch["tip"]))
+        self.assertEqual([d["kind"] for d in loads(pre_rebase["diagnostics"])], ["conflict", "cross_batch"])
+
+    def test_a_preparation_waits_while_a_pre_rebase_task_is_claimed(self):
+        self.controller.set_setting("prepare_min_members", 2, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+        self.conflicting_batch()
+        batch = self.open_batch()
+        [pre_rebase] = self.open_tasks(batch)
+        self.assertEqual(pre_rebase["kind"], "pre_rebase", "below prepare_min_members: no preparation to wait for")
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual(task.kind, "pre_rebase")
+        # The batch becomes eligible for preparation while the agent works on its chain.
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        reasons = self.controller.tick()
+        self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["pre_rebase"])
+        self.assertIn(
+            f"open batch {batch['id']}: preparation waits for the claimed pre_rebase task {pre_rebase['id']}", reasons
+        )
+        background = self.controller.status()["open_batches"][0]["background"]
+        self.assertEqual(background["active"], {"kind": "pre_rebase", "task_id": pre_rebase["id"], "claimed": True})
+        self.assertEqual(background["waiting"]["kind"], "prepare")
+        # Given back unresolved, the pre_rebase task gives way to the preparation.
+        self.controller.release_task(task.task_id, task.claim_token, "artifacts_unavailable")
+        self.controller.tick()
+        self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"])
+        superseded = self.controller.store.row("tasks", {"id": pre_rebase["id"]})
+        self.assertEqual((superseded["state"], superseded["resolution"]), ("superseded", "prepare"))
 
     def test_the_setting_turns_it_off(self):
         self.controller.set_setting("pre_rebase_enabled", False, "kim")
@@ -657,6 +750,8 @@ class Preparation(ControllerCase):
     def setUp(self):
         super().setUp()
         self.controller.set_setting("prepare_min_members", 3, "t")
+        # Background claims leave one slot for head work: with 1 there are none.
+        self.controller.set_setting("repair_concurrency", 2, "t")
 
     def open_batch(self, numbers=(201, 202, 203)):
         """A head waiting on CI and an open batch of `numbers` behind it."""
@@ -729,42 +824,71 @@ class Preparation(ControllerCase):
         self.controller.tick()
         self.assertEqual(len(self.prepare_tasks()), 1)
 
-    def test_the_head_task_is_claimed_first_and_supersedes_a_running_preparation(self):
-        self.open_batch()
-        self.quiet()
-        preparation = self.controller.claim_task("worker-1", "admin-worker")
-        self.assertEqual(preparation.kind, "prepare")
-        # The head's CI fails: its repair task comes first, and the preparation gives way.
+    def fail_head(self):
         head = self.controller.store.row("batches", {"state": "head"})
         self.github.runs[-1].verdict = "fail"
         self.github.runs[-1].diagnostics = [{"kind": "compiler", "module": "M.lean", "message": "boom"}]
         self.github.complete_runs()
         self.controller.handle_event("status", {"sha": head["tip"], "context": "build"})
         self.controller.tick()
-        self.assertEqual(self.prepare_tasks(), [])
-        self.assertEqual(self.prepare_tasks("superseded")[0]["resolution"], "head-task")
-        with self.assertRaises(TaskError) as caught:
-            self.controller.renew_task(preparation.task_id, preparation.claim_token)
-        self.assertEqual(caught.exception.code, "claim-superseded")
-        repair = self.controller.claim_task("worker-2", "admin-worker")
-        self.assertEqual(repair.kind, "repair")
+        return head
+
+    def test_a_running_preparation_is_not_superseded_and_a_head_task_is_claimed_at_once(self):
+        self.open_batch()
         self.quiet()
-        self.assertEqual(self.prepare_tasks(), [], "no preparation while the head has a task")
+        preparation = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual(preparation.kind, "prepare")
+        self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"), "the last slot is the head's")
+        self.fail_head()
+        self.assertEqual([t["id"] for t in self.prepare_tasks()], [preparation.task_id])
+        self.controller.renew_task(preparation.task_id, preparation.claim_token)
+        repair = self.controller.claim_task("worker-2", "admin-worker")
+        self.assertEqual(repair.kind, "repair", "head work never waits behind background work")
+        self.assertIsNone(self.controller.claim_task("worker-3", "admin-worker"))
+
+    def test_with_concurrency_one_a_preparation_is_never_claimed(self):
+        self.controller.set_setting("repair_concurrency", 1, "t")
+        self.open_batch()
+        self.quiet()
+        self.assertEqual(len(self.prepare_tasks()), 1)
+        self.assertIsNone(self.controller.claim_task("worker-1", "admin-worker"), "no background claims at 1")
+        self.fail_head()
+        self.quiet()
+        self.assertEqual(len(self.prepare_tasks()), 1, "still open beside the head's task")
+        self.assertEqual(self.controller.claim_task("worker-1", "admin-worker").kind, "repair")
+        self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"))
+
+    def test_a_preparation_is_created_and_claimed_while_the_head_has_a_task(self):
+        batch = self.open_batch()
+        head = self.fail_head()
+        self.quiet()
+        [task] = self.prepare_tasks()
+        self.assertEqual(task["batch_id"], batch["id"])
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        first = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual((first.kind, first.batch_id), ("repair", head["id"]), "the head's task is claimed first")
+        second = self.controller.claim_task("worker-2", "admin-worker")
+        self.assertEqual((second.kind, second.batch_id), ("prepare", batch["id"]), "a second worker prepares")
+        self.assertIsNone(self.controller.claim_task("worker-3", "admin-worker"), "two claims in total")
+        result = self.controller.submit_task(second.task_id, second.claim_token, batch["tip"])
+        self.assertTrue(result.accepted, "adopted while the head is being repaired")
+        self.assertEqual(self.controller.store.row("tasks", {"id": first.task_id})["state"], "open")
 
     def test_claims_are_ordered_by_kind_priority_then_age(self):
         batch = self.open_batch()
         self.quiet()
         head = self.controller.store.row("batches", {"state": "head"})
-        # A head task created after the preparation, before the tick that would supersede it.
+        # A head task created after the preparation still comes first.
         self.clock.advance(5)
         self.controller._create_task(head, "repair", head["base"], [], self.clock())
-        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.controller.set_setting("repair_concurrency", 3, "t")
         first = self.controller.claim_task("worker-1", "admin-worker")
         self.assertEqual((first.kind, first.batch_id), ("repair", head["id"]))
         second = self.controller.claim_task("worker-2", "admin-worker")
-        self.assertEqual(second.kind, "repair", "the head's task takes every claim the concurrency allows")
-        self.assertIsNone(self.controller.claim_task("worker-3", "admin-worker"))
-        self.assertEqual(self.prepare_tasks()[0]["batch_id"], batch["id"])
+        self.assertEqual((second.kind, second.batch_id), ("prepare", batch["id"]), "before a second head claim")
+        third = self.controller.claim_task("worker-3", "admin-worker")
+        self.assertEqual(third.kind, "repair", "then the head's task takes the claims left")
+        self.assertIsNone(self.controller.claim_task("worker-4", "admin-worker"))
 
     def test_the_submission_adopts_repaired_commits_and_keeps_the_batch_open(self):
         batch = self.open_batch()

@@ -80,8 +80,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "outbox_drain_budget_seconds": 20,
     # Background preparation of open batches (`prepare` tasks): an open batch of at least
     # `prepare_min_members` members that has had no insertion for `prepare_quiet_seconds` and has not
-    # been prepared at its current version is built and repaired on its own base while the head has no
-    # task of its own.
+    # been prepared at its current version is built and repaired on its own base, beside the head's
+    # own tasks; such a batch gets a `pre_rebase` task only once it is prepared.
     "prepare_open_batches": True,
     "prepare_min_members": 20,
     "prepare_quiet_seconds": 600,
@@ -118,6 +118,9 @@ TASK_PREPARE = "prepare"
 # come first, then the oldest open batch's pre-rebase onto the head, then the background preparation
 # of an open batch.
 TASK_PRIORITY = {TASK_REBASE_CONFLICT: 0, TASK_REPAIR: 0, TASK_PRE_REBASE: 1, TASK_PREPARE: 2}
+# The kinds of an open batch's background tasks: at most one of them is open or claimed per batch.
+BACKGROUND_TASKS = (TASK_PRE_REBASE, TASK_PREPARE)
+BACKGROUND_OPERATIONS = tuple(f"task:{kind}" for kind in BACKGROUND_TASKS)
 # How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
 # is how the worker learns that the controller took the batch back (it sealed, or the head needs the
 # worker), so the interval bounds how long a superseded preparation keeps running.
@@ -128,6 +131,8 @@ PREPARE_SETTLED = ("adopted", "prepared", "failed")
 # failures after which a `prepare` task is not retried at the same batch version.
 PREPARE_CLEAN_REASON = "prepared_clean"
 PREPARE_FAILED_REASONS = ("agent_failed", "push_failed")
+# The most errors a preparation left that a later `pre_rebase` task's diagnostics carry.
+PREPARE_ERRORS_LIMIT = 100
 # An open batch's pre-rebase (`pre_rebase_state`): a usable chain on `pre_rebase_onto` replayed by the
 # controller or adopted from a `pre_rebase` task, or a conflict waiting for that task.
 PRE_REBASE_CLEAN = "clean"
@@ -775,11 +780,14 @@ class Controller:
     def claim_task(self, worker_identity: str, github_login: str) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
-        Tasks are offered by kind priority, then age (`TASK_PRIORITY`): the head's `repair` or
-        `rebase_conflict` task first, as many claims on it as `repair_concurrency` allows; then the
-        oldest open batch's `pre_rebase` task, within the same per-task bound; a `prepare` task only
-        while the head has no open task, one claim per open batch, and only while fewer than
-        `repair_concurrency` task claims are active in total.
+        `repair_concurrency` bounds the live task claims in total. Within it, tasks are offered in
+        three tiers, each by kind priority then age (`TASK_PRIORITY`): first a head task (`repair` or
+        `rebase_conflict`) nobody holds; then an open batch's background task (`pre_rebase`, then
+        `prepare`), one claim per batch and at most `repair_concurrency - 1` background claims in
+        total, so head work never waits behind background work; last a further claim on a head task
+        already held, up to `repair_concurrency` claims on it. So with two workers one repairs the
+        head while the other prepares or pre-rebases the next batch, and a second claim on the head's
+        task is only taken when no background task waits.
         """
         with self._lock:
             now = self.clock()
@@ -790,30 +798,19 @@ class Controller:
                 self.store.journal(now, "claim-refused", worker=worker_identity, login=github_login, reason=reason)
                 return None
             concurrency = int(self.setting("repair_concurrency"))
-            chosen: tuple[dict[str, Any], dict[str, Any]] | None = None
-            for task, batch in self._claimable_tasks():
-                if task["kind"] == TASK_PRE_REBASE:
-                    if len(self._active_claims(batch["id"], task_id=task["id"])) >= concurrency:
-                        continue
-                    chosen = (task, batch)
-                    break
-                if task["kind"] != TASK_PREPARE:
-                    active = self._active_claims(batch["id"], task_id=task["id"])
-                    if len(active) >= concurrency:
-                        self._count("claim_collisions")
-                        self.store.journal(
-                            now, "claim-refused", worker=worker_identity, reason="concurrency", task_id=task["id"]
-                        )
-                        return None
-                    chosen = (task, batch)
-                    break
-                # The head's own task, when there is one, came first and stops the loop either way.
-                if self._active_claims(batch["id"]):
-                    continue
-                if len(self._active_task_claims()) >= concurrency:
-                    return None
-                chosen = (task, batch)
-                break
+            claimable = self._claimable_tasks()
+            if len(self._active_task_claims()) >= concurrency:
+                if claimable and claimable[0][0]["kind"] not in BACKGROUND_TASKS:
+                    self._count("claim_collisions")
+                    self.store.journal(
+                        now,
+                        "claim-refused",
+                        worker=worker_identity,
+                        reason="concurrency",
+                        task_id=claimable[0][0]["id"],
+                    )
+                return None
+            chosen = self._choose_task(claimable, concurrency)
             if chosen is None:
                 return None
             task, batch = chosen
@@ -844,6 +841,35 @@ class Controller:
                 )
             return self._task_record(task, batch, claim_id, token, now + int(self.setting("claim_ttl_seconds")))
 
+    def _choose_task(
+        self, claimable: list[tuple[dict[str, Any], dict[str, Any]]], concurrency: int
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """The next claim's task among `claimable` (ordered by kind priority, then age): an unheld
+        head task, else a background task on a batch no worker holds a background task of, while
+        background claims number fewer than `concurrency - 1` (one slot is always left for head work,
+        so with `repair_concurrency` 1 nothing runs in the background), else a held head task with
+        fewer than `concurrency` claims."""
+        held: dict[int, int] = {}
+        for task, batch in claimable:
+            held[task["id"]] = len(self._active_claims(batch["id"], task_id=task["id"]))
+        head = [pair for pair in claimable if pair[0]["kind"] not in BACKGROUND_TASKS]
+        for pair in head:
+            if held[pair[0]["id"]] == 0:
+                return pair
+        background = [c for c in self._active_task_claims() if c["operation"] in BACKGROUND_OPERATIONS]
+        if len(background) < concurrency - 1:
+            for task, batch in claimable:
+                if task["kind"] in BACKGROUND_TASKS and not self._background_claims(batch["id"]):
+                    return task, batch
+        for pair in head:
+            if held[pair[0]["id"]] < concurrency:
+                return pair
+        return None
+
+    def _background_claims(self, batch_id: int) -> list[dict[str, Any]]:
+        """The live claims on the batch's background tasks (`prepare`, `pre_rebase`)."""
+        return [c for c in self._active_claims(batch_id) if c["operation"] in BACKGROUND_OPERATIONS]
+
     def _claimable_tasks(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         """Open tasks whose batch is still at the task's version and in the state the kind works on
         (`open` for `prepare`, `head` otherwise), with their batch, by kind priority then age. A
@@ -868,7 +894,7 @@ class Controller:
         return found
 
     def _active_task_claims(self) -> list[dict[str, Any]]:
-        """Every worker's live task claim, on any batch: what `repair_concurrency` bounds for `prepare`."""
+        """Every worker's live task claim, on any batch: what `repair_concurrency` bounds."""
         now = self.clock()
         return [
             row
@@ -1959,15 +1985,17 @@ class Controller:
             self._reasons.append(reason)
 
     def _prepare_open_batches(self, now: float) -> None:
-        """Create `prepare` tasks for quiet, sizeable open batches while the head has no task of its own.
+        """Create `prepare` tasks for quiet, sizeable open batches, whatever the head is doing.
 
         A `prepare` task builds an open batch on its own base (never on the head's tip) and repairs what
         fails, so that the batch is ready when it seals; its result is adopted into the members and the
-        batch stays open. Head tasks take priority: while the head has an open task no preparation is
-        created, and the ones open or claimed are superseded so the worker turns to the head.
+        batch stays open. It runs beside the head's own tasks: those keep claim priority and
+        `repair_concurrency` bounds the claims in total, so a second worker prepares while the first
+        repairs the head. A preparation is superseded only when its batch seals or changes. It is one
+        of the batch's two background kinds (`BACKGROUND_TASKS`): it waits while a worker holds the
+        batch's `pre_rebase` task, since adopting it rewrites the chain that task works on, and it
+        supersedes an unclaimed one, which `_pre_rebase` recreates from the prepared chain.
         """
-        head = self._head()
-        head_task = self._open_task(head) if head is not None else None
         for task in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN, "kind": TASK_PREPARE}):
             batch = self.store.row("batches", {"id": task["batch_id"]})
             if batch is None or batch["state"] != BATCH_OPEN:
@@ -1975,14 +2003,85 @@ class Controller:
                 self._supersede_prepare(task["batch_id"], closed, now)
             elif batch["version"] != task["batch_version"]:
                 self._supersede_prepare(task["batch_id"], "batch-changed", now)
-            elif head_task is not None:
-                self._supersede_prepare(task["batch_id"], "head-task", now)
-        if not self.setting("prepare_open_batches") or head_task is not None or self._state("inference_hold"):
+        if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
         for batch in self._open_batches():
-            if self._prepare_due(batch, now):
-                self._create_task(batch, TASK_PREPARE, batch["base"], [], now)
-                self._note_reason(f"open batch {batch['id']} waits for a worker to prepare it")
+            if not self._prepare_due(batch, now):
+                continue
+            pre_rebase = self._open_pre_rebase_task(batch)
+            if pre_rebase is not None and self._active_claims(batch["id"], task_id=pre_rebase["id"]):
+                self._note_reason(
+                    f"open batch {batch['id']}: preparation waits for the claimed pre_rebase task {pre_rebase['id']}"
+                )
+                continue
+            if pre_rebase is not None:
+                with self.store.transaction():
+                    self._supersede_pre_rebase_tasks(batch["id"], "prepare", now)
+                    self.store.journal(
+                        now, "pre-rebase-superseded", batch["id"], task_id=pre_rebase["id"], resolution="prepare"
+                    )
+            self._create_task(batch, TASK_PREPARE, batch["base"], [], now)
+            self._note_reason(f"open batch {batch['id']} waits for a worker to prepare it")
+
+    def _pre_rebase_waits_for_prepare(self, batch: dict[str, Any]) -> str | None:
+        """Why a `pre_rebase` task may not be created for the batch yet; None once it may.
+
+        A batch that background preparation applies to (`prepare_open_batches` on, at least
+        `prepare_min_members` members) is pre-rebased by an agent only from its prepared chain: a
+        preparation adopted later would rewrite the chain under the pre-rebase and discard the
+        agent's resolutions. So the task waits while a `prepare` task is open and until the batch is
+        prepared at its current version, or its preparation at that version failed.
+        """
+        prepare = self.store.row(
+            "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE}, order="id DESC"
+        )
+        if prepare is not None:
+            held = "claimed" if self._active_claims(batch["id"], task_id=prepare["id"]) else "open"
+            return f"prepare task {prepare['id']} is {held}"
+        if not self.setting("prepare_open_batches"):
+            return None
+        if len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
+            return None
+        if batch["prepared_version"] == batch["version"]:
+            return None
+        settled = self.store.row(
+            "tasks",
+            {"batch_id": batch["id"], "batch_version": batch["version"], "kind": TASK_PREPARE, "resolution": "failed"},
+        )
+        if settled is not None:
+            return None
+        return f"not yet prepared at v{batch['version']}"
+
+    def _prepare_outcome(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        """The `prepare_errors` diagnostic of a batch prepared at its current version: the errors its
+        preparation left (the `prepare` task's own diagnostics and the `remaining_errors` the worker
+        reported with the adopted submission), or None when it left none."""
+        if batch["prepared_version"] is None or batch["prepared_version"] != batch["version"]:
+            return None
+        task = self.store.row(
+            "tasks", {"batch_id": batch["id"], "kind": TASK_PREPARE, "state": TASK_SUBMITTED}, order="id DESC"
+        )
+        if task is None:
+            return None
+        errors = [d for d in loads(task["diagnostics"], []) if isinstance(d, dict)]
+        submission = self.store.row("submissions", {"task_id": task["id"], "accepted": 1}, order="id DESC")
+        try:
+            notes = loads(submission["worker_notes"], {}) if submission is not None else {}
+        except ValueError:
+            notes = {}  # free-text notes carry no error list
+        reported = notes.get("remaining_errors") if isinstance(notes, dict) else None
+        if isinstance(reported, list):
+            errors += [e for e in reported if isinstance(e, dict) and e not in errors]
+        if not errors:
+            return None
+        return {
+            "kind": "prepare_errors",
+            "task_id": task["id"],
+            "resolution": task["resolution"],
+            "version": batch["version"],
+            "errors": errors[:PREPARE_ERRORS_LIMIT],
+            "omitted": max(0, len(errors) - PREPARE_ERRORS_LIMIT),
+        }
 
     def _prepare_due(self, batch: dict[str, Any], now: float) -> bool:
         """The batch is big enough, quiet long enough, not prepared at this version, and has no
@@ -2156,8 +2255,15 @@ class Controller:
         if self._open_pre_rebase_task(batch) is not None:
             self._reasons.append(f"open batch {batch['id']} waits for a worker to resolve its pre-rebase")
             return
+        waiting = self._pre_rebase_waits_for_prepare(batch)
         if batch["pre_rebase_onto"] == onto and batch["pre_rebase_source"] == batch["tip"] and state:
-            return  # up to date (a conflict without an open task waits for the batch or the head to change)
+            if state != PRE_REBASE_CONFLICT:
+                return  # up to date
+            if waiting is not None:
+                self._note_reason(f"open batch {batch['id']}: pre_rebase task waits for its preparation ({waiting})")
+                return
+            # A conflict recorded while the batch waited for its preparation, which then found nothing
+            # to change: replayed again below and handed to a `pre_rebase` task.
         refs: list[str] = []
 
         def replay(base: str, tip: str, target: str) -> chain.ChainResult:
@@ -2216,7 +2322,16 @@ class Controller:
                 onto=onto,
                 source_pr=conflict.source_pr if conflict else None,
                 landed_on_base=result.landed_on_base,
+                waits_for_prepare=waiting,
             )
+        if waiting is not None:
+            # The agent resolves the conflict on the prepared chain: a preparation adopted later would
+            # rewrite the chain under it. The conflict is replayed again once the batch is prepared.
+            self._note_reason(f"open batch {batch['id']}: pre_rebase task waits for its preparation ({waiting})")
+            return
+        prepared = self._prepare_outcome(batch)
+        if prepared is not None:
+            diagnostics.append(prepared)
         self._create_task(batch, TASK_PRE_REBASE, onto, diagnostics, now)
         self._reasons.append(f"open batch {batch['id']} needs an agent to resolve its pre-rebase onto the head")
 
@@ -3152,7 +3267,34 @@ class Controller:
             "oldest_member_age_seconds": (now - min(m["added_at"] for m in members)) if members else None,
             **self._preparation_status(batch, members, now),
             "pre_rebase": self._pre_rebase_status(batch),
+            "background": self._background_status(batch, now),
         }
+
+    def _background_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
+        """Which of the batch's background kinds is `active` (its open task, and whether a worker holds
+        it) and which one is `waiting` for it, with the reason; at most one kind is active per batch."""
+        prepare = self.store.row(
+            "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE}, order="id DESC"
+        )
+        pre_rebase = self._open_pre_rebase_task(batch)
+        task = prepare or pre_rebase
+        active = None
+        waiting = None
+        if task is not None:
+            claimed = bool(self._active_claims(batch["id"], task_id=task["id"]))
+            active = {"kind": task["kind"], "task_id": task["id"], "claimed": claimed}
+            if task["kind"] == TASK_PREPARE:
+                waiting = {
+                    "kind": TASK_PRE_REBASE,
+                    "reason": f"waits for prepare task {task['id']} to be adopted, released clean or superseded",
+                }
+            elif claimed and self._prepare_due(batch, now):
+                waiting = {"kind": TASK_PREPARE, "reason": f"waits for the claimed pre_rebase task {task['id']}"}
+        elif batch["pre_rebase_state"] == PRE_REBASE_CONFLICT:
+            reason = self._pre_rebase_waits_for_prepare(batch)
+            if reason is not None:
+                waiting = {"kind": TASK_PRE_REBASE, "reason": f"waits for its preparation ({reason})"}
+        return {"active": active, "waiting": waiting}
 
     def _preparation_status(self, batch: dict[str, Any], members: list[dict[str, Any]], now: float) -> dict[str, Any]:
         """An open batch's background preparation: the version last prepared, the open `prepare` task."""
