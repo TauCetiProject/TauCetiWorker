@@ -133,9 +133,21 @@ class GitHubPort(Protocol):
         ...
 
     def dispatch_candidate(
-        self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id: str, members: Sequence[int]
+        self,
+        repo: str,
+        *,
+        head_sha: str,
+        base_sha: str,
+        base_ref: str,
+        batch_id: str,
+        members: Sequence[int],
+        repair_outputs_revs: Sequence[str] = (),
     ) -> str:
-        """`repository_dispatch` of `pr-build.yml` with event `tauceti-bors-staging`; returns a dispatch id."""
+        """`repository_dispatch` of `pr-build.yml` with event `tauceti-bors-staging`; returns a dispatch id.
+
+        `repair_outputs_revs` names the revisions whose published build outputs CI may restore when
+        none are published for `head_sha`, in the order to try them.
+        """
         ...
 
     def find_candidate_run(

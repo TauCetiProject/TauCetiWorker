@@ -21,7 +21,10 @@ Tables:
   whether it was `withdrawn` (an emptied `no_repair` member whose commit stays until the head lands).
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
 - `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state.
-- `ci_attempts`: every candidate dispatch with the run it was bound to, placement, phases, outcome.
+- `batch_tips`: every tip a batch has had, by version and time, so that a CI dispatch can name the
+  previous tips whose published build outputs Lake can reuse after the batch is replayed.
+- `ci_attempts`: every candidate dispatch with the run it was bound to, placement, phases, outcome,
+  and the candidate revisions for published outputs it sent (`repair_outputs_revs`).
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
 - `journal`: an append-only log of what the controller did, for status and tests.
@@ -164,6 +167,14 @@ CREATE TABLE IF NOT EXISTS submissions (
     worker_notes TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS batch_tips (
+    id INTEGER PRIMARY KEY,
+    batch_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    tip TEXT NOT NULL,
+    recorded_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS batch_tips_version ON batch_tips (batch_id, version);
 CREATE TABLE IF NOT EXISTS ci_attempts (
     id INTEGER PRIMARY KEY,
     batch_id INTEGER NOT NULL,
@@ -193,7 +204,8 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     diagnostics TEXT NOT NULL DEFAULT '[]',
     infrastructure_retry INTEGER NOT NULL DEFAULT 0,
     needs_observation INTEGER NOT NULL DEFAULT 1,
-    verdicts TEXT NOT NULL DEFAULT '{}'
+    verdicts TEXT NOT NULL DEFAULT '{}',
+    repair_outputs_revs TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS ci_batch ON ci_attempts (batch_id, batch_version);
 CREATE TABLE IF NOT EXISTS outbox (

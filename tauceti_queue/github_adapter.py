@@ -10,7 +10,7 @@ protocol and record shapes; timestamps are unix seconds, run ids strings):
 
     fetch_pr(repo, number) -> PullRequest                 (raises PullRequestNotFound)
     fetch_refs(repo, refspecs)
-    dispatch_candidate(repo, *, head_sha, base_sha, base_ref, batch_id, members) -> dispatch id
+    dispatch_candidate(repo, *, head_sha, base_sha, base_ref, batch_id, members, repair_outputs_revs) -> dispatch id
     find_candidate_run(repo, *, batch_id, head_sha, base_sha) -> CandidateRun | None
     commit_status(repo, sha, context) -> Status | None
     fast_forward(repo, branch, expected_parent, tip) -> FastForwardResult
@@ -577,9 +577,21 @@ class GitHubAdapter:
     # -- CI dispatch and observation
 
     def dispatch_candidate(
-        self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id, members: Sequence
+        self,
+        repo: str,
+        *,
+        head_sha: str,
+        base_sha: str,
+        base_ref: str,
+        batch_id,
+        members: Sequence,
+        repair_outputs_revs: Sequence[str] = (),
     ) -> str:
-        """`repository_dispatch` of pr-build.yml exactly as Bors sends it; returns the run title."""
+        """`repository_dispatch` of pr-build.yml as Bors sends it; returns the run title.
+
+        The payload adds `repair_outputs_revs`, the revisions whose published build outputs CI may
+        restore when none are published for `head_sha` (empty when the caller names none).
+        """
         payload = {
             "event_type": STAGING_EVENT,
             "client_payload": {
@@ -588,6 +600,7 @@ class GitHubAdapter:
                 "batch_id": _batch_id(batch_id),
                 "members": dispatch_members(members),
                 "base_ref": base_ref,
+                "repair_outputs_revs": list(repair_outputs_revs),
             },
         }
         self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,))

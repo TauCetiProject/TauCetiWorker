@@ -484,7 +484,15 @@ class FakeGitHub:
             run_git(self.repo.clone, "fetch", "-q", "--no-tags", str(self.repo.origin), *refspecs)
 
     def dispatch_candidate(
-        self, repo: str, *, head_sha: str, base_sha: str, base_ref: str, batch_id: str, members: Sequence[int]
+        self,
+        repo: str,
+        *,
+        head_sha: str,
+        base_sha: str,
+        base_ref: str,
+        batch_id: str,
+        members: Sequence[int],
+        repair_outputs_revs: Sequence[str] = (),
     ) -> str:
         with self.lock:
             self._call("dispatch_candidate", head_sha, base_sha, batch_id)
@@ -522,6 +530,7 @@ class FakeGitHub:
                     "batch_id": batch_id,
                     "members": list(members),
                     "base_ref": base_ref,
+                    "repair_outputs_revs": list(repair_outputs_revs),
                 },
                 "run_id": run.run_id,
             }

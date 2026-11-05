@@ -144,6 +144,11 @@ class CleanFlow(QueueFixture):
                 "batch_id": "1",
                 "members": [m["number"] for m in self.members(head)],
                 "base_ref": "main",
+                # The batch's tip after its first insertion, then its base.
+                "repair_outputs_revs": [
+                    self.controller.store.row("batch_tips", {"batch_id": head["id"], "version": 1})["tip"],
+                    base,
+                ],
             },
         )
         # A third PR approved while the head builds goes to the open batch, which is based on the old main.
