@@ -60,6 +60,7 @@ are unix seconds, run and comment ids strings, `repo` is `owner/name`, SHAs are 
 | `update_ref(repo, ref, sha)` | force-updates `refs/<ref>` by pushing `+<sha>:refs/<ref>` from the service's clone with the token in the `GIT_CONFIG_*` header, so the retained commit's objects (which exist only in that clone) travel with the ref; without a clone the Git Data API creates or moves the ref, which works only for objects GitHub already has (retained candidate refs, never the base branch). The controller pushes the head's retained ref this way before every dispatch, since CI checks the candidate out by SHA |
 | `post_comment(repo, number, body, marker) -> str` | appends `<!-- tauceti-queue <marker> -->`; a comment already carrying the marker is edited (or left alone when identical), never duplicated |
 | `set_labels(repo, number, add, remove)` | `POST /issues/{n}/labels` and `DELETE /issues/{n}/labels/{name}` (404 tolerated) |
+| `ensure_label(repo, name, color, description)` | `POST /labels` (422 `already_exists` tolerated) |
 | `close_pr(repo, number, title)` | `PATCH /pulls/{n} {state: closed, title}`, bookkeeping fields only, as Bors's `close_merged_pr`; the controller passes the `[Merged by Bors] - ` title |
 | `repository_admin(login, repo=None) -> bool` | `GET /collaborators/{login}/permission` is `admin` (the `security_audit.require_admin` predicate); `reviewer(login)` is Bors's reviewer check, push access (`admin`, `maintain`, `write`) |
 | `rate_limit() -> (int, float)` | from the last response headers, else `GET /rate_limit` |
@@ -174,6 +175,17 @@ line count and a link to the commit. Then the earlier edited revisions, the PRs 
 mentions and the retained ref, as before. Each summary is journaled as `edit-summary` (number,
 commit, accepted head, `diff_lines`, `truncated`) and counted in `edit_summaries`. A clean member's
 comment is unchanged.
+
+**The `repaired-in-queue` label.** Beside `dont-repair-in-queue` (the author's opt-out) and
+`needs-rebase` (the author must act), the queue marks the PRs it changed: every landed member that
+gets an edit summary also gets the `repaired_label` setting's label (default `repaired-in-queue`;
+the empty string disables it) through an outbox `labels` entry keyed
+`repaired-label:<batch>:<pr>`. A clean member gets none, and neither does a member whose landed
+commit is the empty one carrying the landing note (its PR was already on `main`). The first such
+entry a controller process performs creates the label in the repository when it is missing
+(`ensure_label`, `POST labels`, an existing label left as it is) with the description "The merge
+queue modified this contribution while integrating it; see the landing comment"; later entries
+skip that call.
 
 **The label.** A PR carrying one of the `no_repair_labels` (a runtime setting, default
 `["dont-repair-in-queue"]`, compared case-insensitively) is never edited by an agent. The controller

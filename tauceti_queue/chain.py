@@ -333,6 +333,11 @@ def landed_commit(landed: dict[str, str], source_pr: str) -> str | None:
     return sha
 
 
+def carries_landed_note(message: str) -> bool:
+    """Whether the message carries the landing note `landed_message` appends."""
+    return bool(_LANDED_NOTE_RE.search(message))
+
+
 def landed_message(message: str, sha: str) -> str:
     """The message with the landing note appended once; a message that already carries one is returned as is."""
     if _LANDED_NOTE_RE.search(message):

@@ -17,6 +17,7 @@ protocol and record shapes; timestamps are unix seconds, run ids strings):
     update_ref(repo, ref, sha)
     post_comment(repo, number, body, marker) -> comment id
     set_labels(repo, number, add, remove)
+    ensure_label(repo, name, color, description)
     close_pr(repo, number, title)
     repository_admin(login) -> bool
     rate_limit() -> (remaining, reset_at)
@@ -875,6 +876,16 @@ class GitHubAdapter:
         for label in remove:
             encoded = urllib.parse.quote(label, safe="")
             self.client.request("DELETE", f"repos/{repo}/issues/{number}/labels/{encoded}", tolerate=(404,))
+
+    def ensure_label(self, repo: str, name: str, color: str, description: str) -> None:
+        """`POST labels`; GitHub's 422 `already_exists` leaves the existing label untouched."""
+        self.client.request(
+            "POST",
+            f"repos/{repo}/labels",
+            json_body={"name": name, "color": color, "description": description},
+            ok=(201,),
+            tolerate=(422,),
+        )
 
     # -- people and limits
 

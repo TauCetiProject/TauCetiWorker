@@ -82,6 +82,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "polling_interval_seconds": 60,
     "approval_poll_interval_seconds": 900,
     "membership_label": "bors-staging",
+    # Added to a landed member whose commit the queue modified (one with an edit summary in its landing
+    # comment); created in the repository on first use. Empty disables it.
+    "repaired_label": "repaired-in-queue",
     # Wall-clock bounds on one tick's work: insertion stops probing and the outbox stops draining once
     # the budget is spent, and the loop is woken to continue in the next tick. The probes' and the
     # drain's GitHub I/O runs without the controller lock (`ControllerLock`), so the worker endpoints
@@ -125,6 +128,9 @@ INPUT_CANCELLED = "cancelled"
 # interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
 PROBLEM_ANTICIPATED = "problem-anticipated"
 NEEDS_REBASE_LABEL = "needs-rebase"
+# How `repaired_label` is created when the repository lacks it.
+REPAIRED_LABEL_COLOR = "d4c5f9"
+REPAIRED_LABEL_DESCRIPTION = "The merge queue modified this contribution while integrating it; see the landing comment"
 # `inputs.anticipated.stage` of a `problem-anticipated` input: `pending` while the interacting PR is
 # followed, `unattributed` when the agent named none, then `needs-rebase`, `readmitted`,
 # `readmit-refused` (the PR could not be re-admitted as it stands) or `superseded` (approved again).
@@ -367,6 +373,8 @@ class Controller:
         self._status_snapshot: tuple[float, dict[str, Any]] | None = None
         self.canonical_branch = canonical_branch or self._discover_canonical_branch()
         self._canonical: str | None = self.store.get_setting("state:canonical_sha")
+        # Labels this process has made sure exist in the repository (`_ensure_labels`).
+        self._labels_ensured: set[str] = set()
 
     # --- settings ----------------------------------------------------------------------------------
 
@@ -3991,6 +3999,20 @@ class Controller:
                 truncated=diff["truncated"],
                 error=diff["error"],
             )
+            label = self.setting("repaired_label")
+            if label and not self._landed_outside_queue(member):
+                self._enqueue(
+                    "labels",
+                    f"repaired-label:{batch['id']}:{number}",
+                    {
+                        "number": number,
+                        "add": [label],
+                        "remove": [],
+                        "ensure": [
+                            {"name": label, "color": REPAIRED_LABEL_COLOR, "description": REPAIRED_LABEL_DESCRIPTION}
+                        ],
+                    },
+                )
         marker = f"<!-- {COMMENT_MARKER} landed:{self.repository}#{number}:{batch['id']}:{member['commit_sha']} -->"
         self._enqueue(
             "comment",
@@ -3998,6 +4020,15 @@ class Controller:
             {"number": number, "body": body + "\n\n" + marker, "marker": marker},
         )
         self._enqueue("close_pr", f"landed-close:{batch['id']}:{number}", {"number": number})
+
+    def _landed_outside_queue(self, member: dict[str, Any]) -> bool:
+        """Whether the member's landed commit is the empty one carrying the landing note: its PR was
+        already on `main`, so the queue emptied it rather than repairing it."""
+        try:
+            commit = chain.read_commit(self.clone, member["commit_sha"])
+            return chain.carries_landed_note(commit.message) and self._commit_empty(member["commit_sha"])
+        except chain.ChainError:
+            return False
 
     def member_comment(self, batch: dict[str, Any], member: dict[str, Any]) -> str:
         """The one consolidated landing comment for a member: Bors's notice, plus the agent's explanation when edited."""
@@ -4497,6 +4528,15 @@ class Controller:
         )
         self.log.warning("outbox %s %s failed (attempt %s): %s", entry["kind"], entry["key"], attempts, error)
 
+    def _ensure_labels(self, repo: str, labels: list[dict[str, str]]) -> None:
+        """Create each label the repository may lack, once per process: adding a missing label to a PR
+        would otherwise create it with GitHub's default colour and no description."""
+        for label in labels:
+            if label["name"] in self._labels_ensured:
+                continue
+            self.github.ensure_label(repo, label["name"], label["color"], label["description"])
+            self._labels_ensured.add(label["name"])
+
     def _perform(self, kind: str, payload: dict[str, Any], now: float) -> str:
         repo = self.repository
         if kind == "retain_ref":
@@ -4507,6 +4547,7 @@ class Controller:
                 self.github.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )
         if kind == "labels":
+            self._ensure_labels(repo, payload.get("ensure", []))
             self.github.set_labels(repo, payload["number"], payload.get("add", []), payload.get("remove", []))
             return "labels"
         if kind == "close_pr":

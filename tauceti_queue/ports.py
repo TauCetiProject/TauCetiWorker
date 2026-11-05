@@ -196,6 +196,10 @@ class GitHubPort(Protocol):
 
     def set_labels(self, repo: str, number: int, add: Sequence[str], remove: Sequence[str]) -> None: ...
 
+    def ensure_label(self, repo: str, name: str, color: str, description: str) -> None:
+        """Create the repository label `name` unless it exists; an existing label is left as it is."""
+        ...
+
     def close_pr(self, repo: str, number: int, title: str) -> None:
         """`PATCH pulls/<number> {state: closed, title}`: how Bors closes a squash-landed member (not GitHub's merged state)."""
         ...

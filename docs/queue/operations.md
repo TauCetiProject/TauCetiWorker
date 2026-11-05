@@ -581,6 +581,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `polling_interval_seconds` | `60` | integer, at least 0 |
 | `approval_poll_interval_seconds` | `900` | integer, at least 1 |
 | `membership_label` | `bors-staging` | text |
+| `repaired_label` | `repaired-in-queue` | text; empty disables |
 | `insertion_probe_budget_seconds` | `20` | integer, at least 0 |
 | `outbox_drain_budget_seconds` | `20` | integer, at least 0 |
 | `prepare_open_batches` | `true` | `true` or `false` |
