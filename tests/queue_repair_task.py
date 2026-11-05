@@ -55,7 +55,7 @@ for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CO
     os.environ.pop(key, None)
 
 from tauceti_queue import chain as chain_tool  # noqa: E402
-from tauceti_queue import repair, repair_task  # noqa: E402
+from tauceti_queue import repair, repair_task, repair_tools  # noqa: E402
 
 PROJECT = "TauCetiProject/TauCeti"
 TOKEN = "worker-token"
@@ -2510,6 +2510,9 @@ class Records(unittest.TestCase):
         self.assertEqual(records[9]["accepted_head"], f"{10:040x}")
         self.assertTrue(os.access(listings.parent / "check", os.X_OK))
         self.assertIn(f"TARGET = {onto!r}", (listings.parent / "check").read_text())
+        self.assertTrue(os.access(listings.parent / "build", os.X_OK), "the scoped build script is written too")
+        self.assertIn("Check a fix with `.tauceti-repair/build <Module.Name>` first", prompt)
+        self.assertIn("Run the whole-library `lake build --iofail` only as the final verdict.", prompt)
         self.assertEqual(sh(seed, "status", "--porcelain"), "", "the listings are excluded from Git")
         self.assertEqual(sh(seed, "check-ignore", str(listings)), str(listings))
         # Written again for the next prompt, and the exclude entry is not repeated.
@@ -2570,6 +2573,127 @@ class Records(unittest.TestCase):
         short = repair.chain_report(seed, content.base, content.tip, tip, [m["source_pr"] for m in content.members[:2]])
         self.assertFalse(short["ok"])
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
+
+
+class BuildScript(unittest.TestCase):
+    """The agent's scoped build, ``.tauceti-repair/build``, on a small fixture library with a fake ``lake``
+    on PATH that records its arguments and exits with ``FAKE_LAKE_STATUS``."""
+
+    LIBRARY = {
+        "TauCeti.lean": "import TauCeti.A\nimport TauCeti.B\nimport TauCeti.C\nimport TauCeti.D\n",
+        "TauCeti/A.lean": "theorem a : True := trivial\n",
+        "TauCeti/B.lean": "import TauCeti.A\n\ntheorem b : True := trivial\n",
+        "TauCeti/C.lean": "import TauCeti.B\nimport Mathlib.Logic.Basic\n\ntheorem c : True := trivial\n",
+        "TauCeti/D.lean": "import TauCeti.A\n",
+        ".lake/packages/mathlib/Mathlib/Other.lean": "import TauCeti.A\n",  # outside the library: not scanned
+    }
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="scoped-build-", dir=TMP))
+        for name, text in self.LIBRARY.items():
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_text(text)
+        self.script = repair_tools.write_build_script(self.root / ".tauceti-repair")
+        self.assertLess(len(self.script.read_text().splitlines()), 60)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.log = self.root / "lake.log"
+        lake = self.bin / "lake"
+        lake.write_text(
+            "#!/usr/bin/env python3\nimport json, os, sys\n"
+            "open(os.environ['FAKE_LAKE_LOG'], 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "print('building', *sys.argv[3:]); sys.exit(int(os.environ.get('FAKE_LAKE_STATUS', '0')))\n"
+        )
+        lake.chmod(0o755)
+
+    def build(self, *args: str, status: int = 0) -> tuple[int, str]:
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LAKE_LOG": str(self.log)}
+        env["FAKE_LAKE_STATUS"] = str(status)
+        result = subprocess.run([str(self.script), *args], cwd=self.root, env=env, text=True, capture_output=True)
+        return result.returncode, result.stdout
+
+    def lake_calls(self) -> list[list[str]]:
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def test_modules_and_paths_name_the_modules_to_build(self):
+        self.assertTrue(os.access(self.script, os.X_OK))
+        self.assertEqual(self.build("TauCeti/A.lean", "TauCeti.B")[0], 0)
+        self.assertEqual(self.lake_calls(), [["build", "--iofail", "TauCeti.A", "TauCeti.B"]])
+        self.assertEqual(self.build()[0], 0)
+        self.assertEqual(self.lake_calls()[-1], ["build", "--iofail"], "no arguments builds the whole library")
+
+    def test_dependents_come_from_the_import_lines_once(self):
+        rc, out = self.build("TauCeti/B.lean", "--dependents")
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            sorted(self.lake_calls()[-1]), sorted(["build", "--iofail", "TauCeti.B", "TauCeti", "TauCeti.C"])
+        )
+        cache = json.loads((self.root / ".tauceti-repair" / "imports.json").read_text())
+        self.assertEqual(cache["TauCeti.C"], ["TauCeti.B", "Mathlib.Logic.Basic"])
+        self.assertNotIn("Mathlib.Other", "".join(cache), "files under .lake are not the library")
+        self.assertEqual(sorted(cache), ["TauCeti", "TauCeti.A", "TauCeti.B", "TauCeti.C", "TauCeti.D"])
+        # The cache is read, not recomputed: an edit to a module's imports is not seen until it is dropped.
+        (self.root / "TauCeti" / "D.lean").write_text("import TauCeti.B\n")
+        self.build("TauCeti.B", "--dependents")
+        self.assertEqual(
+            sorted(self.lake_calls()[-1]), sorted(["build", "--iofail", "TauCeti.B", "TauCeti", "TauCeti.C"])
+        )
+        repair_tools.write_build_script(self.root / ".tauceti-repair")
+        self.assertFalse((self.root / ".tauceti-repair" / "imports.json").exists(), "rewriting drops the cache")
+        self.build("TauCeti.A", "--dependents")
+        self.assertEqual(self.lake_calls()[-1][:3], ["build", "--iofail", "TauCeti.A"], "the named modules come first")
+        self.assertEqual(set(self.lake_calls()[-1][3:]), {"TauCeti", "TauCeti.B", "TauCeti.C", "TauCeti.D"})
+
+    def test_the_build_waits_for_the_lock_and_takes_it(self):
+        lock = self.root / ".tauceti-repair" / "build.lock"
+        lock.mkdir()
+        (lock / "pid").write_text(str(os.getpid()))  # held by a live process: us
+        threading.Timer(1.0, lambda: (lock / "pid").unlink()).start()
+        threading.Timer(1.1, lock.rmdir).start()
+        started = time.monotonic()
+        rc, out = self.build("TauCeti.A")
+        self.assertEqual(rc, 0)
+        self.assertGreaterEqual(time.monotonic() - started, 1.0)
+        self.assertIn(f"waiting for .tauceti-repair/build.lock (held by pid {os.getpid()})", out)
+        self.assertIn("building TauCeti.A", out)
+        self.assertEqual(self.lake_calls(), [["build", "--iofail", "TauCeti.A"]])
+        self.assertFalse(lock.exists(), "released after the build")
+        # The worker's own builds share the lock: while build_lock holds it, the script waits.
+        with repair_tools.build_lock(self.root) as held:
+            self.assertEqual(held, lock)
+            self.assertEqual((lock / "pid").read_text(), str(os.getpid()))
+            proc = subprocess.Popen(
+                [str(self.script), "TauCeti.B"],
+                cwd=self.root,
+                env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LAKE_LOG": str(self.log)},
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            time.sleep(0.5)
+            self.assertIsNone(proc.poll(), "the script waits while the worker builds")
+            self.assertEqual(len(self.lake_calls()), 1)
+        out, _ = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(self.lake_calls()[-1], ["build", "--iofail", "TauCeti.B"])
+
+    def test_a_lock_whose_holder_died_is_cleared(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        lock = self.root / ".tauceti-repair" / "build.lock"
+        lock.mkdir()
+        (lock / "pid").write_text(str(dead.pid))
+        started = time.monotonic()
+        self.assertEqual(self.build("TauCeti.A")[0], 0)
+        self.assertLess(time.monotonic() - started, 2.0, "no polling interval is spent on a dead holder")
+        self.assertEqual(self.lake_calls(), [["build", "--iofail", "TauCeti.A"]])
+        self.assertFalse(lock.exists())
+        self.assertEqual([p.name for p in lock.parent.iterdir() if "stale" in p.name], [])
+
+    def test_the_exit_status_is_lake_s(self):
+        rc, out = self.build("TauCeti.C", status=3)
+        self.assertEqual(rc, 3)
+        self.assertIn("building TauCeti.C", out, "Lake's output streams through")
+        self.assertFalse((self.root / ".tauceti-repair" / "build.lock").exists(), "released on failure too")
 
 
 if __name__ == "__main__":
