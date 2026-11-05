@@ -200,6 +200,7 @@ class Task:
     instruction: str = ""
     created_at: float | None = None
     extra: dict = dataclasses.field(default_factory=dict)
+    warm_revs: list[str] = dataclasses.field(default_factory=list)  # pre_rebase, prepare: repair outputs to restore
 
     @classmethod
     def from_json(cls, data: dict) -> Task:
@@ -268,6 +269,7 @@ class Task:
             instruction=str(data.get("instruction") or ""),
             created_at=float(data["created_at"]) if data.get("created_at") is not None else None,
             extra=extra,
+            warm_revs=[str(r) for r in (data.get("warm_revs") or extra.get("warm_revs") or []) if r],
         )
 
     def to_json(self) -> dict:
@@ -941,6 +943,10 @@ def artifact_revisions(task: Task) -> list[str]:
     stacked = pre_rebased(task)
     if stacked is not None:
         order += [str(stacked.get("head_base") or ""), str(stacked.get("batch_base") or "")]
+    if task.kind == "pre_rebase" and task.warm_revs:
+        # The head's tip and the commits of its chain are never in the public cache: start the walk at
+        # the head's base, the last of the controller's warm revisions, which is a `main` commit.
+        order = [task.warm_revs[-1], *order]
     revisions: list[str] = []
     for revision in order:
         if revision and revision not in revisions:
@@ -965,8 +971,20 @@ def describe_cache_revision(task: Task, artifacts: dict) -> str:
         role = "the batch base" if rebase else "the base"
     elif revision == task.onto:
         role = "the rebase target"
+    elif task.kind == "pre_rebase" and task.warm_revs and revision == task.warm_revs[-1]:
+        role = "the head's base"
+    elif revision in task.warm_revs:
+        role = "an earlier tip of the head" if task.kind == "pre_rebase" else "an earlier tip of the batch"
     else:
-        target = f"{'the rebase target' if rebase else 'the base'} {artifact_revisions(task)[0][:12]}"
+        start = artifact_revisions(task)[0]
+        name = (
+            "the head's base"
+            if task.warm_revs and start == task.warm_revs[-1] and task.kind == "pre_rebase"
+            else "the rebase target"
+            if rebase
+            else "the base"
+        )
+        target = f"{name} {start[:12]}"
         distance = artifacts.get("cache_distance")
         role = (
             f"{distance} commit{'s' if distance != 1 else ''} behind {target}"
@@ -1329,6 +1347,7 @@ def run_repair_agent(
                         session_path=state.session_path,
                         session_actor="queue-repair-task",
                         session_scope=task.task_id,
+                        cache_note=False,
                     )
             except AgentLaunchUnavailable as error:
                 # Its own outcome, not the cache's: the artifacts were ready and the process never existed,
@@ -1713,8 +1732,17 @@ def run_task(
                 mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
                 lake=cfg.lake,
                 preferred=repair_publish.preferred(cfg.publish, task),
+                warm=repair_publish.warm(cfg.publish, task),
                 build=not streaming,
             )
+            if artifacts.get("warm_attempts"):
+                warmed = artifacts.get("warmed_from") or []
+                missing = [a["revision"][:12] for a in artifacts["warm_attempts"] if not a["mapping_found"]]
+                log(
+                    f"task {task.task_id}: repair outputs warmed the tree from "
+                    + (", ".join(r[:12] for r in warmed) if warmed else "no revision")
+                    + (f"; no published mapping for {', '.join(missing)}" if missing else "")
+                )
             if artifacts["cache_revision"]:
                 skipped = "; ".join(artifacts.get("cache_skipped") or ())
                 log(

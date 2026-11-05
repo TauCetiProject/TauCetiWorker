@@ -854,6 +854,7 @@ def prepare_artifacts(
     mathlib_cache: bool = False,
     lake: tuple[str, ...] = ("lake",),
     preferred: tuple[tuple[str, str], ...] = (),
+    warm: tuple[tuple[str, str], ...] = (),
     build: bool = True,
 ) -> dict:
     """Warm artifacts the way the plan's default source does: main's cache at the base, then an
@@ -875,7 +876,12 @@ def prepare_artifacts(
     probes whether the failed candidate's own outputs were published (measurement only).
     ``preferred`` are ``(service, revision)`` fetches tried before all of these (the workers' repair
     namespace, ``repair_publish.preferred``); ``cache_service`` records the service of the restored
-    mapping. ``build=False`` fetches only: the caller runs the
+    mapping. ``warm`` are ``(service, revision)`` fetches that all run before those, each that has a
+    mapping restoring its outputs (``warm_attempts`` records every one, ``warmed_from`` the revisions
+    that had a mapping, in order); Lake keys the outputs by input trace, so the fetches add to one
+    another and a later one never displaces an artifact for a different input. A warm hit makes the
+    artifacts available even when no other revision is published (``cache_revision`` is then the
+    first warmed revision). ``build=False`` fetches only: the caller runs the
     incremental build itself (``repair_stream`` streams it to the agent), so ``available`` rests on the
     fetch alone.
     """
@@ -888,8 +894,22 @@ def prepare_artifacts(
         seconds += deps["seconds"]
         if deps["rc"] != 0:
             reasons.append(f"lake exe cache get exited {deps['rc']}")
+    warm_attempts: list[dict] = []
+    for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
+        fetch = _fetch_mapping(
+            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
+        )
+        fetch["distance"] = None
+        warm_attempts.append(fetch)
+        seconds += fetch["seconds"]
+    warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
+    record["warm_attempts"] = warm_attempts
+    record["warmed_from"] = [fetch["revision"] for fetch in warmed]
+    tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
     attempts: list[dict] = []
-    candidates = [(service, revision, None) for service, revision in preferred if revision] + [
+    candidates = [
+        (service, revision, None) for service, revision in preferred if revision and (service, revision) not in tried
+    ] + [
         (CACHE_SERVICE, revision, distance)
         for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
     ]
@@ -904,6 +924,8 @@ def prepare_artifacts(
             break
     found = attempts[-1] if attempts[-1]["mapping_found"] else None
     record["base_cache"] = attempts[-1]
+    if found is None and warmed:
+        found = warmed[0]
     record["cache_attempts"] = attempts
     record["cache_revision"] = found["revision"] if found else None
     record["cache_distance"] = found["distance"] if found else None
@@ -1335,6 +1357,15 @@ def _hours_text(seconds: int) -> str:
     return f"{seconds}-second"
 
 
+# What every task's prompt says about the build cache: the worker has fetched it, the agent never does.
+CACHE_SENTENCE = (
+    "The worker has already placed in `.lake` every build artifact it could find (the repair cache's outputs for "
+    "this batch and the revisions near it, then the public cache); do not run `lake exe cache get`, "
+    "`lake cache get` or any other cache fetch yourself. When the task replays a batch onto a queue head, the "
+    "public cache has nothing for the target commit, which is not on `main` yet: that miss is expected and is not "
+    "a reason to stop. Proceed to build incrementally."
+)
+
 # The one sentence the prompt says about the worker's checks (``repair_audit``): a fact, not a request.
 AUDIT_SENTENCE = (
     f"`{LISTINGS_DIR}/{BUILD_FILE}` with no module arguments and the worker's verification also run CI's audits and "
@@ -1393,8 +1424,9 @@ def _verification_section(
             + " Judge each by its exit status; the queue's CI builds the whole library once you return. Run a full "
             "`lake build --iofail` only after the rebase is finished and only if time allows. "
             + foreground
-            + " Do not run `lake exe cache get` or `lake cache get` (the worker already tried); do not use "
-            "`--fail-fast`.",
+            + " "
+            + CACHE_SENTENCE
+            + " Do not use `--fail-fast`.",
             *scoped,
         ]
     else:
@@ -1403,7 +1435,9 @@ def _verification_section(
             "`lake build --iofail` (whole library, incremental, as CI runs it) rebuilds only the failing modules and their "
             "dependents. Run it and judge it by its exit status. "
             + foreground
-            + " Do not run `lake exe cache get` or `lake cache get`; do not use `--fail-fast`.",
+            + " "
+            + CACHE_SENTENCE
+            + " Do not use `--fail-fast`.",
             *scoped,
         ]
     lines += [

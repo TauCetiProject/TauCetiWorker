@@ -188,6 +188,30 @@ has a time budget holds because the service re-exposes the task.
    any public revision; `cache_service` records which service the restored mapping came from.
    Checkpoint `artifacts_ready`.
 
+   **Warm revisions.** A `pre_rebase` task builds on a queue head's tip, which is never on `main` and
+   so never in the public cache, and a `prepare` task builds a batch whose own tips the workers may
+   already have published. The controller therefore puts `warm_revs` on every `pre_rebase` and
+   `prepare` task record, computed at claim time (`Controller._warm_revs`): for a `pre_rebase`, the
+   head's current tip and its previous tips (newest first, up to `REPAIR_OUTPUTS_PREVIOUS_TIPS`, from
+   `batch_tips`), then the head's base; for a `prepare` of the pre-rebased chain, the head's tips, then
+   the batch's own tips (the one the pre-rebase covers first); for a `prepare` on its own base, the
+   batch's previous tips, then that base. Before the agent runs, the worker fetches the repair namespace's outputs for every one
+   of them, then for the task's `tip`, `onto` and `base` (`repair_publish.warm`, without repeats). All
+   are tried, not only the first that answers: Lake keys outputs by input trace, so each mapping adds
+   the artifacts of its own tree and a nearly identical tree's outputs serve nearly completely. A
+   revision without a mapping is skipped. For a `pre_rebase` the public walk then starts at the last warm
+   revision (the head's base, a `main` commit) rather than at the head's tip. The record carries `warm_attempts`
+   and `warmed_from`, and the worker logs `repair outputs warmed the tree from <shas>; no published
+   mapping for <shas>`. A warm hit alone makes the artifacts available. The prompt for every task kind
+   (`repair.CACHE_SENTENCE`) says the worker has already placed every artifact it could find, that the
+   agent must not run `lake exe cache get` or any other cache fetch, that a public-cache miss for a
+   queue head's tip is expected and is no reason to stop, and that it proceeds to build
+   incrementally. The queue launches agents with `run_agent_host(..., cache_note=False)`, so the
+   fleet's build-cache appendix (its fetch commands and the stop rule for `TAUCETI_PR_CACHE_MISS`) and
+   that variable never reach a queue agent; the fleet's own rounds keep both. Production batch 3's
+   `pre_rebase` task (2026-11-05) is the case: Codex fetched the public cache itself, found nothing for
+   head 2's tip, followed the appendix's stop rule and aborted the replay twice.
+
    **Sandboxed builds.** Every `lake build` the worker runs goes through
    `repair_sandbox.sandboxed_lake(argv, worktree, env)` (`tauceti_queue/repair_sandbox.py`), which wraps
    it in the offline `bwrap` sandbox CI's required build uses (TauCeti `pr-build.yml`, "Build exact

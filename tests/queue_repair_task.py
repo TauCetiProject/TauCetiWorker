@@ -25,6 +25,7 @@ the lock behave as the prompt says, and ``--no-stream-repair`` restores the sequ
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import re
@@ -232,7 +233,7 @@ launch = {
 }
 started = time.time()
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 fcntl.flock(call_lock, fcntl.LOCK_UN)
 call_lock.close()
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
@@ -1907,6 +1908,62 @@ class Providers(Fixture):
         self.assertEqual(repair.claude_profile().model, "claude-opus-5-5")
 
 
+class QueueCacheNote(Fixture):
+    """The queue warms the tree itself: the fleet harness's cache-fetch appendix never reaches its agents."""
+
+    BASE_FILES = {"lakefile.toml": 'name = "TauCeti"\n'}  # the appendix is added only in a Lake checkout
+
+    def test_a_codex_pre_rebase_gets_no_cache_fetch_appendix_and_no_cache_miss_flag(self):
+        """Batch 3's pre-rebase (2026-11-05): the fleet harness appended its cache-fetch paragraph, the
+        host preparation set ``TAUCETI_PR_CACHE_MISS=1`` because a queue head's tip is never in the public
+        cache, and Codex followed the appendix's stop rule and aborted the replay."""
+        from tauceti_worker import agents
+
+        @contextlib.contextmanager
+        def missed(cwd, env, logdir):
+            env["TAUCETI_PR_CACHE_MISS"] = "1"  # what the host preparation does on that miss
+            yield None
+
+        raw = self.content.rebase_task()
+        raw["kind"] = "pre_rebase"
+        self.service.tasks = {1: raw}
+        cfg = self.config(providers=("codex",))
+        with (
+            patch.object(agents, "TAUCETI_CACHE_SERVICE", "tauceti-public"),
+            patch.object(agents, "host_build_cache_context", missed),
+        ):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        call = self.agent_calls()[0]
+        self.assertEqual(call["agent"], "codex")
+        self.assertNotIn("Build cache preparation", call["prompt"])
+        self.assertNotIn("TAUCETI_PR_CACHE_MISS", call["prompt"])
+        self.assertNotIn("report the cache miss and stop", call["prompt"])
+        self.assertNotIn("(the worker already tried)", call["prompt"])
+        self.assertIsNone(call["env"]["TAUCETI_PR_CACHE_MISS"])
+        self.assertIn(repair.CACHE_SENTENCE, call["prompt"])
+        self.assertIn("that miss is expected and is not a reason to stop", call["prompt"])
+        # The fleet's own runs keep the appendix.
+        captured: list[str] = []
+
+        def launch(prompt, profile):
+            captured.append(prompt)
+            return ["true"], {}, None
+
+        with (
+            patch.object(agents, "TAUCETI_CACHE_SERVICE", "tauceti-public"),
+            patch.object(agents, "host_agent_launch", launch),
+            patch.dict(os.environ, {"TAUCETI_AGENT_ECHO": "1"}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            agents.run_agent_host(self.content.clone, "fleet", repair.codex_profile(), self.root / "fleet-logs")
+            agents.run_agent_host(
+                self.content.clone, "queue", repair.codex_profile(), self.root / "fleet-logs", cache_note=False
+            )
+        self.assertIn("Build cache preparation", captured[0])
+        self.assertEqual(captured[1], "queue")
+
+
 class AgentTimeout(Fixture):
     def test_the_worker_cap_is_an_agent_failure_not_a_lost_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
@@ -2565,6 +2622,62 @@ class PublishOutputs(Fixture):
         heartbeat = json.loads(repair_task.heartbeat_path(cfg).read_text())["publish"]
         self.assertEqual((heartbeat["published"], heartbeat["failed"], heartbeat["running"]), (1, 0, []))
         self.assertEqual(heartbeat["last"]["revision"], outcome["tip"])
+
+    def test_a_pre_rebase_warms_from_every_published_warm_rev_and_skips_the_missing(self):
+        """Production batch 3's pre-rebase onto head 2's tip: the target is not on main, so the public
+        cache cannot have it, but the repair namespace has the head's previous tip and its base."""
+        raw = self.content.rebase_task()
+        raw["kind"] = "pre_rebase"
+        onto = raw["onto"]
+        previous, unpublished = "8" * 40, "9" * 40
+        raw["warm_revs"] = [onto, unpublished, previous, self.content.base]
+        self.service.tasks = {1: raw}
+        os.environ["STUB_LAKE_REPAIR_REVS"] = f"{previous},{self.content.base}"
+        lines: list[str] = []
+        original = repair_task.log
+        repair_task.log = lines.append
+        self.addCleanup(setattr, repair_task, "log", original)
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        fetches = [c for c in self.lake_calls() if c.startswith("cache get")]
+        repair_fetches = [c.split("--rev=")[1] for c in fetches if "--service tauceti-repair " in c]
+        self.assertEqual(
+            repair_fetches,
+            [onto, unpublished, previous, self.content.base, self.content.tip],
+            "every warm revision was tried in order, then the batch's own tip, each once",
+        )
+        public = [c.split("--rev=")[1] for c in fetches if "--service tauceti-repair " not in c]
+        self.assertEqual(public, [self.content.base], "the public walk starts at the head's base, not its tip")
+        artifacts = outcome["artifacts"]
+        self.assertEqual(artifacts["warmed_from"], [previous, self.content.base])
+        self.assertEqual(artifacts["cache_revision"], self.content.base)
+        self.assertTrue(artifacts["available"])
+        self.assertIn(
+            f"task 1: repair outputs warmed the tree from {previous[:12]}, {self.content.base[:12]}; "
+            f"no published mapping for {onto[:12]}, {unpublished[:12]}, {self.content.tip[:12]}",
+            lines,
+        )
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn(repair.CACHE_SENTENCE, prompt)
+        self.assertIn("Artifacts are warm", prompt)
+
+    def test_warm_revs_alone_make_the_artifacts_available(self):
+        raw = self.content.rebase_task()
+        raw["kind"] = "pre_rebase"
+        previous = "8" * 40
+        raw["warm_revs"] = [raw["onto"], previous, self.content.base]
+        self.service.tasks = {1: raw}
+        os.environ["STUB_LAKE_REPAIR_REVS"] = previous
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"  # nothing public at all
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        artifacts = outcome["artifacts"]
+        self.assertEqual((artifacts["warmed_from"], artifacts["cache_revision"]), ([previous], previous))
+        self.assertEqual(artifacts["cache_service"], "tauceti-repair")
+        self.assertTrue(artifacts["available"])
+        self.assertNotIn("cold", artifacts)
 
     def test_before_publishes_ahead_of_the_push(self):
         cfg = self.config(publish=self.settings(when="before"))

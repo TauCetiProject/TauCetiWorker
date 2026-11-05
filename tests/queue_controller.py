@@ -832,6 +832,23 @@ class PreRebase(ControllerCase):
         self.assertEqual((background["active"]["kind"], background["waiting"]), ("pre_rebase", None))
         self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
 
+    def test_a_pre_rebase_task_names_the_heads_tips_then_its_base_to_warm_from(self):
+        self.conflicting_batch()
+        batch = self.open_batch()
+        head = self.controller.store.row("batches", {"state": "head"})
+        # Earlier tips of the head, oldest first; one repeats and the current tip is never listed twice.
+        earlier = ["1" * 40, "2" * 40, "3" * 40, "2" * 40, "4" * 40, "5" * 40]
+        self.controller.store.execute("DELETE FROM batch_tips WHERE batch_id = ?", (head["id"],))
+        for version, sha in enumerate(earlier):
+            self.controller._record_tip(head["id"], version, sha, self.clock())
+        self.controller._record_tip(head["id"], len(earlier), head["tip"], self.clock())
+        self.controller.store.update("batches", {"id": head["id"]}, version=len(earlier))
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual((task.kind, task.onto, task.batch_id), ("pre_rebase", head["tip"], batch["id"]))
+        expected = [head["tip"], "5" * 40, "4" * 40, "2" * 40, "3" * 40, head["base"]]
+        self.assertEqual(task.warm_revs, expected)
+        self.assertEqual(task.to_dict()["warm_revs"], expected)
+
     def test_a_clean_preparation_hands_the_recorded_conflict_to_a_pre_rebase_task(self):
         self.controller.set_setting("prepare_min_members", 1, "kim")
         self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
@@ -1053,6 +1070,21 @@ class Preparation(ControllerCase):
             self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
         self.controller.tick()  # observes the verdict and promotes
         self.controller.tick()  # seals the next head
+
+    def test_a_prepare_task_names_the_batchs_previous_tips_then_its_base_to_warm_from(self):
+        batch = self.open_batch()
+        tips = [
+            row["tip"]
+            for row in self.controller.store.rows("batch_tips", {"batch_id": batch["id"]}, order="version DESC")
+        ]
+        self.assertEqual(tips[0], batch["tip"])
+        self.assertGreaterEqual(len(tips), 3, "one tip per member inserted")
+        self.quiet()
+        [row] = self.prepare_tasks()
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual((task.task_id, task.kind), (row["id"], "prepare"))
+        self.assertEqual(task.warm_revs, [*tips[1:5], batch["base"]])
+        self.assertNotIn(batch["tip"], task.warm_revs)
 
     def test_a_quiet_open_batch_gets_one_prepare_task_on_its_own_base(self):
         self.assertTrue(DEFAULT_SETTINGS["prepare_open_batches"])
@@ -1302,6 +1334,24 @@ class PreRebasedPreparation(ControllerCase):
             self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
         self.controller.tick()  # observes the verdict and promotes
         self.controller.tick()  # seals the next head
+
+    def test_the_pre_rebased_preparation_warms_from_the_heads_tips_then_the_batchs_own(self):
+        batch = self.open_batch()
+        head = self.head()
+        self.controller._record_tip(head["id"], head["version"] + 1, "1" * 40, self.clock())
+        self.controller.store.update("batches", {"id": head["id"]}, version=head["version"] + 1, tip="1" * 40)
+        self.controller._record_tip(head["id"], head["version"] + 2, head["tip"], self.clock())
+        self.controller.store.update("batches", {"id": head["id"]}, version=head["version"] + 2, tip=head["tip"])
+        own_tips = [
+            row["tip"]
+            for row in self.controller.store.rows("batch_tips", {"batch_id": batch["id"]}, order="version DESC")
+        ]
+        claimed = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertIn("pre_rebased", claimed.extra)
+        self.assertEqual(claimed.warm_revs[:2], [head["tip"], "1" * 40], "the head's tip, then its previous tip")
+        self.assertEqual(claimed.warm_revs[2], batch["tip"], "then the batch tip the pre-rebase covers")
+        self.assertEqual(claimed.warm_revs[3:], [t for t in own_tips if t != batch["tip"]][:4])
+        self.assertEqual(len(claimed.warm_revs), len(set(claimed.warm_revs)))
 
     def test_adopting_the_pre_rebase_creates_a_prepare_task_for_the_pre_rebased_chain(self):
         self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"])

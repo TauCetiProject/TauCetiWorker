@@ -185,6 +185,18 @@ def preferred(settings: Settings, task) -> tuple[tuple[str, str], ...]:
     return tuple((settings.service, revision) for revision in revisions)
 
 
+def warm(settings: Settings, task) -> tuple[tuple[str, str], ...]:
+    """The (service, revision) fetches that all run before the public cache, every one with a mapping
+    restoring its outputs: the controller's ``warm_revs`` (a ``pre_rebase`` or ``prepare`` task's
+    nearby revisions), then ``preferred``'s, without repeats; empty when the task names none or the
+    namespace is not configured."""
+    revisions = list(getattr(task, "warm_revs", None) or ())
+    if not settings.url or not revisions:
+        return ()
+    ordered = dict.fromkeys([*revisions, *(revision for _, revision in preferred(settings, task))])
+    return tuple((settings.service, revision) for revision in ordered if revision)
+
+
 def _artifact_bytes(mapping: Path, artifacts: Path) -> tuple[int, int]:
     """Count and total size of the artifacts the output map names (rows ``[input, artifact]``)."""
     count = size = 0
