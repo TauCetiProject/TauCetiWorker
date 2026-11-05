@@ -1117,7 +1117,18 @@ class Preparation(QueueFixture):
         landed = self.controller.store.row("batches", {"id": batch["id"]})
         self.assertEqual(landed["state"], "landed")
         self.assertEqual(self.source_failures(batch), 0, "the head's CI round found nothing left to repair")
-        self.assertEqual([t.kind for t in agent.tasks], ["prepare"], "no repair round for the prepared batch")
+        self.assertEqual(
+            [t.kind for t in agent.tasks], ["prepare", "prepare"], "no repair round for the prepared batch"
+        )
+        self.assertEqual(
+            ["pre_rebased" in t.extra for t in agent.tasks],
+            [False, True],
+            "prepared on its own base, then its pre-rebased chain on the head's tip",
+        )
+        stacked = agent.results[1]
+        self.assertTrue(stacked.accepted, stacked)
+        attempts = self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id")
+        self.assertEqual(attempts[0]["head_sha"], stacked.tip, "CI ran on the exact prepared tip")
         self.assertEqual(self.repo.file_at(self.repo.main_sha(), "TauCeti/Pr202.lean"), "202\n")
         member = {m["number"]: m for m in self.members(landed)}[202]
         self.assertEqual(member["provenance"], "edited")
@@ -1144,7 +1155,11 @@ class Preparation(QueueFixture):
         # The head fails CI: its repair task is the next claim, ahead of the newer batch's preparation.
         self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
         self.tick()
-        self.assertEqual(self.controller.store.count("tasks", {"kind": "prepare", "state": "open"}), 0, "below 3")
+        self.assertEqual(
+            self.controller.store.count("tasks", {"kind": "prepare", "state": "open", "pre_rebase_source": None}),
+            0,
+            "below 3",
+        )
         head = self.head()
         self.github.runs[-1].verdict = "fail"
         self.github.runs[-1].diagnostics = [{"kind": "compiler", "module": "TauCeti/Pr101.lean", "message": "x"}]

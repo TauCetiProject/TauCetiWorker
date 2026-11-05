@@ -317,8 +317,9 @@ def group_prompt(context: PromptContext, group: Group, chain: list[ChainCommit],
         "",
         "## What happened",
         "",
-        f"The queue built this batch of {len(chain)} squash commits, one per pull request, on the `main` commit "
-        f"`{base_short}` with CI (`lake build --iofail`, as the staging build runs it) and the build failed. The "
+        f"The queue built this batch of {len(chain)} squash commits, one per pull request, on "
+        + ("the queue head's tip" if context.pre_rebased else "the `main` commit")
+        + f" `{base_short}` with CI (`lake build --iofail`, as the staging build runs it) and the build failed. The "
         "failures split into independent groups of modules; this run repairs one group while other runs repair the "
         "others at the same time, each in its own worktree. The worker folds every group's fixes into the chain and "
         "runs the whole-library build itself afterwards.",

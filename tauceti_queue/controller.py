@@ -93,6 +93,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Replay the oldest open batch onto the head's tip once the head's chain is submitted and waits
     # for its CI verdict, so the next head seals from the result without a replay (`_pre_rebase`).
     "pre_rebase_enabled": True,
+    # Build, repair and publish an open batch's usable pre-rebase on the head's tip (a `prepare` task
+    # of the pre-rebased chain, `_prepare_pre_rebased`), so the head it seals as reaches CI with
+    # published outputs for its exact tip. Applies to the batches own-base preparation applies to.
+    "prepare_pre_rebased": True,
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
@@ -399,6 +403,11 @@ class Controller:
     def pre_rebase_ref(batch_id: int, onto: str) -> str:
         """The clone-only ref holding an open batch's chain replayed onto the head's tip `onto`."""
         return f"{chain.REF_NAMESPACE}/batches/{batch_id}/pre/{onto}"
+
+    @staticmethod
+    def pre_rebased_ref(batch_id: int, tip: str) -> str:
+        """The published ref of an open batch's pre-rebased chain `tip`, which a worker preparing it fetches."""
+        return f"{chain.REF_NAMESPACE}/batches/{batch_id}/pre-rebased/{tip}"
 
     @staticmethod
     def submission_ref(task_id: int, claim_id: int) -> str:
@@ -993,7 +1002,8 @@ class Controller:
         """Open tasks whose batch is still at the task's version and in the state the kind works on
         (`open` for `prepare`, `head` otherwise), with their batch, by kind priority then age. A
         `pre_rebase` task instead needs its batch open with the task's chain as a prefix and the head's
-        tip unchanged (`_pre_rebase_task_current`): insertion may append to the batch meanwhile."""
+        tip unchanged (`_pre_rebase_task_current`): insertion may append to the batch meanwhile; a
+        `prepare` task of the pre-rebased chain likewise (`_pre_rebased_prepare_current`)."""
         found = []
         for task in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
             batch = self.store.row("batches", {"id": task["batch_id"]})
@@ -1001,6 +1011,10 @@ class Controller:
                 continue
             if task["kind"] == TASK_PRE_REBASE:
                 if self._pre_rebase_task_current(task, batch):
+                    found.append((task, batch))
+                continue
+            if self._pre_rebased_prepare(task):
+                if self._pre_rebased_prepare_current(task, batch):
                     found.append((task, batch))
                 continue
             if batch["version"] != task["batch_version"]:
@@ -1052,6 +1066,9 @@ class Controller:
 
     def _settle_prepare_release(self, task: dict[str, Any], reason: str, now: float) -> None:
         batch = self.store.row("batches", {"id": task["batch_id"]})
+        if self._pre_rebased_prepare(task):
+            self._settle_pre_rebased_release(task, batch, reason, now)
+            return
         current = batch is not None and batch["state"] == BATCH_OPEN and batch["version"] == task["batch_version"]
         if reason == PREPARE_CLEAN_REASON:
             self.store.update("tasks", {"id": task["id"]}, state=TASK_SUBMITTED, resolved_at=now, resolution="prepared")
@@ -1120,6 +1137,9 @@ class Controller:
             if task["kind"] == TASK_PRE_REBASE:
                 if not self._pre_rebase_task_current(task, batch):
                     return reject("version-mismatch")
+            elif self._pre_rebased_prepare(task):
+                if not self._pre_rebased_prepare_current(task, batch):
+                    return reject("version-mismatch")
             elif (
                 task["state"] != TASK_OPEN
                 or batch["version"] != task["batch_version"]
@@ -1179,6 +1199,8 @@ class Controller:
                 return reject("no-repair-edited", violations)
             if task["kind"] == TASK_PRE_REBASE:
                 return self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
+            if self._pre_rebased_prepare(task):
+                return self._adopt_prepared_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
             return self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
 
     def _commit_empty(self, sha: str | None) -> bool:
@@ -1427,10 +1449,11 @@ class Controller:
         )
 
     def _task_members(self, task: dict[str, Any]) -> list[dict[str, Any]]:
-        """The members a task's chain covers: the batch's, or for a `pre_rebase` task those in its
-        `base..tip` (members inserted since are replayed onto its result afterwards)."""
+        """The members a task's chain covers: the batch's, or for a `pre_rebase` task and a `prepare`
+        task of the pre-rebased chain those in its `base..tip` (members inserted since are replayed
+        onto its result afterwards)."""
         members = self._members(task["batch_id"])
-        if task["kind"] != TASK_PRE_REBASE:
+        if task["kind"] != TASK_PRE_REBASE and not self._pre_rebased_prepare(task):
             return members
         covered = {commit.source_pr for commit in chain.chain_commits(self.clone, task["base"], task["tip"])}
         return [member for member in members if member["source_pr"] in covered]
@@ -1461,6 +1484,20 @@ class Controller:
         extra: dict[str, Any] = {"canonical_branch": self.canonical_branch, "claim_id": claim_id}
         if task["kind"] == TASK_PREPARE:
             extra["renew_after"] = PREPARE_RENEW_SECONDS
+        if self._pre_rebased_prepare(task):
+            # The pre-rebased chain exists only in the controller's clone until `_prepare_pre_rebased`
+            # retains it on GitHub; the worker builds on the head's tip and falls back to the public
+            # cache at the head's base, then the batch's own base, when no repair outputs are published.
+            refs.insert(1, self.pre_rebased_ref(batch["id"], task["tip"]))
+            ahead = self._head()
+            extra["pre_rebased"] = {
+                "source": task["pre_rebase_source"],
+                "batch_base": batch["base"],
+                "head_batch_id": ahead["id"] if ahead is not None else None,
+                "head_base": ahead["base"] if ahead is not None and ahead["tip"] == task["onto"] else None,
+            }
+            if ahead is not None and ahead["tip"] == task["onto"]:
+                refs.insert(2, self.batch_ref(ahead["id"], ahead["version"]))
         if task["kind"] == TASK_PRE_REBASE:
             ahead = self._head()
             if ahead is not None and ahead["tip"] == task["onto"]:
@@ -1493,7 +1530,12 @@ class Controller:
         diagnostics: list[dict[str, Any]],
         now: float,
         ci_attempt_id: int | None = None,
+        *,
+        pre_rebased: tuple[str, str] | None = None,
     ) -> int:
+        """Create the batch's next task of `kind` on `onto`, superseding what it replaces. A `prepare`
+        task of the pre-rebased chain passes `pre_rebased` (its tip, and the batch tip it covers): its
+        chain is `onto..tip` instead of the batch's own `base..tip`."""
         # The head's task replaces any other; an open batch's background tasks (`prepare`, `pre_rebase`)
         # each replace only their own kind.
         where: dict[str, Any] = {"batch_id": head["id"], "state": TASK_OPEN}
@@ -1510,16 +1552,19 @@ class Controller:
                 repository=self.repository,
                 batch_id=head["id"],
                 batch_version=head["version"],
-                base=head["base"],
-                tip=head["tip"],
+                base=onto if pre_rebased else head["base"],
+                tip=pre_rebased[0] if pre_rebased else head["tip"],
                 onto=onto,
                 diagnostics=dumps(diagnostics),
                 state=TASK_OPEN,
                 created_at=now,
                 ci_attempt_id=ci_attempt_id,
+                pre_rebase_source=pre_rebased[1] if pre_rebased else None,
             )
-            self._count(f"tasks_{kind}")
-            self.store.journal(now, "task", head["id"], task_id=task_id, task_kind=kind, onto=onto)
+            self._count("tasks_prepare_pre_rebased" if pre_rebased else f"tasks_{kind}")
+            self.store.journal(
+                now, "task", head["id"], task_id=task_id, task_kind=kind, onto=onto, pre_rebased=bool(pre_rebased)
+            )
         return task_id
 
     # --- claims ------------------------------------------------------------------------------------
@@ -1675,6 +1720,7 @@ class Controller:
         self._reconcile_head(now)
         self._pre_rebase(now)
         self._prepare_open_batches(now)
+        self._prepare_pre_rebased(now)
         self._republish_retained_refs(now)
         self._drain_outbox(self.clock())
         self._set_state("last_tick_at", now)
@@ -2227,8 +2273,8 @@ class Controller:
             if batch is None or batch["state"] != BATCH_OPEN:
                 closed = "sealed" if batch is not None and batch["state"] == BATCH_HEAD else "batch-closed"
                 self._supersede_prepare(task["batch_id"], closed, now)
-            elif batch["version"] != task["batch_version"]:
-                self._supersede_prepare(task["batch_id"], "batch-changed", now)
+            elif batch["version"] != task["batch_version"] and not self._pre_rebased_prepare(task):
+                self._supersede_prepare(task["batch_id"], "batch-changed", now, own_base_only=True)
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
         for batch in self._open_batches():
@@ -2238,6 +2284,13 @@ class Controller:
             if pre_rebase is not None and self._active_claims(batch["id"], task_id=pre_rebase["id"]):
                 self._note_reason(
                     f"open batch {batch['id']}: preparation waits for the claimed pre_rebase task {pre_rebase['id']}"
+                )
+                continue
+            pre_rebased = self._open_pre_rebased_prepare(batch)
+            if pre_rebased is not None and self._active_claims(batch["id"], task_id=pre_rebased["id"]):
+                self._note_reason(
+                    f"open batch {batch['id']}: preparation waits for the claimed preparation of its pre-rebased "
+                    f"chain (task {pre_rebased['id']})"
                 )
                 continue
             if pre_rebase is not None:
@@ -2258,9 +2311,7 @@ class Controller:
         agent's resolutions. So the task waits while a `prepare` task is open and until the batch is
         prepared at its current version, or its preparation at that version failed.
         """
-        prepare = self.store.row(
-            "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE}, order="id DESC"
-        )
+        prepare = self._open_own_base_prepare(batch)
         if prepare is not None:
             held = "claimed" if self._active_claims(batch["id"], task_id=prepare["id"]) else "open"
             return f"prepare task {prepare['id']} is {held}"
@@ -2285,7 +2336,9 @@ class Controller:
         if batch["prepared_version"] is None or batch["prepared_version"] != batch["version"]:
             return None
         task = self.store.row(
-            "tasks", {"batch_id": batch["id"], "kind": TASK_PREPARE, "state": TASK_SUBMITTED}, order="id DESC"
+            "tasks",
+            {"batch_id": batch["id"], "kind": TASK_PREPARE, "state": TASK_SUBMITTED, "pre_rebase_source": None},
+            order="id DESC",
         )
         if task is None:
             return None
@@ -2320,15 +2373,25 @@ class Controller:
         if now - max(m["added_at"] for m in members) < int(self.setting("prepare_quiet_seconds")):
             return False
         for task in self.store.rows(
-            "tasks", {"batch_id": batch["id"], "batch_version": batch["version"], "kind": TASK_PREPARE}
+            "tasks",
+            {
+                "batch_id": batch["id"],
+                "batch_version": batch["version"],
+                "kind": TASK_PREPARE,
+                "pre_rebase_source": None,
+            },
         ):
             if task["state"] == TASK_OPEN or task["resolution"] in PREPARE_SETTLED:
                 return False
         return True
 
-    def _supersede_prepare(self, batch_id: int, resolution: str, now: float) -> None:
-        """Supersede the batch's open `prepare` tasks and release their claims."""
-        tasks = self.store.rows("tasks", {"batch_id": batch_id, "state": TASK_OPEN, "kind": TASK_PREPARE})
+    def _supersede_prepare(self, batch_id: int, resolution: str, now: float, *, own_base_only: bool = False) -> None:
+        """Supersede the batch's open `prepare` tasks (with `own_base_only`, not the preparation of its
+        pre-rebased chain) and release their claims."""
+        where: dict[str, Any] = {"batch_id": batch_id, "state": TASK_OPEN, "kind": TASK_PREPARE}
+        if own_base_only:
+            where["pre_rebase_source"] = None
+        tasks = self.store.rows("tasks", where)
         if not tasks:
             return
         with self.store.transaction():
@@ -2399,10 +2462,15 @@ class Controller:
         onto: str | None = None,
         source: str | None = None,
         edits: dict[str, Any] | None = None,
+        prepared: bool = False,
     ) -> None:
         """Record (or with an empty `state`, clear) a batch's pre-rebase, keeping its chain under
-        `pre_rebase_ref` in the clone and dropping the previous one."""
+        `pre_rebase_ref` in the clone and dropping the previous one. `pre_rebase_prepared` names the
+        tip when `prepared` (a preparation of the chain was adopted) and is kept while the tip is the
+        one prepared; any other tip is unprepared."""
         current = self.store.row("batches", {"id": batch["id"]}) or batch
+        kept = current.get("pre_rebase_prepared")
+        prepared_tip = tip if prepared or (tip and kept == tip) else None
         previous = (
             self.pre_rebase_ref(batch["id"], current["pre_rebase_onto"])
             if current.get("pre_rebase_tip") and current.get("pre_rebase_onto")
@@ -2422,6 +2490,7 @@ class Controller:
             pre_rebase_source=source,
             pre_rebase_edits=dumps(edits or {}),
             pre_rebase_at=now if state else None,
+            pre_rebase_prepared=prepared_tip if state else None,
         )
 
     def _supersede_pre_rebase_tasks(self, batch_id: int, resolution: str, now: float) -> int:
@@ -2456,6 +2525,7 @@ class Controller:
             with self.store.transaction():
                 self._supersede_pre_rebase_tasks(batch["id"], "head-moved", now)
                 self.store.journal(now, "pre-rebase-superseded", batch["id"], task_id=task["id"], onto=task["onto"])
+        self._supersede_stale_pre_rebased_prepare(now)
 
     def _pre_rebase(self, now: float) -> None:
         """Replay the oldest open batch onto the head's tip in the background, once the head allows it.
@@ -2583,6 +2653,225 @@ class Controller:
                 return None
             tip = extended.tip
         return tip, loads(batch["pre_rebase_edits"], {})
+
+    # --- preparation of the pre-rebased chain ------------------------------------------------------
+
+    @staticmethod
+    def _pre_rebased_prepare(task: dict[str, Any]) -> bool:
+        """A `prepare` task of a batch's pre-rebased chain (on the head's tip), not of its own chain."""
+        return task["kind"] == TASK_PREPARE and bool(task.get("pre_rebase_source"))
+
+    def _open_own_base_prepare(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        return self.store.row(
+            "tasks",
+            {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE, "pre_rebase_source": None},
+            order="id DESC",
+        )
+
+    def _open_pre_rebased_prepare(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        for task in self.store.rows(
+            "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE}, order="id DESC"
+        ):
+            if self._pre_rebased_prepare(task):
+                return task
+        return None
+
+    def _pre_rebased_prepare_current(self, task: dict[str, Any], batch: dict[str, Any]) -> bool:
+        """A `prepare` task of the pre-rebased chain still describes its batch: open, the batch open
+        with a usable pre-rebase on the task's `onto`, which is still the head's tip, and the task's
+        chain a prefix of that pre-rebase (insertion extends it by replay, which keeps the prefix)."""
+        return (
+            task["state"] == TASK_OPEN
+            and batch["state"] == BATCH_OPEN
+            and batch["pre_rebase_state"] in PRE_REBASE_USABLE
+            and bool(batch["pre_rebase_tip"])
+            and batch["pre_rebase_onto"] == task["onto"]
+            and task["onto"] == self._pre_rebase_target()
+            and chain.is_ancestor(self.clone, task["tip"], batch["pre_rebase_tip"])
+        )
+
+    def _supersede_stale_pre_rebased_prepare(self, now: float) -> None:
+        """Supersede (releasing its claims) a preparation of a pre-rebased chain that no longer
+        describes its open batch: the head's tip changed (a repair round, a rebase of the head), or the
+        pre-rebase was redone, discarded or hit a conflict. A sealed batch's is superseded by `_seal`."""
+        for task in self.store.rows("tasks", {"state": TASK_OPEN, "kind": TASK_PREPARE}):
+            if not self._pre_rebased_prepare(task):
+                continue
+            batch = self.store.row("batches", {"id": task["batch_id"]})
+            if batch is None or batch["state"] != BATCH_OPEN or self._pre_rebased_prepare_current(task, batch):
+                continue
+            moved = task["onto"] != self._pre_rebase_target()
+            resolution = "head-moved" if moved else "pre-rebase-changed"
+            with self.store.transaction():
+                self.store.update(
+                    "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
+                )
+                for claim in self._active_claims(batch["id"], task_id=task["id"]):
+                    self._release_claim(claim, "superseded", now)
+                self.store.journal(
+                    now, "prepare-superseded", batch["id"], task_id=task["id"], resolution=resolution, pre_rebased=True
+                )
+
+    def _pre_rebased_prepare_blocked(self, batch: dict[str, Any]) -> str | None:
+        """Why the batch's pre-rebased chain gets no `prepare` task now; None once it may.
+
+        The chain must be a usable pre-rebase that is up to date (on the head's tip, covering the
+        batch's tip) and not yet prepared, on a head `_pre_rebase_blocked` allows (its tip moves only
+        after a failed CI round), for a batch that own-base preparation applies to and that is prepared
+        at its current version (`_pre_rebase_waits_for_prepare`: a later own-base preparation would
+        rewrite the chain under it). No other background task of the batch may be open, and a
+        preparation of the same chain that was adopted, released clean or failed is not repeated."""
+        if not self.setting("prepare_pre_rebased") or not self.setting("prepare_open_batches"):
+            return "prepare_pre_rebased is off"
+        if len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
+            return "below prepare_min_members"
+        if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not batch["pre_rebase_tip"]:
+            return "no usable pre-rebase"
+        blocked = self._pre_rebase_blocked(self._head())
+        if blocked is not None:
+            return blocked
+        if batch["pre_rebase_onto"] != self._pre_rebase_target() or batch["pre_rebase_source"] != batch["tip"]:
+            return "the pre-rebase is not up to date"
+        if batch["pre_rebase_prepared"] == batch["pre_rebase_tip"]:
+            return "prepared"
+        waiting = self._pre_rebase_waits_for_prepare(batch)
+        if waiting is not None:
+            return waiting
+        for kind in BACKGROUND_TASKS:
+            if self.store.row("tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": kind}) is not None:
+                return f"a {kind} task is open"
+        for task in self.store.rows(
+            "tasks",
+            {
+                "batch_id": batch["id"],
+                "kind": TASK_PREPARE,
+                "tip": batch["pre_rebase_tip"],
+                "onto": batch["pre_rebase_onto"],
+            },
+        ):
+            if task["resolution"] in PREPARE_SETTLED:
+                return f"prepare task {task['id']} was {task['resolution']}"
+        return None
+
+    def _prepare_pre_rebased(self, now: float) -> None:
+        """Create a `prepare` task for the oldest open batch's pre-rebased chain on the head's tip.
+
+        The worker builds that chain warm from the outputs published for the head's tip, repairs what
+        fails in place, runs the audits, submits, and publishes the outputs of the tip it submitted;
+        `_adopt_prepared_pre_rebase` records the result as the batch's pre-rebase, prepared on that
+        tip. A head that lands as that tip seals with the chain unchanged, so its CI round fetches the
+        published outputs for its exact tip. The task is a background task like any other (one claim
+        per batch, `repair_concurrency - 1` in total), superseded when the head's tip changes, and
+        sealing never waits for it."""
+        self._supersede_stale_pre_rebased_prepare(now)
+        if self._state("inference_hold"):
+            return
+        batch = self._open_batch()
+        if batch is None or not self._members(batch["id"]):
+            return
+        if self._pre_rebased_prepare_blocked(batch) is not None:
+            return
+        tip = batch["pre_rebase_tip"]
+        self._retain(self.pre_rebased_ref(batch["id"], tip), tip)
+        self._create_task(batch, TASK_PREPARE, batch["pre_rebase_onto"], [], now, pre_rebased=(tip, batch["tip"]))
+        self._note_reason(f"open batch {batch['id']} waits for a worker to prepare its pre-rebased chain")
+
+    def _settle_pre_rebased_release(
+        self, task: dict[str, Any], batch: dict[str, Any] | None, reason: str, now: float
+    ) -> None:
+        """A released preparation of a pre-rebased chain: `prepared_clean` records the chain as
+        prepared (when it is still the batch's pre-rebase), a failure settles the task for that chain."""
+        if reason == PREPARE_CLEAN_REASON:
+            self.store.update("tasks", {"id": task["id"]}, state=TASK_SUBMITTED, resolved_at=now, resolution="prepared")
+            if (
+                batch is not None
+                and batch["pre_rebase_tip"] == task["tip"]
+                and self._pre_rebased_prepare_current(task, batch)
+            ):
+                self.store.update("batches", {"id": batch["id"]}, pre_rebase_prepared=task["tip"])
+            self._count("pre_rebased_prepares_clean")
+            self.store.journal(
+                now, "prepared", task["batch_id"], task_id=task["id"], tip=task["tip"], clean=True, pre_rebased=True
+            )
+        elif reason in PREPARE_FAILED_REASONS:
+            self.store.update("tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="failed")
+            self._count("pre_rebased_prepares_failed")
+            self.store.journal(
+                now, "prepare-failed", task["batch_id"], task_id=task["id"], reason=reason, pre_rebased=True
+            )
+
+    def _adopt_prepared_pre_rebase(
+        self,
+        task: dict[str, Any],
+        claim: dict[str, Any],
+        batch: dict[str, Any],
+        tip_sha: str,
+        comparison: chain.ComparisonReport,
+        worker_notes: str,
+        now: float,
+    ) -> Adoption:
+        """Record a prepared pre-rebased chain as the open batch's pre-rebase, prepared on the head's tip.
+
+        Like `_adopt_pre_rebase`, the batch's own members, base, tip and version are unchanged; the
+        members the agent edited join the pre-rebase's edits (explanations appended), which the seal
+        that adopts the chain records (`_seal_from_pre_rebase`). The chain covers the batch tip the
+        task was created for; members inserted since are replayed onto it by the next `_pre_rebase`.
+        """
+        edits = loads(batch["pre_rebase_edits"], {})
+        for m in comparison.members:
+            if m.provenance != chain.EDITED:
+                continue
+            prior = edits.get(m.source_pr) or {}
+            explanation = (str(prior.get("explanation", "")) + "\n\n" + m.explanation.strip()).strip()
+            edits[m.source_pr] = {"explanation": explanation, "task_id": task["id"]}
+        provenance = {
+            m["source_pr"]: "edited" if m["source_pr"] in edits else m["provenance"] for m in self._task_members(task)
+        }
+        ref = self.pre_rebase_ref(batch["id"], task["onto"])
+        with self.store.transaction():
+            self._set_pre_rebase(
+                batch,
+                PRE_REBASE_ADOPTED if edits else batch["pre_rebase_state"],
+                now,
+                tip=tip_sha,
+                onto=task["onto"],
+                source=task["pre_rebase_source"],
+                edits=edits,
+                prepared=True,
+            )
+            self.store.update(
+                "tasks",
+                {"id": task["id"]},
+                state=TASK_SUBMITTED,
+                resolved_at=now,
+                resolution="adopted",
+                submissions=task["submissions"] + 1,
+            )
+            self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="submitted")
+            self.store.insert(
+                "submissions",
+                task_id=task["id"],
+                claim_id=claim["id"],
+                tip=tip_sha,
+                retained_ref=ref,
+                accepted=1,
+                reason="adopted",
+                worker_notes=worker_notes,
+                created_at=now,
+            )
+            self._count("pre_rebased_prepares_adopted")
+            self.store.journal(
+                now,
+                "pre-rebase-prepared",
+                batch["id"],
+                task_id=task["id"],
+                onto=task["onto"],
+                tip=tip_sha,
+                provenance=provenance,
+            )
+        self.report_inference(claim["worker"], True)
+        self._wake.set()
+        return Adoption(True, "adopted", task["id"], batch["id"], batch["version"], tip_sha, ref, provenance=provenance)
 
     def _cross_batch(self, head: dict[str, Any], batch: dict[str, Any]) -> dict[str, Any]:
         """The `cross_batch` diagnostic: names the head removes or renames that the batch's members use,
@@ -4040,8 +4329,9 @@ class Controller:
         }
 
     def _background_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
-        """Which of the batch's background kinds is `active` (its open task, and whether a worker holds
-        it) and which one is `waiting` for it, with the reason; at most one kind is active per batch."""
+        """Which of the batch's background kinds is `active` (its open task, whether a worker holds it,
+        and for a `prepare` task whether it prepares the `own_base` or the `pre_rebased` chain) and
+        which one is `waiting` for it, with the reason; at most one kind is active per batch."""
         prepare = self.store.row(
             "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE}, order="id DESC"
         )
@@ -4053,6 +4343,14 @@ class Controller:
             claimed = bool(self._active_claims(batch["id"], task_id=task["id"]))
             active = {"kind": task["kind"], "task_id": task["id"], "claimed": claimed}
             if task["kind"] == TASK_PREPARE:
+                active["chain"] = "pre_rebased" if self._pre_rebased_prepare(task) else "own_base"
+            if task["kind"] == TASK_PREPARE and self._pre_rebased_prepare(task):
+                if claimed and self._prepare_due(batch, now):
+                    waiting = {
+                        "kind": TASK_PREPARE,
+                        "reason": f"waits for the claimed preparation of the pre-rebased chain (task {task['id']})",
+                    }
+            elif task["kind"] == TASK_PREPARE:
                 waiting = {
                     "kind": TASK_PRE_REBASE,
                     "reason": f"waits for prepare task {task['id']} to be adopted, released clean or superseded",
@@ -4067,9 +4365,7 @@ class Controller:
 
     def _preparation_status(self, batch: dict[str, Any], members: list[dict[str, Any]], now: float) -> dict[str, Any]:
         """An open batch's background preparation: the version last prepared, the open `prepare` task."""
-        task = self.store.row(
-            "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE}, order="id DESC"
-        )
+        task = self._open_own_base_prepare(batch)
         return {
             "prepared_version": batch["prepared_version"],
             "prepared": batch["prepared_version"] is not None and batch["prepared_version"] == batch["version"],
@@ -4080,11 +4376,22 @@ class Controller:
     def _pre_rebase_status(self, batch: dict[str, Any]) -> dict[str, Any] | None:
         """An open batch's pre-rebase: `state` (`clean`, `adopted` or `conflict`), the head tip it is
         on (`onto`), its chain's `tip`, the batch tip it covers (`source`), whether it is `current` (on
-        the head's tip and covering the batch's tip), the members edited in it, and the open task."""
+        the head's tip and covering the batch's tip), the members edited in it, the open task, and
+        `preparation`: `preparing` while a `prepare` task of the chain is open (`prepare_task_id`,
+        `prepare_claimed`), `prepared` once the chain's current tip was built and repaired on the head's
+        tip (`prepared_tip`), else `unprepared` (with `prepare_blocked`, why no task is open)."""
         task = self._open_pre_rebase_task(batch)
         if not batch["pre_rebase_state"] and task is None:
             return None
         target = self._pre_rebase_target()
+        preparing = self._open_pre_rebased_prepare(batch)
+        prepared = bool(batch["pre_rebase_tip"]) and batch["pre_rebase_prepared"] == batch["pre_rebase_tip"]
+        if preparing is not None:
+            preparation = "preparing"
+        elif prepared:
+            preparation = "prepared"
+        else:
+            preparation = "unprepared"
         return {
             "state": batch["pre_rebase_state"],
             "onto": batch["pre_rebase_onto"],
@@ -4096,6 +4403,12 @@ class Controller:
             and batch["pre_rebase_source"] == batch["tip"],
             "edited": sorted(loads(batch["pre_rebase_edits"], {})),
             "task_id": None if task is None else task["id"],
+            "preparation": preparation,
+            "prepared_tip": batch["pre_rebase_prepared"],
+            "prepare_task_id": None if preparing is None else preparing["id"],
+            "prepare_claimed": preparing is not None
+            and bool(self._active_claims(batch["id"], task_id=preparing["id"])),
+            "prepare_blocked": None if preparing is not None or prepared else self._pre_rebased_prepare_blocked(batch),
         }
 
     def _batch_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:

@@ -618,6 +618,35 @@ class Content:
         ]
         return task
 
+    def pre_rebased_task(self, task_id: int = 1) -> dict:
+        """A ``prepare`` task of the batch's pre-rebased chain: the head's tip ``H`` (one head member on
+        the base) is ``base`` and ``onto``, and ``tip`` is the batch's members replayed onto it."""
+        seed = self.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.base)
+        head = commit(seed, "head member", {"TauCeti/Head.lean": "theorem head : True := trivial\n"})
+        members = [
+            chain_tool.Member(PROJECT, m["number"], m["accepted_head"], title=m["title"], description=m["description"])
+            for m in self.members
+        ]
+        built = chain_tool.build(seed, head, members, chain_id="pre-rebased")
+        assert built.status == chain_tool.CLEAN, built
+        sh(seed, "push", "--quiet", "origin", f"{head}:refs/heads/queue/head/tip")
+        sh(seed, "push", "--quiet", "origin", f"{built.tip}:refs/heads/queue/batch-1/pre-rebased")
+        task = self.task(task_id, kind="prepare")
+        task.update(base=head, tip=built.tip, onto=head, diagnostics=[])
+        task["members"] = [dict(m, commit=c.sha) for m, c in zip(self.members, built.commits, strict=True)]
+        task["retained_refs"] = [
+            *task["retained_refs"],
+            "refs/heads/queue/head/tip",
+            "refs/heads/queue/batch-1/pre-rebased",
+        ]
+        task["extra"] = {
+            **task["extra"],
+            "renew_after": 0.2,
+            "pre_rebased": {"source": self.tip, "batch_base": self.base, "head_batch_id": 6, "head_base": self.base},
+        }
+        return task
+
 
 # ---- the fake service ----------------------------------------------------------------------------
 
@@ -3433,6 +3462,101 @@ exit 1
         last = json.loads((worktree / ".tauceti-repair" / "errors.jsonl").read_text().splitlines()[-1])
         self.assertEqual(last["event"], "build_finished")
         self.assertEqual(last["errors"], 0)
+
+
+class PreRebasedPrepare(Fixture):
+    """A ``prepare`` task of the next batch's pre-rebased chain is run like an own-base preparation, on
+    the head's tip: warm from the outputs published for that tip, built with the streaming build,
+    repaired in place, submitted on the head's tip and published for the resulting tip."""
+
+    script = StreamRepair.script
+
+    def setUp(self):
+        super().setUp()
+        self.raw = self.content.pre_rebased_task()
+        self.head = self.raw["onto"]
+        self.service.tasks = {1: self.raw}
+
+    def settings(self) -> repair_publish.Settings:
+        key_file = self.root / "repair-cache-key"
+        key_file.write_text("access-id:secret\n")
+        return repair_publish.Settings(url="https://repair-cache.example", key_file=key_file)
+
+    def observe_log(self) -> list[str]:
+        lines: list[str] = []
+        original = repair_task.log
+        repair_task.log = lines.append
+        self.addCleanup(setattr, repair_task, "log", original)
+        return lines
+
+    def test_the_revisions_tried_are_the_heads_tip_then_its_base_then_the_batch_base(self):
+        task = repair_task.Task.from_json({**self.raw, "claim_token": "t", "expires_at": time.time() + 60})
+        self.assertEqual(repair_task.pre_rebased(task)["source"], self.content.tip)
+        self.assertEqual(repair_task.artifact_revisions(task), [self.head, self.content.base])
+        task.extra["pre_rebased"]["head_base"] = "f" * 40
+        self.assertEqual(repair_task.artifact_revisions(task), [self.head, "f" * 40, self.content.base])
+        self.assertEqual(
+            [rev for _, rev in repair_publish.preferred(self.settings(), task)],
+            [task.tip, self.head],
+            "the repair namespace at the pre-rebased tip, then at the head's tip",
+        )
+        own = repair_task.Task.from_json(
+            {**self.content.task(kind="prepare"), "claim_token": "t", "expires_at": time.time() + 60}
+        )
+        self.assertIsNone(repair_task.pre_rebased(own))
+        self.assertEqual(repair_task.artifact_revisions(own), [self.content.base])
+
+    def test_the_worker_repairs_the_pre_rebased_chain_on_the_heads_tip_and_publishes_its_tip(self):
+        os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.head  # the public cache never has the head's tip
+        os.environ["STUB_LAKE_REPAIR_REVS"] = self.head  # the head's repair published its outputs
+        self.script()
+        os.environ["STUB_AGENT_MODE"] = "stream"
+        lines = self.observe_log()
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(
+            (outcome["artifacts"]["cache_revision"], outcome["artifacts"]["cache_service"]),
+            (self.head, "tauceti-repair"),
+        )
+        warm = [line for line in lines if "warm artifacts from" in line]
+        self.assertEqual(
+            warm,
+            [
+                f"task 1: warm artifacts from {self.head[:12]} (the head's tip); skipped: tauceti-repair: "
+                f"no published cache mapping for {self.raw['tip'][:12]}"
+            ],
+        )
+        self.assertEqual(outcome["stream_build"]["failed_modules"], ["TauCeti.Two", "TauCeti.Three"])
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn(f"has been replayed onto the head's tip `{self.head[:12]}`", prompt)
+        self.assertNotIn("on the `main` commit", prompt)
+        # The result sits on the head's tip, one commit per member, and is published under its tip.
+        tip = outcome["tip"]
+        self.assertEqual(
+            [c.source_pr for c in chain_tool.chain_commits(self.content.clone, self.head, tip)],
+            [m["source_pr"] for m in self.content.members],
+        )
+        self.assertEqual(self.service.results[0]["tip_sha"], tip)
+        record = repair_publish.BACKGROUND.wait(60)
+        self.assertEqual([(r["revision"], r["state"]) for r in record], [(tip, "published")])
+
+    def test_a_pre_rebased_chain_that_builds_is_released_as_prepared_and_published(self):
+        self.script("✔ [1/3] Built TauCeti.One (0.1s)\n✔ [2/3] Built TauCeti.Two (0.1s)\nexit 0\n")
+        lines = self.observe_log()
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual((outcome["status"], outcome["reason"]), ("released", "prepared_clean"), outcome)
+        self.assertEqual(self.agent_calls(), [])
+        self.assertEqual(
+            [(r["reason"], r["error"]) for r in self.service.releases],
+            [("prepared_clean", "the batch built on the head's tip without errors")],
+        )
+        self.assertIn("task 1: the open batch builds on the head's tip; nothing to prepare", lines)
+        # The scripted build says green while the stub's own build still fails member 2, so the
+        # publisher's rehash pass skips; what matters here is which tip it was started for.
+        self.assertTrue(outcome["publish"]["launched"], outcome["publish"])
+        self.assertEqual(outcome["publish"]["revision"], self.raw["tip"])
 
 
 class ErrorParsing(unittest.TestCase):

@@ -15,12 +15,15 @@ Tables:
 - `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`),
   the expected parent recorded for promotion and, for an open batch, the version a `prepare` task
   last built (and repaired) on its own base and its pre-rebase onto the head's tip
-  (`pre_rebase_state`, `_tip`, `_onto`, `_source`, `_edits`, `_at`).
+  (`pre_rebase_state`, `_tip`, `_onto`, `_source`, `_edits`, `_at`, and `_prepared`, the pre-rebased
+  tip a `prepare` task last built and repaired on the head's tip).
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it, the explanation collected from its message, the `no_repair` opt-out and
   whether it was `withdrawn` (an emptied `no_repair` member whose commit stays until the head lands).
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
-- `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state.
+- `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state; a
+  `prepare` task of a batch's pre-rebased chain carries the batch tip that chain covers
+  (`pre_rebase_source`), and none for a preparation on the batch's own base.
 - `batch_tips`: every tip a batch has had, by version and time, so that a CI dispatch can name the
   previous tips whose published build outputs Lake can reuse after the batch is replayed.
 - `ci_attempts`: every candidate dispatch with the run it was bound to, placement, phases, outcome,
@@ -98,7 +101,8 @@ CREATE TABLE IF NOT EXISTS batches (
     pre_rebase_onto TEXT,
     pre_rebase_source TEXT,
     pre_rebase_edits TEXT NOT NULL DEFAULT '{}',
-    pre_rebase_at REAL
+    pre_rebase_at REAL,
+    pre_rebase_prepared TEXT
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
@@ -153,7 +157,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     resolution TEXT NOT NULL DEFAULT '',
     ci_attempt_id INTEGER,
     claims INTEGER NOT NULL DEFAULT 0,
-    submissions INTEGER NOT NULL DEFAULT 0
+    submissions INTEGER NOT NULL DEFAULT 0,
+    pre_rebase_source TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_state ON tasks (state, batch_id);
 CREATE TABLE IF NOT EXISTS submissions (
@@ -276,6 +281,8 @@ class Store:
         ("inputs", "anticipated", "TEXT NOT NULL DEFAULT '{}'"),
         ("members", "no_repair", "INTEGER NOT NULL DEFAULT 0"),
         ("members", "withdrawn", "INTEGER NOT NULL DEFAULT 0"),
+        ("batches", "pre_rebase_prepared", "TEXT"),
+        ("tasks", "pre_rebase_source", "TEXT"),
     )
 
     def _add_missing_columns(self) -> None:

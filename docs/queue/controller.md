@@ -227,6 +227,33 @@ directly (the `rebased` journal entry carries `pre_rebased`), recording the memb
 task as edited; otherwise it is replayed as before. The stacked pair is never built by the
 controller and nothing about the pre-rebase is a verdict.
 
+Preparing the pre-rebased chain (item 16 of "Five improvements from the first production repair" in
+the plan): a clean replay produces a tip nobody has built, so `_prepare_pre_rebased` creates a
+second kind of `prepare` task for the oldest open batch's usable pre-rebase (`clean`, or `adopted`
+from a `pre_rebase` task) once it is up to date (on the head's tip, covering the batch's tip),
+`_pre_rebase_blocked` allows the head, `prepare_pre_rebased` and `prepare_open_batches` are on, the
+batch has `prepare_min_members` members and is prepared on its own base at its current version, no
+other background task of the batch is open, and the chain is neither prepared nor already prepared,
+released clean or failed for that tip. The task's `base` and `onto` are the head's tip, its `tip` the
+pre-rebased tip, and `tasks.pre_rebase_source` the batch tip the chain covers (null for an own-base
+preparation); the controller retains the chain as `refs/tauceti-queue/batches/<id>/pre-rebased/<tip>`
+on GitHub and the claim's `extra.pre_rebased` carries `source`, the batch's own base (`batch_base`),
+the head's id and base (`head_batch_id`, `head_base`), which the worker uses as cache fallbacks. It
+is claimed like any background task (one claim per batch, at most `repair_concurrency - 1`), and
+insertion skips the batch while it is held. The submission is validated against the members the
+chain covers and adopted as the batch's pre-rebase (`pre-rebase-prepared` in the journal): its tip
+becomes `pre_rebase_tip`, the members the agent edited join `pre_rebase_edits`, and
+`batches.pre_rebase_prepared` records the tip as prepared on that head tip; a `prepared_clean`
+release records the task's tip the same way, and `agent_failed` or `push_failed` settles the task as
+`failed` for that tip. The batch's own chain, version and members are unchanged. A task whose `onto`
+is no longer the head's tip (`head-moved`), or whose chain is no longer a prefix of the batch's
+usable pre-rebase (`pre-rebase-changed`), is superseded and its claims released; sealing never waits
+for it (it is superseded as `sealed` with the own-base preparation). An own-base preparation that
+becomes due waits while a worker holds this task and supersedes it when unclaimed. A head that lands
+as the prepared tip's base seals with the prepared tip unchanged, so its CI round fetches the outputs
+the worker published for that exact tip; a later insertion extends the pre-rebase by replay, which
+leaves it unprepared until the next preparation.
+
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
 `base_sha`, `batch_id`, `members`, `base_ref`, `repair_outputs_revs`). Observation reads `find_candidate_run` when an event
@@ -374,6 +401,7 @@ and reported in status:
 | `prepare_min_members` | 20 | members an open batch needs before it is prepared |
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
+| `prepare_pre_rebased` | true | create a `prepare` task for the oldest open batch's usable pre-rebase on the head's tip (with `prepare_open_batches`, for the batches it applies to) |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
 ## Ports
@@ -447,9 +475,12 @@ count, oldest age, max passes waited, the inputs); `open_batch` (the first open 
 base, tip, size, oldest member age, members, claim, retained ref); `open_batches` (every open batch
 in id order: id, version, base, tip, size, urgent, oldest member age, and the preparation:
 `prepared_version`, `prepared`, the open `prepare_task`, `quiet_seconds` since the last insertion;
-and `pre_rebase` (null, or `state`, `onto`, `tip`, `source`, `at`, `current`, `edited` and the open
-`task_id`); and `background`, `active` (null, or the open background task's `kind`, `task_id` and
-whether it is `claimed`) and `waiting` (null, or the other `kind` and the `reason` it waits);
+and `pre_rebase` (null, or `state`, `onto`, `tip`, `source`, `at`, `current`, `edited`, the open
+`task_id`, and the preparation of the pre-rebased chain: `preparation` (`preparing`, `prepared` or
+`unprepared`), `prepared_tip`, the open `prepare_task_id` and whether it is `prepare_claimed`, and
+`prepare_blocked`, why an unprepared chain has no task); and `background`, `active` (null, or the
+open background task's `kind`, `task_id`, whether it is `claimed` and, for `prepare`, the `chain` it
+prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` and the `reason` it waits);
 `open_batch` carries the same preparation and `pre_rebase` fields); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and

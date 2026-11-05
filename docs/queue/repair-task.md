@@ -65,7 +65,8 @@ repeated for a task whose repository differs from the configured one.
 `Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair`, `rebase_conflict`, `pre_rebase` or `prepare`),
 `repository`, `batch_id`, `batch_version`, `base` and `tip` (the chain to start from), `onto` (the
 commit the replacement must be based on: the canonical commit for a rebase conflict, the head's tip
-for a pre-rebase of the next open batch, `base` itself for a repair or a preparation), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
+for a pre-rebase of the next open batch, `base` itself for a repair or a preparation, and the head's
+tip, like `base`, for a preparation of the pre-rebased chain), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
 `description`, `author`, `explanation`, `retained_ref`), `diagnostics`, `retained_refs`,
 `submission_ref`, `claim_token`, `expires_at`, `instruction` (the plan's agent instruction, used
 verbatim as the prompt's first paragraph), `created_at`, `extra`. The runner renews every
@@ -384,6 +385,27 @@ build passed, otherwise the compiler errors handed to the last agent (the stream
 `errors.jsonl` merged with the diagnostics), which no worker build showed fixed. The controller
 passes them to the batch's later `pre_rebase` task as a `prepare_errors` diagnostic, which the
 prompt lists under "Errors the batch's preparation left".
+
+**Preparing the pre-rebased chain** (a `prepare` task whose `extra.pre_rebased` is set;
+`docs/queue/controller.md`, "Preparing the pre-rebased chain"). After an open batch's pre-rebase onto
+the head's tip, the controller hands out a second preparation of the replayed chain: `base` and
+`onto` are the head's tip, `tip` the pre-rebased tip (fetched from
+`refs/tauceti-queue/batches/<id>/pre-rebased/<tip>`), the members are the commits of that chain, and
+`extra.pre_rebased` names the batch tip it covers (`source`), the batch's own base (`batch_base`) and
+the head's base (`head_base`). The worker runs it exactly like an own-base preparation, so the
+streaming build, the parallel groups, the in-place repair with edits folded into the owning members'
+commits, the worker's audits (against the head's tip) and the submission are unchanged. Only the
+artifacts differ: the repair namespace is asked for the pre-rebased tip and then the head's tip
+(`repair_publish.preferred`), the outputs the head's repair published, and the public cache for the
+head's tip, its first-parent ancestors, then `head_base` and `batch_base` (`artifact_revisions`),
+since the public cache never has the head's tip; the log names the revision restored as the head's
+tip, the head's base or the batch's own base. The prompt's "What happened" says that the batch has
+been replayed onto the head's tip, the commit it becomes the next head on, and that the head's own
+commits below it are not the agent's to edit. A green build releases the task as `prepared_clean`
+("the batch built on the head's tip without errors"), otherwise the result is submitted, and in both
+cases the publisher then publishes the outputs for the tip: the pre-rebased tip, or the submitted
+one. The controller adopts that tip as the batch's pre-rebase, so a head that lands unchanged seals
+with it and CI's fetch for the exact staging head finds these outputs.
 
 ## Repair cache publication
 
