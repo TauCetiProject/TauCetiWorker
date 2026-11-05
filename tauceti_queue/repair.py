@@ -820,6 +820,7 @@ def prepare_artifacts(
     mathlib_cache: bool = False,
     lake: tuple[str, ...] = ("lake",),
     preferred: tuple[tuple[str, str], ...] = (),
+    build: bool = True,
 ) -> dict:
     """Warm artifacts the way the plan's default source does: main's cache at the base, then an
     incremental build of the batch's modules. Returns timings, module counts and ``available``.
@@ -840,7 +841,9 @@ def prepare_artifacts(
     probes whether the failed candidate's own outputs were published (measurement only).
     ``preferred`` are ``(service, revision)`` fetches tried before all of these (the workers' repair
     namespace, ``repair_publish.preferred``); ``cache_service`` records the service of the restored
-    mapping.
+    mapping. ``build=False`` fetches only: the caller runs the
+    incremental build itself (``repair_stream`` streams it to the agent), so ``available`` rests on the
+    fetch alone.
     """
     record: dict = {}
     seconds = 0.0
@@ -879,20 +882,20 @@ def prepare_artifacts(
         own["published"] = own["mapping_found"]
         record["candidate_outputs_published"] = own
         seconds += own["seconds"]
-    if not reasons:
-        build = run_logged(
+    if build and not reasons:
+        built = run_logged(
             repair_sandbox.sandboxed_lake([*lake, "build", "--iofail"], worktree, env),
             worktree,
             logdir / "prepare-build.log",
             env=env,
             timeout=build_timeout,
         )
-        build.update(parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
-        record["incremental_build"] = build
-        seconds += build["seconds"]
-        if build["timed_out"]:
+        built.update(parse_lake_build_log(Path(built["log"]).read_text(errors="replace")))
+        record["incremental_build"] = built
+        seconds += built["seconds"]
+        if built["timed_out"]:
             reasons.append(f"incremental build did not complete within {build_timeout:.0f}s")
-        elif build["rc"] == 127:
+        elif built["rc"] == 127:
             reasons.append("lake could not be run")
     record["seconds"] = round(seconds, 1)
     record["available"] = not reasons

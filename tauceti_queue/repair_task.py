@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from tauceti_queue import repair, repair_context, repair_publish, repair_sandbox
+from tauceti_queue import repair, repair_context, repair_publish, repair_sandbox, repair_stream
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 
 SCHEMA = "tauceti-queue.repair-task/v1"
@@ -642,6 +642,9 @@ class RunnerConfig:
     lake: tuple[str, ...] = ("lake",)
     poll_seconds: float = 60.0
     admin_recheck_seconds: float = 3600.0
+    # Run the first whole-library build in the background and launch the agent at its first error
+    # (``repair_stream``; ``TAUCETI_QUEUE_STREAM_REPAIR``, ``--no-stream-repair``). Off: the agent runs it.
+    stream_repair: bool = True
     # The service publishes a task's retained refs through its outbox a moment after creating the
     # task, so a ref the remote does not have yet is retried for this long before it is an error.
     fetch_retry_seconds: float = 120.0
@@ -1449,6 +1452,8 @@ def run_task(
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
     outcome: dict = {"task_id": task.task_id, "status": "running", "worker": cfg.worker}
+    streaming = cfg.stream_repair and task.kind == "repair" and not resuming
+    stream: repair_stream.StreamingBuild | None = None
     started = time.monotonic()
 
     def discard(detail: str) -> dict:
@@ -1519,6 +1524,7 @@ def run_task(
                 mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
                 lake=cfg.lake,
                 preferred=repair_publish.preferred(cfg.publish, task),
+                build=not streaming,
             )
             if artifacts["cache_revision"]:
                 skipped = "; ".join(artifacts.get("cache_skipped") or ())
@@ -1560,6 +1566,20 @@ def run_task(
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         ownership = repair_context.compute(cfg.clone, chain_before, task.validation_base, worktree)
         outcome["repair_context"] = ownership.summary()
+        if streaming and (outcome.get("artifacts") or {}).get("available"):
+            stream = repair_stream.start_build(
+                worktree,
+                repair.listings_path(worktree).parent,
+                env_lake,
+                chain=chain_before,
+                repository=task.repository,
+                lake=cfg.lake,
+                timeout=cfg.build_timeout,
+                copy_log_to=logdir / "stream-build.log",
+            )
+            if not stream.wait_for_agent(cancel):
+                return cancelled("cancelled while the build streamed")
+            outcome["stream_build"] = stream.summary()
         findings = task_findings(task)
         feedback: str | None = None
         pushed: str | None = None
@@ -1587,6 +1607,8 @@ def run_task(
                 )
                 context.repair_context = ownership
                 prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
+                if stream is not None:
+                    prompt = stream.annotate(prompt)
                 if resume_session:
                     prompt = (
                         "The worker running this task was interrupted and has resumed your session; the worktree is "
@@ -1777,6 +1799,9 @@ def run_task(
         lease.stop()
         if stop is not None:
             stop.detach(cancel)
+        if stream is not None:
+            stream.stop()
+            outcome["stream_build"] = stream.summary()
         outcome["seconds"] = round(time.monotonic() - started, 1)
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
         # An interrupted task keeps its worktree: the next start resumes the agent in it.
@@ -2245,6 +2270,12 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
     return checks
 
 
+def stream_repair_enabled(no_stream_repair: bool = False, environ: dict | None = None) -> bool:
+    """``--no-stream-repair`` or ``TAUCETI_QUEUE_STREAM_REPAIR`` set to 0/false/no/off turn streaming off."""
+    value = (os.environ if environ is None else environ).get("TAUCETI_QUEUE_STREAM_REPAIR", "1").strip().lower()
+    return not no_stream_repair and value not in ("0", "false", "no", "off")
+
+
 def _env_path(key: str) -> Path | None:
     value = os.environ.get(key)
     return Path(value).expanduser() if value else None
@@ -2256,7 +2287,8 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__.split("\n\n")[0]
         + " Defaults come from the environment the service unit's EnvironmentFile sets: TAUCETI_QUEUE_SERVICE,"
         " TAUCETI_QUEUE_WORKER, TAUCETI_QUEUE_CLONE, TAUCETI_QUEUE_TASK_ROOT, TAUCETI_QUEUE_POLL_SECONDS,"
-        " TAUCETI_QUEUE_SEED_PACKAGES, TAUCETI_QUEUE_TOKEN_FILE (or TAUCETI_QUEUE_TOKEN), TAUCETI_QUEUE_PROVIDERS,"
+        " TAUCETI_QUEUE_SEED_PACKAGES, TAUCETI_QUEUE_STREAM_REPAIR, TAUCETI_QUEUE_TOKEN_FILE (or TAUCETI_QUEUE_TOKEN),"
+        " TAUCETI_QUEUE_PROVIDERS,"
         " TAUCETI_QUEUE_RATE and ANTHROPIC_API_KEY (the api provider's key).",
     )
     parser.add_argument(
@@ -2312,6 +2344,12 @@ def main(argv: list[str] | None = None) -> int:
         help="share this extracted .lake/packages instead of lake exe cache get ($TAUCETI_QUEUE_SEED_PACKAGES)",
     )
     parser.add_argument("--no-resume", action="store_true", help="do not continue checkpointed tasks on start")
+    parser.add_argument(
+        "--no-stream-repair",
+        action="store_true",
+        help="let the agent run the first whole-library build itself instead of the worker streaming it to the agent"
+        " as it runs ($TAUCETI_QUEUE_STREAM_REPAIR=0)",
+    )
     args = parser.parse_args(argv)
     if not args.service:
         parser.error("--service (or TAUCETI_QUEUE_SERVICE) is required")
@@ -2349,6 +2387,7 @@ def main(argv: list[str] | None = None) -> int:
         providers=providers,
         rate=args.rate or None,
         api_key=api_key,
+        stream_repair=stream_repair_enabled(args.no_stream_repair),
     )
     if args.check:
         checks = preflight(cfg)

@@ -160,7 +160,9 @@ has a time budget holds because the service re-exposes the task.
    for Mathlib (or a shared extracted `.lake/packages` through `--seed-packages`, the experiment's
    stand-in for the shared Mathlib view), `lake cache get --service tauceti-public --repo <repository>
    --rev=<revision>` into the private pool, then `lake build --iofail` at the tip, which restores every
-   unchanged module and builds the batch's own modules and their dependents. The artifacts come from
+   unchanged module and builds the batch's own modules and their dependents (for a repair with
+   streaming on, the default, that build is the worker's background build described after this list,
+   and the preparation ends with the fetch). The artifacts come from
    the newest revision the cache has: the revision the build runs on (`artifact_revisions` puts it
    first: a repair's `base`, a rebase conflict's `onto`), then its first-parent ancestors walking back
    up to `ARTIFACT_ANCESTORS` (50) commits, each asked with its own `lake cache get --rev=` until one
@@ -303,6 +305,28 @@ has a time budget holds because the service re-exposes the task.
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
    outcome record.
+
+**Repair while the build still streams** (`tauceti_queue/repair_stream.py`; setting
+`TAUCETI_QUEUE_STREAM_REPAIR`, default on, and `--no-stream-repair`). The first production repair spent
+its whole first `lake build --iofail` pass collecting errors before touching anything, so for a repair
+task with warm artifacts the worker runs that build itself: once the worktree and the cache fetch are
+ready it starts `lake build --iofail` in the worktree in the background with its log at
+`.tauceti-repair/build.log`, holds `.tauceti-repair/build.lock` while it runs, tails the log and
+appends each compiler error (`file:line:col: error: ...` with its continuation lines) to
+`.tauceti-repair/errors.jsonl` as it appears, as one JSON object with `module`, `file`, `line`,
+`column`, `message`, `member` (the PR whose squash commit last touched the file) and `commit`. The agent
+is launched at the first error, or when the build ends, whichever comes first, with a "Build in
+progress" section before the verification advice: the build is running in the background, its log and
+error list are at those paths and grow, modules that have already failed may be edited now, no `lake
+build` of its own may start while the lock exists, and `.tauceti-repair/build <Module> ...` (the scoped
+build script of `tauceti_queue/repair_tools.py`, whose lock the streaming build takes through
+`take_lock` so the two never overlap) waits for the lock and builds only the named modules.
+When the build ends the worker appends a `build finished, exit N, M errors total` line to the error
+list, removes the lock and copies the log to `tasks/<id>/logs/stream-build.log`; the outcome records
+the build under `stream_build`. The agent's final whole-library `lake build --iofail` after its fixes
+is still the only verdict. A build still running when the task ends or is interrupted is stopped and
+its lock removed. Rebase-conflict tasks, resumed tasks and `--no-stream-repair` keep the sequential
+flow: the preparation's own incremental build, then the agent.
 
 ## Repair cache publication
 
