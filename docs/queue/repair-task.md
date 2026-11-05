@@ -244,6 +244,26 @@ has a time budget holds because the service re-exposes the task.
    non-existent path, an isolated `CLAUDE_CONFIG_DIR` seeded as the workers seed theirs, and the
    private artifact pool's `LAKE_*` variables. The provider session id is written to
    `tasks/<id>/session.json` as the worker's session identity. Checkpoint `agent_running`.
+
+   Before the first attempt the worker also gives the agent ownership and declaration context
+   (`repair_context.compute`, called once the worktree exists; the result goes on
+   `PromptContext.repair_context` and its summary into the outcome record): for every member, the
+   files its squash commit changes (`.tauceti-repair/files.jsonl`: `position`, `pr`, `commit`,
+   `files`) and the declaration names it adds, removes or renames (`.tauceti-repair/decls.jsonl`:
+   `added`, `removed`, `renamed` pairs, marked `approximate: true` because they come from a line scan
+   of each changed Lean file's two versions for `theorem`, `lemma`, `def`, `abbrev`, `instance`,
+   `structure`, `class`, `inductive`, `axiom` and `alias` under their `namespace`/`section` nesting,
+   not from the compiled environment; a removal and an addition in one file sharing a dotted or
+   underscored prefix or suffix are paired as a rename), and from those the collisions (a name added
+   by two or more members) and rename ripples (a name removed or renamed by one member and still
+   referenced, whole word, in another member's changed files at the chain tip or in the target's
+   version of a file no member changed). Every collision and ripple is in
+   `.tauceti-repair/collisions.jsonl` with line numbers; the prompt's "Likely collisions and
+   renames" section, next to "Already on main", lists them with member positions, PRs and files up
+   to `repair_context.SECTION_LINES` bullets and points at that file for the rest. One `git
+   diff-tree` per member and `git cat-file --batch` for the changed blobs run over a thread pool, so
+   a 1,197-member head takes about a second; a failure in this step is recorded in the outcome and
+   the prompt simply lacks the section.
 5. **Checks.** `repair.chain_report`, the controller's own checks in its order: `chain.validate`
    against the recorded members on `onto` (identity by `Source-PR`, single-parent history, both
    trailers, count) and `chain.compare` of the input chain `base..tip` against the result on `onto`
@@ -396,8 +416,10 @@ the same session, a terminal rejection, a superseded claim at submission, a loca
 retried with the local report, the local explanation follow-up turn, artifacts unavailable with and
 without a `release` route, inference unavailable after bounded retries, an ordinary agent failure
 and the worker's attempt cap released as `agent_failed`, a second claimant and a stale token refused,
-resumption of a checkpointed session, the task record and prompt for a rebase conflict, and the
+resumption of a checkpointed session, the task record and prompt for a rebase conflict, the
 provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
 unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the
 `api` provider's key and credential-free config dir, the attempts in the outcome and the heartbeat, and
-the eligibility check against the pacer's readers). No real inference and no network.
+the eligibility check against the pacer's readers), and the ownership and declaration context
+(declarations under namespaces, a collision and a rename ripple reported with their members, and a
+120-member batch whose prompt section stays under the cap). No real inference and no network.

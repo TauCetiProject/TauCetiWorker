@@ -926,6 +926,7 @@ class PromptContext:
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
     rebase_options: str = "--keep-empty --empty=keep --reapply-cherry-picks"  # the replay's git options
+    repair_context: object | None = None  # ``repair_context.compute``'s result: ownership, collisions and ripples
 
 
 def _pr_list(prs: list[int]) -> str:
@@ -1644,6 +1645,8 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     if where is None:
         lines += _inline_listing(context, chain, landed)
     lines += _landed_section(context, chain, landed, where)
+    if context.repair_context is not None and where:
+        lines += context.repair_context.prompt_lines()
     lines += _result_section(base_short)
     lines += _editing_section(context, chain, base_short, where)
     lines += _verification_section(context, findings, base_short, check_command)
