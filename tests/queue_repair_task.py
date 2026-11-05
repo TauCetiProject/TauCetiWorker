@@ -161,15 +161,13 @@ CLAUDE = r'''#!/usr/bin/env python3
 """claude / codex stub (installed under both names; the name selects the CLI it imitates): a scripted
 repair agent. STUB_AGENT_MODE selects the behaviour (STUB_AGENT_MODES, a comma list, selects it per
 call); every call is logged."""
-import json, os, re, subprocess, sys, time
+import fcntl, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 agent = Path(sys.argv[0]).name  # claude | codex
 args = sys.argv[1:]
 stub_dir = Path(os.environ["STUB_DIR"])
 calls = stub_dir / "agent-calls.jsonl"
-previous = sum(1 for _ in calls.open()) if calls.exists() else 0
-call = previous + 1
 prompt, prompt_via, resume = "", None, None
 if agent == "claude":
     # Like Claude Code: `-p <prompt>` takes the prompt from argv; a bare `-p` (the next argument is an
@@ -189,6 +187,12 @@ else:
     else:
         prompt, prompt_via = args[-1], "argv"
     resume = args[-2] if "resume" in args[:3] else None
+# Concurrent calls (the parallel path's group agents) number themselves under a lock held until their
+# call record is appended, so no two of them count the same lines and take the same number.
+call_lock = (stub_dir / "agent-calls.lock").open("a")
+fcntl.flock(call_lock, fcntl.LOCK_EX)
+previous = sum(1 for _ in calls.open()) if calls.exists() else 0
+call = previous + 1
 modes = [m for m in os.environ.get("STUB_AGENT_MODES", "").split(",") if m]
 mode = modes[min(call, len(modes)) - 1] if modes else os.environ.get("STUB_AGENT_MODE", "repair")
 config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -203,6 +207,8 @@ launch = {
 started = time.time()
 with calls.open("a") as handle:
     handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+fcntl.flock(call_lock, fcntl.LOCK_UN)
+call_lock.close()
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
 if agent == "claude":
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
@@ -267,6 +273,17 @@ def fixup():
     failing = os.environ.get("STUB_FAIL_GROUP_WITH")
     if failing and failing in allowed:
         finish("this group's agent gave up", rc=1)
+    barrier = int(os.environ.get("STUB_GROUP_BARRIER", "0"))
+    if barrier:
+        # Wait until that many group agents have arrived, so they provably run at the same time.
+        arrived = stub_dir / "group-barrier"
+        arrived.mkdir(exist_ok=True)
+        (arrived / str(call)).touch()
+        deadline = time.time() + 60
+        while len(list(arrived.iterdir())) < barrier:
+            if time.time() > deadline:
+                finish("the other group agents never arrived", rc=4)
+            time.sleep(0.05)
     time.sleep(float(os.environ.get("STUB_GROUP_SLEEP", "1.0")))
     for path in allowed:
         file = Path(path)
@@ -789,7 +806,13 @@ class Fixture(unittest.TestCase):
         os.environ.pop("STUB_GH_ADMIN", None)
         os.environ.pop(repair_sandbox.DISABLE_VARIABLE, None)
         (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir)}))
-        for key in ("STUB_FAIL_GROUP_WITH", "STUB_GROUP_STRAY", "STUB_GROUP_BUILD", "STUB_LAKE_BUILD_SLEEP"):
+        for key in (
+            "STUB_FAIL_GROUP_WITH",
+            "STUB_GROUP_STRAY",
+            "STUB_GROUP_BUILD",
+            "STUB_GROUP_BARRIER",
+            "STUB_LAKE_BUILD_SLEEP",
+        ):
             os.environ.pop(key, None)
         os.environ["STUB_GROUP_SLEEP"] = "1.0"
         self.service = FakeService(self.content.bare, [self.content.task()])
@@ -2486,6 +2509,8 @@ class ParallelRepair(Fixture):
 
     def test_two_independent_groups_are_repaired_in_parallel_and_folded(self):
         os.environ["STUB_GROUP_BUILD"] = "1"  # each group agent checks its fix through the scoped build script
+        os.environ["STUB_GROUP_BARRIER"] = "2"  # neither agent finishes until both have started
+        os.environ["STUB_GROUP_SLEEP"] = "0"
         cfg = self.config(parallel_agents=3)
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
@@ -2495,6 +2520,7 @@ class ParallelRepair(Fixture):
         self.assertEqual(len(calls), 2)
         self.assertEqual(sorted(c["cwd"] for c in calls), [str(self.group_worktree(1)), str(self.group_worktree(2))])
         self.assertEqual({c["agent"] for c in calls}, {"claude"})
+        self.assertEqual(sorted(c["call"] for c in calls), [1, 2], "concurrent agents take distinct call numbers")
         finishes = {f["call"]: f for f in self.agent_finishes()}
         first, second = finishes[1], finishes[2]
         self.assertLess(first["started"], second["finished"])
