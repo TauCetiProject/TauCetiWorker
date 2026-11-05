@@ -263,6 +263,12 @@ Consequences:
   `tauceti-queue serve`, after which the supervisor loop restarts it on the new revision (the same
   shutdown as the unit's). Verify as in "Verification after a deploy", reading `service.log` instead
   of `journalctl`.
+- **Keep systemd disabled on this host.** The installer currently enables and starts units even
+  with `--no-restart`; do not run it beneath the detached supervisors. Use the deployed
+  `deploy-queue.sh` / `deploy-service.sh` scripts, or fast-forward the checkout to a verified
+  revision, bake `_revision.py`, and restart the existing supervisors. Confirm the service and
+  repair units remain disabled afterward. The installer is appropriate on the dedicated host
+  once systemd owns those processes.
 - **Baked revision.** `tauceti_queue/_revision.py` is written by `install.sh` only. After a plain
   `git pull` in `~/TauCetiQueue`, rewrite it by hand before restarting, or the status page reports the
   old revision:
