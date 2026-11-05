@@ -68,6 +68,8 @@ from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_cha
 SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
 SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
+# ``prepare`` builds an open batch on its own base and repairs what fails before the batch is the head.
+TASK_KINDS = ("repair", "rebase_conflict", "prepare")
 RELEASE_REASONS = (
     "artifacts_unavailable",
     "inference_unavailable",
@@ -75,6 +77,7 @@ RELEASE_REASONS = (
     "agent_failed",
     "push_failed",
     "worker-stopped",  # the worker was stopped (SIGTERM) before the task reached a resumable phase
+    "prepared_clean",  # a ``prepare`` task's batch built without an error: nothing to repair
 )
 # Checkpoint states with the claim still ours and the task unfinished; everything else is settled.
 IN_FLIGHT_STATES = (
@@ -167,7 +170,7 @@ class Task:
     """
 
     task_id: str
-    kind: str  # repair | rebase_conflict
+    kind: str  # repair | rebase_conflict | prepare
     repository: str
     batch_id: str
     batch_version: int
@@ -190,7 +193,7 @@ class Task:
         for key in ("task_id", "kind", "repository", "base", "tip", "members", "claim_token", "expires_at"):
             if key not in data:
                 raise ValueError(f"task record lacks {key!r}")
-        if data["kind"] not in ("repair", "rebase_conflict"):
+        if data["kind"] not in TASK_KINDS:
             raise ValueError(f"unknown task kind {data['kind']!r}")
         repository = str(data["repository"])
         members = []
@@ -1529,7 +1532,9 @@ def run_task(
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
     outcome: dict = {"task_id": task.task_id, "status": "running", "worker": cfg.worker}
-    streaming = cfg.stream_repair and task.kind == "repair" and not resuming
+    # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
+    # to repair at all (the batch has not been tried, so the task carries no diagnostics).
+    streaming = (task.kind == "prepare" or (cfg.stream_repair and task.kind == "repair")) and not resuming
     stream: repair_stream.StreamingBuild | None = None
     started = time.monotonic()
 
@@ -1657,6 +1662,22 @@ def run_task(
             if not stream.wait_for_agent(cancel):
                 return cancelled("cancelled while the build streamed")
             outcome["stream_build"] = stream.summary()
+            if task.kind == "prepare" and stream.finished.is_set() and stream.rc == 0 and not stream.errors:
+                # The batch builds on its base as assembled: publish the outputs for the head's later
+                # rounds and give the task back as prepared, without an agent.
+                outcome["publish"] = repair_publish.publish_outputs(
+                    worktree,
+                    task.tip,
+                    settings=cfg.publish,
+                    env=env_lake,
+                    logdir=logdir,
+                    repository=task.repository,
+                    lake=cfg.lake,
+                )
+                log(f"task {task.task_id}: the open batch builds on its base; nothing to prepare")
+                return release_task(
+                    cfg, client, task, state, "prepared_clean", "the batch built without errors", outcome, lease
+                )
         findings = task_findings(task)
         feedback: str | None = None
         pushed: str | None = None
@@ -1672,7 +1693,7 @@ def run_task(
             attempt += 1
             if cancel.is_set() or stopping():
                 return cancelled("cancelled before the agent started")
-            if attempt == 1 and not resuming and task.kind == "repair" and cfg.parallel_agents > 1:
+            if attempt == 1 and not resuming and task.kind in ("repair", "prepare") and cfg.parallel_agents > 1:
                 # Independent failing groups are repaired by concurrent agents first; what they leave
                 # (nothing, a group that failed, a build that still fails) goes to the usual agent below.
                 parallel, remaining = run_parallel_groups(

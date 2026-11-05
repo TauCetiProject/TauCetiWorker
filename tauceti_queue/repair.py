@@ -932,7 +932,7 @@ class PromptContext:
 
     repository: str
     base: str  # the base the result must be on (for a rebase conflict: the target base)
-    kind: str = "repair"  # repair | rebase_conflict
+    kind: str = "repair"  # repair | rebase_conflict | prepare
     origin: str = ""  # one sentence: where this batch came from and why it is here
     suspects: list[int] = dataclasses.field(default_factory=list)
     suspect_heads: dict[int, str] = dataclasses.field(default_factory=dict)
@@ -1561,6 +1561,26 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     if conflict:
         happened, evidence = _rebase_sections(context, chain, clone, base_short, where)
         lines += happened + evidence
+    elif context.kind == "prepare":
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} squash commits, one per pull request, is waiting behind the queue's head on "
+            f"the `main` commit `{base_short}`. This batch has not yet been tried; fix what fails to build so it is "
+            "ready when it becomes the head; nothing you do is a verdict. The head's CI round decides later, after "
+            "the batch is rebased onto the `main` of that time, and your edits travel with its members."
+            + (f" {context.origin}" if context.origin else "")
+            + f" Your job is to make the whole batch build on `{base_short}`.",
+            "",
+            f"You are in a private, detached Git worktree of {context.repository}; HEAD is the batch's tip on "
+            f"`{base_short}`.",
+            "",
+            "## Build evidence",
+            "",
+            "No CI run has seen this batch. The worker's own whole-library `lake build --iofail` of it reports the "
+            "errors; see the build section below.",
+            "",
+        ]
     else:
         lines += [
             "## What happened",

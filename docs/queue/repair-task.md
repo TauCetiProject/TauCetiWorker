@@ -62,10 +62,10 @@ repeated for a task whose repository differs from the configured one.
 | `POST /tasks/<id>/result` | `{worker, claim_token, tip_sha, pushed_ref, worker_notes}` | the `Adoption` record |
 | `POST /tasks/<id>/release` | `{worker, claim_token, reason, error}` | `{task_id, released}`; `404` when the service has no such route |
 
-`Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair` or `rebase_conflict`), `repository`,
-`batch_id`, `batch_version`, `base` and `tip` (the chain to start from), `onto` (the commit the
-replacement must be based on: the canonical commit for a rebase conflict, `base` itself for a
-repair), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
+`Task` (`ports.Task.to_dict`): `task_id`, `kind` (`repair`, `rebase_conflict` or `prepare`),
+`repository`, `batch_id`, `batch_version`, `base` and `tip` (the chain to start from), `onto` (the
+commit the replacement must be based on: the canonical commit for a rebase conflict, `base` itself
+for a repair or a preparation), `members` (`source_pr`, `number`, `accepted_head`, `commit`, `provenance`, `title`,
 `description`, `author`, `explanation`, `retained_ref`), `diagnostics`, `retained_refs`,
 `submission_ref`, `claim_token`, `expires_at`, `instruction` (the plan's agent instruction, used
 verbatim as the prompt's first paragraph), `created_at`, `extra`. The runner renews every
@@ -110,6 +110,7 @@ controller's inference hold (`report_inference(worker, False, error)`), and `err
 | `agent_launch_failed` | the agent process could not be created at all (`OSError` from `Popen`: a missing executable, an argv the kernel rejects); the artifacts were ready, so no `artifacts_backoff` applies, and the error names the launch as the cause. A prompt longer than `agents.PROMPT_ARGV_LIMIT` (64 KiB) is written to the agent's stdin rather than passed in argv, since Linux rejects a single argument above 128 KiB |
 | `agent_failed` | the agent ran and exited on its own terms, or returned a chain that fails local validation, twice; the task is re-exposed to any worker |
 | `push_failed` | `git-safe-push` to the submission ref failed; the chain is retained locally under `refs/tauceti-queue/task/<id>/attempt-<n>` in the worker's clone |
+| `prepared_clean` | a `prepare` task's open batch built on its base without an error, so there was nothing to repair; the controller records the batch version as prepared |
 
 Stream F's server does not route `/tasks/<id>/release` yet; when the endpoint answers `404` the
 runner records `release_unsupported`, stops renewing and lets the claim expire, and the controller
@@ -327,6 +328,21 @@ the build under `stream_build`. The agent's final whole-library `lake build --io
 is still the only verdict. A build still running when the task ends or is interrupted is stopped and
 its lock removed. Rebase-conflict tasks, resumed tasks and `--no-stream-repair` keep the sequential
 flow: the preparation's own incremental build, then the agent.
+
+**Preparing an open batch** (`kind: "prepare"`; `docs/queue/controller.md`, "Background
+preparation"). While the head waits on CI the controller hands out `prepare` tasks for quiet open
+batches: `base` and `tip` are the open batch's own (never the head's tip), `onto` is `base`, and
+`diagnostics` is empty because no CI run has seen the batch. The worker runs it as a repair with the
+streaming build, always, even under `--no-stream-repair`, since that build is how it learns whether
+anything fails: a build that finishes with exit 0 and no error publishes its outputs to the repair
+cache under the batch tip and releases the task as `prepared_clean` without starting an agent. When
+the build reports errors the agent (or the parallel group agents) is launched as for a repair, with
+the "What happened" section saying that the batch has not yet been tried, that it should fix what
+fails to build so the batch is ready when it becomes the head, and that nothing it does is a verdict;
+the result is validated, pushed and submitted the same way, and the controller adopts it into the
+open batch's members, which carry the repairs through the batch's later rebase as the head. The
+claim's `extra.renew_after` is 60 seconds: the controller supersedes a preparation when its batch
+seals or the head gets a task, and the refused renewal stops the agent within a minute.
 
 ## Repair cache publication
 
@@ -557,4 +573,6 @@ fixups folded into a valid chain that is adopted, the groups taken from the stre
 sandbox wrapper, a group whose agent fails (or whose fixups stray outside its files) handed to the
 sequential agent, a lost claim stopping the group agents, the build lock serializing two concurrent
 scoped builds and taking over a stale lock, a provider-neutral group prompt, and dependent or
-unassignable failures staying sequential. No real inference and no network.
+unassignable failures staying sequential. A `prepare` task whose batch builds is released as
+`prepared_clean` without an agent, and one whose batch fails is repaired with the not-yet-tried
+prompt and adopted. No real inference and no network.

@@ -1040,6 +1040,115 @@ class OpenBatches(QueueFixture):
         self.assertEqual(len(restarted.batches("open")), 2)
 
 
+class Preparation(QueueFixture):
+    """Item 8 of the pipeline acceleration: an open batch is built and repaired on its own base while
+    the head waits on CI, so it seals carrying the repairs and lands without a failed CI round."""
+
+    def broken_content_policy(self):
+        """CI fails a candidate whose member module still says `BROKEN`, whatever the member numbers."""
+
+        def policy(head, _base, members):
+            broken = [n for n in members if "BROKEN" in (self.repo.file_at(head, f"TauCeti/Pr{n}.lean") or "")]
+            if broken:
+                return "fail", [
+                    {"kind": "compiler", "module": f"TauCeti/Pr{n}.lean", "message": f"error in PR {n}"} for n in broken
+                ]
+            return "pass", []
+
+        return policy
+
+    def scenario(self, prepare):
+        """A head in CI and an open batch with one broken member behind it; returns the batch and the agent."""
+        self.controller.set_setting("prepare_open_batches", prepare, "t")
+        self.controller.set_setting("prepare_min_members", 3, "t")
+        self.github.ci_policy = self.broken_content_policy()
+        self.approve(101, {"TauCeti/Pr101.lean": "head\n"})
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "ci")
+        for number in (201, 202, 203):
+            body = "BROKEN\n" if number == 202 else f"{number}\n"
+            self.approve(number, {f"TauCeti/Pr{number}.lean": body})
+        self.tick()
+        batch = self.open_batch()
+        self.assertEqual(len(self.members(batch)), 3)
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {
+                f"{PROJECT}#202": Resolution({"TauCeti/Pr202.lean": "202\n"}, explanation="Replaced BROKEN.")
+            }
+        )
+        return batch, agent
+
+    def drive_until_landed(self, batch, agents, limit=12):
+        """Tick, run CI and let the agents work until `batch` has landed; returns the rounds taken."""
+        for rounds in range(limit):
+            self.tick()
+            if self.controller.store.row("batches", {"id": batch["id"]})["state"] == "landed":
+                return rounds
+            head = self.controller.status()["head"]
+            if head is not None and head["stage"] == "ci":
+                self.run_ci()
+                continue
+            for agent in agents:
+                agent.run(self.controller)
+        self.fail(f"batch {batch['id']} did not land in {limit} rounds")
+
+    def source_failures(self, batch):
+        return self.controller.store.count("ci_attempts", {"batch_id": batch["id"], "outcome": "source-failure"})
+
+    def test_a_prepared_batch_seals_with_its_repairs_and_lands_without_a_failed_round(self):
+        batch, agent = self.scenario(prepare=True)
+        result = agent.run(self.controller)
+        self.assertEqual(agent.tasks[0].kind, "prepare")
+        self.assertEqual((agent.tasks[0].base, agent.tasks[0].onto), (batch["base"], batch["base"]))
+        self.assertTrue(result.accepted, result)
+        prepared = self.controller.store.row("batches", {"id": batch["id"]})
+        self.assertEqual((prepared["state"], prepared["prepared_version"]), ("open", prepared["version"]))
+        self.drive_until_landed(batch, [agent])
+        landed = self.controller.store.row("batches", {"id": batch["id"]})
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(self.source_failures(batch), 0, "the head's CI round found nothing left to repair")
+        self.assertEqual([t.kind for t in agent.tasks], ["prepare"], "no repair round for the prepared batch")
+        self.assertEqual(self.repo.file_at(self.repo.main_sha(), "TauCeti/Pr202.lean"), "202\n")
+        member = {m["number"]: m for m in self.members(landed)}[202]
+        self.assertEqual(member["provenance"], "edited")
+        self.assertIn("Replaced BROKEN.", member["explanation"])
+
+    def test_without_preparation_the_same_batch_fails_its_first_ci_round(self):
+        batch, agent = self.scenario(prepare=False)
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "prepare"}), 0)
+        self.drive_until_landed(batch, [agent])
+        self.assertEqual(self.source_failures(batch), 1)
+        self.assertEqual([t.kind for t in agent.tasks], ["repair"])
+
+    def test_insertion_during_preparation_goes_to_the_next_batch_and_the_head_task_comes_first(self):
+        batch, agent = self.scenario(prepare=True)
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "prepare")
+        self.approve(301, {"TauCeti/Pr301.lean": "301\n"})
+        self.tick()
+        row = self.controller.input_for(PROJECT, 301)
+        self.assertNotEqual(row["batch_id"], batch["id"], "inflow continues into the next open batch")
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["version"], batch["version"])
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        # The head fails CI: its repair task is the next claim, ahead of the newer batch's preparation.
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "prepare", "state": "open"}), 0, "below 3")
+        head = self.head()
+        self.github.runs[-1].verdict = "fail"
+        self.github.runs[-1].diagnostics = [{"kind": "compiler", "module": "TauCeti/Pr101.lean", "message": "x"}]
+        self.run_ci()
+        self.tick()
+        repair = self.agent(
+            "repairer", script=lambda task: {f"{PROJECT}#101": Resolution({"TauCeti/Pr101.lean": "ok\n"})}
+        )
+        self.assertEqual(repair.claim(self.controller).kind, "repair")
+        self.assertEqual(repair.tasks[0].batch_id, head["id"])
+
+
 class Lanes(QueueFixture):
     def test_s20_urgent_pr_is_in_the_next_head_without_cancelling_the_running_one(self):
         self.approve(101, {"A.lean": "a\n"})

@@ -11,12 +11,13 @@ Tables:
 - `settings`: runtime settings and small pieces of controller state (`key`, JSON `value`, actor, time).
 - `inputs`: approved inputs, one row per accepted PR revision, with the waiting/reserved/inserted/
   landed/cancelled state, priority, urgency and the retained ref of the accepted head.
-- `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`)
-  and the expected parent recorded for promotion.
+- `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`),
+  the expected parent recorded for promotion and, for an open batch, the version a `prepare` task
+  last built (and repaired) on its own base.
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it and the explanation collected from its message.
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
-- `tasks`: repair and rebase-conflict tasks with their diagnostics and state.
+- `tasks`: repair, rebase-conflict and prepare tasks with their diagnostics and state.
 - `ci_attempts`: every candidate dispatch with the run it was bound to, placement, phases, outcome.
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
@@ -81,7 +82,8 @@ CREATE TABLE IF NOT EXISTS batches (
     landed_how TEXT NOT NULL DEFAULT '',
     expected_parent TEXT,
     urgent INTEGER NOT NULL DEFAULT 0,
-    first_dispatch_at REAL
+    first_dispatch_at REAL,
+    prepared_version INTEGER
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
@@ -235,6 +237,7 @@ class Store:
         ("ci_attempts", "verdicts", "TEXT NOT NULL DEFAULT '{}'"),
         ("inputs", "last_probe_base", "TEXT NOT NULL DEFAULT ''"),
         ("inputs", "probe_conflicts", "TEXT NOT NULL DEFAULT '{}'"),
+        ("batches", "prepared_version", "INTEGER"),
     )
 
     def _add_missing_columns(self) -> None:

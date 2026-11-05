@@ -78,6 +78,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # budget is spent, and the loop is woken to continue in the next tick.
     "insertion_probe_budget_seconds": 20,
     "outbox_drain_budget_seconds": 20,
+    # Background preparation of open batches (`prepare` tasks): an open batch of at least
+    # `prepare_min_members` members that has had no insertion for `prepare_quiet_seconds` and has not
+    # been prepared at its current version is built and repaired on its own base while the head has no
+    # task of its own.
+    "prepare_open_batches": True,
+    "prepare_min_members": 20,
+    "prepare_quiet_seconds": 600,
 }
 
 # How long `status()` waits for the controller lock before serving the last snapshot instead.
@@ -99,6 +106,23 @@ BATCH_REMOVED = "removed"
 TASK_OPEN = "open"
 TASK_SUBMITTED = "submitted"
 TASK_SUPERSEDED = "superseded"
+
+TASK_REPAIR = "repair"
+TASK_REBASE_CONFLICT = "rebase_conflict"
+TASK_PREPARE = "prepare"
+# `claim_task` hands out the lowest value first, then the oldest task: the head's own tasks always
+# come before the background preparation of an open batch.
+TASK_PRIORITY = {TASK_REBASE_CONFLICT: 0, TASK_REPAIR: 0, TASK_PREPARE: 1}
+# How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
+# is how the worker learns that the controller took the batch back (it sealed, or the head needs the
+# worker), so the interval bounds how long a superseded preparation keeps running.
+PREPARE_RENEW_SECONDS = 60
+# Resolutions of a `prepare` task that settle its batch version: no second task is created for it.
+PREPARE_SETTLED = ("adopted", "prepared", "failed")
+# Worker release reasons: `prepared_clean` (the batch built without errors, nothing to repair) and the
+# failures after which a `prepare` task is not retried at the same batch version.
+PREPARE_CLEAN_REASON = "prepared_clean"
+PREPARE_FAILED_REASONS = ("agent_failed", "push_failed")
 
 OUTCOME_PENDING = "pending"
 OUTCOME_PASS = "pass"
@@ -733,7 +757,13 @@ class Controller:
             return None
 
     def claim_task(self, worker_identity: str, github_login: str) -> Task | None:
-        """Hand the head's open task to an authorized worker under a renewable claim, within `repair_concurrency`."""
+        """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
+
+        Tasks are offered by kind priority, then age (`TASK_PRIORITY`): the head's `repair` or
+        `rebase_conflict` task first, as many claims on it as `repair_concurrency` allows; a `prepare`
+        task only while the head has no open task, one claim per open batch, and only while fewer than
+        `repair_concurrency` task claims are active in total.
+        """
         with self._lock:
             now = self.clock()
             self._expire_claims(now)
@@ -742,39 +772,79 @@ class Controller:
                 reason = "not-admin" if admin is False else "github-unavailable"
                 self.store.journal(now, "claim-refused", worker=worker_identity, login=github_login, reason=reason)
                 return None
-            head = self._head()
-            if head is None:
+            concurrency = int(self.setting("repair_concurrency"))
+            chosen: tuple[dict[str, Any], dict[str, Any]] | None = None
+            for task, batch in self._claimable_tasks():
+                if task["kind"] != TASK_PREPARE:
+                    active = self._active_claims(batch["id"], task_id=task["id"])
+                    if len(active) >= concurrency:
+                        self._count("claim_collisions")
+                        self.store.journal(
+                            now, "claim-refused", worker=worker_identity, reason="concurrency", task_id=task["id"]
+                        )
+                        return None
+                    chosen = (task, batch)
+                    break
+                # The head's own task, when there is one, came first and stops the loop either way.
+                if self._active_claims(batch["id"]):
+                    continue
+                if len(self._active_task_claims()) >= concurrency:
+                    return None
+                chosen = (task, batch)
+                break
+            if chosen is None:
                 return None
-            task = self._open_task(head)
-            if task is None:
-                return None
-            active = self._active_claims(head["id"], task_id=task["id"])
-            if len(active) >= int(self.setting("repair_concurrency")):
-                self._count("claim_collisions")
-                self.store.journal(
-                    now, "claim-refused", worker=worker_identity, reason="concurrency", task_id=task["id"]
-                )
-                return None
+            task, batch = chosen
             token = secrets.token_hex(16)
             with self.store.transaction():
                 claim_id = self.store.insert(
                     "claims",
-                    batch_id=head["id"],
-                    batch_version=head["version"],
+                    batch_id=batch["id"],
+                    batch_version=batch["version"],
                     operation=f"task:{task['kind']}",
                     worker=worker_identity,
                     github_login=github_login,
                     token=token,
-                    starting_tip=head["tip"],
+                    starting_tip=batch["tip"],
                     task_id=task["id"],
                     created_at=now,
                     expires_at=now + int(self.setting("claim_ttl_seconds")),
                 )
                 self.store.update("tasks", {"id": task["id"]}, claims=task["claims"] + 1)
                 self.store.journal(
-                    now, "claimed", head["id"], task_id=task["id"], worker=worker_identity, claim_id=claim_id
+                    now,
+                    "claimed",
+                    batch["id"],
+                    task_id=task["id"],
+                    task_kind=task["kind"],
+                    worker=worker_identity,
+                    claim_id=claim_id,
                 )
-            return self._task_record(task, head, claim_id, token, now + int(self.setting("claim_ttl_seconds")))
+            return self._task_record(task, batch, claim_id, token, now + int(self.setting("claim_ttl_seconds")))
+
+    def _claimable_tasks(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Open tasks whose batch is still at the task's version and in the state the kind works on
+        (`open` for `prepare`, `head` otherwise), with their batch, by kind priority then age."""
+        found = []
+        for task in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
+            batch = self.store.row("batches", {"id": task["batch_id"]})
+            if batch is None or batch["version"] != task["batch_version"]:
+                continue
+            wanted = BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD
+            if batch["state"] != wanted:
+                continue
+            found.append((task, batch))
+        found.sort(key=lambda pair: (TASK_PRIORITY.get(pair[0]["kind"], 0), pair[0]["created_at"], pair[0]["id"]))
+        return found
+
+    def _active_task_claims(self) -> list[dict[str, Any]]:
+        """Every worker's live task claim, on any batch: what `repair_concurrency` bounds for `prepare`."""
+        now = self.clock()
+        return [
+            row
+            for row in self.store.rows("claims", {"released_at": None})
+            if row["task_id"] is not None and row["expires_at"] > now
+        ]
 
     def renew_task(self, task_id: int, claim_token: str) -> float:
         with self._lock:
@@ -785,15 +855,42 @@ class Controller:
             return expires
 
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "") -> None:
-        """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold."""
+        """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
+
+        A `prepare` task released as `prepared_clean` (its batch built without an error, so there was
+        nothing to repair) records the batch version as prepared; one released after the agent or the
+        push failed is resolved as `failed` and not offered again at that version. Any other release
+        leaves the task open for the next claim, as for the head's tasks.
+        """
         with self._lock:
             now = self.clock()
             claim = self._claim_for(task_id, claim_token, now)
+            task = self.store.row("tasks", {"id": task_id})
             with self.store.transaction():
                 self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason=reason)
                 self.store.journal(now, "released", claim["batch_id"], task_id=task_id, reason=reason, error=error)
+                if task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
+                    self._settle_prepare_release(task, reason, now)
             if reason == "inference_unavailable":
                 self.report_inference(claim["worker"], False, error)
+            self._wake.set()
+
+    def _settle_prepare_release(self, task: dict[str, Any], reason: str, now: float) -> None:
+        batch = self.store.row("batches", {"id": task["batch_id"]})
+        current = batch is not None and batch["state"] == BATCH_OPEN and batch["version"] == task["batch_version"]
+        if reason == PREPARE_CLEAN_REASON:
+            self.store.update("tasks", {"id": task["id"]}, state=TASK_SUBMITTED, resolved_at=now, resolution="prepared")
+            if current:
+                assert batch is not None
+                self.store.update("batches", {"id": batch["id"]}, prepared_version=batch["version"])
+            self._count("prepares_clean")
+            self.store.journal(
+                now, "prepared", task["batch_id"], task_id=task["id"], version=task["batch_version"], clean=True
+            )
+        elif reason in PREPARE_FAILED_REASONS:
+            self.store.update("tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="failed")
+            self._count("prepares_failed")
+            self.store.journal(now, "prepare-failed", task["batch_id"], task_id=task["id"], reason=reason)
 
     def submit_task(self, task_id: int, claim_token: str, tip_sha: str, worker_notes: str = "") -> Adoption:
         """Validate a proposed chain against the task and adopt it as the batch's next version.
@@ -845,7 +942,8 @@ class Controller:
                 return reject("claim-expired")
             if not self._repository_admin(claim["github_login"]):
                 return reject("not-authorized")
-            if task["state"] != TASK_OPEN or batch["version"] != task["batch_version"] or batch["state"] != BATCH_HEAD:
+            wanted = BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD
+            if task["state"] != TASK_OPEN or batch["version"] != task["batch_version"] or batch["state"] != wanted:
                 return reject("version-mismatch")
             if retained is None:
                 return reject("tip-unavailable")
@@ -936,12 +1034,15 @@ class Controller:
                         self._count("shrink_to_empty")
                 self.store.update("members", {"id": member["id"]}, **values)
                 provenance[member["source_pr"]] = values.get("provenance", member["provenance"])
+            # An adopted preparation keeps its batch open: the repaired members are what it seals with.
+            prepared = {"prepared_version": version} if task["kind"] == TASK_PREPARE else {}
             self.store.update(
                 "batches",
                 {"id": batch["id"]},
                 version=version,
                 base=task["onto"],
                 tip=tip_sha,
+                **prepared,
             )
             self.store.update(
                 "tasks",
@@ -975,7 +1076,11 @@ class Controller:
                 created_at=now,
             )
             self._retain(self.batch_ref(batch["id"], version), tip_sha)
-            self._count("repair_rounds" if task["kind"] == "repair" else "rebase_conflicts_resolved")
+            self._count(
+                {TASK_REPAIR: "repair_rounds", TASK_PREPARE: "prepares_adopted"}.get(
+                    task["kind"], "rebase_conflicts_resolved"
+                )
+            )
             self.store.journal(
                 now, "adopted", batch["id"], task_id=task["id"], version=version, tip=tip_sha, provenance=provenance
             )
@@ -1009,10 +1114,10 @@ class Controller:
         )
 
     def _task_record(
-        self, task: dict[str, Any], head: dict[str, Any], claim_id: int, token: str, expires: float
+        self, task: dict[str, Any], batch: dict[str, Any], claim_id: int, token: str, expires: float
     ) -> Task:
         members = []
-        for member in self._members(head["id"]):
+        for member in self._members(batch["id"]):
             input_row = self.store.row("inputs", {"id": member["input_id"]}) or {}
             members.append(
                 TaskMember(
@@ -1028,13 +1133,16 @@ class Controller:
                     retained_ref=self.input_ref(member["number"], member["accepted_head"]),
                 )
             )
-        refs = [self.batch_ref(head["id"], head["version"])] + [m.retained_ref for m in members]
+        refs = [self.batch_ref(batch["id"], batch["version"])] + [m.retained_ref for m in members]
+        extra: dict[str, Any] = {"canonical_branch": self.canonical_branch, "claim_id": claim_id}
+        if task["kind"] == TASK_PREPARE:
+            extra["renew_after"] = PREPARE_RENEW_SECONDS
         return Task(
             task_id=task["id"],
             kind=task["kind"],
             repository=self.repository,
-            batch_id=head["id"],
-            batch_version=head["version"],
+            batch_id=batch["id"],
+            batch_version=batch["version"],
             base=task["base"],
             tip=task["tip"],
             onto=task["onto"],
@@ -1046,7 +1154,7 @@ class Controller:
             expires_at=expires,
             instruction=AGENT_INSTRUCTION,
             created_at=task["created_at"],
-            extra={"canonical_branch": self.canonical_branch, "claim_id": claim_id},
+            extra=extra,
         )
 
     def _create_task(
@@ -1194,6 +1302,7 @@ class Controller:
         self._insertion_passes(now)
         self._seal(now)
         self._reconcile_head(now)
+        self._prepare_open_batches(now)
         self._republish_retained_refs(now)
         self._drain_outbox(self.clock())
         self._set_state("last_tick_at", now)
@@ -1310,7 +1419,8 @@ class Controller:
         resolve it: an input whose recorded conflict is against a batch's current base is not probed there
         again but against the next open batch, created on the canonical commit (never on another batch's
         tip) while fewer than `open_batch_limit` are open. An input that conflicts with every open batch
-        waits for a base to change (a new open batch or a rebase).
+        waits for a base to change (a new open batch or a rebase). A batch a `prepare` task holds is
+        skipped the same way, so inflow continues into the next open batch while it is prepared.
 
         The passes stop once `insertion_probe_budget_seconds` of wall time is spent (each probe is a git
         replay onto a batch's tip, and the controller lock is held throughout the tick); the remaining
@@ -1332,6 +1442,11 @@ class Controller:
             target: dict[str, Any] | None = None
             eligible: list[dict[str, Any]] = []
             for batch in batches:
+                if self._active_claims(batch["id"]):
+                    # A `prepare` task holds this batch: insertion goes on to the next open batch
+                    # (created on the canonical commit when the limit allows) instead of waiting.
+                    self._note_reason(f"open batch {batch['id']} is being prepared; insertion uses the next one")
+                    continue
                 eligible = [
                     row
                     for row in remaining
@@ -1568,10 +1683,14 @@ class Controller:
         if blocked:
             self._reasons.append(blocked)
             return
-        if self._active_claims(batch["id"]):
+        claims = self._active_claims(batch["id"])
+        if any(claim["task_id"] is None for claim in claims):
             self._reasons.append(f"open batch {batch['id']} is claimed; sealing waits for the release")
             return
         with self.store.transaction():
+            # A preparation in flight does not hold the head back: its claim is superseded (the worker
+            # learns it at its next renewal and stops) and the batch seals with what it has adopted.
+            self._supersede_prepare(batch["id"], "sealed", now)
             self.store.update("batches", {"id": batch["id"]}, sealed=1, state=BATCH_HEAD, sealed_at=now)
             self._count("heads_sealed")
             self.store.journal(
@@ -1688,6 +1807,69 @@ class Controller:
         self._create_task(head, "rebase_conflict", canonical, diagnostics, now)
         self._reasons.append(f"head {head['id']} needs an agent to resolve the rebase conflict")
         return False
+
+    # --- background preparation of open batches ----------------------------------------------------
+
+    def _note_reason(self, reason: str) -> None:
+        if reason not in self._reasons:
+            self._reasons.append(reason)
+
+    def _prepare_open_batches(self, now: float) -> None:
+        """Create `prepare` tasks for quiet, sizeable open batches while the head has no task of its own.
+
+        A `prepare` task builds an open batch on its own base (never on the head's tip) and repairs what
+        fails, so that the batch is ready when it seals; its result is adopted into the members and the
+        batch stays open. Head tasks take priority: while the head has an open task no preparation is
+        created, and the ones open or claimed are superseded so the worker turns to the head.
+        """
+        head = self._head()
+        head_task = self._open_task(head) if head is not None else None
+        for task in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN, "kind": TASK_PREPARE}):
+            batch = self.store.row("batches", {"id": task["batch_id"]})
+            if batch is None or batch["state"] != BATCH_OPEN:
+                closed = "sealed" if batch is not None and batch["state"] == BATCH_HEAD else "batch-closed"
+                self._supersede_prepare(task["batch_id"], closed, now)
+            elif batch["version"] != task["batch_version"]:
+                self._supersede_prepare(task["batch_id"], "batch-changed", now)
+            elif head_task is not None:
+                self._supersede_prepare(task["batch_id"], "head-task", now)
+        if not self.setting("prepare_open_batches") or head_task is not None or self._state("inference_hold"):
+            return
+        for batch in self._open_batches():
+            if self._prepare_due(batch, now):
+                self._create_task(batch, TASK_PREPARE, batch["base"], [], now)
+                self._note_reason(f"open batch {batch['id']} waits for a worker to prepare it")
+
+    def _prepare_due(self, batch: dict[str, Any], now: float) -> bool:
+        """The batch is big enough, quiet long enough, not prepared at this version, and has no
+        preparation open or settled (adopted, clean or failed) at this version."""
+        if batch["prepared_version"] == batch["version"]:
+            return False
+        members = self._members(batch["id"])
+        if len(members) < max(1, int(self.setting("prepare_min_members"))):
+            return False
+        if now - max(m["added_at"] for m in members) < int(self.setting("prepare_quiet_seconds")):
+            return False
+        for task in self.store.rows(
+            "tasks", {"batch_id": batch["id"], "batch_version": batch["version"], "kind": TASK_PREPARE}
+        ):
+            if task["state"] == TASK_OPEN or task["resolution"] in PREPARE_SETTLED:
+                return False
+        return True
+
+    def _supersede_prepare(self, batch_id: int, resolution: str, now: float) -> None:
+        """Supersede the batch's open `prepare` tasks and release their claims."""
+        tasks = self.store.rows("tasks", {"batch_id": batch_id, "state": TASK_OPEN, "kind": TASK_PREPARE})
+        if not tasks:
+            return
+        with self.store.transaction():
+            for task in tasks:
+                self.store.update(
+                    "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
+                )
+                for claim in self._active_claims(batch_id, task_id=task["id"]):
+                    self._release_claim(claim, "superseded", now)
+                self.store.journal(now, "prepare-superseded", batch_id, task_id=task["id"], resolution=resolution)
 
     # --- CI ----------------------------------------------------------------------------------------
 
@@ -2504,6 +2686,19 @@ class Controller:
             "size": len(members),
             "urgent": bool(batch["urgent"]),
             "oldest_member_age_seconds": (now - min(m["added_at"] for m in members)) if members else None,
+            **self._preparation_status(batch, members, now),
+        }
+
+    def _preparation_status(self, batch: dict[str, Any], members: list[dict[str, Any]], now: float) -> dict[str, Any]:
+        """An open batch's background preparation: the version last prepared, the open `prepare` task."""
+        task = self.store.row(
+            "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PREPARE}, order="id DESC"
+        )
+        return {
+            "prepared_version": batch["prepared_version"],
+            "prepared": batch["prepared_version"] is not None and batch["prepared_version"] == batch["version"],
+            "prepare_task": None if task is None else self._task_status(task),
+            "quiet_seconds": (now - max(m["added_at"] for m in members)) if members else None,
         }
 
     def _batch_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
@@ -2546,6 +2741,7 @@ class Controller:
                 for c in claims
             ],
             "retained_ref": self.batch_ref(batch["id"], batch["version"]),
+            **(self._preparation_status(batch, members, now) if batch["state"] == BATCH_OPEN else {}),
         }
 
     def _head_status(

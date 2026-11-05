@@ -216,17 +216,18 @@ class TaskMember:
 
 @dataclass
 class Task:
-    """A claimed repair or rebase-conflict task.
+    """A claimed repair, rebase-conflict or prepare task.
 
     `base` and `tip` are the chain the agent starts from. For a `rebase_conflict` task `onto` is
     the canonical commit the replacement chain must be based on and `tip` the chain that failed to
-    replay; for a `repair` task `onto` equals `base`. `diagnostics` are the CI findings (repair) or
+    replay; for a `repair` task `onto` equals `base`, and so for a `prepare` task, which builds and
+    repairs an open batch on its own base before it seals and carries no diagnostics. `diagnostics` are the CI findings (repair) or
     the failed replay's conflict evidence (rebase conflict). `retained_refs` name the refs under
     which the inputs and the current chain can be fetched.
     """
 
     task_id: int
-    kind: str  # "repair" or "rebase_conflict"
+    kind: str  # "repair", "rebase_conflict" or "prepare"
     repository: str
     batch_id: int
     batch_version: int

@@ -3027,6 +3027,43 @@ exit 1
             repair_task.main(["--no-stream-repair", *common])
         self.assertEqual([cfg.stream_repair for cfg in seen], [True, False])
 
+    def prepare_task(self) -> dict:
+        """A ``prepare`` task: an open batch on its own base, not yet tried, so no diagnostics."""
+        raw = self.content.task(kind="prepare")
+        raw["diagnostics"] = []
+        raw["extra"] = {**raw["extra"], "renew_after": 0.2}
+        self.service.tasks = {1: raw}
+        return raw
+
+    def test_a_prepare_task_whose_batch_builds_is_released_as_prepared_without_an_agent(self):
+        self.prepare_task()
+        self.script("✔ [1/3] Built TauCeti.One (0.1s)\n✔ [2/3] Built TauCeti.Two (0.1s)\nexit 0\n")
+        cfg = self.config(stream_repair=False)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual((outcome["status"], outcome["reason"]), ("released", "prepared_clean"), outcome)
+        self.assertEqual(self.agent_calls(), [], "a batch that builds needs no agent")
+        self.assertEqual([r["reason"] for r in self.service.releases], ["prepared_clean"])
+        self.assertEqual(
+            self.lake_calls().count("build --iofail"), 1, "a prepare task streams even when repair does not"
+        )
+
+    def test_a_prepare_task_repairs_what_fails_with_the_not_yet_tried_prompt(self):
+        self.prepare_task()
+        self.script()
+        os.environ["STUB_AGENT_MODE"] = "stream"
+        cfg = self.config(keep_worktree=True)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn(
+            "This batch has not yet been tried; fix what fails to build so it is ready when it becomes the head; "
+            "nothing you do is a verdict.",
+            prompt,
+        )
+        self.assertNotIn("with CI (`lake build --iofail`, as the staging build runs it) and the build failed", prompt)
+        self.assertIn("## Build in progress", prompt)
+        self.assertEqual(outcome["stream_build"]["failed_modules"], ["TauCeti.Two", "TauCeti.Three"])
+
     def test_a_cancelled_wait_stops_the_build_and_releases_the_lock(self):
         self.script("✔ [1/2] Built TauCeti.One (0.1s)\nsleep 30\nexit 0\n")
         worktree = self.root / "wt"
