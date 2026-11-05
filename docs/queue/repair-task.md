@@ -159,11 +159,19 @@ has a time budget holds because the service re-exposes the task.
    for Mathlib (or a shared extracted `.lake/packages` through `--seed-packages`, the experiment's
    stand-in for the shared Mathlib view), `lake cache get --service tauceti-public --repo <repository>
    --rev=<revision>` into the private pool, then `lake build --iofail` at the tip, which restores every
-   unchanged module and builds the batch's own modules and their dependents. The revisions tried are
-   `artifact_revisions`: a repair fetches its `base`, then `onto` when that differs; a rebase conflict
-   builds on `onto`, so it fetches `onto` first and the stale `base` as the fallback. The build is
-   expected to fail on the failing modules; artifacts are unavailable only when no tried revision has a
-   published mapping, a fetch fails or the build does not complete. Unavailable artifacts release a
+   unchanged module and builds the batch's own modules and their dependents. The artifacts come from
+   the newest revision the cache has: the revision the build runs on (`artifact_revisions` puts it
+   first: a repair's `base`, a rebase conflict's `onto`), then its first-parent ancestors walking back
+   up to `ARTIFACT_ANCESTORS` (50) commits, each asked with its own `lake cache get --rev=` until one
+   answers, then the other requested revision when it is off that walk (a stale `base` further back,
+   or the `onto` of a repair whose base is stale). Each fetch's verdict reads only that run's output:
+   the per-revision `cache-get-<sha>.log` is appended to across claims of the task, and reading the
+   whole file once made a published target look missing because of an earlier claim's miss (production
+   repair 2, 2026-11-05). The worker logs `warm artifacts from <sha> (<role>); skipped: <why the newer
+   candidates were passed over>`; the record carries `cache_revision`, `cache_distance`,
+   `cache_attempts` and `cache_skipped`. The build is expected to fail on the failing modules;
+   artifacts are unavailable only when no tried revision has a published mapping, a fetch fails or the
+   build does not complete. Unavailable artifacts release a
    repair task (`artifacts_unavailable`; its agent never runs cold), while a rebase conflict, whose
    rebase needs no build, runs its agent without warm artifacts and leaves the validation build to run
    cold or to the service's CI. Checkpoint `artifacts_ready`.
