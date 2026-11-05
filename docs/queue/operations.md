@@ -310,10 +310,27 @@ requirements below (the service's `repair_concurrency` setting bounds how many h
     claiming. Source order: `TAUCETI_QUEUE_TOKEN_FILE` (a mode 0600 file), `TAUCETI_QUEUE_TOKEN`,
     `GH_TOKEN`, `GITHUB_TOKEN`, else `gh auth token` from the account's gh login. The same account's
     git credentials push the submission ref (`gh auth setup-git`, or the token in the helper).
-  - Claude Code's credentials in `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`), copied
-    into the task's isolated config dir; `ANTHROPIC_API_KEY` stays unset so the subscription is billed,
-    as in the experiments. `claude` on PATH.
+  - One credential per provider in the chain `TAUCETI_QUEUE_PROVIDERS` (default `claude,codex,api`;
+    [repair-task.md](repair-task.md), "Providers"). `claude`: Claude Code's credentials in
+    `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`), copied into the task's isolated config
+    dir with `ANTHROPIC_API_KEY` unset so the subscription is billed, as in the experiments; `claude` on
+    PATH. `codex`: the Codex credential in `$CODEX_HOME/auth.json` (default `~/.codex`, written by
+    `codex login`), copied into the task's isolated `CODEX_HOME` as the fleet seeds its isolated
+    workers'; `codex` on PATH. `api`: `ANTHROPIC_API_KEY` in the environment file itself (mode 0600),
+    which the worker takes out of its own environment at start and gives only to that provider's agent.
+    Leave a provider out of the chain when the host has no credential for it; `--check` reports each
+    one named in the chain.
 - The content clone named by `TAUCETI_QUEUE_CLONE` (the installer creates it).
+
+The chain is tried in order for each task. A subscription provider is eligible only while the fleet
+pacer (`tauceti_worker.quota`, the same usage endpoints and `time%:budget%` curve the worker's `--pace`
+flag applies) reports it under pace; `TAUCETI_QUEUE_RATE` sets that curve for the repair worker (unset:
+the pacer's default, `60:40`). A subscription over its pace or unmeasurable (no credential, a usage
+endpoint failure) is skipped with the reason in the journal; a provider that fails to start or answers a
+rate-limit or authentication error before doing any work hands the task to the next one at once. Each
+task's outcome and `worker.json` (`providers` counts, `last_outcome.provider_attempts`) record every
+provider tried or skipped with its reason and seconds. `--providers` and `--rate` override the two
+settings on the command line.
 
 ### Install and update
 
@@ -349,9 +366,11 @@ jq . "$(. ~/.config/tauceti-queue/repair-environment; echo "$TAUCETI_QUEUE_TASK_
 ```
 
 `--check` prints one line per host requirement and exits 1 when any fails, naming the token's source
-and the login, never the token. `worker.json` is the worker's heartbeat: `pid`, `state` (`starting`,
-`claiming`, `running`, `idle`, `stopping`, `stopped`), `tasks`, `outcomes` by status, `errors` and
-`last_error`, `last_outcome`, `started_at` and `updated_at`. The service side of the same facts is
+and the login, never the token, and whether the api key is set, never the key. `worker.json` is the
+worker's heartbeat: `pid`, `state` (`starting`, `claiming`, `running`, `idle`, `stopping`, `stopped`),
+`tasks`, `outcomes` by status, `providers` (per provider: `ran`, `skipped`, `failed` counts), `errors`
+and `last_error`, `last_outcome` (with the task's `provider` and `provider_attempts`), `started_at` and
+`updated_at`. The service side of the same facts is
 `status.head.claim` (the worker name and expiry while a task is claimed) and the task's outcome in
 the status document. Each task's record is `<task root>/tasks/<id>/` (`task.json`, `outcome.json`,
 `logs/` with the agent transcript, prompt, push and build logs).

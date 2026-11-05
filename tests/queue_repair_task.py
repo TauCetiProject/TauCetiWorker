@@ -106,30 +106,49 @@ esac
 """
 
 CLAUDE = r'''#!/usr/bin/env python3
-"""claude stub: a scripted repair agent. STUB_AGENT_MODE selects the behaviour; every call is logged."""
+"""claude / codex stub (installed under both names; the name selects the CLI it imitates): a scripted
+repair agent. STUB_AGENT_MODE selects the behaviour (STUB_AGENT_MODES, a comma list, selects it per
+call); every call is logged."""
 import json, os, re, subprocess, sys, time
 from pathlib import Path
 
+agent = Path(sys.argv[0]).name  # claude | codex
 args = sys.argv[1:]
 stub_dir = Path(os.environ["STUB_DIR"])
 calls = stub_dir / "agent-calls.jsonl"
 previous = sum(1 for _ in calls.open()) if calls.exists() else 0
 call = previous + 1
-# Like Claude Code: `-p <prompt>` takes the prompt from argv; a bare `-p` (the next argument is an
-# option, or there is none) reads the whole of stdin as the prompt.
-prompt, prompt_via = "", None
-if "-p" in args:
-    after = args[args.index("-p") + 1 :]
-    if after and not after[0].startswith("--"):
-        prompt, prompt_via = after[0], "argv"
-    else:
+prompt, prompt_via, resume = "", None, None
+if agent == "claude":
+    # Like Claude Code: `-p <prompt>` takes the prompt from argv; a bare `-p` (the next argument is an
+    # option, or there is none) reads the whole of stdin as the prompt.
+    if "-p" in args:
+        after = args[args.index("-p") + 1 :]
+        if after and not after[0].startswith("--"):
+            prompt, prompt_via = after[0], "argv"
+        else:
+            prompt, prompt_via = sys.stdin.read(), "stdin"
+    resume = args[args.index("--resume") + 1] if "--resume" in args else None
+else:
+    # Like `codex exec`: the prompt is the last argument, `-` reads it from stdin; `exec resume <thread>`
+    # continues a thread.
+    if args[-1] == "-":
         prompt, prompt_via = sys.stdin.read(), "stdin"
-resume = args[args.index("--resume") + 1] if "--resume" in args else None
-mode = os.environ.get("STUB_AGENT_MODE", "repair")
+    else:
+        prompt, prompt_via = args[-1], "argv"
+    resume = args[-2] if "resume" in args[:3] else None
+modes = [m for m in os.environ.get("STUB_AGENT_MODES", "").split(",") if m]
+mode = modes[min(call, len(modes)) - 1] if modes else os.environ.get("STUB_AGENT_MODE", "repair")
+config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+codex_home = os.environ.get("CODEX_HOME")
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS")}}) + "\n")
-session = "sess-" + str(call)
-print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+session = ("sess-" if agent == "claude" else "thread-") + str(call)
+if agent == "claude":
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
+else:
+    print(json.dumps({"type": "thread.started", "thread_id": session}), flush=True)
+    print(json.dumps({"type": "turn.started"}), flush=True)
 
 
 def git(*a, **kw):
@@ -137,9 +156,23 @@ def git(*a, **kw):
 
 
 def finish(text="done", rc=0):
-    print(json.dumps({"type": "assistant", "session_id": session, "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}, "content": [{"type": "text", "text": text}]}}), flush=True)
-    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "total_cost_usd": 0.01, "result": text, "session_id": session, "usage": {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}}), flush=True)
+    usage = {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}
+    if agent == "codex":
+        print(json.dumps({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": text}}), flush=True)
+        print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 5}}), flush=True)
+        sys.exit(rc)
+    print(json.dumps({"type": "assistant", "session_id": session, "message": {"id": "m1", "model": "claude-opus-5-5", "usage": usage, "content": [{"type": "text", "text": text}]}}), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "total_cost_usd": 0.01, "result": text, "session_id": session, "usage": usage}), flush=True)
     sys.exit(rc)
+
+
+def refuse(message):
+    """The provider refused the request before any work: Codex's error event, Claude's error result."""
+    if agent == "codex":
+        print(json.dumps({"type": "error", "message": message}), flush=True)
+    else:
+        print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 0, "result": message, "session_id": session}), flush=True)
+    sys.exit(1)
 
 
 def rebuild(explain=True, drop=None):
@@ -168,6 +201,10 @@ def rebuild(explain=True, drop=None):
 
 if mode == "repair":
     rebuild()
+    if agent == "codex" and Path(".tauceti-repair/check").exists():
+        # The helper the prompt names is plain Python and runs the same under either CLI.
+        check = subprocess.run([".tauceti-repair/check"], text=True, capture_output=True)
+        finish(f"done; check: {check.stdout.strip() or check.stderr.strip()} (exit {check.returncode})")
     finish()
 elif mode == "no-explanation":
     rebuild(explain=resume is not None)
@@ -181,6 +218,16 @@ elif mode == "sleep":
 elif mode == "529":
     print("API Error: 529 Overloaded", flush=True)
     sys.exit(1)
+elif mode == "usage-limit":
+    if agent == "codex":
+        refuse("usage_limit_reached: You've hit your usage limit. Try again later.")
+    print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": 0}}), flush=True)
+    refuse("You've hit your usage limit.")
+elif mode == "auth-error":
+    refuse("401 Unauthorized: Not logged in" if agent == "codex" else "Failed to authenticate. API Error: 401 Invalid authentication credentials")
+elif mode == "work-then-fail":
+    print(json.dumps({"type": "item.completed", "item": {"id": "c1", "type": "command_execution", "command": "ls", "exit_code": 0}} if agent == "codex" else {"type": "assistant", "session_id": session, "message": {"id": "m0", "model": "claude-opus-5-5", "usage": {"input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}}), flush=True)
+    refuse("the provider dropped the connection after the first tool call")
 elif mode == "noop":
     finish("nothing to do")
 elif mode == "resume-only":
@@ -192,7 +239,7 @@ else:
     finish(f"unknown mode {mode}", rc=2)
 '''
 
-for name, text in (("lake", LAKE), ("gh", GH), ("claude", CLAUDE)):
+for name, text in (("lake", LAKE), ("gh", GH), ("claude", CLAUDE), ("codex", CLAUDE)):
     path = BIN / name
     path.write_text(text)
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -580,6 +627,20 @@ class Fixture(unittest.TestCase):
         self.stub_dir.mkdir()
         os.environ["STUB_DIR"] = str(self.stub_dir)
         os.environ["STUB_AGENT_MODE"] = "repair"
+        os.environ.pop("STUB_AGENT_MODES", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        os.environ.pop("CODEX_HOME", None)
+        # Every subscription is under pace unless a scenario says otherwise; the pacer's real readers
+        # (``Quota.claude`` / ``Quota.codex``) are exercised by ``Providers.test_the_status_is_the_pacer_s``.
+        self.statuses: dict[str, tuple[bool, str]] = {}
+        self._real_subscription_status = repair_task.subscription_status
+        status = patch.object(
+            repair_task,
+            "subscription_status",
+            lambda cfg, provider: self.statuses.get(provider, (True, "under pace (test)")),
+        )
+        status.start()
+        self.addCleanup(status.stop)
         os.environ.pop("STUB_LAKE_CACHE_FAIL", None)
         os.environ.pop("STUB_LAKE_CACHE_FAIL_REVS", None)
         os.environ.pop("STUB_SLEEP", None)
@@ -606,9 +667,18 @@ class Fixture(unittest.TestCase):
             fetch_retry_delay=0.05,
             release_backoff=(0.0,),
             artifacts_backoff=(0.0, 0.0),
+            providers=("claude",),
         )
         values.update(overrides)
         return repair_task.RunnerConfig(**values)
+
+    def break_launch(self, name: str) -> None:
+        """Make the ``name`` stub impossible to start (an interpreter that does not exist), restored after
+        the test: ``Popen`` fails with ENOENT, which is ``AgentLaunchUnavailable``."""
+        path = BIN / name
+        original = path.read_text()
+        path.write_text("#!/nonexistent/interpreter\n" + original)
+        self.addCleanup(path.write_text, original)
 
     def client(self, cfg: repair_task.RunnerConfig, worker: str | None = None) -> repair_task.TaskClient:
         return repair_task.TaskClient(cfg.service, TOKEN, worker or cfg.worker)
@@ -1065,6 +1135,350 @@ class AgentLaunchFailed(Fixture):
         history = [h["state"] for h in self.state()["history"]]
         self.assertIn("artifacts_ready", history, "the artifacts were prepared; the launch is what failed")
         self.assertIsNone(self.service.live_claim(1), "the service freed the claim")
+
+
+class Providers(Fixture):
+    """The provider chain: order, the pacer's eligibility check, fall-through on a failure before any
+    work, the api provider's environment, and the attempts recorded in the outcome and the heartbeat."""
+
+    def provider_attempts(self, outcome: dict) -> list[tuple[str, str]]:
+        return [(a["provider"], a["status"]) for a in repair_task.provider_attempts_of(outcome)]
+
+    def test_the_chain_order_is_honoured(self):
+        cfg = self.config(providers=("codex", "claude", "api"), api_key="sk-test-key")
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual([c["agent"] for c in calls], ["codex"])
+        self.assertEqual(calls[0]["argv"][:4], ["exec", "--json", "--model", repair.codex_profile().model])
+        self.assertEqual(calls[0]["prompt_via"], "argv")
+        self.assertIn(repair.AGENT_INSTRUCTION, calls[0]["prompt"])
+        env = calls[0]["env"]
+        self.assertTrue(env["CODEX_HOME"].startswith(str(self.root / "state")), "an isolated CODEX_HOME")
+        self.assertIsNone(env["ANTHROPIC_API_KEY"], "a subscription run never sees the api key")
+        self.assertIsNone(env["OPENAI_API_KEY"])
+        self.assertIsNone(env["TAUCETI_CLAUDE_BILLING"])
+        self.assertEqual(env["TAUCETI_SHELL_LIMIT_SECONDS"], str(repair.SHELL_LIMIT_SECONDS), "the same two-hour limit")
+        self.assertEqual(self.provider_attempts(outcome), [("codex", "ran")])
+        self.assertEqual(outcome["agent"][0]["provider"], "codex")
+        self.assertEqual(outcome["agent"][0]["attempts"][0]["provider"], "codex")
+        self.assertEqual(outcome["agent"][0]["attempts"][0]["telemetry"]["provider"], "codex")
+        self.assertEqual(self.state()["provider"], "codex")
+
+    def test_codex_runs_a_repair_end_to_end(self):
+        # The scripted agent through the Codex argv: the same prompt (no CLI-specific tool names), the
+        # task's own check script run from it, the transcript rendered to the same agent log shape, and
+        # the usage priced from the telemetry the renderer writes.
+        cfg = self.config(providers=("codex",))
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.service.results), 1)
+        call = self.agent_calls()[0]
+        self.assertEqual(call["agent"], "codex")
+        profile = repair.codex_profile()
+        self.assertEqual(
+            call["argv"],
+            [
+                "exec",
+                "--json",
+                "--model",
+                profile.model,
+                "-c",
+                f'model_reasoning_effort="{profile.effort}"',
+                "-c",
+                'model_reasoning_summary="detailed"',
+                "-c",
+                "show_raw_agent_reasoning=false",
+                "--sandbox",
+                "danger-full-access",
+                "--skip-git-repo-check",
+            ],
+        )
+        for word in ("Bash tool", "Read tool", "Edit tool", "Claude", "claude"):
+            self.assertNotIn(word, call["prompt"], f"the prompt is provider-neutral; found {word!r}")
+        self.assertIn(".tauceti-repair/check", call["prompt"])
+        self.assertIn("two-hour limit", call["prompt"], "the shell limit reaches Codex through the prompt")
+        logs = cfg.tasks_dir / "1" / "logs"
+        rendered = sorted(logs.glob("agent-codex-*.log"))
+        self.assertEqual(len(rendered), 1, [p.name for p in logs.iterdir()])
+        text = rendered[0].read_text()
+        self.assertIn("[session] codex thread-1", text)
+        self.assertIn("[turn] started", text)
+        self.assertIn("[assistant]\ndone; check: ok (exit 0)", text)
+        self.assertIn("[turn] completed; input=10, cached_input=2, output=5", text)
+        self.assertNotIn("[warning] no structured codex events", text)
+        telemetry = json.loads((logs / "agent-codex-telemetry.json").read_text())
+        self.assertEqual(telemetry["provider"], "codex")
+        self.assertEqual(telemetry["usage"], {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 5})
+        attempt = outcome["agent"][0]["attempts"][0]
+        self.assertEqual(attempt["telemetry"]["usage"], telemetry["usage"])
+        self.assertEqual(attempt["session"], "thread-1")
+        self.assertIsInstance(attempt["estimated_cost_usd"], float, "Sol usage is priced from the repository table")
+        self.assertGreater(attempt["estimated_cost_usd"], 0)
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        self.assertEqual(notes["estimated_cost_usd"], attempt["estimated_cost_usd"])
+        self.assertEqual(json.loads((cfg.tasks_dir / "1" / "session.json").read_text())["profile"]["provider"], "codex")
+
+    def test_a_long_prompt_reaches_codex_on_stdin(self):
+        from tauceti_worker.agents import PROMPT_ARGV_LIMIT
+
+        cfg = self.config(providers=("codex",))
+        with self.padded_prompts(PROMPT_ARGV_LIMIT + 1024):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual([c["agent"] for c in calls], ["codex"])
+        self.assertEqual(calls[0]["prompt_via"], "stdin")
+        self.assertEqual(calls[0]["argv"][-2:], ["--skip-git-repo-check", "-"])
+        self.assertTrue(calls[0]["prompt"].endswith("x" * 99 + "\n"), "the whole prompt arrived, in order")
+
+    def test_a_rate_limited_subscription_is_skipped(self):
+        self.statuses["claude"] = (False, "session ahead of pace (70% elapsed: used 61% > 55% pace budget), 39% left")
+        cfg = self.config(providers=("claude", "codex"))
+        with patch.object(repair_task, "log") as logged:
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual([c["agent"] for c in self.agent_calls()], ["codex"])
+        attempts = repair_task.provider_attempts_of(outcome)
+        self.assertEqual([(a["provider"], a["status"]) for a in attempts], [("claude", "skipped"), ("codex", "ran")])
+        self.assertIn("ahead of pace", attempts[0]["reason"])
+        self.assertEqual(attempts[0]["seconds"], 0.0)
+        self.assertTrue(
+            any("provider claude skipped: session ahead of pace" in str(c.args[0]) for c in logged.call_args_list),
+            [c.args[0] for c in logged.call_args_list],
+        )
+
+    def test_an_unmeasurable_subscription_is_skipped_and_an_empty_chain_releases(self):
+        self.statuses["claude"] = (False, "no /home/x/.claude/.credentials.json")
+        self.statuses["codex"] = (False, "codex usage HTTP 503")
+        cfg = self.config(providers=("claude", "codex"))
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "inference_unavailable")
+        self.assertIn("no eligible provider", outcome["detail"])
+        self.assertIn("codex usage HTTP 503", outcome["detail"])
+        self.assertEqual(self.agent_calls(), [])
+        self.assertEqual(self.provider_attempts(outcome), [("claude", "skipped"), ("codex", "skipped")])
+
+    def test_a_launch_failure_falls_through_to_the_next_provider(self):
+        # Popen searches every PATH entry and skips one whose exec fails with ENOENT, so the broken stub
+        # must be the only `codex` on PATH or the host's real one would run.
+        self.break_launch("codex")
+        path = [d for d in os.environ["PATH"].split(":") if d == str(BIN) or not (Path(d) / "codex").exists()]
+        cfg = self.config(providers=("codex", "claude"))
+        with patch.dict(os.environ, {"PATH": ":".join(path)}):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual([c["agent"] for c in self.agent_calls()], ["claude"])
+        attempts = repair_task.provider_attempts_of(outcome)
+        self.assertEqual([(a["provider"], a["status"]) for a in attempts], [("codex", "failed"), ("claude", "ran")])
+        self.assertIn("could not start", attempts[0]["reason"])
+        self.assertEqual(outcome["agent"][0]["provider"], "claude")
+        self.assertEqual(len(self.service.releases), 0)
+
+    def test_a_refusal_before_any_work_falls_through_at_once(self):
+        # Codex refuses with its usage-limit error; Claude's stream reports a rejected rate limit; the api
+        # provider does the work. No inference delay is spent between providers.
+        os.environ["STUB_AGENT_MODES"] = "usage-limit,usage-limit,repair"
+        cfg = self.config(providers=("codex", "claude", "api"), api_key="sk-test-key", inference_delays=(30.0,))
+        started = time.monotonic()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual([c["agent"] for c in calls], ["codex", "claude", "claude"])
+        attempts = repair_task.provider_attempts_of(outcome)
+        self.assertEqual(
+            [(a["provider"], a["status"]) for a in attempts],
+            [("codex", "failed"), ("claude", "failed"), ("api", "ran")],
+        )
+        self.assertIn("usage_limit_reached", attempts[0]["reason"])
+        self.assertEqual(attempts[1]["reason"], "rate limit status rejected")
+        self.assertTrue(all(a["seconds"] >= 0 for a in attempts))
+        self.assertEqual(outcome["agent"][0]["provider"], "api")
+        # The refused runs are in the attempt records too, with no session to resume.
+        self.assertEqual([a["provider"] for a in outcome["agent"][0]["attempts"]], ["codex", "claude", "api"])
+        self.assertIsNone(outcome["agent"][0]["attempts"][0]["session"])
+
+    def test_an_authentication_error_falls_through(self):
+        os.environ["STUB_AGENT_MODES"] = "auth-error,repair"
+        cfg = self.config(providers=("api", "claude"), api_key="sk-bad-key")
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        attempts = repair_task.provider_attempts_of(outcome)
+        self.assertEqual([(a["provider"], a["status"]) for a in attempts], [("api", "failed"), ("claude", "ran")])
+        self.assertIn("API Error: 401", attempts[0]["reason"])
+        self.assertNotIn("sk-bad-key", json.dumps(outcome))
+        self.assertNotIn("sk-bad-key", json.dumps(self.state()))
+
+    def test_a_provider_that_failed_after_working_is_not_replaced(self):
+        os.environ["STUB_AGENT_MODE"] = "work-then-fail"
+        cfg = self.config(providers=("codex", "claude"), agent_attempts=1)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "agent_failed")
+        self.assertEqual([c["agent"] for c in self.agent_calls()], ["codex"])
+        self.assertEqual(self.provider_attempts(outcome), [("codex", "ran")])
+
+    def test_a_whole_chain_refused_is_retried_then_released(self):
+        os.environ["STUB_AGENT_MODE"] = "usage-limit"
+        cfg = self.config(providers=("codex", "claude"), inference_attempts=2)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "inference_unavailable")
+        self.assertEqual([c["agent"] for c in self.agent_calls()], ["codex", "claude", "codex", "claude"])
+        self.assertEqual(self.provider_attempts(outcome), [("codex", "failed"), ("claude", "failed")] * 2)
+        self.assertEqual([r["reason"] for r in self.service.releases], ["inference_unavailable"])
+
+    def test_the_api_provider_sets_the_key_and_drops_the_subscription_credentials(self):
+        claude_dir = HOME / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        credentials = claude_dir / ".credentials.json"
+        credentials.write_text(json.dumps({"claudeAiOauth": {"accessToken": "sub-token"}}))
+        self.addCleanup(credentials.unlink)
+        cfg = self.config(providers=("api",), api_key="sk-test-key")
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual([c["agent"] for c in calls], ["claude"])
+        env = calls[0]["env"]
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-test-key")
+        self.assertEqual(env["TAUCETI_CLAUDE_BILLING"], "api")
+        self.assertTrue(env["CLAUDE_CONFIG_DIR"].endswith("claude-config-api"))
+        self.assertFalse(calls[0]["claude_credentials"], "no subscription credential beside the key")
+        self.assertNotIn("sk-test-key", json.dumps(outcome))
+        self.assertNotIn("sk-test-key", json.dumps(self.state()))
+        # The subscription provider, on the same host, gets the credential and no key.
+        self.service = FakeService(self.content.bare, [self.content.task(2)])
+        self.addCleanup(self.service.close)
+        cfg = self.config(providers=("claude",), api_key="sk-test-key")
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        env = self.agent_calls()[1]["env"]
+        self.assertIsNone(env["ANTHROPIC_API_KEY"])
+        self.assertIsNone(env["TAUCETI_CLAUDE_BILLING"])
+        self.assertTrue(env["CLAUDE_CONFIG_DIR"].endswith("claude-config"))
+        self.assertTrue(self.agent_calls()[1]["claude_credentials"])
+
+    def test_the_codex_credential_is_copied_into_the_isolated_home(self):
+        codex_dir = HOME / ".codex"
+        codex_dir.mkdir(exist_ok=True)
+        auth = codex_dir / "auth.json"
+        auth.write_text(json.dumps({"tokens": {"access_token": "codex-token", "account_id": "acct"}}))
+        self.addCleanup(auth.unlink)
+        cfg = self.config(providers=("codex",))
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        call = self.agent_calls()[0]
+        self.assertTrue(call["codex_credentials"])
+        self.assertEqual(call["env"]["CODEX_HOME"], str(self.root / "state" / "codex-home"))
+
+    def test_a_resumed_session_keeps_its_provider_even_over_pace(self):
+        # An interrupted task resumes the recorded codex thread, ahead of a now-eligible claude and
+        # without re-checking codex's pace: the work was admitted when it started.
+        os.environ["STUB_AGENT_MODE"] = "resume-only"
+        cfg = self.config(providers=("claude", "codex"))
+        claim = self.service.preclaim(1, "old-token", cfg.worker)
+        task = repair_task.Task.from_json(self.service.task_record(1, claim))
+        repair_task.fetch_retained(cfg.clone, task)
+        worktree = cfg.root / "worktrees" / "task-1"
+        repair.checkout_worktree(cfg.clone, task.tip, worktree)
+        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
+        state.write("agent_running", agent_attempt=1, provider="codex")
+        from tauceti_worker.runtime_status import atomic_json
+
+        atomic_json(state.session_path, {"session": "thread-old", "cwd": str(worktree)})
+        self.statuses["codex"] = (False, "weekly ahead of pace")
+        outcomes = repair_task.resume_pending(cfg, self.client(cfg))
+        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
+        calls = self.agent_calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("codex", "thread-old")])
+        self.assertEqual(self.provider_attempts(outcomes[0]), [("codex", "ran")])
+
+    def test_the_heartbeat_counts_the_providers(self):
+        self.statuses["claude"] = (False, "weekly exhausted")
+        self.break_launch("codex")
+        path = [d for d in os.environ["PATH"].split(":") if d == str(BIN) or not (Path(d) / "codex").exists()]
+        cfg = self.config(providers=("claude", "codex", "api"), api_key="sk-test-key", poll_seconds=0.2)
+        stop = repair_task.Stop()
+        result: dict = {}
+
+        def run():
+            result["summary"] = repair_task.serve(cfg, self.client(cfg), stop)
+
+        with patch.dict(os.environ, {"PATH": ":".join(path)}):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            self.addCleanup(stop.set, "cleanup")
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline and len(self.service.results) < 1:
+                time.sleep(0.05)
+            stop.set("test")
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        heartbeat = json.loads(repair_task.heartbeat_path(cfg).read_text())
+        self.assertEqual(heartbeat["outcomes"], {"adopted": 1})
+        self.assertEqual(
+            heartbeat["providers"],
+            {
+                "claude": {"ran": 0, "skipped": 1, "failed": 0},
+                "codex": {"ran": 0, "skipped": 0, "failed": 1},
+                "api": {"ran": 1, "skipped": 0, "failed": 0},
+            },
+        )
+        self.assertEqual(heartbeat["last_outcome"]["provider"], "api")
+        attempts = heartbeat["last_outcome"]["provider_attempts"]
+        self.assertEqual(
+            [(a["provider"], a["status"]) for a in attempts],
+            [("claude", "skipped"), ("codex", "failed"), ("api", "ran")],
+        )
+        self.assertEqual(attempts[0]["reason"], "weekly exhausted")
+        self.assertIn("could not start", attempts[1]["reason"])
+        self.assertNotIn("sk-test-key", repair_task.heartbeat_path(cfg).read_text())
+
+    def test_the_status_is_the_pacer_s(self):
+        from tauceti_worker import quota
+
+        seen: dict = {}
+
+        def claude(self_, *, refresh=False, renew=False):
+            seen["pace"] = os.environ.get("TAUCETI_PACE")
+            seen["renew"] = renew
+            window = quota.Window("session", 61.0, 70.0, time.time() + 3600, quota.STATUS_OVER_PACE, 55.0)
+            return quota.Provider("claude", False, None, [window])
+
+        def codex(self_, *, refresh=False):
+            return quota.Provider(
+                "codex", True, "gpt-5", [quota.Window("weekly", 10.0, 20.0, None, "under-pace", 30.0)]
+            )
+
+        cfg = self.config(rate="0:10,50:70")
+        with patch.object(repair_task, "subscription_status", self._real_subscription_status):
+            with patch.object(quota.Quota, "claude", claude), patch.object(quota.Quota, "codex", codex):
+                self.assertEqual(
+                    repair_task.subscription_status(cfg, "claude"),
+                    (False, "session ahead of pace (70% elapsed: used 61% > 55% pace budget), 39% left"),
+                )
+                self.assertEqual(
+                    repair_task.subscription_status(cfg, "codex"), (True, "under pace (weekly 10% used of 30% budget)")
+                )
+            self.assertEqual(
+                seen, {"pace": "0:10,50:70", "renew": False}, "the task's rate is the pacer's curve; no token rotation"
+            )
+            self.assertIsNone(os.environ.get("TAUCETI_PACE"))
+            # No credential at all: unmeasurable, not eligible, and the reason names the file.
+            ok, reason = repair_task.subscription_status(cfg, "claude")
+            self.assertFalse(ok)
+            self.assertIn(".credentials.json", reason)
+
+    def test_the_chain_spec(self):
+        self.assertEqual(repair_task.parse_providers(None), ("claude", "codex", "api"))
+        self.assertEqual(repair_task.parse_providers(" Codex, api "), ("codex", "api"))
+        for bad in ("claude,kiro", "claude,claude", ","):
+            with self.assertRaises(ValueError):
+                repair_task.parse_providers(bad)
+        self.assertEqual(repair.codex_profile().model, "gpt-6.1-sol")
+        self.assertEqual(repair.claude_profile().model, "claude-opus-5-5")
 
 
 class AgentTimeout(Fixture):

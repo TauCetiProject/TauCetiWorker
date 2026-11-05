@@ -868,7 +868,12 @@ def host_agent_argv(
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
-        env.pop("ANTHROPIC_API_KEY", None)
+        # The one exception is a launcher that bills the API with the key in its own environment and
+        # no accounting shim (the queue's repair task, `TAUCETI_CLAUDE_BILLING=api` without
+        # `TAUCETI_API_CONTEXT`); the fleet's API mode routes the key through the shim instead and has
+        # already removed it from the environment (claude_api.configure_api).
+        if not (env.get("TAUCETI_CLAUDE_BILLING") == "api" and not os.environ.get("TAUCETI_API_CONTEXT")):
+            env.pop("ANTHROPIC_API_KEY", None)
         command = (
             os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
         )
@@ -1082,6 +1087,22 @@ def take_last_agent_infra_failure() -> str | None:
     return reason
 
 
+# What the transcript renderer saw of the most recent agent subprocess: whether the agent did any work
+# (a tool call, a tool result, an assistant message), the final structured failure, and the last Claude
+# rate-limit status. A launcher with a chain of providers (the queue's repair task) reads this to tell
+# a provider that refused the request before any work from an agent that worked and failed.
+_LAST_AGENT_RUN: dict | None = None
+
+
+def take_last_agent_run() -> dict | None:
+    """The renderer's record of the last agent subprocess (``provider``, ``rc``, ``saw_work``,
+    ``terminal_failure``, ``rate_limit_status``, ``usage``, the last lines of its ``tail``), or None.
+    Reads AND CLEARS, like ``take_last_agent_infra_failure``."""
+    global _LAST_AGENT_RUN
+    record, _LAST_AGENT_RUN = _LAST_AGENT_RUN, None
+    return record
+
+
 def _feed_stdin(proc: subprocess.Popen, text: str) -> None:
     """Write ``text`` to ``proc.stdin`` and close it; an agent that exits first just closes the pipe."""
     assert proc.stdin is not None
@@ -1113,8 +1134,9 @@ def run_agent_proc(
     written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
     cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
     """
-    global _LAST_AGENT_FAILURE
+    global _LAST_AGENT_FAILURE, _LAST_AGENT_RUN
     _LAST_AGENT_FAILURE = None
+    _LAST_AGENT_RUN = None
     telemetry_stamp = time.strftime("%Y%m%d-%H%M%S")
     cwds = str(cwd) if cwd is not None else None
     # A prompt arrives in argv unless it is too long for one argv string, in which case it is the whole
@@ -1244,6 +1266,16 @@ def run_agent_proc(
         }
         atomic(logdir / f"{label}-{telemetry_stamp}-telemetry.json", telemetry)
         atomic(logdir / f"{label}-telemetry.json", telemetry)
+        global _LAST_AGENT_RUN
+        _LAST_AGENT_RUN = {
+            "provider": provider,
+            "rc": rc,
+            "saw_work": renderer.saw_work,
+            "terminal_failure": renderer.terminal_failure_text,
+            "rate_limit_status": renderer.rate_limit_status,
+            "usage": dict(renderer.usage),
+            "tail": list(tail)[-6:],  # the guardian's own traceback when the agent executable is missing
+        }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
         return rc

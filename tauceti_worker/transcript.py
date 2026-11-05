@@ -186,6 +186,9 @@ class AgentTranscriptRenderer:
         self.terminal_failure_final = False
         self.compactions = 0
         self.usage: dict[str, int] = {}
+        # The `status` of Claude Code's latest `rate_limit_event` (`allowed`, `allowed_warning`, or a
+        # refusal such as `rejected`); None until one is seen. Codex has no equivalent event.
+        self.rate_limit_status: str | None = None
 
     def render_line(self, raw: str) -> str:
         if self.provider not in {"codex", "claude"}:
@@ -427,6 +430,8 @@ class AgentTranscriptRenderer:
         if kind == "rate_limit_event":
             self.active = True
             info = event.get("rate_limit_info") if isinstance(event.get("rate_limit_info"), dict) else {}
+            if info.get("status") is not None:
+                self.rate_limit_status = str(info["status"])
             details = [
                 f"{label}={info[key]}"
                 for key, label in (("status", "status"), ("rateLimitType", "type"), ("resetsAt", "resets"))

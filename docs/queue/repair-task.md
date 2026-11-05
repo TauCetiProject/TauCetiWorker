@@ -13,6 +13,7 @@ and the task use one implementation.
 uv run python -m tauceti_queue.repair_task --service https://queue.example [--once | --check] [--worker ID]
     [--clone PATH] [--root PATH] [--repository owner/repo] [--poll SECONDS]
     [--agent-timeout S] [--build-timeout S] [--keep-worktree] [--seed-packages PATH] [--no-resume]
+    [--providers claude,codex,api] [--rate T:B[,T:B...]]
 ```
 
 Without `--once` the runner is the long-running worker (`serve`): resume checkpointed tasks, claim,
@@ -23,10 +24,12 @@ authorization check fails. SIGTERM and SIGINT stop a running agent and record th
 `interrupted` with its claim and worktree kept; the next start resumes the session
 (`resume_pending`). It writes a heartbeat to `<root>/worker.json`. `--check` prints the host checks
 (tools, token source, repository admin, service, clone, Claude credentials, free disk) and exits.
-`--service`, `--worker`, `--clone`, `--poll` and `--seed-packages` default to `TAUCETI_QUEUE_SERVICE`,
-`TAUCETI_QUEUE_WORKER`, `TAUCETI_QUEUE_CLONE`, `TAUCETI_QUEUE_POLL_SECONDS` and
-`TAUCETI_QUEUE_SEED_PACKAGES`, which is how `services/queue/tauceti-queue-repair.service` configures
-it (`docs/queue/operations.md`, "Repair worker"). Otherwise `--clone` defaults to the worker's content
+`--service`, `--worker`, `--clone`, `--poll`, `--seed-packages`, `--providers` and `--rate` default to
+`TAUCETI_QUEUE_SERVICE`, `TAUCETI_QUEUE_WORKER`, `TAUCETI_QUEUE_CLONE`, `TAUCETI_QUEUE_POLL_SECONDS`,
+`TAUCETI_QUEUE_SEED_PACKAGES`, `TAUCETI_QUEUE_PROVIDERS` and `TAUCETI_QUEUE_RATE`, which is how
+`services/queue/tauceti-queue-repair.service` configures it (`docs/queue/operations.md`, "Repair
+worker"); the `api` provider's `ANTHROPIC_API_KEY` comes from the same environment file (Providers
+below). Otherwise `--clone` defaults to the worker's content
 checkout (`Config.resolve().checkout`, the path `agents.prepare_checkout` maintains). `--root` defaults to `$TAUCETI_QUEUE_TASK_ROOT`, else
 `$TAUCETI_ACTIVITY_DIR/queue-repair`, else `~/.local/state/tauceti/queue-repair`; it holds the task
 checkpoints and logs (`tasks/<task_id>/`), the private worktrees (`worktrees/task-<task_id>`), the
@@ -248,6 +251,53 @@ recorded session when one exists; after the last attempt the task is released wi
 or a chain that does not validate, is the agent's own failure and takes the `agent_failed` path; it
 is never reported as inference unavailability.
 
+## Providers
+
+The agent's provider is chosen per task from a chain, `RunnerConfig.providers`
+(`TAUCETI_QUEUE_PROVIDERS` / `--providers`, default `claude,codex,api`):
+
+- `claude`: the Claude subscription, with the repository's Claude authoring profile
+  (`resolve_authoring_profile("claude")`, `claude-opus-5-5` at effort `high`), `claude -p` with
+  `ANTHROPIC_API_KEY` unset and the credential copied into the task's isolated `CLAUDE_CONFIG_DIR`.
+- `codex`: the Codex subscription, with the repository's Codex authoring profile
+  (`resolve_authoring_profile("codex")`, `gpt-6.1-sol` at effort `high`), `codex exec --json --model
+  <model>` with the credential (`auth.json`) copied from `$CODEX_HOME` (default `~/.codex`) into the
+  task's isolated `CODEX_HOME`, as `agents.isolate_home` seeds a fleet worker's. The prompt is the same
+  text; past `agents.PROMPT_ARGV_LIMIT` it reaches `codex exec -` on stdin as it reaches `claude -p`,
+  and the task sets the same `TAUCETI_SHELL_LIMIT_SECONDS` (two hours), which the prompt states; Codex
+  has no shell-limit setting of its own (the fleet's Codex rounds get none either), so the prompt is
+  what carries the limit there. The prompt names no CLI-specific tool, and the helpers it points at
+  (`.tauceti-repair/check`, `step`) are plain Python and shell, so they run unchanged. The transcript
+  goes through the same renderer as Claude's (`agents.run_agent_proc`): the same `agent-codex-*.log`
+  shape, and `agent-codex-telemetry.json` with the turn's `input_tokens`, `cached_input_tokens` and
+  `output_tokens`, which `repair.price_usage` prices for the attempt record and the submission notes.
+- `api`: Claude billed to the API, the `TAUCETI_CLAUDE_BILLING=api` semantics: the same Claude
+  profile, `ANTHROPIC_API_KEY` from the repair environment file set for this provider's agent only, in
+  an isolated config dir that holds no subscription credential. The worker takes the key out of its own
+  environment at start; it is never logged or recorded.
+
+At the start of each run (`select_providers`) a subscription provider is eligible only if the fleet
+pacer (`tauceti_worker.quota.Quota.claude` / `.codex`, the usage endpoints read with the host's
+credential, their session and weekly windows against the pacing curve) reports it under pace, with
+`RunnerConfig.rate` (`TAUCETI_QUEUE_RATE` / `--rate`, the worker's `--pace` spec) as that curve. The
+read spends nothing and rotates no token. A subscription over its pace, with no credential, or with an
+unreadable usage response is skipped with the pacer's reason logged; the `api` provider is skipped
+without a key. A resumed session's provider is not re-checked: the work was admitted when it started.
+
+The eligible providers are tried in order (`run_repair_agent`). One that fails to launch, or exits
+before doing any work with a refusal (`prework_failure`: for Claude a `rate_limit_event` status other
+than `allowed` / `allowed_warning` or an API error on the first turn; for Codex its usage-limit,
+rate-limit or authentication error event; for either an infrastructure failure the fleet classifier
+names, or a missing executable) hands the task to the next provider at once, with no inference delay.
+An agent that did work (a tool call, a tool result, an assistant message) is never replaced: its exit is
+the task's, as before. When the whole chain fails before any work the pass is retried after
+`inference_delays` up to `inference_attempts` times and the task released as `inference_unavailable`
+(as `agent_launch_failed` when no provider's process could start at all). Every provider tried or
+skipped is recorded in the run's `provider_attempts` (`provider`, `status` `ran` / `skipped` / `failed`,
+`reason`, `seconds`), the run's `provider` names the one whose agent ran, the checkpoint records it for
+resumption, and `worker.json` counts them per provider (`providers`) and repeats the last task's list
+(`last_outcome.provider_attempts`).
+
 ## Recovery
 
 The checkpoint `tasks/<id>/task.json` (written with `runtime_status.atomic_json`, the style of
@@ -301,7 +351,7 @@ run, `resume_pending(cfg, client)` for checkpointed tasks. Integrating it as a w
 - the service URL and the token source as worker configuration (`TAUCETI_QUEUE_SERVICE`,
   `TAUCETI_QUEUE_TOKEN`);
 - activity accounting from the outcome record (`status`, `agent[*].attempts[*].seconds` and
-  `estimated_cost_usd`, `lease.renewals`, `response`), and the `agent-claude-*-telemetry.json` files
+  `estimated_cost_usd`, `lease.renewals`, `response`), and the `agent-<provider>-*-telemetry.json` files
   the host agent writes under `tasks/<id>/logs/`;
 - the round's own deadline: the task sets `TAUCETI_ROUND_DEADLINE` from `agent_timeout` for the
   agent's shell limits, and a loop that owns the round should pass its remaining time as
@@ -326,5 +376,8 @@ the same session, a terminal rejection, a superseded claim at submission, a loca
 retried with the local report, the local explanation follow-up turn, artifacts unavailable with and
 without a `release` route, inference unavailable after bounded retries, an ordinary agent failure
 and the worker's attempt cap released as `agent_failed`, a second claimant and a stale token refused,
-resumption of a checkpointed session, and the task record and prompt for a rebase conflict. No real
-inference and no network.
+resumption of a checkpointed session, the task record and prompt for a rebase conflict, and the
+provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
+unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the
+`api` provider's key and credential-free config dir, the attempts in the outcome and the heartbeat, and
+the eligibility check against the pacer's readers). No real inference and no network.

@@ -1605,30 +1605,79 @@ def claude_profile():
     return resolve_authoring_profile("claude")
 
 
-def prepare_claude_config(root: Path) -> Path:
-    """An isolated Claude config dir seeded the way workers seed theirs: credentials, not personality."""
+def codex_profile():
+    from tauceti_worker.agents import resolve_authoring_profile
+
+    return resolve_authoring_profile("codex")
+
+
+# The repair agent's provider, as the task's provider chain names it: the Claude subscription, the Codex
+# subscription, or Claude billed to the API through ``ANTHROPIC_API_KEY``.
+PROVIDERS = ("claude", "codex", "api")
+
+
+def prepare_claude_config(root: Path, *, credentials: bool = True) -> Path:
+    """An isolated Claude config dir seeded the way workers seed theirs: credentials, not personality.
+
+    With ``credentials=False`` (the ``api`` provider) the dir is a separate one that holds no
+    subscription credential at all, so ``claude`` can only authenticate with the API key in its
+    environment and the subscription is never billed by accident."""
     from tauceti_worker.agents import seed_worker_claude_config
     from tauceti_worker.quota import claude_dir
 
-    iso = root / "claude-config"
+    iso = root / ("claude-config" if credentials else "claude-config-api")
     iso.mkdir(parents=True, exist_ok=True)
     real = claude_dir(Path(os.environ.get("HOME", os.path.expanduser("~"))))
     seed_worker_claude_config(real, iso)
     for name in (".credentials.json",):
         src = real / name
-        if src.exists():
+        if credentials and src.exists():
             shutil.copy2(src, iso / name)
+        elif not credentials:
+            (iso / name).unlink(missing_ok=True)
     return iso
 
 
-def isolation_env(root: Path, env_lake: dict | None = None) -> dict:
+def prepare_codex_home(root: Path) -> Path:
+    """An isolated ``CODEX_HOME`` holding only the operator's Codex credential (``auth.json``), copied
+    from the real one (``$CODEX_HOME``, default ``~/.codex``) the way ``agents.isolate_home`` seeds a
+    worker's: no host ``config.toml`` (the model and effort come from the authoring profile's flags)."""
+    from tauceti_worker.quota import codex_dir
+
+    iso = root / "codex-home"
+    iso.mkdir(parents=True, exist_ok=True)
+    real = codex_dir(Path(os.environ.get("HOME", os.path.expanduser("~"))))
+    src = real / "auth.json"
+    if src.exists():
+        shutil.copy2(src, iso / "auth.json")
+    return iso
+
+
+def isolation_env(
+    root: Path, env_lake: dict | None = None, provider: str = "claude", *, api_key: str | None = None
+) -> dict:
     """Environment changes that keep a repair agent private: no GitHub credentials, no push, its
-    own Claude config dir, and the private artifact pool."""
+    own provider config dir with that provider's credential and no other, and the private artifact
+    pool. ``provider`` is one of ``PROVIDERS``; the ``api`` provider gets ``api_key`` as
+    ``ANTHROPIC_API_KEY`` and ``TAUCETI_CLAUDE_BILLING=api``, the subscription providers get neither."""
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown repair provider {provider!r} (one of {', '.join(PROVIDERS)})")
     changes: dict = {}
     for key in LAKE_ENV_KEYS:
         if env_lake and key in env_lake:
             changes[key] = env_lake[key]
-    changes["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root))
+    changes["OPENAI_API_KEY"] = None
+    if provider == "api":
+        changes["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root, credentials=False))
+        changes["ANTHROPIC_API_KEY"] = api_key
+        changes["TAUCETI_CLAUDE_BILLING"] = "api"
+    else:
+        changes["ANTHROPIC_API_KEY"] = None
+        changes["TAUCETI_CLAUDE_BILLING"] = None
+        if provider == "codex":
+            changes["CODEX_HOME"] = str(prepare_codex_home(root))
+        else:
+            changes["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root))
     changes["GH_TOKEN"] = None
     changes["GITHUB_TOKEN"] = None
     empty_gh = root / "gh-config-empty"
