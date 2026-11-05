@@ -311,6 +311,7 @@ class FakeService:
         self.inference_reports: list[dict] = []
         self.renew_mode = "ok"  # ok | refuse | error
         self.claim_mode = "ok"  # ok | error
+        self.release_mode = "ok"  # ok | error
         self.release_supported = True
         self.inference_supported = True
         self.lock = threading.Lock()
@@ -520,6 +521,8 @@ class FakeService:
                 if verb == "renew":
                     return 200, self.renew_task(task_id, token)
                 if verb == "release":
+                    if self.release_mode == "error":
+                        raise RuntimeError("database unavailable")
                     return 200, self.release_task(task_id, token, str(body.get("reason")), str(body.get("error", "")))
                 return 200, self.submit_task(
                     task_id, token, str(body.get("tip_sha") or ""), str(body.get("worker_notes", ""))
@@ -562,6 +565,9 @@ class Fixture(unittest.TestCase):
             lease_retry_interval=0.1,
             push_remote=str(self.content.bare),
             mathlib_cache=True,
+            fetch_retry_seconds=0.0,  # the scenarios that wait for late refs set their own window
+            fetch_retry_delay=0.05,
+            release_backoff=(0.0,),
         )
         values.update(overrides)
         return repair_task.RunnerConfig(**values)
@@ -978,6 +984,11 @@ class Serve(Fixture):
         )
         self.assertTrue(thread.is_alive())
         self.service.claim_mode = "ok"
+        # Task 1's error gives its claim back at once (so the service re-exposes it); the fake offers
+        # it first again, so once released it is withdrawn here to let task 2 be reached.
+        self.wait_for(lambda: len(self.service.releases) >= 1, "task 1's error released its claim")
+        with self.service.lock:
+            del self.service.tasks[1]
         self.wait_for(lambda: len(self.service.results) == 1, "task 2 was adopted after task 1 failed")
         stop.set("test")
         thread.join(30)
@@ -986,8 +997,9 @@ class Serve(Fixture):
         self.assertGreaterEqual(summary["errors"], 2, summary)
         self.assertEqual(summary["outcomes"], {"adopted": 1})
         self.assertEqual(self.service.results[0]["task_id"], 2)
-        self.assertEqual(self.state("1")["state"], "error")
-        self.assertIn("RuntimeError", self.state("1")["error"])
+        self.assertEqual(self.service.releases[0]["reason"], "artifacts_unavailable")
+        self.assertEqual(self.state("1")["state"], "released")
+        self.assertIn("SourcesUnavailable", self.state("1")["error"])
         self.assertEqual(self.state("2")["state"], "adopted")
         self.assertEqual(self.heartbeat(cfg)["last_error"]["what"], "task")
 
@@ -1044,6 +1056,169 @@ class Serve(Fixture):
         self.assertEqual(summary["tasks"], 0)
         self.assertEqual(self.service.claim_attempts, [])
         self.assertEqual(self.heartbeat(cfg)["state"], "stopped")
+
+
+class ReleaseRetry(Fixture):
+    """Claims given back through outages: an errored task releases its claim, a release the service
+    could not confirm is retried from the checkpoint before the next claim, and retained refs the
+    service publishes a moment after the task are waited for."""
+
+    RETAINED_TIP = "refs/heads/queue/batch-1/tip"
+
+    def drop_retained_ref(self):
+        sh(self.content.bare, "update-ref", "-d", self.RETAINED_TIP)
+
+    def restore_retained_ref(self):
+        sh(self.content.bare, "update-ref", self.RETAINED_TIP, self.content.tip)
+
+    def retain_many(self, count: int) -> list[str]:
+        """``count`` retained refs on the bare repository, created in one ``update-ref --stdin``."""
+        refs = [f"refs/heads/queue/inputs/{n}" for n in range(count)]
+        subprocess.run(
+            ["git", "-C", str(self.content.bare), "update-ref", "--stdin"],
+            input="".join(f"update {r} {self.content.tip}\n" for r in refs),
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+        return refs
+
+    def fetch_calls(self):
+        """Run with ``repair_task.git`` observed; returns (calls, restore) for the fetch invocations."""
+        calls: list[tuple[str, ...]] = []
+        original = repair_task.git
+
+        def observed(clone, *args, **kwargs):
+            if args[:1] == ("fetch",):
+                calls.append(args)
+            return original(clone, *args, **kwargs)
+
+        repair_task.git = observed
+        self.addCleanup(setattr, repair_task, "git", original)
+        return calls
+
+    def test_many_retained_refs_are_fetched_a_chunk_at_a_time(self):
+        refs = self.retain_many(450)
+        task = repair_task.Task.from_json(
+            {**self.content.task(), "retained_refs": refs, "claim_token": "t", "expires_at": time.time() + 60}
+        )
+        calls = self.fetch_calls()
+        fetched = repair_task.fetch_retained(self.content.clone, task, chunk=200)
+        self.assertEqual(len(fetched["refs"]), 450)
+        self.assertEqual([len(c) - 3 for c in calls], [200, 200, 50], "one fetch per chunk of refspecs, not per ref")
+        self.assertEqual(
+            sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/1/retained/queue/inputs/449"),
+            self.content.tip,
+        )
+        # A chunk the remote refuses is fetched ref by ref, so the error names the missing ref; the
+        # other chunks are still one call each.
+        calls.clear()
+        missing = refs[:250] + ["refs/heads/queue/inputs/absent"] + refs[250:]
+        task = repair_task.Task.from_json({**task.to_json(), "retained_refs": missing})
+        with self.assertRaises(repair_task.SourcesUnavailable) as failed:
+            repair_task.fetch_retained(self.content.clone, task, chunk=200)
+        self.assertIn("queue/inputs/absent", str(failed.exception))
+        self.assertEqual(len(calls[0]) - 3, 200)
+        self.assertEqual(len(calls[1]) - 3, 200, "the second chunk holds the missing ref")
+        self.assertTrue(all(len(c) - 3 == 1 for c in calls[2:]), "then its refs one at a time")
+
+    def test_a_retained_ref_published_late_is_waited_for(self):
+        self.drop_retained_ref()
+        timer = threading.Timer(1.0, self.restore_retained_ref)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        cfg = self.config(fetch_retry_seconds=20, fetch_retry_delay=0.3)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertGreaterEqual(outcome["sources"]["attempts"], 2, "the first fetch found no ref")
+        self.assertEqual(self.service.releases, [])
+
+    def test_sources_still_missing_after_the_window_release_the_claim(self):
+        self.drop_retained_ref()
+        cfg = self.config(fetch_retry_seconds=0.5, fetch_retry_delay=0.1)
+        with self.assertRaises(repair_task.SourcesUnavailable):
+            repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual([r["reason"] for r in self.service.releases], ["artifacts_unavailable"])
+        self.assertIn("queue/batch-1/tip", self.service.releases[0]["error"])
+        state = self.state()
+        self.assertEqual(state["state"], "released")
+        self.assertEqual([h["state"] for h in state["history"]][-2:], ["error", "released"])
+        self.assertIsNone(state["pending_release"])
+        self.assertIsNone(self.service.live_claim(1), "the task is claimable again at once")
+        self.assertEqual(self.agent_calls(), [])
+
+    def test_an_unconfirmed_release_is_retried_from_the_checkpoint_before_the_next_claim(self):
+        self.drop_retained_ref()
+        self.service.ttl = 600  # production's claim_ttl_seconds: an unreleased claim blocks the task for long
+        self.service.release_mode = "error"
+        cfg = self.config(fetch_retry_seconds=0, release_backoff=(0.0,))
+        client = self.client(cfg)
+        with self.assertRaises(repair_task.SourcesUnavailable):
+            repair_task.claim_and_run(cfg, client)
+        state = self.state()
+        self.assertEqual(state["state"], "release_failed")
+        self.assertEqual(state["pending_release"]["reason"], "artifacts_unavailable")
+        self.assertEqual(state["pending_release"]["attempts"], 1)
+        self.assertEqual(state["task"]["claim_token"], self.service.claims[1]["token"], "the claim token is kept")
+        self.assertEqual(self.service.releases, [])
+        self.assertIsNotNone(self.service.live_claim(1))
+        # While the service is still down a pass keeps the pending release and counts the attempt.
+        self.assertEqual(repair_task.retry_releases(cfg, client), [])
+        self.assertEqual(self.state()["pending_release"]["attempts"], 2)
+        self.assertIsNone(client.claim(), "our own stale claim makes the task unclaimable (concurrency)")
+        # The service is back and the ref exists: the loop settles the release first, then claims
+        # the task again and runs it to adoption, instead of polling for the claim's whole TTL.
+        self.service.release_mode = "ok"
+        self.restore_retained_ref()
+        stop = repair_task.Stop()
+        result: dict = {}
+        thread = threading.Thread(
+            target=lambda: result.update(summary=repair_task.serve(cfg, client, stop)), daemon=True
+        )
+        thread.start()
+        self.addCleanup(stop.set, "cleanup")
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not self.service.results:
+            time.sleep(0.05)
+        stop.set("test")
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([r["reason"] for r in self.service.releases], ["artifacts_unavailable"])
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(result["summary"]["releases_settled"], 1)
+        self.assertEqual(result["summary"]["outcomes"], {"adopted": 1})
+        states = [h["state"] for h in self.state()["history"]]
+        self.assertLess(states.index("released"), states.index("adopted"))
+        self.assertEqual(self.state()["state"], "adopted")
+        self.assertIsNone(self.state()["pending_release"])
+
+    def test_an_error_checkpoint_written_before_pending_releases_is_released_once(self):
+        cfg = self.config()
+        client = self.client(cfg)
+        claim = self.service.preclaim(1, "old-token", cfg.worker)
+        task = repair_task.Task.from_json(self.service.task_record(1, claim))
+        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
+        state.write("claimed", worker=cfg.worker)
+        state.write("error", error="RuntimeError: git fetch failed", phase="claimed")
+        # Another worker's checkpoint in the same root is not ours to release.
+        other = repair_task.TaskState(cfg.tasks_dir / "9", task)
+        other.write("claimed", worker="worker-b@test")
+        other.write("error", error="RuntimeError: git fetch failed", phase="claimed")
+        settled = repair_task.retry_releases(cfg, client)
+        self.assertEqual(settled, [{"task_id": "1", "state": "released", "reason": "artifacts_unavailable"}])
+        self.assertEqual([r["reason"] for r in self.service.releases], ["artifacts_unavailable"])
+        self.assertIsNone(self.service.live_claim(1))
+        self.assertEqual(repair_task.retry_releases(cfg, client), [], "a settled release is not sent again")
+        self.assertEqual(len(self.service.releases), 1)
+        # A pending release whose claim the service no longer knows is settled as lost.
+        gone = repair_task.Task.from_json({**task.to_json(), "claim_token": "gone"})
+        lost = repair_task.TaskState(cfg.tasks_dir / "2", gone)
+        lost.write("claimed", worker=cfg.worker)
+        lost.write("error", error="RuntimeError: boom", phase="agent_running")
+        self.assertEqual(
+            repair_task.retry_releases(cfg, client), [{"task_id": "1", "state": "claim_lost", "reason": "agent_failed"}]
+        )
+        self.assertEqual(len(self.service.releases), 1)
 
 
 class Preflight(Fixture):

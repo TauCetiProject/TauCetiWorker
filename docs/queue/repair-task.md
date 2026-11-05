@@ -213,6 +213,18 @@ original prompt, skipping source and artifact preparation. A claim the service n
 is recorded as `claim_lost` and not resumed. Bookkeeping loss therefore never restarts a model
 session while the claim is live, and a lost claim never produces a late submission.
 
+A task that ends in an error releases its claim (`artifacts_unavailable` before the agent ran,
+`agent_failed` after) so the service re-exposes it at once rather than at the claim's expiry. When
+the service cannot confirm a release (unreachable, 5xx) the checkpoint keeps it as
+`pending_release` beside the claim token (state `release_failed`), and `retry_releases` sends it
+again before every claim the loop makes, backing off per `release_backoff`, until the service
+confirms it, answers that the claim is gone (`claim_lost`), or has no release endpoint; a checkpoint
+left in `error` by an older worker is treated the same. This is what stops a worker from polling
+around its own stale claim, which the service refuses for concurrency, for the claim's whole TTL.
+Retained refs the service has not published yet (its outbox writes them a moment after creating the
+task) are retried every `fetch_retry_delay` seconds for `fetch_retry_seconds` (10 s, 120 s) before
+the sources count as unavailable.
+
 ## Worker loop integration
 
 The runner is importable: `RunnerConfig` (service, clone, root, worker identity, profile and the
