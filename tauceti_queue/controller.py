@@ -1187,8 +1187,15 @@ class Controller:
             if batch is None:
                 break
             # An input that conflicted with this very tip would conflict again; it waits for the tip to move.
+            # A textual conflict is with content already in the chain, so appending members cannot resolve
+            # it: a conflicted input is re-probed only once the batch's base changes (a new open batch or
+            # a rebase), not after every insertion, which cost one replay per conflicted input per member.
             waiting = [
-                row for row in self._waiting() if row["id"] not in probed and row["last_probe_tip"] != batch["tip"]
+                row
+                for row in self._waiting()
+                if row["id"] not in probed
+                and row["last_probe_tip"] != batch["tip"]
+                and not (row["last_probe_base"] and row["last_probe_base"] == batch["base"])
             ]
             if not waiting:
                 break
@@ -1270,7 +1277,12 @@ class Controller:
         except chain.ChainError as error:
             with self.store.transaction():
                 self.store.update(
-                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe=f"error: {error}"
+                    "inputs",
+                    {"id": row["id"]},
+                    state=INPUT_WAITING,
+                    batch_id=None,
+                    last_probe=f"error: {error}",
+                    last_probe_base="",
                 )
                 self._release_claim(claim, "probe-error", now)
                 self.store.journal(now, "probe-error", batch["id"], number=row["number"], error=str(error))
@@ -1309,6 +1321,7 @@ class Controller:
                         batch_id=None,
                         last_probe=dumps(paths),
                         last_probe_tip=batch["tip"],
+                        last_probe_base=batch["base"],
                     )
                 self._release_claim(claim, "conflict", now)
                 self.store.journal(

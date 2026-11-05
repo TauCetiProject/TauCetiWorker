@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS inputs (
     probes INTEGER NOT NULL DEFAULT 0,
     last_probe TEXT NOT NULL DEFAULT '',
     last_probe_tip TEXT NOT NULL DEFAULT '',
+    last_probe_base TEXT NOT NULL DEFAULT '',
     landed_at REAL,
     landed_sha TEXT
 );
@@ -229,7 +230,10 @@ class Store:
 
     # Columns added to a table after databases with the table already existed; `CREATE TABLE IF NOT
     # EXISTS` leaves those databases alone, so each is added here when absent.
-    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (("ci_attempts", "verdicts", "TEXT NOT NULL DEFAULT '{}'"),)
+    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("ci_attempts", "verdicts", "TEXT NOT NULL DEFAULT '{}'"),
+        ("inputs", "last_probe_base", "TEXT NOT NULL DEFAULT ''"),
+    )
 
     def _add_missing_columns(self) -> None:
         for table, column, declaration in self.ADDED_COLUMNS:
