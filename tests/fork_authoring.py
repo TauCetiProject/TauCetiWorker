@@ -189,9 +189,11 @@ def test_roadmap():
 
     check("roadmap: bubble target stays canonical", cap.get("target") == TAUCETI)
     check("roadmap: --allow-push is the fork", cap.get("allow_push") == FORK)
+    check("roadmap: bubble claim_repo is the fork", cap.get("claim_repo") == FORK)
     check("roadmap: push remote is the fork URL", os.environ.get("TAUCETI_PUSH_REMOTE") == f"https://github.com/{FORK}")
     check("roadmap: PUSH_EXPECT popped (create-only)", "TAUCETI_PUSH_EXPECT" not in os.environ)
     prompt = cap.get("prompt", "")
+    check("roadmap: prompt names $CLAIM_REPO for authoring claims", "`$CLAIM_REPO`" in prompt)
     check("roadmap: prompt has --head <forkowner>:", "--head alice:roadmap/" in prompt)
     check("roadmap: prompt carries the worker id", "worker3" in prompt)
     check(
@@ -238,14 +240,60 @@ def test_roadmap():
     check("roadmap: URL clone is mounted read-only", f"{cloned['dest']}:/opt/source:ro" in cap.get("mounts", []))
 
     host_cap = {}
+    saved_claims_repo = tc.work_units.claims_repo
+    os.environ.pop("CLAIM_REPO", None)
+    tc.work_units.claims_repo = lambda: tc.constants.CLAIMS
     tc.work_units.fetch_git_source = fake_fetch_source
     tc.work_units.prepare_checkout = lambda cfg, **_: True
-    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir, **_kwargs: host_cap.update(prompt=prompt) or 0
+    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir, **_kwargs: (
+        host_cap.update(prompt=prompt, claim_repo=os.environ.get("CLAIM_REPO")) or 0
+    )
     opts.source = str(source)
-    tc.work_units.do_roadmap(w, None, c, opts, bubble=False)
-    host_prompt = host_cap.get("prompt", "")
-    check("roadmap: host uses a disposable snapshot", "worker-owned disposable snapshot" in host_prompt)
-    check("roadmap: host prompt points at materialized copy", str(materialized["dest"]) in host_prompt)
+    try:
+        tc.work_units.do_roadmap(w, None, c, opts, bubble=False)
+        host_prompt = host_cap.get("prompt", "")
+        check("roadmap: host uses a disposable snapshot", "worker-owned disposable snapshot" in host_prompt)
+        check("roadmap: host prompt points at materialized copy", str(materialized["dest"]) in host_prompt)
+        check("roadmap: host claim repo uses claims_repo()", host_cap.get("claim_repo") == tc.constants.CLAIMS)
+        check("roadmap: host CLAIM_REPO restored after do_roadmap", "CLAIM_REPO" not in os.environ)
+
+        os.environ["CLAIM_REPO"] = "coordination/claims"
+        cap.clear()
+        tc.work_units.do_roadmap(w, None, c, opts, bubble=True)
+        check("roadmap: bubble keeps fork claim_repo even when $CLAIM_REPO is set", cap.get("claim_repo") == FORK)
+        check("roadmap: pre-existing CLAIM_REPO preserved", os.environ.get("CLAIM_REPO") == "coordination/claims")
+    finally:
+        tc.work_units.claims_repo = saved_claims_repo
+        os.environ.pop("CLAIM_REPO", None)
+
+    # End-to-end check on real claim.sh: with TAUCETI_WORKER_ID forwarded (as run_in_bubble does),
+    # separate subshell invocations share one owner so `release` on retreat deletes the lease.
+    remote_bare = tmp / "fork-claims.git"
+    git_env = {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "safe.bareRepository",
+        "GIT_CONFIG_VALUE_0": "all",
+        "GIT_CONFIG_KEY_1": f"url.{remote_bare}.insteadOf",
+        "GIT_CONFIG_VALUE_1": f"https://github.com/{FORK}",
+        "CLAIM_REPO": FORK,
+        "CLAIM_GITDIR": str(tmp / "scratch-claims.git"),
+        "TAUCETI_WORKER_ID": "worker3",
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(remote_bare)], check=True, env=git_env)
+    acq = subprocess.run([str(REPO / "scripts" / "claim.sh"), "acquire", "author/Topology/demo"], env=git_env)
+    check("roadmap claim.sh: acquire succeeds in fork", acq.returncode == 0)
+    reacq = subprocess.run([str(REPO / "scripts" / "claim.sh"), "acquire", "author/Topology/demo"], env=git_env)
+    check("roadmap claim.sh: re-acquire in new subshell recognizes own lease", reacq.returncode == 0)
+    rel = subprocess.run([str(REPO / "scripts" / "claim.sh"), "release", "author/Topology/demo"], env=git_env)
+    refs = subprocess.run(
+        ["git", "--git-dir", str(remote_bare), "for-each-ref", "refs/tauceti-claims"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=git_env,
+    ).stdout.strip()
+    check("roadmap claim.sh: release in new subshell deletes lease", rel.returncode == 0 and refs == "")
 
     opts.source = None
     cap.clear()
