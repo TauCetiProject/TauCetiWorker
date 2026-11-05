@@ -985,6 +985,7 @@ class PromptContext:
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
     rebase_options: str = "--keep-empty --empty=keep --reapply-cherry-picks"  # the replay's git options
     repair_context: object | None = None  # ``repair_context.compute``'s result: ownership, collisions and ripples
+    pre_rebased: bool = False  # prepare: the chain is the batch's pre-rebase on the head's tip ``base``
 
 
 def _pr_list(prs: list[int]) -> str:
@@ -1649,6 +1650,27 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     if conflict:
         happened, evidence = _rebase_sections(context, chain, clone, base_short, where)
         lines += happened + evidence
+    elif context.kind == "prepare" and context.pre_rebased:
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} squash commits, one per pull request, is waiting behind the queue's head and "
+            f"has been replayed onto the head's tip `{base_short}`, the commit it becomes the next head on when the "
+            "head lands as it is. Fix what fails to build on that tip so the batch is ready when it becomes the head; "
+            "nothing you do is a verdict. The head's CI round decides later, and your edits travel with the members."
+            + (f" {context.origin}" if context.origin else "")
+            + f" Your job is to make the whole batch build on `{base_short}`; the head's own commits below it are not "
+            "yours to edit.",
+            "",
+            f"You are in a private, detached Git worktree of {context.repository}; HEAD is the batch's pre-rebased tip "
+            f"on `{base_short}`.",
+            "",
+            "## Build evidence",
+            "",
+            "No CI run has seen this chain. The worker's own whole-library `lake build --iofail` of it reports the "
+            "errors; see the build section below.",
+            "",
+        ]
     elif context.kind == "prepare":
         lines += [
             "## What happened",

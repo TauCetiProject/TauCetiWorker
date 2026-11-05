@@ -920,13 +920,27 @@ def task_findings(task: Task) -> dict:
 ARTIFACT_ANCESTORS = 50  # first-parent ancestors of the build revision asked for a published cache mapping
 
 
+def pre_rebased(task: Task) -> dict | None:
+    """``extra.pre_rebased`` of a ``prepare`` task whose chain is an open batch's pre-rebase on the
+    head's tip (``base`` and ``onto`` that tip): the batch tip it covers (``source``), the batch's own
+    base, and the head's base; None for a preparation on the batch's own base."""
+    record = task.extra.get("pre_rebased") if task.kind == "prepare" else None
+    return record if isinstance(record, dict) else None
+
+
 def artifact_revisions(task: Task) -> list[str]:
     """The revisions whose published cache to try, in order. A rebase conflict replays the chain onto
     ``onto`` and builds there, so its artifacts come first and the stale batch base is the fallback;
-    a repair builds on its base and falls back to ``onto`` when that differs. ``prepare_artifacts``
-    walks the first one's first-parent ancestors (``ARTIFACT_ANCESTORS`` of them) before a fallback
-    off that walk, so the artifacts come from the newest revision the cache has."""
+    a repair builds on its base and falls back to ``onto`` when that differs. A preparation of a
+    pre-rebased chain builds on the head's tip, which the public cache never has (the repair cache
+    under the head's tip is tried before all of these, ``repair_publish.preferred``), so the head's
+    base and then the batch's own base follow it. ``prepare_artifacts`` walks the first one's
+    first-parent ancestors (``ARTIFACT_ANCESTORS`` of them) before a fallback off that walk, so the
+    artifacts come from the newest revision the cache has."""
     order = [task.onto, task.base] if task.kind in repair.REBASE_KINDS else [task.base, task.onto]
+    stacked = pre_rebased(task)
+    if stacked is not None:
+        order += [str(stacked.get("head_base") or ""), str(stacked.get("batch_base") or "")]
     revisions: list[str] = []
     for revision in order:
         if revision and revision not in revisions:
@@ -940,7 +954,14 @@ def describe_cache_revision(task: Task, artifacts: dict) -> str:
     85f3eb5579df)``."""
     revision = artifacts["cache_revision"]
     rebase = task.kind in repair.REBASE_KINDS
-    if revision == task.base:
+    stacked = pre_rebased(task) or {}
+    if stacked and revision == task.base:
+        role = "the head's tip"
+    elif stacked and revision == stacked.get("head_base"):
+        role = "the head's base"
+    elif stacked and revision == stacked.get("batch_base"):
+        role = "the batch's own base"
+    elif revision == task.base:
         role = "the batch base" if rebase else "the base"
     elif revision == task.onto:
         role = "the rebase target"
@@ -1006,6 +1027,7 @@ def prompt_context(
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         listings_path=listings,
         shell_limit=shell_limit,
+        pre_rebased=pre_rebased(task) is not None,
     )
 
 
@@ -1783,9 +1805,17 @@ def run_task(
                         repository=task.repository,
                         lake=cfg.lake,
                     )
-                log(f"task {task.task_id}: the open batch builds on its base; nothing to prepare")
+                where = "the head's tip" if pre_rebased(task) is not None else "its base"
+                log(f"task {task.task_id}: the open batch builds on {where}; nothing to prepare")
                 released = release_task(
-                    cfg, client, task, state, "prepared_clean", "the batch built without errors", outcome, lease
+                    cfg,
+                    client,
+                    task,
+                    state,
+                    "prepared_clean",
+                    f"the batch built on {where} without errors",
+                    outcome,
+                    lease,
                 )
                 publish_after(task.tip)
                 return released
