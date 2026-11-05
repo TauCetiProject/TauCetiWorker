@@ -455,6 +455,24 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 503, "a login never checked before is neither granted nor refused")
         self.assertIn("could not confirm", body["error"])
 
+    def test_admin_settings_accepts_every_controller_setting_and_refuses_unknown_keys_first(self):
+        from tauceti_queue.controller import DEFAULT_SETTINGS
+
+        applied = []
+        self.controller.effective_settings = lambda: dict(DEFAULT_SETTINGS)
+        self.controller.set_setting = lambda key, value, actor: applied.append((key, value, actor))
+        body = {"lost_run_seconds": 14400, "publication_enabled": True, "membership_label": "bors-staging"}
+        status, _ = self.request("POST", "/admin/settings", body, self.bearer("ghp_kim"))
+        self.assertEqual(status, 200)
+        self.assertEqual(applied, [(key, value, "kim-em") for key, value in body.items()])
+        applied.clear()
+        status, reply = self.request(
+            "POST", "/admin/settings", {"lost_run_seconds": 1, "batch_cap": 4}, self.bearer("ghp_kim")
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("batch_cap", reply["error"])
+        self.assertEqual(applied, [], "nothing is applied when any key is unknown")
+
     def test_admin_endpoints(self):
         self.assertEqual(self.request("POST", "/admin/settings", {"insertion_age_window": 8})[0], 401)
         status, body = self.request("POST", "/admin/settings", {"insertion_age_window": 8}, self.bearer("ghp_worker"))

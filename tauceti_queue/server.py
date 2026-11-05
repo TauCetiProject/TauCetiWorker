@@ -18,6 +18,9 @@ same process. Routes:
     POST /admin/settings                              same bearer scheme; the controller checks the
     POST /admin/urgent                                caller's repository-admin permission
 
+`/admin/settings` takes one JSON object `{"<setting>": <value>, ...}` whose keys are any of the
+controller's `DEFAULT_SETTINGS`, each value of the type of that setting's initial value.
+
 The controller methods behind them: `status()`, `handle_event`, `claim_task(worker_identity,
 github_login)`, `renew_task(task_id, worker_identity, github_login, body)`, `submit_task(task_id,
 worker_identity, github_login, body)`, `update_settings(github_login, settings)`, `mark_urgent(repo,
@@ -518,8 +521,16 @@ class Handler(BaseHTTPRequestHandler):
         self._call(lambda: self._apply_settings(identity[0], body))
 
     def _apply_settings(self, login: str, body: dict) -> dict:
+        """`POST /admin/settings` with a JSON object `{"<key>": <value>, ...}`: every key of the
+        controller's settings (`DEFAULT_SETTINGS`) may be set, each value of the type of its initial
+        value. Unknown keys are refused before any value is applied."""
         controller = self.server.controller
         if hasattr(controller, "set_setting"):
+            if hasattr(controller, "effective_settings"):
+                known = controller.effective_settings()
+                unknown = sorted(key for key in body if key not in known)
+                if unknown:
+                    raise ValueError(f"unknown setting {', '.join(unknown)}; known: {', '.join(sorted(known))}")
             for key, value in body.items():
                 controller.set_setting(key, value, login)
             status = controller.status() if hasattr(controller, "status") else {}

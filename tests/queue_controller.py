@@ -5,6 +5,7 @@ The end-to-end flows are in tests/queue_fixture.py; this file checks the control
 decisions against the fake GitHub without driving whole head cycles.
 """
 
+import dataclasses
 import json
 import sys
 import tempfile
@@ -20,6 +21,7 @@ from tauceti_queue import chain, feeds  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
     DEFAULT_SETTINGS,
     LOG_GRACE_SECONDS,
+    LOST_IN_PROGRESS,
     MERGED_TITLE_PREFIX,
     STATUS_SCHEMA,
     VERDICT_CONTEXTS,
@@ -404,6 +406,172 @@ class Dispatch(ControllerCase):
         self.assertIn(
             "dispatch refused", self.controller.store.journal_entries("dispatch-failed")[-1]["detail"]["error"]
         )
+
+
+class LostRuns(ControllerCase):
+    """A run GitHub still reports queued or in progress is never lost, and is re-adopted rather than duplicated."""
+
+    def setUp(self):
+        super().setUp()
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()  # dispatch
+        self.head = self.controller.store.row("batches", {"state": "head"})
+
+    def attempt(self):
+        return self.controller.store.row("ci_attempts", {"batch_id": self.head["id"]}, order="id DESC")
+
+    def observe(self, seconds=0):
+        self.clock.advance(seconds or self.controller.setting("polling_interval_seconds") + 1)
+        return self.controller.tick()
+
+    def test_default_lost_run_seconds_is_four_hours(self):
+        self.assertEqual(DEFAULT_SETTINGS["lost_run_seconds"], 14400)
+
+    def test_in_progress_run_building_for_an_hour_without_job_updates_is_not_lost(self):
+        # The incident: one long `lake build` step, no phase change for an hour, GitHub says in_progress.
+        self.github.start_runs()
+        self.observe()
+        reasons = self.observe(3601)
+        attempt = self.attempt()
+        self.assertEqual(attempt["outcome"], "pending", attempt["outcome_detail"])
+        self.assertEqual(len(self.github.dispatches), 1, "no duplicate run is dispatched")
+        self.assertFalse(any(r.startswith("stall:") for r in reasons), "under lost_run_seconds: not even a stall line")
+
+    def test_in_progress_run_without_job_updates_is_a_stall_while_github_still_updates_the_run(self):
+        self.github.start_runs()
+        self.observe()
+        threshold = self.controller.setting("lost_run_seconds")
+        listed = self.github.read_run
+
+        def fresh(repo, run_id, **kwargs):
+            run = listed(repo, run_id, **kwargs)
+            return dataclasses.replace(run, updated_at=self.clock() - 60)
+
+        self.github.read_run = fresh
+        reasons = self.observe(threshold + 1)
+        self.assertEqual(self.attempt()["outcome"], "pending")
+        self.assertTrue(any(r.startswith("stall:") and "not treated as lost" in r for r in reasons), reasons)
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_updated_at_moving_advances_last_progress(self):
+        self.github.start_runs()
+        self.observe()
+        threshold = self.controller.setting("lost_run_seconds")
+        before = self.attempt()["last_progress_at"]
+        for _ in range(3):
+            self.clock.advance(threshold - 100)
+            self.github.runs[0].updated_at = self.clock()
+            self.observe()
+        attempt = self.attempt()
+        self.assertEqual(attempt["outcome"], "pending", attempt["outcome_detail"])
+        self.assertGreater(attempt["last_progress_at"], before + 2 * threshold)
+        self.assertEqual(self.controller.status()["head"]["ci"]["updated_at"], self.github.runs[0].updated_at)
+
+    def test_queued_run_is_never_lost(self):
+        self.observe()
+        reasons = self.observe(3 * self.controller.setting("lost_run_seconds"))
+        self.assertEqual(self.attempt()["outcome"], "pending")
+        self.assertTrue(any(r.startswith("stall:") and "queued" in r for r in reasons), reasons)
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_in_progress_run_stale_in_a_direct_read_is_lost_but_readopted_while_github_reports_it_live(self):
+        self.github.start_runs()
+        self.observe()
+        self.observe(self.controller.setting("lost_run_seconds") + 1)
+        attempt = self.attempt()
+        self.assertEqual(attempt["outcome"], "infrastructure")
+        self.assertTrue(attempt["outcome_detail"].startswith(LOST_IN_PROGRESS), attempt["outcome_detail"])
+        self.assertIn(("read_run", (attempt["run_id"],)), self.github.calls, "the run was read directly first")
+        self.observe(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+        self.assertEqual(len(self.github.dispatches), 1, "a dispatch would cancel the live run")
+        self.assertEqual(self.attempt()["outcome"], "pending")
+        self.assertEqual(
+            self.controller.store.journal_entries("run-readopted")[-1]["detail"]["run_id"], attempt["run_id"]
+        )
+
+    def test_no_second_dispatch_for_a_tip_while_its_run_is_live(self):
+        # pr-build.yml's concurrency group cancels the older staging run when a second dispatch for the
+        # same candidate starts (the fake models it): the live run must survive every re-dispatch path.
+        self.github.start_runs()
+        self.observe()
+        first = self.attempt()
+        for outcome, detail in (
+            ("infrastructure", "lost-run: no progress for 3600s"),
+            ("infrastructure", "no-run: the dispatch produced no run"),
+            ("superseded", ""),
+        ):
+            with self.subTest(outcome=outcome, detail=detail):
+                self.controller.store.update("ci_attempts", {"id": first["id"]}, outcome=outcome, outcome_detail=detail)
+                self.observe(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+                self.assertEqual(len(self.github.dispatches), 1)
+                self.assertEqual(self.github.runs[0].status, "in_progress", "the live run was not cancelled")
+                self.assertEqual(self.attempt()["id"], first["id"])
+                self.assertEqual(self.attempt()["outcome"], "pending")
+        # Once the run has really finished without a verdict, the re-dispatch goes ahead.
+        self.github.runs[0].status, self.github.runs[0].conclusion = "completed", "cancelled"
+        self.observe()
+        self.assertEqual(self.attempt()["outcome_detail"], "run-cancelled")
+        self.observe(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+        self.assertEqual(len(self.github.dispatches), 2)
+
+    def test_retry_ci_refuses_while_a_run_for_the_tip_is_live(self):
+        self.github.start_runs()
+        self.observe()
+        run_id = self.attempt()["run_id"]
+        self.controller.store.update(
+            "ci_attempts", {"id": self.attempt()["id"]}, outcome="infrastructure", outcome_detail="lost-run: old"
+        )
+        result = self.controller.retry_ci(PROJECT, "operator")
+        self.assertEqual((result["retried"], result["reason"], result["run_id"]), (False, "live-run", run_id))
+        self.assertIn("would cancel it", result["detail"])
+        self.assertEqual(self.attempt()["outcome"], "infrastructure", "nothing was forgotten")
+        self.github.complete_runs()
+        self.assertTrue(self.controller.retry_ci(PROJECT, "operator")["retried"])
+
+    def test_vanished_run_is_lost(self):
+        self.observe()
+        self.github.runs[0].vanished = True
+        self.observe()
+        attempt = self.attempt()
+        self.assertEqual(attempt["outcome"], "infrastructure")
+        self.assertEqual(attempt["outcome_detail"], f"lost-run: run {attempt['run_id']} is no longer on GitHub")
+
+    def test_live_run_is_readopted_instead_of_redispatched(self):
+        # An attempt declared lost by the old rule while its run was still building: the next
+        # re-dispatch finds the run in progress and binds the attempt to it again.
+        self.github.start_runs()
+        self.observe()
+        attempt = self.attempt()
+        self.controller.store.update(
+            "ci_attempts",
+            {"id": attempt["id"]},
+            outcome="infrastructure",
+            outcome_detail="lost-run: no progress for 3600s",
+        )
+        reasons = self.observe(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+        self.assertEqual(len(self.github.dispatches), 1, "no duplicate run")
+        readopted = self.attempt()
+        self.assertEqual(readopted["id"], attempt["id"], "the same attempt, so the staging branch is unchanged")
+        self.assertEqual((readopted["outcome"], readopted["run_id"]), ("pending", attempt["run_id"]))
+        entry = self.controller.store.journal_entries("run-readopted")[-1]
+        self.assertEqual(entry["detail"]["run_id"], attempt["run_id"])
+        self.assertTrue(any("re-adopted live CI run" in r for r in reasons), reasons)
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": self.head["tip"], "context": context})
+        self.controller.tick()
+        self.assertEqual(self.attempt()["outcome"], "pass")
+        self.assertEqual(self.repo.main_sha(), self.head["tip"])
+
+    def test_run_found_after_the_dispatch_timeout_is_readopted(self):
+        self.github.runs[0].vanished = True  # GitHub lists nothing yet
+        self.observe(self.controller.setting("dispatch_timeout_seconds") + 1)
+        self.assertTrue(self.attempt()["outcome_detail"].startswith("no-run"))
+        self.github.runs[0].vanished = False
+        self.observe(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.attempt()["outcome"], "pending")
+        self.assertEqual(self.attempt()["run_id"], self.github.runs[0].run_id)
 
 
 class Rebuild(ControllerCase):

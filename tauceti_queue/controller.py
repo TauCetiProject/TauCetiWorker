@@ -32,6 +32,7 @@ from .eligibility import KEEP as BLOCKING_LABELS
 from .ports import (
     AGENT_INSTRUCTION,
     Adoption,
+    CandidateRun,
     GitHubPort,
     GitHubUnavailable,
     Task,
@@ -62,7 +63,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "publication_enabled": False,
     "claim_ttl_seconds": 900,
     "dispatch_timeout_seconds": 600,
-    "lost_run_seconds": 3600,
+    # An in-progress run counts as lost only when neither its jobs nor GitHub's direct read of the run
+    # (`updated_at`) have moved for this long; until then a long build is a `stall` reason line.
+    "lost_run_seconds": 14400,
     "infrastructure_retry_limit": 3,
     "infrastructure_retry_backoff_seconds": 60,
     "inference_failure_threshold": 3,
@@ -145,6 +148,12 @@ OUTCOME_PASS = "pass"
 OUTCOME_SOURCE_FAILURE = "source-failure"
 OUTCOME_INFRASTRUCTURE = "infrastructure"
 OUTCOME_SUPERSEDED = "superseded"
+# Run statuses GitHub reports for a run that has not finished: such a run is never re-dispatched over.
+LIVE_RUN_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
+# The detail of an in-progress run declared lost after a direct read confirmed it stale. Such a run is
+# still re-adopted while GitHub reports it live: pr-build.yml's concurrency group cancels the older
+# staging run when a second one for the same candidate starts, so a duplicate dispatch kills it.
+LOST_IN_PROGRESS = "lost-run: in_progress"
 
 _PR_MENTION_RE = re.compile(r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<number>\d+)")
 # The subject of a squash commit bors-ng lands: `<title> (#<number>)`, with no `Source-PR` trailer.
@@ -2561,13 +2570,33 @@ class Controller:
             }
 
     def retry_ci(self, repo: str, actor: str) -> dict[str, Any]:
-        """Operator: forget the head's exhausted infrastructure failures so the next tick re-dispatches."""
+        """Operator: forget the head's exhausted infrastructure failures so the next tick re-dispatches.
+
+        Refused (`reason: live-run`) while GitHub reports a run for the head's tip queued or in
+        progress, since the re-dispatch would cancel it; `github-unavailable` when that cannot be checked.
+        """
         with self._lock:
             self._check_repo(repo)
             head = self._head()
             if head is None:
                 return {"retried": False, "reason": "no-head"}
             now = self.clock()
+            attempts = self._tip_attempts(head)
+            if attempts:
+                # A new dispatch would cancel a live run for the tip (pr-build.yml's concurrency group).
+                try:
+                    run = self._live_run(head, attempts)
+                except Exception as error:  # noqa: BLE001
+                    return {"retried": False, "reason": "github-unavailable", "detail": str(error)}
+                if run is not None:
+                    self.store.journal(now, "retry-ci-refused", head["id"], actor=actor, run_id=run.run_id)
+                    return {
+                        "retried": False,
+                        "reason": "live-run",
+                        "detail": f"run {run.run_id} for the tip is {run.status}; a re-dispatch would cancel it",
+                        "run_id": run.run_id,
+                        "status": run.status,
+                    }
             count = self.store.update(
                 "ci_attempts",
                 {"batch_id": head["id"], "batch_version": head["version"], "outcome": OUTCOME_INFRASTRUCTURE},
@@ -2577,11 +2606,94 @@ class Controller:
             self._wake.set()
             return {"retried": True, "forgotten": count}
 
+    def _tip_attempts(self, head: dict[str, Any]) -> list[dict[str, Any]]:
+        """The attempts at the head's current version for its current tip and base, oldest first."""
+        return [
+            a
+            for a in self.store.rows("ci_attempts", {"batch_id": head["id"], "batch_version": head["version"]})
+            if a["head_sha"] == head["tip"] and a["base_sha"] == head["base"]
+        ]
+
+    def _live_run(self, head: dict[str, Any], attempts: list[dict[str, Any]]) -> CandidateRun | None:
+        """The newest run GitHub reports for the head's tip since its first attempt, when it is still
+        queued or in progress; `None` when there is none. Raises when GitHub cannot be asked."""
+        run = self.github.find_candidate_run(
+            self.repository,
+            batch_id=str(head["id"]),
+            head_sha=head["tip"],
+            base_sha=head["base"],
+            since=min(a["dispatched_at"] for a in attempts),
+        )
+        return run if run is not None and run.status in LIVE_RUN_STATUSES else None
+
+    def _readopt_live_run(self, head: dict[str, Any], now: float) -> bool:
+        """Before any re-dispatch of a tip that was dispatched before: re-adopt a run for it that GitHub
+        still reports queued or in progress, instead of dispatching a duplicate beside it.
+
+        A duplicate is not only wasted: pr-build.yml's concurrency group cancels the live staging run
+        when the second one starts. So a live run is re-adopted whatever its attempt was classified as
+        (lost, no-run, superseded). The newest attempt for the tip becomes pending again, bound to the
+        live run, so the staging candidate branch named after the attempt stays the one CI verifies.
+        Returns whether the dispatch must not happen this tick (re-adopted, or GitHub could not be asked).
+        """
+        attempts = self._tip_attempts(head)
+        if not attempts:
+            return False
+        try:
+            run = self._live_run(head, attempts)
+        except Exception as error:  # noqa: BLE001
+            self._reasons.append(f"head {head['id']}: cannot check for a live CI run before re-dispatch: {error}")
+            return True
+        if run is None:
+            return False
+        attempt = attempts[-1]
+        with self.store.transaction():
+            self.store.update(
+                "ci_attempts",
+                {"id": attempt["id"]},
+                outcome=OUTCOME_PENDING,
+                outcome_detail="",
+                run_id=run.run_id,
+                run_status=run.status,
+                last_progress_at=now,
+                needs_observation=1,
+            )
+            self._count("ci_readoptions")
+            self.store.journal(
+                now,
+                "run-readopted",
+                head["id"],
+                attempt_id=attempt["id"],
+                run_id=run.run_id,
+                status=run.status,
+                previous_outcome=attempt["outcome"],
+                previous_detail=attempt["outcome_detail"],
+            )
+        self.log.info(
+            "head %s: re-adopted live CI run %s (%s) instead of re-dispatching after %s %s",
+            head["id"],
+            run.run_id,
+            run.status,
+            attempt["outcome"],
+            attempt["outcome_detail"],
+        )
+        self._reasons.append(f"head {head['id']} re-adopted live CI run {run.run_id} ({run.status})")
+        return True
+
+    def _read_run(self, run_id: str, *, with_jobs: bool) -> CandidateRun | None:
+        """`read_run` on the port; a port without it reads nothing directly (raises, so nothing is lost)."""
+        reader = getattr(self.github, "read_run", None)
+        if reader is None:
+            raise ControllerError("no-read-run", "the GitHub port cannot read a run directly")
+        return reader(self.repository, run_id, with_jobs=with_jobs)
+
     def _dispatch(self, head: dict[str, Any], now: float, retry: int) -> None:
         if not self.setting("publication_enabled"):
             self._reasons.append(
                 f"publication disabled: would dispatch CI for head {head['id']} v{head['version']} ({head['tip'][:12]} on {head['base'][:12]})"
             )
+            return
+        if self._readopt_live_run(head, now):
             return
         members = [m["number"] for m in self._members(head["id"])]
         # The attempt row is reserved first because its id names the staging candidate branch that the
@@ -2641,6 +2753,49 @@ class Controller:
                 retry=retry,
             )
 
+    def _check_lost_run(
+        self, head: dict[str, Any], attempt: dict[str, Any], run: CandidateRun, values: dict[str, Any], now: float
+    ) -> None:
+        """Decide whether an unfinished run is lost; updates `values` with the verdict when it is.
+
+        A queued (or otherwise waiting) run is never lost. An in-progress run is lost only when its
+        jobs have reported nothing for `lost_run_seconds` and a direct read of the run still says
+        `in_progress` with an `updated_at` at least that old; short of that a long silence is a
+        `stall` reason line, never an infrastructure verdict.
+        """
+        threshold = int(self.setting("lost_run_seconds"))
+        silence = now - values["last_progress_at"]
+        if silence < threshold:
+            return
+        stall = f"stall: head {head['id']} run {run.run_id} is {run.status or 'unknown'} with no job update for {silence:.0f}s"
+        if run.status != "in_progress":
+            self._reasons.append(f"{stall}; a run GitHub reports {run.status or 'unknown'} is not lost")
+            return
+        try:
+            direct = self._read_run(run.run_id, with_jobs=False)
+        except Exception as error:  # noqa: BLE001
+            self._reasons.append(f"{stall}; the direct read of the run failed ({error}), not treated as lost")
+            return
+        if direct is None:
+            detail = f"lost-run: run {run.run_id} is no longer on GitHub"
+        elif direct.status != "in_progress":
+            # Finished (or requeued) since the listing: the next observation reads it in full.
+            values["needs_observation"] = 1
+            self._reasons.append(f"{stall}; GitHub now reports it {direct.status or 'unknown'}")
+            return
+        elif direct.updated_at is not None and now - direct.updated_at < threshold:
+            self._reasons.append(
+                f"{stall}; GitHub updated the run {now - direct.updated_at:.0f}s ago, not treated as lost"
+            )
+            return
+        else:
+            age = "unknown" if direct.updated_at is None else f"{now - direct.updated_at:.0f}s"
+            detail = f"{LOST_IN_PROGRESS} with no job update for {silence:.0f}s and run updated_at {age} old"
+        values.update(outcome=OUTCOME_INFRASTRUCTURE, outcome_detail=detail)
+        self.store.journal(
+            now, "ci-infrastructure", head["id"], attempt_id=attempt["id"], run_id=run.run_id, detail=detail
+        )
+
     def _observe_attempt(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
         interval = int(self.setting("polling_interval_seconds"))
         due = (
@@ -2662,6 +2817,24 @@ class Controller:
             self._reasons.append(f"CI observation failed: {error}")
             return
         values: dict[str, Any] = {"last_observed_at": now, "needs_observation": 0}
+        if run is None and attempt["run_id"]:
+            # The run this attempt was bound to is missing from the listing: read it by id before
+            # calling it lost, so a listing that momentarily omits it costs nothing.
+            try:
+                run = self._read_run(attempt["run_id"], with_jobs=True)
+            except Exception as error:  # noqa: BLE001
+                self._reasons.append(f"CI observation failed: direct read of run {attempt['run_id']}: {error}")
+                return
+            if run is None:
+                values.update(
+                    outcome=OUTCOME_INFRASTRUCTURE,
+                    outcome_detail=f"lost-run: run {attempt['run_id']} is no longer on GitHub",
+                )
+                self.store.journal(
+                    now, "ci-infrastructure", head["id"], attempt_id=attempt["id"], detail=values["outcome_detail"]
+                )
+                self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
+                return
         if run is None:
             if now - attempt["dispatched_at"] >= int(self.setting("dispatch_timeout_seconds")):
                 values.update(outcome=OUTCOME_INFRASTRUCTURE, outcome_detail="no-run: the dispatch produced no run")
@@ -2670,12 +2843,17 @@ class Controller:
                 )
             self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
             return
-        progress = [t for t in (run.created_at, run.started_at, run.completed_at) if t]
+        progress = [t for t in (run.created_at, run.started_at, run.completed_at, run.updated_at) if t]
         for phase in run.phases:
             progress.extend(t for t in (phase.started_at, phase.completed_at) if t)
         last_progress = max(progress) if progress else attempt["last_progress_at"]
         phases = [vars(phase) for phase in run.phases]
-        if phases != loads(attempt["phases"], []) and not progress:
+        # Progress is any change GitHub reports: a phase or step appearing, starting or completing
+        # (its timestamps are part of the phase), or the run's `updated_at` moving.
+        moved = phases != loads(attempt["phases"], []) or (
+            run.updated_at is not None and run.updated_at != attempt["run_updated_at"]
+        )
+        if moved:
             last_progress = now
         values.update(
             run_id=run.run_id,
@@ -2685,6 +2863,7 @@ class Controller:
             run_created_at=run.created_at,
             run_started_at=run.started_at,
             run_completed_at=run.completed_at,
+            run_updated_at=run.updated_at if run.updated_at is not None else attempt["run_updated_at"],
             runner_name=run.runner_name,
             runner_labels=dumps(list(run.runner_labels)),
             host=run.host,
@@ -2694,14 +2873,7 @@ class Controller:
             diagnostics=dumps(list(run.diagnostics)),
         )
         if run.status != "completed":
-            if now - values["last_progress_at"] >= int(self.setting("lost_run_seconds")):
-                values.update(
-                    outcome=OUTCOME_INFRASTRUCTURE,
-                    outcome_detail=f"lost-run: no progress for {now - values['last_progress_at']:.0f}s",
-                )
-                self.store.journal(
-                    now, "ci-infrastructure", head["id"], attempt_id=attempt["id"], detail=values["outcome_detail"]
-                )
+            self._check_lost_run(head, attempt, run, values, now)
             self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
             return
         if run.conclusion not in ("success", "failure"):
@@ -3410,6 +3582,7 @@ class Controller:
                 "created_at": attempt["run_created_at"],
                 "started_at": attempt["run_started_at"],
                 "completed_at": attempt["run_completed_at"],
+                "updated_at": attempt["run_updated_at"],
                 "runner": attempt["runner_name"],
                 "runner_labels": loads(attempt["runner_labels"], []),
                 "host": attempt["host"],

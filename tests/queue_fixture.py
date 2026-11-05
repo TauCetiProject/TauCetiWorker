@@ -727,7 +727,9 @@ class HeadOperations(QueueFixture):
         self.clock.advance(backoff + 1)
         self.tick()
         self.assertEqual(len(self.github.dispatches), 2)
-        self.clock.advance(self.controller.setting("lost_run_seconds") + 1)  # the lost run never starts
+        self.tick()  # the second run is observed queued: bound to the attempt, never lost while queued
+        self.github.start_runs()  # the `lost` run vanishes from GitHub instead of starting
+        self.clock.advance(self.controller.setting("polling_interval_seconds") + 1)
         self.tick()
         self.assertIn("lost-run", self.controller.status()["head"]["ci"]["outcome_detail"])
         self.clock.advance(2 * backoff + 1)
