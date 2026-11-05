@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tauceti_queue import admission_planning, repair
-from tauceti_queue.fakes import make_controller
+from tauceti_queue.fakes import make_controller, reopen_controller
 
 PROJECT = "TauCetiProject/TauCeti"
 
@@ -110,11 +110,15 @@ class Planning(unittest.TestCase):
 
     def test_budget_failure_keeps_known_paths_and_marks_unknown(self):
         self.approve(101, {"TauCeti/A.lean": "x" * (admission_planning.MAX_FILE_BYTES + 1)})
+        self.approve(102, {"TauCeti/B.lean": "import TauCeti.C\ndef b := 1\n"})
+        self.approve(103, {"TauCeti/C.lean": "def c := 1\n"})
         self.controller.tick()
         batch, members, inputs = self.context()
         context = admission_planning.Planner(self.repo.clone).context(members, inputs, tip=batch["tip"])
         self.assertFalse(context["complete"])
         self.assertIn("budget", context["errors"][0])
+        component = next(r for r in context["records"] if r["kind"] == "import_component")
+        self.assertEqual(component["members"], [102, 103], "one oversized blob must not discard other headers")
 
     def start_prediction(self):
         self.approve(101, {"TauCeti/A.lean": "def a := 1\n"})
@@ -225,6 +229,124 @@ class Planning(unittest.TestCase):
         with self.controller._lock:
             context = self.controller._admission_context(batch, self.clock())
         self.assertIn(evidence, context["records"])
+
+    def test_conflicting_insertion_after_restart_uses_persisted_ownership(self):
+        self.approve(101, {"TauCeti/Head.lean": "def h := 1\n"})
+        self.controller.tick()
+        self.approve(102, {"Shared.lean": "line one\nfirst alternative\nline three\n"})
+        self.controller.tick()
+        batch = self.controller._open_batch()
+        self.assertTrue(self.controller._state(f"admission_context:{batch['id']}")["ownership"])
+        self.controller.store.close()
+        self.controller = reopen_controller(self.tmp.name, self.github, self.repo, self.clock)
+        self.addCleanup(self.controller.store.close)
+        self.controller.recover()
+        self.assertFalse(hasattr(self.controller, "_admission_planner"))
+        self.approve(103, {"Shared.lean": "line one\nsecond alternative\nline three\n"})
+        self.controller.tick()
+        row = self.controller._input_for(103)
+        self.assertEqual(row["state"], "inserted")
+        self.assertEqual(json.loads(row["evidence"])["merge_selection"][0]["members"], [102])
+        self.assertFalse(self.controller.store.rows("inputs", {"state": "reserved"}))
+
+    def test_infrastructure_retry_continues_without_a_prediction_worker(self):
+        self.github.ci_policy = lambda *_: ("infrastructure", [])
+        head, _ = self.start_prediction()
+        self.github.complete_runs()
+        self.clock.advance(61)
+        self.controller.tick()
+        self.assertEqual(self.controller._current_attempt(head)["outcome"], "infrastructure")
+        self.clock.advance(61)
+        self.controller.tick()
+        self.assertEqual(len(self.github.runs), 2)
+        self.assertEqual(self.controller._current_attempt(head)["outcome"], "pending")
+
+    def test_prediction_keeps_pre_rebase_available_until_actual_source_failure(self):
+        head, _ = self.start_prediction()
+        self.assertIsNone(self.controller._pre_rebase_blocked(head))
+        self.controller.claim_task("fixture", "admin-worker")
+        self.assertIsNone(self.controller._pre_rebase_blocked(head))
+
+    def test_real_source_failure_cannot_be_resolved_by_an_earlier_noop_prediction(self):
+        self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "TauCeti.A", "message": "boom"}])
+        head, task_row = self.start_prediction()
+        task = self.controller.claim_task("fixture", "admin-worker")
+        self.github.complete_runs()
+        self.clock.advance(61)
+        self.controller.tick()
+        row = self.controller.store.row("tasks", {"id": task_row["id"]})
+        self.assertFalse(self.controller._prediction_task(row))
+        self.assertEqual(json.loads(row["diagnostics"])[0]["message"], "boom")
+        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "invalid-chain")
+        self.assertEqual(self.controller._head()["version"], head["version"])
+
+    def test_landing_discards_operational_admission_caches(self):
+        head, _ = self.start_prediction()
+        self.patch.stop()
+        with self.controller._lock:
+            self.controller._admission_context(head, self.clock())
+        self.github.complete_runs()
+        self.clock.advance(61)
+        self.controller.tick()
+        prefix = f"state:admission_repair:{head['id']}:"
+        self.assertFalse(any(r["key"].startswith(prefix) for r in self.controller.store.rows("settings")))
+        self.assertIsNone(self.controller._state(f"admission_context:{head['id']}"))
+
+    def test_optional_planner_exception_does_not_strand_admission(self):
+        with patch.object(admission_planning.Planner, "context", side_effect=OSError("unavailable")):
+            self.approve(101, {"TauCeti/A.lean": "def a := 1\n"})
+            self.controller.tick()
+        self.assertEqual(len(self.github.runs), 1)
+        self.assertFalse(self.controller.store.rows("inputs", {"state": "reserved"}))
+        context = self.controller._state(f"admission_context:{self.controller._head()['id']}")
+        self.assertFalse(context["complete"])
+
+    def test_prompt_never_claims_a_prediction_is_a_failed_ci_verdict(self):
+        self.assertFalse(any("admission.json" in line for line in admission_planning.prompt_lines(knowledge())))
+
+    def test_preparation_navigation_is_not_a_preparation_error(self):
+        self.approve(101, {"TauCeti/Head.lean": "def h := 1\n"})
+        self.controller.tick()
+        self.approve(102, {"TauCeti/A.lean": "def a := 1\n"})
+        self.controller.tick()
+        batch = self.controller._open_batch()
+        with self.controller._lock:
+            task_id = self.controller._create_task(batch, "prepare", batch["base"], [knowledge()], self.clock())
+            self.controller.store.update("tasks", {"id": task_id}, state="submitted", resolution="adopted")
+            self.controller.store.update("batches", {"id": batch["id"]}, prepared_version=batch["version"])
+            batch = self.controller.store.row("batches", {"id": batch["id"]})
+            self.assertIsNone(self.controller._prepare_outcome(batch))
+
+    def test_new_insertions_do_not_repeat_a_collision_preparation_bypass(self):
+        self.start_prediction()
+        self.approve(102, {"TauCeti/A.lean": "def a := 1\n"})
+        self.controller.tick()
+        batch = self.controller._open_batch()
+        prepared = self.controller.store.rows("tasks", {"kind": "prepare", "batch_id": batch["id"]})
+        self.assertEqual(len(prepared), 1)
+        self.approve(103, {"TauCeti/B.lean": "def b := 1\n"})
+        self.controller.tick()
+        self.assertEqual(len(self.controller.store.rows("tasks", {"kind": "prepare", "batch_id": batch["id"]})), 1)
+
+    def test_payload_is_bounded_and_compiled_collisions_are_prioritized(self):
+        self.approve(101, {"TauCeti/A.lean": "def a := 1\n"})
+        self.approve(102, {"TauCeti/B.lean": "def b := 1\n"})
+        self.controller.tick()
+        batch, members, inputs = self.context()
+        for row in inputs.values():
+            row["evidence"] = {
+                "merge_selection": [
+                    {"kind": "selection_conflict", "pr": 101, "batch_id": 1, "paths": ["x" * 8192], "members": [102]}
+                    for _ in range(50)
+                ]
+            }
+        with patch.object(admission_planning, "MAX_CONTEXT_BYTES", 8192):
+            context = admission_planning.Planner(self.repo.clone).context(members, inputs, tip=batch["tip"])
+        self.assertLessEqual(len(json.dumps(context).encode()), 8192)
+        self.assertFalse(context["complete"])
+        self.assertEqual(context["records"][0]["kind"], "declaration_collision")
 
 
 if __name__ == "__main__":

@@ -1453,6 +1453,19 @@ class Controller:
                 return self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
             if self._pre_rebased_prepare(task):
                 return self._adopt_prepared_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
+            knowledge = next(
+                (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
+            )
+            if tip_sha == task["tip"] and knowledge.get("was_proactive"):
+                return reject(
+                    "invalid-chain",
+                    [
+                        chain.Violation(
+                            "unchanged-source-failure",
+                            "The candidate's own CI reported source failures; an unchanged prediction cannot resolve them.",
+                        )
+                    ],
+                )
             if self._prediction_task(task):
                 self._record_prediction_result(task, batch, comparison, tip_sha, now)
                 if tip_sha == task["tip"]:
@@ -1797,6 +1810,11 @@ class Controller:
         knowledge = self._admission_context(head, now)
         if knowledge.get("records") and not any(d.get("kind") == "admission_predictions" for d in diagnostics):
             diagnostics = [*diagnostics, knowledge]
+        collisions = self._predicted_collisions(knowledge)
+        if kind == TASK_PREPARE and collisions:
+            self._set_state(
+                f"admission_prepare:{head['id']}", admission_planning.fingerprint([{"base": head["base"]}, *collisions])
+            )
         # The head's task replaces any other; an open batch's background tasks (`prepare`, `pre_rebase`)
         # each replace only their own kind.
         where: dict[str, Any] = {"batch_id": head["id"], "state": TASK_OPEN}
@@ -2213,17 +2231,27 @@ class Controller:
         inputs = {m["input_id"]: self.store.row("inputs", {"id": m["input_id"]}) or {} for m in members}
         key = f"admission_context:{batch['id']}"
         signature = admission_planning.fingerprint(
-            [{"tip": batch["tip"], "names": [r.get("declaration_names") for r in inputs.values()]}]
+            [{"schema": 2, "tip": batch["tip"], "names": [r.get("declaration_names") for r in inputs.values()]}]
         )
         prior = self._state(key, {})
         if prior.get("signature") == signature:
             return prior
         if not hasattr(self, "_admission_planner"):
             self._admission_planner = admission_planning.Planner(self.clone)
-        context = self._admission_planner.context(members, inputs, tip=batch["tip"])
+        try:
+            context = self._admission_planner.context(members, inputs, tip=batch["tip"])
+        except Exception as error:  # optional navigation must never strand a reservation or stop CI
+            context = {
+                "kind": "admission_predictions",
+                "tip": batch["tip"],
+                "records": [],
+                "ownership": [],
+                "complete": False,
+                "errors": [type(error).__name__],
+                "truncated": False,
+            }
         context["signature"] = signature
         context["at"] = now
-        self._set_state(key, context)
         predictions = self._predicted_collisions(context)
         if predictions and admission_planning.fingerprint(predictions) != prior.get("prediction_digest"):
             self.store.journal(now, "admission-predicted", batch["id"], tip=batch["tip"], collisions=predictions)
@@ -2252,7 +2280,7 @@ class Controller:
         collisions = self._predicted_collisions(context)
         if not collisions:
             return
-        digest = admission_planning.fingerprint(collisions)
+        digest = admission_planning.fingerprint([{"base": head["base"]}, *collisions])
         key = f"admission_repair:{head['id']}:{digest}"
         if self._state(key):
             return
@@ -2281,7 +2309,7 @@ class Controller:
             tip=tip,
             edited=edited,
             collisions=self._predicted_collisions(knowledge),
-            before_verdict=(now < attempt["run_completed_at"]) if attempt.get("run_completed_at") else None,
+            observed_ci_outcome=attempt.get("outcome"),
             verified_fixed=None,
             verification="worker build and audits; CI remains required",
         )
@@ -2314,6 +2342,29 @@ class Controller:
         self.report_inference(claim["worker"], True)
         self._wake.set()
         return Adoption(True, "adopted", task["id"], batch["id"], batch["version"], tip, retained)
+
+    def _clear_admission_state(self, batch_id: int) -> None:
+        self.store.execute(
+            "DELETE FROM settings WHERE key IN (?, ?) OR key LIKE ?",
+            (
+                f"state:admission_context:{batch_id}",
+                f"state:admission_prepare:{batch_id}",
+                f"state:admission_repair:{batch_id}:%",
+            ),
+        )
+
+    def _update_prediction_verdict(self, head, task, attempt, now):
+        if attempt["outcome"] == OUTCOME_SOURCE_FAILURE:
+            knowledge = [
+                dict(d, proactive=False, was_proactive=True)
+                for d in loads(task["diagnostics"], [])
+                if d.get("kind") == "admission_predictions"
+            ]
+            self.store.update(
+                "tasks", {"id": task["id"]}, diagnostics=dumps([*loads(attempt["diagnostics"], []), *knowledge])
+            )
+        elif attempt["outcome"] in (OUTCOME_INFRASTRUCTURE, OUTCOME_SUPERSEDED):
+            self._ci(head, now)  # speculative work must not disable the controller's retry policy
 
     # --- insertion ---------------------------------------------------------------------------------
 
@@ -2441,6 +2492,7 @@ class Controller:
         with self.store.transaction():
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_REMOVED)
             self.store.journal(now, "batch-removed", batch["id"], reason=reason)
+            self._clear_admission_state(batch["id"])
         self._cancel_superseded_runs(batch["id"], now, reason=f"batch removed ({reason})")
 
     def _probe(self, row: dict[str, Any], batch: dict[str, Any], now: float) -> bool:
@@ -2523,17 +2575,8 @@ class Controller:
             against_main = batch["tip"] == batch["base"] == self._canonical
             selection = self._admission_context(batch, now)
             interacting = sorted(
-                {
-                    pr
-                    for d in selection.get("records", [])
-                    if d["kind"] == "path_overlap" and d["path"] in paths
-                    for pr in d["members"]
-                }
+                {entry["pr"] for entry in selection.get("ownership", []) if any(p in paths for p in entry["paths"])}
             )
-            # A singly owned path is just as useful as an existing shared path.
-            for m in self._members(batch["id"]):
-                if any(p in paths for p, _ in self._admission_planner.changes.get(m["commit_sha"], [])):
-                    interacting.append(m["number"])
             evidence = loads(row.get("evidence"), {})
             evidence["merge_selection"] = [
                 *evidence.get("merge_selection", []),
@@ -2704,6 +2747,9 @@ class Controller:
                 attempt = self._current_attempt(head)
                 if attempt is not None and attempt["outcome"] == OUTCOME_PENDING:
                     self._observe_attempt(head, attempt, now)
+                    attempt = self.store.row("ci_attempts", {"id": attempt["id"]}) or attempt
+                if attempt is not None:
+                    self._update_prediction_verdict(head, active, attempt, now)
             self._reasons.append(f"head {head['id']} is claimed by {', '.join(c['worker'] for c in task_claims)}")
             return
         if head["base"] != canonical:
@@ -2728,11 +2774,8 @@ class Controller:
                     )
                     self._promote(head, attempt, now)
                     return
-                if attempt is not None and attempt["outcome"] == OUTCOME_SOURCE_FAILURE:
-                    knowledge = [d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"]
-                    self.store.update(
-                        "tasks", {"id": task["id"]}, diagnostics=dumps([*loads(attempt["diagnostics"], []), *knowledge])
-                    )
+                if attempt is not None:
+                    self._update_prediction_verdict(head, task, attempt, now)
             self._reasons.append(
                 f"head {head['id']} waits for an authorized worker to claim {task['kind']} task {task['id']}"
             )
@@ -2915,7 +2958,11 @@ class Controller:
         )
         if task is None:
             return None
-        errors = [d for d in loads(task["diagnostics"], []) if isinstance(d, dict)]
+        errors = [
+            d
+            for d in loads(task["diagnostics"], [])
+            if isinstance(d, dict) and d.get("kind") != "admission_predictions"
+        ]
         submission = self.store.row("submissions", {"task_id": task["id"], "accepted": 1}, order="id DESC")
         try:
             notes = loads(submission["worker_notes"], {}) if submission is not None else {}
@@ -2944,7 +2991,8 @@ class Controller:
         if not members:
             return False
         predicted = self._predicted_collisions(self._admission_context(batch, now))
-        if not predicted:
+        digest = admission_planning.fingerprint([{"base": batch["base"]}, *predicted])
+        if not predicted or self._state(f"admission_prepare:{batch['id']}") == digest:
             if len(members) < max(1, int(self.setting("prepare_min_members"))):
                 return False
             if now - max(m["added_at"] for m in members) < int(self.setting("prepare_quiet_seconds")):
@@ -2998,9 +3046,11 @@ class Controller:
             return "pre_rebase_enabled is off"
         if head["base"] != self._canonical:
             return f"head {head['id']} is not yet based on {self.canonical_branch}"
-        if self.store.row("tasks", {"batch_id": head["id"], "state": TASK_OPEN}) is not None:
+        task = self._open_task(head)
+        speculative = task is not None and self._prediction_task(task)
+        if task is not None and not speculative:
             return f"head {head['id']} has an open task"
-        if self._active_claims(head["id"]):
+        if self._active_claims(head["id"]) and not speculative:
             return f"head {head['id']} is claimed"
         attempt = self._current_attempt(head)
         if attempt is None or attempt["head_sha"] != head["tip"]:
@@ -4250,6 +4300,7 @@ class Controller:
         members = [m for m in everyone if not m["withdrawn"]]
         with self.store.transaction():
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
+            self._clear_admission_state(batch["id"])
             for member in members:
                 self.store.update(
                     "inputs",

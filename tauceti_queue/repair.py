@@ -1693,6 +1693,18 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     if conflict:
         happened, evidence = _rebase_sections(context, chain, clone, base_short, where)
         lines += happened + evidence
+    elif knowledge and knowledge.get("proactive"):
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} attributed PR commits is on `{base_short}`. Its first CI attempt is still "
+            "being validated. Compiled accepted-input records predict an interaction worth checking now; no failed "
+            "CI verdict is implied. Resolve real problems found by the worker's scripted build and audits. If those "
+            "checks pass and no edit is needed, leave the chain unchanged; the controller keeps its existing CI.",
+            "",
+            "## Admission and build evidence",
+            "",
+        ]
     elif context.kind == "prepare" and context.pre_rebased:
         lines += [
             "## What happened",
@@ -1852,7 +1864,7 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
         lines += prepare_errors_lines(findings.get("prepare_errors"))
     from .admission_planning import prompt_lines
 
-    lines += prompt_lines(knowledge)
+    lines += prompt_lines(knowledge, with_file=context.listings_path is not None)
     lines += _result_section(base_short)
     lines += _editing_section(context, chain, base_short, where)
     lines += _verification_section(context, findings, base_short, check_command)

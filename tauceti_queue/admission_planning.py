@@ -21,6 +21,8 @@ MAX_FILE_BYTES = 256 * 1024
 MAX_BLOB_BYTES = 8 * 1024 * 1024
 MAX_RECORDS = 4096
 MAX_NAMES = 262144
+MAX_EDGES = 2048
+MAX_CONTEXT_BYTES = 512 * 1024
 
 
 def imports(text: str) -> list[str]:
@@ -55,6 +57,7 @@ class Planner:
         self.clone = clone
         self.changes: dict[str, list[tuple[str, str | None]]] = {}
         self.headers: dict[str, list[str]] = {}
+        self.omitted: dict[str, str] = {}
 
     def git(self, *args: str, data: bytes | None = None) -> bytes:
         return subprocess.run(
@@ -94,7 +97,7 @@ class Planner:
                     pos += 2
                 self.changes[sha] = changes
         blobs = sorted({b for sha in commits for p, b in self.changes[sha] if p.endswith(".lean") and b})
-        blobs = [b for b in blobs if b not in self.headers]
+        blobs = [b for b in blobs if b not in self.headers and b not in self.omitted]
         if not blobs:
             return
         sizes = (
@@ -109,9 +112,10 @@ class Planner:
         selected, total = [], 0
         for row in sizes:
             sha, kind, size = row.split()
+            if kind != "blob" or int(size) > MAX_FILE_BYTES or total + int(size) > MAX_BLOB_BYTES:
+                self.omitted[sha] = "import context byte budget exceeded"
+                continue
             total += int(size)
-            if kind != "blob" or int(size) > MAX_FILE_BYTES or total > MAX_BLOB_BYTES:
-                raise ValueError("import context byte budget exceeded")
             selected.append(sha)
         raw = self.git("cat-file", "--batch", data=("\n".join(selected) + "\n").encode())
         pos = 0
@@ -121,7 +125,10 @@ class Planner:
             if oid != sha or kind != "blob":
                 raise ValueError("unexpected blob identity")
             end_data = end + 1 + int(size)
-            self.headers[sha] = imports(raw[end + 1 : end_data].decode())
+            try:
+                self.headers[sha] = imports(raw[end + 1 : end_data].decode())
+            except UnicodeError:
+                self.omitted[sha] = "non-text import context"
             pos = end_data + 1
 
     def context(self, members: list[dict], inputs: dict[int, dict], *, tip: str) -> dict:
@@ -131,6 +138,11 @@ class Planner:
             self.load([m["commit_sha"] for m in active])
         except (ValueError, UnicodeError, subprocess.SubprocessError) as error:
             errors.append(type(error).__name__ + ": " + str(error)[:200])
+        errors.extend(
+            sorted(
+                {self.omitted[b] for m in active for _, b in self.changes.get(m["commit_sha"], []) if b in self.omitted}
+            )
+        )
         owners: dict[str, set[int]] = defaultdict(set)
         added: dict[str, list[dict]] = defaultdict(list)
         total_names = 0
@@ -185,15 +197,21 @@ class Planner:
                 for module in self.headers.get(blob, []):
                     provider = module.replace(".", "/") + ".lean"
                     for owner in owners.get(provider, set()) - {m["number"]}:
-                        edges.add((m["number"], owner, path, provider))
+                        if len(edges) < MAX_EDGES:
+                            edges.add((m["number"], owner, path, provider))
+                        elif "import edge budget exceeded" not in errors:
+                            errors.append("import edge budget exceeded")
         # Connected components compress indirect import interactions, including shared paths.
         graph: dict[int, set[int]] = defaultdict(set)
         for a, b, _, _ in edges:
             graph[a].add(b)
             graph[b].add(a)
         for prs in owners.values():
-            for pr in prs:
-                graph[pr].update(prs - {pr})
+            # A star connects the same component without a quadratic clique.
+            anchor = min(prs)
+            for pr in prs - {anchor}:
+                graph[pr].add(anchor)
+                graph[anchor].add(pr)
         seen = set()
         for start in sorted(graph):
             if start in seen:
@@ -219,19 +237,39 @@ class Planner:
                         ],
                     }
                 )
+        records.sort(
+            key=lambda r: {
+                "declaration_collision": 0,
+                "selection_conflict": 1,
+                "path_overlap": 2,
+                "import_component": 3,
+            }.get(r["kind"], 4)
+        )
         truncated = len(records) > MAX_RECORDS
-        return {
+        context = {
             "kind": "admission_predictions",
             "tip": tip,
             "records": records[:MAX_RECORDS],
+            "ownership": [
+                {"pr": m["number"], "paths": [p for p, _ in self.changes.get(m["commit_sha"], [])]} for m in active
+            ],
             "complete": not errors and not truncated,
             "errors": errors,
             "truncated": truncated,
             "message": "Admission-time predictions and overlaps; the worker's scripted build and audits decide findings.",
         }
+        while len(json.dumps(context).encode()) > MAX_CONTEXT_BYTES:
+            context.update(complete=False, truncated=True)
+            if context["ownership"]:
+                del context["ownership"][max(0, len(context["ownership"]) // 2) :]
+            elif context["records"]:
+                del context["records"][max(0, len(context["records"]) // 2) :]
+            else:
+                break
+        return context
 
 
-def prompt_lines(context: dict | None) -> list[str]:
+def prompt_lines(context: dict | None, *, with_file: bool = False) -> list[str]:
     if not context:
         return []
     lines = ["Admission-time knowledge (predictions and navigation; scripted audits remain authoritative):", ""]
@@ -256,5 +294,7 @@ def prompt_lines(context: dict | None) -> list[str]:
             )
     if not context.get("complete", True):
         lines.append("This context is incomplete; missing evidence is unknown.")
-    lines += ["The full retained admission context is in `.tauceti-repair/admission.json`.", ""]
+    if with_file:
+        lines.append("The full retained admission context is in `.tauceti-repair/admission.json`.")
+    lines.append("")
     return lines

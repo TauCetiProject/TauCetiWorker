@@ -27,8 +27,11 @@ not proof that the current source still conflicts.
 groups and connected import components. It reads Git blobs without checking out or executing the
 candidate. The import-header scan is conservative and explicitly approximate. Immutable Git
 evidence is cached; blob reads are limited to 256 KiB per file and 8 MiB per load. A budget or
-parsing failure marks the context incomplete and does not stop the queue. Task context is capped
-at 4,096 records and prompt excerpts at 40 records.
+parsing failure marks the context incomplete and does not stop the queue. Oversized blobs are
+skipped while other headers are retained. Task context is capped at 4,096 records, 2,048 import
+edges, 262,144 compiled-name observations and 512 KiB; compiled collisions take priority when
+truncation is necessary. Prompt excerpts show at most 40 records. Operational contexts are removed
+when a batch lands or is removed; its journal and task evidence remain retained.
 
 The inventory of `bors-ng` at `8021558cd` covered `lib/worker/batcher/`,
 `lib/worker/declaration_names.ex`, `lib/worker/local_git.ex` and `priv/local_git.py`:
@@ -46,18 +49,22 @@ The inventory of `bors-ng` at `8021558cd` covered `lib/worker/batcher/`,
 
 At insertion and when late declaration records arrive, exact accepted added-name intersections
 become predicted collision diagnostics on the batch. Edited and empty members do not trigger
-another repair from their historical accepted names. Shared paths and import components accompany
+another repair from their historical accepted names. Persisted per-member path ownership makes
+conflict attribution independent of the in-memory Git cache after a service restart. Shared paths and import components accompany
 tasks as navigation; overlap alone does not imply a source failure.
 
 A predicted compiled collision makes an open batch eligible for preparation without waiting for
 the usual size and quiet thresholds. On a head, the controller dispatches the first CI attempt
-and exposes a repair task alongside it. The candidate build continues while the worker repairs
-its private chain. CI observation continues while that claim prevents promotion. An adoption that
+and exposes a repair task alongside it. A collision digest bypasses preparation thresholds once
+per base, so each insertion does not trigger another speculative build. The candidate build continues while the worker repairs
+its private chain. CI observation and infrastructure retries continue while that claim prevents promotion. The next
+batch can still pre-rebase speculatively; adoption of a changed head supersedes stale work. An adoption that
 changes the tip requires the replacement candidate's own CI; the earlier result cannot approve it.
 
 A same-tip submission resolves the speculative task without changing the version, restarting CI
 or adding a comment. If CI passes before an unclaimed speculative task starts, the task is retired
-and the audited candidate can land. If it fails first, its actual diagnostics join the same task.
+and the audited candidate can land. If it fails first, its actual diagnostics join the same task and an unchanged result can no longer
+resolve that source failure.
 Claims, authorization, membership, append-only explanations and opt-out rules apply normally.
 
 The full context is retained in task diagnostics and written to `.tauceti-repair/admission.json`
