@@ -2416,6 +2416,8 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                     (
                         "--roadmap-dir",
                         str(roadmap_dir),
+                        "--roadmap-ref",
+                        "origin/main",
                         "--code-dir",
                         str(w.cfg.checkout),
                         "--min-prs",

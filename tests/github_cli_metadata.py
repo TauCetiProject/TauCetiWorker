@@ -40,6 +40,35 @@ with (
         assert network.call_count == 2
 
     failure = subprocess.CompletedProcess([], 1, "", "unavailable")
+    from tauceti_worker.constants import ROADMAP
+
+    cadence = ["gh", "api", f"repos/{ROADMAP}/commits?per_page=30", "--jq", ".[]"]
+    with patch.object(tr, "_execute", return_value=success) as network:
+        now = tr.time.time()
+        for stamp in (now, now + 60, now + 299, now + 301):
+            with patch.object(tr.time, "time", return_value=stamp):
+                tr.execute(cadence)
+        assert network.call_count == 2
+        # Other accounts cannot borrow a credential-scoped result.
+        with patch.dict(os.environ, GH_TOKEN="different-account"):
+            tr.execute(cadence)
+        assert network.call_count == 3
+        # Planning and explicit fresh reads cannot reuse the survey verdict.
+        with patch.dict(os.environ, TAUCETI_GITHUB_PHASE="progress"):
+            tr.execute(cadence)
+        with tr.read_context(fresh=True):
+            tr.execute(cadence)
+        assert network.call_count == 5
+        tr.invalidate(["api", f"repos/{ROADMAP}/git/refs/heads/main", "-X", "PATCH"])
+        tr.execute(cadence)
+        assert network.call_count == 6
+    with (
+        patch.dict(os.environ, GH_TOKEN="failed-cadence"),
+        patch.object(tr, "_execute", return_value=failure) as network,
+    ):
+        assert tr.execute(cadence).returncode == 1
+        assert tr.execute(cadence).returncode == 1
+        assert network.call_count == 2
     with patch.object(tr, "_execute", return_value=failure) as network:
         args = ["gh", "api", "repos/org/review/git/commits/" + sha]
         assert tr.execute(args).returncode == 1
@@ -49,6 +78,7 @@ with (
     for args in (
         ["api", "repos/org/code/pulls/7"],
         ["api", "repos/org/review/commits/main"],
+        ["api", "repos/org/other/commits?per_page=30"],
         ["api", "repos/org/review/commits/" + sha, "--include"],
         ["api", "repos/org/review/commits/" + sha, "-X", "DELETE"],
     ):
@@ -96,3 +126,30 @@ assert (
     == "closed_prs"
 )
 print("GitHub CLI metadata cache checks passed")
+
+# The installed gh shim executes this file as __main__, not as a package import.
+# Two separate worker processes must share one advisory request without import
+# errors, while keeping the original CLI output intact.
+with tempfile.TemporaryDirectory() as tmp:
+    calls = Path(tmp) / "calls"
+    real_gh = Path(tmp) / "gh-real"
+    real_gh.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\n"
+        f"with Path({str(calls)!r}).open('a') as f: f.write('request\\n')\n"
+        "print('cadence observation')\n"
+    )
+    real_gh.chmod(0o700)
+    env = dict(
+        os.environ,
+        GH_TOKEN="test",
+        TAUCETI_GITHUB_SHARED_DIR=tmp,
+        TAUCETI_REAL_GH=str(real_gh),
+        TAUCETI_GITHUB_PHASE="survey",
+    )
+    for _ in range(2):
+        result = subprocess.run(
+            [sys.executable, tr.__file__, "--proxy", *cadence[1:]], env=env, capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "cadence observation\n"
+    assert calls.read_text().splitlines() == ["request"]
