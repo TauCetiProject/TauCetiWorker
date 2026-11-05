@@ -4,7 +4,8 @@ This is increment 1 of `docs/redesign/specs/ai-merge-queue.md`: one open batch r
 insertions and at most one sealed head that is rebased, built, repaired in place by agents claiming
 tasks, and fast-forwarded onto the canonical branch. The controller is one object shared by the
 reconciliation loop (`tauceti_queue.loop`) and the HTTP server; every public method takes the
-controller lock, and every record mutation is a `Store` transaction.
+controller lock (`ControllerLock`: the worker endpoints take it ahead of the tick, which lets
+go of it around its GitHub I/O), and every record mutation is a `Store` transaction.
 
 The controller never calls GitHub itself; it is handed a `GitHubPort`. Git work (squash, replay,
 validation, provenance) is `tauceti_queue.chain` run against a local clone of the content
@@ -18,13 +19,14 @@ Documentation of the records, state machine, task API and status schema: `docs/q
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import random
 import re
 import secrets
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from . import chain
@@ -80,9 +82,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "polling_interval_seconds": 60,
     "approval_poll_interval_seconds": 900,
     "membership_label": "bors-staging",
-    # Wall-clock bounds on one tick's work, so the controller lock is not held for minutes while the
-    # public endpoints wait on it: insertion stops probing and the outbox stops draining once the
-    # budget is spent, and the loop is woken to continue in the next tick.
+    # Wall-clock bounds on one tick's work: insertion stops probing and the outbox stops draining once
+    # the budget is spent, and the loop is woken to continue in the next tick. The probes' and the
+    # drain's GitHub I/O runs without the controller lock (`ControllerLock`), so the worker endpoints
+    # answer during either; the budgets bound how long one tick defers the rest of its pass.
     "insertion_probe_budget_seconds": 20,
     "outbox_drain_budget_seconds": 20,
     # Background preparation of open batches (`prepare` tasks): an open batch of at least
@@ -208,6 +211,111 @@ class TaskError(ControllerError):
     """A task API error: unknown task or claim, expired or superseded claim, not authorized."""
 
 
+class ControllerLock:
+    """The controller lock: reentrant, with a priority lane for the worker endpoints.
+
+    A priority acquirer (`priority()`: claim, renew, release, submit, inference reports) waits only
+    for the current holder; any other acquirer also waits while a priority acquirer is waiting. So
+    whenever the holder lets go, the worker endpoints go first. The tick lets go entirely around its
+    GitHub I/O (`unlocked()`) and between units of work (`offer()`), so a worker request waits for at
+    most one unit of the tick's work, not for the whole tick.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._owner: int | None = None
+        self._depth = 0
+        self._priority_waiting = 0
+
+    def _take(self, priority: bool, deadline: float | None) -> bool:
+        """Under `_cond`: wait until the lock is free (and, for an ordinary acquirer, no priority
+        acquirer waits), then own it once. False when `deadline` passes first."""
+        if priority:
+            self._priority_waiting += 1
+        try:
+            while self._owner is not None or (not priority and self._priority_waiting):
+                if deadline is None:
+                    self._cond.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            self._owner = threading.get_ident()
+            self._depth = 1
+            return True
+        finally:
+            if priority:
+                self._priority_waiting -= 1
+                if not self._priority_waiting:
+                    self._cond.notify_all()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1, *, priority: bool = False) -> bool:
+        with self._cond:
+            if self._owner == threading.get_ident():
+                self._depth += 1
+                return True
+            if not blocking:
+                timeout = 0
+            deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+            return self._take(priority, deadline)
+
+    def release(self) -> None:
+        with self._cond:
+            if self._owner != threading.get_ident():
+                raise RuntimeError("cannot release a controller lock this thread does not hold")
+            self._depth -= 1
+            if not self._depth:
+                self._owner = None
+                self._cond.notify_all()
+
+    def __enter__(self) -> ControllerLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+    @contextlib.contextmanager
+    def priority(self) -> Iterator[None]:
+        """Hold the lock, ahead of every ordinary acquirer that is waiting."""
+        self.acquire(priority=True)
+        try:
+            yield
+        finally:
+            self.release()
+
+    def waiting(self) -> int:
+        """The priority acquirers waiting for the lock now."""
+        with self._cond:
+            return self._priority_waiting
+
+    @contextlib.contextmanager
+    def unlocked(self) -> Iterator[None]:
+        """Let go of every level this thread holds for the body, then take them back (as an ordinary
+        acquirer, so the priority requests that queued meanwhile run first). A no-op for a thread that
+        does not hold the lock. The caller must not be inside a store transaction."""
+        with self._cond:
+            if self._owner != threading.get_ident():
+                depth = 0
+            else:
+                depth, self._depth, self._owner = self._depth, 0, None
+                self._cond.notify_all()
+        try:
+            yield
+        finally:
+            if depth:
+                with self._cond:
+                    self._take(False, None)
+                    self._depth = depth
+
+    def offer(self) -> None:
+        """Between two units of a long holder's work: let the waiting priority requests run."""
+        if self.waiting():
+            with self.unlocked():
+                pass
+
+
 class Controller:
     def __init__(
         self,
@@ -244,7 +352,14 @@ class Controller:
             namespace="admin",
             decode=bool,
         )
-        self._lock = threading.RLock()
+        self._lock = ControllerLock()
+        # Serializes ticks: the tick lets go of `_lock` around its GitHub I/O, so the lock alone no
+        # longer keeps a second tick (or drain) from interleaving with the first.
+        self._ticking = threading.RLock()
+        # Renewals waiting for the lock: claim token -> when the request arrived. `_expire_claims`
+        # spares a claim whose renewal arrived before it expired.
+        self._renewing: dict[str, float] = {}
+        self._renewing_guard = threading.Lock()
         self._wake = threading.Event()
         self._reasons: list[str] = []
         # The last status document and the monotonic time it was taken, served by `status()` when the
@@ -861,7 +976,7 @@ class Controller:
 
     def report_inference(self, worker_identity: str, ok: bool, error: str = "") -> dict[str, Any] | None:
         """A worker's report of a provider call: failures accumulate into a hold, a success lifts it."""
-        with self._lock:
+        with self._lock.priority():
             now = self.clock()
             hold = self._state("inference_hold")
             if ok:
@@ -926,11 +1041,14 @@ class Controller:
         already held, up to `repair_concurrency` claims on it. So with two workers one repairs the
         head while the other prepares or pre-rebases the next batch, and a second claim on the head's
         task is only taken when no background task waits.
+
+        The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
+        lock's priority lane, so a claim answers while a tick is running.
         """
-        with self._lock:
+        admin = self._repository_admin(github_login)
+        with self._lock.priority():
             now = self.clock()
             self._expire_claims(now)
-            admin = self._repository_admin(github_login)
             if not admin:
                 reason = "not-admin" if admin is False else "github-unavailable"
                 self.store.journal(now, "claim-refused", worker=worker_identity, login=github_login, reason=reason)
@@ -1046,12 +1164,26 @@ class Controller:
         ]
 
     def renew_task(self, task_id: int, claim_token: str) -> float:
-        with self._lock:
-            now = self.clock()
-            claim = self._claim_for(task_id, claim_token, now)
-            expires = now + int(self.setting("claim_ttl_seconds"))
-            self.store.update("claims", {"id": claim["id"]}, expires_at=expires, renewed_at=now)
-            return expires
+        """Extend the claim by `claim_ttl_seconds` from now.
+
+        The claim's expiry is judged at the request's arrival, not when it gets the lock: a renewal that
+        arrived before the claim expired extends it even if a busy tick kept it waiting past the expiry
+        (and `_expire_claims` spares the claim while such a renewal waits).
+        """
+        arrived = self.clock()
+        with self._renewing_guard:
+            self._renewing[claim_token] = min(arrived, self._renewing.get(claim_token, arrived))
+        try:
+            with self._lock.priority():
+                claim = self._claim_for(task_id, claim_token, arrived)
+                now = self.clock()
+                expires = now + int(self.setting("claim_ttl_seconds"))
+                self.store.update("claims", {"id": claim["id"]}, expires_at=expires, renewed_at=now)
+                return expires
+        finally:
+            with self._renewing_guard:
+                if self._renewing.get(claim_token) == arrived:
+                    del self._renewing[claim_token]
 
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "") -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
@@ -1061,7 +1193,7 @@ class Controller:
         push failed is resolved as `failed` and not offered again at that version. Any other release
         leaves the task open for the next claim, as for the head's tasks.
         """
-        with self._lock:
+        with self._lock.priority():
             now = self.clock()
             claim = self._claim_for(task_id, claim_token, now)
             task = self.store.row("tasks", {"id": task_id})
@@ -1100,7 +1232,7 @@ class Controller:
         A late result (expired claim, superseded task or batch version) is rejected but its commits
         stay retained under a submissions ref. See `Adoption` for the reason codes.
         """
-        with self._lock:
+        with self._lock.priority():
             now = self.clock()
             task = self.store.row("tasks", {"id": task_id})
             if task is None:
@@ -1588,7 +1720,13 @@ class Controller:
         return [row for row in self.store.rows("claims", where) if row["expires_at"] > now]
 
     def _expire_claims(self, now: float) -> None:
+        """Release the claims past their expiry, except one whose renewal arrived in time and is waiting
+        for the lock (`renew_task`)."""
+        with self._renewing_guard:
+            renewing = dict(self._renewing)
         for claim in self.store.rows("claims", {"released_at": None}):
+            if claim["token"] in renewing and renewing[claim["token"]] < claim["expires_at"]:
+                continue
             if claim["expires_at"] <= now:
                 with self.store.transaction():
                     self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
@@ -1802,19 +1940,25 @@ class Controller:
 
         The pass ends by taking the status snapshot `status()` serves while a later pass holds the lock.
         """
-        with self._lock:
+        with self._ticking, self._lock:
             try:
                 return self._tick()
             finally:
                 self._refresh_snapshot()
 
     def _tick(self) -> list[str]:
+        """The pass, holding the controller lock except around its GitHub I/O (the outbox drain, the
+        canonical fetch, each probe's fetch and replay) and offering it to the waiting worker
+        requests between steps (`ControllerLock`), so a worker endpoint waits for one step at most."""
+        offer = self._lock.offer
         self._reasons = []
         now = self.clock()
         self._expire_claims(now)
         self._drain_outbox(now)
+        offer()
         try:
-            canonical = self._fetch_canonical()
+            with self._lock.unlocked():
+                canonical = self._fetch_canonical()
         except Exception as error:  # noqa: BLE001 - the pass reports the failure and waits for the next one
             self._reasons.append(f"canonical branch unavailable: {error}")
             return list(self._reasons)
@@ -1823,14 +1967,20 @@ class Controller:
         hold = self._state("inference_hold")
         if hold:
             self._reasons.append(f"inference hold since {hold['since']:.0f}: {hold['last_error']}")
+        offer()
         self._insertion_passes(now)
-        self._supersede_stale_pre_rebase(now)
-        self._seal(now)
-        self._reconcile_head(now)
-        self._pre_rebase(now)
-        self._prepare_open_batches(now)
-        self._prepare_pre_rebased(now)
-        self._republish_retained_refs(now)
+        for step in (
+            self._supersede_stale_pre_rebase,
+            self._seal,
+            self._reconcile_head,
+            self._pre_rebase,
+            self._prepare_open_batches,
+            self._prepare_pre_rebased,
+            self._republish_retained_refs,
+        ):
+            offer()
+            step(now)
+        offer()
         self._drain_outbox(self.clock())
         self._set_state("last_tick_at", now)
         return list(self._reasons)
@@ -1955,8 +2105,8 @@ class Controller:
         waits for a base to change (a new open batch or a rebase). A batch a `prepare` task holds is
         skipped the same way, so inflow continues into the next open batch while it is prepared.
 
-        The passes stop once `insertion_probe_budget_seconds` of wall time is spent (each probe is a git
-        replay onto a batch's tip, and the controller lock is held throughout the tick); the remaining
+        The passes stop once `insertion_probe_budget_seconds` of wall time is spent (each probe is a fetch
+        and a git replay onto a batch's tip, run without the controller lock, see `_probe`); the remaining
         inputs wait for the next tick, which the loop is woken to run at once. `probed` is per tick and
         the draw's age bound carries over in `passes_waited`, so a paused tick starves nobody.
         """
@@ -2067,6 +2217,11 @@ class Controller:
     def _probe(self, row: dict[str, Any], batch: dict[str, Any], now: float) -> bool:
         """Reserve the input, claim the open batch, replay the squash onto its tip; commit or roll back.
 
+        The fetch of the head and the replay run without the controller lock (the reservation and the
+        `insert` claim stand for it meanwhile); the outcome is recorded under the lock only if the input
+        is still reserved (no event withdrew it meanwhile) and the batch has neither moved nor been
+        claimed by a `prepare` task, else the input goes back to waiting.
+
         A worker's claim on the batch's `pre_rebase` task does not stop insertion: the task covers the
         members it was created with, and members appended since are replayed onto its result.
         """
@@ -2088,28 +2243,45 @@ class Controller:
             coauthors=None if loads(row["coauthors"]) is None else tuple(loads(row["coauthors"])),
         )
         chain_id = f"probe-{batch['id']}-{secrets.token_hex(4)}"
+        failure: chain.ChainError | None = None
+        result: chain.ChainResult | None = None
         try:
-            if not self._fetch_head(row["number"], row["head_sha"]):
-                raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
-            result = chain.build(self.clone, batch["tip"], [member], chain_id=chain_id)
+            with self._lock.unlocked():
+                if not self._fetch_head(row["number"], row["head_sha"]):
+                    raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
+                result = chain.build(self.clone, batch["tip"], [member], chain_id=chain_id)
         except chain.ChainError as error:
+            failure = error
+        finally:
+            chain.delete_chain_ref(self.clone, chain_id)
+        fresh = self.store.row("inputs", {"id": row["id"]})
+        if fresh is None or fresh["state"] != INPUT_RESERVED:
+            # Withdrawn while the probe ran (closed, a new head, unapproved): it is not inserted.
+            with self.store.transaction():
+                if fresh is not None and fresh["batch_id"] == batch["id"]:
+                    self.store.update("inputs", {"id": row["id"]}, batch_id=None)
+                self._release_claim(claim, "input-withdrawn", now)
+            return False
+        if failure is not None:
             with self.store.transaction():
                 self.store.update(
                     "inputs",
                     {"id": row["id"]},
                     state=INPUT_WAITING,
                     batch_id=None,
-                    last_probe=f"error: {error}",
+                    last_probe=f"error: {failure}",
                     last_probe_base="",
                 )
                 self._release_claim(claim, "probe-error", now)
-                self.store.journal(now, "probe-error", batch["id"], number=row["number"], error=str(error))
+                self.store.journal(now, "probe-error", batch["id"], number=row["number"], error=str(failure))
             return False
-        finally:
-            chain.delete_chain_ref(self.clone, chain_id)
+        assert result is not None
+        row = fresh
         current = self.store.row("batches", {"id": batch["id"]})
-        if current is None or current["version"] != batch["version"] or current["state"] != BATCH_OPEN:
-            # The batch moved under us (it cannot while we hold the claim, but recheck as the plan demands).
+        prepared = any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"]))
+        if current is None or current["version"] != batch["version"] or current["state"] != BATCH_OPEN or prepared:
+            # The batch moved while the probe ran without the lock (an adoption, a removal), or a
+            # `prepare` task claimed it: the input waits for the next pass.
             with self.store.transaction():
                 self.store.update(
                     "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="batch-moved"
@@ -4143,10 +4315,18 @@ class Controller:
     def _drain_outbox(self, now: float) -> None:
         """Perform the due entries: several retained refs go in one push, the rest one by one, until
         `outbox_drain_budget_seconds` of wall time is spent; what remains waits for the next tick,
-        which the loop is woken to run at once."""
-        started = time.monotonic()
-        budget = float(self.setting("outbox_drain_budget_seconds"))
-        due = [e for e in self.store.rows("outbox", {"state": "pending"}, order="id") if e["next_attempt_at"] <= now]
+        which the loop is woken to run at once.
+
+        The GitHub calls run without the controller lock: each entry is re-read under the lock, its
+        call made with the lock let go (`ControllerLock.unlocked`), and the outcome recorded under the
+        lock again, so worker requests are answered between entries however long the drain runs. A
+        `promote` entry reads and changes the records, so it alone is performed under the lock."""
+        with self._lock:
+            started = time.monotonic()
+            budget = float(self.setting("outbox_drain_budget_seconds"))
+            due = [
+                e for e in self.store.rows("outbox", {"state": "pending"}, order="id") if e["next_attempt_at"] <= now
+            ]
         performed = 0
         retains = [e for e in due if e["kind"] == "retain_ref"]
         if len(retains) > 1 and hasattr(self.github, "update_refs"):
@@ -4155,31 +4335,64 @@ class Controller:
                 due = [e for e in due if e["kind"] != "retain_ref"]
         for index, entry in enumerate(due):
             if performed and time.monotonic() - started >= budget:
-                self._reasons.append(f"outbox drain paused with {len(due) - index} entries pending (budget)")
+                with self._lock:
+                    self._reasons.append(f"outbox drain paused with {len(due) - index} entries pending (budget)")
                 self._wake.set()
                 return
             performed += 1
-            history = loads(entry["history"], [])
-            try:
-                result = self._perform(entry["kind"], loads(entry["payload"], {}), now)
-            except Exception as error:  # noqa: BLE001 - every adapter failure is recorded and retried
-                self._outbox_failed(entry, history, error, now)
-                continue
-            self._outbox_done(entry, history, result, now)
+            self._drain_entry(entry, now)
+
+    def _pending_entry(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        """The entry's current row while it is still pending (another path may have performed it)."""
+        current = self.store.row("outbox", {"id": entry["id"]})
+        return current if current is not None and current["state"] == "pending" else None
+
+    def _drain_entry(self, entry: dict[str, Any], now: float) -> None:
+        with self._lock:
+            current = self._pending_entry(entry)
+            if current is None:
+                return
+            if current["kind"] == "promote":
+                try:
+                    result = self._perform(current["kind"], loads(current["payload"], {}), now)
+                except Exception as error:  # noqa: BLE001 - every adapter failure is recorded and retried
+                    self._outbox_failed(current, loads(current["history"], []), error, now)
+                else:
+                    self._outbox_done(current, loads(current["history"], []), result, now)
+                return
+        error: Exception | None = None
+        result = ""
+        try:
+            with self._lock.unlocked():
+                result = self._perform(current["kind"], loads(current["payload"], {}), now)
+        except Exception as caught:  # noqa: BLE001 - every adapter failure is recorded and retried
+            error = caught
+        with self._lock:
+            current = self._pending_entry(entry)
+            if current is None:
+                return
+            if error is not None:
+                self._outbox_failed(current, loads(current["history"], []), error, now)
+            else:
+                self._outbox_done(current, loads(current["history"], []), result, now)
 
     def _retain_batch(self, entries: list[dict[str, Any]], now: float) -> bool:
         """Push the entries' retained refs in one `git push` (one connection, one object upload) instead of
-        one push each. On failure nothing is recorded: the caller pushes them singly, so one bad ref
-        does not block the rest."""
+        one push each, without the controller lock. On failure nothing is recorded: the caller pushes
+        them singly, so one bad ref does not block the rest."""
         payloads = [loads(entry["payload"], {}) for entry in entries]
         updates = [(payload["ref"], payload["sha"]) for payload in payloads]
         try:
-            self.github.update_refs(self.repository, updates)
+            with self._lock.unlocked():
+                self.github.update_refs(self.repository, updates)
         except Exception as error:  # noqa: BLE001 - the single pushes record their own failures
             self.log.warning("batched push of %s retained refs failed, pushing singly: %s", len(updates), error)
             return False
-        for entry in entries:
-            self._outbox_done(entry, loads(entry["history"], []), "retained", now)
+        with self._lock:
+            for entry in entries:
+                current = self._pending_entry(entry)
+                if current is not None:
+                    self._outbox_done(current, loads(current["history"], []), "retained", now)
         return True
 
     def _outbox_done(self, entry: dict[str, Any], history: list[Any], result: str, now: float) -> None:
