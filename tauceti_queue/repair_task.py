@@ -1034,6 +1034,10 @@ def prompt_context(
     ``listings`` is where the member listings and the check script go (``repair.listings_path``);
     ``shell_limit`` is the agent's foreground shell limit in seconds, as ``run_repair_agent`` sets it."""
     findings = findings if findings is not None else task_findings(task)
+    # Streaming/verification replaces errors, not the retained admission observations.
+    knowledge = task_findings(task).get("admission_predictions")
+    if knowledge:
+        findings.setdefault("admission_predictions", knowledge)
     conflict = dict(findings.get("conflict") or {}) or None
     if conflict is not None:
         conflict.setdefault("onto", task.onto)
@@ -1986,7 +1990,8 @@ def run_task(
             report["unchanged"] = tip == task.tip
             report["agent_failed"] = agent["status"] == "failed"
             state.write("validated", attempt=attempt, tip=tip, report=report)
-            acceptable = report["ok"] and not report["dirty"] and not report["unchanged"]
+            proactive = bool((task_findings(task).get("admission_predictions") or {}).get("proactive"))
+            acceptable = report["ok"] and not report["dirty"] and (not report["unchanged"] or proactive)
             if not acceptable:
                 detail = format_report(report)
                 if agent.get("timed_out"):

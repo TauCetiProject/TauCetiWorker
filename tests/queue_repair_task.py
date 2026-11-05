@@ -1549,6 +1549,41 @@ class InferenceUnavailable(Fixture):
         self.assertEqual(self.service.results, [])
 
 
+class PredictedRepair(Fixture):
+    BROKEN = ()
+
+    def prediction(self):
+        knowledge = {
+            "kind": "admission_predictions",
+            "proactive": True,
+            "complete": True,
+            "records": [{"kind": "path_overlap", "path": "TauCeti/One.lean", "members": [1, 2]}],
+        }
+        self.service.tasks[1]["diagnostics"] = [knowledge]
+        return knowledge
+
+    def test_noop_proactive_repair_is_verified_and_submitted_without_a_forced_edit(self):
+        self.prediction()
+        os.environ["STUB_AGENT_MODE"] = "noop"
+        cfg = self.config(agent_attempts=1)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["tip"], self.content.tip)
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(json.loads(self.service.results[0]["worker_notes"])["edited"], [])
+        self.assertEqual(len(outcome["verification"]), 1)
+        self.assertTrue(outcome["verification"][0]["ok"])
+        self.assertIn("Admission-time knowledge", self.agent_calls()[0]["prompt"])
+
+    def test_admission_navigation_survives_replacement_of_build_errors(self):
+        knowledge = self.prediction()
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        findings = repair.empty_findings()
+        context = repair_task.prompt_context(task, "next verification round", findings)
+        self.assertEqual(findings["admission_predictions"], knowledge)
+        self.assertEqual(context.kind, "repair")
+
+
 class LongPrompt(Fixture):
     def test_a_prompt_too_long_for_argv_is_delivered_on_stdin(self):
         # Linux rejects a single argv string above 128 KiB (MAX_ARG_STRLEN); a 1,197-member head built a

@@ -148,6 +148,7 @@ RUN_STDLIB=(
   queue_eligibility.py
   queue_diagnostics.py
   queue_controller.py
+  queue_admission_planning.py
   queue_fixture.py
   queue_store.py
   queue_config.py
