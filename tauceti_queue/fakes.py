@@ -31,6 +31,7 @@ from .ports import (
     CandidatePhase,
     CandidateRun,
     FastForwardResult,
+    GitHubUnavailable,
     OpenPullRequest,
     PullRequest,
     Status,
@@ -217,6 +218,8 @@ class FakeGitHub:
         self.repository = repository
         self.prs: dict[int, dict[str, Any]] = {}
         self.admins: set[str] = set()
+        # When set, `repository_admin` raises `GitHubUnavailable` (a quota outage) with this message.
+        self.unavailable: str | None = None
         self.comments: list[dict[str, Any]] = []
         self.labels: dict[int, set[str]] = {}
         self.closed: dict[int, str] = {}
@@ -587,6 +590,8 @@ class FakeGitHub:
     def repository_admin(self, login: str) -> bool:
         with self.lock:
             self._call("repository_admin", login)
+            if self.unavailable:
+                raise GitHubUnavailable(f"fake outage: {self.unavailable}")
             return login in self.admins
 
     def rate_limit(self) -> tuple[int, float]:

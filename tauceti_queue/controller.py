@@ -33,9 +33,11 @@ from .ports import (
     AGENT_INSTRUCTION,
     Adoption,
     GitHubPort,
+    GitHubUnavailable,
     Task,
     TaskMember,
 )
+from .stale_cache import StaleCache
 from .store import Store, dumps, loads
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
@@ -80,6 +82,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 # How long `status()` waits for the controller lock before serving the last snapshot instead.
 STATUS_LOCK_WAIT_SECONDS = 2.0
+# How long one `repository_admin(login)` answer stands; served stale while GitHub cannot answer.
+ADMIN_CACHE_SECONDS = 6 * 3600.0
 
 INPUT_WAITING = "waiting"
 INPUT_RESERVED = "reserved"
@@ -147,6 +151,11 @@ class Controller:
         self.rng = rng or random.Random()
         self.log = logger or logging.getLogger("tauceti_queue.controller")
         self.started_at = clock()
+        # `repository_admin(login)` per login, kept for `ADMIN_CACHE_SECONDS` and served stale while
+        # GitHub cannot answer, so a quota outage neither refuses nor grants anything new.
+        self.admins = StaleCache(
+            github.repository_admin, ttl=ADMIN_CACHE_SECONDS, clock=clock, logger=self.log, what="admin"
+        )
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._reasons: list[str] = []
@@ -715,13 +724,23 @@ class Controller:
 
     # --- tasks -------------------------------------------------------------------------------------
 
+    def _repository_admin(self, login: str) -> bool | None:
+        """`repository_admin(login)` through the cache; None when GitHub cannot answer and never has."""
+        try:
+            return bool(self.admins.get(login, login))
+        except GitHubUnavailable as error:
+            self.log.warning("admin check for %s failed with nothing cached: %s", login, error)
+            return None
+
     def claim_task(self, worker_identity: str, github_login: str) -> Task | None:
         """Hand the head's open task to an authorized worker under a renewable claim, within `repair_concurrency`."""
         with self._lock:
             now = self.clock()
             self._expire_claims(now)
-            if not self.github.repository_admin(github_login):
-                self.store.journal(now, "claim-refused", worker=worker_identity, login=github_login, reason="not-admin")
+            admin = self._repository_admin(github_login)
+            if not admin:
+                reason = "not-admin" if admin is False else "github-unavailable"
+                self.store.journal(now, "claim-refused", worker=worker_identity, login=github_login, reason=reason)
                 return None
             head = self._head()
             if head is None:
@@ -824,7 +843,7 @@ class Controller:
             if claim["expires_at"] <= now:
                 self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
                 return reject("claim-expired")
-            if not self.github.repository_admin(claim["github_login"]):
+            if not self._repository_admin(claim["github_login"]):
                 return reject("not-authorized")
             if task["state"] != TASK_OPEN or batch["version"] != task["batch_version"] or batch["state"] != BATCH_HEAD:
                 return reject("version-mismatch")

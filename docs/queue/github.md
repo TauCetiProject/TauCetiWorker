@@ -331,8 +331,11 @@ status plus `revision` and `started_at`.
 | `POST /admin/retry-ci` | bearer and repository admin; `retry_ci(repo, login)` |
 
 Bearer tokens are GitHub tokens resolved to a login through `GET /user` (cached by token digest for
-five minutes); the admin routes check `repository_admin(login)` before calling the controller, the
-predicate `security_audit.require_admin` uses. The worker identity is `body.worker` or
+six hours); the admin routes check `repository_admin(login)` before calling the controller, the
+predicate `security_audit.require_admin` uses, cached per login for the same six hours. Both caches
+keep expired entries and serve them while GitHub cannot answer (a rate-limited 403, 5xx or a network
+error, `ports.GitHubUnavailable`), so an exhausted user quota logs nobody out of a claim and grants
+nobody new; only a 401 from `GET /user` evicts a token, and a login never checked before gets 503. The worker identity is `body.worker` or
 `X-TauCeti-Worker`. A `ControllerError`'s `code` maps to HTTP: `unknown-*` 404, `claim-expired`,
 `claim-superseded`, `version-mismatch` 409, `not-authorized` 403, anything else 400; a
 `PermissionError` is 403, `LookupError` 404, `ValueError` 400, and any other exception 500 with the
