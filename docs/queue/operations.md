@@ -157,6 +157,10 @@ reports the mismatch deliberately). The unit has `Restart=always`, `TimeoutStopS
 `KillSignal=SIGTERM`: on stop the process finishes its current reconciliation step, stops the HTTP
 server and closes the store before exiting, so a restart never interrupts a store write.
 
+On a host without lingering (Current deployment, "Hosts without lingering") the units are disabled and
+a deploy is `install.sh --revision <sha> --no-restart` followed by `pkill -f 'tauceti-queue serve'`;
+the supervisor loop restarts the service on the new revision.
+
 Useful commands:
 
 ```sh
@@ -169,67 +173,105 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 
 ## Current deployment
 
-Installed 2026-11-04 on `tauchonki` with publication disabled, revision
-`045c7e589c676ec3a0bee2900111d49d2ca4aabd` (`main` at the time), by `services/queue/install.sh` run as
-the fleet account `kim`. The App credentials were copied from `chungus2` (`scp -p`, checksums
-compared). Updated live to `cc5270bcad283ef4644dadb181d4ab1d2762fef6` the same day. The Public endpoint
-steps were completed on tauchonki on 2026-11-04 at 22:37 to 22:45 UTC (operator decision, 2026-11-04:
-no shadow period, cutover from tauchonki): tunnel `tauceti-queue`
-(`be28d750-6092-4526-8aed-76a0d0bf7c66`), the proxied CNAME `queue.taucetiproject.org`, the
-`cloudflared-tauceti-queue` user unit, and the App webhook with all eight events. Deliveries answer
-202 and `status.webhooks.received` counts them. Bors is untouched until the cutover.
+Running on `chungus` since 2026-11-05 01:13 UTC, revision `d84649118232`, as the account `kim`. Both
+`queue.taucetiproject.org` and `bors.taucetiproject.org` report `service.host` `chungus` since
+01:13:33 UTC. The operator has no root on chungus and lingering is not enabled for the account
+(`loginctl enable-linger` is denied), so the service, the tunnel and the repair worker run as detached
+supervised processes started by hand (Hosts without lingering below); the units are installed but
+disabled. **chungus is a temporary host too.** A fresh dedicated machine is expected about eight hours
+after the move; the service moves there by the procedure below, restoring the systemd units and the
+backup timer.
 
-**tauchonki is a temporary host.** The operator's condition is that the service moves to a dedicated,
-stable host as soon as it is the production merge backend. The move procedure is below; the tunnel
-moves with it (`~/.cloudflared/` is copied, or the tunnel is recreated by the Public endpoint steps).
+History: the service was installed on `tauchonki` on 2026-11-04 (revision `045c7e58`, updated live to
+`cc5270bc`), got its tunnel, public hostname and App webhook there at 22:37 to 22:45 UTC and became
+the production merge backend from there at 22:58 UTC. tauchonki also runs the fleet's staging builds
+and many Claude sessions; on 2026-11-05 its load sat between 150 and 490, one controller pass took
+ten minutes and the public endpoints timed out, so the operator moved the service. At 01:10 UTC the
+service and the backup timer were stopped on tauchonki (last backup `queue-20261105T011003Z.sqlite3`),
+`~/TauCetiQueue-data` (database with WAL, logs, content clone) was copied to chungus by tar over ssh
+together with the App credentials, `config.toml` (`host` set to `chungus`) and the tunnel files
+(`~/.cloudflared/cert.pem`, `config.yml`, `be28d750-6092-4526-8aed-76a0d0bf7c66.json`);
+`install.sh --revision d84649118232 --no-restart` installed the checkout, and at 01:13 the service and
+the tunnel were started on chungus. On tauchonki the units `tauceti-queue`, `tauceti-queue-backup.timer`
+and `cloudflared-tauceti-queue` are disabled and `~/TauCetiQueue-data` is kept for a day.
 
-Paths on tauchonki, where they differ from the layout table:
+Paths on chungus, where they differ from the layout table:
 
 | Path | Content |
 | --- | --- |
-| `~/TauCetiQueue` | the checkout; `tauceti_queue/_revision.py` baked by the installer |
-| `~/.config/tauceti-queue/config.toml` | `host = "tauchonki"`, `publication_enabled = false`, `review_app_id = 3947238`, settings 16 / 1 / 900, the data paths below |
+| `~/TauCetiQueue` | the checkout, shared by the service and the repair worker; `tauceti_queue/_revision.py` baked by the installer |
+| `~/.config/tauceti-queue/config.toml` | copied from tauchonki with `host = "chungus"`, `review_app_id = 3947238`, the data paths below |
 | `~/TauCetiQueue-data/clone` | the content clone of `TauCetiProject/TauCeti` (`content_clone`) |
 | `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | the database (`database`) |
 | `~/TauCetiQueue-data/logs` | the service's own files (`log_dir`) |
-| `~/.local/state/tauceti-queue/backups/` | daily backups (the backup script's default directory; it finds the database through `check-config`) |
-| `127.0.0.1:8780` | the listen address; the port was free, and no other unit on the host uses it |
-| `~/.cloudflared/cert.pem`, `config.yml`, `<tunnel id>.json` | the Cloudflare origin certificate, tunnel configuration and tunnel credentials |
-| `~/.local/bin/cloudflared` | symlink to `~/.nix-profile/bin/cloudflared` for the tunnel unit's PATH (the unit now lists `~/.nix-profile/bin` itself) |
+| `~/TauCetiQueue-data/run-service.sh`, `service.log` | the service supervisor loop (`uv run tauceti-queue serve`) and the process log, which replaces journald |
+| `~/TauCetiQueue-data/run-tunnel.sh`, `tunnel.log` | the tunnel supervisor loop (`cloudflared tunnel ... run`) and its log |
+| `~/TauCetiQueue-data/repair-clone`, `~/TauCetiQueue-data/repair`, `repair-worker.log` | the repair worker's content clone, task root and log |
+| `~/.local/state/tauceti-queue/backups/` | backups, taken by hand (no timer) |
+| `127.0.0.1:8780` | the listen address |
+| `~/.cloudflared/cert.pem`, `config.yml`, `<tunnel id>.json` | the Cloudflare origin certificate, tunnel configuration and tunnel credentials, copied from tauchonki |
+| `~/.config/systemd/user/tauceti-queue.service`, `tauceti-queue-backup.{service,timer}`, `tauceti-queue-repair.service` | installed by the installers, disabled |
 
-The host runs the fleet's `tauceti-fleet*`, `tauceti-worker-*` and `tauceti-cleanup` user units; the
-queue units are independent of them and the installer does not touch them.
+### Hosts without lingering
 
-What this deployment does while publication is disabled: every pass fetches the canonical branch into
-the clone and records canonical advances, drains the (empty) outbox and runs insertion over the
-approved inputs it holds. Approval intake comes from webhook deliveries (`tauceti_queue/webhook.py`
-calls `eligibility.reconcile` for the review App's `merge eligibility` check runs) and from the
-approval poll (Approval polling below), which found the existing approvals before the webhook was
-active.
+Without lingering (`loginctl enable-linger` needs an administrator) systemd user units die when the
+account's last login session ends, so the three processes run detached under `nohup setsid`, each from
+a login shell on the host. The installers still run with `--no-restart` so the checkout, the
+configuration and the units are in place; the units stay disabled.
+
+```sh
+cd ~/TauCetiQueue-data
+nohup setsid ./run-service.sh >/dev/null 2>&1 &      # loops `uv run tauceti-queue serve`; log service.log
+nohup setsid ./run-tunnel.sh >/dev/null 2>&1 &       # loops `cloudflared tunnel ... run`; log tunnel.log
+cd ~/TauCetiQueue && nohup setsid uv run python -m tauceti_queue.repair_task \
+  --service https://queue.taucetiproject.org --worker repair@chungus \
+  --clone ~/TauCetiQueue-data/repair-clone --root ~/TauCetiQueue-data/repair \
+  >~/TauCetiQueue-data/repair-worker.log 2>&1 &
+pgrep -af 'run-service.sh|run-tunnel.sh|tauceti-queue serve|cloudflared tunnel|repair_task'
+```
+
+Consequences:
+
+- **No restart after a reboot.** After a reboot of chungus, or whenever `pgrep` shows a process
+  missing, the operator or an agent starts the three again by hand as above. The repair worker has no
+  loop around it, so a crash leaves it down until restarted.
+- **No daily backup.** The timer is disabled; run `~/TauCetiQueue/services/queue/backup.sh` by hand
+  before any risky change, or from a cron entry (`17 3 * * * ~/TauCetiQueue/services/queue/backup.sh`).
+- **Deploy** is `~/TauCetiQueue/services/queue/install.sh --revision <sha> --no-restart` followed by
+  `pkill -f 'tauceti-queue serve'`; the supervisor loop restarts the service on the new revision
+  (the SIGTERM shutdown is the same as the unit's). Verify as in "Verification after a deploy",
+  reading `service.log` instead of `journalctl`. The repair worker shares the checkout, so after a
+  deploy that changes it, `pkill -f tauceti_queue.repair_task` (a running task is checkpointed and
+  resumed) and start it again.
+- **Stop** the service or the tunnel for good by killing the loop script before its child
+  (`pkill -f run-service.sh; pkill -f 'tauceti-queue serve'`); killing only the child restarts it.
 
 ### Moving to the dedicated host
 
 1. On the new host, meet the Host requirements (account, lingering, `git`, `uv`, outbound HTTPS).
    Create `~/.config/tauceti-queue/` with mode 0700 and copy the three credential files and
-   `config.toml` from tauchonki with `scp -p` (mode 0600; compare checksums, never print them). Set
+   `config.toml` from chungus with `scp -p` (mode 0600; compare checksums, never print them). Set
    `host` in the copied `config.toml` to the new host's name.
-2. On tauchonki, stop the service and the timer so the store is closed and the WAL checkpointed:
-   `systemctl --user stop tauceti-queue tauceti-queue-backup.timer`. Take a last backup
+2. On chungus, stop the service so the store is closed and the WAL checkpointed: kill the loop script
+   and then the service (`pkill -f run-service.sh; pkill -f 'tauceti-queue serve'`; on a host with
+   enabled units, `systemctl --user stop tauceti-queue tauceti-queue-backup.timer`). Stop the repair
+   worker the same way once `worker.json` reports `idle`. Take a last backup
    (`~/TauCetiQueue/services/queue/backup.sh`).
 3. Copy the data directory: `rsync -a ~/TauCetiQueue-data/ <newhost>:~/TauCetiQueue-data/` (the
    database with its `-wal` and `-shm` files, the content clone and the logs). Copying the clone
    saves the fresh clone the installer would otherwise make.
-4. On the new host, install at the revision tauchonki was running (or `main`, if a newer revision is
+4. On the new host, install at the revision chungus was running (or `main`, if a newer revision is
    wanted; the store schema is migrated by the service):
    `git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue && ~/TauCetiQueue/services/queue/install.sh --revision <sha>`.
-   The installer reports `content clone present`, runs `check-config` and verifies the revision.
+   The installer reports `content clone present`, runs `check-config`, enables the unit and the backup
+   timer and verifies the revision. Install the repair worker with `install-repair.sh`.
 5. Verify as in "Verification after a deploy": `service.host` is the new host, `canonical_sha` equals
-   tauchonki's last value, `settings` are the persisted ones (the store wins over the file), and
-   `counters` carried over. Then run the Public endpoint steps on the new host.
-6. On tauchonki, `systemctl --user disable --now tauceti-queue tauceti-queue-backup.timer`, remove
-   the three unit files from `~/.config/systemd/user/`, and `systemctl --user daemon-reload`. Keep
-   `~/TauCetiQueue-data` until the new host has run for a day, then delete it together with
-   `~/TauCetiQueue` and `~/.config/tauceti-queue`. Update this section and `status.md`.
+   chungus's last value, `settings` are the persisted ones (the store wins over the file), and
+   `counters` carried over. Then stop the tunnel loop on chungus, copy `~/.cloudflared/` to the new
+   host and enable the `cloudflared-tauceti-queue` unit there (or run the Public endpoint steps).
+6. On chungus, remove the disabled unit files from `~/.config/systemd/user/` and `systemctl --user
+   daemon-reload`. Keep `~/TauCetiQueue-data` until the new host has run for a day, then delete it
+   together with `~/TauCetiQueue` and `~/.config/tauceti-queue`. Update this section and `status.md`.
 
 ## Repair worker
 
@@ -317,7 +359,9 @@ the status document. Each task's record is `<task root>/tasks/<id>/` (`task.json
 To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is interrupted and
 resumed at the next start, as above); to stop it from coming back, `systemctl --user disable --now
 tauceti-queue-repair`. To stop without interrupting a task (finish the current one, claim no more),
-stop it right after `worker.json` reports `idle`.
+stop it right after `worker.json` reports `idle`. On a host without lingering (Current deployment) the
+worker is a detached process: its log is `~/TauCetiQueue-data/repair-worker.log`, it is stopped with
+`pkill -f tauceti_queue.repair_task` (the same SIGTERM path) and started again by hand.
 
 ## Public endpoint
 
@@ -338,7 +382,8 @@ Workers), so the steps are operator instructions in the `tauceti` Cloudflare acc
    in the zone (or add it in the dashboard: CNAME `queue` to `<uuid>.cfargotunnel.com`, proxied).
 5. Install and start the tunnel unit:
    `install -m 0644 ~/TauCetiQueue/services/queue/cloudflared-tauceti-queue.service ~/.config/systemd/user/ &&
-   systemctl --user daemon-reload && systemctl --user enable --now cloudflared-tauceti-queue`.
+   systemctl --user daemon-reload && systemctl --user enable --now cloudflared-tauceti-queue`
+   (on a host without lingering, the `run-tunnel.sh` loop instead; Current deployment).
 6. Check `curl -s https://queue.taucetiproject.org/healthz` reports the same `service.revision` as the
    local `/status`.
 7. Create and activate the App webhook, as an organization owner on the App's settings page: tick
@@ -359,8 +404,9 @@ Cloudflare Access policy is needed for increment 1.
 `services/queue/backup.sh` takes an online SQLite backup (the backup API through Python's stdlib, so
 the service keeps running and the copy is a consistent snapshot), verifies it with `PRAGMA
 integrity_check` and keeps the newest 14 copies in `~/.local/state/tauceti-queue/backups/`. The
-installer enables `tauceti-queue-backup.timer`, which runs it daily at 03:17 UTC. Run it by hand before
-any risky change:
+installer enables `tauceti-queue-backup.timer`, which runs it daily at 03:17 UTC; on a host without
+lingering the timer stays disabled and the backup runs by hand or from cron (Current deployment). Run it
+by hand before any risky change:
 
 ```sh
 ~/TauCetiQueue/services/queue/backup.sh            # configured database, default directory
