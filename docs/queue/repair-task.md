@@ -173,7 +173,19 @@ has a time budget holds because the service re-exposes the task.
    and an autosquash rebase with `--keep-empty --empty=keep`, or any method yielding a linear chain
    on `onto` with one commit per member and every prior message preserved as a prefix; for a rebase
    conflict, `git rebase --onto` with conflicts resolved inside the constituent commits), and local
-   verification (`lake build --iofail`, `scripts/lint-env.sh` for lint findings, no weakening). The
+   verification (`lake build --iofail`, `scripts/lint-env.sh` for lint findings, no weakening). For
+   a rebase conflict the rebase recipe and the conflicting files come right after the goal paragraph,
+   before the rules and the listings. A batch of more than `repair.LARGE_BATCH` (40) members does not
+   carry its commit and member listings in the prompt (1,197 members once made a 291 KB prompt, about
+   75k tokens of noise): the prompt shows the conflicting or diagnosed members with three neighbours
+   on each side in chain order, the counts, and a pointer to `.tauceti-repair/members.md` in the
+   worktree, where `repair.compose_prompt` writes the full listings for the agent to `grep`; the
+   directory is excluded from Git through the clone's `info/exclude`, so no recipe the agent runs
+   can commit it, and `checkout_worktree` leaves it alone. Small batches keep the full inline
+   listings. The verification advice follows the artifacts outcome: with warm artifacts it describes
+   the incremental whole-library build; when a rebase conflict runs without them (`cold`) it says so,
+   gives the reason, warns that `lake build --iofail` starts from nothing and may take hours, and asks
+   for the touched modules (`lake build <Module>`) to be built first. The
    agent runs through `tauceti_worker.agents.run_agent_host` with the claude authoring profile the
    workers use for repair, in the task's worktree, with `repair.isolation_env`: no
    `GH_TOKEN`/`GITHUB_TOKEN`, an empty `GH_CONFIG_DIR`, `remote.origin.pushurl` pointed at a

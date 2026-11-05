@@ -342,6 +342,22 @@ with tempfile.TemporaryDirectory() as raw:
     )
     check("prompt names Bors's suspect as a hint", "#26269" in prompt and "not a verdict" in prompt)
     check("prompt explains verification", "lake build --iofail" in prompt and "scripts/lint-env.sh" in prompt)
+    check("prompt says the artifacts are warm by default", "Artifacts are warm" in prompt)
+    cold = rx.compose_prompt(
+        by_id[1931],
+        findings,
+        chain,
+        repo,
+        base[:12],
+        artifacts={"available": False, "unavailable_reason": "no published cache mapping for 0123456789ab"},
+    )
+    check(
+        "a cold prompt says so, with the reason, and suggests the failing module first",
+        "The build is cold" in cold
+        and "no published cache mapping for 0123456789ab" in cold
+        and "`lake build TauCeti.AlgebraicGeometry.Modules.PseudoCoherent.Pullback`" in cold
+        and "Artifacts are warm" not in cold,
+    )
 
 # ---- chain construction through the chain tool, with the retained-chain fallback -----------------
 

@@ -937,6 +937,9 @@ class RebaseArtifacts(Fixture):
         self.assertNotIn("cold", outcome["artifacts"])
         self.assertEqual(self.service.releases, [])
         self.assertEqual(len(self.service.results), 1)
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn("Artifacts are warm", prompt)
+        self.assertNotIn("The build is cold", prompt)
 
     def test_the_base_is_the_fallback_when_onto_is_not_published_yet(self):
         os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.onto
@@ -962,6 +965,11 @@ class RebaseArtifacts(Fixture):
         self.assertIn(self.content.base[:12], outcome["artifacts"]["unavailable_reason"])
         self.assertEqual([c for c in self.lake_calls() if c.startswith("build")], [], "no incremental build")
         self.assertEqual(len(self.agent_calls()), 1, "the agent ran without warm artifacts")
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn("The build is cold", prompt)
+        self.assertNotIn("Artifacts are warm", prompt)
+        self.assertIn(self.onto[:12], prompt, "the prompt says why the build is cold")
+        self.assertIn("`lake build TauCeti.Two`", prompt, "the conflicting module is the suggested first build")
         self.assertEqual(self.service.releases, [], "a rebase without artifacts is not released")
         history = [h["state"] for h in self.state()["history"]]
         self.assertIn("artifacts_unavailable", history)
@@ -1593,6 +1601,14 @@ class Records(unittest.TestCase):
         self.assertTrue(prompt.startswith(repair.AGENT_INSTRUCTION))
         self.assertIn("scripted rebase conflicted", prompt)
         self.assertIn(f"--onto {onto[:12]} {content.base[:12]}", prompt)
+        self.assertLess(
+            prompt.index("## The rebase"), prompt.index("do not push"), "the rebase recipe comes before the rules"
+        )
+        self.assertLess(prompt.index("`TauCeti/Two.lean`"), prompt.index("## Constituent commits"))
+        self.assertIn("Artifacts are warm", prompt)
+        self.assertNotIn(".tauceti-repair", prompt, "a small batch keeps its listings inline")
+        for member in content.members:
+            self.assertIn(f"`{member['commit'][:12]}` #{member['number']}:", prompt)
         self.assertIn("`TauCeti/Two.lean` is changed by PR #2", prompt)
         self.assertIn(f"not yet replayed after it: {PROJECT}#3", prompt)
         self.assertIn(f"Source-PR: {PROJECT}#2`, `Accepted-Head: {content.members[1]['accepted_head']}", prompt)
@@ -1603,6 +1619,115 @@ class Records(unittest.TestCase):
         self.assertTrue(custom_prompt.startswith("Custom instruction."), "the service's instruction is used verbatim")
         with self.assertRaises(ValueError):
             repair_task.Task.from_json({**raw, "kind": "mystery", "claim_token": "x", "expires_at": 1})
+
+    def test_a_large_batch_prompt_points_at_the_listings_file(self):
+        root = Path(tempfile.mkdtemp(prefix="large-", dir=TMP))
+        seed = root / "seed"
+        subprocess.run(["git", "init", "--quiet", "-b", "main", str(seed)], check=True)
+        sh(seed, "config", "user.name", "Fixture")
+        sh(seed, "config", "user.email", "fixture@example.invalid")
+        base = commit(seed, "base", {"TauCeti/A.lean": "theorem a : True := trivial\n"})
+        count, conflicting = 100, 57
+        members = []
+        for number in range(1, count + 1):
+            head = f"{number:040x}"
+            sha = commit(
+                seed,
+                f"feat: add {number} (#{number})\n\nBody of {number}.\n\nSource-PR: {PROJECT}#{number}\n"
+                f"Accepted-Head: {head}\n",
+                {f"TauCeti/M{number}.lean": f"theorem m{number} : True := trivial\n"},
+            )
+            members.append(
+                {
+                    "source_pr": f"{PROJECT}#{number}",
+                    "number": number,
+                    "accepted_head": head,
+                    "commit": sha,
+                    "provenance": "clean",
+                    "title": f"feat: add {number}",
+                    "description": f"Body of {number}.",
+                    "author": "alice",
+                    "explanation": "",
+                    "retained_ref": f"refs/tauceti-queue/inputs/{number}/{head}",
+                }
+            )
+        tip = members[-1]["commit"]
+        sh(seed, "checkout", "--quiet", "--detach", base)
+        onto = commit(seed, "main moved", {f"TauCeti/M{conflicting}.lean": "theorem clash : True := trivial\n"})
+        sh(seed, "checkout", "--quiet", "--detach", tip)
+        raw = {
+            "task_id": 11,
+            "kind": "rebase_conflict",
+            "repository": PROJECT,
+            "batch_id": 8,
+            "batch_version": 1,
+            "base": base,
+            "tip": tip,
+            "onto": onto,
+            "members": members,
+            "diagnostics": [
+                {
+                    "kind": "conflict",
+                    "source_pr": f"{PROJECT}#{conflicting}",
+                    "paths": [f"TauCeti/M{conflicting}.lean"],
+                    "onto": onto,
+                    "message": f"replaying the chain onto {onto[:12]} conflicts at {PROJECT}#{conflicting}",
+                    "pending": [f"{PROJECT}#{n}" for n in range(conflicting + 1, count + 1)],
+                    "clean_prefix_tip": members[conflicting - 2]["commit"],
+                }
+            ],
+            "retained_refs": [],
+            "instruction": repair.AGENT_INSTRUCTION,
+            "created_at": time.time(),
+            "extra": {},
+            "claim_token": "x",
+            "expires_at": time.time() + 60,
+        }
+        task = repair_task.Task.from_json(raw)
+        chain = repair.read_chain(seed, base, tip)
+        self.assertEqual(len(chain), count)
+        listings = repair.listings_path(seed)
+        artifacts = {
+            "available": False,
+            "cold": True,
+            "unavailable_reason": "no published cache mapping for " + onto[:12],
+        }
+        context = repair_task.prompt_context(task, None, artifacts=artifacts, listings=listings)
+        prompt = repair.compose_prompt(context, repair_task.task_findings(task), chain, seed)
+        self.assertLess(len(prompt), 20_000, f"prompt is {len(prompt)} bytes")
+        conflict_sha = members[conflicting - 1]["commit"][:12]
+        self.assertIn(f"`{conflict_sha}` #{conflicting}: feat: add {conflicting} (#{conflicting})", prompt)
+        self.assertIn("(the conflicting member)", prompt)
+        self.assertIn(f"`Source-PR: {PROJECT}#{conflicting}`, `Accepted-Head: {conflicting:040x}`", prompt)
+        for neighbour in (conflicting - 3, conflicting + 3):
+            self.assertIn(f"#{neighbour}: feat: add {neighbour}", prompt)
+        self.assertNotIn("#10: feat: add 10", prompt, "far members are left to the listings file")
+        self.assertIn("commits omitted", prompt)
+        self.assertIn(f"This batch has {count} constituent commits", prompt)
+        self.assertIn(f"There are {count} recorded members ({count} clean)", prompt)
+        self.assertIn(".tauceti-repair/members.md", prompt)
+        self.assertLess(prompt.index(f"--onto {onto[:12]} {base[:12]}"), prompt.index("do not push"))
+        self.assertIn("The build is cold", prompt)
+        self.assertIn(f"`lake build TauCeti.M{conflicting}`", prompt)
+        # The file holds everything and Git ignores it.
+        text = listings.read_text()
+        for member in members:
+            self.assertIn(f"`{member['commit'][:12]}` #{member['number']}:", text)
+            self.assertIn(f"`Source-PR: {member['source_pr']}`", text)
+        self.assertEqual(sh(seed, "status", "--porcelain"), "", "the listings file is excluded from Git")
+        self.assertEqual(sh(seed, "check-ignore", str(listings)), str(listings))
+        # Written again for the next prompt, and the exclude entry is not repeated.
+        repair.compose_prompt(context, repair_task.task_findings(task), chain, seed)
+        repair.listings_path(seed)
+        exclude = Path(sh(seed, "rev-parse", "--git-path", "info/exclude"))
+        exclude = exclude if exclude.is_absolute() else seed / exclude
+        self.assertEqual(exclude.read_text().count("/.tauceti-repair/"), 1)
+        # Without a listings path the full listings stay inline, as the experiment fixtures expect.
+        inline = repair.compose_prompt(
+            repair_task.prompt_context(task, None), repair_task.task_findings(task), chain, seed
+        )
+        self.assertIn("#10: feat: add 10", inline)
+        self.assertNotIn(".tauceti-repair", inline)
 
     def test_admin_predicate(self):
         repair_task.verify_admin(PROJECT)

@@ -811,6 +811,12 @@ def prepare_artifacts(
 # Prompt
 
 
+LARGE_BATCH = 40  # above this many constituent commits the prompt points at a listings file instead
+LISTING_NEIGHBOURS = 3  # commits shown on each side of a conflicting or diagnosed member
+LISTINGS_DIR = ".tauceti-repair"
+LISTINGS_FILE = "members.md"
+
+
 @dataclasses.dataclass
 class PromptContext:
     """What the prompt says about the batch beyond its diagnostics and commits."""
@@ -829,60 +835,324 @@ class PromptContext:
     )  # recorded members: source_pr, accepted_head, provenance
     lint_script: str = "scripts/lint-env.sh"
     instruction: str = AGENT_INSTRUCTION  # the plan's instruction; the service sends it with the task
+    artifacts_cold: bool = False  # no warm artifacts: the agent's first build starts from nothing
+    artifacts_reason: str | None = None  # ``prepare_artifacts``'s ``unavailable_reason`` when cold
+    listings_path: Path | None = None  # where a large batch's full member listings are written
 
 
 def _pr_list(prs: list[int]) -> str:
     return ", ".join("#" + str(p) for p in prs)
 
 
+def path_to_module(path: str) -> str | None:
+    """``TauCeti/A/B.lean`` to ``TauCeti.A.B``; None for anything that is not a Lean source path."""
+    return path[:-5].replace("/", ".") if path.endswith(".lean") and "/" in path else None
+
+
+def listings_path(worktree: Path) -> Path:
+    """Where ``compose_prompt`` writes a large batch's full listings: ``.tauceti-repair/members.md`` in
+    the worktree, excluded from Git through the repository's ``info/exclude`` (shared by all its
+    worktrees) so no recipe the agent runs, ``git add -A`` included, can commit it. The
+    ``git clean`` of ``checkout_worktree`` leaves ignored files alone; the file is rewritten for every
+    prompt, so a stale copy is overwritten, never read."""
+    exclude = git(worktree, "rev-parse", "--git-path", "info/exclude", check=False).strip()
+    if exclude:
+        exclude_path = Path(exclude) if os.path.isabs(exclude) else worktree / exclude
+        pattern = f"/{LISTINGS_DIR}/"
+        try:
+            existing = exclude_path.read_text() if exclude_path.exists() else ""
+            if pattern not in existing.splitlines():
+                exclude_path.parent.mkdir(parents=True, exist_ok=True)
+                with exclude_path.open("a") as handle:
+                    handle.write(("" if not existing or existing.endswith("\n") else "\n") + pattern + "\n")
+        except OSError:
+            pass  # the listing is still written; the prompt tells the agent not to commit it
+    return worktree / LISTINGS_DIR / LISTINGS_FILE
+
+
+def _commit_line(commit: ChainCommit) -> str:
+    return f"- `{commit.sha[:12]}` #{commit.pr}: {commit.subject}"
+
+
+def _member_line(member: dict) -> str:
+    provenance = member.get("provenance")
+    return f"- `Source-PR: {member.get('source_pr')}`, `Accepted-Head: {member.get('accepted_head')}`" + (
+        f" (currently {provenance})" if provenance else ""
+    )
+
+
+def member_listings(context: PromptContext, chain: list[ChainCommit]) -> str:
+    """The full listings a large batch's prompt points at instead of carrying: every constituent
+    commit in chain order and every recorded member with its trailers."""
+    lines = [
+        f"# Members of this batch ({len(chain)} constituent commits)",
+        "",
+        "## Constituent commits (oldest first)",
+        "",
+        *[_commit_line(c) for c in chain],
+    ]
+    if context.members:
+        lines += ["", f"## Recorded members ({len(context.members)})", "", *[_member_line(m) for m in context.members]]
+    return "\n".join(lines) + "\n"
+
+
+def finding_paths(findings: dict) -> list[str]:
+    """Every file the diagnostics name, in their order, without repeats."""
+    paths: list[str] = []
+    for error in findings.get("compiler_errors") or []:
+        paths.append(error["path"])
+    paths += [module_to_path(m) for m in findings.get("failed_modules") or []]
+    for duplicate in findings.get("duplicate_declarations") or []:
+        paths += [module_to_path(m) for m in duplicate["modules"]]
+    for collision in findings.get("import_collisions") or []:
+        paths += [module_to_path(collision["module"]), module_to_path(collision["other_module"])]
+    for finding in (findings.get("lint") or {}).get("findings") or []:
+        path = finding.get("path") or (
+            declaration_module(finding["declaration"]) if finding.get("declaration") else None
+        )
+        if path:
+            paths.append(path)
+    for finding in findings.get("other") or []:
+        if finding.get("module"):
+            paths.append(finding["module"])
+    return list(dict.fromkeys(p for p in paths if p))
+
+
+def highlighted_prs(context: PromptContext, findings: dict, chain: list[ChainCommit], clone: Path) -> list[int]:
+    """The members the prompt shows in full when the batch is large: the conflicting member, Bors's
+    suspects and the owners of every file the diagnostics name."""
+    prs: list[int] = []
+    member = (context.conflict or {}).get("member") if context.kind == "rebase_conflict" else None
+    if member and "#" in str(member):
+        try:
+            prs.append(pr_number(str(member)))
+        except ValueError:
+            pass
+    prs += context.suspects
+    for path in [*((context.conflict or {}).get("paths") or []), *finding_paths(findings)]:
+        prs += owners_of(clone, chain, path)
+    return list(dict.fromkeys(prs))
+
+
+def _shown_indices(chain: list[ChainCommit], highlighted: list[int], radius: int) -> set[int]:
+    """Chain positions a large batch's prompt lists: the highlighted members and their neighbours in
+    chain order, or the ends of the chain when nothing is highlighted."""
+    centres = [i for i, c in enumerate(chain) if c.pr in highlighted]
+    if not centres:
+        centres = [0, len(chain) - 1]
+    shown: set[int] = set()
+    for centre in centres:
+        shown.update(range(max(0, centre - radius), min(len(chain), centre + radius + 1)))
+    return shown
+
+
+def _listing_sections(context: PromptContext, findings: dict, chain: list[ChainCommit], clone: Path) -> list[str]:
+    """The constituent commits and recorded members: in full for a small batch, and for a large one
+    the members around the conflict or diagnosis with a pointer to the complete listings file."""
+    lines = [
+        "",
+        "## Constituent commits (oldest first)",
+        "",
+        "Each commit carries `Source-PR:` and `Accepted-Head:` trailers; keep them on the commit that represents that PR.",
+        "",
+    ]
+    large = len(chain) > LARGE_BATCH and context.listings_path is not None
+    if not large:
+        lines += [_commit_line(c) for c in chain]
+        if context.members:
+            lines += [
+                "",
+                "## Recorded members",
+                "",
+                "The queue validates the result against this member list: exactly one commit per member, identified by "
+                "these trailers, in any order.",
+                "",
+                *[_member_line(m) for m in context.members],
+            ]
+        return lines
+    assert context.listings_path is not None
+    context.listings_path.parent.mkdir(parents=True, exist_ok=True)
+    context.listings_path.write_text(member_listings(context, chain))
+    where = (
+        f"{LISTINGS_DIR}/{LISTINGS_FILE}"
+        if context.listings_path.parts[-2:] == (LISTINGS_DIR, LISTINGS_FILE)
+        else str(context.listings_path)
+    )
+    highlighted = highlighted_prs(context, findings, chain, clone)
+    conflict_pr = highlighted[0] if highlighted and context.kind == "rebase_conflict" and context.conflict else None
+    shown = _shown_indices(chain, highlighted, LISTING_NEIGHBOURS)
+    lines += [
+        f"This batch has {len(chain)} constituent commits. The complete list, with the recorded members, is in "
+        f"`{where}` (ignored by Git; `grep` it for a PR number, commit or title; do not commit it). The commits "
+        + (
+            f"around the members named above (each with the {LISTING_NEIGHBOURS} before and after it in chain order):"
+            if highlighted
+            else "at both ends of the chain:"
+        ),
+        "",
+    ]
+    omitted = 0
+    for index, commit in enumerate(chain):
+        if index not in shown:
+            omitted += 1
+            continue
+        if omitted:
+            lines.append(f"- ({omitted} commits omitted; see `{where}`)")
+            omitted = 0
+        mark = ""
+        if commit.pr == conflict_pr:
+            mark = "  (the conflicting member)"
+        elif commit.pr in highlighted:
+            mark = "  (named in the diagnostics)"
+        lines.append(_commit_line(commit) + mark)
+    if omitted:
+        lines.append(f"- ({omitted} commits omitted; see `{where}`)")
+    if context.members:
+        by_number: dict[int, dict] = {}
+        for member in context.members:
+            try:
+                by_number[pr_number(str(member.get("source_pr")))] = member
+            except (ValueError, IndexError):
+                continue
+        counts = collections.Counter(str(m.get("provenance") or "unknown") for m in context.members)
+        shown_members = [
+            by_number[chain[i].pr] for i in sorted(shown) if chain[i].pr in by_number and chain[i].pr is not None
+        ]
+        lines += [
+            "",
+            "## Recorded members",
+            "",
+            "The queue validates the result against the recorded member list: exactly one commit per member, identified "
+            f"by its `Source-PR` and `Accepted-Head` trailers, in any order. There are {len(context.members)} recorded "
+            "members ("
+            + ", ".join(f"{n} {p}" for p, n in sorted(counts.items()))
+            + f"); the full list is in `{where}`. "
+            "The members shown above:",
+            "",
+            *[_member_line(m) for m in shown_members],
+        ]
+    return lines
+
+
+def _verification_section(context: PromptContext, findings: dict, base_short: str) -> list[str]:
+    conflict = context.conflict if context.kind == "rebase_conflict" else None
+    lines = ["", "## Verifying locally", ""]
+    if context.artifacts_cold:
+        modules = [
+            m
+            for m in (path_to_module(p) for p in [*((conflict or {}).get("paths") or []), *finding_paths(findings)])
+            if m
+        ]
+        modules = list(dict.fromkeys(modules))
+        first = (
+            " Build only the modules you touched first: " + " and ".join(f"`lake build {m}`" for m in modules[:4]) + "."
+            if modules
+            else " Build only the modules you touched first (`lake build <Module.Name>`)."
+        )
+        lines += [
+            "The build is cold: the worker found no warm artifacts"
+            + (f" ({context.artifacts_reason})" if context.artifacts_reason else "")
+            + ", so nothing of Mathlib or of this batch is built in `.lake`, and a whole-library `lake build --iofail` "
+            "starts from nothing and may take hours. Do not start with it."
+            + first
+            + " Judge each by its exit status; the queue's CI builds the whole library once you return. Run a full "
+            "`lake build --iofail` only after the rebase is finished and only if time allows. Shell commands have a "
+            "ten-minute limit; if a build times out, rerun the same command in the same checkout, completed modules "
+            "are kept. Do not run `lake exe cache get` or `lake cache get` (the worker already tried); do not use "
+            "`--fail-fast`. ",
+        ]
+    else:
+        lines += [
+            "Artifacts are warm: Mathlib and every module of this batch that compiled are already built in `.lake`, so "
+            "`lake build --iofail` (whole library, incremental, as CI runs it) rebuilds only the failing modules and their "
+            "dependents. Run it in the foreground and judge it by its exit status. Shell commands have a ten-minute limit; if "
+            "a build times out, rerun the same command in the same checkout, completed modules are kept. Do not run "
+            "`lake exe cache get` or `lake cache get`; do not use `--fail-fast`. ",
+        ]
+    lines[-1] += (
+        f"For lint findings, `bash {context.lint_script}` reproduces the environment lint (it needs the complete build and takes "
+        "a while). For duplicate declarations there is no light local audit: make sure the name is declared exactly once "
+        "across the two modules (or made private/renamed so both intents survive) and that both modules build. "
+        "Do not weaken anything to get green: no `sorry`, no `native_decide`, no new axioms, no silenced linters, no "
+        "`maxHeartbeats` overrides."
+    )
+    lines += [
+        "",
+        "Work synchronously to completion in this turn; nothing resumes you. Finish with a short summary of what failed, "
+        "what you changed in which PR's commit, and the exit status of the final `lake build"
+        + (" <Module.Name>` commands" if context.artifacts_cold else " --iofail`")
+        + ".",
+    ]
+    return lines
+
+
 def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainCommit], clone: Path) -> str:
-    """The plan's instruction, then the batch's real diagnostics and its constituent commits."""
+    """The plan's instruction, then the batch's real diagnostics and its constituent commits.
+
+    For a rebase conflict the rebase recipe and the conflicting files follow the goal paragraph
+    directly. A batch of more than ``LARGE_BATCH`` commits with a ``listings_path`` gets its full
+    commit and member listings written there and the prompt shows only the members around the
+    conflict or diagnosis; ``artifacts_cold`` changes the verification advice from an incremental
+    whole-library build to building the touched modules first.
+    """
     base_short = context.base[:12]
     lines = [context.instruction or AGENT_INSTRUCTION, ""]
     conflict = context.conflict if context.kind == "rebase_conflict" else None
+    rules = [
+        "Nothing you do here is published: do not push, do not open pull requests, do not comment, do not use `gh`. "
+        "Only this worktree and its commits matter.",
+        "Do not edit `lakefile.toml`, `lake-manifest.json`, `lean-toolchain`, `scripts/`, `.github/` or anything under `.lake/`.",
+    ]
     if conflict:
-        previous = (conflict.get("previous_base") or "")[:12] or "its previous base"
+        previous = (conflict.get("previous_base") or "")[:12]
+        recipe_base = previous or "<previous base>"
+        member = conflict.get("member")
+        paths = conflict.get("paths") or []
+        in_paths = " in " + ", ".join(f"`{p}`" for p in paths) if paths else ""
         lines += [
             "## The batch",
             "",
             f"You are in a private, detached Git worktree of {context.repository}. HEAD is the tip of a batch of "
-            f"{len(chain)} constituent commits, one squash commit per pull request, on base `{previous}`. The queue "
-            f"needs this batch on `{base_short}` (current `main`) and its scripted rebase conflicted."
-            + (f" {context.origin}" if context.origin else ""),
-            "Nothing you do here is published: do not push, do not open pull requests, do not comment, do not use `gh`. "
-            "Only this worktree and its commits matter.",
-            "Do not edit `lakefile.toml`, `lake-manifest.json`, `lean-toolchain`, `scripts/`, `.github/` or anything under `.lake/`.",
+            f"{len(chain)} constituent commits, one squash commit per pull request, on base `{previous or 'its previous base'}`. "
+            f"The queue needs this batch on `{base_short}` (current `main`) and its scripted rebase conflicted at "
+            f"{member or 'one member'}{in_paths}." + (f" {context.origin}" if context.origin else ""),
             "",
-            "## Conflict evidence",
+            "## The rebase",
             "",
+            f"Run `git rebase --keep-empty --empty=keep --onto {base_short} {recipe_base}`. It replays the chain "
+            f"commit by commit onto `{base_short}` and stops at {member or 'the conflicting member'}"
+            + (" with conflicts in " + ", ".join(f"`{p}`" for p in paths) if paths else "")
+            + "; resolve each conflict inside the constituent commit it stops at, `git add` the resolution and "
+            "`git rebase --continue`. A member whose change is already in the new base becomes an empty commit, never "
+            "a dropped one.",
+            "",
+            f"- replaying {member or 'a member'} onto `{base_short}` conflicted{in_paths}",
         ]
-        member = conflict.get("member")
-        paths = conflict.get("paths") or []
-        lines.append(
-            f"- replaying {member or 'a member'} onto `{base_short}` conflicted"
-            + (" in " + ", ".join(f"`{p}`" for p in paths) if paths else "")
-        )
         for path in paths:
             owners = owners_of(clone, chain, path)
             if owners:
                 lines.append(f"  - `{path}` is changed by PR {_pr_list(owners)} in this batch")
-        if conflict.get("pending"):
-            lines.append("- not yet replayed after it: " + ", ".join(str(p) for p in conflict["pending"]))
+        pending = [str(p) for p in conflict.get("pending") or []]
+        if len(pending) > 2 * LISTING_NEIGHBOURS and len(chain) > LARGE_BATCH:
+            lines.append(
+                f"- not yet replayed after it: {len(pending)} members, {pending[0]} through {pending[-1]} in chain order"
+            )
+        elif pending:
+            lines.append("- not yet replayed after it: " + ", ".join(pending))
         if conflict.get("clean_prefix_tip"):
             lines.append(
                 f"- the members before it replay cleanly; that prefix is commit `{conflict['clean_prefix_tip'][:12]}`"
             )
-        lines.append("")
+        lines += ["", *rules]
     else:
+        recipe_base = base_short
         lines += [
             "## The batch",
             "",
             f"You are in a private, detached Git worktree of {context.repository}. HEAD is the tip of a batch of "
             f"{len(chain)} constituent commits, one squash commit per pull request, on base `{base_short}` (the `main` "
             f"of the time)." + (f" {context.origin}" if context.origin else ""),
-            "Nothing you do here is published: do not push, do not open pull requests, do not comment, do not use `gh`. "
-            "Only this worktree and its commits matter.",
-            "Do not edit `lakefile.toml`, `lake-manifest.json`, `lean-toolchain`, `scripts/`, `.github/` or anything under `.lake/`.",
+            *rules,
             "",
             "## CI failure evidence",
             "",
@@ -972,31 +1242,7 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             "",
             "Start from HEAD as it is now and produce a chain that passes these checks.",
         ]
-    lines += [
-        "",
-        "## Constituent commits (oldest first)",
-        "",
-        "Each commit carries `Source-PR:` and `Accepted-Head:` trailers; keep them on the commit that represents that PR.",
-        "",
-    ]
-    for commit in chain:
-        lines.append(f"- `{commit.sha[:12]}` #{commit.pr}: {commit.subject}")
-    if context.members:
-        lines += [
-            "",
-            "## Recorded members",
-            "",
-            "The queue validates the result against this member list: exactly one commit per member, identified by "
-            "these trailers, in any order.",
-            "",
-        ]
-        for member in context.members:
-            provenance = member.get("provenance")
-            lines.append(
-                f"- `Source-PR: {member.get('source_pr')}`, `Accepted-Head: {member.get('accepted_head')}`"
-                + (f" (currently {provenance})" if provenance else "")
-            )
-    recipe_base = base_short if not conflict else (conflict.get("previous_base") or "")[:12] or "<previous base>"
+    lines += _listing_sections(context, findings, chain, clone)
     lines += [
         "",
         "## Editing constituent commits",
@@ -1009,33 +1255,8 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
         "Source-PR trailer, every previous message preserved as a prefix of the new one, and empty commits kept where a "
         "contribution was reduced to nothing. Leave HEAD (detached) at the new chain tip with a clean working tree.",
     ]
-    if conflict:
-        lines += [
-            "",
-            f"For the rebase itself: `git rebase --keep-empty --empty=keep --onto {base_short} {recipe_base}` replays the chain "
-            f"commit by commit onto `{base_short}`; resolve each conflict inside the constituent commit it stops at, "
-            "`git add` the resolution and `git rebase --continue`. A member whose change is already in the new base "
-            "becomes an empty commit, never a dropped one.",
-        ]
-    lines += [
-        "",
-        "## Verifying locally",
-        "",
-        "Artifacts are warm: Mathlib and every module of this batch that compiled are already built in `.lake`, so "
-        "`lake build --iofail` (whole library, incremental, as CI runs it) rebuilds only the failing modules and their "
-        "dependents. Run it in the foreground and judge it by its exit status. Shell commands have a ten-minute limit; if "
-        "a build times out, rerun the same command in the same checkout, completed modules are kept. Do not run "
-        "`lake exe cache get` or `lake cache get`; do not use `--fail-fast`. "
-        f"For lint findings, `bash {context.lint_script}` reproduces the environment lint (it needs the complete build and takes "
-        "a while). For duplicate declarations there is no light local audit: make sure the name is declared exactly once "
-        "across the two modules (or made private/renamed so both intents survive) and that both modules build. "
-        "Do not weaken anything to get green: no `sorry`, no `native_decide`, no new axioms, no silenced linters, no "
-        "`maxHeartbeats` overrides.",
-        "",
-        "Work synchronously to completion in this turn; nothing resumes you. Finish with a short summary of what failed, "
-        "what you changed in which PR's commit, and the exit status of the final `lake build --iofail`.",
-    ]
-    return "\n".join(lines)
+    lines += _verification_section(context, findings, base_short)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
 
 
 def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
