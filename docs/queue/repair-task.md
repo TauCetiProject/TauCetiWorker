@@ -223,7 +223,12 @@ left in `error` by an older worker is treated the same. This is what stops a wor
 around its own stale claim, which the service refuses for concurrency, for the claim's whole TTL.
 Retained refs the service has not published yet (its outbox writes them a moment after creating the
 task) are retried every `fetch_retry_delay` seconds for `fetch_retry_seconds` (10 s, 120 s) before
-the sources count as unavailable.
+the sources count as unavailable. The refs are fetched 200 refspecs per `git fetch`; when a chunk
+fails (git stops at the first ref the remote lacks and names only that one) the failure's exit status
+and stderr are logged, the remote is asked once with `ls-remote` which of the chunk's refs exist, the
+existing ones are fetched in one call and the rest are reported missing by name; if the listing or
+the trimmed fetch fails too the chunk is halved and each half retried, so one bad ref costs log(n)
+fetches. Each retry attempt fetches only the refs the earlier attempts did not get.
 
 ## Worker loop integration
 

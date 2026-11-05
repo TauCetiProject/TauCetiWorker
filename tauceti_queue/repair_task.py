@@ -674,39 +674,90 @@ class SourcesUnavailable(RuntimeError):
 FETCH_CHUNK = 200  # refspecs per `git fetch`: one round trip each, well under the command-line limit
 
 
-def retained_refspecs(task: Task) -> list[tuple[str, str]]:
-    """``(refspec, private ref)`` for each retained ref of the task."""
+def retained_refspecs(task: Task) -> list[tuple[str, str, str]]:
+    """``(refspec, private ref, remote ref)`` for each retained ref of the task."""
     specs = []
     for ref in task.retained_refs:
         name = ref.removeprefix("refs/heads/").removeprefix("refs/")
         private = f"{RESULT_REF_PREFIX}/{task.task_id}/retained/{name}"
-        specs.append((f"+{ref}:{private}", private))
+        specs.append((f"+{ref}:{private}", private, ref))
     return specs
 
 
-def _fetch_retained_once(clone: Path, task: Task, chunk: int = FETCH_CHUNK) -> dict:
+def _git_failure(error: BaseException) -> str:
+    """git's exit status and stderr from a ``git()`` failure, without the (long) refspec list."""
+    text = " ".join(str(error).split())
+    _, found, tail = text.partition(" failed (")
+    return (f"exit {tail}" if found else text)[:600]
+
+
+def _fetch_chunk(clone: Path, task_id: str, group: list[tuple[str, str, str]]) -> tuple[list[str], dict[str, str]]:
+    """Fetch one chunk of refspecs in one ``git fetch``; returns the private refs fetched and the remote
+    refs that are missing, by name, with git's error.
+
+    git stops at the first ref the remote lacks and names only that one, so when the chunk fails the
+    remote is asked once (``ls-remote`` of the chunk's refs) which of them exist, the existing ones
+    are fetched in one call and the rest are reported missing. When that listing fails too, or the
+    trimmed fetch still fails (a transient server error), the chunk is halved and each half retried,
+    so one bad ref costs log(n) fetches instead of n.
+    """
+    try:
+        git(clone, "fetch", "--quiet", "origin", *(spec for spec, _, _ in group))
+        return [private for _, private, _ in group], {}
+    except RuntimeError as error:
+        detail = _git_failure(error)
+        if len(group) == 1:
+            return [], {group[0][2]: detail}
+        log(f"task {task_id}: warning: fetch of {len(group)} retained refs failed: {detail}")
+    try:
+        listed = git(clone, "ls-remote", "origin", *(remote for _, _, remote in group))
+        present = {line.split("\t", 1)[1].strip() for line in listed.splitlines() if "\t" in line}
+    except RuntimeError as error:
+        log(
+            f"task {task_id}: warning: ls-remote of the chunk failed ({' '.join(str(error).split())[:300]}); halving it"
+        )
+    else:
+        missing = {remote: "not on the remote" for _, _, remote in group if remote not in present}
+        if missing:
+            keep = [entry for entry in group if entry[2] not in missing]
+            log(
+                f"task {task_id}: {len(missing)} of {len(group)} retained refs are not on the remote yet; fetching the other {len(keep)}"
+            )
+            if not keep:
+                return [], missing
+            fetched, more = _fetch_chunk(clone, task_id, keep)
+            return fetched, {**missing, **more}
+        log(f"task {task_id}: the remote has every ref of the failed chunk; halving it")
+    half = len(group) // 2
+    fetched_a, missing_a = _fetch_chunk(clone, task_id, group[:half])
+    fetched_b, missing_b = _fetch_chunk(clone, task_id, group[half:])
+    return fetched_a + fetched_b, {**missing_a, **missing_b}
+
+
+def _fetch_retained_once(clone: Path, task: Task, chunk: int = FETCH_CHUNK, done: set[str] | None = None) -> dict:
     """Fetch the retained refs a chunk of refspecs per ``git fetch`` (a task can retain a thousand of
-    them: per ref, production took 1.3 s each); a chunk that fails is fetched ref by ref so the error
-    names the ref that is missing rather than the whole chunk."""
+    them: per ref, production took 1.3 s each). ``done`` holds the private refs already fetched by an
+    earlier attempt of the same call, which are not fetched again; the refs the remote lacks are
+    raised together by name."""
+    done = done if done is not None else set()
     specs = retained_refspecs(task)
-    fetched = []
-    for start in range(0, len(specs), max(1, chunk)):
-        group = specs[start : start + max(1, chunk)]
-        try:
-            git(clone, "fetch", "--quiet", "origin", *(spec for spec, _ in group))
-        except RuntimeError:
-            if len(group) == 1:
-                raise
-            for spec, _ in group:
-                git(clone, "fetch", "--quiet", "origin", spec)
-        fetched.extend(private for _, private in group)
+    missing: dict[str, str] = {}
+    pending = [entry for entry in specs if entry[1] not in done]
+    for start in range(0, len(pending), max(1, chunk)):
+        fetched, absent = _fetch_chunk(clone, task.task_id, pending[start : start + max(1, chunk)])
+        done.update(fetched)
+        missing.update(absent)
+    if missing:
+        names = sorted(missing)
+        shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+        raise RuntimeError(f"{len(names)} retained ref(s) not fetchable: {shown} ({missing[names[0]]})")
     for sha in (task.base, task.tip, task.validation_base):
         if git(clone, "cat-file", "-t", sha, check=False).strip() != "commit":
             git(clone, "fetch", "--quiet", "origin", sha, check=False)
         if git(clone, "cat-file", "-t", sha, check=False).strip() != "commit":
             raise RuntimeError(f"commit {sha[:12]} is not in the content repository after fetching the retained refs")
     git(clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/input", task.tip)
-    return {"refs": fetched, "base": task.base, "tip": task.tip}
+    return {"refs": [private for _, private, _ in specs], "base": task.base, "tip": task.tip}
 
 
 def fetch_retained(
@@ -722,14 +773,16 @@ def fetch_retained(
 
     A ref the remote does not have yet (the service publishes them through its outbox a moment after
     creating the task) or a transient fetch failure is retried every ``retry_delay`` seconds for
-    ``retry_seconds``; afterwards ``SourcesUnavailable`` carries the last error.
+    ``retry_seconds``, each attempt fetching only the refs the earlier ones did not get; afterwards
+    ``SourcesUnavailable`` carries the last error.
     """
     deadline = time.monotonic() + max(0.0, retry_seconds)
     attempt = 0
+    done: set[str] = set()
     while True:
         attempt += 1
         try:
-            fetched = _fetch_retained_once(clone, task, chunk)
+            fetched = _fetch_retained_once(clone, task, chunk, done)
         except RuntimeError as error:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or (cancel is not None and cancel.is_set()):
