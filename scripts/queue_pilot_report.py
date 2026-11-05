@@ -84,6 +84,8 @@ DETAIL_KEYS = {
     "error",
     "verified_fixed",
     "verification",
+    "task_kind",
+    "input_tip",
 }
 
 
@@ -334,12 +336,32 @@ def prediction_metrics(events, attempts):
             for c in detail.get("collisions", []):
                 predicted.add((e["batch_id"], c.get("name")))
         elif e["kind"] == "admission-repair-result":
-            a = attempt_map.get(detail.get("attempt_id"), {})
+            submitted_attempt = detail.get("attempt_id")
+            binding = "submitted-attempt"
+            if submitted_attempt is None:
+                # Background preparation precedes the first head CI dispatch. Bind
+                # only to the first subsequent dispatch of this same batch; a
+                # later completed retry cannot substitute for an unobserved one.
+                following = [
+                    a
+                    for a in attempts
+                    if a["batch_id"] == e["batch_id"] and a.get("dispatched_at", float("-inf")) >= e["at"]
+                ]
+                a = min(following, key=lambda a: (a["dispatched_at"], a["id"])) if following else {}
+                binding = "first-subsequent-same-batch-dispatch"
+            else:
+                a = attempt_map.get(submitted_attempt, {})
+                if a.get("batch_id") != e["batch_id"]:
+                    a = {}
             completed = a.get("run_completed_at")
             row = {
                 "task_id": detail.get("task_id"),
                 "batch": e["batch_id"],
-                "attempt_id": detail.get("attempt_id"),
+                "attempt_id": submitted_attempt,
+                "timing_attempt_id": a.get("id"),
+                "completion_binding": binding if a else "unknown",
+                "task_kind": detail.get("task_kind"),
+                "input_tip": detail.get("input_tip"),
                 "edited": detail.get("edited", []),
                 "before_completed_verdict": e["at"] < completed if completed else None,
                 "verified_fixed": detail.get("verified_fixed"),

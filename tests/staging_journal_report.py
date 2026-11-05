@@ -684,6 +684,47 @@ def test_wait_age_denominator_and_negative_timestamp_inconsistencies():
     assert p["approval_to_insertion_timing_inconsistencies"][0]["delta_seconds"] == -1
 
 
+def test_pre_dispatch_preparation_uses_first_following_same_batch_ci_only():
+    event = {
+        "kind": "admission-repair-result",
+        "batch_id": 3,
+        "at": 90,
+        "detail": {
+            "attempt_id": None,
+            "task_id": 5,
+            "task_kind": "prepare",
+            "input_tip": "before",
+            "edited": ["repo#1"],
+            "verified_fixed": ["duplicate"],
+        },
+    }
+    attempts = [
+        {"id": 1, "batch_id": 3, "dispatched_at": 80, "run_completed_at": 110},
+        {"id": 2, "batch_id": 99, "dispatched_at": 90, "run_completed_at": 120},
+        {"id": 3, "batch_id": 3, "dispatched_at": 100, "run_completed_at": 150},
+        {"id": 4, "batch_id": 3, "dispatched_at": 110, "run_completed_at": 160},
+    ]
+    report = qpr.prediction_metrics([event], attempts)
+    row = report["result_records"][0]
+    assert row["attempt_id"] is None and row["timing_attempt_id"] == 3, row
+    assert row["task_kind"] == "prepare" and row["input_tip"] == "before"
+    assert row["completion_binding"] == "first-subsequent-same-batch-dispatch"
+    assert report["verified_fixed_before_verdict"] == 1
+    attempts[2]["run_completed_at"] = None
+    row = qpr.prediction_metrics([event], attempts)["result_records"][0]
+    assert row["timing_attempt_id"] == 3 and row["before_completed_verdict"] is None, row
+    # No following same-batch CI must not select the older batch or another batch.
+    row = qpr.prediction_metrics([event], attempts[:2])["result_records"][0]
+    assert row["timing_attempt_id"] is None and row["completion_binding"] == "unknown", row
+    # An explicit submission-time binding is never silently replaced with a retry.
+    event["detail"]["attempt_id"] = 1
+    row = qpr.prediction_metrics([event], attempts)["result_records"][0]
+    assert row["timing_attempt_id"] == 1 and row["completion_binding"] == "submitted-attempt", row
+    event["detail"]["attempt_id"] = 2
+    assert qpr.prediction_metrics([event], attempts)["result_records"][0]["timing_attempt_id"] is None
+    assert {"task_kind", "input_tip", "verified_fixed"} <= qpr.DETAIL_KEYS
+
+
 def main():
     failures = 0
     for name, fn in sorted(globals().items()):
