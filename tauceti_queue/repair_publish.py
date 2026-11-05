@@ -187,8 +187,8 @@ def preferred(settings: Settings, task) -> tuple[tuple[str, str], ...]:
 
 def warm(settings: Settings, task) -> tuple[tuple[str, str], ...]:
     """The (service, revision) fetches that all run before the public cache, every one with a mapping
-    restoring its outputs: the controller's ``warm_revs`` (a ``pre_rebase`` or ``prepare`` task's
-    nearby revisions), then ``preferred``'s, without repeats; empty when the task names none or the
+    restoring its outputs: the controller's ``warm_revs`` (the task's nearby revisions: a head
+    task's tips, or a ``pre_rebase`` or ``prepare`` task's), then ``preferred``'s, without repeats; empty when the task names none or the
     namespace is not configured."""
     revisions = list(getattr(task, "warm_revs", None) or ())
     if not settings.url or not revisions:

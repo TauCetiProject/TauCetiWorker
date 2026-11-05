@@ -971,6 +971,23 @@ class PreRebase(ControllerCase):
 
 
 class Tasks(ControllerCase):
+    def test_the_heads_repair_task_warms_from_its_tips_then_its_base_and_main(self):
+        head = self.failing_head()
+        # Earlier tips of the head, oldest first; one repeats and the current tip is never listed twice.
+        earlier = ["1" * 40, "2" * 40, "3" * 40, "2" * 40, "4" * 40, "5" * 40]
+        self.controller.store.execute("DELETE FROM batch_tips WHERE batch_id = ?", (head["id"],))
+        for version, sha in enumerate(earlier):
+            self.controller._record_tip(head["id"], version, sha, self.clock())
+        self.controller._record_tip(head["id"], len(earlier), head["tip"], self.clock())
+        self.controller.store.update("batches", {"id": head["id"]}, version=len(earlier))
+        self.controller.store.update("tasks", {"batch_id": head["id"], "state": "open"}, batch_version=len(earlier))
+        self.controller._canonical = "c" * 40
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual((task.kind, task.tip), ("repair", head["tip"]))
+        expected = [head["tip"], "5" * 40, "4" * 40, "2" * 40, "3" * 40, head["base"], "c" * 40]
+        self.assertEqual(task.warm_revs, expected)
+        self.assertEqual(task.to_dict()["warm_revs"], expected)
+
     def test_task_record_carries_members_diagnostics_refs_and_instruction(self):
         head = self.failing_head()
         self.assertIsNone(self.controller.claim_task("w", "nobody"))

@@ -2679,6 +2679,42 @@ class PublishOutputs(Fixture):
         self.assertTrue(artifacts["available"])
         self.assertNotIn("cold", artifacts)
 
+    def test_a_head_repair_warms_from_the_first_published_tip_of_the_head(self):
+        """Production head 2's repair task 10: its current tip was never published, but the repair
+        namespace has its previous tip's outputs."""
+        raw = self.content.task()
+        previous, older, canonical = "8" * 40, "7" * 40, "6" * 40
+        raw["warm_revs"] = [self.content.tip, previous, older, self.content.base, canonical]
+        self.service.tasks = {1: raw}
+        os.environ["STUB_LAKE_REPAIR_REVS"] = f"{previous},{older}"
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"  # nothing public at all
+        lines: list[str] = []
+        original = repair_task.log
+        repair_task.log = lines.append
+        self.addCleanup(setattr, repair_task, "log", original)
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        fetches = [c for c in self.lake_calls() if c.startswith("cache get")]
+        repair_fetches = [c.split("--rev=")[1] for c in fetches if "--service tauceti-repair " in c]
+        self.assertEqual(repair_fetches, raw["warm_revs"], "every warm revision was tried in order, each once")
+        artifacts = outcome["artifacts"]
+        self.assertEqual(artifacts["warmed_from"], [previous, older])
+        self.assertEqual((artifacts["cache_revision"], artifacts["cache_service"]), (previous, "tauceti-repair"))
+        self.assertTrue(artifacts["available"])
+        self.assertIn(
+            f"task 1: repair outputs warmed the tree from {previous[:12]}, {older[:12]}; "
+            f"no published mapping for {self.content.tip[:12]}, {self.content.base[:12]}, {canonical[:12]}",
+            lines,
+        )
+        self.assertTrue(
+            any(
+                line.startswith(f"task 1: warm artifacts from {previous[:12]} (an earlier tip of the head)")
+                for line in lines
+            ),
+            lines,
+        )
+
     def test_before_publishes_ahead_of_the_push(self):
         cfg = self.config(publish=self.settings(when="before"))
         pushed_at: list[float] = []

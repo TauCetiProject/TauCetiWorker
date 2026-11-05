@@ -200,7 +200,7 @@ class Task:
     instruction: str = ""
     created_at: float | None = None
     extra: dict = dataclasses.field(default_factory=dict)
-    warm_revs: list[str] = dataclasses.field(default_factory=list)  # pre_rebase, prepare: repair outputs to restore
+    warm_revs: list[str] = dataclasses.field(default_factory=list)  # repair outputs to restore, in order
 
     @classmethod
     def from_json(cls, data: dict) -> Task:
@@ -954,6 +954,9 @@ def artifact_revisions(task: Task) -> list[str]:
     return revisions
 
 
+HEAD_KINDS = ("repair", "rebase_conflict")  # the head's own tasks, which warm from the head's tips
+
+
 def describe_cache_revision(task: Task, artifacts: dict) -> str:
     """The restored revision and its relation to the task, for the worker log: ``85f3eb5579df (the rebase
     target)``, ``5f78b5307b93 (the batch base)``, ``67aa17161ba1 (3 commits behind the rebase target
@@ -973,6 +976,12 @@ def describe_cache_revision(task: Task, artifacts: dict) -> str:
         role = "the rebase target"
     elif task.kind == "pre_rebase" and task.warm_revs and revision == task.warm_revs[-1]:
         role = "the head's base"
+    elif task.kind in HEAD_KINDS and revision == task.tip:
+        role = "the head's tip"
+    elif task.kind in HEAD_KINDS and revision in task.warm_revs:
+        # The head's tips come before its base in `warm_revs`, canonical main after it.
+        after_base = task.base in task.warm_revs and task.warm_revs.index(revision) > task.warm_revs.index(task.base)
+        role = "canonical main" if after_base else "an earlier tip of the head"
     elif revision in task.warm_revs:
         role = "an earlier tip of the head" if task.kind == "pre_rebase" else "an earlier tip of the batch"
     else:
