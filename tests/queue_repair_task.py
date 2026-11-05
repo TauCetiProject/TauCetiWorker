@@ -80,7 +80,9 @@ LAKE = r'''#!/usr/bin/env python3
 STUB_LAKE_CACHE_FAIL_REVS (comma separated); from the repair namespace (`--service tauceti-repair`)
 only the revisions in STUB_LAKE_REPAIR_REVS are published. `build` fails modules containing BROKEN
 and with `-o FILE` writes an output map naming one artifact in the pool. `cache put` records the
-key it was given in `lake-put-key` and fails when STUB_LAKE_PUT_FAIL=1. `build --iofail` replays the
+key it was given in `lake-put-key` and fails when STUB_LAKE_PUT_FAIL=1; otherwise it uploads, as Lake
+does, each artifact the map names and then the map to `remote/` under STUB_DIR, logging each upload
+in `remote/uploads.log`, and with STUB_LAKE_PUT_FAIL=partial fails after the artifacts. `build --iofail` replays the
 file STUB_LAKE_BUILD_SCRIPT when set (literal lines, `sleep S`, `exit N`), the first time only. `env CMD ...`
 runs CMD, as `lake env` does."""
 import os, sys, time
@@ -103,8 +105,26 @@ if args == ["build", "--iofail"] and os.environ.get("STUB_LAKE_BUILD_SCRIPT") an
 if args[:1] == ["env"]:
     os.execvp(args[1], args[1:])
 if args[:2] == ["cache", "put"]:
+    import json, shutil, subprocess
     (stub / "lake-put-key").write_text(os.environ.get("LAKE_CACHE_KEY", ""))
-    sys.exit(1 if os.environ.get("STUB_LAKE_PUT_FAIL") == "1" else 0)
+    if os.environ.get("STUB_LAKE_PUT_FAIL") == "1":
+        sys.exit(1)
+    remote = stub / "remote"
+    (remote / "artifacts").mkdir(parents=True, exist_ok=True)
+    uploads = (remote / "uploads.log").open("a")
+    for line in Path(args[2]).read_text().splitlines():
+        row = json.loads(line)
+        if isinstance(row, list):
+            shutil.copy(Path(os.environ["LAKE_CACHE_DIR"]) / "artifacts" / row[1], remote / "artifacts" / row[1])
+            uploads.write(f"artifact {row[1]}\n")
+            uploads.flush()
+    if os.environ.get("STUB_LAKE_PUT_FAIL") == "partial":
+        sys.exit(1)
+    rev = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (remote / "revisions").mkdir(exist_ok=True)
+    shutil.copy(args[2], remote / "revisions" / f"{rev}.jsonl")
+    uploads.write(f"mapping {rev}\n")
+    sys.exit(0)
 if args[:2] == ["cache", "get"] and "tauceti-repair" in args:
     rev = next((a[len("--rev="):] for a in args if a.startswith("--rev=")), "")
     if rev not in os.environ.get("STUB_LAKE_REPAIR_REVS", "").split(","):
@@ -885,6 +905,11 @@ class Fixture(unittest.TestCase):
         os.environ.pop("STUB_GH_FAIL", None)
         os.environ.pop("STUB_GH_ADMIN", None)
         os.environ.pop(repair_sandbox.DISABLE_VARIABLE, None)
+        os.environ.pop("INVOCATION_ID", None)  # background publishers are subprocesses here, not units
+        background = patch.object(repair_publish, "BACKGROUND", repair_publish.Background())
+        background.start()
+        self.addCleanup(background.stop)
+        self.addCleanup(lambda: repair_publish.BACKGROUND.wait(60))
         (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir)}))
         for key in (
             "STUB_FAIL_GROUP_WITH",
@@ -2454,21 +2479,47 @@ class PublishOutputs(Fixture):
     def puts(self) -> list[str]:
         return [c for c in self.lake_calls() if c.startswith("cache put")]
 
-    def test_a_green_repair_publishes_the_tip_before_submission(self):
+    def published(self) -> dict:
+        """The background publication's record, once its publisher has finished."""
+        records = repair_publish.BACKGROUND.wait(60)
+        self.assertEqual(len(records), 1, records)
+        return records[0]
+
+    def test_a_green_repair_submits_and_then_publishes_the_tip(self):
+        submitted: list[float] = []
+        submit = self.service.submit_task
+
+        def timed(*args, **kwargs):
+            submitted.append(time.time())
+            return submit(*args, **kwargs)
+
         cfg = self.config(publish=self.settings())
-        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        with patch.object(self.service, "submit_task", timed):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        record = outcome["publish"]
+        launch = outcome["publish"]
+        self.assertTrue(launch["launched"] and launch["background"], launch)
+        self.assertEqual(launch["revision"], outcome["tip"])
+        record = self.published()
+        self.assertEqual(record["state"], "published", record)
         self.assertTrue(record["published"], record)
         self.assertEqual(record["revision"], outcome["tip"])
         self.assertEqual((record["artifacts"], record["bytes"]), (1, 2048))
+        # The chain was submitted before the publisher's first command started.
+        check = next(b for b in self.lake_builds() if "--no-build" in b["args"])
+        self.assertEqual(len(submitted), 1)
+        self.assertLess(submitted[0], check["started"], "submission comes first")
         calls = self.lake_calls()
-        check = next(i for i, c in enumerate(calls) if c.startswith("build --no-build --rehash -o "))
+        check_at = next(i for i, c in enumerate(calls) if c.startswith("build --no-build --rehash -o "))
         put = next(i for i, c in enumerate(calls) if c.startswith("cache put "))
-        self.assertLess(check, put, "the output map is written by the --no-build pass first")
+        self.assertLess(check_at, put, "the output map is written by the --no-build pass first")
         self.assertIn(f"--service tauceti-repair-upload --repo {PROJECT}", calls[put])
         self.assertEqual((self.stub_dir / "lake-put-key").read_text(), self.KEY, "the key reaches lake cache put")
         self.assertIsNone(self.agent_calls()[0]["env"]["LAKE_CACHE_KEY"], "and never the agent")
+        logs = self.root / "state" / "tasks" / "1" / "logs"
+        self.assertTrue((logs / repair_publish.BACKGROUND_LOG).is_file())
+        self.assertIn("$ nice -n 10 lake build --no-build --rehash", (logs / "publish-outputs.log").read_text())
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists(), "the publisher removes it")
         config = (self.root / "state" / "lake.toml").read_text()
         self.assertIn('name = "tauceti-repair"', config)
         self.assertIn('artifactEndpoint = "https://repair-cache.example/artifacts"', config)
@@ -2480,26 +2531,110 @@ class PublishOutputs(Fixture):
         self.assertEqual(repair_fetches, [self.content.tip, self.content.base])
         self.assertNotIn("tauceti-repair", fetches[-1], "the public cache came last")
         self.assertEqual(outcome["artifacts"]["cache_revision"], self.content.base)
+        # worker.json reports the publication.
+        repair_task.write_heartbeat(cfg, {}, "idle")
+        heartbeat = json.loads(repair_task.heartbeat_path(cfg).read_text())["publish"]
+        self.assertEqual((heartbeat["published"], heartbeat["failed"], heartbeat["running"]), (1, 0, []))
+        self.assertEqual(heartbeat["last"]["revision"], outcome["tip"])
 
-    def test_a_published_tip_is_restored_from_the_repair_namespace(self):
-        os.environ["STUB_LAKE_REPAIR_REVS"] = self.content.tip
+    def test_before_publishes_ahead_of_the_push(self):
+        cfg = self.config(publish=self.settings(when="before"))
+        pushed_at: list[float] = []
+        push = repair_task.push_result
+
+        def timed(*args, **kwargs):
+            pushed_at.append(time.time())
+            return push(*args, **kwargs)
+
+        with patch.object(repair_task, "push_result", timed):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertTrue(outcome["publish"]["published"], outcome["publish"])
+        self.assertNotIn("background", outcome["publish"])
+        check = next(b for b in self.lake_builds() if "--no-build" in b["args"])
+        self.assertLess(check["finished"], pushed_at[0], "published before the push")
+        self.assertEqual(repair_publish.BACKGROUND.running, {})
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
+
+    def test_off_publishes_nothing(self):
+        cfg = self.config(publish=self.settings(when="off"))
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertFalse(outcome["publish"]["launched"])
+        self.assertEqual(outcome["publish"]["skipped"], "TAUCETI_REPAIR_PUBLISH is off")
+        self.assertEqual(self.puts(), [])
+        self.assertEqual([b for b in self.lake_builds() if "--no-build" in b["args"]], [])
+        self.assertEqual(repair_publish.BACKGROUND.running, {})
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists(), "the task removes it")
+        # The read side still prefers the repair namespace.
+        self.assertTrue(any("--service tauceti-repair " in c for c in self.lake_calls() if c.startswith("cache get")))
+
+    def test_the_mapping_is_uploaded_after_the_artifacts(self):
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(self.published()["state"], "published")
+        uploads = (self.stub_dir / "remote" / "uploads.log").read_text().splitlines()
+        self.assertEqual(uploads, ["artifact 00aa00aa00aa00aa.ltar", f"mapping {outcome['tip']}"])
+        self.assertTrue((self.stub_dir / "remote" / "revisions" / f"{outcome['tip']}.jsonl").is_file())
+
+    def test_a_partial_upload_leaves_no_mapping(self):
+        os.environ["STUB_LAKE_PUT_FAIL"] = "partial"
         cfg = self.config(publish=self.settings())
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        fetches = [c for c in self.lake_calls() if c.startswith("cache get")]
-        self.assertEqual(len(fetches), 1, fetches)
-        self.assertIn(f"--service tauceti-repair --repo {PROJECT} --rev={self.content.tip}", fetches[0])
-        self.assertEqual(outcome["artifacts"]["cache_service"], "tauceti-repair")
-        self.assertEqual(outcome["artifacts"]["cache_revision"], self.content.tip)
+        record = self.published()
+        self.assertEqual((record["state"], record["error"]), ("failed", "lake cache put exited 1"))
+        self.assertTrue((self.stub_dir / "remote" / "artifacts" / "00aa00aa00aa00aa.ltar").is_file())
+        self.assertFalse((self.stub_dir / "remote" / "revisions").exists(), "no mapping for a partial set")
 
     def test_a_failed_upload_is_logged_and_the_task_still_submits(self):
         os.environ["STUB_LAKE_PUT_FAIL"] = "1"
         cfg = self.config(publish=self.settings())
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertFalse(outcome["publish"]["published"])
-        self.assertEqual(outcome["publish"]["error"], "lake cache put exited 1")
         self.assertEqual(len(self.service.results), 1)
+        self.assertTrue(self.service.results[0]["response"]["accepted"])
+        record = self.published()
+        self.assertFalse(record["published"])
+        self.assertEqual((record["state"], record["error"]), ("failed", "lake cache put exited 1"))
+        repair_task.write_heartbeat(cfg, {}, "idle")
+        heartbeat = json.loads(repair_task.heartbeat_path(cfg).read_text())["publish"]
+        self.assertEqual((heartbeat["published"], heartbeat["failed"]), (0, 1))
+        self.assertEqual(heartbeat["last_failure"]["error"], "lake cache put exited 1")
+        self.assertEqual(self.state()["state"], "adopted", "the checkpoint keeps the submission's outcome")
+
+    def test_a_publisher_that_cannot_start_does_not_fail_the_task(self):
+        cfg = self.config(publish=self.settings())
+        with patch.object(repair_publish, "_spawn", side_effect=OSError("no processes left")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["publish"]["state"], "failed")
+        self.assertIn("no processes left", outcome["publish"]["error"])
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists(), "the task removes it")
+
+    def test_under_systemd_the_publisher_is_a_unit_of_its_own(self):
+        """A worker in a unit starts the publisher with ``systemd-run --user``, passing the lake and path
+        variables and none of the worker's credentials."""
+        bindir = self.root / "systemd-bin"
+        bindir.mkdir()
+        tool = bindir / "systemd-run"
+        tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$STUB_DIR/systemd-run-args"\n')
+        tool.chmod(0o755)
+        env = repair.lake_env(self.root / "state")
+        env.update(PATH=f"{bindir}{os.pathsep}{env['PATH']}", INVOCATION_ID="abc", GH_TOKEN="gh-secret")
+        logdir = self.root / "logs"
+        record = repair_publish.start_background(
+            self.content.clone, self.content.tip, settings=self.settings(), env=env, logdir=logdir, task_id="7"
+        )
+        self.assertTrue(record["launched"], record)
+        self.assertTrue(record["unit"].startswith(f"tauceti-repair-publish-7-{self.content.tip[:12]}-"))
+        args = (self.stub_dir / "systemd-run-args").read_text().splitlines()
+        self.assertEqual(args[:3], ["--user", "--quiet", "--collect"])
+        self.assertIn(f"--setenv=LAKE_CACHE_DIR={env['LAKE_CACHE_DIR']}", args)
+        self.assertFalse([a for a in args if "gh-secret" in a or "INVOCATION_ID" in a], args)
+        self.assertEqual(args[-2:], ["tauceti_queue.repair_publish", str(logdir / repair_publish.SPEC)])
+        self.assertNotIn(self.KEY, "\n".join(args))
+        self.assertEqual(json.loads((logdir / repair_publish.RECORD).read_text())["state"], "running")
 
     def test_without_a_key_or_when_switched_off_nothing_is_put(self):
         for settings, reason in (
@@ -2547,6 +2682,12 @@ class PublishOutputs(Fixture):
         self.assertEqual(repair_publish.Settings.from_env({}).url, None)
         upload = repair_publish.Settings.from_env({**base, "TAUCETI_REPAIR_CACHE_UPLOAD_URL": "https://s3.example/b"})
         self.assertEqual(upload.upload_base, "https://s3.example/b")
+        self.assertEqual(on.when, "after", "after the submission by default")
+        for value, when in (("before", "before"), ("OFF", "off"), ("after", "after"), ("later", "after")):
+            self.assertEqual(repair_publish.Settings.from_env({**base, "TAUCETI_REPAIR_PUBLISH": value}).when, when)
+        off = repair_publish.Settings.from_env({**base, "TAUCETI_REPAIR_PUBLISH": "off"})
+        self.assertEqual(off.disabled_reason(), "TAUCETI_REPAIR_PUBLISH is off")
+        self.assertEqual(repair_publish.Settings.from_json(json.loads(json.dumps(on.to_json()))), on)
 
     def test_configure_replaces_its_own_services_and_keeps_the_public_one(self):
         env = repair.lake_env(self.root / "state")

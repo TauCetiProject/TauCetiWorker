@@ -335,8 +335,9 @@ has a time budget holds because the service re-exposes the task.
    source style lint are not run on the worker. In CI runs of 2026-11-05 on the full library (24,455 TauCeti
    modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
    PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
-6. **Publish and submit.** Publish the build outputs (below), push, `result`, record the response (checkpoints `pushed`, `submitted`,
-   then `adopted` or `not_adopted`). The worktree is removed afterwards unless `--keep-worktree`;
+6. **Submit and publish.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
+   then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is removed
+   afterwards (by the background publisher when one runs) unless `--keep-worktree`;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
@@ -369,8 +370,8 @@ preparation"). While the head waits on CI or is repaired the controller hands ou
 batches: `base` and `tip` are the open batch's own (never the head's tip), `onto` is `base`, and
 `diagnostics` is empty because no CI run has seen the batch. The worker runs it as a repair with the
 streaming build, always, even under `--no-stream-repair`, since that build is how it learns whether
-anything fails: a build that finishes with exit 0 and no error publishes its outputs to the repair
-cache under the batch tip and releases the task as `prepared_clean` without starting an agent. When
+anything fails: a build that finishes with exit 0 and no error releases the task as `prepared_clean`
+without starting an agent and publishes its outputs to the repair cache under the batch tip. When
 the build reports errors the agent (or the parallel group agents) is launched as for a repair, with
 the "What happened" section saying that the batch has not yet been tried, that it should fix what
 fails to build so the batch is ready when it becomes the head, and that nothing it does is a verdict;
@@ -386,8 +387,7 @@ prompt lists under "Errors the batch's preparation left".
 
 ## Repair cache publication
 
-After a chain passes the local checks and before it is pushed, `repair_publish.publish_outputs`
-publishes the worktree's build outputs under the tip's revision to a cache namespace only the workers
+After a chain is submitted, `repair_publish.publish_outputs` publishes the worktree's build outputs under the tip's revision to a cache namespace only the workers
 read, so the next repair round on the same head and the next head's agent start warm instead of
 rebuilding what this repair built. `lake build --no-build --rehash -o <map>` writes the output map and
 exits nonzero unless every module is built and current at the tip, so only a green final build is
@@ -404,7 +404,30 @@ laid out like the public cache. The write key, the `access-key-id:secret` pair L
 bucket of its own with an R2 token scoped to it, so the worker's key cannot write the public cache
 CI publishes to (`LAKE_CACHE_KEY` in TauCeti's `publish-lake-cache.yml`). `TAUCETI_QUEUE_PUBLISH_CACHE`
 (`1`/`0`) switches publication on or off; unset, it is on when the key file and an upload URL are
-configured. CI never fetches from this namespace, so its verdicts are unchanged.
+configured. CI fetches from this namespace only the exact staging head (TauCetiTools
+`repair-cache-get.sh`), and Lake still checks every trace against the candidate's inputs, so its
+verdicts are unchanged.
+
+Publication never delays the submission. On 2026-11-05 head 2's repair validated at 09:18:58 UTC and
+the publish step (the `--no-build --rehash` pass over about 26,000 modules, then the upload) ran for
+more than 12 minutes before the chain was submitted, and CI, dispatched only after submission, waited
+with the whole queue. `TAUCETI_REPAIR_PUBLISH` (`after`, the default; `before`; `off`) now chooses
+the order. Under `after` the worker pushes and submits exactly as before (the same checkpoint token,
+the claim released or adopted by the submission) and then starts `repair_publish.start_background`
+for the submitted tip, after `adopted` or `not_adopted` and after a `prepared_clean` release, and
+goes on to its next claim. The publisher is a process of its own: under systemd a transient unit
+(`systemd-run --user`, since the worker unit's `KillMode=mixed` kills whatever is left in its cgroup
+on a stop or restart), elsewhere a new session, so a stopping worker does not take it down. It writes
+`tasks/<id>/logs/publish.log` and its record `tasks/<id>/logs/publish.json` (`published`, `skipped`
+or `failed`), removes the task's worktree when done, and `worker.json` reports running publications,
+counts and the last result and failure under `publish`; a failure is logged there and in the journal
+and never changes the task's outcome. Both the rehash and `lake cache put` run under `nice -n 10`, so
+a concurrent repair or build on the host keeps the CPU. `lake cache put` uploads every artifact
+before the revision mapping the fetcher reads, and exits without writing the mapping when an
+artifact upload fails, so CI never sees a mapping for a partially uploaded set; a publisher killed
+mid-upload leaves no mapping, which the fetch script treats as the normal miss. `before` keeps the
+first ordering (publish in the task, before the push) and `off` publishes nothing; the read side is
+unchanged in all three.
 
 ## Parallel agents within one task
 
