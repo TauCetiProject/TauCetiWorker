@@ -31,6 +31,10 @@ Tables:
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
 - `journal`: an append-only log of what the controller did, for status and tests.
+- `identity_cache`: answers GitHub gave about workers and operators, kept across restarts so a
+  restart during a quota outage does not lock them out: per `namespace` (`bearer`, a token's
+  SHA-256 fingerprint to its JSON `[login, id]`; `admin` and `server-admin`, a login to its
+  repository-admin answer), the JSON `value` and the time GitHub last confirmed it (`verified_at`).
 """
 
 from __future__ import annotations
@@ -227,6 +231,13 @@ CREATE TABLE IF NOT EXISTS outbox (
     result TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS outbox_state ON outbox (state, next_attempt_at);
+CREATE TABLE IF NOT EXISTS identity_cache (
+    namespace TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    verified_at REAL NOT NULL,
+    PRIMARY KEY (namespace, key)
+);
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY,
     at REAL NOT NULL,
@@ -434,6 +445,28 @@ class Store:
             row["key"]: {"value": loads(row["value"]), "actor": row["actor"], "updated_at": row["updated_at"]}
             for row in self.rows("settings", order="key")
         }
+
+    # --- identity cache ---------------------------------------------------------------------------
+
+    def cached_identities(self, namespace: str) -> list[dict[str, Any]]:
+        """The `identity_cache` rows of `namespace` as `{key, value, verified_at}`, value decoded."""
+        return [
+            {"key": row["key"], "value": loads(row["value"]), "verified_at": row["verified_at"]}
+            for row in self.rows("identity_cache", {"namespace": namespace}, order="key")
+        ]
+
+    def cache_identity(self, namespace: str, key: str, value: Any, verified_at: float) -> None:
+        with self.transaction():
+            self.execute(
+                "INSERT INTO identity_cache (namespace, key, value, verified_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value, "
+                "verified_at = excluded.verified_at",
+                (namespace, key, dumps(value), verified_at),
+            )
+
+    def forget_identity(self, namespace: str, key: str) -> int:
+        with self.transaction():
+            return self.execute("DELETE FROM identity_cache WHERE namespace = ? AND key = ?", (namespace, key)).rowcount
 
     # --- journal -----------------------------------------------------------------------------------
 

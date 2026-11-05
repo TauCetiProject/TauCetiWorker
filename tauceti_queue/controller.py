@@ -230,9 +230,17 @@ class Controller:
         self.log = logger or logging.getLogger("tauceti_queue.controller")
         self.started_at = clock()
         # `repository_admin(login)` per login, kept for `ADMIN_CACHE_SECONDS` and served stale while
-        # GitHub cannot answer, so a quota outage neither refuses nor grants anything new.
+        # GitHub cannot answer, so a quota outage neither refuses nor grants anything new; persisted
+        # in the store's `identity_cache`, so a restart during the outage keeps the answers.
         self.admins = StaleCache(
-            github.repository_admin, ttl=ADMIN_CACHE_SECONDS, clock=clock, logger=self.log, what="admin"
+            github.repository_admin,
+            ttl=ADMIN_CACHE_SECONDS,
+            clock=clock,
+            logger=self.log,
+            what="admin",
+            store=store,
+            namespace="admin",
+            decode=bool,
         )
         self._lock = threading.RLock()
         self._wake = threading.Event()

@@ -674,6 +674,9 @@ class FakeService:
         self.result_script: list[dict] = []
         self.inference_reports: list[dict] = []
         self.renew_mode = "ok"  # ok | refuse | error
+        # Renewals answered 401 before the next is served, as while the service cannot resolve the
+        # worker's GitHub identity.
+        self.unauthenticated_renewals = 0
         self.claim_mode = "ok"  # ok | error
         self.release_mode = "ok"  # ok | error
         self.release_supported = True
@@ -884,6 +887,9 @@ class FakeService:
                     raise LookupError("unknown-task")
                 token = str(body.get("claim_token") or "")
                 if verb == "renew":
+                    if self.unauthenticated_renewals > 0:
+                        self.unauthenticated_renewals -= 1
+                        return 401, {"error": "a GitHub token in `Authorization: Bearer` is required"}
                     return 200, self.renew_task(task_id, token)
                 if verb == "release":
                     if self.release_mode == "error":
@@ -1161,6 +1167,35 @@ class ClaimExpiry(Fixture):
         self.assertTrue(outcome["lease"]["lost"])
         self.assertEqual(self.state()["state"], "claim_lost")
         self.assertFalse(sh(self.content.bare, "rev-parse", "--verify", "-q", self.submission_ref(), check=False))
+
+    def test_unauthenticated_renewals_keep_the_claim_until_one_succeeds(self):
+        cfg = self.config()
+        client = self.client(cfg)
+        task = client.claim()
+        claimed_until = task.expires_at
+        self.service.unauthenticated_renewals = 2
+        with self.assertRaises(repair_task.ServiceError, msg="a 401 is not a refused claim"):
+            client.renew(task)
+        lease = repair_task.ClaimLease(client, task, retry_interval=0.1)
+        lease.start()
+        self.addCleanup(lease.stop)
+        deadline = time.monotonic() + 4
+        while lease.renewals < 2 and not lease.lost.is_set() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(lease.lost.is_set(), lease.lost_reason)
+        self.assertFalse(lease.cancel.is_set(), "the agent is not stopped")
+        self.assertEqual(lease.errors, 1)
+        self.assertGreaterEqual(lease.renewals, 2, "the renewal after the 401 continues the claim")
+        self.assertGreater(task.expires_at, claimed_until)
+
+    def test_a_401_renewal_followed_by_a_success_keeps_the_task_running(self):
+        cfg = self.config()
+        self.service.unauthenticated_renewals = 1
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertFalse(outcome["lease"]["lost"])
+        self.assertEqual(self.service.unauthenticated_renewals, 0, "the 401 was served")
+        self.assertEqual(len(self.service.results), 1)
 
     def test_renew_errors_keep_the_agent_running(self):
         cfg = self.config()

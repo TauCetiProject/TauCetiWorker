@@ -318,6 +318,23 @@ stops it, and `--check` reports the cached verification's age. The worker runs
 on the service host today; it only needs the service URL, so it can run on any host meeting the
 requirements below (the service's `repair_concurrency` setting bounds how many hold a task at once).
 
+The service resolves each worker's bearer token through `GET /user`, which spends the token owner's
+user quota, shared with any other tooling on that account. What GitHub answered is kept in the
+store's `identity_cache` table (the SHA-256 fingerprint of the token, never the token, with the login
+and the time GitHub last confirmed it; likewise each login's repository-admin answer) and loaded at
+start, so a restart while that quota is exhausted does not lock the workers out. An answer is
+revalidated in the background every five minutes once it is six hours old; while GitHub is rate
+limited or unavailable the stored answer is served (logged once per token per hour) and lookups of
+known identities pause until the limit's reset. A stored answer expires when GitHub has not
+confirmed it for seven days, when GitHub answers that the token is invalid, or when an admin revokes
+it with `POST /admin/revoke-identity` `{"login": "<login>"}` (bearer token of a repository admin),
+which forgets that login's tokens and admin answers. Only a token the service has never resolved is
+refused (401) during an outage. `/status` reports `identities`: `cached` (bearer identities),
+`admin_answers_cached`, `github_lookups_rate_limited`, `github_lookups_retry_at` and
+`last_lookup_error`. On the worker side a 401 or 5xx answer to a claim renewal does not abandon the
+task: the agent keeps running and the renewal is retried until the claim's expiry, and a renewal that
+succeeds before then continues the claim.
+
 ### Host requirements
 
 - The account's systemd user services with lingering enabled, `git`, `uv` and `gh` on the unit's PATH

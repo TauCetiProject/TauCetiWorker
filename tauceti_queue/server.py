@@ -7,8 +7,8 @@ same process. Routes:
 
     GET  /health/                                     200 once the process serves
     GET  /status                                      the controller's status JSON plus the service's
-                                                      revision, start time, GitHub client counters
-                                                      and webhook counters
+                                                      revision, start time, GitHub client counters,
+                                                      webhook counters and the identity cache
     GET  /repositories/<n>/active-batches?base=..     tauceti-bors.observation/v1 (feeds.py)
     GET  /repositories/<n>/candidates?base=..         tauceti-bors.candidates/v1 (feeds.py)
     POST /webhook/github                              HMAC-verified GitHub deliveries (webhook.py)
@@ -17,6 +17,8 @@ same process. Routes:
     POST /tasks/<id>/result                           resolved to a login through `GET /user`
     POST /admin/settings                              same bearer scheme; the controller checks the
     POST /admin/urgent                                caller's repository-admin permission
+    POST /admin/revoke-identity                       `{"login": ...}`: forget the cached identity
+                                                      and admin answers for a login
 
 `/admin/settings` takes one JSON object `{"<setting>": <value>, ...}` whose keys are any of the
 controller's `DEFAULT_SETTINGS`, each value of the type of that setting's initial value.
@@ -47,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import feeds, webhook
 from .ports import GitHubUnavailable
-from .stale_cache import StaleCache
+from .stale_cache import MAX_AGE_SECONDS, StaleCache
 
 log = logging.getLogger("tauceti_queue.server")
 
@@ -94,6 +96,13 @@ class ServerConfig:
     revision: str = ""
     auth_cache_seconds: float = 6 * 3600.0
     clock: Callable[[], float] = time.time
+    # Where the bearer identities and admin answers are kept across restarts (`Store`); the
+    # controller's store when None and the controller has one.
+    store: object | None = None
+    identity_max_age_seconds: float = MAX_AGE_SECONDS
+    # How often the background thread asks GitHub again about cached answers older than
+    # `auth_cache_seconds`; 0 disables it.
+    identity_revalidate_seconds: float = 300.0
 
 
 def running_revision(package_dir: pathlib.Path | None = None) -> str:
@@ -112,11 +121,36 @@ class BearerAuth:
 
     The cache keeps expired entries: when `GET /user` cannot answer (a rate-limited 403, 5xx, a
     network error) the identity resolved earlier is served, so a quota outage does not log workers
-    out of their claims. A 401 from GitHub still evicts the entry and refuses the token.
+    out of their claims. With a `store` the digests and logins (never the tokens) are persisted, so
+    a restart during such an outage keeps them too. A 401 from GitHub still evicts the entry and
+    refuses the token.
     """
 
-    def __init__(self, adapter, *, ttl: float, clock: Callable[[], float]) -> None:
-        self._cache = StaleCache(adapter.user_for_token, ttl=ttl, clock=clock, logger=log, what="bearer identity")
+    def __init__(
+        self,
+        adapter,
+        *,
+        ttl: float,
+        clock: Callable[[], float],
+        store=None,
+        max_age: float = MAX_AGE_SECONDS,
+    ) -> None:
+        self.cache = StaleCache(
+            adapter.user_for_token,
+            ttl=ttl,
+            clock=clock,
+            logger=log,
+            what="bearer identity",
+            store=store,
+            namespace="bearer",
+            max_age=max_age,
+            decode=lambda value: (str(value[0]), int(value[1])),
+        )
+
+    def revoke_login(self, login: str) -> int:
+        """Forget every cached token that resolved to `login`; the number forgotten."""
+        keys = self.cache.keys_where(lambda identity: identity[0] == login)
+        return sum(self.cache.invalidate(key) for key in keys)
 
     def resolve(self, header: str | None) -> tuple[str, int] | None:
         if not header or not header.startswith("Bearer "):
@@ -126,7 +160,7 @@ class BearerAuth:
             return None
         digest = hashlib.sha256(token.encode()).hexdigest()
         try:
-            return self._cache.get(digest, token)
+            return self.cache.get(digest, token)
         except GitHubUnavailable as error:
             log.warning("bearer identity lookup failed with nothing cached for %s: %s", digest[:12], error)
             return None
@@ -158,12 +192,77 @@ class QueueHTTPServer(ThreadingHTTPServer):
         self.receiver = webhook.WebhookReceiver(
             controller, config.adapter, repositories=config.repositories.values(), review_app_id=config.review_app_id
         )
-        self.auth = BearerAuth(config.adapter, ttl=config.auth_cache_seconds, clock=config.clock)
+        store = config.store if config.store is not None else getattr(controller, "store", None)
+        self.identity_store = store
+        self.auth = BearerAuth(
+            config.adapter,
+            ttl=config.auth_cache_seconds,
+            clock=config.clock,
+            store=store,
+            max_age=config.identity_max_age_seconds,
+        )
         self.admins = StaleCache(
-            config.adapter.repository_admin, ttl=config.auth_cache_seconds, clock=config.clock, logger=log, what="admin"
+            config.adapter.repository_admin,
+            ttl=config.auth_cache_seconds,
+            clock=config.clock,
+            logger=log,
+            what="admin",
+            store=store,
+            namespace="server-admin",
+            max_age=config.identity_max_age_seconds,
+            decode=bool,
         )
         self.revision = config.revision or running_revision()
         self.poller = None  # the approval poller, set by `create_server(..., poller=)`
+        self._revalidator_stop = threading.Event()
+
+    def identity_caches(self) -> list[StaleCache]:
+        """The caches of GitHub's answers about callers: bearer identities, the server's admin
+        answers and the controller's (`Controller.admins`) when it keeps one."""
+        caches = [self.auth.cache, self.admins]
+        controller_admins = getattr(self.controller, "admins", None)
+        if isinstance(controller_admins, StaleCache):
+            caches.append(controller_admins)
+        return caches
+
+    def revalidate_identities(self) -> int:
+        answered = 0
+        for cache in self.identity_caches():
+            try:
+                answered += cache.revalidate_due()
+            except Exception:  # noqa: BLE001 - the background pass must not die with one bad lookup
+                log.error("identity revalidation failed:\n%s", traceback.format_exc())
+        return answered
+
+    def _revalidate_loop(self) -> None:
+        interval = float(self.config.identity_revalidate_seconds)
+        while not self._revalidator_stop.wait(interval):
+            self.revalidate_identities()
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        if self.config.identity_revalidate_seconds > 0:
+            threading.Thread(target=self._revalidate_loop, name="identity-revalidate", daemon=True).start()
+        super().serve_forever(poll_interval)
+
+    def shutdown(self) -> None:
+        self._revalidator_stop.set()
+        super().shutdown()
+
+    def identity_status(self) -> dict:
+        """`/status`'s `identities`: how many answers are cached and whether GitHub can be asked."""
+        auth = self.auth.cache.stats()
+        caches = [cache.stats() for cache in self.identity_caches()]
+        unavailable = [stats for stats in caches if stats["github_unavailable"]]
+        retry_at = max((stats["retry_at"] for stats in unavailable), default=None)
+        return {
+            "cached": auth["entries"],
+            "admin_answers_cached": sum(stats["entries"] for stats in caches[1:]),
+            "persisted": self.identity_store is not None,
+            "github_lookups_rate_limited": any(stats["rate_limited"] for stats in caches),
+            "github_lookups_unavailable": bool(unavailable),
+            "github_lookups_retry_at": feeds._iso(retry_at) if retry_at is not None else None,
+            "last_lookup_error": next((stats["last_error"] for stats in unavailable), ""),
+        }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -306,6 +405,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/reconcile-approvals":
             self._admin_reconcile_approvals()
             return
+        if path == "/admin/revoke-identity":
+            self._admin_revoke_identity()
+            return
         if path == "/tasks/inference":
             self._task_inference()
             return
@@ -316,6 +418,7 @@ class Handler(BaseHTTPRequestHandler):
         client = getattr(adapter, "client", None)
         return {
             "github": client.stats() if client is not None and hasattr(client, "stats") else {},
+            "identities": self.server.identity_status(),
             "webhooks": {
                 "received": self.server.receiver.received,
                 "duplicates": self.server.receiver.duplicates,
@@ -361,9 +464,9 @@ class Handler(BaseHTTPRequestHandler):
     def _admin(self, login: str) -> bool:
         """The admin predicate the security audit uses: repository-admin permission for the caller.
 
-        The answer is cached per login with the bearer cache's lifetime and served stale while GitHub
-        cannot answer; a login never checked before is refused (503) during such an outage. Sends the
-        error response itself when refusing.
+        The answer is cached per login (and persisted with the bearer identities) with the bearer
+        cache's lifetime and served stale while GitHub cannot answer; a login never checked before
+        is refused (503) during such an outage. Sends the error response itself when refusing.
         """
         repo = next(iter(self.server.config.repositories.values()), None)
         if not repo:
@@ -595,6 +698,30 @@ class Handler(BaseHTTPRequestHandler):
             self._error(503, "the approval poller is not running in this service")
             return
         self._call(lambda: poller.run_once(reason=f"operator {identity[0]}"))
+
+    def _admin_revoke_identity(self) -> None:
+        """Forget what the service cached about a login (its bearer tokens and admin answers), so
+        the next request with any of its tokens asks GitHub again and an outage cannot serve them."""
+        identity = self._authenticated()
+        if identity is None:
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        login = body.get("login")
+        if not isinstance(login, str) or not login:
+            self._error(400, "`login` must be a GitHub login")
+            return
+        if not self._admin(identity[0]):
+            return
+
+        def revoke() -> dict:
+            tokens = self.server.auth.revoke_login(login)
+            admin = [cache.invalidate(login) for cache in self.server.identity_caches()[1:]]
+            log.warning("%s revoked the cached identity of %s (%d tokens)", identity[0], login, tokens)
+            return {"login": login, "tokens_forgotten": tokens, "admin_answers_forgotten": sum(admin)}
+
+        self._call(revoke)
 
 
 def _renewal(task_id, result) -> dict:  # noqa: E302

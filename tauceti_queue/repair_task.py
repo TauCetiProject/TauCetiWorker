@@ -354,7 +354,12 @@ class TaskClient:
         status, payload = self._post(
             f"/tasks/{task.task_id}/renew", {"worker": self.worker, "claim_token": task.claim_token}
         )
-        if status in (401, 403, 404, 409, 410):
+        if status == 401:
+            # The service could not authenticate the worker (its GitHub identity lookup failing, as
+            # during a quota outage), which says nothing about the claim: a refused claim answers 409
+            # with its code (raised by `_post`). The lease keeps retrying until the claim expires.
+            raise ServiceError(f"renew: HTTP 401 {_error_text(payload)}".strip())
+        if status in (403, 404, 409, 410):
             raise ClaimRefused(f"renew refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200:
             raise ServiceError(f"renew: unexpected HTTP {status}")
@@ -451,9 +456,10 @@ def with_retries(call, *, attempts: int, delays: tuple[float, ...], what: str):
 class ClaimLease(threading.Thread):
     """Renews the claim at ``renew_after`` until stopped; sets ``cancel`` when the claim is lost.
 
-    A transport failure does not lose the claim: the renewal is retried every ``retry_interval``
-    seconds while the claim is unexpired, so the agent keeps running through a coordinator or
-    network outage. The claim is lost when the service refuses the renewal or ``expires_at`` passes
+    A transport failure, a 5xx or a 401 (the service unable to authenticate the worker) does not
+    lose the claim: the renewal is retried every ``retry_interval`` seconds while the claim is
+    unexpired, so the agent keeps running through a coordinator, network or GitHub outage, and a
+    renewal that succeeds before the expiry continues the claim. The claim is lost when the service refuses the renewal or ``expires_at`` passes
     without a successful one; the agent is then stopped and its result discarded.
     """
 

@@ -1042,6 +1042,27 @@ class Tasks(ControllerCase):
         result = self.controller.submit_task(task.task_id, task.claim_token, head["tip"])
         self.assertTrue(result.accepted, "the submission's admin check serves the same stale answer")
 
+    def test_admin_answers_survive_a_restart_during_an_outage(self):
+        self.failing_head()
+        self.assertIsNotNone(self.controller.claim_task("worker-1", "admin-worker"))
+        self.assertIsNone(self.controller.claim_task("worker-3", "stranger"))
+        rows = {row["key"]: row["value"] for row in self.controller.store.cached_identities("admin")}
+        self.assertEqual(rows, {"admin-worker": True, "stranger": False})
+        # Restarted seven hours on (the claim and every fresh answer expired) with GitHub rate limited.
+        self.clock.advance(7 * 3600)
+        self.github.unavailable = "rate limited for 2400s"
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        self.assertIsNotNone(restarted.claim_task("worker-2", "admin-worker"), "the stored admin answer stands")
+        self.assertIsNone(restarted.claim_task("worker-3", "stranger"))
+        self.assertEqual(restarted.store.journal_entries("claim-refused")[-1]["detail"]["reason"], "not-admin")
+        # An answer GitHub has not confirmed for the maximum age is not served.
+        self.clock.advance(8 * 86400)
+        again = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(again.store.close)
+        self.assertIsNone(again._repository_admin("admin-worker"))
+        self.assertEqual(again.store.cached_identities("admin"), [])
+
     def test_invalid_chains_are_rejected_with_the_tool_violations(self):
         head = self.failing_head()
         task = self.controller.claim_task("worker-1", "admin-worker")
