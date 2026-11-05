@@ -62,3 +62,14 @@ TAUCETI_QUEUE_PROVIDERS=claude,codex,api
 # One extracted Mathlib (`lake exe cache get`) shared read-only through a .lake/packages symlink
 # instead of fetching it per task (the experiments' method); optional.
 #TAUCETI_QUEUE_SEED_PACKAGES=/home/operator/TauCetiQueue-data/mathlib-packages
+
+# The workers' own Lake cache namespace (docs/queue/repair-task.md, "Repair cache publication").
+# Repairs read it before the public cache and, after a green repair, publish their outputs to it.
+# The read URL is public; the upload URL is the S3 endpoint of the same bucket. The write key file
+# holds the `access-key-id:secret` pair of an R2 token scoped to that bucket only (mode 0600).
+# Publication is on when the key file and an upload URL are set; TAUCETI_QUEUE_PUBLISH_CACHE=0
+# turns it off.
+#TAUCETI_REPAIR_CACHE_URL=https://repair-cache.taucetiproject.org
+#TAUCETI_REPAIR_CACHE_UPLOAD_URL=https://<account>.r2.cloudflarestorage.com/tauceti-repair-cache
+#TAUCETI_REPAIR_CACHE_KEY_FILE=/home/operator/.config/tauceti-queue/repair-cache-key
+#TAUCETI_QUEUE_PUBLISH_CACHE=1

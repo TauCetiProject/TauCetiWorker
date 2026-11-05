@@ -174,7 +174,10 @@ has a time budget holds because the service re-exposes the task.
    build does not complete. Unavailable artifacts release a
    repair task (`artifacts_unavailable`; its agent never runs cold), while a rebase conflict, whose
    rebase needs no build, runs its agent without warm artifacts and leaves the validation build to run
-   cold or to the service's CI. Checkpoint `artifacts_ready`.
+   cold or to the service's CI. When the workers' repair namespace is configured, the fetches start
+   there (`lake cache get --service tauceti-repair`) for the task's `tip`, `onto` and `base` before
+   any public revision; `cache_service` records which service the restored mapping came from.
+   Checkpoint `artifacts_ready`.
 4. **Agent.** The prompt (`repair.compose_prompt`) opens with the task's instruction verbatim, then
    says what happened in plain words (for a rebase conflict: the queue replayed this batch of N squash
    commits onto the current `main` commit with git, the replay stopped at PR N's commit with conflicts
@@ -273,12 +276,34 @@ has a time budget holds because the service re-exposes the task.
    the same attempt. A chain that fails validation, a dirty worktree, or a HEAD still at the input
    tip is not acceptable: one bounded retry (`agent_attempts`, 2) with the local report and the
    retained input ref appended to the prompt, then `agent_failed`. Checkpoint `validated`.
-6. **Publish and submit.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
+6. **Publish and submit.** Publish the build outputs (below), push, `result`, record the response (checkpoints `pushed`, `submitted`,
    then `adopted` or `not_adopted`). The worktree is removed afterwards unless `--keep-worktree`;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
    outcome record.
+
+## Repair cache publication
+
+After a chain passes the local checks and before it is pushed, `repair_publish.publish_outputs`
+publishes the worktree's build outputs under the tip's revision to a cache namespace only the workers
+read, so the next repair round on the same head and the next head's agent start warm instead of
+rebuilding what this repair built. `lake build --no-build --rehash -o <map>` writes the output map and
+exits nonzero unless every module is built and current at the tip, so only a green final build is
+published; `lake cache put <map> --service tauceti-repair-upload --repo <repository>` then uploads the
+map and its artifacts with a bounded timeout (`TAUCETI_REPAIR_CACHE_PUBLISH_TIMEOUT`, default 1800 s),
+and the outcome's `publish` record holds the artifact count, bytes and seconds. A failure or a skip
+is logged and recorded and never fails the task. The namespace is two services the worker writes
+into the pool's `lake.toml`: `tauceti-repair` reads from `TAUCETI_REPAIR_CACHE_URL` (public, since Lake
+fetches without credentials) and `tauceti-repair-upload` writes to `TAUCETI_REPAIR_CACHE_UPLOAD_URL`
+(the S3 endpoint of the same bucket; default the read URL), each holding `artifacts/` and `revisions/`
+laid out like the public cache. The write key, the `access-key-id:secret` pair Lake takes as
+`LAKE_CACHE_KEY`, is read from the file named by `TAUCETI_REPAIR_CACHE_KEY_FILE` and given only to the
+`lake cache put` process; `LAKE_CACHE_KEY` is removed from the environment the agent inherits. Use a
+bucket of its own with an R2 token scoped to it, so the worker's key cannot write the public cache
+CI publishes to (`LAKE_CACHE_KEY` in TauCeti's `publish-lake-cache.yml`). `TAUCETI_QUEUE_PUBLISH_CACHE`
+(`1`/`0`) switches publication on or off; unset, it is on when the key file and an upload URL are
+configured. CI never fetches from this namespace, so its verdicts are unchanged.
 
 ## Inference unavailability
 
@@ -420,6 +445,10 @@ resumption of a checkpointed session, the task record and prompt for a rebase co
 provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
 unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the
 `api` provider's key and credential-free config dir, the attempts in the outcome and the heartbeat, and
-the eligibility check against the pacer's readers), and the ownership and declaration context
+the eligibility check against the pacer's readers), the ownership and declaration context
 (declarations under namespaces, a collision and a rename ripple reported with their members, and a
-120-member batch whose prompt section stays under the cap). No real inference and no network.
+120-member batch whose prompt section stays under the cap), and the repair cache publication (the
+`--no-build` map then `lake cache put` with the key from the key file and never in the agent's
+environment, the repair namespace fetched for tip and base before the public cache, a failed upload
+that still submits, and no upload without a key, when switched off or when the outputs are not
+green). No real inference and no network.

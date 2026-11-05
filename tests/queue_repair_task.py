@@ -55,7 +55,7 @@ for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CO
     os.environ.pop(key, None)
 
 from tauceti_queue import chain as chain_tool  # noqa: E402
-from tauceti_queue import repair, repair_context, repair_task, repair_tools  # noqa: E402
+from tauceti_queue import repair, repair_context, repair_publish, repair_task, repair_tools  # noqa: E402
 
 PROJECT = "TauCetiProject/TauCeti"
 TOKEN = "worker-token"
@@ -64,12 +64,26 @@ TOKEN = "worker-token"
 
 LAKE = r'''#!/usr/bin/env python3
 """lake stub: `cache get` succeeds unless STUB_LAKE_CACHE_FAIL=1 or the `--rev` is listed in
-STUB_LAKE_CACHE_FAIL_REVS (comma separated); `build` fails modules containing BROKEN."""
+STUB_LAKE_CACHE_FAIL_REVS (comma separated); from the repair namespace (`--service tauceti-repair`)
+only the revisions in STUB_LAKE_REPAIR_REVS are published. `build` fails modules containing BROKEN
+and with `-o FILE` writes an output map naming one artifact in the pool. `cache put` records the
+key it was given in `lake-put-key` and fails when STUB_LAKE_PUT_FAIL=1."""
 import os, sys
 from pathlib import Path
 args = sys.argv[1:]
-log = Path(os.environ["STUB_DIR"]) / "lake-calls.log"
+stub = Path(os.environ["STUB_DIR"])
+log = stub / "lake-calls.log"
 log.open("a").write(" ".join(args) + "\n")
+if args[:2] == ["cache", "put"]:
+    (stub / "lake-put-key").write_text(os.environ.get("LAKE_CACHE_KEY", ""))
+    sys.exit(1 if os.environ.get("STUB_LAKE_PUT_FAIL") == "1" else 0)
+if args[:2] == ["cache", "get"] and "tauceti-repair" in args:
+    rev = next((a[len("--rev="):] for a in args if a.startswith("--rev=")), "")
+    if rev not in os.environ.get("STUB_LAKE_REPAIR_REVS", "").split(","):
+        print("error: outputs not found for revision")
+        sys.exit(1)
+    print("downloaded artifact 0022")
+    sys.exit(0)
 if args[:2] == ["cache", "get"]:
     rev = next((a[len("--rev="):] for a in args if a.startswith("--rev=")), "")
     unpublished = [r for r in os.environ.get("STUB_LAKE_CACHE_FAIL_REVS", "").split(",") if r]
@@ -91,6 +105,11 @@ if args[:1] == ["build"]:
             rc = 1
         else:
             print(f"✔ [{index}/{len(modules)}] Built {name} (0.1s)")
+    if "-o" in args and rc == 0:
+        artifacts = Path(os.environ["LAKE_CACHE_DIR"]) / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "00aa00aa00aa00aa.ltar").write_bytes(b"x" * 2048)
+        Path(args[args.index("-o") + 1]).write_text('"2026-03-17"\n["11bb11bb11bb11bb","00aa00aa00aa00aa.ltar"]\n')
     sys.exit(rc)
 sys.exit(2)
 '''
@@ -142,7 +161,7 @@ mode = modes[min(call, len(modes)) - 1] if modes else os.environ.get("STUB_AGENT
 config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
 codex_home = os.environ.get("CODEX_HOME")
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
 if agent == "claude":
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
@@ -643,6 +662,8 @@ class Fixture(unittest.TestCase):
         self.addCleanup(status.stop)
         os.environ.pop("STUB_LAKE_CACHE_FAIL", None)
         os.environ.pop("STUB_LAKE_CACHE_FAIL_REVS", None)
+        os.environ.pop("STUB_LAKE_REPAIR_REVS", None)
+        os.environ.pop("STUB_LAKE_PUT_FAIL", None)
         os.environ.pop("STUB_SLEEP", None)
         self.service = FakeService(self.content.bare, [self.content.task()])
         self.addCleanup(self.service.close)
@@ -668,6 +689,7 @@ class Fixture(unittest.TestCase):
             release_backoff=(0.0,),
             artifacts_backoff=(0.0, 0.0),
             providers=("claude",),
+            publish=repair_publish.Settings(),
         )
         values.update(overrides)
         return repair_task.RunnerConfig(**values)
@@ -2156,6 +2178,129 @@ class StopAndResume(Fixture):
         # Nothing stale left: a later empty claim stays empty with no extra release.
         self.assertIsNone(repair_task.claim_and_run(cfg, client))
         self.assertEqual(len(self.service.releases), 1)
+
+
+class PublishOutputs(Fixture):
+    """After a green repair the worker publishes the worktree's outputs under the tip to the repair
+    namespace, and the next preparation consults that namespace for tip, onto and base first."""
+
+    KEY = "access-id:secret-value"
+
+    def settings(self, **overrides) -> repair_publish.Settings:
+        key_file = self.root / "repair-cache-key"
+        key_file.write_text(self.KEY + "\n")
+        values = dict(url="https://repair-cache.example", key_file=key_file)
+        values.update(overrides)
+        return repair_publish.Settings(**values)
+
+    def puts(self) -> list[str]:
+        return [c for c in self.lake_calls() if c.startswith("cache put")]
+
+    def test_a_green_repair_publishes_the_tip_before_submission(self):
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        record = outcome["publish"]
+        self.assertTrue(record["published"], record)
+        self.assertEqual(record["revision"], outcome["tip"])
+        self.assertEqual((record["artifacts"], record["bytes"]), (1, 2048))
+        calls = self.lake_calls()
+        check = next(i for i, c in enumerate(calls) if c.startswith("build --no-build --rehash -o "))
+        put = next(i for i, c in enumerate(calls) if c.startswith("cache put "))
+        self.assertLess(check, put, "the output map is written by the --no-build pass first")
+        self.assertIn(f"--service tauceti-repair-upload --repo {PROJECT}", calls[put])
+        self.assertEqual((self.stub_dir / "lake-put-key").read_text(), self.KEY, "the key reaches lake cache put")
+        self.assertIsNone(self.agent_calls()[0]["env"]["LAKE_CACHE_KEY"], "and never the agent")
+        config = (self.root / "state" / "lake.toml").read_text()
+        self.assertIn('name = "tauceti-repair"', config)
+        self.assertIn('artifactEndpoint = "https://repair-cache.example/artifacts"', config)
+        self.assertIn('name = "tauceti-repair-upload"', config)
+        self.assertNotIn(self.KEY, config)
+        # Preparation asked the repair namespace for tip, onto and base before the public cache.
+        fetches = [c for c in calls if c.startswith("cache get")]
+        repair_fetches = [c.split("--rev=")[1] for c in fetches if "--service tauceti-repair " in c]
+        self.assertEqual(repair_fetches, [self.content.tip, self.content.base])
+        self.assertNotIn("tauceti-repair", fetches[-1], "the public cache came last")
+        self.assertEqual(outcome["artifacts"]["cache_revision"], self.content.base)
+
+    def test_a_published_tip_is_restored_from_the_repair_namespace(self):
+        os.environ["STUB_LAKE_REPAIR_REVS"] = self.content.tip
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        fetches = [c for c in self.lake_calls() if c.startswith("cache get")]
+        self.assertEqual(len(fetches), 1, fetches)
+        self.assertIn(f"--service tauceti-repair --repo {PROJECT} --rev={self.content.tip}", fetches[0])
+        self.assertEqual(outcome["artifacts"]["cache_service"], "tauceti-repair")
+        self.assertEqual(outcome["artifacts"]["cache_revision"], self.content.tip)
+
+    def test_a_failed_upload_is_logged_and_the_task_still_submits(self):
+        os.environ["STUB_LAKE_PUT_FAIL"] = "1"
+        cfg = self.config(publish=self.settings())
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertFalse(outcome["publish"]["published"])
+        self.assertEqual(outcome["publish"]["error"], "lake cache put exited 1")
+        self.assertEqual(len(self.service.results), 1)
+
+    def test_without_a_key_or_when_switched_off_nothing_is_put(self):
+        for settings, reason in (
+            (self.settings(key_file=self.root / "missing"), "no write key"),
+            (self.settings(publish=False), "TAUCETI_QUEUE_PUBLISH_CACHE is off"),
+        ):
+            with self.subTest(reason=reason):
+                record = repair_publish.publish_outputs(
+                    self.content.clone,
+                    "0" * 40,
+                    settings=settings,
+                    env=repair.lake_env(self.root / "state"),
+                    logdir=self.root / "logs",
+                )
+                self.assertFalse(record["published"])
+                self.assertIn(reason, record["skipped"])
+        self.assertEqual(self.puts(), [])
+        self.assertEqual([c for c in self.lake_calls() if c.startswith("build")], [])
+
+    def test_outputs_that_are_not_green_are_not_published(self):
+        worktree = self.root / "broken"
+        sh(self.content.clone, "worktree", "add", "--detach", str(worktree), self.content.tip)
+        record = repair_publish.publish_outputs(
+            worktree,
+            self.content.tip,
+            settings=self.settings(),
+            env=repair.lake_env(self.root / "state"),
+            logdir=self.root / "logs",
+        )
+        self.assertFalse(record["published"])
+        self.assertIn("lake build --no-build exited 1", record["skipped"])
+        self.assertEqual(self.puts(), [])
+
+    def test_settings_from_the_environment(self):
+        key_file = self.root / "key"
+        key_file.write_text("k\n")
+        base = {"TAUCETI_REPAIR_CACHE_URL": "https://r.example/", "TAUCETI_REPAIR_CACHE_KEY_FILE": str(key_file)}
+        on = repair_publish.Settings.from_env(base)
+        self.assertEqual((on.url, on.upload_base, on.key()), ("https://r.example", "https://r.example", "k"))
+        self.assertIsNone(on.disabled_reason(), "on by default when the key is present")
+        self.assertIsNotNone(
+            repair_publish.Settings.from_env({**base, "TAUCETI_QUEUE_PUBLISH_CACHE": "0"}).disabled_reason()
+        )
+        self.assertIsNotNone(repair_publish.Settings.from_env({}).disabled_reason())
+        self.assertEqual(repair_publish.Settings.from_env({}).url, None)
+        upload = repair_publish.Settings.from_env({**base, "TAUCETI_REPAIR_CACHE_UPLOAD_URL": "https://s3.example/b"})
+        self.assertEqual(upload.upload_base, "https://s3.example/b")
+
+    def test_configure_replaces_its_own_services_and_keeps_the_public_one(self):
+        env = repair.lake_env(self.root / "state")
+        env["LAKE_CACHE_KEY"] = "inherited"
+        repair_publish.configure(env, self.settings(url="https://one.example"))
+        repair_publish.configure(env, self.settings(url="https://two.example"))
+        text = Path(env["LAKE_CONFIG"]).read_text()
+        self.assertNotIn("LAKE_CACHE_KEY", env)
+        self.assertNotIn("one.example", text)
+        self.assertEqual(text.count('name = "tauceti-repair"'), 1)
+        self.assertEqual(text.count('name = "tauceti-repair-upload"'), 1)
+        self.assertEqual(text.count("[[cache.service]]"), 3, "the public service is kept")
 
 
 class Preflight(Fixture):
