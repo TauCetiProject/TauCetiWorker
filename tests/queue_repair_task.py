@@ -16,7 +16,10 @@ agent failure released as such; a second claimant refused; and a checkpointed ta
 recorded session. The long-running worker (``serve``): the claim/run/submit cycle with the provider
 outcome reported to ``/tasks/inference`` and idle polling until stopped; a failing service and a
 failing task that do not end the loop; SIGTERM stopping the agent while keeping the claim and
-checkpoint, which the next start resumes; and the host preflight checks.
+checkpoint, which the next start resumes; and the host preflight checks. The streaming repair: the
+worker's background ``lake build --iofail`` (a scripted stub emitting two errors with a pause between
+them) launches the agent after the first error with the "Build in progress" section, the error list and
+the lock behave as the prompt says, and ``--no-stream-repair`` restores the sequential flow.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ from tauceti_queue import (  # noqa: E402
     repair_context,
     repair_publish,
     repair_sandbox,
+    repair_stream,
     repair_task,
     repair_tools,
 )
@@ -74,13 +78,23 @@ LAKE = r'''#!/usr/bin/env python3
 STUB_LAKE_CACHE_FAIL_REVS (comma separated); from the repair namespace (`--service tauceti-repair`)
 only the revisions in STUB_LAKE_REPAIR_REVS are published. `build` fails modules containing BROKEN
 and with `-o FILE` writes an output map naming one artifact in the pool. `cache put` records the
-key it was given in `lake-put-key` and fails when STUB_LAKE_PUT_FAIL=1."""
-import os, sys
+key it was given in `lake-put-key` and fails when STUB_LAKE_PUT_FAIL=1. `build --iofail` replays the
+file STUB_LAKE_BUILD_SCRIPT when set (literal lines, `sleep S`, `exit N`)."""
+import os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 stub = Path(os.environ["STUB_DIR"])
 log = stub / "lake-calls.log"
 log.open("a").write(" ".join(args) + "\n")
+if args == ["build", "--iofail"] and os.environ.get("STUB_LAKE_BUILD_SCRIPT"):
+    for line in Path(os.environ["STUB_LAKE_BUILD_SCRIPT"]).read_text().splitlines():
+        if line.startswith("sleep "):
+            time.sleep(float(line.split()[1]))
+        elif line.startswith("exit "):
+            sys.exit(int(line.split()[1]))
+        else:
+            print(line, flush=True)
+    sys.exit(0)
 if args[:2] == ["cache", "put"]:
     (stub / "lake-put-key").write_text(os.environ.get("LAKE_CACHE_KEY", ""))
     sys.exit(1 if os.environ.get("STUB_LAKE_PUT_FAIL") == "1" else 0)
@@ -167,8 +181,15 @@ modes = [m for m in os.environ.get("STUB_AGENT_MODES", "").split(",") if m]
 mode = modes[min(call, len(modes)) - 1] if modes else os.environ.get("STUB_AGENT_MODE", "repair")
 config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
 codex_home = os.environ.get("CODEX_HOME")
+repair_dir = Path(".tauceti-repair")  # what the worker had written when the agent was launched
+errors_file = repair_dir / "errors.jsonl"
+launch = {
+    "errors": [json.loads(l) for l in errors_file.read_text().splitlines() if l.strip()] if errors_file.exists() else None,
+    "lock": (repair_dir / "build.lock").exists(),
+    "build_helper": os.access(repair_dir / "build", os.X_OK),
+}
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
 if agent == "claude":
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
@@ -260,6 +281,18 @@ elif mode == "resume-only":
     if resume is None:
         finish("expected a resumed session", rc=3)
     rebuild()
+    finish()
+elif mode == "stream":
+    # As the prompt asks: fix what has failed, check it with the scoped build helper (which waits for the
+    # worker's build to release the lock), and record what the helper returned and what the list said.
+    rebuild()
+    helper = subprocess.run([str(repair_dir / "build"), "TauCeti.Two"], text=True, capture_output=True)
+    deadline = time.time() + 30
+    while (repair_dir / "build.lock").exists() and time.time() < deadline:
+        time.sleep(0.1)
+    record = {"helper_rc": helper.returncode, "helper_out": helper.stdout, "lock_after": (repair_dir / "build.lock").exists(),
+              "errors_after": [json.loads(l) for l in errors_file.read_text().splitlines() if l.strip()]}
+    (stub_dir / "stream-agent.json").write_text(json.dumps(record))
     finish()
 else:
     finish(f"unknown mode {mode}", rc=2)
@@ -700,6 +733,7 @@ class Fixture(unittest.TestCase):
         os.environ.pop("STUB_LAKE_CACHE_FAIL_REVS", None)
         os.environ.pop("STUB_LAKE_REPAIR_REVS", None)
         os.environ.pop("STUB_LAKE_PUT_FAIL", None)
+        os.environ.pop("STUB_LAKE_BUILD_SCRIPT", None)
         os.environ.pop("STUB_SLEEP", None)
         os.environ.pop(repair_sandbox.DISABLE_VARIABLE, None)
         (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir)}))
@@ -805,7 +839,8 @@ class HappyPath(Fixture):
         self.assertIn("Repair:", by_pr[f"{PROJECT}#2"].explanation)
         self.assertEqual(by_pr[f"{PROJECT}#1"].provenance, chain_tool.CLEAN)
         self.assertEqual(by_pr[f"{PROJECT}#3"].provenance, chain_tool.CLEAN)
-        # Artifacts were prepared before the agent: Mathlib cache, base cache at the base, incremental build.
+        # Artifacts were prepared before the agent: Mathlib cache, base cache at the base; the incremental
+        # build is the worker's streaming build, which the agent was launched into.
         lake = self.lake_calls()
         self.assertEqual(lake[0], "exe cache get")
         self.assertIn(f"--rev={self.content.base}", lake[1])
@@ -815,7 +850,9 @@ class HappyPath(Fixture):
         self.assertEqual([c["argv"][c["argv"].index("--") + 1 :] for c in sandboxed], [["lake", "build", "--iofail"]])
         self.assertFalse({"GH_TOKEN", "HOME", "PATH", "STUB_DIR"} & set(sandboxed[0]["environ"]))
         self.assertTrue(outcome["artifacts"]["available"])
-        self.assertEqual(outcome["artifacts"]["incremental_build"]["failed_modules"], ["TauCeti.Two"])
+        self.assertFalse(outcome["artifacts"]["incremental_build"], "the streaming build replaces the prepare build")
+        self.assertEqual(outcome["stream_build"]["failed_modules"], ["TauCeti.Two"])
+        self.assertTrue(outcome["stream_build"]["finished"])
         # One agent call with the plan's instruction, the diagnostics, the members and no credentials.
         calls = self.agent_calls()
         self.assertEqual(len(calls), 1)
@@ -2477,6 +2514,207 @@ class SandboxedBuilds(Fixture):
         (BIN / "sandbox-env.json").write_text("{}")  # the stub now fails, as a broken bwrap would
         by_name = {c["check"]: c for c in repair_task.preflight(self.config(), min_free_gib=0)}
         self.assertFalse(by_name["build sandbox"]["ok"])
+
+
+class StreamRepair(Fixture):
+    """The worker's background build streams its errors to the agent (``repair_stream``)."""
+
+    SCRIPT = """\
+✖ [2/3] Building TauCeti.Two
+error: TauCeti/Two.lean:1:20: unknown identifier 'BROKEN'
+  the batch-mate renamed it
+sleep 1.5
+✖ [3/3] Building TauCeti.Three
+error: TauCeti/Three.lean:1:1: unsolved goals
+⊢ True
+sleep 0.8
+Some required targets logged failures:
+- TauCeti.Two
+- TauCeti.Three
+exit 1
+"""
+
+    def script(self, text: str = SCRIPT) -> None:
+        path = self.root / "build-script.txt"
+        path.write_text(text)
+        os.environ["STUB_LAKE_BUILD_SCRIPT"] = str(path)
+        # The sandbox starts from an empty environment; the bwrap stub passes these to the lake stub.
+        (BIN / "sandbox-env.json").write_text(
+            json.dumps({"STUB_DIR": str(self.stub_dir), "STUB_LAKE_BUILD_SCRIPT": str(path)})
+        )
+
+    def repair_dir(self, task_id: int = 1) -> Path:
+        return self.root / "state" / "worktrees" / f"task-{task_id}" / ".tauceti-repair"
+
+    def test_the_agent_is_launched_at_the_first_error_and_the_lock_is_released_at_the_end(self):
+        self.script()
+        os.environ["STUB_AGENT_MODE"] = "stream"
+        cfg = self.config(keep_worktree=True)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        # No prepare build: the streaming build is the one whole-library build before the agent.
+        lake = self.lake_calls()
+        self.assertEqual(lake[:3], ["exe cache get", lake[1], "build --iofail"])
+        self.assertIn("cache get", lake[1])
+        self.assertEqual(lake.count("build --iofail"), 1)
+        self.assertFalse(outcome["artifacts"]["incremental_build"])
+        # The agent was launched after the first error, while the build still ran.
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 1)
+        launch = calls[0]["launch"]
+        self.assertTrue(launch["lock"], "the lock exists while the build runs")
+        self.assertTrue(launch["build_helper"], ".tauceti-repair/build is executable")
+        self.assertEqual(len(launch["errors"]), 1, launch)
+        first = launch["errors"][0]
+        self.assertEqual(
+            {k: first[k] for k in ("module", "file", "line", "column", "member")},
+            {"module": "TauCeti.Two", "file": "TauCeti/Two.lean", "line": 1, "column": 20, "member": f"{PROJECT}#2"},
+        )
+        self.assertEqual(first["message"], "unknown identifier 'BROKEN'\n  the batch-mate renamed it")
+        self.assertEqual(first["commit"], self.content.members[1]["commit"])
+        prompt = calls[0]["prompt"]
+        self.assertIn("## Build in progress", prompt)
+        self.assertLess(prompt.index("## Build in progress"), prompt.index("## Verifying locally"))
+        self.assertIn("running in the background", prompt)
+        self.assertIn("reported 1 error so far", prompt)
+        self.assertIn(".tauceti-repair/build.log", prompt)
+        self.assertIn(".tauceti-repair/errors.jsonl", prompt)
+        self.assertIn("do not start your own `lake build` while `.tauceti-repair/build.lock` exists", prompt)
+        self.assertIn("`.tauceti-repair/build <Module> ...` waits for the lock", prompt)
+        self.assertIn("`--dependents` adds the modules importing them", prompt)
+        self.assertIn("build finished, exit N, M errors total", prompt)
+        self.assertIn("verdict is still your own whole-library `lake build --iofail`", prompt)
+        # The scoped build helper waited for the lock, ran lake for the named module and returned its status.
+        agent = json.loads((self.stub_dir / "stream-agent.json").read_text())
+        self.assertEqual(agent["helper_rc"], 0, agent)
+        self.assertIn("waiting for .tauceti-repair/build.lock", agent["helper_out"])
+        self.assertIn("build --iofail TauCeti.Two", lake)
+        self.assertGreater(lake.index("build --iofail TauCeti.Two"), lake.index("build --iofail"))
+        self.assertFalse(agent["lock_after"])
+        # The error list grew to both errors and ends with the finished line; the lock is gone.
+        self.assertEqual([e.get("module") for e in agent["errors_after"]], ["TauCeti.Two", "TauCeti.Three", None])
+        self.assertEqual(agent["errors_after"][1]["message"], "unsolved goals\n⊢ True")
+        self.assertEqual(agent["errors_after"][1]["member"], f"{PROJECT}#3")
+        finished = agent["errors_after"][2]
+        self.assertEqual(finished["event"], "build_finished")
+        self.assertEqual((finished["exit"], finished["errors"]), (1, 2))
+        self.assertEqual(finished["message"], "build finished, exit 1, 2 errors total")
+        self.assertFalse((self.repair_dir() / "build.lock").exists())
+        self.assertEqual(
+            (self.repair_dir() / "errors.jsonl").read_text().splitlines()[-1], json.dumps(finished), "nothing after"
+        )
+        log = (self.repair_dir() / "build.log").read_text()
+        self.assertTrue(log.startswith("$ lake build --iofail\n"))
+        self.assertIn("- TauCeti.Three", log)
+        self.assertEqual((self.root / "state" / "tasks" / "1" / "logs" / "stream-build.log").read_text(), log)
+        self.assertEqual(outcome["stream_build"]["rc"], 1)
+        self.assertEqual(outcome["stream_build"]["errors"], 2)
+        self.assertEqual(outcome["stream_build"]["failed_modules"], ["TauCeti.Two", "TauCeti.Three"])
+
+    def test_a_build_without_errors_launches_the_agent_when_it_ends(self):
+        self.script("✔ [1/1] Built TauCeti.Two (0.1s)\nexit 0\n")
+        cfg = self.config(keep_worktree=True)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(
+            calls[0]["launch"]["errors"],
+            [
+                {
+                    "event": "build_finished",
+                    "exit": 0,
+                    "errors": 0,
+                    "timed_out": False,
+                    "message": "build finished, exit 0, 0 errors total",
+                }
+            ],
+        )
+        self.assertFalse(calls[0]["launch"]["lock"])
+        self.assertIn("has finished: exit 0, 0 errors.", calls[0]["prompt"])
+
+    def test_no_stream_repair_restores_the_sequential_flow(self):
+        cfg = self.config(stream_repair=False, keep_worktree=True)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        lake = self.lake_calls()
+        self.assertEqual(lake[2], "build --iofail")
+        self.assertEqual(outcome["artifacts"]["incremental_build"]["failed_modules"], ["TauCeti.Two"])
+        self.assertNotIn("stream_build", outcome)
+        calls = self.agent_calls()
+        self.assertNotIn("## Build in progress", calls[0]["prompt"])
+        self.assertIn("Artifacts are warm:", calls[0]["prompt"])
+        self.assertIsNone(calls[0]["launch"]["errors"])
+        self.assertFalse(calls[0]["launch"]["lock"])
+        self.assertFalse((self.repair_dir() / "build.log").exists())
+
+    def test_the_flag_and_the_environment_select_the_flow(self):
+        self.assertTrue(repair_task.stream_repair_enabled(environ={}))
+        self.assertTrue(repair_task.stream_repair_enabled(environ={"TAUCETI_QUEUE_STREAM_REPAIR": "1"}))
+        self.assertFalse(repair_task.stream_repair_enabled(environ={"TAUCETI_QUEUE_STREAM_REPAIR": "0"}))
+        self.assertFalse(repair_task.stream_repair_enabled(environ={"TAUCETI_QUEUE_STREAM_REPAIR": "false"}))
+        self.assertFalse(repair_task.stream_repair_enabled(True, environ={}))
+        seen: list[repair_task.RunnerConfig] = []
+        with patch.object(repair_task, "preflight", lambda cfg, **kw: seen.append(cfg) or []):
+            common = [
+                "--check",
+                "--service",
+                self.service.url,
+                "--clone",
+                str(self.content.clone),
+                "--root",
+                str(self.root / "s"),
+            ]
+            repair_task.main(common)
+            repair_task.main(["--no-stream-repair", *common])
+        self.assertEqual([cfg.stream_repair for cfg in seen], [True, False])
+
+    def test_a_cancelled_wait_stops_the_build_and_releases_the_lock(self):
+        self.script("✔ [1/2] Built TauCeti.One (0.1s)\nsleep 30\nexit 0\n")
+        worktree = self.root / "wt"
+        repair.create_worktree(self.content.clone, self.content.tip, worktree)
+        chain = repair.read_chain(self.content.clone, self.content.base, self.content.tip)
+        stream = repair_stream.start_build(
+            worktree, worktree / ".tauceti-repair", dict(os.environ), chain=chain, repository=PROJECT, timeout=60
+        )
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        self.assertFalse(stream.wait_for_agent(cancel, poll=0.1))
+        self.assertTrue((worktree / ".tauceti-repair" / "build.lock").exists())
+        stream.stop()
+        self.assertTrue(stream.finished.is_set())
+        self.assertFalse((worktree / ".tauceti-repair" / "build.lock").exists())
+        self.assertEqual(stream.errors, [])
+        last = json.loads((worktree / ".tauceti-repair" / "errors.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(last["event"], "build_finished")
+        self.assertEqual(last["errors"], 0)
+
+
+class ErrorParsing(unittest.TestCase):
+    def test_continuation_lines_and_terminators(self):
+        lines = [
+            "✖ [1/4] Building TauCeti.A",
+            "error: TauCeti/A.lean:3:4: unknown identifier 'x'",
+            "  with a hint",
+            "",
+            "✖ [2/4] Building TauCeti.B",
+            "TauCeti/B.lean:7:1: error: unsolved goals",
+            "⊢ False",
+            "TauCeti/B.lean:9:1: warning: declaration uses sorry",
+            "error: TauCeti/B.lean:11:2: type mismatch",
+            "  expected Nat",
+            "Some required targets logged failures:",
+            "- TauCeti.A",
+            "error: TauCeti/A.lean:3:4: unknown identifier 'x'",
+        ]
+        errors = repair_stream.parse_errors(lines)
+        self.assertEqual(
+            [(e["module"], e["line"], e["column"], e["message"]) for e in errors],
+            [
+                ("TauCeti.A", 3, 4, "unknown identifier 'x'\n  with a hint"),
+                ("TauCeti.B", 7, 1, "unsolved goals\n⊢ False"),
+                ("TauCeti.B", 11, 2, "type mismatch\n  expected Nat"),
+            ],
+        )
 
 
 class Records(unittest.TestCase):
