@@ -179,7 +179,8 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 
 ## Current deployment
 
-Running on `chungus` since 2026-11-05 01:13 UTC, revision `d84649118232`, as the account `kim`. Both
+Running on `chungus` since 2026-11-05 01:13 UTC, as the account `kim`; installed at revision
+`d84649118232`, the service and repair worker 1 updated to `9d2643f` at 09:38 to 09:41 UTC. Both
 `queue.taucetiproject.org` and `bors.taucetiproject.org` report `service.host` `chungus` since
 01:13:33 UTC. The operator has no root on chungus and lingering is not enabled for the account
 (`loginctl enable-linger` is denied), so the service, the tunnel and the repair worker run as detached
@@ -187,6 +188,16 @@ supervised processes started by hand (Hosts without lingering below); the units 
 disabled. **chungus is a temporary host too.** A fresh dedicated machine is expected about eight hours
 after the move; the service moves there by the procedure below, restoring the systemd units and the
 backup timer.
+
+The user units for the service and the repair worker stay **disabled** while the `nohup` supervisors
+run; check `systemctl --user list-units 'tauceti-queue*'` after any move or install. On 2026-11-05
+`tauceti-queue.service` had been left enabled: it restarted about every 6 s (737 restarts), and each
+attempt seeded the file's `[settings]` into the shared store before failing to bind port 8780, which
+reverted the live `repair_concurrency` from 2 to 1 and left worker 2 refused every claim from 07:04 to
+09:13 UTC. It was stopped and disabled at 09:24 UTC, and `config.toml` now carries
+`repair_concurrency = 2` (backup `config.toml.bak-2026-11-05`). Since
+https://github.com/TauCetiProject/TauCetiWorker/pull/544 the file only seeds settings (Configuration
+above), so a stray start can no longer override a value the operator set.
 
 History: the service was installed on `tauchonki` on 2026-11-04 (revision `045c7e58`, updated live to
 `cc5270bc`), got its tunnel, public hostname and App webhook there at 22:37 to 22:45 UTC and became
@@ -249,9 +260,17 @@ Consequences:
 - **Deploy** is `~/TauCetiQueue/services/queue/install.sh --revision <sha> --no-restart` followed by
   `pkill -f 'tauceti-queue serve'`; the supervisor loop restarts the service on the new revision
   (the SIGTERM shutdown is the same as the unit's). Verify as in "Verification after a deploy",
-  reading `service.log` instead of `journalctl`. The repair worker shares the checkout, so after a
-  deploy that changes it, `pkill -f tauceti_queue.repair_task` (a running task is checkpointed and
-  resumed) and start it again.
+  reading `service.log` instead of `journalctl`.
+- **Baked revision.** `tauceti_queue/_revision.py` is written by `install.sh` only. After a plain
+  `git pull` in `~/TauCetiQueue`, rewrite it by hand before restarting, or the status page reports the
+  old revision:
+  `printf 'SHA = "%s"\nDIRTY = False\n' "$(git rev-parse HEAD)" > tauceti_queue/_revision.py`.
+- **Repair workers.** The workers share the checkout, so a deploy that changes it needs each worker
+  restarted (a running task is checkpointed and resumed). Restart one worker by killing its
+  supervisor (`run-worker.sh`) and then its child, both by PID. `restart-worker.sh` kills every
+  `repair_task` process, the other worker's included, so it is not used while another worker is busy.
+  Never put a process-pattern match (`pkill -f`, `pgrep -f`) in an ssh command line: the pattern
+  matches the ssh session's own shell. Find the PIDs in a login shell on the host.
 - **Stop** the service or the tunnel for good by killing the loop script before its child
   (`pkill -f run-service.sh; pkill -f 'tauceti-queue serve'`); killing only the child restarts it.
 

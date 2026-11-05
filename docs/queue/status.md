@@ -101,6 +101,46 @@ Operator decisions recorded in the plan ([ai-merge-queue.md](../redesign/specs/a
 
 Undecided: whether CI may consume the repair's published outputs instead of recompiling (candidate: a `lean4checker` replay in CI over the published oleans); to be decided after head 2 lands.
 
+## Head 2, second round (2026-11-05)
+
+All times UTC. CI attempt 9 (run 41986292089) failed at 09:01 on `build` alone (`bump-guard` and `scope` passed), with one audit finding: `duplicate-declarations: SimpleGraph.Walk.IsPath.start_notMem_tail_support is declared in both TauCeti.Combinatorics.SimpleGraph.Connectivity.Menger and TauCeti.Combinatorics.SimpleGraph.Paths`.
+
+Repair task 5, claimed by worker 1 at 09:08:
+
+- the streaming build was green at 09:11:53 (66,740 jobs);
+- two parallel groups each deleted one copy of the lemma (PR 24945's copy in Menger, PR 27672's copy in Paths), and the fold's verification build failed at 09:14:55;
+- the lead agent restored the lemma in `Paths.lean` within PR 27672's commit and finished at 09:18:58 (16 turns, about 3 minutes); the worker ran no verification build of its own after the lead agent (fixed by https://github.com/TauCetiProject/TauCetiWorker/pull/545);
+- publishing the outputs (25,918 artifacts, 734 MiB) took 990 s and ran before submission; the chain was submitted at 09:36:18 as version 1200, tip `89293a361f`. CI attempt 10 is run 42003719651.
+
+Lessons: the worker must run CI's audits itself, since a green build is not a green CI (https://github.com/TauCetiProject/TauCetiWorker/pull/545), and publishing must not delay submission (https://github.com/TauCetiProject/TauCetiWorker/pull/548, open).
+
+Batch 3 (207 members): pre-rebase task 3 adopted at 09:08:26; prepare task 4 claimed by worker 2 at 09:13:53, still running at the time of writing.
+
+## Settings regression (2026-11-05)
+
+The systemd user unit `tauceti-queue.service` on chungus was still enabled after the hand-started supervisor took over, and sat in an auto-restart loop (about every 6 s, 737 restarts). Each attempt seeded the config file's `[settings]` into the shared store before failing to bind port 8780, which reverted the live `repair_concurrency` from 2 (set by the operator at 06:06) to 1: worker 2 was refused every claim (`concurrency`) from 07:04 to 09:13. The settings journal gained about 3,000 rows per hour from 06:27, and also from 01:14 to about 01:30.
+
+Remedy: `systemctl --user stop tauceti-queue.service` and `systemctl --user disable tauceti-queue.service` at 09:24; the config file now says `repair_concurrency = 2` (backup `config.toml.bak-2026-11-05`); https://github.com/TauCetiProject/TauCetiWorker/pull/544 makes the file's settings seeds only and stops journaling unchanged values. Guidance in [operations.md](operations.md), "Current deployment".
+
+## Restarts and main's tests (2026-11-05)
+
+- The service and worker 1 were restarted onto `9d2643f` (https://github.com/TauCetiProject/TauCetiWorker/pull/544, https://github.com/TauCetiProject/TauCetiWorker/pull/545) between 09:38 and 09:41; worker 2 is to be restarted after task 4. The procedure's pitfalls (the baked revision after a plain `git pull`, restarting one worker by PID) are in [operations.md](operations.md), "Hosts without lingering".
+- `main`'s `test (portable)` job was red from 05:54, with failures stacked by https://github.com/TauCetiProject/TauCetiWorker/pull/531, https://github.com/TauCetiProject/TauCetiWorker/pull/527, https://github.com/TauCetiProject/TauCetiWorker/pull/514 and https://github.com/TauCetiProject/TauCetiWorker/pull/522; https://github.com/TauCetiProject/TauCetiWorker/pull/544 and https://github.com/TauCetiProject/TauCetiWorker/pull/545 were admin-merged with only those failures, and https://github.com/TauCetiProject/TauCetiWorker/pull/546 fixes them.
+
+## Merged after the first repair run (2026-11-05)
+
+- open batches built and repaired in the background: https://github.com/TauCetiProject/TauCetiWorker/pull/536;
+- the next batch pre-rebased once the head's chain is submitted: https://github.com/TauCetiProject/TauCetiWorker/pull/537;
+- a batch prepared before it is pre-rebased, one background task per batch: https://github.com/TauCetiProject/TauCetiWorker/pull/538;
+- the repair worker's admin check cached across rate limits: https://github.com/TauCetiProject/TauCetiWorker/pull/539;
+- edit summaries, the opt-out label and `problem-anticipated`: https://github.com/TauCetiProject/TauCetiWorker/pull/540;
+- an in-progress CI run never treated as lost, live runs re-adopted: https://github.com/TauCetiProject/TauCetiWorker/pull/541;
+- the opt-out label renamed to `dont-repair-in-queue`: https://github.com/TauCetiProject/TauCetiWorker/pull/542;
+- the parallel repair test made deterministic: https://github.com/TauCetiProject/TauCetiWorker/pull/543;
+- configuration settings seed the store instead of overriding live values: https://github.com/TauCetiProject/TauCetiWorker/pull/544;
+- CI's audits and changed-module lint run in the repair worker: https://github.com/TauCetiProject/TauCetiWorker/pull/545;
+- the portable tests green without bubblewrap: https://github.com/TauCetiProject/TauCetiWorker/pull/546.
+
 ## Operator items outstanding
 
 0. Repair worker host: chungus for now (96 CPUs, 400 GB free), with the Claude Code credentials and the API key the operator placed there; it moves with the service to the dedicated host.
@@ -114,8 +154,9 @@ Undecided: whether CI may consume the repair's published outputs instead of reco
 
 ## Next steps
 
-- Let task 2 finish and submit, then watch head 2's CI round and landing.
-- After the current run submits, deploy the merged worker and service code on chungus (both were deliberately not restarted mid-run) and verify the running revisions.
+- Watch head 2's CI attempt 10 (run 42003719651) and its landing.
+- Restart worker 2 onto `9d2643f` after prepare task 4 finishes, and verify its revision.
+- Land https://github.com/TauCetiProject/TauCetiWorker/pull/548 so publishing no longer delays submission.
 - Move the service and the repair worker from chungus to the dedicated machine when it arrives, restoring the systemd units and the backup timer ([operations.md](operations.md), "Moving to the dedicated host").
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
 - Give Bors's admission-time checks (declaration collisions, merge-selection overlaps) to the agent as diagnostics, as described in the plan; streaming repair, the other follow-up there, is done (https://github.com/TauCetiProject/TauCetiWorker/pull/531).
