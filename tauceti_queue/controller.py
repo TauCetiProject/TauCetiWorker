@@ -1685,9 +1685,9 @@ class Controller:
         (newest first, at most `REPAIR_OUTPUTS_PREVIOUS_TIPS`), then the head's base. A `prepare` task
         of the pre-rebased chain builds there too: the head's tips, then the batch's own tips (the one
         the pre-rebase covers, then the earlier ones). A `prepare` task on the batch's own base: the
-        batch's previous tips, then that base. Lake reuses
+        batch's previous tips, then that base. A `repair` or `rebase_conflict` task on the head: the
+        head's current tip, its previous tips, then its base and the canonical commit. Lake reuses
         artifacts by content trace, so a nearly identical tree's outputs serve nearly completely.
-        Empty for the other kinds, whose artifacts the worker finds from the task's own revisions.
         """
         revs: list[str] = []
 
@@ -1721,6 +1721,15 @@ class Controller:
                 if tip != task["tip"]:
                     add(tip)
             add(task["base"])
+        elif task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT):
+            # The head's tip is never in the public cache, but a worker that verified it, or one of its
+            # earlier tips, published its outputs: its current tip, its previous tips, then main.
+            add(task["tip"])
+            add(batch["tip"])
+            for tip in self._previous_tips(batch):
+                add(tip)
+            add(task["base"])
+            add(self._canonical)
         return revs
 
     def _create_open_batch(self, base: str, now: float) -> dict[str, Any]:

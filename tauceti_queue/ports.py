@@ -273,9 +273,9 @@ class Task:
     instruction: str
     created_at: float
     extra: dict[str, Any] = field(default_factory=dict)
-    # `pre_rebase` and `prepare`: the revisions whose published repair outputs the worker restores
-    # before the agent runs, in order (the head's tips then its base, or the batch's previous tips
-    # then its base).
+    # The revisions whose published repair outputs the worker restores before the agent runs, in
+    # order: for `pre_rebase` the head's tips then its base, for `prepare` the batch's previous tips
+    # then its base, for the head's `repair` and `rebase_conflict` its tips then its base and main.
     warm_revs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
