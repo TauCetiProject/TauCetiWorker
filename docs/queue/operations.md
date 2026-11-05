@@ -380,7 +380,9 @@ succeeds before then continues the claim.
     workers'; `codex` on PATH. `api`: `ANTHROPIC_API_KEY` in the environment file itself (mode 0600),
     which the worker takes out of its own environment at start and gives only to that provider's agent.
     The `claude` binary first on PATH must be recent enough for the configured model; on chungus the
-    managed install (2.1.318 on 2026-11-05) must come before any older copy on PATH.
+    managed install (2.1.318 on 2026-11-05) must come before any older copy on PATH. Likewise check
+    `codex --version` against another fleet host's: an outdated Codex CLI rejects the default model
+    (below).
     Leave a provider out of the chain when the host has no credential for it; `--check` reports each
     one named in the chain.
 - **Worker cache** (optional): `TAUCETI_REPAIR_CACHE_URL`, `TAUCETI_REPAIR_CACHE_UPLOAD_URL` and
@@ -401,9 +403,13 @@ task's outcome and `worker.json` (`providers` counts, `last_outcome.provider_att
 provider tried or skipped with its reason and seconds. `--providers` and `--rate` override the two
 settings on the command line.
 
-Codex through a ChatGPT account (rather than an API key) needs the model pinned to one that account
-serves: in production `TAUCETI_AUTHORING_CODEX_MODEL=gpt-6-astra`, since `gpt-6.1-sol` is API-only
-there. Without the pin the `codex` provider fails and the task falls through to `api`.
+Codex through a ChatGPT account serves the default Sol profile (`gpt-6.1-sol`, with its probe and
+the `gpt-6-luna` fallback); no model pin is needed. A Codex CLI too old to know `gpt-6.1-sol` fails
+instead: it logs "Model metadata for `gpt-6.1-sol` not found" and the server answers `model_not_found`
+("The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account"), so the `codex`
+provider fails and the task falls through to `api`. That error means an outdated CLI, not an account
+limit: update it (`npm install -g @openai/codex@latest`) and restart the worker. On 2026-11-05 chungus
+had 0.154.0, which failed this way; 0.166.0 answers normally on the same Pro account.
 
 ### Install and update
 
