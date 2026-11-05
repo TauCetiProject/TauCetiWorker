@@ -535,16 +535,20 @@ class FakeGitHub:
     def update_ref(self, repo: str, ref: str, sha: str) -> None:
         with self.lock:
             self._call("update_ref", ref, sha)
-            if not chain.object_exists(self.repo.origin, sha):
-                run_git(self.repo.clone, "push", "-q", "-f", str(self.repo.origin), f"{sha}:{ref}")
-            else:
-                run_git(self.repo.origin, "update-ref", ref, sha)
+            self._push_ref(ref, sha)
 
     def update_refs(self, repo: str, updates: Sequence[tuple[str, str]]) -> None:
+        """One recorded call for the whole batch, so tests can count how often each ref was pushed."""
         with self.lock:
             self._call("update_refs", tuple(updates))
             for ref, sha in updates:
-                self.update_ref(repo, ref, sha)
+                self._push_ref(ref, sha)
+
+    def _push_ref(self, ref: str, sha: str) -> None:
+        if not chain.object_exists(self.repo.origin, sha):
+            run_git(self.repo.clone, "push", "-q", "-f", str(self.repo.origin), f"{sha}:{ref}")
+        else:
+            run_git(self.repo.origin, "update-ref", ref, sha)
 
     def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
         with self.lock:

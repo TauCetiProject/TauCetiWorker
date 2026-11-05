@@ -181,9 +181,12 @@ class Controller:
             elif not isinstance(value, type(expected)):
                 raise ControllerError("bad-setting-value", f"{key} must be a {type(expected).__name__}")
             now = self.clock()
+            previous = self.setting(key)
             with self.store.transaction():
                 self.store.set_setting(key, value, actor, now)
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
+                if key == "publication_enabled" and value and not previous:
+                    self._republish_retained_refs(now)
             self._wake.set()
             self._refresh_snapshot()
             return self.effective_settings()
@@ -222,6 +225,48 @@ class Controller:
         self._retain_local(ref, sha)
         if self.setting("publication_enabled"):
             self._enqueue("retain_ref", f"retain:{ref}:{sha}", {"ref": ref, "sha": sha})
+
+    def _local_ref(self, ref: str) -> str | None:
+        """The SHA `ref` names in the clone, or None when the clone has no such ref."""
+        result = chain._git(self.clone, "rev-parse", "--verify", "--quiet", ref)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    def _live_batches(self) -> list[dict[str, Any]]:
+        """The head and open batches: the ones whose retained refs a task or CI may fetch from GitHub."""
+        rows = self.store.rows("batches", {"repository": self.repository, "state": BATCH_HEAD}, order="id")
+        return rows + self._open_batches()
+
+    def _republish_retained_refs(self, now: float) -> int:
+        """Enqueue the live batches' retained refs that never reached GitHub; returns how many.
+
+        `_retain` pushes through the outbox only while `publication_enabled` is true, so a ref retained
+        in shadow mode exists in the clone alone, and a repair task or CI fetching it from GitHub finds
+        nothing. For the head and every open batch, the refs the controller would have pushed (the
+        batch's tip under its current version and each non-removed member's accepted head) are
+        enqueued when the clone still holds them under that name and the outbox has no entry for the
+        ref and SHA. Done entries stay in the outbox, so the check is one indexed lookup per ref and no
+        GitHub call: a pass over a fully published queue enqueues nothing. Runs at restart, when
+        publication is switched on and once per tick.
+        """
+        if not self.setting("publication_enabled"):
+            return 0
+        enqueued = 0
+        for batch in self._live_batches():
+            wanted = [(self.batch_ref(batch["id"], batch["version"]), batch["tip"])]
+            for member in self._members(batch["id"]):
+                wanted.append((self.input_ref(member["number"], member["accepted_head"]), member["accepted_head"]))
+            for ref, sha in wanted:
+                key = f"retain:{ref}:{sha}"
+                if self.store.row("outbox", {"key": key}) is not None or self._local_ref(ref) != sha:
+                    continue
+                self._enqueue("retain_ref", key, {"ref": ref, "sha": sha})
+                enqueued += 1
+        if enqueued:
+            self.store.journal(now, "republish", enqueued=enqueued)
+            self._wake.set()
+        return enqueued
 
     @staticmethod
     def batch_ref(batch_id: int, version: int) -> str:
@@ -1130,12 +1175,14 @@ class Controller:
         self._insertion_passes(now)
         self._seal(now)
         self._reconcile_head(now)
+        self._republish_retained_refs(now)
         self._drain_outbox(self.clock())
         self._set_state("last_tick_at", now)
         return list(self._reasons)
 
     def recover(self) -> dict[str, Any]:
-        """Restart reconciliation: release in-process claims, return reservations, leave worker claims and the outbox."""
+        """Restart reconciliation: release in-process claims, return reservations, leave worker claims and the
+        outbox, and enqueue the retained refs of live batches that never reached GitHub."""
         with self._lock:
             now = self.clock()
             released = 0
@@ -1149,13 +1196,25 @@ class Controller:
                     returned += 1
                 self._attribute_legacy_conflicts()
                 self._expire_claims(now)
+                republished = self._republish_retained_refs(now)
                 pending = self.store.count("outbox", {"state": "pending"})
                 self.store.journal(
-                    now, "restart", released=released, returned=returned, outbox_pending=pending, revision=self.revision
+                    now,
+                    "restart",
+                    released=released,
+                    returned=returned,
+                    outbox_pending=pending,
+                    republished=republished,
+                    revision=self.revision,
                 )
             self.started_at = now
             self._refresh_snapshot()
-            return {"released_claims": released, "returned_reservations": returned, "outbox_pending": pending}
+            return {
+                "released_claims": released,
+                "returned_reservations": returned,
+                "outbox_pending": pending,
+                "republished_refs": republished,
+            }
 
     def _attribute_legacy_conflicts(self) -> None:
         """Databases from before `probe_conflicts` recorded a conflict by base only, against the one open batch."""
@@ -1743,7 +1802,12 @@ class Controller:
             # out by SHA, so the retained ref is pushed before the dispatch rather than by the outbox later.
             # The staging candidate branch is the same commit under the name pr-build.yml's train identity
             # check fetches and compares with the dispatched head.
-            self.github.update_ref(self.repository, self.batch_ref(head["id"], head["version"]), head["tip"])
+            retained_ref = self.batch_ref(head["id"], head["version"])
+            retained = self.store.row("outbox", {"key": f"retain:{retained_ref}:{head['tip']}"})
+            if retained is None or retained["state"] != "done":
+                self.github.update_ref(self.repository, retained_ref, head["tip"])
+                if retained is not None:
+                    self._outbox_done(retained, loads(retained["history"], []), "retained-by-dispatch", now)
             self.github.update_ref(self.repository, f"refs/heads/{branch}", head["tip"])
             dispatch_id = self.github.dispatch_candidate(
                 self.repository,
