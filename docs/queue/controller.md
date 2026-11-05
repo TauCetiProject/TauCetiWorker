@@ -32,8 +32,9 @@ Tables:
 | `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA, the `no_repair` opt-out, `withdrawn` (an emptied `no_repair` member: its empty commit stays in the chain, the PR does not land) |
 | `claims` | batch identity and version, operation (`insert`, `rebase`, `task:repair`, `task:rebase_conflict`), worker identity and GitHub login, token, starting tip, expiry, renewal, release and its reason |
 | `tasks` | repair and rebase-conflict tasks: batch and version, base, tip, `onto`, diagnostics, state (`open`, `submitted`, `superseded`), counts of claims and submissions |
+| `batch_tips` | every tip a batch has had: batch, version, tip SHA and the time it was recorded (written wherever the tip changes: insertion, adoption, rebase, rebuild, and at dispatch for a version not yet recorded) |
 | `submissions` | every submitted chain with its retained ref, accepted flag and reason |
-| `ci_attempts` | every dispatch: head and base SHA, dispatch id, bound run id and attempt, status, conclusion, runner, labels, host, phases, progress timestamps, outcome (`pending`, `pass`, `source-failure`, `infrastructure`, `superseded`) and diagnostics |
+| `ci_attempts` | every dispatch: head and base SHA, dispatch id, bound run id and attempt, status, conclusion, runner, labels, host, phases, progress timestamps, outcome (`pending`, `pass`, `source-failure`, `infrastructure`, `superseded`), diagnostics and the `repair_outputs_revs` the dispatch sent |
 | `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`) with an idempotency key, attempt count, history and next attempt time |
 | `journal` | append-only log of what the controller did (`approved`, `inserted`, `sealed`, `rebased`, `dispatched`, `ci-pass`, `task`, `claimed`, `adopted`, `landed`, ...) for status and tests |
 
@@ -228,7 +229,7 @@ controller and nothing about the pre-rebase is a verdict.
 
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
-`base_sha`, `batch_id`, `members`, `base_ref`). Observation reads `find_candidate_run` when an event
+`base_sha`, `batch_id`, `members`, `base_ref`, `repair_outputs_revs`). Observation reads `find_candidate_run` when an event
 named the head or `polling_interval_seconds` elapsed, recording runner, host, phases and progress
 times. The verdict is the `build`, `bump-guard` and `scope` commit statuses on the tip whose `run_id`
 is the run that completed for this attempt, all three `success` (a red `scope` or `bump-guard` beside
@@ -239,6 +240,19 @@ re-dispatched after `infrastructure_retry_backoff_seconds * 2^n`, at most
 `infrastructure_retry_limit` times, after which the head waits and status says so (`retry_ci` is the
 operator's reset). A failing status with source findings is a source failure and opens a `repair`
 task carrying the findings. A pass enqueues the promotion.
+
+Candidate revisions for published outputs: the repair worker publishes Lake build outputs to the
+repair cache keyed by the tip it verified (`repair_publish.py`), and `pr-build.yml` fetches them for
+the exact `head_sha`. A rebase, rebuild or adoption replaces the tip (new version, new member SHAs),
+so that lookup misses although the tree is nearly identical. Because Lake reuses artifacts by
+content trace, outputs published for a nearby revision are safe and nearly complete, so every
+dispatch carries `repair_outputs_revs`, a JSON list of full SHAs for CI to try in order when nothing
+is published for the head: the batch's previous tips from `batch_tips`, newest first and at most
+four (`REPAIR_OUTPUTS_PREVIOUS_TIPS`), then the head's `base_sha`, then the canonical commit when it
+differs from the base. No SHA appears twice and the head's own tip is never listed, since it is sent
+as `head_sha`; a head that was never replayed sends just `[base_sha]`. The list is stored on the
+attempt, journalled with `dispatched`, and shown as `ci.repair_outputs_revs` in the head's `/status`
+record.
 
 A run GitHub reports `queued` or `in_progress` is never re-dispatched over. It is lost only when it
 can no longer be found (neither in the listing nor by a direct read of the run), or when it is

@@ -321,7 +321,13 @@ class Adapter(unittest.TestCase):
         a = adapter(transport)
         members = [{"pr": 1, "head_sha": "1" * 40}, {"pr": 2, "head_sha": "2" * 40}]
         dispatch_id = a.dispatch_candidate(
-            TAUCETI, head_sha=HEAD, base_sha=BASE, base_ref="main", batch_id=2650, members=members
+            TAUCETI,
+            head_sha=HEAD,
+            base_sha=BASE,
+            base_ref="main",
+            batch_id=2650,
+            members=members,
+            repair_outputs_revs=["e" * 40, BASE],
         )
         self.assertEqual(dispatch_id, f"bors branch=main batch=2650 head={HEAD} base={BASE}")
         body = json.loads(transport.calls[0][3])
@@ -335,6 +341,7 @@ class Adapter(unittest.TestCase):
                     "batch_id": 2650,
                     "members": members,
                     "base_ref": "main",
+                    "repair_outputs_revs": ["e" * 40, BASE],
                 },
             },
         )

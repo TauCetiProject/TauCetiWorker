@@ -50,6 +50,8 @@ BUILD_CONTEXT = "build"
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
 LOG_GRACE_SECONDS = 600  # how long a failed run may go without a readable log before it counts as infrastructure
 DISPATCH_EVENT = "tauceti-bors-staging"
+# How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
+REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
 MERGED_TITLE_PREFIX = "[Merged by Bors] - "  # what bors-ng writes when it closes a squash-landed member
 COMMENT_MARKER = "tauceti-queue"
 
@@ -1285,6 +1287,7 @@ class Controller:
                 tip=tip_sha,
                 **prepared,
             )
+            self._record_tip(batch["id"], version, tip_sha, now)
             self.store.update(
                 "tasks",
                 {"id": task["id"]},
@@ -1587,6 +1590,42 @@ class Controller:
         return self.store.row(
             "ci_attempts", {"batch_id": head["id"], "batch_version": head["version"]}, order="id DESC"
         )
+
+    def _record_tip(self, batch_id: int, version: int, tip: str, now: float) -> None:
+        """Record `tip` as the batch's tip at `version` in `batch_tips`; a version already recorded is kept."""
+        self.store.execute(
+            "INSERT OR IGNORE INTO batch_tips (batch_id, version, tip, recorded_at) VALUES (?, ?, ?, ?)",
+            (batch_id, version, tip, now),
+        )
+
+    def _repair_outputs_revs(self, head: dict[str, Any]) -> list[str]:
+        """The revisions whose published build outputs CI may restore when the head's own are missing.
+
+        The repair worker publishes Lake outputs keyed by the tip it verified, and CI fetches them for
+        the exact head, which a rebase replaces. Lake reuses artifacts by content trace, so the outputs
+        of a nearly identical tree are safe and nearly complete: the batch's previous tips (newest
+        first, at most `REPAIR_OUTPUTS_PREVIOUS_TIPS`), then its base, then the canonical commit when it
+        differs. No revision appears twice and the head's own tip, which CI is given separately, is left out.
+        """
+        previous = self.store.rows(
+            "batch_tips",
+            {"batch_id": head["id"]},
+            order="version DESC",
+        )
+        revs: list[str] = []
+
+        def add(sha: str | None) -> None:
+            if sha and sha != head["tip"] and sha not in revs:
+                revs.append(sha)
+
+        for row in previous:
+            if len(revs) >= REPAIR_OUTPUTS_PREVIOUS_TIPS:
+                break
+            if row["version"] < head["version"]:
+                add(row["tip"])
+        add(head["base"])
+        add(self._canonical)
+        return revs
 
     def _create_open_batch(self, base: str, now: float) -> dict[str, Any]:
         batch_id = self.store.insert(
@@ -1976,6 +2015,7 @@ class Controller:
             self.store.update(
                 "batches", {"id": batch["id"]}, version=version, tip=result.tip, urgent=batch["urgent"] or row["urgent"]
             )
+            self._record_tip(batch["id"], version, result.tip, now)
             self.store.update(
                 "inputs", {"id": row["id"]}, state=INPUT_INSERTED, batch_id=batch["id"], last_probe="inserted"
             )
@@ -2116,6 +2156,7 @@ class Controller:
                 self.store.update(
                     "batches", {"id": head["id"]}, version=version, base=canonical, tip=result.tip, expected_parent=None
                 )
+                self._record_tip(head["id"], version, result.tip, now)
                 self._set_pre_rebase(head, "", now)
                 for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
                     self.store.update(
@@ -2621,6 +2662,7 @@ class Controller:
             self.store.update(
                 "batches", {"id": head["id"]}, version=version, base=canonical, tip=tip, expected_parent=None
             )
+            self._record_tip(head["id"], version, tip, now)
             self._set_pre_rebase(head, "", now)
             for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
                 self.store.update(
@@ -2726,6 +2768,7 @@ class Controller:
                     if record is not None:
                         self.store.update("members", {"id": member["id"]}, commit_sha=record.sha)
                 self.store.update("batches", {"id": head["id"]}, version=version, tip=result.tip, expected_parent=None)
+                self._record_tip(head["id"], version, result.tip, now)
                 superseded = 0
                 for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
                     self.store.update(
@@ -2881,6 +2924,10 @@ class Controller:
         if self._readopt_live_run(head, now):
             return
         members = [m["number"] for m in self._members(head["id"])]
+        # A head from before `batch_tips` existed has its current tip recorded here, so that the
+        # dispatch after its next rebase names it.
+        self._record_tip(head["id"], head["version"], head["tip"], now)
+        repair_outputs_revs = self._repair_outputs_revs(head)
         # The attempt row is reserved first because its id names the staging candidate branch that the
         # feed reports and CI verifies; a failed push or dispatch removes the row again.
         attempt_id = self.store.insert(
@@ -2893,6 +2940,7 @@ class Controller:
             dispatched_at=now,
             infrastructure_retry=retry,
             last_progress_at=now,
+            repair_outputs_revs=dumps(repair_outputs_revs),
         )
         branch = self.staging_candidate_ref(attempt_id, head["version"])
         try:
@@ -2914,6 +2962,7 @@ class Controller:
                 base_ref=self.canonical_branch,
                 batch_id=str(head["id"]),
                 members=members,
+                repair_outputs_revs=repair_outputs_revs,
             )
         except Exception as error:  # noqa: BLE001
             with self.store.transaction():
@@ -2936,6 +2985,7 @@ class Controller:
                 tip=head["tip"],
                 dispatch_id=dispatch_id,
                 retry=retry,
+                repair_outputs_revs=repair_outputs_revs,
             )
 
     def _check_lost_run(
@@ -4143,6 +4193,7 @@ class Controller:
                 "verdicts": loads(attempt["verdicts"], {}),
                 "html_url": attempt["html_url"],
                 "infrastructure_retry": attempt["infrastructure_retry"],
+                "repair_outputs_revs": loads(attempt["repair_outputs_revs"], []),
             }
             info["ci"] = ci
             if attempt["outcome"] == OUTCOME_PENDING and attempt["last_progress_at"]:

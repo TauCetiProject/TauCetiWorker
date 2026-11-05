@@ -421,6 +421,53 @@ class Republication(ControllerCase):
 
 
 class Dispatch(ControllerCase):
+    def test_a_head_without_history_sends_only_its_base_as_output_candidate(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        payload = self.github.dispatches[-1]["client_payload"]
+        self.assertEqual(payload["repair_outputs_revs"], [head["base"]])
+        ci = self.controller.status()["head"]["ci"]
+        self.assertEqual(ci["repair_outputs_revs"], [head["base"]])
+
+    def test_a_rebased_head_sends_its_previous_tip_first_then_the_base(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        before = self.controller.store.row("batches", {"state": "head"})
+        canonical = self.repo.advance_main({"Z.lean": "z\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.assertEqual((head["version"], head["base"]), (before["version"] + 1, canonical))
+        self.assertNotEqual(head["tip"], before["tip"])
+        self.assertEqual(self.github.dispatches[-1]["client_payload"]["head_sha"], head["tip"])
+        revs = self.github.dispatches[-1]["client_payload"]["repair_outputs_revs"]
+        self.assertEqual(revs, [before["tip"], canonical])
+        self.assertEqual(self.controller.status()["head"]["ci"]["repair_outputs_revs"], revs)
+        self.assertEqual(self.controller.store.journal_entries("dispatched")[-1]["detail"]["repair_outputs_revs"], revs)
+
+    def test_output_candidates_are_bounded_and_never_repeat_or_name_the_head(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        base, tip = head["base"], head["tip"]
+        # Earlier versions, one of them back at the current tip and one at the base, and later
+        # versions that are not previous tips at all.
+        recorded = ["1" * 40, "2" * 40, tip, "2" * 40, base, "3" * 40, "4" * 40, "5" * 40]
+        version = head["version"] + 1
+        for offset, sha in enumerate(recorded):
+            self.controller._record_tip(head["id"], version + offset, sha, self.clock())
+        current = len(recorded) - 1
+        head = dict(head, version=version + current, tip="6" * 40)
+        self.controller._canonical = "7" * 40
+        revs = self.controller._repair_outputs_revs(head)
+        self.assertEqual(revs, ["4" * 40, "3" * 40, base, "2" * 40, "7" * 40])
+        self.assertEqual(len(revs), len(set(revs)))
+        self.assertNotIn(head["tip"], revs)
+        # With the head back at its base and main there too, the base is listed once, as a previous tip.
+        self.controller._canonical = base
+        revs = self.controller._repair_outputs_revs(dict(head, tip="6" * 40))
+        self.assertEqual(revs, ["4" * 40, "3" * 40, base, "2" * 40])
+
     def test_dispatch_pushes_the_staging_candidate_branch_the_feed_names(self):
         self.approve(101, {"A.lean": "a\n"})
         self.controller.tick()
