@@ -1312,6 +1312,26 @@ class Controller:
                 self.store.journal(now, "released", claim["batch_id"], task_id=task_id, reason=reason, error=error)
                 if task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
                     self._settle_prepare_release(task, reason, now)
+                    if reason == PREPARE_CLEAN_REASON:
+                        settled = self.store.row("tasks", {"id": task_id}) or {}
+                        knowledge = next(
+                            (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
+                        )
+                        if settled.get("state") == TASK_SUBMITTED and self._predicted_collisions(knowledge):
+                            self.store.journal(
+                                now,
+                                "admission-repair-result",
+                                task["batch_id"],
+                                task_id=task_id,
+                                task_kind=TASK_PREPARE,
+                                input_tip=task["tip"],
+                                tip=task["tip"],
+                                attempt_id=None,
+                                edited=[],
+                                collisions=self._predicted_collisions(knowledge),
+                                verified_fixed=[],
+                                verification="prepared clean without source edits",
+                            )
             if reason == "inference_unavailable":
                 self.report_inference(claim["worker"], False, error)
             self._wake.set()
@@ -1457,8 +1477,9 @@ class Controller:
                 (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
             )
             if tip_sha == task["tip"] and knowledge.get("was_proactive"):
+                self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
-                    "invalid-chain",
+                    "claim-superseded",
                     [
                         chain.Violation(
                             "unchanged-source-failure",
@@ -1466,10 +1487,10 @@ class Controller:
                         )
                     ],
                 )
-            if self._prediction_task(task):
-                self._record_prediction_result(task, batch, comparison, tip_sha, now)
-                if tip_sha == task["tip"]:
-                    return self._adopt_prediction_noop(task, claim, batch, tip_sha, retained, worker_notes, now)
+            if self._predicted_collisions(knowledge):
+                self._record_prediction_result(task, batch, comparison, tip_sha, worker_notes, now)
+            if self._prediction_task(task) and tip_sha == task["tip"]:
+                return self._adopt_prediction_noop(task, claim, batch, tip_sha, retained, worker_notes, now)
             return self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
 
     def _commit_empty(self, sha: str | None) -> bool:
@@ -1810,6 +1831,9 @@ class Controller:
         knowledge = self._admission_context(head, now)
         if knowledge.get("records") and not any(d.get("kind") == "admission_predictions" for d in diagnostics):
             diagnostics = [*diagnostics, knowledge]
+        diagnostics = [
+            admission_planning.task_context(d) if d.get("kind") == "admission_predictions" else d for d in diagnostics
+        ]
         collisions = self._predicted_collisions(knowledge)
         if kind == TASK_PREPARE and collisions:
             self._set_state(
@@ -2231,10 +2255,10 @@ class Controller:
         inputs = {m["input_id"]: self.store.row("inputs", {"id": m["input_id"]}) or {} for m in members}
         key = f"admission_context:{batch['id']}"
         signature = admission_planning.fingerprint(
-            [{"schema": 2, "tip": batch["tip"], "names": [r.get("declaration_names") for r in inputs.values()]}]
+            [{"schema": 3, "tip": batch["tip"], "names": [r.get("declaration_names") for r in inputs.values()]}]
         )
         prior = self._state(key, {})
-        if prior.get("signature") == signature:
+        if prior.get("signature") == signature and (not prior.get("retryable") or now < prior.get("retry_after", 0)):
             return prior
         if not hasattr(self, "_admission_planner"):
             self._admission_planner = admission_planning.Planner(self.clone)
@@ -2249,9 +2273,13 @@ class Controller:
                 "complete": False,
                 "errors": [type(error).__name__],
                 "truncated": False,
+                "retryable": True,
+                "ownership_complete": False,
             }
         context["signature"] = signature
         context["at"] = now
+        if context.get("retryable"):
+            context["retry_after"] = now + 60
         predictions = self._predicted_collisions(context)
         if predictions and admission_planning.fingerprint(predictions) != prior.get("prediction_digest"):
             self.store.journal(now, "admission-predicted", batch["id"], tip=batch["tip"], collisions=predictions)
@@ -2296,22 +2324,45 @@ class Controller:
             collisions=collisions,
         )
 
-    def _record_prediction_result(self, task, batch, comparison, tip, now):
+    def _record_prediction_result(self, task, batch, comparison, tip, worker_notes, now):
         knowledge = next(d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions")
-        attempt = self.store.row("ci_attempts", {"id": task["ci_attempt_id"]}) or {}
+        attempt = self._current_attempt(batch) or {}
         edited = [m.source_pr for m in comparison.members if m.provenance == chain.EDITED]
+        try:
+            notes = loads(worker_notes, {})
+        except ValueError:
+            notes = {}
+        verification = notes.get("admission_verification") if isinstance(notes, dict) else None
+        fixed = None
+        if (
+            isinstance(verification, dict)
+            and verification.get("tip") == tip
+            and verification.get("checks_passed") is True
+        ):
+            observed = verification.get("observed_duplicate_names", [])
+            if isinstance(observed, list) and all(isinstance(n, str) for n in observed):
+                edited_numbers = {int(pr.rsplit("#", 1)[1]) for pr in edited}
+                fixed = sorted(
+                    {
+                        r["name"]
+                        for r in self._predicted_collisions(knowledge)
+                        if r["name"] in observed and any(o["pr"] in edited_numbers for o in r["sources"])
+                    }
+                )
         self.store.journal(
             now,
             "admission-repair-result",
             batch["id"],
             task_id=task["id"],
-            attempt_id=task["ci_attempt_id"],
+            task_kind=task["kind"],
+            input_tip=task["tip"],
+            attempt_id=attempt.get("id"),
             tip=tip,
             edited=edited,
             collisions=self._predicted_collisions(knowledge),
             observed_ci_outcome=attempt.get("outcome"),
-            verified_fixed=None,
-            verification="worker build and audits; CI remains required",
+            verified_fixed=fixed,
+            verification="authenticated worker scripted duplicate observations and final checks; CI remains required",
         )
 
     def _adopt_prediction_noop(self, task, claim, batch, tip, retained, notes, now):
@@ -2352,6 +2403,15 @@ class Controller:
                 f"state:admission_repair:{batch_id}:%",
             ),
         )
+
+    def _finish_prediction_pass(self, head, task, attempt, now):
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="prediction-ci-passed"
+            )
+            for claim in self._active_claims(head["id"], task_id=task["id"]):
+                self._release_claim(claim, "superseded", now)
+            self._promote(head, attempt, now)
 
     def _update_prediction_verdict(self, head, task, attempt, now):
         if attempt["outcome"] == OUTCOME_SOURCE_FAILURE:
@@ -2588,6 +2648,7 @@ class Controller:
                     "tip": batch["tip"],
                     "paths": paths,
                     "members": sorted(set(interacting)),
+                    "interacting_complete": selection.get("ownership_complete", False),
                     "at": now,
                 },
             ][-8:]
@@ -2748,6 +2809,9 @@ class Controller:
                 if attempt is not None and attempt["outcome"] == OUTCOME_PENDING:
                     self._observe_attempt(head, attempt, now)
                     attempt = self.store.row("ci_attempts", {"id": attempt["id"]}) or attempt
+                if attempt is not None and attempt["outcome"] == OUTCOME_PASS:
+                    self._finish_prediction_pass(head, active, attempt, now)
+                    return
                 if attempt is not None:
                     self._update_prediction_verdict(head, active, attempt, now)
             self._reasons.append(f"head {head['id']} is claimed by {', '.join(c['worker'] for c in task_claims)}")
@@ -2765,14 +2829,7 @@ class Controller:
                     self._observe_attempt(head, attempt, now)
                     attempt = self.store.row("ci_attempts", {"id": attempt["id"]}) or attempt
                 if attempt is not None and attempt["outcome"] == OUTCOME_PASS:
-                    self.store.update(
-                        "tasks",
-                        {"id": task["id"]},
-                        state=TASK_SUPERSEDED,
-                        resolved_at=now,
-                        resolution="prediction-ci-passed",
-                    )
-                    self._promote(head, attempt, now)
+                    self._finish_prediction_pass(head, task, attempt, now)
                     return
                 if attempt is not None:
                     self._update_prediction_verdict(head, task, attempt, now)

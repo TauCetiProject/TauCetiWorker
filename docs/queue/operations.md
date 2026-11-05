@@ -163,9 +163,9 @@ reports the mismatch deliberately). The unit has `Restart=always`, `TimeoutStopS
 `KillSignal=SIGTERM`: on stop the process finishes its current reconciliation step, stops the HTTP
 server and closes the store before exiting, so a restart never interrupts a store write.
 
-On a host without lingering (Current deployment, "Hosts without lingering") the units are disabled and
-a deploy is `install.sh --revision <sha> --no-restart` followed by `pkill -f 'tauceti-queue serve'`;
-the supervisor loop restarts the service on the new revision.
+On a host without lingering (Current deployment, "Hosts without lingering") keep the units disabled
+and use the deployed supervisor scripts described there. The installer enables and starts units
+even with `--no-restart`, so it must not run beneath those supervisors.
 
 Useful commands:
 
@@ -258,10 +258,9 @@ Consequences:
 - **No daily backup.** The timer is disabled; run `~/TauCetiQueue/services/queue/backup.sh` by hand
   before any risky change, or from a cron entry (`17 3 * * * ~/TauCetiQueue/services/queue/backup.sh`).
 - **Deploy** with the scripts in `~/TauCetiQueue-data`: `deploy-queue.sh` updates the service and
-  both repair workers, `deploy-service.sh` the service only. Underneath, the service is updated by
-  `~/TauCetiQueue/services/queue/install.sh --revision <sha> --no-restart` and a SIGTERM to
-  `tauceti-queue serve`, after which the supervisor loop restarts it on the new revision (the same
-  shutdown as the unit's). Verify as in "Verification after a deploy", reading `service.log` instead
+  both repair workers, `deploy-service.sh` the service only. These fast-forward the checkout, bake
+  its revision into `_revision.py`, and send SIGTERM to the existing service process; the supervisor
+  loop restarts it on the new revision with the same graceful shutdown as the unit. Verify as in "Verification after a deploy", reading `service.log` instead
   of `journalctl`.
 - **Keep systemd disabled on this host.** The installer currently enables and starts units even
   with `--no-restart`; do not run it beneath the detached supervisors. Use the deployed

@@ -58,6 +58,7 @@ class Planner:
         self.changes: dict[str, list[tuple[str, str | None]]] = {}
         self.headers: dict[str, list[str]] = {}
         self.omitted: dict[str, str] = {}
+        self.pending = False
 
     def git(self, *args: str, data: bytes | None = None) -> bytes:
         return subprocess.run(
@@ -65,6 +66,7 @@ class Planner:
         ).stdout
 
     def load(self, commits: list[str]) -> None:
+        self.pending = False
         missing = sorted(set(commits) - self.changes.keys())
         if missing:
             raw = (
@@ -112,8 +114,11 @@ class Planner:
         selected, total = [], 0
         for row in sizes:
             sha, kind, size = row.split()
-            if kind != "blob" or int(size) > MAX_FILE_BYTES or total + int(size) > MAX_BLOB_BYTES:
+            if kind != "blob" or int(size) > MAX_FILE_BYTES:
                 self.omitted[sha] = "import context byte budget exceeded"
+                continue
+            if total + int(size) > MAX_BLOB_BYTES:
+                self.pending = True
                 continue
             total += int(size)
             selected.append(sha)
@@ -133,16 +138,21 @@ class Planner:
 
     def context(self, members: list[dict], inputs: dict[int, dict], *, tip: str) -> dict:
         records, errors = [], []
+        retryable = False
         active = [m for m in members if not m.get("withdrawn")]
         try:
             self.load([m["commit_sha"] for m in active])
         except (ValueError, UnicodeError, subprocess.SubprocessError) as error:
             errors.append(type(error).__name__ + ": " + str(error)[:200])
+            retryable = True
         errors.extend(
             sorted(
                 {self.omitted[b] for m in active for _, b in self.changes.get(m["commit_sha"], []) if b in self.omitted}
             )
         )
+        if self.pending:
+            errors.append("import context awaiting another byte-budgeted pass")
+            retryable = True
         owners: dict[str, set[int]] = defaultdict(set)
         added: dict[str, list[dict]] = defaultdict(list)
         total_names = 0
@@ -177,6 +187,7 @@ class Planner:
             self.changes = {s: c for s, c in self.changes.items() if s in live}
             blobs = {b for changes in self.changes.values() for _, b in changes}
             self.headers = {b: h for b, h in self.headers.items() if b in blobs}
+            self.omitted = {b: why for b, why in self.omitted.items() if b in blobs}
         for name, sources in sorted(added.items()):
             if len({s["pr"] for s in sources}) > 1:
                 records.append(
@@ -254,6 +265,8 @@ class Planner:
                 {"pr": m["number"], "paths": [p for p, _ in self.changes.get(m["commit_sha"], [])]} for m in active
             ],
             "complete": not errors and not truncated,
+            "retryable": retryable,
+            "ownership_complete": all(m["commit_sha"] in self.changes for m in active),
             "errors": errors,
             "truncated": truncated,
             "message": "Admission-time predictions and overlaps; the worker's scripted build and audits decide findings.",
@@ -261,12 +274,19 @@ class Planner:
         while len(json.dumps(context).encode()) > MAX_CONTEXT_BYTES:
             context.update(complete=False, truncated=True)
             if context["ownership"]:
+                context["ownership_complete"] = False
                 del context["ownership"][max(0, len(context["ownership"]) // 2) :]
             elif context["records"]:
                 del context["records"][max(0, len(context["records"]) // 2) :]
             else:
                 break
         return context
+
+
+def task_context(context: dict) -> dict:
+    """Retain agent evidence without copying the controller's ownership cache/bookkeeping."""
+    fields = {"kind", "tip", "records", "complete", "errors", "truncated", "message", "proactive", "was_proactive"}
+    return {key: value for key, value in context.items() if key in fields}
 
 
 def prompt_lines(context: dict | None, *, with_file: bool = False) -> list[str]:
@@ -281,11 +301,13 @@ def prompt_lines(context: dict | None, *, with_file: bool = False) -> list[str]:
         elif kind == "path_overlap":
             lines.append(f"- Shared path `{record['path']}`: " + ", ".join(f"#{p}" for p in record["members"]) + ".")
         elif kind == "selection_conflict":
+            caveat = " (owner list incomplete)" if not record.get("interacting_complete", True) else ""
             lines.append(
                 f"- Insertion of #{record['pr']} conflicted with batch {record['batch_id']} at "
                 + ", ".join(record["paths"])
                 + "; interacting members: "
                 + ", ".join(f"#{p}" for p in record["members"])
+                + caveat
                 + "."
             )
         else:

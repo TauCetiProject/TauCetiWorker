@@ -28,10 +28,12 @@ groups and connected import components. It reads Git blobs without checking out 
 candidate. The import-header scan is conservative and explicitly approximate. Immutable Git
 evidence is cached; blob reads are limited to 256 KiB per file and 8 MiB per load. A budget or
 parsing failure marks the context incomplete and does not stop the queue. Oversized blobs are
-skipped while other headers are retained. Task context is capped at 4,096 records, 2,048 import
+skipped while other headers are retained. Total-byte limits advance through further passes,
+and transient failures retry after a minute without requiring a source change. Task context is capped at 4,096 records, 2,048 import
 edges, 262,144 compiled-name observations and 512 KiB; compiled collisions take priority when
 truncation is necessary. Prompt excerpts show at most 40 records. Operational contexts are removed
-when a batch lands or is removed; its journal and task evidence remain retained.
+when a batch lands or is removed; its journal and task evidence remain retained. Ownership and
+controller bookkeeping stay out of task payloads; a truncated owner list is explicitly incomplete.
 
 The inventory of `bors-ng` at `8021558cd` covered `lib/worker/batcher/`,
 `lib/worker/declaration_names.ex`, `lib/worker/local_git.ex` and `priv/local_git.py`:
@@ -57,14 +59,16 @@ A predicted compiled collision makes an open batch eligible for preparation with
 the usual size and quiet thresholds. On a head, the controller dispatches the first CI attempt
 and exposes a repair task alongside it. A collision digest bypasses preparation thresholds once
 per base, so each insertion does not trigger another speculative build. The candidate build continues while the worker repairs
-its private chain. CI observation and infrastructure retries continue while that claim prevents promotion. The next
-batch can still pre-rebase speculatively; adoption of a changed head supersedes stale work. An adoption that
+its private chain. CI observation and infrastructure retries continue while the agent works. A passing candidate
+retires even a claimed speculative task and lands immediately. The next batch can still pre-rebase
+speculatively; adoption of a changed head supersedes stale work. An adoption that
 changes the tip requires the replacement candidate's own CI; the earlier result cannot approve it.
 
 A same-tip submission resolves the speculative task without changing the version, restarting CI
 or adding a comment. If CI passes before an unclaimed speculative task starts, the task is retired
 and the audited candidate can land. If it fails first, its actual diagnostics join the same task and an unchanged result can no longer
-resolve that source failure.
+resolve that source failure. Its old claim is released immediately so the real diagnostics can
+be claimed without waiting for expiry, while a useful changed submission can still be adopted.
 Claims, authorization, membership, append-only explanations and opt-out rules apply normally.
 
 The full context is retained in task diagnostics and written to `.tauceti-repair/admission.json`
@@ -77,4 +81,9 @@ The journal records `admission-predicted`, `admission-repair-started` and
 identities, submitted tip and edited members. Reporters compare the result time with the run's
 actual completion time; a last-observed pending status alone cannot prove a repair preceded the
 verdict. A changed contribution is not by itself proof that a predicted collision was fixed.
-The worker's scripted verification and the candidate's subsequent CI provide that evidence.
+The worker reports duplicate names actually observed by scripted checks, the exact verified tip
+and whether the final build and audits passed. A result counts as a fixed prediction only when
+that duplicate was observed, its owning contribution changed, and those final checks passed.
+Missing or unavailable audits remain unknown. Background results are compared with the first
+subsequent CI run of that same batch; head results use the current attempt after any
+infrastructure retry. None of these measurements authorizes publication without required CI.

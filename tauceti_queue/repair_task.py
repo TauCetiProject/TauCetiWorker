@@ -929,6 +929,22 @@ def task_findings(task: Task) -> dict:
     return repair.findings_from_diagnostics(task.diagnostics)
 
 
+def admission_verification(task: Task, tip: str, outcome: dict, stream_findings: list) -> dict | None:
+    """Telemetry from scripted checks, never permission to skip the candidate's CI."""
+    if not task_findings(task).get("admission_predictions"):
+        return None
+    observed = set(outcome.get("observed_duplicate_names", []))
+    for findings in (task_findings(task), repair.findings_from_diagnostics(stream_findings)):
+        observed.update(d["declaration"] for d in findings.get("duplicate_declarations", []))
+    checks_passed = any(
+        v.get("tip") == tip and v.get("ok") is True and (v.get("checks") or {}).get("status") == "passed"
+        for v in outcome.get("verification", [])
+    )
+    parallel = outcome.get("parallel") or {}
+    checks_passed |= parallel.get("verified_tip") == tip and (parallel.get("checks") or {}).get("status") == "passed"
+    return {"tip": tip, "checks_passed": checks_passed, "observed_duplicate_names": sorted(observed)}
+
+
 ARTIFACT_ANCESTORS = 50  # first-parent ancestors of the build revision asked for a published cache mapping
 
 
@@ -1912,6 +1928,9 @@ def run_task(
                     outcome["agent"] = agent_records
                     skip_agent = parallel["status"] == "ok"
                     findings = remaining if remaining is not None else findings
+            observed = set(outcome.get("observed_duplicate_names", []))
+            observed.update(d["declaration"] for d in findings.get("duplicate_declarations", []))
+            outcome["observed_duplicate_names"] = sorted(observed)
             if resubmit:
                 resubmit = False  # the explanation turn already ran; check and submit its result
             elif skip_agent:
@@ -2010,7 +2029,7 @@ def run_task(
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             verified = (outcome.get("parallel") or {}).get("verified_tip") == tip
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
-            if cfg.worker_audits and task.kind == "repair" and not artifacts_cold and not verified:
+            if cfg.worker_audits and task.kind in ("repair", "prepare") and not artifacts_cold and not verified:
                 # The worker's own verdict before anything is submitted: the whole-library build, then CI's
                 # audits and the changed-module lint. A finding goes back to the agent as a diagnostic.
                 state.write("verifying", attempt=attempt, tip=tip)
@@ -2027,6 +2046,14 @@ def run_task(
                     {k: v for k, v in verification.items() if k != "diagnostics"}
                     | {"tip": tip, "findings": len(verification["diagnostics"])}
                 )
+                observed = set(outcome.get("observed_duplicate_names", []))
+                observed.update(
+                    d["declaration"]
+                    for d in repair.findings_from_diagnostics(verification["diagnostics"]).get(
+                        "duplicate_declarations", []
+                    )
+                )
+                outcome["observed_duplicate_names"] = sorted(observed)
                 checks = verification.get("checks") or {}
                 if checks.get("status") == "unavailable":
                     log(f"task {task.task_id}: audits unavailable ({checks.get('reason')}); CI runs them")
@@ -2077,6 +2104,11 @@ def run_task(
                     a.get("estimated_cost_usd") or 0 for r in agent_records for a in r.get("attempts", [])
                 ),
             }
+            verification_note = admission_verification(
+                task, tip, outcome, stream.findings if stream is not None else []
+            )
+            if verification_note is not None:
+                notes["admission_verification"] = verification_note
             if task.kind == "prepare":
                 notes["remaining_errors"] = prepare_remaining_errors(outcome.get("parallel"), findings, worktree)
             lease.submitting.set()

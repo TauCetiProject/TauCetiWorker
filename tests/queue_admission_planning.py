@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tauceti_queue import admission_planning, repair
-from tauceti_queue.fakes import make_controller, reopen_controller
+from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller
 
 PROJECT = "TauCetiProject/TauCeti"
 
@@ -182,17 +182,17 @@ class Planning(unittest.TestCase):
         task = self.controller.store.row("tasks", {"id": 1})
         self.assertEqual(task["resolution"], "prediction-ci-passed")
 
-    def test_ci_observation_continues_while_prediction_claim_blocks_promotion(self):
+    def test_own_ci_pass_retires_a_claimed_prediction_and_lands_immediately(self):
         head, _ = self.start_prediction()
         task = self.controller.claim_task("fixture", "admin-worker")
         self.github.complete_runs()
         self.clock.advance(61)
         self.controller.tick()
         self.assertEqual(self.controller._current_attempt(head)["outcome"], "pass")
-        self.assertEqual(self.controller._head()["tip"], task.tip)
-        self.controller.submit_task(task.task_id, task.claim_token, task.tip)
-        self.controller.tick()
         self.assertIsNone(self.controller._head())
+        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "claim-superseded")
 
     def test_source_failure_is_added_to_existing_prediction_task(self):
         self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "TauCeti.A", "message": "boom"}])
@@ -279,8 +279,11 @@ class Planning(unittest.TestCase):
         self.assertEqual(json.loads(row["diagnostics"])[0]["message"], "boom")
         result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
         self.assertFalse(result.accepted)
-        self.assertEqual(result.reason, "invalid-chain")
+        self.assertEqual(result.reason, "claim-superseded")
         self.assertEqual(self.controller._head()["version"], head["version"])
+        refreshed = self.controller.claim_task("refreshed-worker", "admin-worker")
+        self.assertIsNotNone(refreshed, "no expired-claim delay after a stale no-op")
+        self.assertEqual(refreshed.diagnostics[0]["message"], "boom")
 
     def test_landing_discards_operational_admission_caches(self):
         head, _ = self.start_prediction()
@@ -347,6 +350,113 @@ class Planning(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(context).encode()), 8192)
         self.assertFalse(context["complete"])
         self.assertEqual(context["records"][0]["kind"], "declaration_collision")
+
+    def test_transient_planning_failure_retries_without_changing_the_tip(self):
+        self.approve(101, {"TauCeti/A.lean": "def a := 1\n"})
+        with patch.object(admission_planning.Planner, "context", side_effect=OSError("temporary")):
+            self.controller.tick()
+        head = self.controller._head()
+        self.assertTrue(self.controller._state(f"admission_context:{head['id']}")["retryable"])
+        self.clock.advance(61)
+        with self.controller._lock:
+            context = self.controller._admission_context(head, self.clock())
+        self.assertTrue(context["complete"])
+        self.assertEqual(context["tip"], head["tip"])
+        self.assertTrue(context["ownership_complete"])
+
+    def test_total_blob_budget_progresses_over_multiple_passes(self):
+        self.approve(101, {"TauCeti/A.lean": "import TauCeti.B\ndef a := 1\n"})
+        self.approve(102, {"TauCeti/B.lean": "def b := 1\n"})
+        self.controller.tick()
+        batch, members, inputs = self.context()
+        planner = admission_planning.Planner(self.repo.clone)
+        with patch.object(admission_planning, "MAX_BLOB_BYTES", 35):
+            first = planner.context(members, inputs, tip=batch["tip"])
+            self.assertTrue(first["retryable"])
+            second = planner.context(members, inputs, tip=batch["tip"])
+        self.assertTrue(second["complete"])
+        self.assertFalse(planner.omitted, "a per-call budget is not a permanent per-file failure")
+        self.assertTrue(any(r["kind"] == "import_component" for r in second["records"]))
+
+    def test_task_payload_omits_ownership_and_controller_bookkeeping(self):
+        context = dict(
+            knowledge(),
+            ownership=[{"pr": 101, "paths": ["A.lean"]}],
+            signature="internal",
+            at=1,
+            prediction_digest="internal",
+            retry_after=2,
+        )
+        payload = admission_planning.task_context(context)
+        self.assertEqual(payload, knowledge())
+
+    def test_prediction_result_uses_the_retried_ci_attempt(self):
+        self.github.ci_policy = lambda *_: ("infrastructure", [])
+        head, original = self.start_prediction()
+        self.github.complete_runs()
+        self.clock.advance(61)
+        self.controller.tick()
+        self.clock.advance(61)
+        self.controller.tick()
+        current = self.controller._current_attempt(head)
+        self.assertNotEqual(current["id"], original["ci_attempt_id"])
+        task = self.controller.claim_task("fixture", "admin-worker")
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, task.tip).accepted)
+        row = self.controller.store.row("journal", {"kind": "admission-repair-result"}, order="id DESC")
+        self.assertEqual(json.loads(row["detail"])["attempt_id"], current["id"])
+
+    def test_verified_fixed_requires_observed_duplicate_final_checks_and_an_edited_owner(self):
+        self.start_prediction()
+        task = self.controller.claim_task("fixture", "admin-worker")
+        agent = ScriptedAgent(
+            "fixture",
+            "admin-worker",
+            self.repo,
+            Path(self.tmp.name) / "agent",
+            lambda _: {f"{PROJECT}#101": Resolution({"TauCeti/A.lean": "def a := 2\n"})},
+        )
+        tip = agent.produce(task)
+        notes = {
+            "admission_verification": {
+                "tip": tip,
+                "checks_passed": True,
+                "observed_duplicate_names": ["TauCeti.shared", "Other.name"],
+            }
+        }
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip, json.dumps(notes)).accepted)
+        row = self.controller.store.row("journal", {"kind": "admission-repair-result"}, order="id DESC")
+        self.assertEqual(json.loads(row["detail"])["verified_fixed"], ["TauCeti.shared"])
+
+    def test_noop_cannot_count_as_a_fixed_prediction(self):
+        self.start_prediction()
+        task = self.controller.claim_task("fixture", "admin-worker")
+        notes = {
+            "admission_verification": {
+                "tip": task.tip,
+                "checks_passed": True,
+                "observed_duplicate_names": ["TauCeti.shared"],
+            }
+        }
+        self.assertTrue(
+            self.controller.submit_task(task.task_id, task.claim_token, task.tip, json.dumps(notes)).accepted
+        )
+        row = self.controller.store.row("journal", {"kind": "admission-repair-result"}, order="id DESC")
+        self.assertEqual(json.loads(row["detail"])["verified_fixed"], [])
+
+    def test_clean_background_preparation_records_zero_source_fixes(self):
+        self.start_prediction()
+        self.controller.set_setting("repair_concurrency", 2, "operator")
+        self.approve(102, {"TauCeti/B.lean": "def b := 1\n"})
+        self.controller.tick()
+        self.controller.claim_task("head-worker", "admin-worker")
+        task = self.controller.claim_task("background-worker", "admin-worker")
+        self.assertEqual(task.kind, "prepare")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        row = self.controller.store.row("journal", {"kind": "admission-repair-result"}, order="id DESC")
+        detail = json.loads(row["detail"])
+        self.assertEqual(detail["verified_fixed"], [])
+        self.assertIsNone(detail["attempt_id"])
+        self.assertEqual(detail["task_kind"], "prepare")
 
 
 if __name__ == "__main__":

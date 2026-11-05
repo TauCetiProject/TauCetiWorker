@@ -1583,6 +1583,20 @@ class PredictedRepair(Fixture):
         self.assertEqual(findings["admission_predictions"], knowledge)
         self.assertEqual(context.kind, "repair")
 
+    def test_prediction_verification_requires_the_exact_tip_and_actual_audits(self):
+        self.prediction()
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        outcome = {
+            "observed_duplicate_names": ["Foo.bar"],
+            "verification": [{"tip": task.tip, "ok": True, "checks": {"status": "passed"}}],
+        }
+        note = repair_task.admission_verification(task, task.tip, outcome, [])
+        self.assertTrue(note["checks_passed"])
+        self.assertEqual(note["observed_duplicate_names"], ["Foo.bar"])
+        self.assertFalse(repair_task.admission_verification(task, "0" * 40, outcome, [])["checks_passed"])
+        outcome["verification"][0]["checks"]["status"] = "unavailable"
+        self.assertFalse(repair_task.admission_verification(task, task.tip, outcome, [])["checks_passed"])
+
 
 class LongPrompt(Fixture):
     def test_a_prompt_too_long_for_argv_is_delivered_on_stdin(self):
@@ -4427,6 +4441,32 @@ class WorkerAudits(Fixture):
         path = self.root / "state" / "worktrees" / "task-1" / ".tauceti-repair" / "errors.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def test_prepare_runs_final_audits_and_reports_observed_duplicates(self):
+        self.service.tasks[1]["kind"] = "prepare"
+        self.service.tasks[1]["diagnostics"] = [
+            {
+                "kind": "admission_predictions",
+                "complete": True,
+                "records": [
+                    {
+                        "kind": "declaration_collision",
+                        "name": "Foo.bar",
+                        "sources": [{"pr": 2, "module": "TauCeti.Two"}, {"pr": 3, "module": "TauCeti.Three"}],
+                    }
+                ],
+            }
+        ]
+        self.findings("audit-findings", DUPLICATE_LINE)
+        cfg = self.config(keep_worktree=True)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        notes = json.loads(self.service.results[0]["worker_notes"])["admission_verification"]
+        self.assertTrue(notes["checks_passed"])
+        self.assertEqual(notes["tip"], outcome["tip"])
+        self.assertEqual(notes["observed_duplicate_names"], ["Foo.bar"])
+        self.assertFalse(outcome["verification"][0]["ok"])
+        self.assertTrue(outcome["verification"][-1]["ok"])
+
     def test_a_duplicate_fails_the_verification_and_the_agent_is_run_on_it(self):
         self.findings("audit-findings", DUPLICATE_LINE)
         cfg = self.config(keep_worktree=True)
@@ -4549,6 +4589,7 @@ class StreamAudits(WorkerAudits):
         self.assertTrue(outcome["verification"][-1]["ok"])
 
     # The scenarios of the parent class assume a failing streaming build.
+    test_prepare_runs_final_audits_and_reports_observed_duplicates = None
     test_a_duplicate_fails_the_verification_and_the_agent_is_run_on_it = None
     test_a_lint_finding_fails_the_verification = None
     test_a_finding_that_persists_is_never_submitted = None

@@ -233,3 +233,37 @@ $2.17). Warm-artifact decision: `main`'s cache at the base plus an incremental b
 and is the only source (failed candidates publish no outputs); the cost is about 30 GB of disk per
 live base, so the repair worker keeps one pool per head and prunes on base change. Follow-up for the
 repair task: hand the agent CI's changed-module list for lint scoping (the two slow runs were lint).
+
+
+## Admission evidence and pilot measurements (2026-11-05)
+
+Implementation is tracked by [PR 563](https://github.com/TauCetiProject/TauCetiWorker/pull/563)
+(compiled PR-build declaration records), [PR 564](https://github.com/TauCetiProject/TauCetiWorker/pull/564)
+(attempt-bound journal reporting and the pilot report), and
+[PR 565](https://github.com/TauCetiProject/TauCetiWorker/pull/565)
+(merge-selection evidence and proactive repairs). The compiled-record fetch is activated by PR 565;
+563 and 565 deploy together. The operating contract is in [admission-knowledge.md](admission-knowledge.md).
+
+The first [pilot report](pilot-2026-11-05.md), through 21:35:59 UTC, separates 1,506 member landings,
+1,502 unique PR identities, 1,401 nonempty contributions and 105 empty commits. Rates are 66.37
+unique PR identities/hour and 61.91 nonempty contributions/hour; the comparable Bors identity rate
+is 17.97/hour, with nonempty baseline contributions unknown. The inherited backlog makes this an
+initial observation, not a sustained-throughput result. Head 2 took 494.23 minutes from first
+dispatch to landing, so the 120-minute scenario was not met in the observed data; a full week
+cannot yet be assessed. Recorded cost estimates total $157.51, with 30 provider attempts missing
+estimates and total spend explicitly unknown. [The journal runbook](journal-report.md) gives the
+read-only snapshot and daily-report commands.
+
+Production audits on the same day:
+
+- All eleven landed chains through batch 14 (1,508 member occurrences) passed the chain validator:
+  single-parent history, exact recorded base and a bijection to accepted PR identities/heads.
+- All 268 edited-member landing comments had exactly one queue comment, a retained
+  commit link and their appended explanation. Four (26346, 26540, 27033, 27785) explicitly reported
+  no difference in the PR's files; clean-replay suppression remains a later increment.
+- Recent promotions' `build`, `scope` and `bump-guard` statuses were all bound to their own completed
+  run. The sampled status had no conditions, inference hold, active claims or pending outbox entries.
+- An online SQLite backup passed integrity checking at 21:36:50 UTC. The full comment audit is at
+  `~/TauCetiQueue-data/reports/2026-11-05/comment-audit.json` on chungus; report inputs and script
+  copies are archived under `~/TauCetiQueue-data/reports/` there. These are observations at the
+  recorded times; deployment verification must recheck live status.
