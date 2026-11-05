@@ -708,6 +708,7 @@ def prepare_artifacts(
     *,
     repository: str = DEFAULT_REPOSITORY,
     candidate: str | None = None,
+    fallbacks: tuple[str, ...] = (),
     mathlib_cache: bool = False,
     lake: tuple[str, ...] = ("lake",),
 ) -> dict:
@@ -719,7 +720,11 @@ def prepare_artifacts(
     exists because modules fail); only a fetch failure, a missing base mapping or a build that did
     not complete (timeout, missing ``lake``) make the artifacts unavailable. ``mathlib_cache`` first
     runs ``lake exe cache get`` for the dependencies, as the workers do before PR repair.
-    ``candidate`` probes whether the failed candidate's own outputs were published (measurement only).
+    ``fallbacks`` are further revisions to fetch, in order, when ``base`` has no published mapping
+    (the rebase target when the batch base is stale, or the batch base when the rebase target is
+    not published yet); ``cache_revision`` records which one was restored and ``cache_attempts``
+    every fetch tried. ``candidate`` probes whether the failed candidate's own outputs were
+    published (measurement only).
     """
     record: dict = {}
     seconds = 0.0
@@ -730,24 +735,38 @@ def prepare_artifacts(
         seconds += deps["seconds"]
         if deps["rc"] != 0:
             reasons.append(f"lake exe cache get exited {deps['rc']}")
-    fetch = run_logged(
-        [*lake, "cache", "get", "--service", CACHE_SERVICE, "--repo", repository, f"--rev={base}"],
-        worktree,
-        logdir / "cache-get-base.log",
-        env=env,
-        timeout=1800,
-    )
-    text = Path(fetch["log"]).read_text(errors="replace")
-    fetch["mapping_found"] = fetch["rc"] == 0 and "outputs not found for revision" not in text
-    fetch["artifacts_downloaded"] = text.count("downloaded artifact")
-    record["base_cache"] = fetch
-    seconds += fetch["seconds"]
-    if not fetch["mapping_found"]:
-        reasons.append(
-            f"no published cache mapping for base {base[:12]}"
-            if fetch["rc"] == 0
-            else f"lake cache get --rev={base[:12]} exited {fetch['rc']}"
+    revisions = [base]
+    for revision in fallbacks:
+        if revision and revision not in revisions:
+            revisions.append(revision)
+    attempts: list[dict] = []
+    missing: list[str] = []
+    for index, revision in enumerate(revisions):
+        fetch = run_logged(
+            [*lake, "cache", "get", "--service", CACHE_SERVICE, "--repo", repository, f"--rev={revision}"],
+            worktree,
+            logdir / ("cache-get-base.log" if index == 0 else f"cache-get-fallback-{index}.log"),
+            env=env,
+            timeout=1800,
         )
+        text = Path(fetch["log"]).read_text(errors="replace")
+        fetch["revision"] = revision
+        fetch["mapping_found"] = fetch["rc"] == 0 and "outputs not found for revision" not in text
+        fetch["artifacts_downloaded"] = text.count("downloaded artifact")
+        attempts.append(fetch)
+        seconds += fetch["seconds"]
+        if fetch["mapping_found"]:
+            break
+        missing.append(
+            f"no published cache mapping for {revision[:12]}"
+            if fetch["rc"] == 0
+            else f"lake cache get --rev={revision[:12]} exited {fetch['rc']}"
+        )
+    record["base_cache"] = attempts[-1]
+    record["cache_attempts"] = attempts
+    record["cache_revision"] = attempts[-1]["revision"] if attempts[-1]["mapping_found"] else None
+    if record["cache_revision"] is None:
+        reasons.append("; ".join(missing))
     if candidate:
         own = run_logged(
             [

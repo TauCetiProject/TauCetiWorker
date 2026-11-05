@@ -101,7 +101,7 @@ controller's inference hold (`report_inference(worker, False, error)`), and `err
 
 | reason | meaning for the service |
 | --- | --- |
-| `artifacts_unavailable` | the worker could not prepare warm artifacts (no published cache mapping for the base, a fetch failure, an incomplete incremental build, or the worker's own cache preparation refusing to start inference); the task was not run cold |
+| `artifacts_unavailable` | the worker could not prepare warm artifacts (no published cache mapping for the base or `onto`, a fetch failure, an incomplete incremental build, or the worker's own cache preparation refusing to start inference); the task was not run cold. After such a release `serve` waits `artifacts_backoff` (60 s, doubling to 600 s across consecutive releases) before its next claim, since the service re-exposes the same task at once |
 | `inference_unavailable` | every bounded attempt failed with a provider error, a transport failure or exhausted credentials (`agents.classify_agent_failure`); the queue holds the task and re-exposes it (plan, "Inference unavailability") |
 | `agent_failed` | the agent ran and exited on its own terms, or returned a chain that fails local validation, twice; the task is re-exposed to any worker |
 | `push_failed` | `git-safe-push` to the submission ref failed; the chain is retained locally under `refs/tauceti-queue/task/<id>/attempt-<n>` in the worker's clone |
@@ -154,11 +154,15 @@ has a time budget holds because the service re-exposes the task.
 3. **Artifacts.** `repair.prepare_artifacts`, exactly the experiment's recipe: `lake exe cache get`
    for Mathlib (or a shared extracted `.lake/packages` through `--seed-packages`, the experiment's
    stand-in for the shared Mathlib view), `lake cache get --service tauceti-public --repo <repository>
-   --rev=<base>` into the private pool, then `lake build --iofail` at the tip, which restores every
-   unchanged module and builds the batch's own modules and their dependents. The build is expected to
-   fail on the failing modules; artifacts are unavailable only when the base mapping is missing, a
-   fetch fails or the build does not complete. Unavailable artifacts release the task
-   (`artifacts_unavailable`); the agent never runs cold. Checkpoint `artifacts_ready`.
+   --rev=<revision>` into the private pool, then `lake build --iofail` at the tip, which restores every
+   unchanged module and builds the batch's own modules and their dependents. The revisions tried are
+   `artifact_revisions`: a repair fetches its `base`, then `onto` when that differs; a rebase conflict
+   builds on `onto`, so it fetches `onto` first and the stale `base` as the fallback. The build is
+   expected to fail on the failing modules; artifacts are unavailable only when no tried revision has a
+   published mapping, a fetch fails or the build does not complete. Unavailable artifacts release a
+   repair task (`artifacts_unavailable`; its agent never runs cold), while a rebase conflict, whose
+   rebase needs no build, runs its agent without warm artifacts and leaves the validation build to run
+   cold or to the service's CI. Checkpoint `artifacts_ready`.
 4. **Agent.** The prompt (`repair.compose_prompt`) opens with the task's instruction verbatim, then
    the batch (where it came from, what it must not do: no push, no PRs, no comments, no `gh`, no
    edits to the build configuration), the diagnostics with file-level owners computed from the chain
