@@ -830,12 +830,30 @@ def artifact_revisions(task: Task) -> list[str]:
     return revisions
 
 
-def prompt_context(task: Task, feedback: str | None, findings: dict | None = None) -> PromptContext:
+def artifacts_cold(task: Task, artifacts: dict | None) -> bool:
+    """Whether the agent builds without warm artifacts: a rebase conflict whose preparation found no
+    cache (a repair without artifacts is released instead, so it never gets this far)."""
+    if not artifacts:
+        return False
+    return bool(artifacts.get("cold")) or (task.kind == "rebase_conflict" and not artifacts.get("available", True))
+
+
+def prompt_context(
+    task: Task,
+    feedback: str | None,
+    findings: dict | None = None,
+    *,
+    artifacts: dict | None = None,
+    listings: Path | None = None,
+) -> PromptContext:
+    """``artifacts`` is the ``prepare_artifacts`` record (the prompt says when the build is cold);
+    ``listings`` is where a large batch's full member listings go (``repair.listings_path``)."""
     findings = findings if findings is not None else task_findings(task)
     conflict = dict(findings.get("conflict") or {}) or None
     if conflict is not None:
         conflict.setdefault("onto", task.onto)
         conflict.setdefault("previous_base", task.base)
+    cold = artifacts_cold(task, artifacts)
     return PromptContext(
         repository=task.repository,
         base=task.validation_base,
@@ -849,6 +867,9 @@ def prompt_context(task: Task, feedback: str | None, findings: dict | None = Non
             {"source_pr": m.source_pr, "accepted_head": m.accepted_head, "provenance": m.provenance}
             for m in task.members
         ],
+        artifacts_cold=cold,
+        artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
+        listings_path=listings,
     )
 
 
@@ -1212,9 +1233,14 @@ def run_task(
             if resubmit:
                 resubmit = False  # the explanation turn already ran; check and submit its result
             else:
-                prompt = repair.compose_prompt(
-                    prompt_context(task, feedback, findings), findings, chain_before, cfg.clone
+                context = prompt_context(
+                    task,
+                    feedback,
+                    findings,
+                    artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
+                    listings=repair.listings_path(worktree),
                 )
+                prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
                 if resume_session:
                     prompt = (
                         "The worker running this task was interrupted and has resumed your session; the worktree is "

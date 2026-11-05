@@ -63,6 +63,7 @@ from tauceti_queue.repair import (  # noqa: F401  (re-exported for the harness's
     host_state,
     lake_env,
     link_shared_packages,
+    listings_path,
     module_to_path,
     owners_of,
     parse_lake_build_log,
@@ -724,8 +725,20 @@ def prepare_artifacts(worktree: Path, failure: Failure, env: dict, logdir: Path,
 # Agent
 
 
-def compose_prompt(failure: Failure, findings: dict, chain: list[ChainCommit], clone: Path, base_short: str) -> str:
-    """The plan's instruction, then the candidate's real diagnostics and its constituent commits."""
+def compose_prompt(
+    failure: Failure,
+    findings: dict,
+    chain: list[ChainCommit],
+    clone: Path,
+    base_short: str,
+    *,
+    worktree: Path | None = None,
+    artifacts: dict | None = None,
+) -> str:
+    """The plan's instruction, then the candidate's real diagnostics and its constituent commits.
+    With a ``worktree`` a large batch's full listings go to ``repair.listings_path``; ``artifacts``
+    (the ``prepare_artifacts`` record) says whether the build is cold."""
+    cold = bool(artifacts) and not artifacts.get("available", True)
     context = PromptContext(
         repository=REPO,
         base=failure.base_sha,
@@ -733,6 +746,9 @@ def compose_prompt(failure: Failure, findings: dict, chain: list[ChainCommit], c
         suspects=list(failure.suspects),
         suspect_heads=dict(failure.suspect_heads),
         named_modules=failure.failing_modules,
+        artifacts_cold=cold,
+        artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
+        listings_path=listings_path(worktree) if worktree is not None else None,
     )
     return _compose_prompt(context, findings, chain, clone)
 
@@ -952,7 +968,15 @@ def run_experiment(
             write_record(record_path, record)
             return record
         findings = record["sources"]["ci_findings"]
-        prompt = compose_prompt(failure, findings, chain_before, clone, failure.base_sha[:12])
+        prompt = compose_prompt(
+            failure,
+            findings,
+            chain_before,
+            clone,
+            failure.base_sha[:12],
+            worktree=worktree,
+            artifacts=record["artifacts"],
+        )
         (experiment_dir / "prompt.md").write_text(prompt)
         record["prompt_chars"] = len(prompt)
         if skip_agent:
