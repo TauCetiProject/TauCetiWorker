@@ -56,7 +56,12 @@ class GenerationRetryTests(unittest.TestCase):
             ),
         )
         self.calls, self.caches, self.timeouts = [], [], []
-        fetch = patch.object(wu.subprocess, "run", return_value=subprocess.CompletedProcess([], 0))
+
+        def fetched(argv):
+            self.assertEqual(argv, ["git", "-C", str(self.roadmap), "fetch", "-q", "origin"])
+            return subprocess.CompletedProcess([], 0)
+
+        fetch = patch.object(wu.subprocess, "run", side_effect=fetched)
         self.fetch = fetch.start()
         self.addCleanup(fetch.stop)
 
@@ -83,6 +88,8 @@ class GenerationRetryTests(unittest.TestCase):
         before = {p.name: p.read_bytes() for p in self.work.iterdir()}
 
         def churning(stage, *args, **kwargs):
+            if stage == "plan":
+                self.assertEqual(self.fetch.call_count, self.calls.count("plan") + 1)
             proc = self.run_tool(stage, *args, **kwargs)
             return subprocess.CompletedProcess([], 76, "facts partial stdout", LEGACY) if stage == "facts" else proc
 
@@ -90,7 +97,7 @@ class GenerationRetryTests(unittest.TestCase):
             wu._prepare_progress(self.worker, churning, self.roadmap, self.work)
         self.assertIn("3 attempts", str(raised.exception))
         self.assertEqual(self.calls, ["plan", "facts"] * 3)
-        self.assertEqual(self.fetch.call_count, 2)
+        self.assertEqual(self.fetch.call_count, 3)
         self.fetch.assert_called_with(["git", "-C", str(self.roadmap), "fetch", "-q", "origin"])
         self.assertEqual(len({cache for _, cache in self.caches}), 3)
         for a, b in zip(self.caches[::2], self.caches[1::2], strict=True):
@@ -121,10 +128,11 @@ class GenerationRetryTests(unittest.TestCase):
             proc = self.run_tool(stage, *args, **kwargs)
             return subprocess.CompletedProcess([], 76, "", LEGACY) if stage == "facts" else proc
 
-        self.fetch.return_value = subprocess.CompletedProcess([], 1)
-        with self.assertRaisesRegex(Die, "before replanning failed"):
+        self.fetch.side_effect = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
+        with self.assertRaisesRegex(Die, "before planning failed"):
             wu._prepare_progress(self.worker, churning, self.roadmap, self.work)
         self.assertEqual(self.calls, ["plan", "facts"])
+        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
         self.assert_uncharged()
 
     def pages_fixture(self):

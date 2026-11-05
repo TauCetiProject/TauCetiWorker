@@ -2404,10 +2404,10 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
         return {key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")}
 
     for attempt in range(3):
-        # The first attempt uses the round's fetch. A retry can follow a long
-        # facts run; observe reports that landed while that attempt was running.
-        if attempt and subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
-            _progress_mechanical_failed(w, f"progress: refreshing {roadmap_dir} before replanning failed")
+        # Checkout preparation and facts collection can take time. Observe
+        # reports that landed since the round's fetch before every plan.
+        if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
+            raise Die(f"progress: refreshing {roadmap_dir} before planning failed")
         output = attempts / str(attempt + 1)
         output.mkdir()
         plan_file, facts_file = output / "plan.json", output / "facts.json"
