@@ -3,7 +3,8 @@
 A worker claims a repair or rebase-conflict task from the queue service, prepares warm build
 artifacts, runs the repair agent in a private worktree and returns a validated attributed chain. The
 service alone adopts a chain; this module never publishes anything except the proposed tip under
-the task's submission ref in the content repository, which the service fetches.
+the task's submission ref in the content repository, which the service fetches, and the green
+tip's build outputs to the workers' own cache namespace (``repair_publish``), which CI never reads.
 
 Task protocol (``docs/queue/repair-task.md``), all JSON over HTTP with
 ``Authorization: Bearer <GitHub token of the worker's account>``:
@@ -61,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from tauceti_queue import repair, repair_context
+from tauceti_queue import repair, repair_context, repair_publish
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 
 SCHEMA = "tauceti-queue.repair-task/v1"
@@ -652,6 +653,8 @@ class RunnerConfig:
     # next claim, doubling on each consecutive such release up to the second value, so a base with no
     # published cache is not released and re-claimed within seconds.
     artifacts_backoff: tuple[float, float] = (60.0, 600.0)
+    # The workers' own cache namespace: read before the public cache, written after a green repair.
+    publish: repair_publish.Settings = dataclasses.field(default_factory=repair_publish.Settings.from_env)
 
     @property
     def tasks_dir(self) -> Path:
@@ -1485,6 +1488,7 @@ def run_task(
         if task.repository != cfg.repository:
             verify_admin(task.repository)
         env_lake = repair.lake_env(cfg.root)
+        repair_publish.configure(env_lake, cfg.publish)
         if not resuming:
             try:
                 outcome["sources"] = fetch_retained(
@@ -1514,6 +1518,7 @@ def run_task(
                 ancestors=ARTIFACT_ANCESTORS,
                 mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
                 lake=cfg.lake,
+                preferred=repair_publish.preferred(cfg.publish, task),
             )
             if artifacts["cache_revision"]:
                 skipped = "; ".join(artifacts.get("cache_skipped") or ())
@@ -1662,6 +1667,16 @@ def run_task(
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
+            if (outcome.get("publish") or {}).get("revision") != tip:
+                outcome["publish"] = repair_publish.publish_outputs(
+                    worktree,
+                    tip,
+                    settings=cfg.publish,
+                    env=env_lake,
+                    logdir=logdir,
+                    repository=task.repository,
+                    lake=cfg.lake,
+                )
             push = push_result(cfg, task, worktree, tip, logdir, pushed)
             outcome["push"] = {k: v for k, v in push.items() if "load" not in k}
             if not push["ok"]:

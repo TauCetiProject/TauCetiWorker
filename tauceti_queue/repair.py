@@ -722,17 +722,20 @@ def _fetch_mapping(
     repository: str,
     lake: tuple[str, ...],
     mappings_only: bool,
+    service: str | None = None,
 ) -> dict:
-    """One ``lake cache get --rev=<revision>``; the verdict reads this run's output only.
+    """One ``lake cache get --rev=<revision>`` (from ``service``, default the public one); the verdict reads this run's output only.
 
     The log is appended to (``run_logged``), and a task's preparation runs again on every claim of
     the task, so the file holds the output of earlier fetches too. Production repair 2 (2026-11-05)
     judged the rebase target unpublished because an earlier run's "outputs not found" for another
     revision was still in the file, although its own fetch had exited 0 and downloaded the artifacts.
     """
-    log = logdir / f"cache-get-{revision[:12]}.log"
+    service = CACHE_SERVICE if service is None else service
+    public = service == CACHE_SERVICE
+    log = logdir / (f"cache-get-{revision[:12]}.log" if public else f"cache-get-{service}-{revision[:12]}.log")
     offset = log.stat().st_size if log.exists() else 0
-    argv = [*lake, "cache", "get", "--service", CACHE_SERVICE, "--repo", repository, f"--rev={revision}"]
+    argv = [*lake, "cache", "get", "--service", service, "--repo", repository, f"--rev={revision}"]
     if mappings_only:
         argv.append("--mappings-only")
     fetch = run_logged(argv, worktree, log, env=env, timeout=600 if mappings_only else 1800)
@@ -740,6 +743,7 @@ def _fetch_mapping(
         handle.seek(offset)
         text = handle.read().decode(errors="replace")
     fetch["revision"] = revision
+    fetch["service"] = service
     fetch["mapping_found"] = fetch["rc"] == 0 and MAPPING_MISSING not in text
     fetch["artifacts_downloaded"] = text.count("downloaded artifact")
     if fetch["mapping_found"]:
@@ -748,6 +752,8 @@ def _fetch_mapping(
         fetch["reason"] = f"no published cache mapping for {revision[:12]}"
     else:
         fetch["reason"] = f"lake cache get --rev={revision[:12]} exited {fetch['rc']}"
+    if fetch["reason"] and not public:
+        fetch["reason"] = f"{service}: {fetch['reason']}"
     return fetch
 
 
@@ -813,6 +819,7 @@ def prepare_artifacts(
     ancestors: int = 0,
     mathlib_cache: bool = False,
     lake: tuple[str, ...] = ("lake",),
+    preferred: tuple[tuple[str, str], ...] = (),
 ) -> dict:
     """Warm artifacts the way the plan's default source does: main's cache at the base, then an
     incremental build of the batch's modules. Returns timings, module counts and ``available``.
@@ -831,6 +838,9 @@ def prepare_artifacts(
     many commits behind ``base`` it is (``None`` for a fallback off the walk), ``cache_attempts`` every
     fetch tried and ``cache_skipped`` why the revisions before it were passed over. ``candidate``
     probes whether the failed candidate's own outputs were published (measurement only).
+    ``preferred`` are ``(service, revision)`` fetches tried before all of these (the workers' repair
+    namespace, ``repair_publish.preferred``); ``cache_service`` records the service of the restored
+    mapping.
     """
     record: dict = {}
     seconds = 0.0
@@ -842,8 +852,14 @@ def prepare_artifacts(
         if deps["rc"] != 0:
             reasons.append(f"lake exe cache get exited {deps['rc']}")
     attempts: list[dict] = []
-    for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors):
-        fetch = _fetch_mapping(worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False)
+    candidates = [(service, revision, None) for service, revision in preferred if revision] + [
+        (CACHE_SERVICE, revision, distance)
+        for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
+    ]
+    for service, revision, distance in candidates:
+        fetch = _fetch_mapping(
+            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
+        )
         fetch["distance"] = distance
         attempts.append(fetch)
         seconds += fetch["seconds"]
@@ -854,6 +870,7 @@ def prepare_artifacts(
     record["cache_attempts"] = attempts
     record["cache_revision"] = found["revision"] if found else None
     record["cache_distance"] = found["distance"] if found else None
+    record["cache_service"] = found["service"] if found else None
     record["cache_skipped"] = _skipped_summary(attempts, base)
     if found is None:
         reasons.append("; ".join(record["cache_skipped"]))
