@@ -959,12 +959,12 @@ def run_experiment(
             record["status"] = "prepared_only"
             write_record(record_path, record)
             return record
-        argv, agent_env = agent_environment(prompt, root, env, agent_timeout)
+        argv, agent_env, stdin_text = agent_environment(prompt, root, env, agent_timeout)
         record["agent_argv"] = [a if a != prompt else "<prompt>" for a in argv]
         record["status"] = "agent_running"
         record["agent_started_at"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         write_record(record_path, record)
-        record["agent"] = run_agent(worktree, argv, agent_env, experiment_dir / "logs", agent_timeout)
+        record["agent"] = run_agent(worktree, argv, agent_env, experiment_dir / "logs", agent_timeout, stdin_text)
         record["status"] = "measuring"
         write_record(record_path, record)
         record["result"] = measure_repair(clone, worktree, failure, chain_before, env, experiment_dir, build_timeout)
