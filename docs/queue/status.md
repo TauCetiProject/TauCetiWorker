@@ -173,7 +173,7 @@ Batch 3 held 234 PRs after insertions. Its own-base prepare task 8 was adopted a
 
 ## Provider chain in production (2026-11-05)
 
-The Claude subscription was skipped all day as ahead of its weekly pace (55% used at 33% of the week). Codex through the ChatGPT account needs `TAUCETI_AUTHORING_CODEX_MODEL=gpt-6-astra`, because `gpt-6.1-sol` is API-only there; without that pin the task falls through to the API key.
+The Claude subscription was skipped all day as ahead of its weekly pace (55% used at 33% of the week). Codex through the ChatGPT account first failed on `gpt-6.1-sol` with `model_not_found` ("The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account"), and the repair environment was pinned to `TAUCETI_AUTHORING_CODEX_MODEL=gpt-6-astra` as a workaround. The cause was the Codex CLI on chungus, 0.154.0, which lacks the `gpt-6.1-sol` model metadata ("Model metadata for `gpt-6.1-sol` not found"), not the account. After `npm install -g @openai/codex@latest` (0.166.0) at 20:50 UTC, `codex exec --model gpt-6.1-sol` on the same Pro ChatGPT account answered normally; the pin was removed and both workers restarted, so the default Sol profile with its probe and `gpt-6-luna` fallback is in use. A `model_not_found` for Sol on a ChatGPT account means an outdated Codex CLI: update it, and compare `codex --version` with another fleet host's when checking a host.
 
 ## Heads 3 and 4 landing (2026-11-05)
 
