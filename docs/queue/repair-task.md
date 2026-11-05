@@ -334,7 +334,7 @@ its lock removed. Rebase-conflict tasks, resumed tasks and `--no-stream-repair` 
 flow: the preparation's own incremental build, then the agent.
 
 **Preparing an open batch** (`kind: "prepare"`; `docs/queue/controller.md`, "Background
-preparation"). While the head waits on CI the controller hands out `prepare` tasks for quiet open
+preparation"). While the head waits on CI or is repaired the controller hands out `prepare` tasks for quiet open
 batches: `base` and `tip` are the open batch's own (never the head's tip), `onto` is `base`, and
 `diagnostics` is empty because no CI run has seen the batch. The worker runs it as a repair with the
 streaming build, always, even under `--no-stream-repair`, since that build is how it learns whether
@@ -346,7 +346,12 @@ fails to build so the batch is ready when it becomes the head, and that nothing 
 the result is validated, pushed and submitted the same way, and the controller adopts it into the
 open batch's members, which carry the repairs through the batch's later rebase as the head. The
 claim's `extra.renew_after` is 60 seconds: the controller supersedes a preparation when its batch
-seals or the head gets a task, and the refused renewal stops the agent within a minute.
+seals or changes, and the refused renewal stops the agent within a minute. The submission's notes
+carry `remaining_errors` (`prepare_remaining_errors`): none when the parallel path's verification
+build passed, otherwise the compiler errors handed to the last agent (the streaming build's
+`errors.jsonl` merged with the diagnostics), which no worker build showed fixed. The controller
+passes them to the batch's later `pre_rebase` task as a `prepare_errors` diagnostic, which the
+prompt lists under "Errors the batch's preparation left".
 
 ## Repair cache publication
 

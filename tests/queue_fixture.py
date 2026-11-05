@@ -1148,6 +1148,107 @@ class Preparation(QueueFixture):
         self.assertEqual(repair.claim(self.controller).kind, "repair")
         self.assertEqual(repair.tasks[0].batch_id, head["id"])
 
+    def test_a_second_worker_prepares_the_open_batch_while_the_first_repairs_the_head(self):
+        self.controller.set_setting("prepare_min_members", 3, "t")
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.github.ci_policy = self.broken_content_policy()
+        self.approve(101, {"TauCeti/Pr101.lean": "BROKEN\n"})
+        self.tick()
+        head = self.head()
+        for number in (201, 202, 203):
+            self.approve(number, {f"TauCeti/Pr{number}.lean": "BROKEN\n" if number == 202 else f"{number}\n"})
+        self.tick()
+        batch = self.open_batch()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        self.assertEqual(
+            self.controller.store.count("tasks", {"kind": "prepare", "state": "open"}), 1, "beside the head's task"
+        )
+        repairer = self.agent(
+            "repairer", script=lambda task: {f"{PROJECT}#101": Resolution({"TauCeti/Pr101.lean": "101\n"})}
+        )
+        preparer = self.agent(
+            "preparer", script=lambda task: {f"{PROJECT}#202": Resolution({"TauCeti/Pr202.lean": "202\n"})}
+        )
+        repair = repairer.claim(self.controller)
+        preparation = preparer.claim(self.controller)
+        self.assertEqual((repair.kind, repair.batch_id), ("repair", head["id"]))
+        self.assertEqual((preparation.kind, preparation.batch_id), ("prepare", batch["id"]))
+        tip = preparer.produce(preparation)
+        self.assertTrue(self.controller.submit_task(preparation.task_id, preparation.claim_token, tip).accepted)
+        tip = repairer.produce(repair)
+        self.assertTrue(self.controller.submit_task(repair.task_id, repair.claim_token, tip).accepted)
+        self.drive_until_landed(batch, [repairer, preparer])
+        self.assertEqual(self.source_failures(batch), 0, "prepared while the head was repaired")
+        self.assertEqual([t.kind for t in preparer.tasks], ["prepare"])
+
+
+class SequencedBackgroundTasks(QueueFixture):
+    """An open batch is prepared before it is pre-rebased: a preparation adopted under a running
+    pre-rebase would rewrite its chain and discard the agent's conflict resolutions."""
+
+    def test_the_pre_rebase_follows_the_preparation_and_seals_with_both(self):
+        self.controller.set_setting("prepare_min_members", 2, "t")
+        self.github.ci_policy = lambda head, _base, members: (
+            ("fail", [{"kind": "compiler", "module": "TauCeti/P203.lean", "message": "error in PR 203"}])
+            if "BROKEN" in (self.repo.file_at(head, "TauCeti/P203.lean") or "")
+            else ("pass", [])
+        )
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.tick()
+        head = self.head()
+        self.approve(202, {"Shared.lean": "line one\nline two by 202\nline three\n"})
+        self.approve(203, {"TauCeti/P203.lean": "BROKEN\n"})
+        self.tick()
+        batch = self.open_batch()
+        self.assertEqual(batch["pre_rebase_state"], "conflict")
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "pre_rebase"}), 0, "not before preparation")
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        open_kinds = [
+            t["kind"] for t in self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        ]
+        self.assertEqual(open_kinds, ["prepare"])
+        preparer = self.agent(
+            "preparer",
+            script=lambda task: {
+                f"{PROJECT}#203": Resolution({"TauCeti/P203.lean": "203\n"}, explanation="Replaced BROKEN.")
+            },
+        )
+        self.assertTrue(preparer.run(self.controller).accepted)
+        self.assertEqual(preparer.tasks[0].kind, "prepare")
+        self.tick()
+        prepared = self.open_batch()
+        pre_rebase = self.controller.store.row("tasks", {"kind": "pre_rebase", "state": "open"})
+        self.assertEqual((pre_rebase["tip"], pre_rebase["onto"]), (prepared["tip"], head["tip"]))
+
+        def resolve(task):
+            self.assertEqual(task.kind, "pre_rebase")
+            return {
+                f"{PROJECT}#202": Resolution(
+                    {"Shared.lean": "line one\nline two by 101 and 202\nline three\n"},
+                    explanation="Merged the line two edits of #101 and this PR.",
+                )
+            }
+
+        resolver = self.agent("resolver", script=resolve)
+        self.assertTrue(resolver.run(self.controller).accepted)
+        self.assertEqual(self.open_batch()["pre_rebase_state"], "adopted")
+        self.assertEqual(self.controller.store.count("tasks", {"batch_id": batch["id"], "state": "open"}), 0)
+        self.run_ci()
+        self.tick(2)
+        sealed = self.head()
+        self.assertEqual(sealed["id"], batch["id"])
+        self.assertTrue(self.controller.store.journal_entries("rebased")[-1]["detail"]["pre_rebased"])
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["state"], "landed")
+        self.assertEqual(self.repo.file_at("main", "Shared.lean"), "line one\nline two by 101 and 202\nline three\n")
+        self.assertEqual(self.repo.file_at("main", "TauCeti/P203.lean"), "203\n")
+
 
 class Lanes(QueueFixture):
     def test_s20_urgent_pr_is_in_the_next_head_without_cancelling_the_running_one(self):
