@@ -2474,7 +2474,7 @@ class Fixture(unittest.TestCase):
             patch.object(rr, "conversation_identity", return_value="fixture-account"),
             patch(
                 "tauceti_worker.agents.host_agent_argv",
-                side_effect=lambda *a: ([sys.executable, "-c", script], os.environ.copy()),
+                side_effect=lambda *a, **k: ([sys.executable, "-c", script], os.environ.copy()),
             ),
             patch("tauceti_worker.agents.host_build_cache_context", side_effect=lambda *a: contextlib.nullcontext([])),
             patch("tauceti_worker.fleet_capacity.check_launch_admission") as admission,

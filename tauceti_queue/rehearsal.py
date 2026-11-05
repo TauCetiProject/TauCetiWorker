@@ -1357,6 +1357,14 @@ class LocalRig(Rig):
                 return {"id": comment["id"], "body": comment["body"]}
         return None
 
+    def runner_environment(self) -> dict[str, str | None]:
+        # The dry run builds with the `lake` stub under `bin_dir`, which the offline sandbox would not
+        # see; sandboxing a stub proves nothing, and the dry run must pass on hosts without bwrap.
+        # The live rehearsal builds with the real `lake` and keeps the sandbox.
+        from .repair_sandbox import DISABLE_VARIABLE
+
+        return {DISABLE_VARIABLE: "0"}
+
     def runner_config(self, inference_attempts: int):
         from .repair_task import RunnerConfig
 
@@ -1377,6 +1385,10 @@ class LocalRig(Rig):
             push_remote=str(self.repo.origin),
             mathlib_cache=False,
             lake=(str(self.bin_dir / "lake"),),
+            # The scripted `claude` stub runs as the `api` provider: the subscriptions' eligibility
+            # reads real credentials and usage endpoints, which the dry run has neither of.
+            providers=("api",),
+            api_key="rehearsal-local",
         )
 
 
@@ -2523,6 +2535,9 @@ class Rehearsal:
             "An admin advance rebases the running head; a conflicting member goes to a rebase-conflict task; a PR that did not replay cleanly is probed again and inserts without an agent",
             [2, 9, 10],
         ) as rec:
+            # One open batch: a conflicting PR then waits for the open batch's base to change, the path
+            # this scenario rehearses, instead of starting a second open batch on main.
+            self.rig.admin("/admin/settings", {"open_batch_limit": 1})
             invocations = self.rig.agent_invocations()
             gamma = self.rig.create_pr("gamma", self.content.module("Gamma", "7 + 1 = 8"))
             self.rig.hold_ci()
@@ -2626,6 +2641,9 @@ class Rehearsal:
             ]
             expect(conflicts, f"batch {head_y['id']} has no probe-conflict entry for #{xray.number}")
             rec.evidence["probe_conflict_event"] = conflicts[0]
+            from .controller import DEFAULT_SETTINGS
+
+            self.rig.admin("/admin/settings", {"open_batch_limit": DEFAULT_SETTINGS["open_batch_limit"]})
             expect(
                 landed_y["base"] != head_y["base"] or head_y["base"] == landed_g["tip"],
                 "the resolved chain is not based on the landed head",
