@@ -1061,6 +1061,7 @@ class Preparation(QueueFixture):
         """A head in CI and an open batch with one broken member behind it; returns the batch and the agent."""
         self.controller.set_setting("prepare_open_batches", prepare, "t")
         self.controller.set_setting("prepare_min_members", 3, "t")
+        self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.github.ci_policy = self.broken_content_policy()
         self.approve(101, {"TauCeti/Pr101.lean": "head\n"})
         self.tick()
@@ -1189,6 +1190,10 @@ class Preparation(QueueFixture):
 class SequencedBackgroundTasks(QueueFixture):
     """An open batch is prepared before it is pre-rebased: a preparation adopted under a running
     pre-rebase would rewrite its chain and discard the agent's conflict resolutions."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
 
     def test_the_pre_rebase_follows_the_preparation_and_seals_with_both(self):
         self.controller.set_setting("prepare_min_members", 2, "t")
@@ -1553,6 +1558,10 @@ class StatusAndComments(QueueFixture):
 
 class PreRebase(QueueFixture):
     """The next open batch is replayed onto the head's tip once the head's chain is submitted (item 9)."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
 
     def journal(self, kind):
         return self.controller.store.journal_entries(kind)

@@ -120,6 +120,7 @@ TASK_PREPARE = "prepare"
 TASK_PRIORITY = {TASK_REBASE_CONFLICT: 0, TASK_REPAIR: 0, TASK_PRE_REBASE: 1, TASK_PREPARE: 2}
 # The kinds of an open batch's background tasks: at most one of them is open or claimed per batch.
 BACKGROUND_TASKS = (TASK_PRE_REBASE, TASK_PREPARE)
+BACKGROUND_OPERATIONS = tuple(f"task:{kind}" for kind in BACKGROUND_TASKS)
 # How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
 # is how the worker learns that the controller took the batch back (it sealed, or the head needs the
 # worker), so the interval bounds how long a superseded preparation keeps running.
@@ -782,10 +783,11 @@ class Controller:
         `repair_concurrency` bounds the live task claims in total. Within it, tasks are offered in
         three tiers, each by kind priority then age (`TASK_PRIORITY`): first a head task (`repair` or
         `rebase_conflict`) nobody holds; then an open batch's background task (`pre_rebase`, then
-        `prepare`), one claim per batch; last a further claim on a head task already held, up to
-        `repair_concurrency` claims on it. So with two workers one repairs the head while the other
-        prepares or pre-rebases the next batch, and a second claim on the head's task is only taken
-        when no background task waits.
+        `prepare`), one claim per batch and at most `repair_concurrency - 1` background claims in
+        total, so head work never waits behind background work; last a further claim on a head task
+        already held, up to `repair_concurrency` claims on it. So with two workers one repairs the
+        head while the other prepares or pre-rebases the next batch, and a second claim on the head's
+        task is only taken when no background task waits.
         """
         with self._lock:
             now = self.clock()
@@ -843,8 +845,10 @@ class Controller:
         self, claimable: list[tuple[dict[str, Any], dict[str, Any]]], concurrency: int
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """The next claim's task among `claimable` (ordered by kind priority, then age): an unheld
-        head task, else a background task on a batch no worker holds a background task of, else a
-        held head task with fewer than `concurrency` claims."""
+        head task, else a background task on a batch no worker holds a background task of, while
+        background claims number fewer than `concurrency - 1` (one slot is always left for head work,
+        so with `repair_concurrency` 1 nothing runs in the background), else a held head task with
+        fewer than `concurrency` claims."""
         held: dict[int, int] = {}
         for task, batch in claimable:
             held[task["id"]] = len(self._active_claims(batch["id"], task_id=task["id"]))
@@ -852,9 +856,11 @@ class Controller:
         for pair in head:
             if held[pair[0]["id"]] == 0:
                 return pair
-        for task, batch in claimable:
-            if task["kind"] in BACKGROUND_TASKS and not self._background_claims(batch["id"]):
-                return task, batch
+        background = [c for c in self._active_task_claims() if c["operation"] in BACKGROUND_OPERATIONS]
+        if len(background) < concurrency - 1:
+            for task, batch in claimable:
+                if task["kind"] in BACKGROUND_TASKS and not self._background_claims(batch["id"]):
+                    return task, batch
         for pair in head:
             if held[pair[0]["id"]] < concurrency:
                 return pair
@@ -862,8 +868,7 @@ class Controller:
 
     def _background_claims(self, batch_id: int) -> list[dict[str, Any]]:
         """The live claims on the batch's background tasks (`prepare`, `pre_rebase`)."""
-        operations = {f"task:{kind}" for kind in BACKGROUND_TASKS}
-        return [c for c in self._active_claims(batch_id) if c["operation"] in operations]
+        return [c for c in self._active_claims(batch_id) if c["operation"] in BACKGROUND_OPERATIONS]
 
     def _claimable_tasks(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         """Open tasks whose batch is still at the task's version and in the state the kind works on

@@ -434,6 +434,10 @@ class Rebuild(ControllerCase):
 class PreRebase(ControllerCase):
     """The next open batch is replayed onto the head only once the head's chain is submitted."""
 
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 2, "kim")  # room for one background claim
+
     def open_batch(self):
         return self.controller.store.row("batches", {"state": "open"})
 
@@ -746,6 +750,8 @@ class Preparation(ControllerCase):
     def setUp(self):
         super().setUp()
         self.controller.set_setting("prepare_min_members", 3, "t")
+        # Background claims leave one slot for head work: with 1 there are none.
+        self.controller.set_setting("repair_concurrency", 2, "t")
 
     def open_batch(self, numbers=(201, 202, 203)):
         """A head waiting on CI and an open batch of `numbers` behind it."""
@@ -827,20 +833,30 @@ class Preparation(ControllerCase):
         self.controller.tick()
         return head
 
-    def test_a_running_preparation_is_not_superseded_by_a_head_task(self):
+    def test_a_running_preparation_is_not_superseded_and_a_head_task_is_claimed_at_once(self):
         self.open_batch()
         self.quiet()
         preparation = self.controller.claim_task("worker-1", "admin-worker")
         self.assertEqual(preparation.kind, "prepare")
+        self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"), "the last slot is the head's")
         self.fail_head()
         self.assertEqual([t["id"] for t in self.prepare_tasks()], [preparation.task_id])
         self.controller.renew_task(preparation.task_id, preparation.claim_token)
-        # repair_concurrency bounds the claims in total: the head's task waits for a second slot.
-        self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"))
-        self.assertEqual(self.controller.status()["counters"]["claim_collisions"], 1)
-        self.controller.set_setting("repair_concurrency", 2, "t")
-        self.assertEqual(self.controller.claim_task("worker-2", "admin-worker").kind, "repair")
+        repair = self.controller.claim_task("worker-2", "admin-worker")
+        self.assertEqual(repair.kind, "repair", "head work never waits behind background work")
         self.assertIsNone(self.controller.claim_task("worker-3", "admin-worker"))
+
+    def test_with_concurrency_one_a_preparation_is_never_claimed(self):
+        self.controller.set_setting("repair_concurrency", 1, "t")
+        self.open_batch()
+        self.quiet()
+        self.assertEqual(len(self.prepare_tasks()), 1)
+        self.assertIsNone(self.controller.claim_task("worker-1", "admin-worker"), "no background claims at 1")
+        self.fail_head()
+        self.quiet()
+        self.assertEqual(len(self.prepare_tasks()), 1, "still open beside the head's task")
+        self.assertEqual(self.controller.claim_task("worker-1", "admin-worker").kind, "repair")
+        self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"))
 
     def test_a_preparation_is_created_and_claimed_while_the_head_has_a_task(self):
         batch = self.open_batch()

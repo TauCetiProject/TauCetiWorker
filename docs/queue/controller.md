@@ -139,8 +139,9 @@ no `prepare` task open or settled (adopted, clean or failed) at that version get
 task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. This happens whether
 or not the head has a task of its own, since the long head repairs are when the batch would
 otherwise sit idle. `claim_task` offers it after every head task nobody holds, one claim per batch,
-within `repair_concurrency` claims in total (below), so a second worker prepares while the first
-repairs the head; the claim's `extra.renew_after` is 60 seconds, so a worker learns within a minute
+within `repair_concurrency` claims in total and at most `repair_concurrency - 1` background claims
+(below), so a second worker prepares while the first repairs the head, a head task appearing is
+claimed at once by a free worker, and with `repair_concurrency` 1 no preparation is claimed; the claim's `extra.renew_after` is 60 seconds, so a worker learns within a minute
 that the controller took the batch back. A preparation is superseded only when its batch seals
 (`sealed`) or changes (`batch-changed`, an insertion or a trim), never by a head task appearing.
 While a worker holds the claim, insertion skips the batch and probes the next open batch (created
@@ -305,7 +306,7 @@ and reported in status:
 | --- | --- | --- |
 | `insertion_age_window` | 16 | size of the age window the draw is taken from |
 | `open_batch_limit` | 2 | open batches at most; an input conflicting with the first is assembled into the next (1 restores increment 1) |
-| `repair_concurrency` | 1 | live task claims in total, the head's and the open batches' background tasks together |
+| `repair_concurrency` | 1 | live task claims in total; background tasks hold at most one fewer, so 1 allows no background claims |
 | `stall_interval_seconds` | 900 | build silence after which status raises a stall |
 | `publication_enabled` | false | shadow mode when false: no dispatch, promotion, comment, label, close or ref push; status says what would happen |
 | `claim_ttl_seconds` | 900 | claim lifetime between renewals |
@@ -361,7 +362,10 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
   offered within `repair_concurrency` live task claims in total, in three tiers, each by kind
   priority then age: a head `repair` or `rebase_conflict` task nobody holds; then an open batch's
   background task (`pre_rebase` (above), then `prepare` (above)) on a batch where no worker holds
-  one; last a further claim on a head task already held, up to `repair_concurrency` claims on it.
+  one, while background claims number fewer than `repair_concurrency - 1`, so one slot is always
+  free for head work and with `repair_concurrency` 1 nothing runs in the background; last a further
+  claim on a head task already held (parallel head work), up to `repair_concurrency` claims on it,
+  taken only when no background task waits.
   A refusal because the total is reached while a head task waits counts in `claim_collisions`.
   The `Task` carries kind, batch and version,
   `base` and `tip` (the chain to start from), `onto` (the commit the replacement must be based on:
@@ -455,7 +459,8 @@ Background preparation is F `Preparation` (a prepared batch seals with its repai
 a failed CI round where the same batch unprepared fails one; insertion during preparation goes to the
 next batch; the head's repair task is claimed first; a second worker prepares the batch while the
 first repairs the head) and C `Preparation` (the quiet period and size, the setting, the claim tiers,
-a preparation created, claimed and adopted while the head has a task and not superseded by one,
+a preparation created, claimed and adopted while the head has a task and not superseded by one, a
+head task appearing during a preparation claimed at once, no background claim at concurrency 1,
 adoption keeping the batch open, sealing superseding a preparation, clean and failed releases).
 The sequencing of the two background kinds is F `SequencedBackgroundTasks` (prepared, then
 pre-rebased from the prepared chain, sealed and landed with both) and C `PreRebase` (no `pre_rebase`
