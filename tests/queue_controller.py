@@ -239,10 +239,10 @@ class Rebuild(ControllerCase):
         rebuilt = self.controller.store.row("batches", {"id": head["id"]})
         self.assertEqual((rebuilt["version"], rebuilt["tip"]), (head["version"] + 1, result["tip"]))
         self.assertEqual(self.controller.store.row("tasks", {"id": task["id"]})["state"], "superseded")
-        self.assertEqual(
         dispatches = len(self.github.dispatches)
         self.controller.tick()
         self.assertEqual(len(self.github.dispatches), dispatches + 1, "the rebuilt head is dispatched again")
+        self.assertEqual(
             self.repo.rev_parse(f"refs/tauceti-queue/batches/{head['id']}/v{rebuilt['version']}"), result["tip"]
         )
         attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"]}, order="id DESC")
