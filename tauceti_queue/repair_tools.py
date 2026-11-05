@@ -9,7 +9,9 @@ directory ``.tauceti-repair/build.lock``, taken atomically by ``mkdir`` with the
 The script takes module names (``TauCeti.Foo.Bar``) or paths (``TauCeti/Foo/Bar.lean``), with
 ``--dependents`` every module importing them transitively (from the library's ``import`` lines, one
 pass, cached in ``.tauceti-repair/imports.json``), and runs ``lake build --iofail`` on them in the
-foreground, exiting with Lake's status; no arguments builds the whole library. Lake runs in the offline
+foreground, exiting with Lake's status; no arguments builds the whole library and, when it is green, runs
+CI's audits and the changed-module lint (``repair_audit.helper_checks``, ``--no-audit`` skips them),
+exiting 1 on a finding. Lake runs in the offline
 ``bwrap`` sandbox of CI's required build (``repair_sandbox.sandboxed_lake``), as the worker's own builds do.
 """
 
@@ -80,11 +82,14 @@ def imports(root: Path) -> dict[str, list[str]]:
 BUILD_HEADER = '''#!/usr/bin/env python3
 """Build only the named modules, one lake build at a time. Written by the queue's repair worker.
 
-Usage: .tauceti-repair/build [--dependents] [TauCeti.Foo.Bar | TauCeti/Foo/Bar.lean ...]; no arguments
-builds the whole library, --dependents adds the modules importing the named ones (from the library's
+Usage: .tauceti-repair/build [--dependents] [--no-audit] [TauCeti.Foo.Bar | TauCeti/Foo/Bar.lean ...]; no
+arguments builds the whole library and, when it is green, runs CI's audits and the changed-module
+environment lint (tauceti_queue.repair_audit; --no-audit skips them), appending any finding to
+.tauceti-repair/errors.jsonl. --dependents adds the modules importing the named ones (from the library's
 import lines, cached in .tauceti-repair/imports.json: delete it after changing imports). Builds wait for
-and hold the lock directory .tauceti-repair/build.lock (mkdir, pid inside); exits with Lake's status.
-Lake runs offline in the bwrap sandbox of CI's required build (tauceti_queue.repair_sandbox).
+and hold the lock directory .tauceti-repair/build.lock (mkdir, pid inside); exits with Lake's status, or 1
+for an audit or lint finding. Lake runs offline in the bwrap sandbox of CI's required build
+(tauceti_queue.repair_sandbox).
 """
 import contextlib, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
@@ -94,14 +99,23 @@ ROOT = Path(__file__).resolve().parent.parent
 '''
 
 BUILD_MAIN = """
-modules = [a[:-5].replace("/", ".") if a.endswith(".lean") else a for a in sys.argv[1:] if a != "--dependents"]
+options = ("--dependents", "--no-audit")
+modules = [a[:-5].replace("/", ".") if a.endswith(".lean") else a for a in sys.argv[1:] if a not in options]
+scoped = bool(modules)
 if "--dependents" in sys.argv:
     table = imports(ROOT)
     for m in modules:  # grows while iterating: the closure over the reverse import graph
         modules += [d for d, deps in table.items() if m in deps and d not in modules]
 take_lock(lock := LOCK)
 try:
-    sys.exit(subprocess.run(sandboxed_lake(["lake", "build", "--iofail", *modules], ROOT), cwd=ROOT).returncode)
+    rc = subprocess.run(sandboxed_lake(["lake", "build", "--iofail", *modules], ROOT), cwd=ROOT).returncode
+    if rc == 0 and scoped:
+        print("audits: CI's audits and lint run after a whole-library build (no module arguments)", flush=True)
+    elif rc == 0 and "--no-audit" not in sys.argv:
+        from tauceti_queue.repair_audit import helper_checks
+
+        rc = helper_checks(ROOT)
+    sys.exit(rc)
 finally:
     shutil.rmtree(lock, ignore_errors=True)
 """

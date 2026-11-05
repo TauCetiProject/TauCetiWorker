@@ -253,11 +253,13 @@ has a time budget holds because the service re-exposes the task.
    (`lake build <Module>`) to be built first. Either way the prompt tells the agent to check a fix
    with the scoped build first and to run the whole-library `lake build --iofail` only as the final
    verdict: `.tauceti-repair/build` (written by `repair_tools.write_build_script` beside the check
-   script, a Python script of under sixty lines) takes module names (`TauCeti.Foo.Bar`) or paths
+   script, a Python script of under eighty-five lines) takes module names (`TauCeti.Foo.Bar`) or paths
    (`TauCeti/Foo/Bar.lean`), with `--dependents` every module importing them transitively (from the
    library's `import` lines, read in one pass and cached in `.tauceti-repair/imports.json`, which the
    worker drops whenever it rewrites the script), and runs `lake build --iofail` on them in the
-   foreground, exiting with Lake's status; with no arguments it builds the whole library. Every build
+   foreground, exiting with Lake's status; with no arguments it builds the whole library and, when that
+   is green, runs CI's audits and the changed-module lint (below; `--no-audit` skips them, a scoped build
+   prints that they run on the whole-library build). Every build
    in the worktree holds the lock directory `.tauceti-repair/build.lock`, taken atomically by `mkdir`
    with the holder's pid in `pid` inside: a waiter polls every 2 s, prints a line every 30 s, and
    clears a lock whose holder has died. The worker's own builds hold the same lock through
@@ -304,6 +306,35 @@ has a time budget holds because the service re-exposes the task.
    the same attempt. A chain that fails validation, a dirty worktree, or a HEAD still at the input
    tip is not acceptable: one bounded retry (`agent_attempts`, 2) with the local report and the
    retained input ref appended to the prompt, then `agent_failed`. Checkpoint `validated`.
+   **CI's audits on the worker** (`tauceti_queue/repair_audit.py`; setting `TAUCETI_QUEUE_WORKER_AUDITS`,
+   default on, and `--no-worker-audits`). Head 2's first CI round after a green worker build failed in the
+   audit phase on a duplicate declaration the agent's text scan had listed and set aside, so the checks are
+   the worker's, not the agent's. After every green whole-library `lake build --iofail` it runs (the
+   streaming build, the parallel path's verification build, the verification below and the agent's
+   `.tauceti-repair/build` without module arguments) it runs what CI's `sandbox-build.sh` runs after its
+   build: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti module, duplicate
+   declarations, axioms) and `lint-env.sh` with the `lint-env-driver` on the TauCeti modules changed between
+   the task's base and HEAD (`lint-scope.sh`'s module list for a batch). The sources are the TauCetiTools pin
+   the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
+   `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
+   `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
+   pinned `build-lint-driver.sh` and `build-audit-driver.sh` inside the sandbox (reused while pin, toolchain
+   and manifest are unchanged); the audit and the lint run in the sandbox too. Their output is read by
+   `diagnostics.parse_log`, so each finding is the diagnostic the controller would create from CI
+   (`{"kind": "audit", "module", "path", "message": "duplicate-declarations: ..."}` once per TauCeti module,
+   `lint` with its location), and it is appended to `.tauceti-repair/errors.jsonl` beside the compiler errors.
+   `repair.findings_from_diagnostics` turns a duplicate into one entry naming both modules, and the parallel
+   path keeps both owners in one group. When the checks cannot run at all (no pin, a failed fetch,
+   materialization or driver build) they are recorded as `unavailable` and logged, and CI remains the only
+   check. For a repair with warm artifacts, after the chain checks pass the worker runs its own verification
+   (`repair_audit.verify`, under the build lock: the whole-library build, then the checks); a failure is not
+   submitted: the agent is run again with the findings as the task's diagnostics and the report as feedback,
+   up to `verify_retries` (2) times, then the task is released as `agent_failed`. Each verification is in the
+   outcome's `verification` list. The prompt says only that the helper and the worker's verification run CI's
+   audits and lints and that the task cannot be submitted until they pass. CI's module-system check and
+   source style lint are not run on the worker. In CI runs of 2026-11-05 on the full library (24,455 TauCeti
+   modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
+   PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
 6. **Publish and submit.** Publish the build outputs (below), push, `result`, record the response (checkpoints `pushed`, `submitted`,
    then `adopted` or `not_adopted`). The worktree is removed afterwards unless `--keep-worktree`;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
