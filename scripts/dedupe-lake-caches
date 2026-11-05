@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Share identical Lake artifact blocks on reflink-capable Linux filesystems.
+
+Only the kernel changes storage mappings, after comparing bytes under its filesystem
+locks. Paths, inodes, permissions, hard links, metadata and concurrent readers/writers
+are preserved. This does NOT put Lake's mutable indexes or download temporaries in
+one directory. No privileges, worker restarts, API calls or cache deletion are needed.
+
+    scripts/dedupe-lake-caches --seconds 600
+
+Run as a low-priority background maintenance job, never in status or a paid round.
+Memory and elapsed time are bounded. A different starting worker each hour spreads
+coverage across subsequent runs. Statistics describe matched ranges, NOT freed bytes:
+the kernel can also report success for blocks which were already shared.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import errno
+import fcntl
+import json
+import os
+import re
+import stat
+import struct
+import time
+from pathlib import Path
+
+FIDEDUPERANGE = 0xC0189436
+CHUNK = 16 * 1024**2
+ARTIFACT = re.compile(r"[0-9a-f]{16}\.(?:ltar|o|a|so|art|olean(?:\.server|\.private)?|ilean|ir(?:\.sig)?|c|bc)")
+
+
+def identity(info):
+    return info.st_dev, info.st_ino, info.st_size
+
+
+def eligible(info):
+    return stat.S_ISREG(info.st_mode) and not info.st_mode & 0o222 and info.st_uid == os.getuid()
+
+
+def dedupe(source, target, expected_source, expected_target, *, deadline=float("inf")):
+    """Read-only descriptors suffice for owned files on Linux. Never chmod a live artifact."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    with os.fdopen(os.open(source, flags), "rb") as src, os.fdopen(os.open(target, flags), "rb") as dst:
+        a, b = os.fstat(src.fileno()), os.fstat(dst.fileno())
+        if not eligible(a) or not eligible(b):
+            return 0, "changed"
+        if identity(a) != expected_source or identity(b) != expected_target or a.st_size != b.st_size:
+            return 0, "changed"
+        if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+            return 0, "linked"
+        matched = 0
+        for offset in range(0, a.st_size, CHUNK):
+            if time.monotonic() >= deadline:
+                return matched, "deadline"
+            length = min(CHUNK, a.st_size - offset)
+            # struct file_dedupe_range, followed by one file_dedupe_range_info.
+            request = bytearray(struct.pack("=QQHHIqQQiI", offset, length, 1, 0, 0, dst.fileno(), offset, 0, 0, 0))
+            fcntl.ioctl(src.fileno(), FIDEDUPERANGE, request, True)
+            _, _, _, _, _, _, _, done, status, _ = struct.unpack("=QQHHIqQQiI", request)
+            if status < 0:
+                raise OSError(-status, os.strerror(-status))
+            if status == 1:
+                return matched, "different"
+            if status != 0 or done != length:
+                return matched, "partial"
+            matched += done
+        return matched, "matched"
+
+
+def roots(base):
+    base = base.resolve()
+    found = []
+    for pattern in (
+        "worker-runtimes/*/lib/python*/site-packages/tauceti_worker/state/*/home/.cache/lake/artifacts",
+        "worker-venv/lib/python*/site-packages/tauceti_worker/state/*/home/.cache/lake/artifacts",
+    ):
+        for path in base.glob(pattern):
+            if path.is_dir() and not path.is_symlink() and path.resolve().is_relative_to(base):
+                found.append(path)
+    return sorted(set(found))
+
+
+def run(directories, *, seconds=600, max_keys=100_000):
+    deadline = time.monotonic() + seconds
+    index = {}
+    report = collections.Counter()
+    last_report = time.monotonic()
+    for root in directories:
+        if time.monotonic() >= deadline:
+            break
+        report["directories_started"] += 1
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if time.monotonic() >= deadline:
+                        break
+                    report["names_seen"] += 1
+                    if time.monotonic() - last_report >= 30:
+                        print(json.dumps(dict(report, indexed=len(index), current=str(root))), flush=True)
+                        last_report = time.monotonic()
+                    if not ARTIFACT.fullmatch(entry.name):
+                        continue
+                    known = index.get(entry.name)
+                    if known is None and len(index) >= max_keys:
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        if not eligible(info) or info.st_size < 4096:
+                            continue
+                        current = identity(info)
+                        if known is None:
+                            index[entry.name] = (entry.path, current)
+                            continue
+                        path, previous = known
+                        if previous == current:
+                            report["same_inode"] += 1
+                            continue
+                        if previous[0] != current[0] or previous[2] != current[2]:
+                            continue
+                        count, outcome = dedupe(path, entry.path, previous, current, deadline=deadline)
+                        report[outcome] += 1
+                        report["matched_range_bytes"] += count
+                        if outcome == "changed":
+                            index[entry.name] = (entry.path, current)
+                    except FileNotFoundError:
+                        # Collection/unlink is normal. Use this still-eligible file next time.
+                        index.pop(entry.name, None)
+                    except OSError as error:
+                        report["errors"] += 1
+                        report[f"errno_{error.errno}"] += 1
+                        if error.errno in (errno.EOPNOTSUPP, errno.ENOTTY, errno.ENOSPC) or report["errors"] >= 100:
+                            report["stopped_early"] = 1
+                            return dict(report)
+        except FileNotFoundError:
+            continue
+    report["indexed"] = len(index)
+    report["deadline_reached"] = int(time.monotonic() >= deadline)
+    return dict(report)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", type=Path, default=Path.home() / ".local/share/tauceti-fleet")
+    parser.add_argument("--seconds", type=float, default=600)
+    parser.add_argument("--max-keys", type=int, default=100_000)
+    args = parser.parse_args()
+    if args.seconds <= 0 or args.max_keys <= 0:
+        parser.error("--seconds and --max-keys must be positive")
+    directories = roots(args.base)
+    if directories:
+        offset = int(time.time() // 3600) % len(directories)
+        directories = directories[offset:] + directories[:offset]
+    started = time.time()
+    print(json.dumps(dict(started_at=started, directories=len(directories))), flush=True)
+    report = run(directories, seconds=args.seconds, max_keys=args.max_keys)
+    print(json.dumps(dict(report, started_at=started, elapsed=time.time() - started, final=True)), flush=True)
+    return int(bool(report.get("stopped_early")))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

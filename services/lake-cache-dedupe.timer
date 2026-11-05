@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically share Tau Ceti Lake artifact blocks
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+Unit=lake-cache-dedupe.service
+
+[Install]
+WantedBy=timers.target
