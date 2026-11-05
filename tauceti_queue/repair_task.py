@@ -607,6 +607,10 @@ class RunnerConfig:
     # A release the service could not confirm (unreachable, 5xx) is retried from the checkpoint on
     # every loop pass, waiting these many seconds between attempts (the last value repeats).
     release_backoff: tuple[float, ...] = (5.0, 15.0, 60.0, 120.0, 300.0)
+    # After a repair task is released as ``artifacts_unavailable`` the loop waits this long before its
+    # next claim, doubling on each consecutive such release up to the second value, so a base with no
+    # published cache is not released and re-claimed within seconds.
+    artifacts_backoff: tuple[float, float] = (60.0, 600.0)
 
     @property
     def tasks_dir(self) -> Path:
@@ -803,6 +807,18 @@ def fetch_retained(
 
 def task_findings(task: Task) -> dict:
     return repair.findings_from_diagnostics(task.diagnostics)
+
+
+def artifact_revisions(task: Task) -> list[str]:
+    """The revisions whose published cache to try, in order. A rebase conflict replays the chain onto
+    ``onto`` and builds there, so its artifacts come first and the stale batch base is the fallback;
+    a repair builds on its base and falls back to ``onto`` when that differs."""
+    order = [task.onto, task.base] if task.kind == "rebase_conflict" else [task.base, task.onto]
+    revisions: list[str] = []
+    for revision in order:
+        if revision and revision not in revisions:
+            revisions.append(revision)
+    return revisions
 
 
 def prompt_context(task: Task, feedback: str | None, findings: dict | None = None) -> PromptContext:
@@ -1118,13 +1134,15 @@ def run_task(
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
             state.write("sources_ready", worktree=str(worktree), sources=outcome["sources"])
+            revisions = artifact_revisions(task)
             artifacts = repair.prepare_artifacts(
                 worktree,
-                task.base,
+                revisions[0],
                 env_lake,
                 logdir,
                 cfg.build_timeout,
                 repository=task.repository,
+                fallbacks=tuple(revisions[1:]),
                 mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
                 lake=cfg.lake,
             )
@@ -1135,8 +1153,23 @@ def run_task(
             }
             state.write("artifacts_ready" if artifacts["available"] else "artifacts_unavailable", artifacts=artifacts)
             if not artifacts["available"]:
-                return release_task(
-                    cfg, client, task, state, "artifacts_unavailable", artifacts["unavailable_reason"], outcome, lease
+                if task.kind != "rebase_conflict":
+                    return release_task(
+                        cfg,
+                        client,
+                        task,
+                        state,
+                        "artifacts_unavailable",
+                        artifacts["unavailable_reason"],
+                        outcome,
+                        lease,
+                    )
+                # The rebase itself needs no build; its validation build runs cold here or in the
+                # service's CI, so the agent is run rather than the task released.
+                outcome["artifacts"]["cold"] = True
+                log(
+                    f"task {task.task_id}: no warm artifacts ({artifacts['unavailable_reason']}); "
+                    "running the rebase without them"
                 )
         elif not worktree.is_dir():
             return release_task(
@@ -1596,6 +1629,25 @@ def serve(
             detail += "\n" + "".join(traceback.format_exception(error)).rstrip()
         log(f"{what}: {detail}; next attempt in {cfg.poll_seconds:.0f}s")
 
+    artifacts_wait = 0.0
+
+    def artifacts_backoff(outcome: dict) -> None:
+        """Wait before the next claim when a task was released for want of artifacts; the service
+        re-exposes the same task at once, and nothing publishes its cache within seconds."""
+        nonlocal artifacts_wait
+        if outcome.get("reason") != "artifacts_unavailable":
+            artifacts_wait = 0.0
+            return
+        first, cap = cfg.artifacts_backoff
+        artifacts_wait = min(artifacts_wait * 2, cap) if artifacts_wait else min(first, cap)
+        summary["artifacts_backoff"] = artifacts_wait
+        log(
+            f"task {outcome.get('task_id')}: artifacts unavailable ({outcome.get('detail')}); "
+            f"waiting {artifacts_wait:.0f}s before the next claim"
+        )
+        write_heartbeat(cfg, summary, "idle")
+        stop.wait(artifacts_wait)
+
     write_heartbeat(cfg, summary, "starting")
     log(f"serving {cfg.service} as {cfg.worker} (poll {cfg.poll_seconds:.0f}s, root {cfg.root})")
     if resume:
@@ -1622,6 +1674,7 @@ def serve(
             failed("task", error, trace=True)
         if outcome is not None:
             record(outcome)
+            artifacts_backoff(outcome)
             write_heartbeat(cfg, summary, "running" if not stop.is_set() else "stopping")
             continue
         write_heartbeat(cfg, summary, "idle")

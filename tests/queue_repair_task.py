@@ -61,14 +61,17 @@ TOKEN = "worker-token"
 # ---- stubs on PATH -------------------------------------------------------------------------------
 
 LAKE = r'''#!/usr/bin/env python3
-"""lake stub: `cache get` succeeds unless STUB_LAKE_CACHE_FAIL=1; `build` fails modules containing BROKEN."""
+"""lake stub: `cache get` succeeds unless STUB_LAKE_CACHE_FAIL=1 or the `--rev` is listed in
+STUB_LAKE_CACHE_FAIL_REVS (comma separated); `build` fails modules containing BROKEN."""
 import os, sys
 from pathlib import Path
 args = sys.argv[1:]
 log = Path(os.environ["STUB_DIR"]) / "lake-calls.log"
 log.open("a").write(" ".join(args) + "\n")
 if args[:2] == ["cache", "get"]:
-    if os.environ.get("STUB_LAKE_CACHE_FAIL") == "1":
+    rev = next((a[len("--rev="):] for a in args if a.startswith("--rev=")), "")
+    unpublished = [r for r in os.environ.get("STUB_LAKE_CACHE_FAIL_REVS", "").split(",") if r]
+    if os.environ.get("STUB_LAKE_CACHE_FAIL") == "1" or rev in unpublished:
         print("error: outputs not found for revision")
         sys.exit(1)
     print("downloaded artifact 0011")
@@ -284,6 +287,28 @@ class Content:
             "extra": {"canonical_branch": "main"},
         }
 
+    def rebase_task(self, task_id: int = 1) -> dict:
+        """A rebase-conflict task: main moved past the batch base, so ``onto`` differs from ``base``."""
+        seed = self.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.base)
+        onto = commit(seed, "main moved", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        sh(seed, "push", "--quiet", "origin", f"{onto}:refs/heads/queue/batch-1/onto")
+        task = self.task(task_id, kind="rebase_conflict")
+        task["onto"] = onto
+        task["retained_refs"] = [*task["retained_refs"], "refs/heads/queue/batch-1/onto"]
+        task["diagnostics"] = [
+            {
+                "kind": "conflict",
+                "source_pr": f"{PROJECT}#2",
+                "paths": ["TauCeti/Two.lean"],
+                "onto": onto,
+                "message": f"replaying the chain onto {onto[:12]} conflicts at {PROJECT}#2",
+                "pending": [f"{PROJECT}#3"],
+                "clean_prefix_tip": self.members[0]["commit"],
+            }
+        ]
+        return task
+
 
 # ---- the fake service ----------------------------------------------------------------------------
 
@@ -392,6 +417,7 @@ class FakeService:
             "task_id": task_id,
             "token": token,
             "worker": worker,
+            "claimed_at": time.time(),
             "expires_at": time.time() + self.ttl,
             "released_at": None,
             "release_reason": None,
@@ -545,6 +571,7 @@ class Fixture(unittest.TestCase):
         os.environ["STUB_DIR"] = str(self.stub_dir)
         os.environ["STUB_AGENT_MODE"] = "repair"
         os.environ.pop("STUB_LAKE_CACHE_FAIL", None)
+        os.environ.pop("STUB_LAKE_CACHE_FAIL_REVS", None)
         os.environ.pop("STUB_SLEEP", None)
         self.service = FakeService(self.content.bare, [self.content.task()])
         self.addCleanup(self.service.close)
@@ -568,6 +595,7 @@ class Fixture(unittest.TestCase):
             fetch_retry_seconds=0.0,  # the scenarios that wait for late refs set their own window
             fetch_retry_delay=0.05,
             release_backoff=(0.0,),
+            artifacts_backoff=(0.0, 0.0),
         )
         values.update(overrides)
         return repair_task.RunnerConfig(**values)
@@ -839,6 +867,90 @@ class ArtifactsUnavailable(Fixture):
         self.assertIsNotNone(self.service.live_claim(1), "the claim is held until it expires on its own")
         self.assertFalse(outcome["lease"]["lost"])
 
+    def test_a_repair_on_a_published_base_fetches_the_base_only(self):
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        fetches = [c.split("--rev=")[1] for c in self.lake_calls() if c.startswith("cache get")]
+        self.assertEqual(fetches, [self.content.base])
+        self.assertEqual(outcome["artifacts"]["cache_revision"], self.content.base)
+
+    def test_revision_order_by_task_kind(self):
+        repair_raw = self.content.task()
+        rebase_raw = self.content.rebase_task()
+        claim = {"claim_token": "x", "expires_at": time.time() + 60, "extra": {"claim_id": 1}}
+        repair_same = repair_task.Task.from_json({**repair_raw, **claim})
+        self.assertEqual(repair_task.artifact_revisions(repair_same), [self.content.base])
+        repair_moved = repair_task.Task.from_json({**repair_raw, **claim, "onto": rebase_raw["onto"]})
+        self.assertEqual(repair_task.artifact_revisions(repair_moved), [self.content.base, rebase_raw["onto"]])
+        rebase = repair_task.Task.from_json({**rebase_raw, **claim})
+        self.assertEqual(repair_task.artifact_revisions(rebase), [rebase_raw["onto"], self.content.base])
+
+
+class RebaseArtifacts(Fixture):
+    """A rebase conflict builds on ``onto``: its published cache is fetched first, the stale base is
+    the fallback, and with neither the rebase runs without warm artifacts instead of being released."""
+
+    def setUp(self):
+        super().setUp()
+        self.raw = self.content.rebase_task()
+        self.onto = self.raw["onto"]
+        self.service.tasks = {1: self.raw}
+
+    def fetches(self) -> list[str]:
+        return [c.split("--rev=")[1] for c in self.lake_calls() if c.startswith("cache get")]
+
+    def test_the_rebase_target_is_fetched_first(self):
+        os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.content.base  # the stale base has no outputs
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.fetches(), [self.onto], "onto's cache was found; the base was never tried")
+        self.assertTrue(outcome["artifacts"]["available"])
+        self.assertEqual(outcome["artifacts"]["cache_revision"], self.onto)
+        self.assertNotIn("cold", outcome["artifacts"])
+        self.assertEqual(self.service.releases, [])
+        self.assertEqual(len(self.service.results), 1)
+
+    def test_the_base_is_the_fallback_when_onto_is_not_published_yet(self):
+        os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.onto
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.fetches(), [self.onto, self.content.base])
+        self.assertEqual(outcome["artifacts"]["cache_revision"], self.content.base)
+        attempts = outcome["artifacts"]["cache_attempts"]
+        self.assertEqual([a["mapping_found"] for a in attempts], [False, True])
+        self.assertEqual(self.service.releases, [])
+
+    def test_without_any_artifacts_the_rebase_runs_cold(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.fetches(), [self.onto, self.content.base], "every candidate was tried")
+        self.assertFalse(outcome["artifacts"]["available"])
+        self.assertIsNone(outcome["artifacts"]["cache_revision"])
+        self.assertTrue(outcome["artifacts"]["cold"])
+        self.assertIn(self.onto[:12], outcome["artifacts"]["unavailable_reason"])
+        self.assertIn(self.content.base[:12], outcome["artifacts"]["unavailable_reason"])
+        self.assertEqual([c for c in self.lake_calls() if c.startswith("build")], [], "no incremental build")
+        self.assertEqual(len(self.agent_calls()), 1, "the agent ran without warm artifacts")
+        self.assertEqual(self.service.releases, [], "a rebase without artifacts is not released")
+        history = [h["state"] for h in self.state()["history"]]
+        self.assertIn("artifacts_unavailable", history)
+        self.assertGreater(history.index("agent_running"), history.index("artifacts_unavailable"))
+        self.assertEqual(self.state()["state"], "adopted")
+
+    def test_a_repair_without_artifacts_is_still_released(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        self.service.tasks = {1: self.content.task()}
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "artifacts_unavailable")
+        self.assertEqual(self.agent_calls(), [])
+
 
 class InferenceUnavailable(Fixture):
     def test_bounded_retries_then_release(self):
@@ -1002,6 +1114,27 @@ class Serve(Fixture):
         self.assertIn("SourcesUnavailable", self.state("1")["error"])
         self.assertEqual(self.state("2")["state"], "adopted")
         self.assertEqual(self.heartbeat(cfg)["last_error"]["what"], "task")
+
+    def test_a_repair_released_for_artifacts_waits_with_backoff_before_the_next_claim(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config(poll_seconds=0.05, artifacts_backoff=(0.4, 0.6))
+        stop = repair_task.Stop()
+        thread, result = self.serve_in_thread(cfg, stop)
+        self.wait_for(lambda: len(self.service.releases) >= 4, "the task keeps being released and re-claimed")
+        stop.set("test")
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(all(r["reason"] == "artifacts_unavailable" for r in self.service.releases))
+        claims = sorted(self.service.claims.values(), key=lambda c: c["id"])[:4]
+        gaps = [
+            later["claimed_at"] - earlier["released_at"] for earlier, later in zip(claims, claims[1:], strict=False)
+        ]
+        # A minute doubling to ten in production; here 0.4 s then the 0.6 s cap, never within poll_seconds.
+        self.assertGreaterEqual(gaps[0], 0.4, gaps)
+        self.assertGreaterEqual(gaps[1], 0.6, gaps)
+        self.assertGreaterEqual(gaps[2], 0.6, gaps)
+        self.assertEqual(result["summary"]["artifacts_backoff"], 0.6)
+        self.assertEqual(self.agent_calls(), [])
 
     def test_sigterm_interrupts_the_agent_keeps_the_claim_and_the_next_start_resumes(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
