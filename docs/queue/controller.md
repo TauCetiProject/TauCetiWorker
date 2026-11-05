@@ -2,8 +2,9 @@
 
 `tauceti_queue/controller.py` is the state machine of increment 1 of
 [`docs/redesign/specs/ai-merge-queue.md`](../redesign/specs/ai-merge-queue.md) (on the `overhaul`
-branch): one open batch receiving scripted insertions, at most one sealed head that is rebased,
-built, repaired in place by agents and fast-forwarded onto the canonical branch. It is one object
+branch): open batches receiving scripted insertions (one, plus a second for inputs that conflict with
+the first; see "Open batches" below), at most one sealed head that is rebased, built, repaired in
+place by agents and fast-forwarded onto the canonical branch. It is one object
 shared by the reconciliation loop (`tauceti_queue/loop.py`) and the HTTP server (work plan stream F),
 over one SQLite database (`tauceti_queue/store.py`) and a local clone of the content repository. It
 talks to GitHub only through the `GitHubPort` protocol in `tauceti_queue/ports.py`; all chain work is
@@ -62,17 +63,22 @@ Every `tick()` (one reconciliation pass) does, under the controller lock:
    `Source-PR` appears in the new commits are cancelled as `landed-externally`. An admin merge of a
    member PR needs no special case: the member's commit replays as an empty commit at the next
    rebase, or conflicts and goes to an agent.
-3. Insertion passes: while there are waiting inputs not yet probed in this pass, ensure the open
-   batch exists (based on the canonical commit), draw one (below), reserve it, claim the batch,
+3. Insertion passes: while there are waiting inputs not yet probed in this pass against an open
+   batch they are eligible for, ensure the first open batch exists (based on the canonical commit),
+   pick the oldest open batch with eligible inputs, draw one (below), reserve it, claim the batch,
    `chain.build` its squash onto the tip in the clone, recheck the batch version, and commit tip,
    version, member row, retained ref and the `inserted` state in one transaction (plus the
-   membership label through the outbox). A conflict leaves the input waiting with the paths and the
-   tip it conflicted with (it is not re-merged until the tip moves); a conflict against the
-   canonical commit itself cancels the input and posts the conflict request. Any error returns the
-   input to waiting and releases the claim.
-4. Seal: when there is no head, the open batch is nonempty, no claim is active on it, no
+   membership label through the outbox). A conflict leaves the input waiting with the paths and,
+   per batch (`probe_conflicts`), the base it conflicted against: the input is not probed against
+   that batch again while its base is unchanged (the conflict is with content already in the
+   chain, so appending members cannot resolve it) but against the next open batch, created when
+   none exists and fewer than `open_batch_limit` are open; a conflict against the canonical commit
+   itself cancels the input and posts the conflict request. Any error returns the input to waiting
+   and releases the claim. Empty open batches beyond the first are removed at the end of the pass.
+4. Seal: when there is no head, the oldest open batch is nonempty, no claim is active on it, no
    inference hold is in force and Bors's external head (below) is not awaited, it becomes the head
-   in the same pass and a new open batch is created. There is no collection window.
+   in the same pass; the other open batches stay open and keep receiving insertions, and a new open
+   batch is created only when none remains. There is no collection window.
 5. Head reconciliation, in the plan's order: a head under a worker's task claim is left alone;
    a head not based on the canonical commit is claimed and replayed (`chain.replay`), a clean
    replay becoming the next version with provenance unchanged, a conflict becoming a
@@ -86,6 +92,18 @@ Insertion draw: inputs are ordered urgent first, then priority, then age. The wi
 `insertion_age_window` passes while in the window is drawn (oldest first), which is the starvation
 bound of scenario 18; else one is drawn at random. `passes_waited` counts passes spent in the window
 without being drawn and resets on a draw.
+
+Open batches: increment 1 has one open batch, and an approved PR whose replay conflicts textually
+with content in it waits until that batch seals and lands. A step beyond increment 1 (operator
+decision, 2026-11-05, with about 190 approved inputs waiting behind a 1,200-member open batch in
+production) allows up to `open_batch_limit` open batches (default 2; 1 restores increment 1), ordered
+by id. An input is probed against the first open batch; one whose recorded conflict is against that
+batch's current base is probed against the next, which is created on the canonical commit (never on
+another batch's tip: batches are never stacked on an unlanded predecessor) when none exists. An
+input that conflicts with every open batch waits as before. Sealing takes the oldest open batch;
+when it lands and the canonical commit advances, the next sealed head is rebased by the ordinary
+path and its conflicts become `rebase_conflict` tasks for the agent, which is the intended place for
+them. The urgent lane still inserts into the first open batch, which seals when the head lands.
 
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
@@ -186,6 +204,7 @@ and reported in status:
 | setting | initial | meaning |
 | --- | --- | --- |
 | `insertion_age_window` | 16 | size of the age window the draw is taken from |
+| `open_batch_limit` | 2 | open batches at most; an input conflicting with the first is assembled into the next (1 restores increment 1) |
 | `repair_concurrency` | 1 | concurrent task claims on the head |
 | `stall_interval_seconds` | 900 | build silence after which status raises a stall |
 | `publication_enabled` | false | shadow mode when false: no dispatch, promotion, comment, label, close or ref push; status says what would happen |
@@ -257,8 +276,9 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
 `status()` returns the `tauceti-queue.status/v1` document, JSON-serialisable, with: `repository`,
 `canonical_branch`, `canonical_sha`; `service` (running revision, start time, now, last pass);
 `settings` (effective values) and `publication_enabled`; `inference_hold`; `waiting` (count, urgent
-count, oldest age, max passes waited, the inputs); `open_batch` (id, version, base, tip, size,
-oldest member age, members, claim, retained ref); `head` (the same plus `sealed_at`,
+count, oldest age, max passes waited, the inputs); `open_batch` (the first open batch: id, version,
+base, tip, size, oldest member age, members, claim, retained ref); `open_batches` (every open batch
+in id order: id, version, base, tip, size, urgent, oldest member age); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
@@ -287,7 +307,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 6 reservation, claims, expiry, late results | F `test_s6_s11_claims_expiry_late_results_and_second_claimants`, `test_s6_reservation_and_duplicate_approvals_cannot_insert_a_pr_twice`; C `Tasks` |
 | 7 one open batch, at most one head, claimed batch protected, seal without delay, restart | F `test_s7_sealing_promotion_and_restart_keep_one_open_batch_and_at_most_one_head` |
 | 8 open batch never launches CI; settings change without a PR | F `test_s8_open_batch_never_launches_ci_and_settings_change_without_a_pr`; C `Settings` |
-| 9 a conflicting PR is probed again and inserts once its batch-mate landed | F `test_s9_conflicting_pr_is_probed_again_and_inserts_once_its_batch_mate_landed`, `test_pr_conflicting_with_main_itself_gets_the_conflict_request` |
+| 9 a conflicting PR is probed again and inserts once its batch-mate landed | F `test_s9_conflicting_pr_is_probed_again_and_inserts_once_its_batch_mate_landed`, `test_conflicting_pr_is_not_probed_again_until_the_batch_base_changes` (both with `open_batch_limit` 1), `test_pr_conflicting_with_main_itself_gets_the_conflict_request` |
 | 10 admin advances, lost promotion responses, no merge commit, stale CI | F `test_s10_admin_advance_...`, `test_s10_promotion_refused_after_an_advance_between_pass_and_push`, `test_s10_lost_promotion_response_is_reconciled_from_main`, `test_s10_s19_stale_status_cannot_approve_changed_source` |
 | 11 authorized claim, second claimant and late result cannot compete | F `test_s6_s11_...`, `test_s11_renewal_keeps_a_claim_alive_and_release_frees_the_task`; C `test_repair_concurrency_allows_parallel_claims_and_first_adoption_wins` (warm artifacts are stream G's) |
 | 12 restart recovers outbox, claims and CI state before repeating work | F `test_s12_restart_recovers_pending_outbox_expired_claim_and_repeats_no_work`, `test_s12_loop_runs_passes_on_wake_and_on_the_polling_interval` |
@@ -305,4 +325,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 
 Also covered: infrastructure failures retried with backoff and bounded
 (`test_infrastructure_failures_are_retried_with_backoff_and_bounded`), shadow mode publishing
-nothing and reconciling an external landing (`test_shadow_mode_builds_batches_but_publishes_nothing`).
+nothing and reconciling an external landing (`test_shadow_mode_builds_batches_but_publishes_nothing`). The second open batch (beyond increment 1) is F `OpenBatches`: a conflicting PR is
+assembled into a second batch based on the canonical commit, the oldest seals first and the other
+keeps receiving, `open_batch_limit` 1 keeps it waiting, a PR conflicting with every open batch
+waits, an empty second batch is removed, and a restart attributes a legacy conflict record.

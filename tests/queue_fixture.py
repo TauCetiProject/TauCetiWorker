@@ -6,6 +6,7 @@ a controllable clock and no inference. The tests are named after the acceptance 
 `docs/redesign/specs/ai-merge-queue.md`; the mapping is in `docs/queue/controller.md`.
 """
 
+import json
 import sys
 import tempfile
 import time
@@ -15,7 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue import chain  # noqa: E402
+from tauceti_queue import chain, feeds  # noqa: E402
 from tauceti_queue.controller import MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
@@ -741,6 +742,7 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.controller.status()["head"]["task"]["diagnostics"][0]["module"], "TauCeti/A.lean")
 
     def test_s9_conflicting_pr_is_probed_again_and_inserts_once_its_batch_mate_landed(self):
+        self.controller.set_setting("open_batch_limit", 1, "t")  # increment 1: one open batch
         self.github.ci_policy = fail_members(102)
         self.approve(101, {"A.lean": "a\n"})
         self.tick()
@@ -779,6 +781,7 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.repo.file_at("main", "Shared.lean"), "line one\nline two by 103\nline three\n")
 
     def test_conflicting_pr_is_not_probed_again_until_the_batch_base_changes(self):
+        self.controller.set_setting("open_batch_limit", 1, "t")  # one open batch: a conflicting input waits
         self.approve(101, {"A.lean": "a\n"})
         self.tick()  # head 101
         self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
@@ -818,6 +821,176 @@ class HeadOperations(QueueFixture):
         self.tick()
         self.assertIn("conflicts with `main`", self.github.comments_for(101)[0]["body"])
         self.assertIsNone(self.head())
+
+
+class OpenBatches(QueueFixture):
+    """A step beyond increment 1 (operator decision, 2026-11-05): up to `open_batch_limit` open batches."""
+
+    def open_batches(self):
+        return self.controller.batches("open")
+
+    def test_conflicting_pr_is_assembled_into_a_second_open_batch_based_on_canonical(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()  # head 101
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.tick()
+        batch_a = self.open_batch()
+        self.approve(103, {"Shared.lean": "line one\nline two by 103\nline three\n"})
+        self.tick()
+        # 103 conflicts with 102 in batch A and is assembled into batch B in the same pass.
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-conflict"}), 1)
+        self.assertEqual(self.controller.inputs()[2]["state"], "inserted")
+        batch_a, batch_b = self.open_batches()
+        self.assertEqual(self.controller.inputs()[2]["batch_id"], batch_b["id"])
+        self.assertEqual([m["number"] for m in self.members(batch_a)], [102])
+        self.assertEqual([m["number"] for m in self.members(batch_b)], [103])
+        self.assertEqual(batch_b["base"], self.repo.main_sha(), "based on the canonical commit")
+        self.assertNotEqual(batch_b["base"], batch_a["tip"], "never stacked on another open batch")
+        self.assertEqual(self.controller.inputs()[2]["last_probe"], "inserted")
+        status = self.controller.status()
+        self.assertEqual(status["open_batch"]["id"], batch_a["id"], "the first open batch, for compatibility")
+        self.assertEqual(
+            [(b["id"], b["size"], b["base"]) for b in status["open_batches"]],
+            [(batch_a["id"], 1, batch_a["base"]), (batch_b["id"], 1, batch_b["base"])],
+        )
+        self.assertIsNotNone(status["open_batches"][0]["oldest_member_age_seconds"])
+        source = feeds.ControllerFeedSource(self.controller)
+        self.assertEqual(
+            {(view.id, view.state) for view in source.active_batches(PROJECT, "main") if not view.sealed},
+            {(batch_a["id"], "waiting"), (batch_b["id"], "waiting")},
+        )
+        # A clean input still goes into the first open batch; a third open batch is never created.
+        self.approve(104, {"D.lean": "d\n"})
+        self.tick()
+        self.assertEqual([m["number"] for m in self.members(self.open_batch())], [102, 104])
+        self.assertEqual(len(self.open_batches()), 2)
+        # The head lands: A (the oldest) seals, B stays open and keeps receiving insertions.
+        self.run_ci()
+        self.tick(2)
+        head = self.head()
+        self.assertEqual(head["id"], batch_a["id"])
+        self.assertEqual([m["number"] for m in self.members(head)], [102, 104])
+        self.assertEqual([b["id"] for b in self.open_batches()], [batch_b["id"]])
+        self.approve(105, {"E.lean": "e\n"})
+        self.tick()
+        self.assertEqual([m["number"] for m in self.members(self.open_batch())], [103, 105])
+        # A lands; B seals and its conflict with 102's content is the head's rebase conflict task.
+        self.run_ci()
+        self.tick(2)
+        head = self.head()
+        self.assertEqual(head["id"], batch_b["id"])
+        status = self.controller.status()["head"]
+        self.assertEqual(status["stage"], "rebase_conflict")
+        self.assertEqual(status["task"]["diagnostics"][0]["source_pr"], f"{PROJECT}#103")
+        self.assertEqual(status["task"]["diagnostics"][0]["paths"], ["Shared.lean"])
+        agent = self.agent(
+            script=lambda t: {
+                f"{PROJECT}#103": Resolution(
+                    {"Shared.lean": "line one\nline two by 102 and 103\nline three\n"},
+                    explanation="Merged the line two edits of #102 and this PR.",
+                )
+            }
+        )
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.file_at("main", "Shared.lean"), "line one\nline two by 102 and 103\nline three\n")
+        self.assertEqual(self.repo.file_at("main", "E.lean"), "e\n")
+        self.assertEqual({row["state"] for row in self.controller.inputs()}, {"landed"})
+
+    def test_open_batch_limit_one_keeps_the_conflicting_pr_waiting(self):
+        self.controller.set_setting("open_batch_limit", 1, "operator")
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.tick()
+        self.approve(103, {"Shared.lean": "line one\nline two by 103\nline three\n"})
+        self.tick(3)
+        self.assertEqual(self.controller.inputs()[2]["state"], "waiting")
+        self.assertEqual(self.controller.inputs()[2]["probes"], 1)
+        self.assertEqual(len(self.open_batches()), 1)
+        self.assertEqual(len(self.controller.status()["open_batches"]), 1)
+        # Raising the limit assembles it into a second batch on the next pass.
+        self.controller.set_setting("open_batch_limit", 2, "operator")
+        self.tick()
+        self.assertEqual(self.controller.inputs()[2]["state"], "inserted")
+        self.assertEqual(len(self.open_batches()), 2)
+
+    def test_pr_conflicting_with_every_open_batch_waits_until_one_seals(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.tick()
+        self.approve(103, {"Shared.lean": "line one\nline two by 103\nline three\n"})
+        self.tick()
+        batch_a, batch_b = self.open_batches()
+        self.approve(104, {"Shared.lean": "line one\nline two by 104\nline three\n"})
+        self.tick()
+        waiting = self.controller.inputs()[3]
+        self.assertEqual(waiting["state"], "waiting")
+        self.assertEqual(waiting["probes"], 2, "probed once against each open batch")
+        self.assertEqual(len(self.open_batches()), 2, "no third batch beyond the limit")
+        self.tick(2)
+        self.assertEqual(self.controller.inputs()[3]["probes"], 2, "not probed again while both bases stand")
+        # The head lands and A seals: A's content is no longer in an open batch, so 104 is assembled into a
+        # new open batch on the canonical commit (as it would be in increment 1 once the batch sealed); its
+        # conflict with 102 resurfaces at that batch's rebase, as a `rebase_conflict` task for the agent.
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.head()["id"], batch_a["id"])
+        self.assertEqual([b["id"] for b in self.open_batches()], [batch_b["id"]])
+        self.assertEqual(self.controller.inputs()[3]["state"], "waiting", "A sealed after this tick's insertions")
+        self.tick()
+        self.assertEqual(self.controller.inputs()[3]["state"], "inserted")
+        batch_b, batch_c = self.open_batches()
+        self.assertEqual(self.controller.inputs()[3]["batch_id"], batch_c["id"])
+        self.assertEqual(batch_c["base"], self.repo.main_sha())
+        self.assertNotEqual(batch_c["base"], self.head()["tip"], "never stacked on the unlanded head")
+
+    def test_empty_second_open_batch_is_removed(self):
+        self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.tick()
+        batch_a = self.open_batch()
+        # 103 conflicts with 102 in batch A; on the second batch, fresh on the canonical commit, the
+        # conflict is with main itself, so the input is cancelled and the empty batch removed.
+        self.approve(
+            103, {"Shared.lean": "line one\nline two by 103\nline three\n"}, start=self.repo.rev_parse("main~1")
+        )
+        self.tick()
+        self.assertEqual(self.controller.inputs()[2]["state"], "cancelled")
+        self.assertEqual(self.controller.inputs()[2]["reason"], "conflicts-with-main")
+        self.assertEqual([b["id"] for b in self.open_batches()], [batch_a["id"]])
+        removed = self.controller.store.journal_entries("batch-removed")
+        self.assertEqual([entry["detail"]["reason"] for entry in removed], ["idle"])
+        self.assertEqual(self.controller.status()["open_batch"]["id"], batch_a["id"])
+        self.assertEqual(len(self.controller.status()["open_batches"]), 1)
+
+    def test_restart_attributes_a_legacy_conflict_record_to_the_open_batch(self):
+        self.controller.set_setting("open_batch_limit", 1, "t")
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.tick()
+        self.approve(103, {"Shared.lean": "line one\nline two by 103\nline three\n"})
+        self.tick()
+        conflicted = self.controller.inputs()[2]
+        self.assertEqual(conflicted["state"], "waiting")
+        batch_a = self.open_batch()
+        # A database written before `probe_conflicts` existed records the conflict by base only.
+        self.controller.store.update("inputs", {"id": conflicted["id"]}, probe_conflicts="{}")
+        self.controller.set_setting("open_batch_limit", 2, "t")
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        restarted.recover()
+        self.assertEqual(json.loads(restarted.inputs()[2]["probe_conflicts"]), {str(batch_a["id"]): batch_a["base"]})
+        restarted.tick()
+        self.assertEqual(restarted.inputs()[2]["probes"], 2, "not re-probed against A; probed against B")
+        self.assertEqual(restarted.inputs()[2]["state"], "inserted")
+        self.assertEqual(len(restarted.batches("open")), 2)
 
 
 class Lanes(QueueFixture):

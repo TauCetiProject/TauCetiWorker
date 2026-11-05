@@ -541,6 +541,7 @@ class StatusShape(ControllerCase):
                 "inference_hold",
                 "waiting",
                 "open_batch",
+                "open_batches",
                 "head",
                 "external_head",
                 "approvals",

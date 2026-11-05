@@ -54,6 +54,7 @@ COMMENT_MARKER = "tauceti-queue"
 # the initial value is the type a new value must have.
 DEFAULT_SETTINGS: dict[str, Any] = {
     "insertion_age_window": 16,
+    "open_batch_limit": 2,
     "repair_concurrency": 1,
     "stall_interval_seconds": 900,
     "publication_enabled": False,
@@ -1035,8 +1036,13 @@ class Controller:
 
     # --- records -----------------------------------------------------------------------------------
 
+    def _open_batches(self) -> list[dict[str, Any]]:
+        """Open batches oldest first: insertion tries them in this order and sealing takes the first."""
+        return self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+
     def _open_batch(self) -> dict[str, Any] | None:
-        return self.store.row("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id DESC")
+        batches = self._open_batches()
+        return batches[0] if batches else None
 
     def _head(self) -> dict[str, Any] | None:
         return self.store.row("batches", {"repository": self.repository, "state": BATCH_HEAD}, order="id DESC")
@@ -1114,6 +1120,7 @@ class Controller:
                 for row in self.store.rows("inputs", {"repository": self.repository, "state": INPUT_RESERVED}):
                     self.store.update("inputs", {"id": row["id"]}, state=INPUT_WAITING)
                     returned += 1
+                self._attribute_legacy_conflicts()
                 self._expire_claims(now)
                 pending = self.store.count("outbox", {"state": "pending"})
                 self.store.journal(
@@ -1121,6 +1128,16 @@ class Controller:
                 )
             self.started_at = now
             return {"released_claims": released, "returned_reservations": returned, "outbox_pending": pending}
+
+    def _attribute_legacy_conflicts(self) -> None:
+        """Databases from before `probe_conflicts` recorded a conflict by base only, against the one open batch."""
+        open_batches = self._open_batches()
+        if len(open_batches) != 1:
+            return
+        batch = open_batches[0]
+        for row in self.store.rows("inputs", {"repository": self.repository, "state": INPUT_WAITING}):
+            if row["last_probe_base"] == batch["base"] and not loads(row["probe_conflicts"], {}):
+                self.store.update("inputs", {"id": row["id"]}, probe_conflicts=dumps({str(batch["id"]): batch["base"]}))
 
     def wake_event(self) -> threading.Event:
         return self._wake
@@ -1180,28 +1197,44 @@ class Controller:
         return rows
 
     def _insertion_passes(self, now: float) -> None:
-        """Probe each waiting input at most once per tick, one age-windowed random draw per pass."""
-        probed: set[int] = set()
-        while True:
-            batch = self._ensure_open_batch(now) if self._waiting() else None
-            if batch is None:
+        """Probe each waiting input at most once per open batch per tick, one age-windowed random draw per pass.
+
+        Open batches are tried oldest first. An input that conflicted with this very tip would conflict
+        again, and a textual conflict is with content already in the chain, so appending members cannot
+        resolve it: an input whose recorded conflict is against a batch's current base is not probed there
+        again but against the next open batch, created on the canonical commit (never on another batch's
+        tip) while fewer than `open_batch_limit` are open. An input that conflicts with every open batch
+        waits for a base to change (a new open batch or a rebase).
+        """
+        probed: set[tuple[int, int]] = set()  # (input, batch) pairs probed in this tick
+        while self._waiting():
+            batches = self._ensure_open_batches(now)
+            if batches is None:
                 break
-            # An input that conflicted with this very tip would conflict again; it waits for the tip to move.
-            # A textual conflict is with content already in the chain, so appending members cannot resolve
-            # it: a conflicted input is re-probed only once the batch's base changes (a new open batch or
-            # a rebase), not after every insertion, which cost one replay per conflicted input per member.
-            waiting = [
-                row
-                for row in self._waiting()
-                if row["id"] not in probed
-                and row["last_probe_tip"] != batch["tip"]
-                and not (row["last_probe_base"] and row["last_probe_base"] == batch["base"])
-            ]
-            if not waiting:
-                break
-            window = waiting[: max(1, int(self.setting("insertion_age_window")))]
-            chosen = self._draw(waiting)
-            probed.add(chosen["id"])
+            remaining = self._waiting()
+            target: dict[str, Any] | None = None
+            eligible: list[dict[str, Any]] = []
+            for batch in batches:
+                eligible = [
+                    row
+                    for row in remaining
+                    if (row["id"], batch["id"]) not in probed and self._probe_eligible(row, batch)
+                ]
+                if eligible:
+                    target = batch
+                    break
+                remaining = [row for row in remaining if self._conflicted_with(row, batch)]
+                if not remaining:
+                    break
+            if target is None:
+                if not remaining or len(batches) >= max(1, int(self.setting("open_batch_limit"))):
+                    break
+                assert self._canonical is not None
+                target = self._create_open_batch(self._canonical, now)
+                eligible = remaining
+            window = eligible[: max(1, int(self.setting("insertion_age_window")))]
+            chosen = self._draw(eligible)
+            probed.add((chosen["id"], target["id"]))
             with self.store.transaction():
                 for row in window:
                     if row["id"] != chosen["id"]:
@@ -1211,8 +1244,16 @@ class Controller:
                         )
                 self.store.update("inputs", {"id": chosen["id"]}, passes_waited=0)
                 self._set_state("insertion_passes", int(self._state("insertion_passes", 0)) + 1)
-            self._probe(chosen, batch, now)
-        self._remove_idle_open_batch(now)
+            self._probe(chosen, target, now)
+        self._remove_idle_open_batches(now)
+
+    @staticmethod
+    def _conflicted_with(row: dict[str, Any], batch: dict[str, Any]) -> bool:
+        """The input's recorded conflict against this batch is against the batch's current base."""
+        return loads(row["probe_conflicts"], {}).get(str(batch["id"])) == batch["base"]
+
+    def _probe_eligible(self, row: dict[str, Any], batch: dict[str, Any]) -> bool:
+        return row["last_probe_tip"] != batch["tip"] and not self._conflicted_with(row, batch)
 
     def _draw(self, waiting: list[dict[str, Any]]) -> dict[str, Any]:
         window = waiting[: max(1, int(self.setting("insertion_age_window")))]
@@ -1225,25 +1266,33 @@ class Controller:
             return overdue[0]  # the age bound: nobody waits more than the window's passes without a draw
         return self.rng.choice(window)
 
-    def _ensure_open_batch(self, now: float) -> dict[str, Any] | None:
-        batch = self._open_batch()
+    def _ensure_open_batches(self, now: float) -> list[dict[str, Any]] | None:
+        """The open batches oldest first, stale empty ones removed and the first created when none remains."""
         canonical = self._canonical
         if canonical is None:
             self._reasons.append("canonical branch not yet observed")
             return None
-        if batch is not None and not self._members(batch["id"]) and batch["base"] != canonical:
-            self._remove_batch(batch, "stale-empty", now)
-            batch = None
-        if batch is None:
-            batch = self._create_open_batch(canonical, now)
-        return batch
+        batches = []
+        for batch in self._open_batches():
+            if not self._members(batch["id"]) and batch["base"] != canonical:
+                self._remove_batch(batch, "stale-empty", now)
+            else:
+                batches.append(batch)
+        if not batches:
+            batches.append(self._create_open_batch(canonical, now))
+        return batches
 
-    def _remove_idle_open_batch(self, now: float) -> None:
-        batch = self._open_batch()
-        if batch is None or self._members(batch["id"]):
-            return
-        if not self._waiting() and self._canonical is not None and batch["base"] != self._canonical:
-            self._remove_batch(batch, "idle", now)
+    def _remove_idle_open_batches(self, now: float) -> None:
+        """Remove empty open batches: a later one as soon as the pass leaves it empty (it is created on
+        demand for an input that conflicts with the batches before it), the first only when nothing waits
+        and its base is stale."""
+        for position, batch in enumerate(self._open_batches()):
+            if self._members(batch["id"]):
+                continue
+            if position > 0:
+                self._remove_batch(batch, "idle", now)
+            elif not self._waiting() and self._canonical is not None and batch["base"] != self._canonical:
+                self._remove_batch(batch, "idle", now)
 
     def _remove_batch(self, batch: dict[str, Any], reason: str, now: float) -> None:
         with self.store.transaction():
@@ -1314,6 +1363,9 @@ class Controller:
                     )
                     self._conflict_request(row, paths, now)
                 else:
+                    open_ids = {str(b["id"]) for b in self._open_batches()}
+                    conflicts = {k: v for k, v in loads(row["probe_conflicts"], {}).items() if k in open_ids}
+                    conflicts[str(batch["id"])] = batch["base"]
                     self.store.update(
                         "inputs",
                         {"id": row["id"]},
@@ -1322,6 +1374,7 @@ class Controller:
                         last_probe=dumps(paths),
                         last_probe_tip=batch["tip"],
                         last_probe_base=batch["base"],
+                        probe_conflicts=dumps(conflicts),
                     )
                 self._release_claim(claim, "conflict", now)
                 self.store.journal(
@@ -1412,7 +1465,7 @@ class Controller:
                 size=len(self._members(batch["id"])),
                 urgent=batch["urgent"],
             )
-            if self._canonical is not None:
+            if self._canonical is not None and not self._open_batches():
                 self._create_open_batch(self._canonical, now)
 
     # --- head reconciliation -----------------------------------------------------------------------
@@ -2131,7 +2184,8 @@ class Controller:
             now = self.clock()
             settings = self.effective_settings()
             waiting = self._waiting()
-            open_batch = self._open_batch()
+            open_batches = self._open_batches()
+            open_batch = open_batches[0] if open_batches else None
             head = self._head()
             hold = self._state("inference_hold")
             alerts: list[str] = []
@@ -2168,6 +2222,7 @@ class Controller:
                     "inputs": [self._input_status(row) for row in waiting],
                 },
                 "open_batch": None if open_batch is None else self._batch_status(open_batch, now),
+                "open_batches": [self._open_batch_summary(batch, now) for batch in open_batches],
                 "head": head_status,
                 "external_head": self._external_head_status(),
                 "approvals": {
@@ -2217,6 +2272,18 @@ class Controller:
             "passes_waited": row["passes_waited"],
             "probes": row["probes"],
             "last_probe": row["last_probe"],
+        }
+
+    def _open_batch_summary(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
+        members = self._members(batch["id"])
+        return {
+            "id": batch["id"],
+            "version": batch["version"],
+            "base": batch["base"],
+            "tip": batch["tip"],
+            "size": len(members),
+            "urgent": bool(batch["urgent"]),
+            "oldest_member_age_seconds": (now - min(m["added_at"] for m in members)) if members else None,
         }
 
     def _batch_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:

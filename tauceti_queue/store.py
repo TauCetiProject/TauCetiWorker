@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS inputs (
     last_probe TEXT NOT NULL DEFAULT '',
     last_probe_tip TEXT NOT NULL DEFAULT '',
     last_probe_base TEXT NOT NULL DEFAULT '',
+    probe_conflicts TEXT NOT NULL DEFAULT '{}',
     landed_at REAL,
     landed_sha TEXT
 );
@@ -233,6 +234,7 @@ class Store:
     ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
         ("ci_attempts", "verdicts", "TEXT NOT NULL DEFAULT '{}'"),
         ("inputs", "last_probe_base", "TEXT NOT NULL DEFAULT ''"),
+        ("inputs", "probe_conflicts", "TEXT NOT NULL DEFAULT '{}'"),
     )
 
     def _add_missing_columns(self) -> None:
