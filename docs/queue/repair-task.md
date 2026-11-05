@@ -230,6 +230,17 @@ original prompt, skipping source and artifact preparation. A claim the service n
 is recorded as `claim_lost` and not resumed. Bookkeeping loss therefore never restarts a model
 session while the claim is live, and a lost claim never produces a late submission.
 
+A claim never outlives the worker that holds it. On SIGTERM with the agent running, the claim is
+renewed and the task checkpointed as `interrupted` for the next start to resume; a stop before the
+agent ran (fetching sources, preparing artifacts) releases the claim with reason `worker-stopped`
+so the service re-exposes the task at once, and the log says which. On start, every checkpoint of
+this worker still in flight (`claimed`, `sources_ready`, `artifacts_ready`, `artifacts_unavailable`,
+`agent_running`, `validated`, `pushed`, `submitted`, `interrupted`) has its claim renewed: a
+resumable one (`agent_running`, `interrupted`) continues, any other is released as `worker-stopped`
+and the task claimed fresh. When a claim comes back empty while such a checkpoint of ours holds a
+live claim (the service refused the claim for concurrency because of it), the stale claim is
+released with its token and the claim retried at once rather than at the next poll.
+
 A task that ends in an error releases its claim (`artifacts_unavailable` before the agent ran,
 `agent_failed` after) so the service re-exposes it at once rather than at the claim's expiry. When
 the service cannot confirm a release (unreachable, 5xx) the checkpoint keeps it as

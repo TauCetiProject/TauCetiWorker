@@ -72,7 +72,22 @@ RELEASE_REASONS = (
     "agent_launch_failed",
     "agent_failed",
     "push_failed",
+    "worker-stopped",  # the worker was stopped (SIGTERM) before the task reached a resumable phase
 )
+# Checkpoint states with the claim still ours and the task unfinished; everything else is settled.
+IN_FLIGHT_STATES = (
+    "claimed",
+    "sources_ready",
+    "artifacts_ready",
+    "artifacts_unavailable",
+    "agent_running",
+    "validated",
+    "pushed",
+    "submitted",
+    "interrupted",
+)
+# In-flight states a restarted worker continues instead of releasing: the agent's session exists.
+RESUMABLE_STATES = ("agent_running", "interrupted")
 # ``run_repair_agent`` statuses that release the task under the same name.
 RELEASED_AGENT_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
 # Checkpoint states before the agent has run: an error there is released as ``artifacts_unavailable``.
@@ -747,7 +762,13 @@ def _fetch_chunk(clone: Path, task_id: str, group: list[tuple[str, str, str]]) -
     return fetched_a + fetched_b, {**missing_a, **missing_b}
 
 
-def _fetch_retained_once(clone: Path, task: Task, chunk: int = FETCH_CHUNK, done: set[str] | None = None) -> dict:
+def _fetch_retained_once(
+    clone: Path,
+    task: Task,
+    chunk: int = FETCH_CHUNK,
+    done: set[str] | None = None,
+    cancel: threading.Event | None = None,
+) -> dict:
     """Fetch the retained refs a chunk of refspecs per ``git fetch`` (a task can retain a thousand of
     them: per ref, production took 1.3 s each). ``done`` holds the private refs already fetched by an
     earlier attempt of the same call, which are not fetched again; the refs the remote lacks are
@@ -757,6 +778,8 @@ def _fetch_retained_once(clone: Path, task: Task, chunk: int = FETCH_CHUNK, done
     missing: dict[str, str] = {}
     pending = [entry for entry in specs if entry[1] not in done]
     for start in range(0, len(pending), max(1, chunk)):
+        if cancel is not None and cancel.is_set():
+            raise RuntimeError("fetch cancelled")
         fetched, absent = _fetch_chunk(clone, task.task_id, pending[start : start + max(1, chunk)])
         done.update(fetched)
         missing.update(absent)
@@ -795,7 +818,7 @@ def fetch_retained(
     while True:
         attempt += 1
         try:
-            fetched = _fetch_retained_once(clone, task, chunk, done)
+            fetched = _fetch_retained_once(clone, task, chunk, done, cancel)
         except RuntimeError as error:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or (cancel is not None and cancel.is_set()):
@@ -1148,15 +1171,28 @@ def run_task(
         return stop is not None and stop.is_set()
 
     def cancelled(detail: str) -> dict:
-        """The agent was cancelled: by the worker stopping (keep the claim and checkpoint for a resume)
-        or by the claim being lost (discard)."""
-        if stopping() and not lease.lost.is_set():
-            phase = state.state
+        """The agent was cancelled: by the claim being lost (discard), or by the worker stopping. A
+        stop with the agent's session in hand renews the claim and checkpoints the task for the next
+        start to resume; before that the claim is released as ``worker-stopped`` so the service
+        re-exposes the task at once instead of at the claim's expiry."""
+        if not stopping() or lease.lost.is_set():
+            return discard(lease.lost_reason or detail)
+        phase = state.state
+        if phase == "agent_running" or state.session():
+            lease.stop()
+            try:
+                task.expires_at = client.renew(task)
+                renewed = f"claim renewed to {time.strftime('%H:%M:%S', time.gmtime(task.expires_at))}"
+            except (ClaimRefused, ServiceError) as error:
+                renewed = f"claim not renewed ({error})"
             outcome.update(status="interrupted", detail=detail, phase=phase)
             state.write("interrupted", phase=phase, detail=detail, outcome=outcome)
-            log(f"task {task.task_id}: interrupted while {phase}; claim kept for the next start to resume")
+            log(f"task {task.task_id}: interrupted while {phase}; {renewed}; the next start resumes the session")
             return outcome
-        return discard(lease.lost_reason or detail)
+        log(f"task {task.task_id}: stopped while {phase}, before the agent ran; releasing the claim (worker-stopped)")
+        return release_task(
+            cfg, client, task, state, "worker-stopped", f"worker stopped while {phase}: {detail}", outcome, lease
+        )
 
     try:
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
@@ -1164,13 +1200,18 @@ def run_task(
             verify_admin(task.repository)
         env_lake = repair.lake_env(cfg.root)
         if not resuming:
-            outcome["sources"] = fetch_retained(
-                cfg.clone,
-                task,
-                retry_seconds=cfg.fetch_retry_seconds,
-                retry_delay=cfg.fetch_retry_delay,
-                cancel=cancel,
-            )
+            try:
+                outcome["sources"] = fetch_retained(
+                    cfg.clone,
+                    task,
+                    retry_seconds=cfg.fetch_retry_seconds,
+                    retry_delay=cfg.fetch_retry_delay,
+                    cancel=cancel,
+                )
+            except SourcesUnavailable:
+                if stopping() and not lease.lost.is_set():
+                    return cancelled("the worker stopped while the sources were fetched")
+                raise
             outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, task.tip, worktree)
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
@@ -1193,6 +1234,8 @@ def run_task(
                 }
             }
             state.write("artifacts_ready" if artifacts["available"] else "artifacts_unavailable", artifacts=artifacts)
+            if stopping() and not lease.lost.is_set():
+                return cancelled("the worker stopped while the artifacts were prepared")
             if not artifacts["available"]:
                 if task.kind != "rebase_conflict":
                     return release_task(
@@ -1405,10 +1448,14 @@ def run_task(
         # failure before the agent ran is the sources' or artifacts' fault; later it is the attempt's.
         # When the service cannot confirm, the checkpoint keeps the release for ``retry_releases``.
         if not lease.lost.is_set():
-            reason = "artifacts_unavailable" if phase in PRE_AGENT_PHASES else "agent_failed"
+            if stopping():
+                reason = "worker-stopped"  # the stop interrupted the step (a cancelled fetch, a killed build)
+            else:
+                reason = "artifacts_unavailable" if phase in PRE_AGENT_PHASES else "agent_failed"
             with contextlib.suppress(Exception):
                 release_task(cfg, client, task, state, reason, outcome["error"], dict(outcome), lease)
                 outcome["release"] = state.state
+            log(f"task {task.task_id}: failed while {phase}; claim {state.state} ({reason})")
         raise
     finally:
         lease.stop()
@@ -1452,6 +1499,8 @@ def claim_and_run(
     """Verify the account, claim one task and run it. None when nothing was claimable."""
     (admin or AdminCheck(cfg)).ensure()
     task = with_retries(client.claim, attempts=cfg.service_attempts, delays=cfg.service_delays, what="claim")
+    if task is None and release_stale_claims(cfg, client):
+        task = with_retries(client.claim, attempts=cfg.service_attempts, delays=cfg.service_delays, what="claim")
     if task is None:
         return None
     log(
@@ -1472,14 +1521,7 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
     its agent started is run again from its sources.
     """
     outcomes = []
-    if not cfg.tasks_dir.is_dir():
-        return outcomes
-    for directory in sorted(cfg.tasks_dir.iterdir()):
-        from tauceti_worker.runtime_status import read_json
-
-        record = read_json(directory / "task.json")
-        if record.get("state") not in ("agent_running", "interrupted") or not isinstance(record.get("task"), dict):
-            continue
+    for directory, record in in_flight_checkpoints(cfg):
         if stop is not None and stop.is_set():
             break
         try:
@@ -1497,9 +1539,65 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
         except ServiceError as error:
             log(f"task {task.task_id}: renew failed during resume ({error}); will retry on the next start")
             continue
+        if record.get("state") not in RESUMABLE_STATES:
+            # Claimed and stopped before the agent ran (or past the agent, mid-submission): nothing
+            # to continue; give the claim back now and claim fresh rather than hold it to expiry.
+            log(
+                f"task {task.task_id}: claim still ours but stopped while {record.get('state')}; releasing (worker-stopped)"
+            )
+            outcomes.append(
+                release_task(
+                    cfg, client, task, state, "worker-stopped", f"worker restarted while {record.get('state')}"
+                )
+            )
+            continue
         log(f"resuming task {task.task_id} (session {state.session() or 'unknown'})")
         outcomes.append(run_task(cfg, task, client, resume_state=state, stop=stop))
     return outcomes
+
+
+def in_flight_checkpoints(cfg: RunnerConfig) -> list[tuple[Path, dict]]:
+    """Checkpoints of this worker whose task is unfinished and whose claim may still be ours."""
+    from tauceti_worker.runtime_status import read_json
+
+    found = []
+    if not cfg.tasks_dir.is_dir():
+        return found
+    for directory in sorted(cfg.tasks_dir.iterdir()):
+        record = read_json(directory / "task.json")
+        if record.get("state") not in IN_FLIGHT_STATES or not isinstance(record.get("task"), dict):
+            continue
+        if record.get("worker") not in (None, cfg.worker):
+            continue
+        found.append((directory, record))
+    return found
+
+
+def release_stale_claims(cfg: RunnerConfig, client: TaskClient) -> int:
+    """Release every in-flight claim this worker still holds on paper. Called when a claim comes back
+    empty: the service refuses a claim for concurrency while our own earlier claim (a stopped run that
+    never released it) is live, and we hold its token. Returns how many the service confirmed."""
+    released = 0
+    for directory, record in in_flight_checkpoints(cfg):
+        try:
+            task = Task.from_json(record["task"])
+        except (ValueError, KeyError):
+            continue
+        state = TaskState(directory, task)
+        try:
+            client.release(task, "worker-stopped", f"stale claim from a run stopped while {record.get('state')}")
+        except ClaimRefused as error:
+            state.write("claim_lost", detail=f"stale claim: {error}")
+            continue
+        except (EndpointMissing, ServiceError) as error:
+            log(f"task {task.task_id}: stale claim could not be released ({error})")
+            continue
+        state.write(
+            "released", reason="worker-stopped", detail=f"stale claim from a run stopped while {record.get('state')}"
+        )
+        log(f"task {task.task_id}: released our stale claim left by a stopped run ({record.get('state')})")
+        released += 1
+    return released
 
 
 # ----------------------------------------------------------------------------------------------

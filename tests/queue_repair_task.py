@@ -1229,7 +1229,10 @@ class Serve(Fixture):
             stop.set("test")
             thread.join(30)
         self.assertFalse(thread.is_alive())
-        self.assertTrue(all(r["reason"] == "agent_launch_failed" for r in self.service.releases))
+        reasons = [r["reason"] for r in self.service.releases]
+        # The stop may catch a re-claimed task before its agent, which releases it as worker-stopped.
+        self.assertGreaterEqual(reasons.count("agent_launch_failed"), 2, reasons)
+        self.assertTrue(all(r in ("agent_launch_failed", "worker-stopped") for r in reasons), reasons)
         self.assertNotIn("artifacts_backoff", result["summary"])
         self.assertEqual(self.agent_calls(), [])
 
@@ -1528,6 +1531,116 @@ class ReleaseRetry(Fixture):
         self.assertEqual(
             repair_task.retry_releases(cfg, client), [{"task_id": "1", "state": "claim_lost", "reason": "agent_failed"}]
         )
+        self.assertEqual(len(self.service.releases), 1)
+
+
+class StopAndResume(Fixture):
+    """A claim never outlives the worker that holds it: a stop before the agent runs releases it, a
+    restart releases or resumes whatever a stopped run left, and a claim refused for our own stale
+    claim is given back and retried at once."""
+
+    RETAINED_TIP = "refs/heads/queue/batch-1/tip"
+
+    def install_handlers(self) -> repair_task.Stop:
+        stop = repair_task.Stop()
+        previous = repair_task.install_signal_handlers(stop)
+        self.addCleanup(lambda: [signal.signal(sig, handler) for sig, handler in previous.items()])
+        return stop
+
+    def terminate_when(self, predicate, delay: float = 0.5) -> None:
+        def terminate():
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if predicate():
+                    time.sleep(delay)
+                    os.kill(os.getpid(), signal.SIGTERM)  # what systemd sends on stop
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(target=terminate, daemon=True).start()
+
+    def checkpoint_state(self, task_id: str = "1") -> str | None:
+        path = self.root / "state" / "tasks" / task_id / "task.json"
+        return json.loads(path.read_text()).get("state") if path.exists() else None
+
+    def test_sigterm_before_the_agent_releases_the_claim_as_worker_stopped(self):
+        # The retained tip is not published yet, so the claimed task waits in the fetch retry window
+        # (production: the stop at 03:06 landed two minutes into the `claimed` phase).
+        sh(self.content.bare, "update-ref", "-d", self.RETAINED_TIP)
+        cfg = self.config(poll_seconds=0.2, fetch_retry_seconds=60, fetch_retry_delay=0.2)
+        stop = self.install_handlers()
+        self.terminate_when(lambda: self.checkpoint_state() == "claimed")
+        started = time.monotonic()
+        summary = repair_task.serve(cfg, self.client(cfg), stop)
+        self.assertLess(time.monotonic() - started, 20, "the fetch retry window was left at once")
+        self.assertEqual(stop.reason, "SIGTERM")
+        self.assertEqual(summary["outcomes"], {"released": 1}, summary)
+        self.assertEqual(summary["errors"], 0)
+        state = self.state()
+        self.assertEqual(state["state"], "released")
+        self.assertEqual(state["reason"], "worker-stopped")
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
+        self.assertIn("claimed", self.service.releases[0]["error"])
+        self.assertIsNone(self.service.live_claim(1), "the task is claimable again at once, not at the TTL")
+        self.assertEqual(self.agent_calls(), [])
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
+        # Once the ref is published a fresh claim runs the task to adoption.
+        sh(self.content.bare, "update-ref", self.RETAINED_TIP, self.content.tip)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+
+    def test_sigterm_with_the_agent_running_renews_the_claim_before_checkpointing(self):
+        os.environ["STUB_AGENT_MODE"] = "sleep"
+        os.environ["STUB_SLEEP"] = "30"
+        cfg = self.config(poll_seconds=0.2)
+        stop = self.install_handlers()
+        self.terminate_when(lambda: self.checkpoint_state() == "agent_running", delay=1.0)
+        renewals_before = self.service.renewals
+        summary = repair_task.serve(cfg, self.client(cfg), stop)
+        self.assertEqual(summary["outcomes"], {"interrupted": 1}, summary)
+        claim = self.service.live_claim(1)
+        self.assertIsNotNone(claim, "the claim is kept for the resume")
+        self.assertGreater(self.service.renewals, renewals_before)
+        self.assertAlmostEqual(claim["expires_at"], self.state()["task"]["expires_at"], delta=1.0)
+        self.assertEqual(self.service.releases, [])
+
+    def test_on_start_a_checkpoint_stopped_before_the_agent_is_released_and_claimed_fresh(self):
+        cfg = self.config()
+        client = self.client(cfg)
+        # A stopped run left the task claimed (its token in the checkpoint) and never got further.
+        claim = self.service.preclaim(1, "stopped-run-token", cfg.worker)
+        task = repair_task.Task.from_json(self.service.task_record(1, claim))
+        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
+        state.write("claimed", worker=cfg.worker)
+        self.assertIsNone(client.claim(), "the stale claim blocks a fresh one (concurrency)")
+        outcomes = repair_task.resume_pending(cfg, client)
+        self.assertEqual([(o["status"], o["reason"]) for o in outcomes], [("released", "worker-stopped")])
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
+        self.assertEqual(self.state()["state"], "released")
+        self.assertIsNone(self.service.live_claim(1))
+        outcome = repair_task.claim_and_run(cfg, client)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.agent_calls()[0]["resume"], None, "a fresh run, not a resume")
+
+    def test_a_claim_refused_for_our_own_stale_claim_is_released_and_retried_at_once(self):
+        cfg = self.config()
+        client = self.client(cfg)
+        claim = self.service.preclaim(1, "stopped-run-token", cfg.worker)
+        task = repair_task.Task.from_json(self.service.task_record(1, claim))
+        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
+        state.write("claimed", worker=cfg.worker)
+        state.write("sources_ready", worker=cfg.worker)
+        # Another worker's in-flight checkpoint in the same root is not ours to release.
+        other = repair_task.TaskState(cfg.tasks_dir / "9", task)
+        other.write("claimed", worker="worker-b@test")
+        outcome = repair_task.claim_and_run(cfg, client)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.service.claim_attempts), 2, "refused once, released the stale claim, claimed again")
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
+        self.assertEqual(self.service.releases[0]["worker"], cfg.worker)
+        self.assertEqual(json.loads((cfg.tasks_dir / "9" / "task.json").read_text())["state"], "claimed")
+        # Nothing stale left: a later empty claim stays empty with no extra release.
+        self.assertIsNone(repair_task.claim_and_run(cfg, client))
         self.assertEqual(len(self.service.releases), 1)
 
 
