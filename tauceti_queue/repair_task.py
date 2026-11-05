@@ -26,7 +26,10 @@ The proposed chain is pushed to the task's ``submission_ref``
 
 Authorization is the security audit's predicate (``security_audit.require_admin``): the account must
 have admin permission on the repository, checked before any claim so a misconfigured worker fails
-before it does work.
+before it does work. The positive answer is cached in ``<root>/admin-check.json`` for
+``admin_recheck_seconds`` (six hours); a check that cannot be made (rate limit, 5xx, network) keeps the
+cached answer, or without one claims anyway, since the service enforces admin on every claim. Only the
+API saying the account is not an admin stops the worker.
 
 Phases, each checkpointed in ``<root>/tasks/<task_id>/task.json`` so a restarted runner can resume
 the same model session instead of starting over: claimed, sources_ready, artifacts_ready,
@@ -539,11 +542,21 @@ def worker_token() -> str:
 
 
 def verify_admin(repository: str) -> None:
-    """The security audit's authorization predicate, applied to the task's repository."""
-    from tauceti_worker.config import Die
+    """The security audit's authorization predicate, applied to the task's repository.
+
+    ``Die`` is the authoritative negative (the API answered and the account is not an admin, or cannot
+    see the repository); ``NoProgress`` means the check could not be made (rate limit, 5xx, network).
+    """
+    from tauceti_worker.config import Die, NoProgress
     from tauceti_worker.security_audit import api
 
-    if api(f"repos/{repository}").get("permissions", {}).get("admin") is not True:
+    try:
+        answer = api(f"repos/{repository}")
+    except NoProgress as error:
+        if re.search(r"\bHTTP 404\b|\bNot Found\b", str(error)):
+            raise Die(f"the queue repair task requires repository-admin permission on {repository}: {error}") from error
+        raise
+    if answer.get("permissions", {}).get("admin") is not True:
         raise Die(f"the queue repair task requires repository-admin permission on {repository}")
 
 
@@ -648,7 +661,10 @@ class RunnerConfig:
     # repair sequential.
     parallel_agents: int = dataclasses.field(default_factory=repair_parallel.parallel_agents_default)
     poll_seconds: float = 60.0
-    admin_recheck_seconds: float = 3600.0
+    # A positive admin answer is cached on disk (``admin-check.json``) this long; a check that could not
+    # be made is retried after ``admin_retry_seconds``, not on every poll.
+    admin_recheck_seconds: float = 6 * 3600.0
+    admin_retry_seconds: float = 900.0
     # Run the first whole-library build in the background and launch the agent at its first error
     # (``repair_stream``; ``TAUCETI_QUEUE_STREAM_REPAIR``, ``--no-stream-repair``). Off: the agent runs it.
     stream_repair: bool = True
@@ -1965,17 +1981,90 @@ def run_task(
 # Loop
 
 
+ADMIN_CHECK_FILE = "admin-check.json"
+
+
+def admin_check_path(cfg: RunnerConfig) -> Path:
+    return cfg.root / ADMIN_CHECK_FILE
+
+
+def read_admin_check(cfg: RunnerConfig) -> dict:
+    """The cached positive verification for ``cfg.repository`` (``login``, ``repository``,
+    ``verified_at``), or ``{}`` when there is none."""
+    from tauceti_worker.runtime_status import read_json
+
+    record = read_json(admin_check_path(cfg))
+    if record.get("repository") != cfg.repository or not isinstance(record.get("verified_at"), (int, float)):
+        return {}
+    return record
+
+
+def describe_age(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}h" if seconds >= 3600 else f"{seconds / 60:.0f}m"
+
+
 class AdminCheck:
-    """Caches the admin verification for ``admin_recheck_seconds`` to spare the shared API quota."""
+    """Caches the admin verification for ``admin_recheck_seconds`` to spare the shared API quota.
+
+    The positive answer is kept in ``<root>/admin-check.json`` so a restart within the window does not
+    check again. A check that cannot be made (``NoProgress``: rate limit, 5xx, network) is not a refusal:
+    the worker keeps the cached answer, or with none claims anyway and leaves the decision to the
+    service, which enforces admin on every claim; it retries after ``admin_retry_seconds``. Only an
+    authoritative negative (``Die``) stops the claim, and it drops the cached answer.
+    """
 
     def __init__(self, cfg: RunnerConfig):
         self.cfg = cfg
-        self.verified_at: float | None = None
+        cached = read_admin_check(cfg)
+        self.verified_at: float | None = float(cached["verified_at"]) if cached else None
+        self.login: str | None = cached.get("login") if cached else None
+        self.retry_at = 0.0
+
+    def fresh(self, now: float) -> bool:
+        return self.verified_at is not None and now - self.verified_at <= self.cfg.admin_recheck_seconds
 
     def ensure(self) -> None:
-        if self.verified_at is None or time.time() - self.verified_at > self.cfg.admin_recheck_seconds:
+        from tauceti_worker.config import Die, NoProgress
+        from tauceti_worker.runtime_status import atomic_json
+
+        now = time.time()
+        if self.fresh(now) or now < self.retry_at:
+            return
+        try:
             verify_admin(self.cfg.repository)
-            self.verified_at = time.time()
+        except Die:
+            self.verified_at = self.login = None
+            admin_check_path(self.cfg).unlink(missing_ok=True)
+            raise
+        except (NoProgress, OSError) as error:
+            self.retry_at = now + self.cfg.admin_retry_seconds
+            if self.verified_at is not None:
+                kept = f"keeping the verification from {describe_age(now - self.verified_at)} ago"
+            else:
+                kept = "no cached verification; claiming anyway, the service enforces admin on every claim"
+            log(
+                f"authorization: local admin check skipped ({type(error).__name__}: {error}); {kept}; "
+                f"next check in {describe_age(self.cfg.admin_retry_seconds)}"
+            )
+            return
+        self.login = admin_login()
+        self.verified_at = time.time()
+        record = {"login": self.login, "repository": self.cfg.repository, "verified_at": self.verified_at}
+        try:
+            atomic_json(admin_check_path(self.cfg), record)
+        except OSError as error:
+            log(f"authorization: could not record the admin verification: {error}")
+
+
+def admin_login() -> str | None:
+    """The account's login, for the record; None when GitHub does not answer."""
+    from tauceti_worker.config import NoProgress
+    from tauceti_worker.security_audit import api
+
+    try:
+        return str(api("user").get("login") or "") or None
+    except (NoProgress, OSError, AttributeError):
+        return None
 
 
 def make_client(cfg: RunnerConfig) -> TaskClient:
@@ -2370,6 +2459,18 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
         check("repository admin", admin, f"{login or 'unknown login'} on {cfg.repository}")
     except Exception as error:
         check("repository admin", False, str(error))
+    cached = read_admin_check(cfg)
+    if cached:
+        age = time.time() - cached["verified_at"]
+        state = "current" if age <= cfg.admin_recheck_seconds else "expired, the worker checks again"
+        check(
+            "admin verification cache",
+            True,
+            f"{cached.get('login') or 'unknown login'} on {cfg.repository} verified {describe_age(age)} ago "
+            f"({state}; window {describe_age(cfg.admin_recheck_seconds)})",
+        )
+    else:
+        check("admin verification cache", True, f"none in {admin_check_path(cfg)}; the worker checks at start")
     try:
         request = urllib.request.Request(
             f"{cfg.service.rstrip('/')}/healthz",

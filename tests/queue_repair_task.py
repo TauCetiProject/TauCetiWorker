@@ -147,7 +147,9 @@ sys.exit(2)
 
 GH = """#!/usr/bin/env bash
 # gh stub: the admin predicate reads repos/<owner>/<repo> and the preflight reads user; everything
-# else is unexpected here.
+# else is unexpected here. Every call is logged; STUB_GH_FAIL makes it fail with that message.
+[ -n "$STUB_DIR" ] && echo "$*" >> "$STUB_DIR/gh-calls.log"
+if [ -n "$STUB_GH_FAIL" ]; then echo "$STUB_GH_FAIL" >&2; exit 1; fi
 case "$*" in
   *repos/*) echo '{"permissions": {"admin": '"${STUB_GH_ADMIN:-true}"'}}' ;;
   *" user") echo '{"login": "stub-worker"}' ;;
@@ -783,6 +785,8 @@ class Fixture(unittest.TestCase):
         os.environ.pop("STUB_LAKE_PUT_FAIL", None)
         os.environ.pop("STUB_LAKE_BUILD_SCRIPT", None)
         os.environ.pop("STUB_SLEEP", None)
+        os.environ.pop("STUB_GH_FAIL", None)
+        os.environ.pop("STUB_GH_ADMIN", None)
         os.environ.pop(repair_sandbox.DISABLE_VARIABLE, None)
         (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir)}))
         for key in ("STUB_FAIL_GROUP_WITH", "STUB_GROUP_STRAY", "STUB_GROUP_BUILD", "STUB_LAKE_BUILD_SLEEP"):
@@ -2743,6 +2747,97 @@ class ParallelRepair(Fixture):
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertNotIn("parallel", outcome)
         self.assertEqual(len(self.agent_calls()), 1)
+
+
+class AdminCache(Fixture):
+    """The worker's admin check: cached on disk, tolerant of a check that cannot be made."""
+
+    def gh_calls(self) -> list[str]:
+        path = self.stub_dir / "gh-calls.log"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def admin_calls(self) -> list[str]:
+        return [call for call in self.gh_calls() if f"repos/{PROJECT}" in call]
+
+    def test_cache_hit_avoids_the_call(self):
+        cfg = self.config()
+        repair_task.AdminCheck(cfg).ensure()
+        self.assertEqual(len(self.admin_calls()), 1)
+        record = json.loads(repair_task.admin_check_path(cfg).read_text())
+        self.assertEqual((record["login"], record["repository"]), ("stub-worker", PROJECT))
+        self.assertLess(time.time() - record["verified_at"], 60)
+        # A restarted worker within the window reads the record instead of asking GitHub.
+        restarted = repair_task.AdminCheck(cfg)
+        restarted.ensure()
+        restarted.ensure()
+        self.assertEqual(len(self.admin_calls()), 1)
+        # A record for another repository is not this one's verification.
+        self.assertIsNone(repair_task.AdminCheck(self.config(repository="Other/Repo")).verified_at)
+        checks = {c["check"]: c for c in repair_task.preflight(cfg, min_free_gib=0)}
+        self.assertTrue(checks["admin verification cache"]["ok"])
+        self.assertRegex(checks["admin verification cache"]["detail"], r"stub-worker on .* verified \d+m ago \(current")
+
+    def test_cache_expiry_rechecks(self):
+        cfg = self.config()
+        old = time.time() - cfg.admin_recheck_seconds - 60
+        repair_task.admin_check_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+        repair_task.admin_check_path(cfg).write_text(
+            json.dumps({"login": "stub-worker", "repository": PROJECT, "verified_at": old})
+        )
+        detail = {c["check"]: c for c in repair_task.preflight(cfg, min_free_gib=0)}["admin verification cache"]
+        self.assertIn("expired", detail["detail"])
+        admin = repair_task.AdminCheck(cfg)
+        self.assertEqual(admin.verified_at, old)
+        before = len(self.admin_calls())  # the preflight's own live check
+        admin.ensure()
+        self.assertEqual(len(self.admin_calls()), before + 1)
+        self.assertGreater(json.loads(repair_task.admin_check_path(cfg).read_text())["verified_at"], old)
+
+    def test_transient_failure_proceeds(self):
+        # A token of its own, so the transport's record of the exhausted quota stays in this test.
+        exhausted = patch.dict(
+            os.environ,
+            {"GH_TOKEN": "exhausted-token", "STUB_GH_FAIL": "gh: API rate limit exceeded for user ID 477956"},
+        )
+        exhausted.start()
+        self.addCleanup(exhausted.stop)
+        cfg = self.config()
+        admin = repair_task.AdminCheck(cfg)
+        with patch.object(repair_task, "log") as logged:
+            admin.ensure()  # no cached answer: the claim goes ahead and the service decides
+        self.assertIn("local admin check skipped", logged.call_args.args[0])
+        self.assertIn("claiming anyway", logged.call_args.args[0])
+        self.assertFalse(repair_task.admin_check_path(cfg).exists())
+        # The next poll does not spend the quota again before the retry interval.
+        admin.ensure()
+        self.assertEqual(len(self.admin_calls()), 1)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg), admin)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        # With an expired cached answer the worker keeps it.
+        stale = repair_task.AdminCheck(cfg)
+        stale.verified_at = time.time() - cfg.admin_recheck_seconds - 60
+        with patch.object(repair_task, "log") as logged:
+            stale.ensure()
+        self.assertIn("keeping the verification from", logged.call_args.args[0])
+
+    def test_negative_answer_stops(self):
+        from tauceti_worker.config import Die
+
+        cfg = self.config()
+        repair_task.AdminCheck(cfg).ensure()
+        self.assertTrue(repair_task.admin_check_path(cfg).exists())
+        os.environ["STUB_GH_ADMIN"] = "false"
+        admin = repair_task.AdminCheck(cfg)
+        admin.verified_at = 0.0  # expired, so the next pass asks again
+        with self.assertRaises(Die):
+            repair_task.claim_and_run(cfg, self.client(cfg), admin)
+        self.assertEqual(self.service.claim_attempts, [])
+        self.assertFalse(repair_task.admin_check_path(cfg).exists(), "a negative answer drops the cache")
+        # A repository the account cannot see is a negative answer too, not a transient failure.
+        os.environ.pop("STUB_GH_ADMIN")
+        os.environ["STUB_GH_FAIL"] = "gh: Not Found (HTTP 404)"
+        with self.assertRaises(Die):
+            repair_task.AdminCheck(cfg).ensure()
 
 
 class Preflight(Fixture):

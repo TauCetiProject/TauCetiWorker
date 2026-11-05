@@ -285,7 +285,11 @@ it. `tauceti_queue/repair_task.py` ([repair-task.md](repair-task.md)) is that wo
 checkpointed tasks, claim, prepare warm artifacts, run the repair agent, push the chain to the task's
 submission ref, submit it, report the provider outcome to `/tasks/inference` (the inference hold),
 sleep the poll interval when nothing is claimable. A task's failure, a service outage or a refused
-authorization is logged and retried on the next pass; the loop never exits for them. The worker runs
+authorization is logged and retried on the next pass; the loop never exits for them. The worker's
+admin check is cached for six hours in `admin-check.json` under the task root, and when GitHub cannot
+answer it (rate limit, 5xx, network) the worker keeps the cached answer or, with none, claims anyway
+and relies on the service's own admin enforcement; only the API saying the account is not an admin
+stops it, and `--check` reports the cached verification's age. The worker runs
 on the service host today; it only needs the service URL, so it can run on any host meeting the
 requirements below (the service's `repair_concurrency` setting bounds how many hold a task at once).
 
