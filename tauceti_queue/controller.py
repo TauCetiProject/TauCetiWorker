@@ -1506,6 +1506,73 @@ class Controller:
         elif attempt["outcome"] == OUTCOME_PASS:
             self._promote(head, attempt, now)
 
+    def rebuild_head(self, repo: str, actor: str) -> dict[str, Any]:
+        """Operator: rebuild the head's chain from its members' accepted heads and dispatch it again.
+
+        For a head whose chain must be regenerated without a source change (a new commit message format,
+        a chain tool fix): the open task is superseded, the members' commits are rebuilt on the head's
+        base, the version advances so the next tick dispatches a fresh attempt. Refused while the head is
+        claimed or when a member carries agent edits, which a rebuild from accepted heads would discard.
+        """
+        with self._lock:
+            self._check_repo(repo)
+            head = self._head()
+            if head is None:
+                return {"rebuilt": False, "reason": "no-head"}
+            if self._active_claims(head["id"]):
+                return {"rebuilt": False, "reason": "claimed"}
+            members = self._members(head["id"])
+            edited = [m["number"] for m in members if m["provenance"] != "clean"]
+            if edited:
+                return {"rebuilt": False, "reason": "agent-edited", "members": edited}
+            now = self.clock()
+            chain_id = f"rebuild-{head['id']}-{secrets.token_hex(4)}"
+            try:
+                for member in members:
+                    if not self._fetch_head(member["number"], member["accepted_head"]):
+                        raise chain.ChainError(f"accepted head {member['accepted_head']} is not available")
+                result = chain.build(
+                    self.clone, head["base"], [self._chain_member(m) for m in members], chain_id=chain_id
+                )
+            except chain.ChainError as error:
+                self.store.journal(now, "rebuild-error", head["id"], actor=actor, error=str(error))
+                return {"rebuilt": False, "reason": str(error)}
+            finally:
+                chain.delete_chain_ref(self.clone, chain_id)
+            if result.status != chain.CLEAN:
+                conflict = result.conflict
+                self.store.journal(
+                    now, "rebuild-conflict", head["id"], actor=actor, source_pr=conflict.source_pr if conflict else None
+                )
+                return {"rebuilt": False, "reason": "conflict", "source_pr": conflict.source_pr if conflict else None}
+            version = head["version"] + 1
+            by_pr = {record.source_pr: record for record in result.commits}
+            with self.store.transaction():
+                for member in members:
+                    record = by_pr.get(member["source_pr"])
+                    if record is not None:
+                        self.store.update("members", {"id": member["id"]}, commit_sha=record.sha)
+                self.store.update("batches", {"id": head["id"]}, version=version, tip=result.tip, expected_parent=None)
+                superseded = 0
+                for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
+                    self.store.update(
+                        "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="rebuilt"
+                    )
+                    superseded += 1
+                self._retain(self.batch_ref(head["id"], version), result.tip)
+                self._count("head_rebuilds")
+                self.store.journal(
+                    now,
+                    "rebuilt",
+                    head["id"],
+                    actor=actor,
+                    version=version,
+                    tip=result.tip,
+                    tasks_superseded=superseded,
+                )
+            self._wake.set()
+            return {"rebuilt": True, "version": version, "tip": result.tip, "tasks_superseded": superseded}
+
     def retry_ci(self, repo: str, actor: str) -> dict[str, Any]:
         """Operator: forget the head's exhausted infrastructure failures so the next tick re-dispatches."""
         with self._lock:

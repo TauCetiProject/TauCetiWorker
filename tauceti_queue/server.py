@@ -285,6 +285,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/retry-ci":
             self._admin_retry_ci()
             return
+        if path == "/admin/rebuild-head":
+            self._admin_rebuild_head()
+            return
         if path == "/admin/import-bors":
             self._admin_import_bors()
             return
@@ -428,6 +431,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(400, "`tip_sha` must be a full commit SHA")
                 return
             self._call(lambda: controller.submit_task(tid, token, tip, str(body.get("worker_notes") or "")))
+
+    def _admin_rebuild_head(self) -> None:
+        identity = self._authenticated()
+        if identity is None:
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        if not self._admin(identity[0]):
+            self._error(403, f"{identity[0]} is not a repository admin")
+            return
+        repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
+        self._call(lambda: self.server.controller.rebuild_head(repo, identity[0]))
 
     def _admin_retry_ci(self) -> None:
         identity = self._authenticated()

@@ -409,6 +409,16 @@ set `publication_enabled = false` (restart). The service returns to shadow mode 
 resumes approval intake. Approved inputs the service holds at that moment are re-approved under Bors by
 their authors or the review App; the service's observation feed lists them.
 
+### Rebuilding the head
+
+`POST /admin/rebuild-head` (bearer token of a repository admin, body `{}`) rebuilds the head's chain
+from its members' accepted heads on the head's base, supersedes its open task, advances the version
+and lets the next tick dispatch a fresh attempt. It is for a head whose commits must be regenerated
+without a source change, for example after a chain tool fix changed the commit message format and the
+head's CI failed on a consequence of the old format; it is refused while the head is claimed and when a
+member carries agent edits, which a rebuild would discard. `POST /admin/retry-ci` stays the action for
+exhausted infrastructure retries.
+
 ## Monitoring
 
 Status (`/status`, schema `tauceti-queue.status/v1`) is the primary surface. The conditions from the
