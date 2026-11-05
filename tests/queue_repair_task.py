@@ -1097,6 +1097,13 @@ class ReleaseRetry(Fixture):
         self.addCleanup(setattr, repair_task, "git", original)
         return calls
 
+    def observe_log(self) -> list[str]:
+        lines: list[str] = []
+        original = repair_task.log
+        repair_task.log = lines.append
+        self.addCleanup(setattr, repair_task, "log", original)
+        return lines
+
     def test_many_retained_refs_are_fetched_a_chunk_at_a_time(self):
         refs = self.retain_many(450)
         task = repair_task.Task.from_json(
@@ -1107,20 +1114,93 @@ class ReleaseRetry(Fixture):
         self.assertEqual(len(fetched["refs"]), 450)
         self.assertEqual([len(c) - 3 for c in calls], [200, 200, 50], "one fetch per chunk of refspecs, not per ref")
         self.assertEqual(
-            sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/1/retained/queue/inputs/449"),
+            sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/1/retained/queue/inputs/449"), self.content.tip
+        )
+
+    def test_a_chunk_with_missing_refs_is_trimmed_by_one_listing_not_fetched_ref_by_ref(self):
+        # Production: the service publishes a task's refs through its outbox over minutes, so a chunk
+        # fails on the first ref the remote lacks (git names only that one) and the old fallback
+        # fetched the chunk's other 199 refs one at a time, 1.3 s each, on every retry.
+        refs = self.retain_many(450)
+        absent = [
+            "refs/heads/queue/inputs/absent-a",
+            "refs/heads/queue/inputs/absent-b",
+            "refs/heads/queue/inputs/absent-c",
+        ]
+        listed = refs[:10] + absent[:1] + refs[10:250] + absent[1:] + refs[250:]
+        task = repair_task.Task.from_json(
+            {**self.content.task(), "retained_refs": listed, "claim_token": "t", "expires_at": time.time() + 60}
+        )
+        calls = self.fetch_calls()
+        warnings = self.observe_log()
+        with self.assertRaises(repair_task.SourcesUnavailable) as failed:
+            repair_task.fetch_retained(self.content.clone, task, chunk=200)
+        message = str(failed.exception)
+        self.assertIn("3 retained ref(s) not fetchable", message)
+        self.assertIn("queue/inputs/absent-a", message)
+        # Chunk 1 (one missing): fail, list, fetch 199. Chunk 2 (two missing): fail, list, fetch 198. Chunk 3: fine.
+        self.assertEqual([len(c) - 3 for c in calls], [200, 199, 200, 198, 53])
+        self.assertTrue(any("warning: fetch of 200 retained refs failed" in line for line in warnings), warnings)
+        self.assertTrue(any("couldn't find remote ref" in line for line in warnings), "git's stderr is logged")
+        self.assertTrue(any("2 of 200 retained refs are not on the remote yet" in line for line in warnings), warnings)
+        # Every present ref was fetched despite the failure.
+        self.assertEqual(
+            sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/1/retained/queue/inputs/449"), self.content.tip
+        )
+
+    def test_a_retry_fetches_only_the_refs_the_earlier_attempt_lacked(self):
+        refs = self.retain_many(450)
+        late = "refs/heads/queue/inputs/late"
+        task = repair_task.Task.from_json(
+            {
+                **self.content.task(),
+                "retained_refs": refs[:100] + [late] + refs[100:],
+                "claim_token": "t",
+                "expires_at": time.time() + 60,
+            }
+        )
+        calls = self.fetch_calls()
+        timer = threading.Timer(0.5, lambda: sh(self.content.bare, "update-ref", late, self.content.tip))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        fetched = repair_task.fetch_retained(self.content.clone, task, chunk=200, retry_seconds=20, retry_delay=0.3)
+        self.assertGreaterEqual(fetched["attempts"], 2)
+        # Attempt 1: chunk 1 fails and is trimmed (2 fetches), chunks 2 and 3 succeed; later attempts
+        # fetch only the one ref still missing, never the 450 again.
+        self.assertEqual([len(c) - 3 for c in calls[:4]], [200, 199, 200, 51])
+        self.assertTrue(all(len(c) - 3 == 1 for c in calls[4:]), [len(c) - 3 for c in calls])
+        self.assertEqual(
+            sh(self.content.clone, "rev-parse", "refs/tauceti-queue/task/1/retained/queue/inputs/late"),
             self.content.tip,
         )
-        # A chunk the remote refuses is fetched ref by ref, so the error names the missing ref; the
-        # other chunks are still one call each.
-        calls.clear()
-        missing = refs[:250] + ["refs/heads/queue/inputs/absent"] + refs[250:]
-        task = repair_task.Task.from_json({**task.to_json(), "retained_refs": missing})
+
+    def test_without_a_listing_a_failed_chunk_is_halved_not_walked(self):
+        refs = self.retain_many(200)
+        listed = refs[:77] + ["refs/heads/queue/inputs/absent"] + refs[77:]
+        task = repair_task.Task.from_json(
+            {**self.content.task(), "retained_refs": listed, "claim_token": "t", "expires_at": time.time() + 60}
+        )
+        calls = self.fetch_calls()
+        original = repair_task.git
+
+        def no_listing(clone, *args, **kwargs):
+            if args[:1] == ("ls-remote",):
+                raise RuntimeError("git ls-remote failed (128): fatal: unable to access origin")
+            return original(clone, *args, **kwargs)
+
+        repair_task.git = no_listing
+        self.addCleanup(setattr, repair_task, "git", original)
         with self.assertRaises(repair_task.SourcesUnavailable) as failed:
             repair_task.fetch_retained(self.content.clone, task, chunk=200)
         self.assertIn("queue/inputs/absent", str(failed.exception))
-        self.assertEqual(len(calls[0]) - 3, 200)
-        self.assertEqual(len(calls[1]) - 3, 200, "the second chunk holds the missing ref")
-        self.assertTrue(all(len(c) - 3 == 1 for c in calls[2:]), "then its refs one at a time")
+        self.assertIn("couldn't find remote ref", str(failed.exception))
+        self.assertLess(len(calls), 24, f"one bad ref in 201 costs about 2 log2(n) fetches, not n: {len(calls)}")
+        self.assertGreater(len(calls), 8)
+        for n in (0, 76, 77, 199):
+            self.assertEqual(
+                sh(self.content.clone, "rev-parse", f"refs/tauceti-queue/task/1/retained/queue/inputs/{n}"),
+                self.content.tip,
+            )
 
     def test_a_retained_ref_published_late_is_waited_for(self):
         self.drop_retained_ref()
