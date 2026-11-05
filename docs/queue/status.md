@@ -80,6 +80,9 @@ Also landed or opened on the day: the status summary read the real status docume
 - Move the service from chungus to the dedicated machine when it arrives (about eight hours after the 2026-11-05 01:13 UTC move), restoring the systemd units and the backup timer; the procedure is in [operations.md](operations.md), "Moving to the dedicated host".
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
 - The `staging-candidate-*` branches the service pushes accumulate as Bors's did; add deletion after the attempt's verdict.
+- Decide whether PRs that modify `scripts/` or `.github/` should enter batches at all: the repair
+  agent is told not to introduce changes there, but a constituent PR that modifies such files keeps
+  its change, so a batch can still land them.
 - A second open batch (`open_batch_limit`, default 2; [controller.md](controller.md), "Open batches") is a step beyond increment 1 taken on 2026-11-05 by operator decision, because 189 approved inputs waited behind the 1,197-member open batch with conflicts against its content; watch the rebase conflicts it moves to the agent when the second batch seals.
 
 ## Latest numbers

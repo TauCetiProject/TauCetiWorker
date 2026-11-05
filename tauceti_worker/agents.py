@@ -782,13 +782,24 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
-def _foreground_shell_env(deadline: float) -> dict[str, str]:
+SHELL_LIMIT_SECONDS = 600  # an authoring round's foreground shell limit
+
+
+def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
     # A shell command is not a whole round. Background tasks can retain the CLI
     # after its final answer and overlap later builds in the same checkout.
+    # ``TAUCETI_SHELL_LIMIT_SECONDS`` lets a launcher with its own budget (the queue's repair task,
+    # whose agent runs whole-library builds in the foreground) lengthen the limit for its agent.
+    if limit_seconds is None:
+        try:
+            limit_seconds = float(os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS") or SHELL_LIMIT_SECONDS)
+        except ValueError:
+            limit_seconds = SHELL_LIMIT_SECONDS
+    limit_ms = max(1000, int(limit_seconds * 1000))
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
     return {
-        "BASH_DEFAULT_TIMEOUT_MS": str(min(600000, remaining_ms)),
-        "BASH_MAX_TIMEOUT_MS": str(min(600000, remaining_ms)),
+        "BASH_DEFAULT_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
+        "BASH_MAX_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     }
 

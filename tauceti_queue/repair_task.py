@@ -594,6 +594,9 @@ class RunnerConfig:
     profile: object = "claude"  # the claude authoring profile the workers use for repair
     token: str | None = None
     agent_timeout: float = 3 * 3600
+    # The agent's foreground shell limit (``TAUCETI_SHELL_LIMIT_SECONDS``): a repair runs whole-library
+    # builds in the foreground, so it gets two hours where the fleet's authoring rounds keep ten minutes.
+    shell_limit: float = repair.SHELL_LIMIT_SECONDS
     build_timeout: float = 3 * 3600
     agent_attempts: int = 2  # ordinary agent failures or locally invalid chains
     validation_retries: int = 1  # ``adopted: false`` with a validation reason
@@ -845,9 +848,11 @@ def prompt_context(
     *,
     artifacts: dict | None = None,
     listings: Path | None = None,
+    shell_limit: int = repair.SHELL_LIMIT_SECONDS,
 ) -> PromptContext:
     """``artifacts`` is the ``prepare_artifacts`` record (the prompt says when the build is cold);
-    ``listings`` is where a large batch's full member listings go (``repair.listings_path``)."""
+    ``listings`` is where the member listings and the check script go (``repair.listings_path``);
+    ``shell_limit`` is the agent's foreground shell limit in seconds, as ``run_repair_agent`` sets it."""
     findings = findings if findings is not None else task_findings(task)
     conflict = dict(findings.get("conflict") or {}) or None
     if conflict is not None:
@@ -858,18 +863,25 @@ def prompt_context(
         repository=task.repository,
         base=task.validation_base,
         kind=task.kind,
-        origin=f"The queue exposed it as {task.kind.replace('_', ' ')} task {task.task_id} "
-        f"(batch {task.batch_id or '?'}, version {task.batch_version}).",
         conflict=conflict,
         feedback=feedback,
         instruction=task.instruction or repair.AGENT_INSTRUCTION,
         members=[
-            {"source_pr": m.source_pr, "accepted_head": m.accepted_head, "provenance": m.provenance}
+            {
+                "source_pr": m.source_pr,
+                "accepted_head": m.accepted_head,
+                "provenance": m.provenance,
+                "title": m.title,
+                # The service's flag for a PR that landed on ``main`` outside the queue, once the member
+                # record carries it; without it the prompt derives the list from the target's history.
+                "landed_externally": getattr(m, "landed_externally", None),
+            }
             for m in task.members
         ],
         artifacts_cold=cold,
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         listings_path=listings,
+        shell_limit=shell_limit,
     )
 
 
@@ -959,6 +971,7 @@ def run_repair_agent(
             return {"status": "cancelled", "attempts": attempts}
         changes = repair.isolation_env(cfg.root, env_lake)
         changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_timeout)
+        changes["TAUCETI_SHELL_LIMIT_SECONDS"] = str(int(cfg.shell_limit))
         started = time.monotonic()
         state.write("agent_running", agent_label=label, agent_attempt=index, prompt=str(prompt_path), resume=resume)
         # The worker's cap on one attempt; the plan gives the task itself no time budget.
@@ -1239,6 +1252,7 @@ def run_task(
                     findings,
                     artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
                     listings=repair.listings_path(worktree),
+                    shell_limit=int(cfg.shell_limit),
                 )
                 prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
                 if resume_session:

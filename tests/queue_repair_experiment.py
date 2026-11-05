@@ -329,8 +329,10 @@ with tempfile.TemporaryDirectory() as raw:
     prompt = rx.compose_prompt(by_id[1931], findings, chain, repo, base[:12])
     check("prompt opens with the plan's instruction verbatim", prompt.startswith(rx.AGENT_INSTRUCTION))
     check(
-        "prompt forbids publication",
-        "do not push" in prompt and "do not open pull requests" in prompt and "do not use `gh`" in prompt,
+        "prompt says what happened and that `gh` is not needed",
+        "## What happened" in prompt
+        and "`gh` is not needed" in prompt
+        and "do not introduce changes" in prompt.lower(),
     )
     check(
         "prompt lists constituent commits with PR identities",
@@ -341,7 +343,26 @@ with tempfile.TemporaryDirectory() as raw:
         "Pullback.lean:101:5" in prompt and "Unknown identifier" in prompt,
     )
     check("prompt names Bors's suspect as a hint", "#26269" in prompt and "not a verdict" in prompt)
-    check("prompt explains verification", "lake build --iofail" in prompt and "scripts/lint-env.sh" in prompt)
+    check(
+        "prompt explains verification without the lint script",
+        "lake build --iofail" in prompt and "scripts/lint-env.sh" not in prompt and "maxHeartbeats" not in prompt,
+    )
+    check(
+        "prompt states the aim before the hard rules",
+        prompt.index("as its author intended") < prompt.index("no `sorry`") and "no `set_option`" in prompt,
+    )
+    check(
+        "prompt gives one editing instruction with the owning commit",
+        "(no commit of this batch modifies this file)" in prompt
+        and "--squash=<sha>" in prompt
+        and f"`{chain[0].sha[:12]}` #1: feat: improve A" in prompt
+        and "Any method is fine" not in prompt,
+    )
+    check(
+        "prompt explains that the result is read from the worktree",
+        "nothing to push, publish or report anywhere else" in prompt
+        and "Nothing you do here is published" not in prompt,
+    )
     check("prompt says the artifacts are warm by default", "Artifacts are warm" in prompt)
     cold = rx.compose_prompt(
         by_id[1931],
