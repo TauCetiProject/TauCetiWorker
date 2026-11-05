@@ -1360,6 +1360,56 @@ class Preparation(ControllerCase):
         result = self.controller.submit_task(preparation.task_id, preparation.claim_token, batch["tip"])
         self.assertTrue(result.accepted, "the preparation still applies to its unchanged batch")
 
+    def test_a_landed_heads_tips_are_candidates_for_the_next_head_and_its_preparations(self):
+        """Production batch 3: head 2 landed as a new `main` commit the public cache did not yet
+        hold, and its published tip was the nearest tree for the next head and the batches behind it."""
+        first = self.open_batch()
+        landed = self.controller.store.row("batches", {"state": "head"})
+        self.land_head()
+        landed = self.controller.store.row("batches", {"id": landed["id"]})
+        self.assertEqual(landed["state"], "landed")
+        # The fixture lands by fast-forward; in production the landed tip and the `main` commit differ.
+        published, earlier = "a" * 40, "b" * 40
+        self.controller._record_tip(landed["id"], landed["version"] + 2, published, self.clock())
+        self.controller._record_tip(landed["id"], landed["version"] + 1, earlier, self.clock())
+        landed_tips = [
+            row["tip"]
+            for row in self.controller.store.rows("batch_tips", {"batch_id": landed["id"]}, order="version DESC")
+        ]
+        self.assertEqual(landed_tips[:2], [published, earlier])
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.assertEqual(head["id"], first["id"])
+        revs = self.controller._repair_outputs_revs(head)
+        own = self.controller._previous_tips(head)
+        expected: list[str] = []
+        for sha in [*own, *landed_tips, head["base"], self.controller._canonical]:
+            if sha and sha != head["tip"] and sha not in expected:
+                expected.append(sha)
+        self.assertEqual(revs, expected, "the head's tips, then the landed head's, then the base and main")
+        self.assertLess(revs.index(earlier), revs.index(head["base"]))
+        batch = self.open_batch_behind((401, 402, 403))
+        tips = [
+            row["tip"]
+            for row in self.controller.store.rows("batch_tips", {"batch_id": batch["id"]}, order="version DESC")
+        ]
+        self.quiet()
+        [row] = self.prepare_tasks()
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual((task.task_id, task.kind), (row["id"], "prepare"))
+        expected = []
+        for sha in [*tips[1:5], *landed_tips, batch["base"]]:
+            if sha not in expected:
+                expected.append(sha)
+        self.assertEqual(task.warm_revs, expected, "the batch's tips, then the landed head's, then the base")
+        self.assertEqual(task.warm_revs[-3:], [published, earlier, batch["base"]])
+
+    def open_batch_behind(self, numbers):
+        """An open batch of `numbers` behind the current head."""
+        for number in numbers:
+            self.approve(number, {f"P{number}.lean": f"{number}\n"})
+        self.controller.tick()
+        return self.controller.store.row("batches", {"state": "open"})
+
     def test_sealing_supersedes_a_running_preparation(self):
         batch = self.open_batch()
         self.quiet()

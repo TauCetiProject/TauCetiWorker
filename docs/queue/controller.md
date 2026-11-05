@@ -281,6 +281,16 @@ as `head_sha`; a head that was never replayed sends just `[base_sha]`. The list 
 attempt, journalled with `dispatched`, and shown as `ci.repair_outputs_revs` in the head's `/status`
 record.
 
+The list also names the published tips of the most recently landed heads. A landed head's tip is in
+the repair cache, but the `main` commit it lands as reaches the public cache only once main's own CI
+has built it, which takes hours when the landing adds more commits than that CI walks back. The next
+head is based on that `main` commit, whose tree equals the landed tip's except for CI files, so
+between the head's own previous tips and its `base_sha` the controller appends the `batch_tips` of
+the last `REPAIR_OUTPUTS_LANDED_HEADS` (two) batches in state `landed`, newest batch first and each
+batch's tips newest first, at most four per batch (`Controller._landed_tips`), without repeats.
+Every task's `warm_revs` (`Controller._warm_revs`) names the same tips after the batch tips it lists
+and before the base.
+
 A run GitHub reports `queued` or `in_progress` is never re-dispatched over. It is lost only when it
 can no longer be found (neither in the listing nor by a direct read of the run), or when it is
 `in_progress`, nothing in its jobs moved for `lost_run_seconds` (progress is any phase or step
