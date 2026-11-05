@@ -7,6 +7,7 @@ decisions against the fake GitHub without driving whole head cycles.
 
 import dataclasses
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -28,7 +29,7 @@ from tauceti_queue.controller import (  # noqa: E402
     ControllerError,
     TaskError,
 )
-from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller  # noqa: E402
+from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.ports import AGENT_INSTRUCTION  # noqa: E402
 from tauceti_queue.store import loads  # noqa: E402
 
@@ -418,6 +419,79 @@ class Republication(ControllerCase):
         )
         self.assertEqual(self.controller.store.count("ci_attempts", {"batch_id": head["id"]}), 1)
         self.assertEqual(self.controller.recover()["republished_refs"], 0)
+
+
+# The `ci_attempts` table as created before `repair_outputs_revs` was declared.
+PRE_REPAIR_OUTPUTS_CI_ATTEMPTS = """
+CREATE TABLE ci_attempts (
+    id INTEGER PRIMARY KEY,
+    batch_id INTEGER NOT NULL,
+    batch_version INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    base_ref TEXT NOT NULL,
+    dispatch_id TEXT NOT NULL DEFAULT '',
+    dispatched_at REAL NOT NULL,
+    run_id TEXT,
+    run_attempt INTEGER,
+    run_status TEXT NOT NULL DEFAULT '',
+    run_conclusion TEXT,
+    run_created_at REAL,
+    run_started_at REAL,
+    run_completed_at REAL,
+    run_updated_at REAL,
+    runner_name TEXT,
+    runner_labels TEXT NOT NULL DEFAULT '[]',
+    host TEXT,
+    phases TEXT NOT NULL DEFAULT '[]',
+    html_url TEXT NOT NULL DEFAULT '',
+    last_progress_at REAL,
+    last_observed_at REAL,
+    outcome TEXT NOT NULL DEFAULT 'pending',
+    outcome_detail TEXT NOT NULL DEFAULT '',
+    diagnostics TEXT NOT NULL DEFAULT '[]',
+    infrastructure_retry INTEGER NOT NULL DEFAULT 0,
+    needs_observation INTEGER NOT NULL DEFAULT 1,
+    verdicts TEXT NOT NULL DEFAULT '{}'
+);
+"""
+
+# Columns declared on `batches` and `tasks` after those tables existed.
+PRE_REBASED_CHAIN_COLUMNS = (("batches", "pre_rebase_prepared"), ("tasks", "pre_rebase_source"))
+
+
+class OlderStore(ControllerCase):
+    def test_older_tables_gain_their_declared_columns_and_status_reads_the_existing_attempt(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"]})
+        self.controller.store.close()
+        # Rebuild `ci_attempts` at the older schema, keeping the dispatched attempt.
+        connection = sqlite3.connect(str(self.root / "queue.sqlite"))
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(ci_attempts)")]
+        columns.remove("repair_outputs_revs")
+        listed = ", ".join(columns)
+        connection.executescript(
+            "ALTER TABLE ci_attempts RENAME TO ci_attempts_current;"
+            + PRE_REPAIR_OUTPUTS_CI_ATTEMPTS
+            + f"INSERT INTO ci_attempts ({listed}) SELECT {listed} FROM ci_attempts_current;"
+            + "DROP TABLE ci_attempts_current;"
+        )
+        # And `batches` and `tasks` as created before their pre-rebased chain columns were declared.
+        for table, column in PRE_REBASED_CHAIN_COLUMNS:
+            connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        connection.close()
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        present = {row["name"] for row in restarted.store.execute("PRAGMA table_info(ci_attempts)")}
+        self.assertIn("repair_outputs_revs", present)
+        for table, column in PRE_REBASED_CHAIN_COLUMNS:
+            present = {row["name"] for row in restarted.store.execute(f"PRAGMA table_info({table})")}
+            self.assertIn(column, present, table)
+        ci = restarted.status()["head"]["ci"]
+        self.assertEqual(ci["attempt_id"], attempt["id"])
+        self.assertEqual(ci["repair_outputs_revs"], [])
 
 
 class Dispatch(ControllerCase):
