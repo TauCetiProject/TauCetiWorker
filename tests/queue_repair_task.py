@@ -61,6 +61,7 @@ from tauceti_queue import chain as chain_tool  # noqa: E402
 from tauceti_queue import (  # noqa: E402
     repair,
     repair_context,
+    repair_parallel,
     repair_publish,
     repair_sandbox,
     repair_stream,
@@ -116,7 +117,16 @@ if args[:2] == ["cache", "get"]:
 if args[:3] == ["exe", "cache", "get"]:
     sys.exit(0)
 if args[:1] == ["build"]:
+    import json
+    skip = {args[args.index("-o") + 1]} if "-o" in args else set()
+    named = [a for a in args[1:] if not a.startswith("-") and a not in skip]
     modules = sorted(Path("TauCeti").glob("*.lean"))
+    if named:
+        modules = [p for p in modules if "TauCeti." + p.stem in named]
+    started = time.time()
+    time.sleep(float(os.environ.get("STUB_LAKE_BUILD_SLEEP", "0")))
+    with (stub / "lake-builds.jsonl").open("a") as handle:
+        handle.write(json.dumps({"args": args, "cwd": os.getcwd(), "started": started, "finished": time.time()}) + "\n")
     rc = 0
     for index, path in enumerate(modules, 1):
         name = "TauCeti." + path.stem
@@ -188,8 +198,9 @@ launch = {
     "lock": (repair_dir / "build.lock").exists(),
     "build_helper": os.access(repair_dir / "build", os.X_OK),
 }
+started = time.time()
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
 if agent == "claude":
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
@@ -203,6 +214,8 @@ def git(*a, **kw):
 
 
 def finish(text="done", rc=0):
+    with (stub_dir / "agent-finished.jsonl").open("a") as handle:
+        handle.write(json.dumps({"call": call, "agent": agent, "started": started, "finished": time.time(), "rc": rc}) + "\n")
     usage = {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}
     if agent == "codex":
         print(json.dumps({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": text}}), flush=True)
@@ -246,7 +259,36 @@ def rebuild(explain=True, drop=None):
             git("commit", "--quiet", "--amend", "--allow-empty", "-F", "-", input=message)
 
 
-if mode == "repair":
+def fixup():
+    """A group agent: fix BROKEN in the files the prompt allows, as fixup! + squash! commits on top of HEAD."""
+    allowed = re.findall(r"`([^`]+\.lean)`", prompt.split("Files you may edit: ", 1)[1].split("\n", 1)[0])
+    failing = os.environ.get("STUB_FAIL_GROUP_WITH")
+    if failing and failing in allowed:
+        finish("this group's agent gave up", rc=1)
+    time.sleep(float(os.environ.get("STUB_GROUP_SLEEP", "1.0")))
+    for path in allowed:
+        file = Path(path)
+        if not file.exists() or "BROKEN" not in file.read_text():
+            continue
+        owner = re.search(r"`" + re.escape(path) + r":\d+:\d+` \(PR #(\d+)'s commit `([0-9a-f]{12})`", prompt)
+        sha = owner.group(2)
+        file.write_text(file.read_text().replace("BROKEN", "trivial"))
+        git("add", path)
+        git("commit", "--quiet", f"--fixup={sha}")
+        git("commit", "--quiet", "--allow-empty", f"--squash={sha}", "-m", f"Repair: replaced the unknown identifier in {path} with `trivial`.")
+    if os.environ.get("STUB_GROUP_STRAY") in allowed:
+        Path("TauCeti/A.lean").write_text("theorem a : True := trivial -- stray\n")
+        git("add", "TauCeti/A.lean")
+        git("commit", "--quiet", f"--fixup={sha}")
+    if os.environ.get("STUB_GROUP_BUILD") == "1":
+        build = subprocess.run(["python3", ".tauceti-repair/build", *re.findall(r"\.tauceti-repair/build ([^`]+)`", prompt)[0].split()], text=True, capture_output=True)
+        finish(f"done; build exit {build.returncode}")
+
+
+if "## Your part of the repair" in prompt:
+    fixup()
+    finish()
+elif mode == "repair":
     rebuild()
     if agent == "codex" and Path(".tauceti-repair/check").exists():
         # The helper the prompt names is plain Python and runs the same under either CLI.
@@ -359,7 +401,8 @@ def commit(repo: Path, message: str, files: dict[str, str]) -> str:
 class Content:
     """A bare content repository, a seed clone that built the chain, and the worker's clone."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, broken: tuple[int, ...] = (2,)):
+        self.broken = broken
         self.bare = root / "content.git"
         subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(self.bare)], check=True)
         seed = root / "seed"
@@ -370,11 +413,9 @@ class Content:
         self.base = commit(seed, "base", {"TauCeti/A.lean": "theorem a : True := trivial\n"})
         sh(seed, "push", "--quiet", "origin", "main")
         heads = {}
-        for number, files in (
-            (1, {"TauCeti/One.lean": "theorem one : True := trivial\n"}),
-            (2, {"TauCeti/Two.lean": "theorem two : True := BROKEN\n"}),
-            (3, {"TauCeti/Three.lean": "theorem three : True := trivial\n"}),
-        ):
+        for number, name in ((1, "One"), (2, "Two"), (3, "Three")):
+            body = "BROKEN" if number in broken else "trivial"
+            files = {f"TauCeti/{name}.lean": f"theorem {name.lower()} : True := {body}\n"}
             sh(seed, "checkout", "--quiet", "--detach", self.base)
             heads[number] = commit(seed, f"pr {number}", files)
         members = [
@@ -419,12 +460,17 @@ class Content:
             "onto": self.base,
             "members": self.members,
             "diagnostics": [
-                {
-                    "kind": "compiler",
-                    "module": "TauCeti/Two.lean",
-                    "message": "TauCeti/Two.lean:1:20: unknown identifier BROKEN",
-                },
-                {"kind": "build", "module": "TauCeti/Two.lean", "message": "module failed to build"},
+                entry
+                for name in ("One", "Two", "Three")
+                if ("One", "Two", "Three").index(name) + 1 in self.broken
+                for entry in (
+                    {
+                        "kind": "compiler",
+                        "module": f"TauCeti/{name}.lean",
+                        "message": f"TauCeti/{name}.lean:1:20: unknown identifier BROKEN",
+                    },
+                    {"kind": "build", "module": f"TauCeti/{name}.lean", "message": "module failed to build"},
+                )
             ],
             "retained_refs": ["refs/heads/queue/batch-1/base", "refs/heads/queue/batch-1/tip"],
             "instruction": repair.AGENT_INSTRUCTION,
@@ -708,9 +754,11 @@ class FakeService:
 
 
 class Fixture(unittest.TestCase):
+    BROKEN = (2,)  # the members whose module fails to build
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="case-", dir=TMP))
-        self.content = Content(self.root)
+        self.content = Content(self.root, broken=self.BROKEN)
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
         os.environ["STUB_DIR"] = str(self.stub_dir)
@@ -737,6 +785,9 @@ class Fixture(unittest.TestCase):
         os.environ.pop("STUB_SLEEP", None)
         os.environ.pop(repair_sandbox.DISABLE_VARIABLE, None)
         (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir)}))
+        for key in ("STUB_FAIL_GROUP_WITH", "STUB_GROUP_STRAY", "STUB_GROUP_BUILD", "STUB_LAKE_BUILD_SLEEP"):
+            os.environ.pop(key, None)
+        os.environ["STUB_GROUP_SLEEP"] = "1.0"
         self.service = FakeService(self.content.bare, [self.content.task()])
         self.addCleanup(self.service.close)
 
@@ -762,6 +813,7 @@ class Fixture(unittest.TestCase):
             artifacts_backoff=(0.0, 0.0),
             providers=("claude",),
             publish=repair_publish.Settings(),
+            parallel_agents=1,  # the parallel path has its own scenarios
         )
         values.update(overrides)
         return repair_task.RunnerConfig(**values)
@@ -787,6 +839,14 @@ class Fixture(unittest.TestCase):
 
     def bwrap_calls(self) -> list[dict]:
         path = self.stub_dir / "bwrap-calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def lake_builds(self) -> list[dict]:
+        path = self.stub_dir / "lake-builds.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def agent_finishes(self) -> list[dict]:
+        path = self.stub_dir / "agent-finished.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def state(self, task_id="1") -> dict:
@@ -2384,6 +2444,305 @@ class PublishOutputs(Fixture):
         self.assertEqual(text.count('name = "tauceti-repair"'), 1)
         self.assertEqual(text.count('name = "tauceti-repair-upload"'), 1)
         self.assertEqual(text.count("[[cache.service]]"), 3, "the public service is kept")
+
+
+class ParallelRepair(Fixture):
+    """Independent failing groups (members #2 and #3, disjoint files) repaired by concurrent agents, each
+    in its own worktree of the tip and its own child process, whose fixup commits the worker folds."""
+
+    BROKEN = (2, 3)
+    PROVIDER_WORDS = ("claude", "codex", "anthropic", "openai", "subagent", "agent tool", "task tool", "--resume")
+
+    def group_worktree(self, number: int) -> Path:
+        return self.root / "state" / "worktrees" / f"task-1-group-{number}"
+
+    def assert_two_groups_folded(self, outcome: dict) -> None:
+        parallel = outcome["parallel"]
+        self.assertEqual(parallel["status"], "ok", parallel)
+        self.assertEqual([g["status"] for g in parallel["groups"]], ["folded", "folded"])
+        self.assertEqual([g["members"] for g in parallel["groups"]], [[2], [3]])
+        self.assertEqual([g["paths"] for g in parallel["groups"]], [["TauCeti/Two.lean"], ["TauCeti/Three.lean"]])
+        self.assertEqual(parallel["fold"]["cherry_picked"], 4, "a fixup and a squash per group")
+        self.assertEqual(parallel["build"]["rc"], 0)
+        self.assertTrue(all(g["seconds"] is not None for g in parallel["groups"]))
+        self.assertEqual(parallel["tip"], outcome["tip"])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertEqual(pushed, outcome["tip"])
+        comparison = chain_tool.compare(
+            self.content.bare, self.content.base, self.content.tip, self.content.base, pushed
+        )
+        by_pr = {m.source_pr: m for m in comparison.members}
+        for number in (2, 3):
+            member = by_pr[f"{PROJECT}#{number}"]
+            self.assertEqual(member.provenance, chain_tool.EDITED, member)
+            self.assertTrue(member.message_preserved)
+            self.assertIn("Repair:", member.explanation)
+        self.assertEqual(by_pr[f"{PROJECT}#1"].provenance, chain_tool.CLEAN)
+        self.assertEqual(len(sh(self.content.bare, "rev-list", f"{self.content.base}..{pushed}").split()), 3)
+
+    def test_two_independent_groups_are_repaired_in_parallel_and_folded(self):
+        os.environ["STUB_GROUP_BUILD"] = "1"  # each group agent checks its fix through the scoped build script
+        cfg = self.config(parallel_agents=3)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assert_two_groups_folded(outcome)
+        # Two group agents ran at the same time, each in its own worktree of the tip with a scoped prompt.
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sorted(c["cwd"] for c in calls), [str(self.group_worktree(1)), str(self.group_worktree(2))])
+        self.assertEqual({c["agent"] for c in calls}, {"claude"})
+        finishes = {f["call"]: f for f in self.agent_finishes()}
+        first, second = finishes[1], finishes[2]
+        self.assertLess(first["started"], second["finished"])
+        self.assertLess(second["started"], first["finished"])
+        two = next(c["prompt"] for c in calls if c["cwd"] == str(self.group_worktree(1)))
+        self.assertTrue(two.startswith(repair.AGENT_INSTRUCTION))
+        self.assertIn(repair_parallel.GROUP_HEADING, two)
+        self.assertIn("`TauCeti/Two.lean:1:20` (PR #2's commit `", two)
+        self.assertIn("Files you may edit: `TauCeti/Two.lean`.", two)
+        self.assertNotIn("TauCeti/Three.lean", two, "the other group's module is not this agent's business")
+        self.assertIn("python3 .tauceti-repair/build TauCeti.Two`", two)
+        self.assertIn("git commit --fixup=<sha>", two)
+        self.assertIn("## Likely collisions and renames", two)
+        self.assertIn("Do not rebase, reorder, squash or amend the chain", two)
+        self.assertNotIn("linear chain on", two, "the group prompt does not ask for a rewritten chain")
+        self.assertEqual(
+            sorted(json.loads(self.service.results[0]["worker_notes"])["edited"]), [f"{PROJECT}#2", f"{PROJECT}#3"]
+        )
+        # The group agents' scoped builds and the worker's one whole-library verification build, all under
+        # the task worktree's lock, so none of them overlapped; the group worktrees are gone afterwards.
+        task_worktree = str(self.root / "state" / "worktrees" / "task-1")
+        builds = sorted(self.lake_builds(), key=lambda b: b["started"])
+        scoped = [b for b in builds if b["cwd"] != task_worktree]
+        self.assertEqual(
+            sorted(b["args"] for b in scoped),
+            [["build", "--iofail", "TauCeti.Three"], ["build", "--iofail", "TauCeti.Two"]],
+        )
+        whole = [b for b in builds if b["cwd"] == task_worktree and b["args"] == ["build", "--iofail"]]
+        self.assertEqual(len(whole), 2, "the artifact preparation's build, then the verification build")
+        self.assertGreater(whole[-1]["started"], max(first["finished"], second["finished"]))
+        for earlier, later in zip(builds, builds[1:], strict=False):
+            self.assertGreaterEqual(later["started"], earlier["finished"], "builds are serialized by the lock")
+        self.assertEqual(outcome["parallel"]["lock"], f"{task_worktree}/.tauceti-repair/build.lock")
+        self.assertFalse(self.group_worktree(1).exists())
+        self.assertFalse(self.group_worktree(2).exists())
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
+        self.assertEqual(self.state()["parallel"]["status"], "ok")
+        # The groups came from the streaming build's complete error list, after that build had finished;
+        # the verification build ran in the sandbox like the rest.
+        self.assertEqual(outcome["parallel"]["source"], "errors.jsonl")
+        self.assertEqual(outcome["parallel"]["stream_errors"], 2)
+        self.assertTrue(outcome["stream_build"]["finished"])
+        self.assertEqual(outcome["stream_build"]["failed_modules"], ["TauCeti.Three", "TauCeti.Two"])
+        sandboxed = [c["argv"][c["argv"].index("--") + 1 :] for c in self.bwrap_calls()]
+        self.assertEqual(sandboxed.count(["lake", "build", "--iofail"]), 2, "the streaming and verification builds")
+        self.assertIn(["lake", "build", "--iofail", "TauCeti.Two"], sandboxed)
+        # Each group ran in its own child process with its own checkpoint, prompt and result.
+        for number in (1, 2):
+            group_dir = self.root / "state" / "tasks" / "1" / "groups" / f"group-{number}"
+            self.assertEqual(json.loads((group_dir / "result.json").read_text())["status"], "ok")
+            self.assertEqual(json.loads((group_dir / "group.json").read_text())["state"], "agent_running")
+            self.assertTrue((group_dir / "prompt.md").exists())
+
+    def test_groups_come_from_the_streaming_build_when_the_diagnostics_under_report(self):
+        # CI's --fail-fast reported only the first broken module; the worker's own build finds both.
+        task = self.service.tasks[1]
+        task["diagnostics"] = [d for d in task["diagnostics"] if d["module"] == "TauCeti/Two.lean"]
+        cfg = self.config(parallel_agents=2)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assert_two_groups_folded(outcome)
+        self.assertEqual(outcome["parallel"]["source"], "errors.jsonl")
+        three = next(c["prompt"] for c in self.agent_calls() if c["cwd"] == str(self.group_worktree(2)))
+        self.assertIn("`TauCeti/Three.lean:1:1` (PR #3's commit `", three, "the streamed error, with its owner")
+        self.assertIn("unknown identifier BROKEN", three)
+
+    def test_group_agents_run_under_the_codex_argv_shape_too(self):
+        cfg = self.config(parallel_agents=2, providers=("codex",))
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assert_two_groups_folded(outcome)
+        calls = self.agent_calls()
+        self.assertEqual([c["agent"] for c in calls], ["codex", "codex"])
+        self.assertEqual({c["prompt_via"] for c in calls}, {"argv"})
+        self.assertEqual({a["provider"] for a in outcome["parallel"]["attempts"]}, {"codex"})
+
+    def test_a_group_whose_agent_fails_falls_back_to_the_sequential_path(self):
+        os.environ["STUB_FAIL_GROUP_WITH"] = "TauCeti/Three.lean"
+        cfg = self.config(parallel_agents=2)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        parallel = outcome["parallel"]
+        self.assertEqual(parallel["status"], "partial", parallel)
+        statuses = {g["name"]: g["status"] for g in parallel["groups"]}
+        self.assertEqual(statuses, {"group-1": "folded", "group-2": "failed"})
+        self.assertEqual(parallel["fold"]["applied"], ["group-1"])
+        self.assertEqual(parallel["build"]["failed_modules"], ["TauCeti.Three"])
+        # The sequential agent ran afterwards on the task's worktree with the usual prompt, for what was left.
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 3)
+        last = calls[-1]
+        self.assertEqual(last["cwd"], str(self.root / "state" / "worktrees" / "task-1"))
+        self.assertNotIn(repair_parallel.GROUP_HEADING, last["prompt"])
+        self.assertIn("linear chain on", last["prompt"])
+        self.assertIn("has finished: exit 1, 2 errors", last["prompt"], "the streaming build's section says it ended")
+        self.assertIn("`TauCeti/Three.lean:1:20`", last["prompt"])
+        self.assertNotIn("TauCeti/Two.lean:1:20", last["prompt"], "the folded group's error is not reported again")
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        comparison = chain_tool.compare(
+            self.content.bare, self.content.base, self.content.tip, self.content.base, pushed
+        )
+        by_pr = {m.source_pr: m for m in comparison.members}
+        self.assertEqual(by_pr[f"{PROJECT}#2"].provenance, chain_tool.EDITED)
+        self.assertEqual(by_pr[f"{PROJECT}#3"].provenance, chain_tool.EDITED)
+        self.assertEqual(by_pr[f"{PROJECT}#1"].provenance, chain_tool.CLEAN)
+        self.assertEqual(outcome["agent"][0]["parallel"], True)
+        self.assertEqual(outcome["agent"][1]["status"], "ok")
+
+    def test_fixups_outside_the_group_are_not_folded(self):
+        os.environ["STUB_GROUP_STRAY"] = "TauCeti/Two.lean"  # group 1's agent also changes TauCeti/A.lean
+        cfg = self.config(parallel_agents=2)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        parallel = outcome["parallel"]
+        self.assertEqual(parallel["status"], "partial", parallel)
+        statuses = {g["name"]: (g["status"], g["detail"]) for g in parallel["groups"]}
+        self.assertEqual(statuses["group-2"], ("folded", None))
+        self.assertEqual(statuses["group-1"][0], "unusable")
+        self.assertIn("outside the group: TauCeti/A.lean", statuses["group-1"][1])
+        self.assertEqual(len(self.agent_calls()), 3)
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertEqual(sh(self.content.bare, "show", f"{pushed}:TauCeti/A.lean"), "theorem a : True := trivial")
+
+    def test_a_lost_claim_cancels_the_group_agents(self):
+        os.environ["STUB_GROUP_SLEEP"] = "30"
+        cfg = self.config(parallel_agents=2)
+
+        def lose_the_claim_once_both_agents_run():
+            deadline = time.monotonic() + 60
+            while len(self.agent_calls()) < 2 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.service.renew_mode = "refuse"
+
+        threading.Thread(target=lose_the_claim_once_both_agents_run, daemon=True).start()
+        started = time.monotonic()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "claim_lost", outcome)
+        self.assertLess(time.monotonic() - started, 25, "the sleeping group agents were stopped")
+        self.assertEqual(outcome["parallel"]["status"], "cancelled")
+        self.assertEqual([g["status"] for g in outcome["parallel"]["groups"]], ["cancelled", "cancelled"])
+        self.assertEqual(len(self.agent_calls()), 2)
+        self.assertEqual(self.service.results, [])
+        self.assertFalse(self.group_worktree(1).exists())
+
+    def test_the_build_lock_serializes_two_concurrent_scoped_builds(self):
+        # The sandbox clears the environment, so the stub's sleep travels with the bwrap stub's extras.
+        (BIN / "sandbox-env.json").write_text(
+            json.dumps({"STUB_DIR": str(self.stub_dir), "STUB_LAKE_BUILD_SLEEP": "0.6"})
+        )
+        lock = self.root / "shared" / "build.lock"
+        trees = []
+        for number in (1, 2):
+            tree = self.root / f"tree-{number}"
+            sh(self.content.clone, "worktree", "add", "--quiet", "--detach", str(tree), self.content.tip)
+            script = repair_tools.write_build_script(tree / repair_tools.TOOLS_DIR, lock=lock)
+            self.assertEqual(script, tree / ".tauceti-repair" / "build")
+            self.assertIn(f"LOCK = Path({str(lock)!r})", script.read_text())
+            trees.append(tree)
+        # A lock left by a builder that is gone is stale and taken over.
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("2147483000")
+        procs = [
+            subprocess.Popen([sys.executable, str(tree / ".tauceti-repair" / "build"), "TauCeti.One"], cwd=tree)
+            for tree in trees
+        ]
+        self.assertEqual([proc.wait(timeout=60) for proc in procs], [0, 0])
+        builds = sorted(self.lake_builds(), key=lambda b: b["started"])
+        self.assertEqual([b["args"] for b in builds], [["build", "--iofail", "TauCeti.One"]] * 2)
+        self.assertEqual(sorted(b["cwd"] for b in builds), sorted(str(t) for t in trees))
+        self.assertGreaterEqual(builds[1]["started"], builds[0]["finished"], "the second build waited for the first")
+        self.assertFalse(lock.exists(), "the lock is removed when the build ends")
+        # The worker's verification build holds the same directory through ``repair_tools.build_lock``.
+        self.assertEqual(repair_parallel.lock_path(trees[0]), trees[0] / ".tauceti-repair" / "build.lock")
+        with repair_tools.build_lock(trees[0]) as held:
+            self.assertEqual(held, repair_parallel.lock_path(trees[0]))
+            self.assertEqual(int((held / "pid").read_text()), os.getpid())
+        self.assertFalse(repair_parallel.lock_path(trees[0]).exists())
+        # The script a sequential agent gets keeps the worktree's own lock.
+        own = repair_tools.write_build_script(self.root / "own")
+        self.assertIn('LOCK = ROOT / ".tauceti-repair" / "build.lock"', own.read_text())
+
+    def test_the_group_prompt_is_provider_neutral_and_dependent_failures_stay_sequential(self):
+        clone = self.content.clone
+        chain = repair.read_chain(clone, self.content.base, self.content.tip)
+        task = repair_task.Task.from_json(
+            {**self.content.task(), "claim_token": "token", "expires_at": time.time() + 60}
+        )
+        findings = repair_task.task_findings(task)
+        tree = self.root / "tree"
+        sh(clone, "worktree", "add", "--quiet", "--detach", str(tree), self.content.tip)
+        groups, reason = repair_parallel.plan_groups(clone, chain, findings, tree)
+        self.assertIsNone(reason)
+        self.assertEqual(
+            [(g.members, g.files, g.paths) for g in groups],
+            [([2], ["TauCeti/Two.lean"], ["TauCeti/Two.lean"]), ([3], ["TauCeti/Three.lean"], ["TauCeti/Three.lean"])],
+        )
+        self.assertEqual([e["path"] for e in groups[1].findings["compiler_errors"]], ["TauCeti/Three.lean"])
+        self.assertEqual([e["module"] for e in groups[1].findings["other"]], ["TauCeti/Three.lean"])
+        context = repair_task.prompt_context(task, None, findings)
+        for group in groups:
+            prompt = repair_parallel.group_prompt(context, group, chain, clone, self.content.tip)
+            lowered = prompt.lower()
+            for word in self.PROVIDER_WORDS:
+                self.assertNotIn(word, lowered, f"{word!r} in the group prompt")
+            self.assertIn("`git commit --fixup=<sha>`", prompt)
+            self.assertIn('`git commit --allow-empty --squash=<sha> -m "<explanation>"`', prompt)
+            self.assertIn(f"python3 .tauceti-repair/build {repair.path_to_module(group.paths[0])}`", prompt)
+            self.assertIn("Do not run `lake build` directly", prompt)
+            self.assertIn(repair.HARD_RULES, prompt)
+            self.assertNotIn("Already on main", prompt)
+        # Three importing Two is one group: the import check reads the files at the tip.
+        (tree / "TauCeti" / "Three.lean").write_text("import TauCeti.Two\ntheorem three : True := BROKEN\n")
+        groups, reason = repair_parallel.plan_groups(clone, chain, findings, tree)
+        self.assertEqual(groups, [])
+        self.assertEqual(reason, "the failing modules depend on each other")
+        # A failure in a module no member changes (a ripple into main) cannot be assigned.
+        ripple = repair.findings_from_diagnostics(
+            [
+                {"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:1:1: unknown"},
+                *task.diagnostics,
+            ]
+        )
+        groups, reason = repair_parallel.plan_groups(clone, chain, ripple, tree)
+        self.assertEqual((groups, reason), ([], "no member's commit changes TauCeti/A.lean"))
+        # One member owning every failing module is sequential too.
+        one = repair.findings_from_diagnostics([d for d in task.diagnostics if d["module"] == "TauCeti/Two.lean"])
+        self.assertEqual(
+            repair_parallel.plan_groups(clone, chain, one, tree), ([], "one member owns every failing module")
+        )
+        # The job file carries the configuration without its secrets and comes back typed.
+        cfg = self.config(
+            api_key="sk-secret",
+            token="tok",
+            seed_packages=self.root / "pkgs",
+            publish=repair_publish.Settings(url="https://r.example", key_file=self.root / "key"),
+        )
+        record = json.loads(json.dumps(repair_parallel.config_to_json(cfg)))
+        self.assertNotIn("sk-secret", json.dumps(record))
+        self.assertNotIn("tok", record.values())
+        revived = repair_parallel.config_from_json(record, repair_task.RunnerConfig)
+        self.assertEqual(revived.seed_packages, self.root / "pkgs")
+        self.assertEqual(revived.providers, ("claude",))
+        self.assertEqual(revived.inference_delays, (0.0,))
+        self.assertEqual(revived.publish, cfg.publish)
+        self.assertIsNone(revived.api_key)
+
+    def test_parallel_agents_disabled_keeps_the_sequential_path(self):
+        cfg = self.config(parallel_agents=1)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertNotIn("parallel", outcome)
+        self.assertEqual(len(self.agent_calls()), 1)
 
 
 class Preflight(Fixture):
