@@ -54,7 +54,7 @@ import types
 import typing
 from pathlib import Path
 
-from tauceti_queue import repair, repair_context, repair_sandbox, repair_stream, repair_tools
+from tauceti_queue import repair, repair_audit, repair_context, repair_sandbox, repair_stream, repair_tools
 from tauceti_queue.repair import ChainCommit, PromptContext, git
 
 DEFAULT_PARALLEL_AGENTS = 3
@@ -66,6 +66,7 @@ IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][\w'.]*)", re.M)
 # Agent statuses that mean the provider, not the group, is the problem; with no group repaired they
 # release the task under the same name (``repair_task.RELEASED_AGENT_STATUSES``).
 PROVIDER_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
+CHECK_KINDS = ("audit", "lint")  # the worker's audit and lint findings in errors.jsonl (``repair_audit``)
 
 
 def parallel_agents_default() -> int:
@@ -205,6 +206,14 @@ def plan_groups(
     for prs in owners.values():
         for other in prs[1:]:
             unite(prs[0], other)
+    # One finding naming several modules (a duplicate declaration, an import collision) is one repair.
+    by_entry: dict[int, list[str]] = {}
+    for path, family, entry in items:
+        if family in ("duplicate_declarations", "import_collisions") and path:
+            by_entry.setdefault(id(entry), []).append(path)
+    for entry_paths in by_entry.values():
+        for path in entry_paths[1:]:
+            unite(owners[entry_paths[0]][0], owners[path][0])
     file_owner: dict[str, int] = {}
     for pr in members:
         for path in files[pr]:
@@ -239,7 +248,8 @@ def plan_groups(
 
 def read_errors(directory: Path) -> list[dict] | None:
     """The compiler errors of the streaming build's ``errors.jsonl`` in ``directory`` (the worktree's
-    ``.tauceti-repair``), without its event lines; None when there is no such file."""
+    ``.tauceti-repair``), with the audit and lint findings the worker appended (``kind`` ``audit`` or
+    ``lint``), without its event lines; None when there is no such file."""
     path = directory / repair_stream.ERRORS_FILE
     if not path.exists():
         return None
@@ -249,15 +259,27 @@ def read_errors(directory: Path) -> list[dict] | None:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(entry, dict) and entry.get("file") and not entry.get("event"):
+        if not isinstance(entry, dict) or entry.get("event"):
+            continue
+        if entry.get("file") or entry.get("kind") in CHECK_KINDS:
             errors.append(entry)
     return errors
 
 
 def merge_errors(findings: dict, errors: list[dict]) -> dict:
     """The task's findings with the streaming build's errors added as compiler errors (a location the
-    diagnostics already report is not repeated) and their modules as failed modules."""
+    diagnostics already report is not repeated) and their modules as failed modules, and its audit and
+    lint findings added as those diagnostics are (``repair.findings_from_diagnostics``)."""
     merged = json.loads(json.dumps(findings))
+    checks = repair.findings_from_diagnostics(
+        [{**e, "path": e.get("file") or ""} for e in errors if e.get("kind") in CHECK_KINDS]
+    )
+    for key in ("duplicate_declarations", "import_collisions"):
+        merged[key] += [entry for entry in checks[key] if entry not in merged[key]]
+    merged["lint"]["findings"] += [f for f in checks["lint"]["findings"] if f not in merged["lint"]["findings"]]
+    merged.setdefault("other", [])
+    merged["other"] += [f for f in checks["other"] if f not in merged["other"]]
+    errors = [e for e in errors if e.get("kind") not in CHECK_KINDS]
     located = {(e["path"], int(e.get("line") or 0), int(e.get("column") or 0)) for e in merged["compiler_errors"]}
     for error in errors:
         path = str(error["file"])
@@ -676,6 +698,7 @@ def repair_groups(
         if ownership is not None and hasattr(ownership, "members"):
             repair_context.write_files(ownership, path)
         repair_tools.write_build_script(path / repair_tools.TOOLS_DIR, lock=lock)
+        repair_audit.write_settings(path, base=base, tools_root=cfg.root / repair_audit.TOOLS_DIR, lake=tuple(cfg.lake))
         group.worktree = str(path)
         return path
 
@@ -777,6 +800,7 @@ def repair_groups(
     record["groups"] = [group.summary() for group in groups]
     folded_tip = record["fold"].get("tip")
     failed_modules: list[str] = []
+    check_findings: list[dict] = []
     if folded_tip:
         report = repair.chain_report(cfg.clone, base, tip, folded_tip, task.member_keys, prior_base=task.base)
         record["report"] = report
@@ -798,6 +822,20 @@ def repair_groups(
                     env_lake,
                     cfg.build_timeout,
                 )
+                if build["rc"] == 0 and getattr(cfg, "worker_audits", False) and task.kind == "repair":
+                    # CI's audits and changed-module lint over the green build, still under the lock.
+                    checks = repair_audit.check(
+                        worktree,
+                        env_lake,
+                        base=base,
+                        tools_root=cfg.root / repair_audit.TOOLS_DIR,
+                        logdir=logdir,
+                        lake=tuple(cfg.lake),
+                        timeout=cfg.build_timeout,
+                    )
+                    record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
+                    check_findings = checks["diagnostics"]
+                    repair_audit.append_errors(worktree / repair_tools.TOOLS_DIR, check_findings)
             build.update(repair.parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
             record["build"] = {k: v for k, v in build.items() if "load" not in k}
             failed_modules = list(build["failed_modules"])
@@ -806,12 +844,26 @@ def repair_groups(
     _cleanup(worktree, groups, cfg.keep_worktree)
     if cancel.is_set():
         record["status"] = "cancelled"
-    elif all(group.status == "folded" for group in groups) and not failed_modules and record.get("build"):
+    elif (
+        all(group.status == "folded" for group in groups)
+        and not failed_modules
+        and not check_findings
+        and record.get("build")
+    ):
         record["status"] = "ok"
         record["tip"] = folded_tip
+        if "checks" in record:
+            record["verified_tip"] = folded_tip  # built and checked: the sequential path need not repeat it
     else:
         record["status"] = "partial"
         record["remaining"] = remaining_findings(findings, groups, failed_modules)
+        if check_findings:
+            # The folded chain builds; what is left is the checks' findings, as the controller would report them.
+            remaining = repair.findings_from_diagnostics(check_findings)
+            for key in ("duplicate_declarations", "import_collisions", "other"):
+                record["remaining"].setdefault(key, [])
+                record["remaining"][key] += remaining[key]
+            record["remaining"]["lint"]["findings"] += remaining["lint"]["findings"]
     record["seconds"] = round(time.monotonic() - started, 1)
     return record
 

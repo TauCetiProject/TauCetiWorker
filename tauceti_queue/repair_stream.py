@@ -11,7 +11,10 @@ files and the rule that exactly one ``lake build`` runs at a time: no build of i
 exists, and ``.tauceti-repair/build <Module> ...`` (``repair_tools``) for a scoped build once the lock
 is free. When the build ends the worker appends a ``build finished, exit N, M errors total`` line to
 the error list and removes the lock. The agent's final whole-library ``lake build --iofail`` after its
-fixes is still the only verdict. The lock is ``repair_tools``'s, the one the agent's build script takes, and
+fixes is still the only verdict. When the build is green and the worker gave it an ``audit`` callable
+(``repair_audit.check``), CI's audits and the changed-module environment lint run before the lock is
+released, and their findings are appended to the error list like compiler errors (``kind`` ``audit`` or
+``lint``, ``module``, ``file``, ``message``, ``member``, ``commit``). The lock is ``repair_tools``'s, the one the agent's build script takes, and
 the build runs in ``repair_sandbox``'s offline sandbox like every build of the worker.
 """
 
@@ -122,8 +125,12 @@ class StreamingBuild:
         lake: tuple[str, ...] = ("lake",),
         timeout: float | None = None,
         copy_log_to: Path | None = None,
+        audit=None,
     ) -> None:
         self.worktree = worktree
+        self.audit = audit  # called once a green build ends, holding the lock; ``repair_audit.check``'s record
+        self.findings: list[dict] = []  # its audit and lint findings
+        self.audit_record: dict | None = None
         self.directory = directory
         self.env = env
         self.chain = chain
@@ -212,6 +219,8 @@ class StreamingBuild:
             "errors_file": str(self.errors_path),
             "errors": len(self.errors),
             "failed_modules": self.failed_modules,
+            "findings": len(self.findings),
+            "audit": self.audit_record,
             "rc": self.rc,
             "timed_out": self.timed_out,
             "finished": self.finished.is_set(),
@@ -241,7 +250,8 @@ class StreamingBuild:
             "object per line with `module`, `file`, `line`, `column`, `message` (continuation lines included), "
             "`member` (the PR whose squash commit last touched the file) and `commit`; both grow while the build "
             "runs, so read the error list again before deciding what is left. When the build ends, the worker "
-            f"appends a `build finished, exit N, M errors total` line to the error list and removes `{directory}/{LOCK_FILE}`.",
+            f"appends a `build finished, exit N, M errors total` line to the error list and removes `{directory}/{LOCK_FILE}`; "
+            "after a green build it first runs CI's audits and lints and appends their findings to the same list.",
             "",
             "Start on the modules that have already failed while the build goes on; they are in the error list, and "
             "the running build will not revisit them. Edit only modules that have already failed: a module the build "
@@ -300,6 +310,14 @@ class StreamingBuild:
                     if line:
                         self._record(parser.feed(line.decode("utf-8", errors="replace")))
             self._record(parser.finish())
+            if (
+                self.audit is not None
+                and not self.timed_out
+                and not self._stop.is_set()
+                and process.wait() == 0
+                and not self.errors
+            ):
+                self._run_audit()
         finally:
             os.close(fd)
             if process.poll() is None:
@@ -316,6 +334,20 @@ class StreamingBuild:
                     self.errors.append(error)
                     handle.write(json.dumps(error) + "\n")
         self.ready.set()
+
+    def _run_audit(self) -> None:
+        from tauceti_queue import repair_audit
+
+        try:
+            record = self.audit()
+        except Exception as error:  # the build's own record must still be finished
+            self.audit_record = {"status": "unavailable", "reason": f"{type(error).__name__}: {error}"}
+            return
+        found = list(record.get("diagnostics") or [])
+        self.audit_record = {k: v for k, v in record.items() if k != "diagnostics"}
+        with self._lock:
+            repair_audit.append_errors(self.directory, found, owner=self._owner)
+            self.findings += found
 
     def _owner(self, path: str) -> dict:
         """The member whose squash commit last touched ``path``: ``member`` (``owner/repo#N``) and ``commit``."""
@@ -359,6 +391,8 @@ class StreamingBuild:
             self.rc = rc
             self.seconds = round(time.monotonic() - self.started_at, 1) if self.started_at is not None else None
             count = len(self.errors)
+            found = len(self.findings)
+            suffix = f", {found} audit or lint finding{'s' if found != 1 else ''}" if found else ""
             try:
                 with self.errors_path.open("a") as handle:
                     handle.write(
@@ -367,8 +401,10 @@ class StreamingBuild:
                                 "event": "build_finished",
                                 "exit": rc,
                                 "errors": count,
+                                **({"findings": found} if found else {}),
                                 "timed_out": self.timed_out,
-                                "message": f"build finished, exit {rc}, {count} error{'s' if count != 1 else ''} total",
+                                "message": f"build finished, exit {rc}, {count} error{'s' if count != 1 else ''} total"
+                                + suffix,
                             }
                         )
                         + "\n"
@@ -396,8 +432,10 @@ def start_build(
     lake: tuple[str, ...] = ("lake",),
     timeout: float | None = None,
     copy_log_to: Path | None = None,
+    audit=None,
 ) -> StreamingBuild:
-    """Start the streaming build; the caller waits with ``wait_for_agent`` and ends it with ``stop``."""
+    """Start the streaming build; the caller waits with ``wait_for_agent`` and ends it with ``stop``.
+    ``audit`` (no arguments, returning ``repair_audit.check``'s record) runs after a green build."""
     return StreamingBuild(
         worktree,
         directory,
@@ -407,4 +445,5 @@ def start_build(
         lake=lake,
         timeout=timeout,
         copy_log_to=copy_log_to,
+        audit=audit,
     ).start()

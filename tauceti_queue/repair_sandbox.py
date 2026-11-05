@@ -117,9 +117,17 @@ def _inside_path(env: dict, elan: Path) -> str:
     return ":".join(entries)
 
 
-def sandbox_argv(argv: list[str], worktree: Path, env: dict | None = None, *, bwrap: str | None = None) -> list[str]:
-    """``argv`` wrapped in the offline sandbox, run from ``worktree``. Raises
-    :class:`SandboxUnavailable` when ``bwrap`` is not on PATH."""
+def sandbox_argv(
+    argv: list[str],
+    worktree: Path,
+    env: dict | None = None,
+    *,
+    bwrap: str | None = None,
+    extra_env: dict | None = None,
+) -> list[str]:
+    """``argv`` wrapped in the offline sandbox, run from ``worktree``, with ``extra_env`` set inside it
+    (the audit and lint scripts' inputs, ``repair_audit``). Raises :class:`SandboxUnavailable` when
+    ``bwrap`` is not on PATH."""
     env = dict(os.environ if env is None else env)
     bwrap = bwrap or shutil.which("bwrap")
     if not bwrap:
@@ -156,17 +164,22 @@ def sandbox_argv(argv: list[str], worktree: Path, env: dict | None = None, *, bw
     for key in PASSED_ENV:
         if env.get(key):
             args += ["--setenv", key, env[key]]
+    for key, value in (extra_env or {}).items():
+        args += ["--setenv", key, str(value)]
     args += ["--chdir", str(worktree), *NAMESPACE_FLAGS, "--", *argv]
     return args
 
 
-def sandboxed_lake(argv: list[str], worktree: Path, env: dict | None = None) -> list[str]:
+def sandboxed_lake(
+    argv: list[str], worktree: Path, env: dict | None = None, *, extra_env: dict | None = None
+) -> list[str]:
     """The command to run for ``argv`` (a ``lake build ...``) from ``worktree``: wrapped in the
-    sandbox, or ``argv`` itself with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``."""
+    sandbox, or ``argv`` itself with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0`` (the caller then
+    passes ``extra_env`` in the process environment)."""
     if disabled():
         warn_disabled(argv)
         return list(argv)
-    return sandbox_argv(argv, worktree, env)
+    return sandbox_argv(argv, worktree, env, extra_env=extra_env)
 
 
 def check(scratch: Path | None = None, env: dict | None = None) -> tuple[bool, str]:

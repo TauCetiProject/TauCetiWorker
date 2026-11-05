@@ -65,7 +65,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from tauceti_queue import repair, repair_context, repair_parallel, repair_publish, repair_sandbox, repair_stream
+from tauceti_queue import (
+    repair,
+    repair_audit,
+    repair_context,
+    repair_parallel,
+    repair_publish,
+    repair_sandbox,
+    repair_stream,
+)
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 
 SCHEMA = "tauceti-queue.repair-task/v1"
@@ -672,6 +680,11 @@ class RunnerConfig:
     # Run the first whole-library build in the background and launch the agent at its first error
     # (``repair_stream``; ``TAUCETI_QUEUE_STREAM_REPAIR``, ``--no-stream-repair``). Off: the agent runs it.
     stream_repair: bool = True
+    # CI's audits and changed-module lint after every green whole-library build the worker runs, and the
+    # worker's own verification build before a repair is submitted (``repair_audit``;
+    # ``TAUCETI_QUEUE_WORKER_AUDITS``, ``--no-worker-audits``).
+    worker_audits: bool = dataclasses.field(default_factory=repair_audit.enabled)
+    verify_retries: int = 2  # agent rounds for the findings of a failed verification before release
     # The service publishes a task's retained refs through its outbox a moment after creating the
     # task, so a ref the remote does not have yet is retried for this long before it is an error.
     fetch_retry_seconds: float = 120.0
@@ -1696,6 +1709,11 @@ def run_task(
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         ownership = repair_context.compute(cfg.clone, chain_before, task.validation_base, worktree)
         outcome["repair_context"] = ownership.summary()
+        tools_root = cfg.root / repair_audit.TOOLS_DIR
+        if cfg.worker_audits:
+            repair_audit.write_settings(
+                worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake)
+            )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
                 worktree,
@@ -1706,11 +1724,29 @@ def run_task(
                 lake=cfg.lake,
                 timeout=cfg.build_timeout,
                 copy_log_to=logdir / "stream-build.log",
+                audit=functools.partial(
+                    repair_audit.check,
+                    worktree,
+                    env_lake,
+                    base=task.validation_base,
+                    tools_root=tools_root,
+                    logdir=logdir,
+                    lake=tuple(cfg.lake),
+                    timeout=cfg.build_timeout,
+                )
+                if cfg.worker_audits
+                else None,
             )
             if not stream.wait_for_agent(cancel):
                 return cancelled("cancelled while the build streamed")
             outcome["stream_build"] = stream.summary()
-            if task.kind == "prepare" and stream.finished.is_set() and stream.rc == 0 and not stream.errors:
+            if (
+                task.kind == "prepare"
+                and stream.finished.is_set()
+                and stream.rc == 0
+                and not stream.errors
+                and not stream.findings
+            ):
                 # The batch builds on its base as assembled: publish the outputs for the head's later
                 # rounds and give the task back as prepared, without an agent.
                 outcome["publish"] = repair_publish.publish_outputs(
@@ -1731,6 +1767,7 @@ def run_task(
         pushed: str | None = None
         attempt = 0
         validation_retries = 0
+        verify_rounds = 0
         explanation_resubmits = 0
         resubmit = False
         agent_records: list[dict] = []
@@ -1855,6 +1892,44 @@ def run_task(
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+            verified = (outcome.get("parallel") or {}).get("verified_tip") == tip
+            artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
+            if cfg.worker_audits and task.kind == "repair" and not artifacts_cold and not verified:
+                # The worker's own verdict before anything is submitted: the whole-library build, then CI's
+                # audits and the changed-module lint. A finding goes back to the agent as a diagnostic.
+                state.write("verifying", attempt=attempt, tip=tip)
+                verification = repair_audit.verify(
+                    worktree,
+                    env_lake,
+                    base=task.validation_base,
+                    tools_root=tools_root,
+                    logdir=logdir,
+                    lake=tuple(cfg.lake),
+                    timeout=cfg.build_timeout,
+                )
+                outcome.setdefault("verification", []).append(
+                    {k: v for k, v in verification.items() if k != "diagnostics"}
+                    | {"tip": tip, "findings": len(verification["diagnostics"])}
+                )
+                checks = verification.get("checks") or {}
+                if checks.get("status") == "unavailable":
+                    log(f"task {task.task_id}: audits unavailable ({checks.get('reason')}); CI runs them")
+                if not verification["ok"]:
+                    detail = "The worker's verification of the chain failed:\n" + repair_audit.format_findings(
+                        verification["diagnostics"]
+                    )
+                    state.write("verification_failed", attempt=attempt, tip=tip, detail=detail)
+                    if verify_rounds < cfg.verify_retries:
+                        verify_rounds += 1
+                        findings = repair.findings_from_diagnostics(verification["diagnostics"])
+                        feedback = (
+                            detail
+                            + "\n\nThe findings are listed above as diagnostics and appended to "
+                            + f"`{repair.LISTINGS_DIR}/{repair_audit.ERRORS_FILE}`."
+                        )
+                        log(f"attempt {attempt}: verification failed; running the agent on its findings")
+                        continue
+                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
             if (outcome.get("publish") or {}).get("revision") != tip:
@@ -2611,6 +2686,12 @@ def main(argv: list[str] | None = None) -> int:
         help="let the agent run the first whole-library build itself instead of the worker streaming it to the agent"
         " as it runs ($TAUCETI_QUEUE_STREAM_REPAIR=0)",
     )
+    parser.add_argument(
+        "--no-worker-audits",
+        action="store_true",
+        help="skip the worker's verification build and CI's audits and changed-module lint after its green builds"
+        " ($TAUCETI_QUEUE_WORKER_AUDITS=0)",
+    )
     args = parser.parse_args(argv)
     if not args.service:
         parser.error("--service (or TAUCETI_QUEUE_SERVICE) is required")
@@ -2650,6 +2731,7 @@ def main(argv: list[str] | None = None) -> int:
         rate=args.rate or None,
         api_key=api_key,
         stream_repair=stream_repair_enabled(args.no_stream_repair),
+        worker_audits=repair_audit.enabled() and not args.no_worker_audits,
     )
     if args.check:
         checks = preflight(cfg)

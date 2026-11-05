@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
-from tauceti_queue import repair_sandbox, repair_tools
+from tauceti_queue import diagnostics, repair_sandbox, repair_tools
 
 DEFAULT_REPOSITORY = "TauCetiProject/TauCeti"
 CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
@@ -207,9 +207,29 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
             if module and module not in findings["failed_modules"]:
                 findings["failed_modules"].append(module)
         elif family == "lint":
-            findings["lint"]["findings"].append(
-                {"linter": raw.get("linter") or kind, "declaration": raw.get("declaration") or message, "path": module}
-            )
+            entry = {
+                "linter": raw.get("linter") or kind,
+                "declaration": raw.get("declaration") or message,
+                "path": module,
+            }
+            if raw.get("path"):
+                entry["path"] = str(raw["path"])
+            if entry not in findings["lint"]["findings"]:
+                findings["lint"]["findings"].append(entry)
+        elif family == "audit" and (duplicate := diagnostics.DUPLICATE.fullmatch(message.strip())):
+            # CI's (and the worker's) audit names both owners on one line; one entry naming both modules.
+            declaration, modules = duplicate.group(1), [duplicate.group(2), duplicate.group(3)]
+            entry = {"declaration": declaration, "modules": [m for m in modules if m.startswith("TauCeti.")]}
+            if entry["modules"] and entry not in findings["duplicate_declarations"]:
+                findings["duplicate_declarations"].append(entry)
+        elif family == "audit" and (collision := diagnostics.AUDIT.fullmatch(message.strip())):
+            entry = {
+                "module": collision.group(1),
+                "declaration": collision.group(2),
+                "other_module": collision.group(3),
+            }
+            if entry not in findings["import_collisions"]:
+                findings["import_collisions"].append(entry)
         else:
             findings["other"].append({"kind": kind or "finding", "module": module, "message": message})
     return findings
@@ -1314,6 +1334,13 @@ def _hours_text(seconds: int) -> str:
     return f"{seconds}-second"
 
 
+# The one sentence the prompt says about the worker's checks (``repair_audit``): a fact, not a request.
+AUDIT_SENTENCE = (
+    f"`{LISTINGS_DIR}/{BUILD_FILE}` with no module arguments and the worker's verification also run CI's audits and "
+    "lints; the task cannot be submitted until they pass."
+)
+
+
 def _verification_section(
     context: PromptContext, findings: dict, base_short: str, check_command: str | None
 ) -> list[str]:
@@ -1333,6 +1360,8 @@ def _verification_section(
             f"Check a fix with `{LISTINGS_DIR}/{BUILD_FILE} <Module.Name>` first (add `--dependents` to include the "
             "modules that import it): it builds only those modules and waits for any other build in this checkout "
             "to finish. Run the whole-library `lake build --iofail` only as the final verdict.",
+            "",
+            AUDIT_SENTENCE,
         ]
         if check_command
         else []
