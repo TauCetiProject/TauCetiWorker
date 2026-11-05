@@ -257,10 +257,12 @@ Consequences:
   loop around it, so a crash leaves it down until restarted.
 - **No daily backup.** The timer is disabled; run `~/TauCetiQueue/services/queue/backup.sh` by hand
   before any risky change, or from a cron entry (`17 3 * * * ~/TauCetiQueue/services/queue/backup.sh`).
-- **Deploy** is `~/TauCetiQueue/services/queue/install.sh --revision <sha> --no-restart` followed by
-  `pkill -f 'tauceti-queue serve'`; the supervisor loop restarts the service on the new revision
-  (the SIGTERM shutdown is the same as the unit's). Verify as in "Verification after a deploy",
-  reading `service.log` instead of `journalctl`.
+- **Deploy** with the scripts in `~/TauCetiQueue-data`: `deploy-queue.sh` updates the service and
+  both repair workers, `deploy-service.sh` the service only. Underneath, the service is updated by
+  `~/TauCetiQueue/services/queue/install.sh --revision <sha> --no-restart` and a SIGTERM to
+  `tauceti-queue serve`, after which the supervisor loop restarts it on the new revision (the same
+  shutdown as the unit's). Verify as in "Verification after a deploy", reading `service.log` instead
+  of `journalctl`.
 - **Baked revision.** `tauceti_queue/_revision.py` is written by `install.sh` only. After a plain
   `git pull` in `~/TauCetiQueue`, rewrite it by hand before restarting, or the status page reports the
   old revision:
@@ -269,8 +271,13 @@ Consequences:
   restarted (a running task is checkpointed and resumed). Restart one worker by killing its
   supervisor (`run-worker.sh`) and then its child, both by PID. `restart-worker.sh` kills every
   `repair_task` process, the other worker's included, so it is not used while another worker is busy.
-  Never put a process-pattern match (`pkill -f`, `pgrep -f`) in an ssh command line: the pattern
-  matches the ssh session's own shell. Find the PIDs in a login shell on the host.
+  `restart-worker-1.sh` restarts worker 1 alone and refuses while worker 1 holds a claim.
+  Never put a process pattern (`pkill -f`, `pgrep -f`, or the pattern as any argument) in an ssh
+  command line: the pattern matches the ssh session's own shell, which on 2026-11-05 killed the
+  operator's shell twice. Use the scripts above, or find the PIDs in a login shell on the host.
+- **GitHub quota.** The operator's tooling, subagents and the workers' claims all spend the same
+  GitHub user quota (5,000 requests per hour), so operator polling stays sparse: a quota exhausted by
+  polling refuses the workers' identity lookups and stalls claims.
 - **Stop** the service or the tunnel for good by killing the loop script before its child
   (`pkill -f run-service.sh; pkill -f 'tauceti-queue serve'`); killing only the child restarts it.
 
@@ -393,6 +400,10 @@ rate-limit or authentication error before doing any work hands the task to the n
 task's outcome and `worker.json` (`providers` counts, `last_outcome.provider_attempts`) record every
 provider tried or skipped with its reason and seconds. `--providers` and `--rate` override the two
 settings on the command line.
+
+Codex through a ChatGPT account (rather than an API key) needs the model pinned to one that account
+serves: in production `TAUCETI_AUTHORING_CODEX_MODEL=gpt-6-astra`, since `gpt-6.1-sol` is API-only
+there. Without the pin the `codex` provider fails and the task falls through to `api`.
 
 ### Install and update
 
