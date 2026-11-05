@@ -4557,7 +4557,7 @@ class Controller:
                 "verdicts": loads(attempt["verdicts"], {}),
                 "html_url": attempt["html_url"],
                 "infrastructure_retry": attempt["infrastructure_retry"],
-                "repair_outputs_revs": loads(attempt["repair_outputs_revs"], []),
+                "repair_outputs_revs": loads(attempt.get("repair_outputs_revs"), []),
             }
             info["ci"] = ci
             if attempt["outcome"] == OUTCOME_PENDING and attempt["last_progress_at"]:

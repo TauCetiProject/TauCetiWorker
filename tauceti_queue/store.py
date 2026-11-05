@@ -237,6 +237,10 @@ CREATE TABLE IF NOT EXISTS journal (
 """
 
 
+# The `CREATE TABLE` statements of `SCHEMA` alone.
+TABLES = "".join(statement + ";\n" for statement in SCHEMA.split(";") if statement.strip().startswith("CREATE TABLE"))
+
+
 def dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -245,6 +249,33 @@ def loads(text: str | None, default: Any = None) -> Any:
     if text is None or text == "":
         return default
     return json.loads(text)
+
+
+def declared_columns() -> dict[str, list[tuple[str, str]]]:
+    """Each table `SCHEMA` creates, with its columns' names and `ADD COLUMN` declarations in order."""
+    scratch = sqlite3.connect(":memory:")
+    try:
+        scratch.executescript(SCHEMA)
+        tables = [
+            name
+            for (name,) in scratch.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        result: dict[str, list[tuple[str, str]]] = {}
+        for table in tables:
+            columns = []
+            for _cid, name, type_, notnull, default, _pk in scratch.execute(f"PRAGMA table_info({table})"):
+                declaration = type_
+                if notnull:
+                    declaration += " NOT NULL"
+                if default is not None:
+                    declaration += f" DEFAULT {default}"
+                columns.append((name, declaration))
+            result[table] = columns
+        return result
+    finally:
+        scratch.close()
 
 
 class Store:
@@ -260,36 +291,25 @@ class Store:
             self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.executescript(SCHEMA)
+        # Tables first, then the columns declared since a table was created, then the indexes (which
+        # may name those columns).
+        self._connection.executescript(TABLES)
         self._add_missing_columns()
-
-    # Columns added to a table after databases with the table already existed; `CREATE TABLE IF NOT
-    # EXISTS` leaves those databases alone, so each is added here when absent.
-    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-        ("ci_attempts", "verdicts", "TEXT NOT NULL DEFAULT '{}'"),
-        ("ci_attempts", "run_updated_at", "REAL"),
-        ("inputs", "last_probe_base", "TEXT NOT NULL DEFAULT ''"),
-        ("inputs", "probe_conflicts", "TEXT NOT NULL DEFAULT '{}'"),
-        ("batches", "prepared_version", "INTEGER"),
-        ("batches", "pre_rebase_state", "TEXT NOT NULL DEFAULT ''"),
-        ("batches", "pre_rebase_tip", "TEXT"),
-        ("batches", "pre_rebase_onto", "TEXT"),
-        ("batches", "pre_rebase_source", "TEXT"),
-        ("batches", "pre_rebase_edits", "TEXT NOT NULL DEFAULT '{}'"),
-        ("batches", "pre_rebase_at", "REAL"),
-        ("inputs", "no_repair", "INTEGER NOT NULL DEFAULT 0"),
-        ("inputs", "anticipated", "TEXT NOT NULL DEFAULT '{}'"),
-        ("members", "no_repair", "INTEGER NOT NULL DEFAULT 0"),
-        ("members", "withdrawn", "INTEGER NOT NULL DEFAULT 0"),
-        ("batches", "pre_rebase_prepared", "TEXT"),
-        ("tasks", "pre_rebase_source", "TEXT"),
-    )
+        self._connection.executescript(SCHEMA)
 
     def _add_missing_columns(self) -> None:
-        for table, column, declaration in self.ADDED_COLUMNS:
+        """Add to each table every column `SCHEMA` declares that the database's table lacks.
+
+        `CREATE TABLE IF NOT EXISTS` leaves a table created at an earlier schema alone, so the columns
+        declared since are read from `SCHEMA` itself (by creating it in a scratch database) and added
+        here. A declared column that `ALTER TABLE ... ADD COLUMN` cannot add (one that is `NOT NULL`
+        without a default, say) fails loudly at open rather than at the first read of the column.
+        """
+        for table, columns in declared_columns().items():
             present = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
-            if column not in present:
-                self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            for column, declaration in columns:
+                if column not in present:
+                    self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def close(self) -> None:
         with self._lock:
