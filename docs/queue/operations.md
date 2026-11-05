@@ -303,6 +303,11 @@ requirements below (the service's `repair_concurrency` setting bounds how many h
   first use by the `lake` shim at `~/.elan/bin/lake`), and the fleet's Lake artifact cache reachable
   (`lake cache get --service tauceti-public`). The worker never builds Mathlib: it restores the base's
   outputs from the cache and builds the batch's own modules.
+- **Build sandbox.** `bwrap` (bubblewrap) on PATH with unprivileged user namespaces: every `lake
+  build` the worker runs is confined the way CI's required build is ([repair-task.md](repair-task.md),
+  "Sandboxed builds"), and `--check` runs `true` inside the sandbox. On NixOS it is
+  `/run/current-system/sw/bin/bwrap`. A host without it may set `TAUCETI_QUEUE_SANDBOX=0` in the
+  environment file, which runs builds unsandboxed and says so in the log on every build.
 - **Credentials**, by name; never print their values.
   - The GitHub token of the worker's account, which must be a repository admin on
     `TauCetiProject/TauCeti`: the service applies `security_audit.require_admin` to the login the

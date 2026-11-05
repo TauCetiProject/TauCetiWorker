@@ -9,7 +9,8 @@ directory ``.tauceti-repair/build.lock``, taken atomically by ``mkdir`` with the
 The script takes module names (``TauCeti.Foo.Bar``) or paths (``TauCeti/Foo/Bar.lean``), with
 ``--dependents`` every module importing them transitively (from the library's ``import`` lines, one
 pass, cached in ``.tauceti-repair/imports.json``), and runs ``lake build --iofail`` on them in the
-foreground, exiting with Lake's status; no arguments builds the whole library.
+foreground, exiting with Lake's status; no arguments builds the whole library. Lake runs in the offline
+``bwrap`` sandbox of CI's required build (``repair_sandbox.sandboxed_lake``), as the worker's own builds do.
 """
 
 from __future__ import annotations
@@ -83,6 +84,7 @@ Usage: .tauceti-repair/build [--dependents] [TauCeti.Foo.Bar | TauCeti/Foo/Bar.l
 builds the whole library, --dependents adds the modules importing the named ones (from the library's
 import lines, cached in .tauceti-repair/imports.json: delete it after changing imports). Builds wait for
 and hold the lock directory .tauceti-repair/build.lock (mkdir, pid inside); exits with Lake's status.
+Lake runs offline in the bwrap sandbox of CI's required build (tauceti_queue.repair_sandbox).
 """
 import contextlib, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
@@ -99,15 +101,20 @@ if "--dependents" in sys.argv:
         modules += [d for d, deps in table.items() if m in deps and d not in modules]
 take_lock(lock := ROOT / ".tauceti-repair" / "build.lock")
 try:
-    sys.exit(subprocess.run(["lake", "build", "--iofail", *modules], cwd=ROOT).returncode)
+    sys.exit(subprocess.run(sandboxed_lake(["lake", "build", "--iofail", *modules], ROOT), cwd=ROOT).returncode)
 finally:
     shutil.rmtree(lock, ignore_errors=True)
 """
 
 
 def build_script() -> str:
-    """The agent's build script: ``take_lock`` and ``imports`` verbatim, then the main."""
-    return BUILD_HEADER + "\n\n".join(inspect.getsource(f) for f in (take_lock, imports)) + BUILD_MAIN
+    """The agent's build script: ``take_lock`` and ``imports`` verbatim, then the main, which runs Lake
+    through ``repair_sandbox.sandboxed_lake`` imported from this checkout of the package."""
+    sandbox = (
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
+        "from tauceti_queue.repair_sandbox import sandboxed_lake\n\n"
+    )
+    return BUILD_HEADER + sandbox + "\n\n".join(inspect.getsource(f) for f in (take_lock, imports)) + BUILD_MAIN
 
 
 def write_build_script(directory: Path) -> Path:

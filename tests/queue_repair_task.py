@@ -55,7 +55,14 @@ for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CO
     os.environ.pop(key, None)
 
 from tauceti_queue import chain as chain_tool  # noqa: E402
-from tauceti_queue import repair, repair_context, repair_publish, repair_task, repair_tools  # noqa: E402
+from tauceti_queue import (  # noqa: E402
+    repair,
+    repair_context,
+    repair_publish,
+    repair_sandbox,
+    repair_task,
+    repair_tools,
+)
 
 PROJECT = "TauCetiProject/TauCeti"
 TOKEN = "worker-token"
@@ -258,7 +265,36 @@ else:
     finish(f"unknown mode {mode}", rc=2)
 '''
 
-for name, text in (("lake", LAKE), ("gh", GH), ("claude", CLAUDE), ("codex", CLAUDE)):
+BWRAP = r'''#!PYTHON
+"""bwrap stub: records its arguments and environment, then runs the command after `--` from
+`--chdir` with the `--setenv` values. The `env -i` before it cleared STUB_DIR, so that comes from
+sandbox-env.json beside this script, and PATH is led by this directory so the lake stub is found."""
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+here = Path(__file__).resolve().parent
+extra = json.loads((here / "sandbox-env.json").read_text())
+with (Path(extra["STUB_DIR"]) / "bwrap-calls.jsonl").open("a") as log:
+    log.write(json.dumps({"argv": args, "environ": dict(os.environ)}) + "\n")
+split = args.index("--")
+env, cwd, i = {}, None, 0
+while i < split:
+    if args[i] == "--setenv":
+        env[args[i + 1]] = args[i + 2]
+        i += 3
+    elif args[i] == "--chdir":
+        cwd = args[i + 1]
+        i += 2
+    else:
+        i += 1
+env.update(extra)
+env["PATH"] = f"{here}:{env.get('PATH', '')}"
+if cwd:
+    os.chdir(cwd)
+os.execvpe(args[split + 1], args[split + 1 :], env)
+'''.replace("PYTHON", sys.executable)
+
+for name, text in (("lake", LAKE), ("gh", GH), ("claude", CLAUDE), ("codex", CLAUDE), ("bwrap", BWRAP)):
     path = BIN / name
     path.write_text(text)
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -665,6 +701,8 @@ class Fixture(unittest.TestCase):
         os.environ.pop("STUB_LAKE_REPAIR_REVS", None)
         os.environ.pop("STUB_LAKE_PUT_FAIL", None)
         os.environ.pop("STUB_SLEEP", None)
+        os.environ.pop(repair_sandbox.DISABLE_VARIABLE, None)
+        (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir)}))
         self.service = FakeService(self.content.bare, [self.content.task()])
         self.addCleanup(self.service.close)
 
@@ -712,6 +750,10 @@ class Fixture(unittest.TestCase):
     def lake_calls(self) -> list[str]:
         path = self.stub_dir / "lake-calls.log"
         return path.read_text().splitlines() if path.exists() else []
+
+    def bwrap_calls(self) -> list[dict]:
+        path = self.stub_dir / "bwrap-calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def state(self, task_id="1") -> dict:
         return json.loads((self.root / "state" / "tasks" / task_id / "task.json").read_text())
@@ -768,6 +810,10 @@ class HappyPath(Fixture):
         self.assertEqual(lake[0], "exe cache get")
         self.assertIn(f"--rev={self.content.base}", lake[1])
         self.assertTrue(lake[2].startswith("build --iofail"))
+        # Only the build ran in the sandbox, from a cleared environment; the cache fetches need the network.
+        sandboxed = self.bwrap_calls()
+        self.assertEqual([c["argv"][c["argv"].index("--") + 1 :] for c in sandboxed], [["lake", "build", "--iofail"]])
+        self.assertFalse({"GH_TOKEN", "HOME", "PATH", "STUB_DIR"} & set(sandboxed[0]["environ"]))
         self.assertTrue(outcome["artifacts"]["available"])
         self.assertEqual(outcome["artifacts"]["incremental_build"]["failed_modules"], ["TauCeti.Two"])
         # One agent call with the plan's instruction, the diagnostics, the members and no credentials.
@@ -2341,6 +2387,98 @@ class Preflight(Fixture):
             repair_task.worker_token()
 
 
+def pairs(argv: list[str], flag: str) -> list[tuple[str, str]]:
+    return [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == flag]
+
+
+class SandboxedBuilds(Fixture):
+    def worktree(self) -> tuple[Path, Path, dict]:
+        worktree = self.root / "worktree"
+        seed = self.root / "seed-packages"
+        (seed / "mathlib").mkdir(parents=True)
+        (worktree / ".lake").mkdir(parents=True)
+        (worktree / ".lake" / "packages").symlink_to(seed)
+        (HOME / ".elan" / "bin").mkdir(parents=True, exist_ok=True)
+        env = repair.lake_env(self.root / "state")
+        return worktree, seed, env
+
+    def test_the_wrapper_composes_ci_sandbox(self):
+        worktree, seed, env = self.worktree()
+        argv = repair_sandbox.sandboxed_lake(["lake", "build", "--iofail"], worktree, env)
+        self.assertEqual(argv[1:3], ["-i", str(BIN / "bwrap")], "bwrap starts from an empty environment")
+        self.assertEqual(argv[argv.index("--") :], ["--", "lake", "build", "--iofail"])
+        for flag in ("--unshare-net", "--unshare-user", "--unshare-pid", "--disable-userns", "--die-with-parent"):
+            self.assertIn(flag, argv)
+        read_only, writable = pairs(argv, "--ro-bind"), pairs(argv, "--bind")
+        self.assertIn((str(worktree), str(worktree)), read_only)
+        self.assertIn((str(HOME / ".elan"), str(HOME / ".elan")), read_only)
+        self.assertIn((str(seed), str(seed)), read_only, "the shared Mathlib packages are read-only")
+        self.assertIn((env["LAKE_CONFIG"], env["LAKE_CONFIG"]), read_only)
+        self.assertEqual(sorted(writable), sorted([(str(worktree / ".lake"),) * 2, (env["LAKE_CACHE_DIR"],) * 2]))
+        self.assertNotIn(str(HOME), [source for source, _ in read_only + writable])
+        self.assertIn(("/tmp",), [(argv[i + 1],) for i, a in enumerate(argv) if a == "--tmpfs"])
+        self.assertLess(argv.index("--ro-bind"), argv.index("--remount-ro"))
+        setenv = dict(pairs(argv, "--setenv"))
+        self.assertEqual(setenv["LAKE_NO_CACHE"], "true")
+        self.assertEqual(setenv["LAKE_CACHE_DIR"], env["LAKE_CACHE_DIR"])
+        self.assertTrue(setenv["PATH"].startswith(f"{HOME / '.elan' / 'bin'}:"))
+        self.assertNotIn(str(BIN), setenv["PATH"], "nothing writable or test-local is on the sandbox PATH")
+        self.assertNotIn("GH_TOKEN", setenv)
+        self.assertEqual(argv[argv.index("--chdir") + 1], str(worktree))
+        # Run through the recording bwrap: the inner command sees only what was set.
+        run = subprocess.run(
+            repair_sandbox.sandboxed_lake(["sh", "-c", "pwd; echo ${GH_TOKEN:-none}"], worktree, env),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(run.stdout.split(), [str(worktree), "none"], run.stderr)
+        self.assertFalse({"GH_TOKEN", "HOME", "PATH", "STUB_DIR"} & set(self.bwrap_calls()[-1]["environ"]))
+
+    def test_the_agents_build_script_runs_lake_in_the_sandbox(self):
+        worktree, _, env = self.worktree()
+        (worktree / "TauCeti").mkdir()
+        (worktree / "TauCeti" / "A.lean").write_text("theorem a : True := trivial\n")
+        script = repair_tools.write_build_script(worktree / ".tauceti-repair")
+        run = subprocess.run([str(script), "TauCeti/A.lean"], cwd=worktree, env=env, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        call = self.bwrap_calls()[-1]["argv"]
+        self.assertEqual(call[call.index("--") :], ["--", "lake", "build", "--iofail", "TauCeti.A"])
+        self.assertIn("--unshare-net", call)
+        self.assertIn((str(worktree), str(worktree)), pairs(call, "--ro-bind"))
+        self.assertEqual(self.lake_calls(), ["build --iofail TauCeti.A"])
+
+    def test_disabled_falls_back_with_a_logged_warning(self):
+        worktree, _, env = self.worktree()
+        os.environ[repair_sandbox.DISABLE_VARIABLE] = "0"
+        with self.assertLogs(repair_sandbox.LOGGER, "WARNING") as logs:
+            argv = repair_sandbox.sandboxed_lake(["lake", "build", "--iofail"], worktree, env)
+        self.assertEqual(argv, ["lake", "build", "--iofail"])
+        self.assertIn("WITHOUT the bwrap sandbox", logs.output[0])
+        ok, detail = repair_sandbox.check(self.root)
+        self.assertTrue(ok)
+        self.assertIn("DISABLED", detail)
+
+    def test_missing_bwrap_fails_closed(self):
+        worktree, _, env = self.worktree()
+        which = repair_sandbox.shutil.which
+        with patch.object(repair_sandbox.shutil, "which", lambda name: None if name == "bwrap" else which(name)):
+            with self.assertRaises(repair_sandbox.SandboxUnavailable):
+                repair_sandbox.sandboxed_lake(["lake", "build"], worktree, env)
+            ok, detail = repair_sandbox.check(self.root)
+        self.assertFalse(ok)
+        self.assertIn(repair_sandbox.DISABLE_VARIABLE, detail)
+
+    def test_preflight_runs_true_in_the_sandbox(self):
+        by_name = {c["check"]: c for c in repair_task.preflight(self.config(), min_free_gib=0)}
+        self.assertTrue(by_name["build sandbox"]["ok"], by_name["build sandbox"])
+        self.assertIn(str(BIN / "bwrap"), by_name["build sandbox"]["detail"])
+        self.assertEqual(self.bwrap_calls()[-1]["argv"][-2:], ["--", "true"])
+        (BIN / "sandbox-env.json").write_text("{}")  # the stub now fails, as a broken bwrap would
+        by_name = {c["check"]: c for c in repair_task.preflight(self.config(), min_free_gib=0)}
+        self.assertFalse(by_name["build sandbox"]["ok"])
+
+
 class Records(unittest.TestCase):
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
@@ -2833,7 +2971,7 @@ class BuildScript(unittest.TestCase):
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text(text)
         self.script = repair_tools.write_build_script(self.root / ".tauceti-repair")
-        self.assertLess(len(self.script.read_text().splitlines()), 60)
+        self.assertLess(len(self.script.read_text().splitlines()), 70)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.log = self.root / "lake.log"
@@ -2848,6 +2986,7 @@ class BuildScript(unittest.TestCase):
     def build(self, *args: str, status: int = 0) -> tuple[int, str]:
         env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LAKE_LOG": str(self.log)}
         env["FAKE_LAKE_STATUS"] = str(status)
+        env[repair_sandbox.DISABLE_VARIABLE] = "0"  # SandboxedBuilds runs the script through bwrap
         result = subprocess.run([str(self.script), *args], cwd=self.root, env=env, text=True, capture_output=True)
         return result.returncode, result.stdout
 
@@ -2904,7 +3043,12 @@ class BuildScript(unittest.TestCase):
             proc = subprocess.Popen(
                 [str(self.script), "TauCeti.B"],
                 cwd=self.root,
-                env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LAKE_LOG": str(self.log)},
+                env={
+                    **os.environ,
+                    "PATH": f"{self.bin}:{os.environ['PATH']}",
+                    "FAKE_LAKE_LOG": str(self.log),
+                    repair_sandbox.DISABLE_VARIABLE: "0",
+                },
                 text=True,
                 stdout=subprocess.PIPE,
             )

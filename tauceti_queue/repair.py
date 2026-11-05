@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
-from tauceti_queue import repair_tools
+from tauceti_queue import repair_sandbox, repair_tools
 
 DEFAULT_REPOSITORY = "TauCetiProject/TauCeti"
 CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
@@ -881,7 +881,11 @@ def prepare_artifacts(
         seconds += own["seconds"]
     if not reasons:
         build = run_logged(
-            [*lake, "build", "--iofail"], worktree, logdir / "prepare-build.log", env=env, timeout=build_timeout
+            repair_sandbox.sandboxed_lake([*lake, "build", "--iofail"], worktree, env),
+            worktree,
+            logdir / "prepare-build.log",
+            env=env,
+            timeout=build_timeout,
         )
         build.update(parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
         record["incremental_build"] = build

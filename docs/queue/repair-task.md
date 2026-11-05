@@ -23,7 +23,8 @@ nothing is claimable, and log and retry rather than exit when a task, the servic
 authorization check fails. SIGTERM and SIGINT stop a running agent and record the task as
 `interrupted` with its claim and worktree kept; the next start resumes the session
 (`resume_pending`). It writes a heartbeat to `<root>/worker.json`. `--check` prints the host checks
-(tools, token source, repository admin, service, clone, Claude credentials, free disk) and exits.
+(tools, token source, repository admin, service, clone, Claude credentials, build sandbox, free
+disk) and exits.
 `--service`, `--worker`, `--clone`, `--poll`, `--seed-packages`, `--providers` and `--rate` default to
 `TAUCETI_QUEUE_SERVICE`, `TAUCETI_QUEUE_WORKER`, `TAUCETI_QUEUE_CLONE`, `TAUCETI_QUEUE_POLL_SECONDS`,
 `TAUCETI_QUEUE_SEED_PACKAGES`, `TAUCETI_QUEUE_PROVIDERS` and `TAUCETI_QUEUE_RATE`, which is how
@@ -178,6 +179,26 @@ has a time budget holds because the service re-exposes the task.
    there (`lake cache get --service tauceti-repair`) for the task's `tip`, `onto` and `base` before
    any public revision; `cache_service` records which service the restored mapping came from.
    Checkpoint `artifacts_ready`.
+
+   **Sandboxed builds.** Every `lake build` the worker runs goes through
+   `repair_sandbox.sandboxed_lake(argv, worktree, env)` (`tauceti_queue/repair_sandbox.py`), which wraps
+   it in the offline `bwrap` sandbox CI's required build uses (TauCeti `pr-build.yml`, "Build exact
+   candidate under bwrap", running TauCetiTools `sandbox-build.sh`): `env -i bwrap` from a read-only
+   synthetic root with the host's system directories bound read-only, `/tmp` a tmpfs, no home
+   directory except the elan toolchains (read-only), the worktree read-only with only its `.lake`
+   writable, CI's namespace flags including `--unshare-net`, and `LAKE_NO_CACHE=true`. The worker's
+   own additions are its artifact pool (`LAKE_CACHE_DIR`, writable, since Lake stores every built
+   artifact there), `LAKE_CONFIG` and a shared `--seed-packages` tree (read-only), and the content
+   clone's Git directory (read-only, so Lake's Git queries resolve). The arguments, `--iofail`
+   included, and the exit status pass through unchanged. Only the build is sandboxed: the cache
+   fetches before it need the network, and the agent's own shell is not confined.
+   The agent's scoped builds through `.tauceti-repair/build` import the same function from the
+   worker's checkout, and `python -m tauceti_queue.repair_sandbox [--worktree DIR] -- lake build ...`
+   is the same wrapper on the command line. Because the pool and the worktree's `.lake` are separate mounts inside the
+   sandbox, Lake copies artifacts between them instead of hard-linking (its own fallback), so a
+   worktree's `.lake/build` takes its full size on disk until the worktree is removed. When `bwrap`
+   is missing the build fails closed; `TAUCETI_QUEUE_SANDBOX=0` runs builds unsandboxed, logging a
+   warning for every build and reporting the sandbox as DISABLED in `--check`.
 4. **Agent.** The prompt (`repair.compose_prompt`) opens with the task's instruction verbatim, then
    says what happened in plain words (for a rebase conflict: the queue replayed this batch of N squash
    commits onto the current `main` commit with git, the replay stopped at PR N's commit with conflicts
@@ -451,4 +472,6 @@ the eligibility check against the pacer's readers), the ownership and declaratio
 `--no-build` map then `lake cache put` with the key from the key file and never in the agent's
 environment, the repair namespace fetched for tip and base before the public cache, a failed upload
 that still submits, and no upload without a key, when switched off or when the outputs are not
-green). No real inference and no network.
+green). For the build sandbox, a recording `bwrap` stub checks the composed binds, `--unshare-net`
+and the cleared environment, the disabled fallback's warning, failing closed without `bwrap`, and the
+`--check` line. No real inference and no network.

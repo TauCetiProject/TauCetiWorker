@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from tauceti_queue import repair, repair_context, repair_publish
+from tauceti_queue import repair, repair_context, repair_publish, repair_sandbox
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 
 SCHEMA = "tauceti-queue.repair-task/v1"
@@ -2233,6 +2233,10 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
     if "api" in cfg.providers:
         check("anthropic api key", bool(cfg.api_key), "ANTHROPIC_API_KEY " + ("set" if cfg.api_key else "not set"))
     try:
+        check("build sandbox", *repair_sandbox.check(cfg.root))
+    except OSError as error:
+        check("build sandbox", False, str(error))
+    try:
         cfg.root.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(cfg.root).free / 2**30
         check("task root", free >= min_free_gib, f"{cfg.root}: {free:.0f} GiB free (need {min_free_gib:.0f})")
@@ -2279,7 +2283,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="print the host checks (tools, token, admin, service, clone, credentials, disk) and exit",
+        help="print the host checks (tools, token, admin, service, clone, credentials, build sandbox, disk) and exit",
     )
     parser.add_argument(
         "--worker", default=default_worker_identity(), help="worker identity string ($TAUCETI_QUEUE_WORKER)"
