@@ -99,7 +99,7 @@ if "--dependents" in sys.argv:
     table = imports(ROOT)
     for m in modules:  # grows while iterating: the closure over the reverse import graph
         modules += [d for d, deps in table.items() if m in deps and d not in modules]
-take_lock(lock := ROOT / ".tauceti-repair" / "build.lock")
+take_lock(lock := LOCK)
 try:
     sys.exit(subprocess.run(sandboxed_lake(["lake", "build", "--iofail", *modules], ROOT), cwd=ROOT).returncode)
 finally:
@@ -107,21 +107,32 @@ finally:
 """
 
 
-def build_script() -> str:
-    """The agent's build script: ``take_lock`` and ``imports`` verbatim, then the main, which runs Lake
-    through ``repair_sandbox.sandboxed_lake`` imported from this checkout of the package."""
+def build_script(lock: Path | None = None) -> str:
+    """The agent's build script: ``take_lock`` and ``imports`` verbatim, the lock (the worktree's own
+    ``.tauceti-repair/build.lock``, or ``lock`` when several worktrees of one repair share one) and the
+    main, which runs Lake through ``repair_sandbox.sandboxed_lake`` imported from this checkout of the
+    package."""
     sandbox = (
         f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
         "from tauceti_queue.repair_sandbox import sandboxed_lake\n\n"
     )
-    return BUILD_HEADER + sandbox + "\n\n".join(inspect.getsource(f) for f in (take_lock, imports)) + BUILD_MAIN
+    where = f"LOCK = Path({str(lock)!r})\n" if lock else 'LOCK = ROOT / ".tauceti-repair" / "build.lock"\n'
+    return (
+        BUILD_HEADER
+        + sandbox
+        + "\n\n".join(inspect.getsource(f) for f in (take_lock, imports))
+        + "\n"
+        + where
+        + BUILD_MAIN
+    )
 
 
-def write_build_script(directory: Path) -> Path:
-    """Write ``directory/build``, executable, dropping any stale import cache beside it."""
+def write_build_script(directory: Path, lock: Path | None = None) -> Path:
+    """Write ``directory/build``, executable, dropping any stale import cache beside it; ``lock`` names
+    a lock directory shared with other worktrees (``repair_parallel``) instead of the worktree's own."""
     directory.mkdir(parents=True, exist_ok=True)
     script = directory / BUILD_FILE
-    script.write_text(build_script())
+    script.write_text(build_script(lock))
     script.chmod(0o755)
     (directory / "imports.json").unlink(missing_ok=True)
     return script

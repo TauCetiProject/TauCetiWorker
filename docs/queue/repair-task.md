@@ -13,7 +13,7 @@ and the task use one implementation.
 uv run python -m tauceti_queue.repair_task --service https://queue.example [--once | --check] [--worker ID]
     [--clone PATH] [--root PATH] [--repository owner/repo] [--poll SECONDS]
     [--agent-timeout S] [--build-timeout S] [--keep-worktree] [--seed-packages PATH] [--no-resume]
-    [--providers claude,codex,api] [--rate T:B[,T:B...]]
+    [--providers claude,codex,api] [--rate T:B[,T:B...]] [--parallel-agents N]
 ```
 
 Without `--once` the runner is the long-running worker (`serve`): resume checkpointed tasks, claim,
@@ -350,6 +350,58 @@ CI publishes to (`LAKE_CACHE_KEY` in TauCeti's `publish-lake-cache.yml`). `TAUCE
 (`1`/`0`) switches publication on or off; unset, it is on when the key file and an upload URL are
 configured. CI never fetches from this namespace, so its verdicts are unchanged.
 
+## Parallel agents within one task
+
+Before the agent of phase 4 runs, a repair task's findings are split into independent groups
+(`tauceti_queue/repair_parallel.py`, `plan_groups`). When the worker streamed the first build, the
+findings are the task's diagnostics merged with that build's complete error list
+(`.tauceti-repair/errors.jsonl`, each error with its file, line, column and message; `read_errors`,
+`merge_errors`): the path waits for the streaming build to finish first, since a group is independent
+only against the whole list, and the outcome's `parallel.source` names `errors.jsonl` with the time
+waited. (With `--parallel-agents 1` the agent is launched at the first error as the streaming
+section describes; with the default of 3 a repair trades that head start for concurrent agents on the
+complete list.) Two failing modules share a group when one
+member's commit changes both, when the owning members' commits change a common file, or when a file
+one member changes `import`s a file of the other's (read from the files at the tip; nothing deeper is
+inferred). A finding in a module no member changes (a ripple into `main`) cannot be assigned and keeps
+the task sequential, as does a single owning member or a provider chain with no eligible provider. With
+two or more groups the worker runs one agent per group concurrently, up to `--parallel-agents`
+(`TAUCETI_QUEUE_PARALLEL_AGENTS`, default 3; 0 or 1 disables the path), each in its own detached
+worktree of the tip (`<root>/worktrees/task-<id>-group-<n>`, added from the task's worktree, with
+`.lake/packages` symlinked to the task worktree's or to `--seed-packages` so no group extracts Mathlib
+again, and built outputs restored from the private artifact pool) and each in its own child process
+(`python -m tauceti_queue.repair_parallel run-group <job>`), which calls `run_repair_agent` exactly as
+the sequential path does: the agent path applies its provider environment to the process and keeps
+the last run's failure in module globals, neither of which threads could share. The worker chooses
+the eligible providers once (`select_providers`) and every group's child takes that chain as given.
+The group prompt (`group_prompt`) carries the instruction, the group's own evidence, the members and
+files it may edit, the collisions section of the repair context, and a protocol instead of the chain
+rewrite: fix in the working tree, `git commit --fixup=<sha>` for the owning member,
+`git commit --allow-empty --squash=<sha> -m <explanation>` for the explanation, and leave those commits
+on top of the tip; no rebase. The prompt is plain shell and python throughout, with no provider's tool
+names in it, so the same text serves whichever provider runs the agent, and nothing depends on an
+agent spawning helpers of its own (a provider that can is free to). Builds are serialized across the
+worktrees by one lock, the task worktree's `.tauceti-repair/build.lock` (`repair_tools`): each group
+worktree gets the same `.tauceti-repair/build` script the sequential agent has, written with that
+shared lock baked in (`write_build_script(directory, lock=...)`), the agents are told to build only
+through it, and the worker's verification build holds the lock through `repair_tools.build_lock`;
+every one of these builds runs in the offline sandbox (`repair_sandbox.sandboxed_lake`), which binds
+a group worktree's symlinked `.lake/packages` read-only from its target. When
+every agent has finished the worker collects each group's commits (they must all be `fixup!` or
+`squash!` commits, the fixups touching only the group's files, on a clean tree; anything else makes
+the group `unusable`), cherry-picks them onto the tip in the task's worktree, folds them with
+`GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash --keep-empty --empty=keep <base>`, validates the
+chain with `repair.chain_report` and runs the one whole-library `lake build --iofail`. A group whose
+agent failed, whose commits were unusable or did not apply, or whose module still fails that build
+goes back to the sequential path: phase 4's usual agent runs on the task's worktree (now holding the
+folded chain) with only the remaining findings, and the ordinary retry and release rules apply from
+there. Every group's status, timing, worktree and agent record, the fold, the verification build and
+the lock wait are in the outcome's `parallel` record and in the checkpoint (state `agent_running`,
+label `parallel`), with each group's job, prompt, checkpoint and result under
+`tasks/<id>/groups/<name>/` and its agent logs under `tasks/<id>/logs/<name>/`. A stop or lost claim
+during the parallel phase terminates every group's child, which stops its agent; a resumed task
+restarts sequentially from the tip.
+
 ## Inference unavailability
 
 After an agent exit, `agents.take_last_agent_infra_failure` names the infrastructure reason when the
@@ -479,8 +531,8 @@ in the controller's order, `explanation-required`, the `release` call, the `Adop
 reason codes, encoded as stream F's server does, with scripted responses where a scenario needs
 them), a local bare content repository with a three-member attributed chain whose second member
 breaks the build, a `lake` stub that fails modules containing `BROKEN`, a `gh` stub for the admin
-predicate and a scripted `claude` stub that rewrites the constituent commits. It covers adoption on
-the happy path, claim expiry stopping the agent without a submission, renewal errors that do not
+predicate and a scripted `claude` stub that rewrites the constituent commits (or, given a group
+prompt, leaves fixup commits). It covers adoption on the happy path, claim expiry stopping the agent without a submission, renewal errors that do not
 stop it, `invalid-chain` retried once with its violations, `explanation-required` resubmitted from
 the same session, a terminal rejection, a superseded claim at submission, a locally invalid chain
 retried with the local report, the local explanation follow-up turn, artifacts unavailable with and
@@ -498,4 +550,11 @@ environment, the repair namespace fetched for tip and base before the public cac
 that still submits, and no upload without a key, when switched off or when the outputs are not
 green). For the build sandbox, a recording `bwrap` stub checks the composed binds, `--unshare-net`
 and the cleared environment, the disabled fallback's warning, failing closed without `bwrap`, and the
-`--check` line. No real inference and no network.
+`--check` line. The parallel path, with members #2 and #3 both broken: two group agents running at the
+same time in their own worktrees and child processes (under the Claude and the Codex argv shapes) with
+fixups folded into a valid chain that is adopted, the groups taken from the streaming build's
+`errors.jsonl` once it has finished, every build serialized by the shared lock and run through the
+sandbox wrapper, a group whose agent fails (or whose fixups stray outside its files) handed to the
+sequential agent, a lost claim stopping the group agents, the build lock serializing two concurrent
+scoped builds and taking over a stale lock, a provider-neutral group prompt, and dependent or
+unassignable failures staying sequential. No real inference and no network.

@@ -73,3 +73,8 @@ TAUCETI_QUEUE_PROVIDERS=claude,codex,api
 #TAUCETI_REPAIR_CACHE_UPLOAD_URL=https://<account>.r2.cloudflarestorage.com/tauceti-repair-cache
 #TAUCETI_REPAIR_CACHE_KEY_FILE=/home/operator/.config/tauceti-queue/repair-cache-key
 #TAUCETI_QUEUE_PUBLISH_CACHE=1
+
+# Concurrent agents for a repair whose failures split into independent groups (different members,
+# disjoint files, no imports between them), each in its own worktree of the tip; 0 or 1 keeps every
+# repair sequential. Builds are serialized by .tauceti-repair/build.lock in the task's worktree.
+#TAUCETI_QUEUE_PARALLEL_AGENTS=3

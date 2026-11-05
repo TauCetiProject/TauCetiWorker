@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from tauceti_queue import repair, repair_context, repair_publish, repair_sandbox, repair_stream
+from tauceti_queue import repair, repair_context, repair_parallel, repair_publish, repair_sandbox, repair_stream
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 
 SCHEMA = "tauceti-queue.repair-task/v1"
@@ -640,6 +640,10 @@ class RunnerConfig:
     mathlib_cache: bool = True  # ``lake exe cache get`` before the base cache fetch
     seed_packages: Path | None = None  # share one extracted Mathlib instead (the experiment's method)
     lake: tuple[str, ...] = ("lake",)
+    # Independent failing groups (``repair_parallel.plan_groups``) go to this many concurrent agents,
+    # each in its own worktree (``TAUCETI_QUEUE_PARALLEL_AGENTS``, default 3); 0 or 1 keeps every
+    # repair sequential.
+    parallel_agents: int = dataclasses.field(default_factory=repair_parallel.parallel_agents_default)
     poll_seconds: float = 60.0
     admin_recheck_seconds: float = 3600.0
     # Run the first whole-library build in the background and launch the agent at its first error
@@ -1162,9 +1166,14 @@ def run_repair_agent(
     resume: str | None = None,
     resume_provider: str | None = None,
     label: str = "repair",
+    preselected: list[str] | None = None,
 ) -> dict:
     """One agent run through the worker's host path, over the task's provider chain, with bounded
     retries on inference unavailability.
+
+    ``preselected`` is an eligible chain the caller already chose (the parallel path chooses once for
+    every group agent, in the worker, and hands it to each group's child process); without it the
+    chain is ``select_providers`` here.
 
     The chain is ``select_providers``: each eligible provider in order, a resumed session's provider
     first. A provider that fails to launch, or exits before doing any work with a rate-limit,
@@ -1192,7 +1201,10 @@ def run_repair_agent(
     if resume and resume_provider not in PROVIDERS:
         log("the recorded session names no provider; starting afresh")
         resume = None
-    eligible, provider_attempts = select_providers(cfg, pinned=resume_provider if resume else None)
+    if preselected:
+        eligible, provider_attempts = list(preselected), []
+    else:
+        eligible, provider_attempts = select_providers(cfg, pinned=resume_provider if resume else None)
     sessions: dict[str, str | None] = {resume_provider: resume} if resume else {}
     attempts: list[dict] = []
     reason = None
@@ -1342,6 +1354,71 @@ def run_repair_agent(
 def _expire_attempt(expired: threading.Event, cancel: threading.Event) -> None:
     expired.set()
     cancel.set()
+
+
+def run_parallel_groups(
+    cfg: RunnerConfig,
+    task: Task,
+    worktree: Path,
+    chain: list,
+    findings: dict,
+    ownership,
+    logdir: Path,
+    cancel: threading.Event,
+    state: TaskState,
+    env_lake: dict,
+    stream: repair_stream.StreamingBuild | None = None,
+) -> tuple[dict, dict | None]:
+    """The parallel path of a repair (``repair_parallel``): split the findings into independent groups
+    and, with two or more and an eligible provider, run one agent per group in its own worktree and
+    child process, fold their fixups into the chain and run the verification build. With a streaming
+    build (``stream``) the path first waits for it to finish and takes the groups from its complete
+    error list, ``errors.jsonl``, merged with the task's diagnostics. Returns the record for the outcome
+    and the findings the sequential path still has to repair (None when nothing changes for it)."""
+    record: dict = {"source": "diagnostics"}
+    if stream is not None:
+        waited = time.monotonic()
+        while not stream.finished.wait(0.5):
+            if cancel.is_set():
+                return {"status": "cancelled", "detail": "cancelled while the streaming build finished"}, None
+        record["stream_wait_seconds"] = round(time.monotonic() - waited, 1)
+    errors = repair_parallel.read_errors(repair.listings_path(worktree).parent)
+    if errors is not None:
+        findings = repair_parallel.merge_errors(findings, errors)
+        record.update(source=repair_stream.ERRORS_FILE, stream_errors=len(errors))
+    groups, reason = repair_parallel.plan_groups(cfg.clone, chain, findings, worktree)
+    if len(groups) < 2:
+        log(f"task {task.task_id}: sequential repair ({reason})")
+        return {**record, "status": "sequential", "reason": reason}, None
+    eligible, skipped = select_providers(cfg)
+    if not eligible:
+        log(f"task {task.task_id}: sequential repair (no eligible provider for the group agents)")
+        return {**record, "status": "sequential", "reason": "no eligible provider", "provider_attempts": skipped}, None
+    log(
+        f"task {task.task_id}: {len(groups)} independent groups, up to {cfg.parallel_agents} agents: "
+        + "; ".join(f"{g.name} PRs {g.members} {g.paths}" for g in groups)
+    )
+    state.write("agent_running", agent_label="parallel", groups=[g.summary() for g in groups])
+    context = prompt_context(
+        task, None, findings, artifacts=state.record.get("artifacts"), listings=None, shell_limit=int(cfg.shell_limit)
+    )
+    context.repair_context = ownership
+    record.update(
+        repair_parallel.repair_groups(
+            cfg, task, worktree, chain, groups, findings, context, logdir, cancel, env_lake, providers=eligible
+        )
+    )
+    record["provider_attempts"] = skipped
+    state.write("agent_running", agent_label="parallel", parallel=_parallel_summary(record))
+    log(
+        f"task {task.task_id}: parallel repair {record['status']} in {record.get('seconds')}s: "
+        + ", ".join(f"{g['name']} {g['status']} ({g.get('seconds')}s)" for g in record["groups"])
+    )
+    return record, record.get("remaining")
+
+
+def _parallel_summary(record: dict) -> dict:
+    return {k: v for k, v in record.items() if k not in ("remaining", "report", "attempts")}
 
 
 def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir: Path, expect: str | None) -> dict:
@@ -1590,12 +1667,34 @@ def run_task(
         agent_records: list[dict] = []
         resume_session = state.session() if resuming else None
         resume_provider = state.session_provider() if resuming else None
+        skip_agent = False
         while True:
             attempt += 1
             if cancel.is_set() or stopping():
                 return cancelled("cancelled before the agent started")
+            if attempt == 1 and not resuming and task.kind == "repair" and cfg.parallel_agents > 1:
+                # Independent failing groups are repaired by concurrent agents first; what they leave
+                # (nothing, a group that failed, a build that still fails) goes to the usual agent below.
+                parallel, remaining = run_parallel_groups(
+                    cfg, task, worktree, chain_before, findings, ownership, logdir, cancel, state, env_lake, stream
+                )
+                outcome["parallel"] = {k: v for k, v in parallel.items() if k != "remaining"}
+                if parallel["status"] == "cancelled":
+                    return cancelled("the parallel agents were cancelled")
+                if parallel["status"] in RELEASED_AGENT_STATUSES:
+                    return release_task(
+                        cfg, client, task, state, parallel["status"], parallel.get("reason"), outcome, lease
+                    )
+                if parallel["status"] in ("ok", "partial"):
+                    agent = {"status": "ok", "parallel": True, "attempts": parallel.get("attempts", [])}
+                    agent_records.append(agent)
+                    outcome["agent"] = agent_records
+                    skip_agent = parallel["status"] == "ok"
+                    findings = remaining if remaining is not None else findings
             if resubmit:
                 resubmit = False  # the explanation turn already ran; check and submit its result
+            elif skip_agent:
+                skip_agent = False  # every group folded and the verification build passed; check and submit
             else:
                 context = prompt_context(
                     task,
@@ -2343,6 +2442,12 @@ def main(argv: list[str] | None = None) -> int:
         default=_env_path("TAUCETI_QUEUE_SEED_PACKAGES"),
         help="share this extracted .lake/packages instead of lake exe cache get ($TAUCETI_QUEUE_SEED_PACKAGES)",
     )
+    parser.add_argument(
+        "--parallel-agents",
+        type=int,
+        default=repair_parallel.parallel_agents_default(),
+        help="concurrent agents for independent failing groups, 0 or 1 for sequential ($TAUCETI_QUEUE_PARALLEL_AGENTS)",
+    )
     parser.add_argument("--no-resume", action="store_true", help="do not continue checkpointed tasks on start")
     parser.add_argument(
         "--no-stream-repair",
@@ -2384,6 +2489,7 @@ def main(argv: list[str] | None = None) -> int:
         keep_worktree=args.keep_worktree,
         seed_packages=args.seed_packages,
         poll_seconds=args.poll,
+        parallel_agents=args.parallel_agents,
         providers=providers,
         rate=args.rate or None,
         api_key=api_key,
