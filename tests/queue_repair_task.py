@@ -944,11 +944,11 @@ class ArtifactsUnavailable(Fixture):
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "released", outcome)
         self.assertEqual(outcome["reason"], "artifacts_unavailable")
-        self.assertIn("lake cache get", outcome["detail"])
+        self.assertIn(f"no published cache mapping for {self.content.base[:12]}", outcome["detail"])
         self.assertEqual(self.agent_calls(), [], "the agent never ran cold")
         self.assertEqual(len(self.service.releases), 1)
         self.assertEqual(self.service.releases[0]["reason"], "artifacts_unavailable")
-        self.assertIn("lake cache get", self.service.releases[0]["error"])
+        self.assertIn("no published cache mapping", self.service.releases[0]["error"])
         self.assertEqual(self.service.results, [])
         self.assertEqual(self.state()["state"], "released")
         self.assertIsNone(self.service.live_claim(1), "the service freed the claim")
@@ -998,15 +998,39 @@ class RebaseArtifacts(Fixture):
     def fetches(self) -> list[str]:
         return [c.split("--rev=")[1] for c in self.lake_calls() if c.startswith("cache get")]
 
+    def observe_log(self) -> list[str]:
+        lines: list[str] = []
+        original = repair_task.log
+        repair_task.log = lines.append
+        self.addCleanup(setattr, repair_task, "log", original)
+        return lines
+
+    def advance_main(self) -> str:
+        """``main`` moves once more past ``onto``: the new rebase target's first parent is the old one,
+        not the batch base."""
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        moved = commit(seed, "main moved again", {"TauCeti/B.lean": "theorem b : True := trivial\n"})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        self.raw["onto"] = moved
+        self.raw["diagnostics"][0]["onto"] = moved
+        self.service.tasks = {1: self.raw}
+        return moved
+
     def test_the_rebase_target_is_fetched_first(self):
         os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.content.base  # the stale base has no outputs
+        lines = self.observe_log()
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual(self.fetches(), [self.onto], "onto's cache was found; the base was never tried")
         self.assertTrue(outcome["artifacts"]["available"])
         self.assertEqual(outcome["artifacts"]["cache_revision"], self.onto)
+        self.assertEqual(outcome["artifacts"]["cache_distance"], 0)
+        self.assertEqual(outcome["artifacts"]["cache_skipped"], [])
         self.assertNotIn("cold", outcome["artifacts"])
+        warm = [line for line in lines if "warm artifacts from" in line]
+        self.assertEqual(warm, [f"task 1: warm artifacts from {self.onto[:12]} (the rebase target)"])
         self.assertEqual(self.service.releases, [])
         self.assertEqual(len(self.service.results), 1)
         prompt = self.agent_calls()[0]["prompt"]
@@ -1027,6 +1051,75 @@ class RebaseArtifacts(Fixture):
         attempts = outcome["artifacts"]["cache_attempts"]
         self.assertEqual([a["mapping_found"] for a in attempts], [False, True])
         self.assertEqual(self.service.releases, [])
+
+    def test_the_parent_of_an_unpublished_target_is_used_before_the_base(self):
+        """Production repair 2 (2026-11-05): the rebase target's mapping had not been published yet, so the
+        newest cached revision is its first parent, found before the stale base."""
+        moved = self.advance_main()
+        os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = moved
+        lines = self.observe_log()
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.fetches(), [moved, self.onto], "the parent answered; the base was never tried")
+        self.assertTrue(outcome["artifacts"]["available"])
+        self.assertEqual(outcome["artifacts"]["cache_revision"], self.onto)
+        self.assertEqual(outcome["artifacts"]["cache_distance"], 1)
+        attempts = outcome["artifacts"]["cache_attempts"]
+        self.assertEqual(
+            [(a["revision"], a["distance"], a["mapping_found"]) for a in attempts],
+            [(moved, 0, False), (self.onto, 1, True)],
+        )
+        self.assertEqual(outcome["artifacts"]["cache_skipped"], [f"no published cache mapping for {moved[:12]}"])
+        warm = [line for line in lines if "warm artifacts from" in line]
+        self.assertEqual(
+            warm,
+            [
+                f"task 1: warm artifacts from {self.onto[:12]} (1 commit behind the rebase target {moved[:12]}); "
+                f"skipped: no published cache mapping for {moved[:12]}"
+            ],
+        )
+        self.assertNotIn("cold", outcome["artifacts"])
+        self.assertIn("Artifacts are warm", self.agent_calls()[0]["prompt"])
+
+    def test_the_walk_runs_newest_first_and_ends_at_a_fallback_off_it(self):
+        moved = self.advance_main()
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.fetches(), [moved, self.onto, self.content.base], "newest first, down to the base")
+        self.assertIsNone(outcome["artifacts"]["cache_revision"])
+        self.assertEqual(
+            outcome["artifacts"]["cache_skipped"],
+            [
+                f"no published cache mapping for {moved[:12]}",
+                f"no published cache mapping for the 2 first-parent ancestors of {moved[:12]} "
+                f"from {self.onto[:12]} back to {self.content.base[:12]}",
+            ],
+        )
+        seed = self.content.bare.parent / "seed"
+        self.assertEqual(
+            repair._artifact_candidates(seed, moved, (self.content.base,), 1),
+            [(moved, 0), (self.onto, 1), (self.content.base, None)],
+            "a fallback older than the walk is tried last",
+        )
+
+    def test_an_earlier_miss_in_the_fetch_log_does_not_hide_a_published_mapping(self):
+        """The production failure: ``run_logged`` appends, every claim of the task fetches into the same
+        log, and the verdict read the whole file, so one "outputs not found" from an earlier claim made
+        every later fetch of that revision look unpublished although it exited 0 and downloaded."""
+        seed = self.content.bare.parent / "seed"
+        logdir = self.root / "artifact-logs"
+        env = dict(os.environ)
+        first = repair.prepare_artifacts(seed, self.onto, env | {"STUB_LAKE_CACHE_FAIL_REVS": self.onto}, logdir, 60)
+        self.assertIsNone(first["cache_revision"])
+        second = repair.prepare_artifacts(seed, self.onto, env, logdir, 60)
+        self.assertEqual(second["cache_revision"], self.onto, second["cache_attempts"])
+        self.assertTrue(second["cache_attempts"][0]["mapping_found"])
+        self.assertEqual(second["cache_attempts"][0]["artifacts_downloaded"], 1, "this run's output only")
+        log = (logdir / f"cache-get-{self.onto[:12]}.log").read_text()
+        self.assertEqual(log.count("outputs not found"), 1, "the earlier miss is still in the shared log")
 
     def test_without_any_artifacts_the_rebase_runs_cold(self):
         os.environ["STUB_LAKE_CACHE_FAIL"] = "1"

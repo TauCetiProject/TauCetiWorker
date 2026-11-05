@@ -871,16 +871,42 @@ def task_findings(task: Task) -> dict:
     return repair.findings_from_diagnostics(task.diagnostics)
 
 
+ARTIFACT_ANCESTORS = 50  # first-parent ancestors of the build revision asked for a published cache mapping
+
+
 def artifact_revisions(task: Task) -> list[str]:
     """The revisions whose published cache to try, in order. A rebase conflict replays the chain onto
     ``onto`` and builds there, so its artifacts come first and the stale batch base is the fallback;
-    a repair builds on its base and falls back to ``onto`` when that differs."""
+    a repair builds on its base and falls back to ``onto`` when that differs. ``prepare_artifacts``
+    walks the first one's first-parent ancestors (``ARTIFACT_ANCESTORS`` of them) before a fallback
+    off that walk, so the artifacts come from the newest revision the cache has."""
     order = [task.onto, task.base] if task.kind == "rebase_conflict" else [task.base, task.onto]
     revisions: list[str] = []
     for revision in order:
         if revision and revision not in revisions:
             revisions.append(revision)
     return revisions
+
+
+def describe_cache_revision(task: Task, artifacts: dict) -> str:
+    """The restored revision and its relation to the task, for the worker log: ``85f3eb5579df (the rebase
+    target)``, ``5f78b5307b93 (the batch base)``, ``67aa17161ba1 (3 commits behind the rebase target
+    85f3eb5579df)``."""
+    revision = artifacts["cache_revision"]
+    rebase = task.kind == "rebase_conflict"
+    if revision == task.base:
+        role = "the batch base" if rebase else "the base"
+    elif revision == task.onto:
+        role = "the rebase target"
+    else:
+        target = f"{'the rebase target' if rebase else 'the base'} {artifact_revisions(task)[0][:12]}"
+        distance = artifacts.get("cache_distance")
+        role = (
+            f"{distance} commit{'s' if distance != 1 else ''} behind {target}"
+            if distance
+            else f"a fallback for {target}"
+        )
+    return f"{revision[:12]} ({role})"
 
 
 def artifacts_cold(task: Task, artifacts: dict | None) -> bool:
@@ -1485,9 +1511,16 @@ def run_task(
                 cfg.build_timeout,
                 repository=task.repository,
                 fallbacks=tuple(revisions[1:]),
+                ancestors=ARTIFACT_ANCESTORS,
                 mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
                 lake=cfg.lake,
             )
+            if artifacts["cache_revision"]:
+                skipped = "; ".join(artifacts.get("cache_skipped") or ())
+                log(
+                    f"task {task.task_id}: warm artifacts from {describe_cache_revision(task, artifacts)}"
+                    + (f"; skipped: {skipped}" if skipped else "")
+                )
             outcome["artifacts"] = {k: v for k, v in artifacts.items() if k != "incremental_build"} | {
                 "incremental_build": {
                     k: v for k, v in (artifacts.get("incremental_build") or {}).items() if "load" not in k

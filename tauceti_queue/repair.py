@@ -708,6 +708,96 @@ def parse_lake_build_log(text: str) -> dict:
 # Warm artifacts (network: the Lake cache service)
 
 
+MAPPING_MISSING = "outputs not found for revision"  # lake's message for a revision the service has no mapping for
+
+
+def _fetch_mapping(
+    worktree: Path,
+    revision: str,
+    env: dict,
+    logdir: Path,
+    *,
+    repository: str,
+    lake: tuple[str, ...],
+    mappings_only: bool,
+) -> dict:
+    """One ``lake cache get --rev=<revision>``; the verdict reads this run's output only.
+
+    The log is appended to (``run_logged``), and a task's preparation runs again on every claim of
+    the task, so the file holds the output of earlier fetches too. Production repair 2 (2026-11-05)
+    judged the rebase target unpublished because an earlier run's "outputs not found" for another
+    revision was still in the file, although its own fetch had exited 0 and downloaded the artifacts.
+    """
+    log = logdir / f"cache-get-{revision[:12]}.log"
+    offset = log.stat().st_size if log.exists() else 0
+    argv = [*lake, "cache", "get", "--service", CACHE_SERVICE, "--repo", repository, f"--rev={revision}"]
+    if mappings_only:
+        argv.append("--mappings-only")
+    fetch = run_logged(argv, worktree, log, env=env, timeout=600 if mappings_only else 1800)
+    with log.open("rb") as handle:
+        handle.seek(offset)
+        text = handle.read().decode(errors="replace")
+    fetch["revision"] = revision
+    fetch["mapping_found"] = fetch["rc"] == 0 and MAPPING_MISSING not in text
+    fetch["artifacts_downloaded"] = text.count("downloaded artifact")
+    if fetch["mapping_found"]:
+        fetch["reason"] = None
+    elif MAPPING_MISSING in text:
+        fetch["reason"] = f"no published cache mapping for {revision[:12]}"
+    else:
+        fetch["reason"] = f"lake cache get --rev={revision[:12]} exited {fetch['rc']}"
+    return fetch
+
+
+def first_parent_ancestors(worktree: Path, revision: str, count: int) -> list[str]:
+    """Up to ``count`` first-parent ancestors of ``revision``, newest first; empty when the history is
+    not in the repository (a shallow fetch) or the commit is a root."""
+    if count <= 0:
+        return []
+    out = git(worktree, "rev-list", "--first-parent", f"--max-count={count}", f"{revision}~1", check=False)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _artifact_candidates(
+    worktree: Path, base: str, fallbacks: tuple[str, ...], ancestors: int
+) -> list[tuple[str, int | None]]:
+    """``(revision, distance)`` to ask the cache for, newest first: ``base`` (distance 0), its first-parent
+    ancestors (distance 1, 2, ...), then any fallback not on that walk (distance ``None``)."""
+    candidates: list[tuple[str, int | None]] = [(base, 0)]
+    for distance, sha in enumerate(first_parent_ancestors(worktree, base, ancestors), 1):
+        if sha != base:
+            candidates.append((sha, distance))
+    seen = {sha for sha, _ in candidates}
+    for revision in fallbacks:
+        if revision and revision not in seen:
+            candidates.append((revision, None))
+            seen.add(revision)
+    return candidates
+
+
+def _skipped_summary(attempts: list[dict], base: str) -> list[str]:
+    """Why the revisions tried before the restored one (or all of them) were passed over: the requested
+    revisions each by name, the walked ancestors as one entry."""
+    reasons: list[str] = []
+    walked = [a for a in attempts if a["reason"] and a["distance"] not in (0, None)]
+    for attempt in attempts:
+        if not attempt["reason"]:
+            continue
+        if attempt["distance"] in (0, None):
+            reasons.append(attempt["reason"])
+        elif attempt is walked[0]:
+            if len(walked) == 1:
+                reasons.append(f"{attempt['reason']} (1 commit behind {base[:12]})")
+            else:
+                failed = sum(1 for a in walked if a["rc"] != 0 and "exited" in a["reason"])
+                reasons.append(
+                    f"no published cache mapping for the {len(walked)} first-parent ancestors of {base[:12]} "
+                    f"from {walked[0]['revision'][:12]} back to {walked[-1]['revision'][:12]}"
+                    + (f" ({failed} of the fetches exited nonzero)" if failed else "")
+                )
+    return reasons
+
+
 def prepare_artifacts(
     worktree: Path,
     base: str,
@@ -718,22 +808,27 @@ def prepare_artifacts(
     repository: str = DEFAULT_REPOSITORY,
     candidate: str | None = None,
     fallbacks: tuple[str, ...] = (),
+    ancestors: int = 0,
     mathlib_cache: bool = False,
     lake: tuple[str, ...] = ("lake",),
 ) -> dict:
     """Warm artifacts the way the plan's default source does: main's cache at the base, then an
     incremental build of the batch's modules. Returns timings, module counts and ``available``.
 
-    ``available`` is the plan's "artifacts could be prepared": the base mapping was found and
-    restored, and the incremental build ran to completion. The build may well fail (a repair task
-    exists because modules fail); only a fetch failure, a missing base mapping or a build that did
-    not complete (timeout, missing ``lake``) make the artifacts unavailable. ``mathlib_cache`` first
-    runs ``lake exe cache get`` for the dependencies, as the workers do before PR repair.
-    ``fallbacks`` are further revisions to fetch, in order, when ``base`` has no published mapping
-    (the rebase target when the batch base is stale, or the batch base when the rebase target is
-    not published yet); ``cache_revision`` records which one was restored and ``cache_attempts``
-    every fetch tried. ``candidate`` probes whether the failed candidate's own outputs were
-    published (measurement only).
+    ``available`` is the plan's "artifacts could be prepared": a mapping was found and restored, and
+    the incremental build ran to completion. The build may well fail (a repair task exists because
+    modules fail); only a fetch failure, no published mapping or a build that did not complete
+    (timeout, missing ``lake``) make the artifacts unavailable. ``mathlib_cache`` first runs
+    ``lake exe cache get`` for the dependencies, as the workers do before PR repair.
+
+    The cache is asked for the newest revision it has among ``base`` (the revision the build runs
+    on), up to ``ancestors`` of its first-parent ancestors walking back from it, and ``fallbacks``
+    (further revisions, in order, that are not on that walk: the stale batch base of a rebase whose
+    target is older than the walk, or the rebase target of a repair whose base is stale), stopping at
+    the first that answers. ``cache_revision`` records which one was restored, ``cache_distance`` how
+    many commits behind ``base`` it is (``None`` for a fallback off the walk), ``cache_attempts`` every
+    fetch tried and ``cache_skipped`` why the revisions before it were passed over. ``candidate``
+    probes whether the failed candidate's own outputs were published (measurement only).
     """
     record: dict = {}
     seconds = 0.0
@@ -744,59 +839,25 @@ def prepare_artifacts(
         seconds += deps["seconds"]
         if deps["rc"] != 0:
             reasons.append(f"lake exe cache get exited {deps['rc']}")
-    revisions = [base]
-    for revision in fallbacks:
-        if revision and revision not in revisions:
-            revisions.append(revision)
     attempts: list[dict] = []
-    missing: list[str] = []
-    for index, revision in enumerate(revisions):
-        fetch = run_logged(
-            [*lake, "cache", "get", "--service", CACHE_SERVICE, "--repo", repository, f"--rev={revision}"],
-            worktree,
-            logdir / ("cache-get-base.log" if index == 0 else f"cache-get-fallback-{index}.log"),
-            env=env,
-            timeout=1800,
-        )
-        text = Path(fetch["log"]).read_text(errors="replace")
-        fetch["revision"] = revision
-        fetch["mapping_found"] = fetch["rc"] == 0 and "outputs not found for revision" not in text
-        fetch["artifacts_downloaded"] = text.count("downloaded artifact")
+    for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors):
+        fetch = _fetch_mapping(worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False)
+        fetch["distance"] = distance
         attempts.append(fetch)
         seconds += fetch["seconds"]
         if fetch["mapping_found"]:
             break
-        missing.append(
-            f"no published cache mapping for {revision[:12]}"
-            if fetch["rc"] == 0
-            else f"lake cache get --rev={revision[:12]} exited {fetch['rc']}"
-        )
+    found = attempts[-1] if attempts[-1]["mapping_found"] else None
     record["base_cache"] = attempts[-1]
     record["cache_attempts"] = attempts
-    record["cache_revision"] = attempts[-1]["revision"] if attempts[-1]["mapping_found"] else None
-    if record["cache_revision"] is None:
-        reasons.append("; ".join(missing))
+    record["cache_revision"] = found["revision"] if found else None
+    record["cache_distance"] = found["distance"] if found else None
+    record["cache_skipped"] = _skipped_summary(attempts, base)
+    if found is None:
+        reasons.append("; ".join(record["cache_skipped"]))
     if candidate:
-        own = run_logged(
-            [
-                *lake,
-                "cache",
-                "get",
-                "--service",
-                CACHE_SERVICE,
-                "--repo",
-                repository,
-                f"--rev={candidate}",
-                "--mappings-only",
-            ],
-            worktree,
-            logdir / "cache-get-candidate.log",
-            env=env,
-            timeout=600,
-        )
-        own["published"] = own["rc"] == 0 and "outputs not found for revision" not in Path(own["log"]).read_text(
-            errors="replace"
-        )
+        own = _fetch_mapping(worktree, candidate, env, logdir, repository=repository, lake=lake, mappings_only=True)
+        own["published"] = own["mapping_found"]
         record["candidate_outputs_published"] = own
         seconds += own["seconds"]
     if not reasons:
