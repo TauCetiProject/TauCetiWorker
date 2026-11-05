@@ -469,6 +469,11 @@ def describe_queue(cand, info):
         "ci-infrastructure": "infrastructure",
         "ci-cancelled": "invalidated",
     }[event["kind"]]
+    if event["kind"] in ("ci-pass", "ci-source-failure"):
+        completed = cand.get("runner_finished_at")
+        if not event["details"].get("run_id") or completed is None or completed > event["observed_at"]:
+            info["unclassified_reason"] = "queue source verdict lacks completed-run evidence"
+            return info
     if outcome == "passed":
         tip = dispatch["details"].get("tip")
         landed = [

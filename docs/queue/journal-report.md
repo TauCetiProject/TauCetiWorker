@@ -12,7 +12,9 @@ committed below.
 
 The candidate-feed report now reads the queue's `queue.controller` events as well as Bors's:
 `ci-source-failure`, `ci-infrastructure`, `ci-pass` and `ci-cancelled` are bound to their exact
-attempt ID. Dispatches are matched by timestamp and batch generation; a `landed` event counts as
+attempt ID. Source pass/failure verdicts also need a named run and its recorded completion time no
+later than the verdict; missing completion evidence remains unknown. Dispatches are matched by
+timestamp and batch generation; a `landed` event counts as
 promotion only for the dispatched tip. A later successful landing cannot turn every previous
 attempt of the same batch into a success. A green unlanded candidate and an infrastructure failure
 have separate occupancy rows. Historical attempts that were superseded without a terminal event
@@ -54,7 +56,12 @@ Head measurements separate first-dispatch-to-landing from seal-to-landing (the f
 in shadow mode), observed CI intervals, claimed repair/preparation intervals, overlap and unobserved
 remainder. Throughput counts distinct PR identities from landing records once, rather than counting
 the same membership again for each CI attempt. Reports show membership occurrences, final empty
-commits and unique nonempty contributions separately. Empty commits bearing the scripted
+commits and unique nonempty contributions separately, with both identity and nonempty-contribution
+rates. The historical baseline has no retained-commit scan, so its nonempty contribution rate stays
+unknown. Waiting-age distributions select members inserted inside the reporting window (including
+those approved earlier); earlier shadow insertions are excluded. The report states those denominators
+and lists negative approval-to-insertion timestamp deltas as timing inconsistencies, excluding them
+from the valid wait distribution. Empty commits bearing the scripted
 already-landed note are identifiable; other empty commits alone do not establish why source was
 removed. Full reduction of a contribution and partial shrink need the retained chain audit as well.
 

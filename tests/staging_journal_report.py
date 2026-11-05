@@ -343,12 +343,14 @@ def queue_candidate(attempt=2):
         "batch_id": 1,
         "generation": attempt,
         "observed_at": attempt * 100 * 1_000_000,
+        "runner_started_at": attempt * 100 * 1_000_000,
+        "runner_finished_at": (attempt * 100 + 49) * 1_000_000,
         "snapshot": {"members": [{"pr": 9}]},
         "events": [
             ev("dispatched", 100, version=1, tip="old"),
-            ev("ci-source-failure", 150, attempt_id=1),
+            ev("ci-source-failure", 150, attempt_id=1, run_id="first"),
             ev("dispatched", 200, version=2, tip="new"),
-            ev("ci-pass", 250, attempt_id=2),
+            ev("ci-pass", 250, attempt_id=2, run_id="second"),
             ev("landed", 260, tip="new", members=[9]),
         ],
     }
@@ -367,6 +369,13 @@ def test_queue_verdicts_bind_attempt_and_landed_tip():
     candidate = queue_candidate(2)
     reduced = sjr.reduce_candidate(candidate)
     assert sjr.describe(reduced)["outcome"] == "promoted"
+    candidate["runner_finished_at"] = None
+    assert sjr.describe(candidate)["unclassified_reason"] == "queue source verdict lacks completed-run evidence"
+    candidate["runner_finished_at"] = 251_000_000
+    assert sjr.describe(candidate)["unclassified_reason"] == "queue source verdict lacks completed-run evidence"
+    candidate["runner_finished_at"] = 249_000_000
+    del candidate["events"][3]["details"]["run_id"]
+    assert sjr.describe(candidate)["unclassified_reason"] == "queue source verdict lacks completed-run evidence"
 
 
 def test_queue_infrastructure_and_readoption():
@@ -503,6 +512,7 @@ def test_pilot_deduplicates_attempts_and_separates_empty_members():
     p = report["pilot"]
     h = report["heads"][0]
     assert p["landed_prs"] == 2 and p["nonempty_unique_prs"] == 1, p
+    assert abs(p["nonempty_unique_prs_per_hour"] - 0.9) < 1e-12
     assert p["empty_member_occurrences"] == 1 and p["already_landed_empty_occurrences"] == 1
     assert h["first_dispatch_to_landing_minutes"] == 50 and h["seal_to_landing_minutes"] == 3100 / 60, h
     assert h["ci_observed_minutes"] == 40 and h["claimed_task_minutes"] == 5, h
@@ -626,6 +636,52 @@ def test_daily_command_preserves_inputs_and_reports():
         assert report["pilot"]["landed_prs"] == 2
         assert report["provenance"]["snapshot"] == str(archive / "snapshot.json")
         assert (archive / "report.md").read_text().startswith("# Queue pilot measurements")
+
+
+def test_production_queue_feed_reducer_retains_attempt_and_completion_proof():
+    fixture = json.loads((REPO / "tests/fixtures/queue-journal-fixture.json").read_text())
+    expected = {5: "failed", 7: "promoted", 14: None, 15: "promoted", 16: "promoted", 24: None}
+    for candidate in fixture["candidates"]:
+        described = sjr.describe(candidate)
+        assert described["outcome"] == expected[candidate["id"]], described
+        reduced = sjr.reduce_candidate(candidate)
+        assert sjr.describe(reduced) == described, (candidate["id"], sjr.describe(reduced), described)
+    # Batch 3's obsolete attempt repeats the later batch landing in production. It
+    # remains unknown, because it has neither its own verdict nor a completed run.
+    superseded = next(c for c in fixture["candidates"] if c["id"] == 14)
+    assert any(e["kind"] == "landed" for e in superseded["events"])
+    assert superseded["runner_finished_at"] is None
+    assert sjr.describe(superseded)["unclassified_reason"] == "dispatched, no outcome in journal"
+    merged = sjr.merge_snapshots([fixture], ["actual production"])
+    regenerated = sjr.reduce_snapshot(merged, list(expected))
+    assert regenerated["candidates"] == fixture["candidates"]
+
+
+def test_wait_age_denominator_and_negative_timestamp_inconsistencies():
+    snapshot = pilot_snapshot()
+    # One earlier shadow insertion is excluded. One later insertion has a
+    # pre-window approval and is included. A negative delta is an inconsistency.
+    snapshot["tables"]["members"][0]["added_at"] = 1200
+    snapshot["tables"]["members"][1]["added_at"] = 1300
+    snapshot["tables"]["inputs"][1]["approved_at"] = 1301
+    snapshot["tables"]["members"].append(
+        {
+            "id": 3,
+            "batch_id": 2,
+            "input_id": 1,
+            "number": 11,
+            "commit_sha": "c1",
+            "added_at": 900,
+            "provenance": "clean",
+        }
+    )
+    p = qpr.analyse(snapshot, {"landed_prs_per_hour": 1})["pilot"]
+    coverage = p["approval_to_insertion_coverage"]
+    assert coverage["membership_rows"] == 3 and coverage["insertions_in_window"] == 2, coverage
+    assert coverage["insertions_before_window"] == 1 and coverage["selected_approvals_before_window"] == 1, coverage
+    assert coverage["valid_nonnegative_waits"] == 1 and coverage["timing_inconsistencies"] == 1, coverage
+    assert p["approval_to_insertion_minutes"]["min"] == round(400 / 60, 3)
+    assert p["approval_to_insertion_timing_inconsistencies"][0]["delta_seconds"] == -1
 
 
 def main():

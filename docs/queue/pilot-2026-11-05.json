@@ -1,6 +1,6 @@
 {
   "schema": "tauceti.queue-pilot-report/v1",
-  "generated_at": "2026-11-05T21:39:54Z",
+  "generated_at": "2026-11-05T21:43:56Z",
   "snapshot_captured_at": "2026-11-05T21:35:59Z",
   "window": {
     "from": "2026-11-04T22:58:06Z",
@@ -56,6 +56,7 @@
     "landed_prs": 1502,
     "landed_prs_per_hour": 66.36857351201407,
     "landed_membership_occurrences": 1506,
+    "nonempty_unique_prs_per_hour": 61.905706717930556,
     "nonempty_unique_prs": 1401,
     "empty_member_occurrences": 105,
     "already_landed_empty_occurrences": 3,
@@ -96,12 +97,425 @@
     "claim_collisions": 42,
     "claim_expiries": 3,
     "approval_to_insertion_minutes": {
-      "count": 313,
-      "min": -0.1,
-      "median": 222.331,
-      "p95": 544.824,
+      "count": 263,
+      "min": 0.022,
+      "median": 363.437,
+      "p95": 546.016,
       "max": 582.601
     },
+    "approval_to_insertion_coverage": {
+      "membership_rows": 1511,
+      "insertions_in_window": 313,
+      "insertions_before_window": 1198,
+      "insertions_at_or_after_window": 0,
+      "selected_approvals_before_window": 183,
+      "missing_input": 0,
+      "timing_inconsistencies": 50,
+      "valid_nonnegative_waits": 263,
+      "selection": "Membership inserted in the half-open reporting window, regardless of approval time. Earlier shadow insertions are excluded; approvals before the window are included when insertion is in the window. Negative timestamp deltas are reported separately and excluded from the wait distribution."
+    },
+    "approval_to_insertion_timing_inconsistencies": [
+      {
+        "member_id": 1441,
+        "batch": 3,
+        "pr": 27529,
+        "approved_at": "2026-11-05T15:13:54Z",
+        "inserted_at": "2026-11-05T15:13:48Z",
+        "delta_seconds": -6.012927293777466
+      },
+      {
+        "member_id": 1445,
+        "batch": 7,
+        "pr": 28005,
+        "approved_at": "2026-11-05T17:42:59Z",
+        "inserted_at": "2026-11-05T17:42:58Z",
+        "delta_seconds": -0.09623050689697266
+      },
+      {
+        "member_id": 1448,
+        "batch": 8,
+        "pr": 28272,
+        "approved_at": "2026-11-05T17:49:34Z",
+        "inserted_at": "2026-11-05T17:49:33Z",
+        "delta_seconds": -0.3101327419281006
+      },
+      {
+        "member_id": 1449,
+        "batch": 8,
+        "pr": 28447,
+        "approved_at": "2026-11-05T17:49:41Z",
+        "inserted_at": "2026-11-05T17:49:41Z",
+        "delta_seconds": -0.15137529373168945
+      },
+      {
+        "member_id": 1450,
+        "batch": 9,
+        "pr": 28446,
+        "approved_at": "2026-11-05T18:17:27Z",
+        "inserted_at": "2026-11-05T18:17:26Z",
+        "delta_seconds": -0.30983662605285645
+      },
+      {
+        "member_id": 1452,
+        "batch": 9,
+        "pr": 27881,
+        "approved_at": "2026-11-05T18:44:20Z",
+        "inserted_at": "2026-11-05T18:44:20Z",
+        "delta_seconds": -0.17679834365844727
+      },
+      {
+        "member_id": 1453,
+        "batch": 10,
+        "pr": 28399,
+        "approved_at": "2026-11-05T18:51:37Z",
+        "inserted_at": "2026-11-05T18:51:37Z",
+        "delta_seconds": -0.3007087707519531
+      },
+      {
+        "member_id": 1454,
+        "batch": 10,
+        "pr": 28085,
+        "approved_at": "2026-11-05T18:57:18Z",
+        "inserted_at": "2026-11-05T18:57:18Z",
+        "delta_seconds": -0.29178500175476074
+      },
+      {
+        "member_id": 1455,
+        "batch": 10,
+        "pr": 28240,
+        "approved_at": "2026-11-05T18:57:42Z",
+        "inserted_at": "2026-11-05T18:57:41Z",
+        "delta_seconds": -0.1267709732055664
+      },
+      {
+        "member_id": 1458,
+        "batch": 10,
+        "pr": 28253,
+        "approved_at": "2026-11-05T18:58:10Z",
+        "inserted_at": "2026-11-05T18:58:10Z",
+        "delta_seconds": -0.2197561264038086
+      },
+      {
+        "member_id": 1459,
+        "batch": 10,
+        "pr": 27808,
+        "approved_at": "2026-11-05T18:58:19Z",
+        "inserted_at": "2026-11-05T18:58:19Z",
+        "delta_seconds": -0.1675891876220703
+      },
+      {
+        "member_id": 1460,
+        "batch": 10,
+        "pr": 27490,
+        "approved_at": "2026-11-05T18:58:26Z",
+        "inserted_at": "2026-11-05T18:58:26Z",
+        "delta_seconds": -0.09060025215148926
+      },
+      {
+        "member_id": 1461,
+        "batch": 10,
+        "pr": 27996,
+        "approved_at": "2026-11-05T18:58:33Z",
+        "inserted_at": "2026-11-05T18:58:33Z",
+        "delta_seconds": -0.28850436210632324
+      },
+      {
+        "member_id": 1462,
+        "batch": 10,
+        "pr": 28023,
+        "approved_at": "2026-11-05T18:58:39Z",
+        "inserted_at": "2026-11-05T18:58:39Z",
+        "delta_seconds": -0.215484619140625
+      },
+      {
+        "member_id": 1463,
+        "batch": 10,
+        "pr": 28414,
+        "approved_at": "2026-11-05T18:58:46Z",
+        "inserted_at": "2026-11-05T18:58:45Z",
+        "delta_seconds": -0.18804669380187988
+      },
+      {
+        "member_id": 1464,
+        "batch": 10,
+        "pr": 28209,
+        "approved_at": "2026-11-05T18:58:52Z",
+        "inserted_at": "2026-11-05T18:58:52Z",
+        "delta_seconds": -0.040874481201171875
+      },
+      {
+        "member_id": 1465,
+        "batch": 10,
+        "pr": 28400,
+        "approved_at": "2026-11-05T18:58:59Z",
+        "inserted_at": "2026-11-05T18:58:59Z",
+        "delta_seconds": -0.0136871337890625
+      },
+      {
+        "member_id": 1466,
+        "batch": 10,
+        "pr": 27863,
+        "approved_at": "2026-11-05T18:59:07Z",
+        "inserted_at": "2026-11-05T18:59:07Z",
+        "delta_seconds": -0.007682323455810547
+      },
+      {
+        "member_id": 1467,
+        "batch": 10,
+        "pr": 27783,
+        "approved_at": "2026-11-05T18:59:15Z",
+        "inserted_at": "2026-11-05T18:59:15Z",
+        "delta_seconds": -0.050240516662597656
+      },
+      {
+        "member_id": 1468,
+        "batch": 10,
+        "pr": 28103,
+        "approved_at": "2026-11-05T18:59:22Z",
+        "inserted_at": "2026-11-05T18:59:22Z",
+        "delta_seconds": -0.41939806938171387
+      },
+      {
+        "member_id": 1469,
+        "batch": 10,
+        "pr": 28120,
+        "approved_at": "2026-11-05T18:59:30Z",
+        "inserted_at": "2026-11-05T18:59:30Z",
+        "delta_seconds": -0.011289596557617188
+      },
+      {
+        "member_id": 1470,
+        "batch": 10,
+        "pr": 28215,
+        "approved_at": "2026-11-05T18:59:38Z",
+        "inserted_at": "2026-11-05T18:59:38Z",
+        "delta_seconds": -0.021668434143066406
+      },
+      {
+        "member_id": 1471,
+        "batch": 10,
+        "pr": 27669,
+        "approved_at": "2026-11-05T18:59:46Z",
+        "inserted_at": "2026-11-05T18:59:45Z",
+        "delta_seconds": -0.30228424072265625
+      },
+      {
+        "member_id": 1472,
+        "batch": 10,
+        "pr": 27679,
+        "approved_at": "2026-11-05T18:59:54Z",
+        "inserted_at": "2026-11-05T18:59:54Z",
+        "delta_seconds": -0.29685235023498535
+      },
+      {
+        "member_id": 1473,
+        "batch": 10,
+        "pr": 28137,
+        "approved_at": "2026-11-05T19:00:00Z",
+        "inserted_at": "2026-11-05T19:00:00Z",
+        "delta_seconds": -0.07117486000061035
+      },
+      {
+        "member_id": 1476,
+        "batch": 10,
+        "pr": 28132,
+        "approved_at": "2026-11-05T19:00:29Z",
+        "inserted_at": "2026-11-05T19:00:28Z",
+        "delta_seconds": -0.2864961624145508
+      },
+      {
+        "member_id": 1477,
+        "batch": 10,
+        "pr": 28388,
+        "approved_at": "2026-11-05T19:00:36Z",
+        "inserted_at": "2026-11-05T19:00:36Z",
+        "delta_seconds": -0.33843326568603516
+      },
+      {
+        "member_id": 1478,
+        "batch": 10,
+        "pr": 28197,
+        "approved_at": "2026-11-05T19:00:46Z",
+        "inserted_at": "2026-11-05T19:00:46Z",
+        "delta_seconds": -0.34440159797668457
+      },
+      {
+        "member_id": 1479,
+        "batch": 10,
+        "pr": 28267,
+        "approved_at": "2026-11-05T19:00:53Z",
+        "inserted_at": "2026-11-05T19:00:53Z",
+        "delta_seconds": -0.0939183235168457
+      },
+      {
+        "member_id": 1481,
+        "batch": 10,
+        "pr": 28194,
+        "approved_at": "2026-11-05T19:01:08Z",
+        "inserted_at": "2026-11-05T19:01:08Z",
+        "delta_seconds": -0.10303473472595215
+      },
+      {
+        "member_id": 1482,
+        "batch": 10,
+        "pr": 28395,
+        "approved_at": "2026-11-05T19:01:17Z",
+        "inserted_at": "2026-11-05T19:01:17Z",
+        "delta_seconds": -0.36101269721984863
+      },
+      {
+        "member_id": 1485,
+        "batch": 10,
+        "pr": 28014,
+        "approved_at": "2026-11-05T19:01:39Z",
+        "inserted_at": "2026-11-05T19:01:39Z",
+        "delta_seconds": -0.41835546493530273
+      },
+      {
+        "member_id": 1486,
+        "batch": 10,
+        "pr": 28060,
+        "approved_at": "2026-11-05T19:01:46Z",
+        "inserted_at": "2026-11-05T19:01:46Z",
+        "delta_seconds": -0.02348804473876953
+      },
+      {
+        "member_id": 1487,
+        "batch": 10,
+        "pr": 26123,
+        "approved_at": "2026-11-05T19:01:55Z",
+        "inserted_at": "2026-11-05T19:01:54Z",
+        "delta_seconds": -0.3664097785949707
+      },
+      {
+        "member_id": 1488,
+        "batch": 10,
+        "pr": 28025,
+        "approved_at": "2026-11-05T19:02:02Z",
+        "inserted_at": "2026-11-05T19:02:02Z",
+        "delta_seconds": -0.3151402473449707
+      },
+      {
+        "member_id": 1489,
+        "batch": 10,
+        "pr": 28335,
+        "approved_at": "2026-11-05T19:02:09Z",
+        "inserted_at": "2026-11-05T19:02:09Z",
+        "delta_seconds": -0.08526277542114258
+      },
+      {
+        "member_id": 1491,
+        "batch": 10,
+        "pr": 28130,
+        "approved_at": "2026-11-05T19:02:25Z",
+        "inserted_at": "2026-11-05T19:02:25Z",
+        "delta_seconds": -0.007889986038208008
+      },
+      {
+        "member_id": 1493,
+        "batch": 10,
+        "pr": 28104,
+        "approved_at": "2026-11-05T19:02:42Z",
+        "inserted_at": "2026-11-05T19:02:41Z",
+        "delta_seconds": -0.3247363567352295
+      },
+      {
+        "member_id": 1494,
+        "batch": 10,
+        "pr": 28347,
+        "approved_at": "2026-11-05T19:02:49Z",
+        "inserted_at": "2026-11-05T19:02:49Z",
+        "delta_seconds": -0.3320741653442383
+      },
+      {
+        "member_id": 1495,
+        "batch": 10,
+        "pr": 27856,
+        "approved_at": "2026-11-05T19:02:57Z",
+        "inserted_at": "2026-11-05T19:02:57Z",
+        "delta_seconds": -0.01195216178894043
+      },
+      {
+        "member_id": 1497,
+        "batch": 10,
+        "pr": 28016,
+        "approved_at": "2026-11-05T19:03:14Z",
+        "inserted_at": "2026-11-05T19:03:13Z",
+        "delta_seconds": -0.3857145309448242
+      },
+      {
+        "member_id": 1498,
+        "batch": 10,
+        "pr": 28135,
+        "approved_at": "2026-11-05T19:03:21Z",
+        "inserted_at": "2026-11-05T19:03:21Z",
+        "delta_seconds": -0.09263920783996582
+      },
+      {
+        "member_id": 1499,
+        "batch": 10,
+        "pr": 28131,
+        "approved_at": "2026-11-05T19:03:29Z",
+        "inserted_at": "2026-11-05T19:03:29Z",
+        "delta_seconds": -0.25969576835632324
+      },
+      {
+        "member_id": 1500,
+        "batch": 10,
+        "pr": 27877,
+        "approved_at": "2026-11-05T19:03:36Z",
+        "inserted_at": "2026-11-05T19:03:36Z",
+        "delta_seconds": -0.18202996253967285
+      },
+      {
+        "member_id": 1501,
+        "batch": 10,
+        "pr": 28373,
+        "approved_at": "2026-11-05T19:03:44Z",
+        "inserted_at": "2026-11-05T19:03:43Z",
+        "delta_seconds": -0.16257739067077637
+      },
+      {
+        "member_id": 1502,
+        "batch": 12,
+        "pr": 28515,
+        "approved_at": "2026-11-05T20:05:34Z",
+        "inserted_at": "2026-11-05T20:05:30Z",
+        "delta_seconds": -3.344940185546875
+      },
+      {
+        "member_id": 1507,
+        "batch": 14,
+        "pr": 28389,
+        "approved_at": "2026-11-05T21:11:08Z",
+        "inserted_at": "2026-11-05T21:11:07Z",
+        "delta_seconds": -0.1476140022277832
+      },
+      {
+        "member_id": 1508,
+        "batch": 14,
+        "pr": 28449,
+        "approved_at": "2026-11-05T21:11:15Z",
+        "inserted_at": "2026-11-05T21:11:15Z",
+        "delta_seconds": -0.2074122428894043
+      },
+      {
+        "member_id": 1509,
+        "batch": 15,
+        "pr": 28465,
+        "approved_at": "2026-11-05T21:17:55Z",
+        "inserted_at": "2026-11-05T21:17:55Z",
+        "delta_seconds": -0.24741601943969727
+      },
+      {
+        "member_id": 1511,
+        "batch": 15,
+        "pr": 25524,
+        "approved_at": "2026-11-05T21:24:40Z",
+        "inserted_at": "2026-11-05T21:24:40Z",
+        "delta_seconds": -0.1786940097808838
+      }
+    ],
     "currently_waiting_age_minutes": {
       "count": 0,
       "min": null,

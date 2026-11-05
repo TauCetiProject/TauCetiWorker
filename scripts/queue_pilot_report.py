@@ -491,11 +491,37 @@ def analyse(snapshot, baseline, since=None, until=None):
     # A unique input can be represented by several attempts; throughput counts only landings.
     prs = {p for h in heads for p in h["landed_prs"]}
     input_map = {i["id"]: i for i in tables["inputs"]}
+    inserted_in_window = [m for m in tables["members"] if start <= m["added_at"] < end]
+    timing_inconsistencies = [
+        {
+            "member_id": m["id"],
+            "batch": m["batch_id"],
+            "pr": m["number"],
+            "approved_at": iso(input_map[m["input_id"]]["approved_at"]),
+            "inserted_at": iso(m["added_at"]),
+            "delta_seconds": m["added_at"] - input_map[m["input_id"]]["approved_at"],
+        }
+        for m in inserted_in_window
+        if m["input_id"] in input_map and m["added_at"] < input_map[m["input_id"]]["approved_at"]
+    ]
     admitted = [
         (m["added_at"] - input_map[m["input_id"]]["approved_at"]) / 60
-        for m in tables["members"]
-        if start <= m["added_at"] < end and m["input_id"] in input_map
+        for m in inserted_in_window
+        if m["input_id"] in input_map and m["added_at"] >= input_map[m["input_id"]]["approved_at"]
     ]
+    insertion_coverage = {
+        "membership_rows": len(tables["members"]),
+        "insertions_in_window": len(inserted_in_window),
+        "insertions_before_window": sum(m["added_at"] < start for m in tables["members"]),
+        "insertions_at_or_after_window": sum(m["added_at"] >= end for m in tables["members"]),
+        "selected_approvals_before_window": sum(
+            input_map[m["input_id"]]["approved_at"] < start for m in inserted_in_window if m["input_id"] in input_map
+        ),
+        "missing_input": sum(m["input_id"] not in input_map for m in inserted_in_window),
+        "timing_inconsistencies": len(timing_inconsistencies),
+        "valid_nonnegative_waits": len(admitted),
+        "selection": "Membership inserted in the half-open reporting window, regardless of approval time. Earlier shadow insertions are excluded; approvals before the window are included when insertion is in the window. Negative timestamp deltas are reported separately and excluded from the wait distribution.",
+    }
     waiting = [
         (end - i["approved_at"]) / 60
         for i in tables["inputs"]
@@ -557,6 +583,9 @@ def analyse(snapshot, baseline, since=None, until=None):
             "landed_prs": len(prs),
             "landed_prs_per_hour": rate,
             "landed_membership_occurrences": sum(h["size"] for h in heads),
+            "nonempty_unique_prs_per_hour": len({p for h in heads for p in h["nonempty_prs"]}) / ((end - start) / 3600)
+            if all(h["emptiness_unknown"] == 0 for h in heads)
+            else None,
             "nonempty_unique_prs": len({p for h in heads for p in h["nonempty_prs"]})
             if all(h["emptiness_unknown"] == 0 for h in heads)
             else None,
@@ -578,6 +607,8 @@ def analyse(snapshot, baseline, since=None, until=None):
             "claim_collisions": counts["claim-refused"],
             "claim_expiries": counts["claim-expired"],
             "approval_to_insertion_minutes": dist(admitted),
+            "approval_to_insertion_coverage": insertion_coverage,
+            "approval_to_insertion_timing_inconsistencies": timing_inconsistencies,
             "currently_waiting_age_minutes": dist(waiting),
             "opt_outs": counts["no-repair"],
             "anticipated_withdrawals": counts["problem-anticipated"],
@@ -672,7 +703,8 @@ def render(report):
         f"| Unique landed PR identities | {p['landed_prs']} | {b['landed_prs']} |",
         f"| Nonempty unique contributions | {p['nonempty_unique_prs']} | unknown |",
         f"| Empty memberships / already-landed note | {p['empty_member_occurrences']} / {p['already_landed_empty_occurrences']} | unknown |",
-        f"| PRs/hour | {p['landed_prs_per_hour']:.2f} | {b['landed_prs_per_hour']:.2f} |",
+        f"| Unique landed PR identities/hour | {p['landed_prs_per_hour']:.2f} | {b['landed_prs_per_hour']:.2f} |",
+        f"| Nonempty unique contributions/hour | {fmt(p['nonempty_unique_prs_per_hour'])} | unknown |",
         f"| Source-failed rounds per landed large head | {fmt(p['failed_rounds_per_large_landing'])} | {fmt(b['failed_rounds_per_large_landing'])} |",
         f"| Singleton CI runs (including natural one-PR heads) | {p['singleton_runs']} | {b['singleton_runs']} |",
         f"| Claim collisions / expiries | {p['claim_collisions']} / {p['claim_expiries']} | unknown |",
@@ -723,7 +755,9 @@ def render(report):
         )
     lines += [
         "",
-        f"Approval → insertion minutes: `{p['approval_to_insertion_minutes']}`. Current waiting age: `{p['currently_waiting_age_minutes']}`.",
+        f"Approval → insertion minutes (valid nonnegative waits): `{p['approval_to_insertion_minutes']}`. Current waiting age: `{p['currently_waiting_age_minutes']}`.",
+        "",
+        f"Waiting-age coverage: {p['approval_to_insertion_coverage']['insertions_in_window']} insertions in the reporting window, of which {p['approval_to_insertion_coverage']['selected_approvals_before_window']} were approved before it. {p['approval_to_insertion_coverage']['insertions_before_window']} earlier insertions (including shadow preparation) are excluded. The distribution contains {p['approval_to_insertion_coverage']['valid_nonnegative_waits']} valid waits; {p['approval_to_insertion_coverage']['timing_inconsistencies']} negative approval-to-insertion timestamp deltas are listed separately in JSON as timing inconsistencies, not valid negative wait.",
         "",
         "Exit criteria:",
         "",
