@@ -68,9 +68,15 @@ Every `tick()` (one reconciliation pass) does, under the controller lock:
 2. Fetch the canonical branch into the clone. If it advanced: a head whose tip is now an ancestor
    of it is `landed` (`promoted` when a promotion was recorded, `external` otherwise, which is how
    the shadow period and an admin merge of the whole head reconcile); waiting inputs whose
-   `Source-PR` appears in the new commits are cancelled as `landed-externally`. An admin merge of a
-   member PR needs no special case: the member's commit replays as an empty commit at the next
-   rebase, or conflicts and goes to an agent.
+   `Source-PR` appears in the new commits are cancelled as `landed-externally`. A member PR landed
+   outside the queue (an admin merge, or Bors during the shadow period) is never withdrawn: at the
+   next rebase `chain.replay` finds its PR in the new commits since the old base (a subject ending
+   ` (#N)` or a `Source-PR` trailer) and writes an empty commit with the member's message plus the
+   note "Landed on main as <sha> outside the queue; nothing left to apply." instead of cherry-picking
+   it, so the member cannot conflict with the changes that landed beside it; `chain.build` does the
+   same for a rebuild. The replay result, the `rebased`, `rebase-conflict` and `rebuilt` journal
+   entries and a `rebase_conflict` task's diagnostics list these members under `landed_on_base`
+   (`{source_pr, commit}` each), and the repair prompt states them as "Already on main".
 3. Insertion passes: while there are waiting inputs not yet probed in this pass against an open
    batch they are eligible for, ensure the first open batch exists (based on the canonical commit),
    pick the oldest open batch with eligible inputs, draw one (below), reserve it, claim the batch,

@@ -138,7 +138,8 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
 
     The controller hands the repair task a list of findings, each ``{kind, module, message}`` as the
     CI adapter extracted them, and for a rebase conflict one ``{kind: "conflict", source_pr, paths,
-    onto, pending, clean_prefix_tip}`` entry. Compiler findings become ``compiler_errors`` (with the
+    onto, pending, clean_prefix_tip, landed_on_base}`` entry (``landed_on_base`` lists the members the
+    target already carries, ``{source_pr, commit}`` each). Compiler findings become ``compiler_errors`` (with the
     line and column parsed from the message when it starts with ``path:line:col``), lint findings keep
     their module and message, every other kind is kept under ``other``, and the conflict entry under
     ``conflict``. A dict is taken as an already structured findings record.
@@ -164,6 +165,11 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
                 "onto": raw.get("onto"),
                 "pending": list(raw.get("pending") or []),
                 "clean_prefix_tip": raw.get("clean_prefix_tip"),
+                "landed_on_base": [
+                    entry
+                    for entry in raw.get("landed_on_base") or []
+                    if isinstance(entry, dict) and entry.get("source_pr")
+                ],
                 "message": message,
             }
             continue
@@ -843,7 +849,9 @@ class PromptContext:
     suspects: list[int] = dataclasses.field(default_factory=list)
     suspect_heads: dict[int, str] = dataclasses.field(default_factory=dict)
     named_modules: list[str] = dataclasses.field(default_factory=list)
-    conflict: dict | None = None  # rebase_conflict: {member, paths, onto, previous_base, pending, clean_prefix_tip}
+    conflict: dict | None = (
+        None  # rebase_conflict: {member, paths, onto, previous_base, pending, clean_prefix_tip, landed_on_base}
+    )
     feedback: str | None = None  # a validation report from a rejected attempt
     members: list[dict] = dataclasses.field(
         default_factory=list
@@ -912,9 +920,12 @@ def conflict_position(context: PromptContext, chain: list[ChainCommit]) -> int |
 def landed_on_main(context: PromptContext, chain: list[ChainCommit], clone: Path) -> dict[int, str | None]:
     """The members whose PR has landed on ``main`` outside the queue, with the landing commit when
     known: from the recorded members' ``landed_externally`` flag when the service sends one (a commit
-    SHA or a boolean), else derived from the commits between the batch's base and the target whose
-    subject ends in ``(#N)`` for a member's PR number. Empty for a repair, whose base is the target."""
-    previous = (context.conflict or {}).get("previous_base") if context.kind == "rebase_conflict" else None
+    SHA or a boolean), from the conflict diagnostics' ``landed_on_base`` entries (what the queue's own
+    replay found in the target's history), else derived from the commits between the batch's base and
+    the target whose subject ends in ``(#N)`` for a member's PR number. Empty for a repair, whose base
+    is the target."""
+    conflict = context.conflict or {}
+    previous = conflict.get("previous_base") if context.kind == "rebase_conflict" else None
     numbers = {c.pr for c in chain if c.pr is not None}
     landed: dict[int, str | None] = {}
     flagged = False
@@ -924,6 +935,16 @@ def landed_on_main(context: PromptContext, chain: list[ChainCommit], clone: Path
             flagged = True
             if number in numbers:
                 landed[number] = flag if isinstance(flag, str) and re.fullmatch(r"[0-9a-f]{40}", flag) else None
+    for entry in conflict.get("landed_on_base") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            number = pr_number(str(entry.get("source_pr") or ""))
+        except ValueError:
+            continue
+        commit = entry.get("commit")
+        if number in numbers and landed.get(number) is None:
+            landed[number] = commit if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) else None
     if not previous or previous[:12] == context.base[:12]:
         return landed
     subjects = git(clone, "log", "--format=%H%x00%s", f"{previous}..{context.base}", check=False)
