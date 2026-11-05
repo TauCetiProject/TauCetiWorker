@@ -159,7 +159,7 @@ or check id and URL, its time, the head approved, the command as typed, `single`
 repository admins the merge base of that head against the base branch, which is what Bors's
 `ManualApproval.grant` records and what the scope-approval check reads back as `scope_approvals`.
 
-## Repair or reject: comments and the `queue-no-repair` label
+## Repair or reject: comments and the `dont-repair-in-queue` label
 
 Repair in place is the default; the author chooses rejection with a label (the plan's "Repair or
 reject: the author's choice").
@@ -176,7 +176,7 @@ commit, accepted head, `diff_lines`, `truncated`) and counted in `edit_summaries
 comment is unchanged.
 
 **The label.** A PR carrying one of the `no_repair_labels` (a runtime setting, default
-`["queue-no-repair"]`, compared case-insensitively) is never edited by an agent. The controller
+`["dont-repair-in-queue"]`, compared case-insensitively) is never edited by an agent. The controller
 reads the labels `fetch_pr` returns at approval into the input's `no_repair` flag, copies it to the
 member at insertion, and refreshes both from `pull_request` `labeled` and `unlabeled` deliveries
 for that label (the payload's `pull_request.labels` when present, else the action), journaled as

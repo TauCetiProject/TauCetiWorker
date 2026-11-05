@@ -360,7 +360,7 @@ and reported in status:
 | `prepare_min_members` | 20 | members an open batch needs before it is prepared |
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
-| `no_repair_labels` | `["queue-no-repair"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
+| `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
 ## Ports
 

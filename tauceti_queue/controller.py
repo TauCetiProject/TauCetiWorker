@@ -94,7 +94,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
-    "no_repair_labels": ["queue-no-repair"],
+    "no_repair_labels": ["dont-repair-in-queue"],
 }
 
 # How long `status()` waits for the controller lock before serving the last snapshot instead.
@@ -3501,7 +3501,7 @@ class Controller:
     def _anticipated_comment(
         self, batch: dict[str, Any], member: dict[str, Any], record: dict[str, Any], landed: bool
     ) -> str:
-        labels = ", ".join(f"`{label}`" for label in self.setting("no_repair_labels")) or "`queue-no-repair`"
+        labels = ", ".join(f"`{label}`" for label in self.setting("no_repair_labels")) or "`dont-repair-in-queue`"
         interacting = record.get("interacting")
         lines = [
             f"This PR carries {labels}, so the merge queue does not edit it. Integrating it in batch {batch['id']} "
