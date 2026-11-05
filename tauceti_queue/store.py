@@ -173,7 +173,8 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     outcome_detail TEXT NOT NULL DEFAULT '',
     diagnostics TEXT NOT NULL DEFAULT '[]',
     infrastructure_retry INTEGER NOT NULL DEFAULT 0,
-    needs_observation INTEGER NOT NULL DEFAULT 1
+    needs_observation INTEGER NOT NULL DEFAULT 1,
+    verdicts TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS ci_batch ON ci_attempts (batch_id, batch_version);
 CREATE TABLE IF NOT EXISTS outbox (
@@ -224,6 +225,17 @@ class Store:
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._connection.execute("PRAGMA busy_timeout=5000")
         self._connection.executescript(SCHEMA)
+        self._add_missing_columns()
+
+    # Columns added to a table after databases with the table already existed; `CREATE TABLE IF NOT
+    # EXISTS` leaves those databases alone, so each is added here when absent.
+    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (("ci_attempts", "verdicts", "TEXT NOT NULL DEFAULT '{}'"),)
+
+    def _add_missing_columns(self) -> None:
+        for table, column, declaration in self.ADDED_COLUMNS:
+            present = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
+            if column not in present:
+                self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def close(self) -> None:
         with self._lock:

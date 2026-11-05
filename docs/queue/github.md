@@ -83,12 +83,18 @@ failures, remaining, reset, last error) is part of `/status` as `github`.
 
 A candidate build is the `repository_dispatch` above. `pr-build.yml` derives its `run-name` from the
 payload, so the run is found by that title, with the creation window bounded to a minute either side
-of the dispatch time; this is the same lookup Bors's `staging_run` performs. The verdict is the
-`build` commit status that `finalize-merge-group-build` posts on the candidate head through
-TauCetiTools' `finalize_batch.py`, whose `target_url` is exactly
+of the dispatch time; this is the same lookup Bors's `staging_run` performs. The verdict is the three
+commit statuses Bors required (`bors.toml` `status = ["build", "bump-guard", "scope"]`,
+`VERDICT_CONTEXTS`) that `finalize-merge-group-build` posts on the candidate head in one step through
+TauCetiTools' `ci_status.py`, each with a `target_url` of exactly
 `https://github.com/<repo>/actions/runs/<run_id>`; `Status.run_id` carries that id so the controller
-accepts a verdict only when it names the candidate's own run (a status from another run, an earlier
-attempt, or a `pull_request` event on a member branch is not the candidate's verdict).
+accepts a status only when it names the candidate's own run (a status from another run, an earlier
+attempt, or a `pull_request` event on a member branch is not the candidate's verdict). The attempt
+passes only when all three are bound and `success`; a red `scope` or `bump-guard` beside a green
+`build` is a source failure of the head carrying the status description (a restricted path without a
+current admin approval, an oversized diff, a new file over 1000 lines, a failed pin validation), and a
+bound `build` with the other two still absent is observed again for `LOG_GRACE_SECONDS` before it
+counts as a missing status. `status.head.ci.verdicts` reports each context's state.
 
 Webhooks come first. `CandidatePoller.poll(refs)` is the fallback: for each pending candidate at most
 one run lookup and one status read per `interval` (60 s), and nothing at all while the remaining
