@@ -165,27 +165,56 @@ has a time budget holds because the service re-exposes the task.
    rebase needs no build, runs its agent without warm artifacts and leaves the validation build to run
    cold or to the service's CI. Checkpoint `artifacts_ready`.
 4. **Agent.** The prompt (`repair.compose_prompt`) opens with the task's instruction verbatim, then
-   the batch (where it came from, what it must not do: no push, no PRs, no comments, no `gh`, no
-   edits to the build configuration), the diagnostics with file-level owners computed from the chain
-   (for a rebase conflict: the conflicting member, its paths and owners, the members not yet
-   replayed and the clean prefix), the constituent commits with their PR identities, the recorded
-   members with their `Source-PR` and `Accepted-Head` trailers, the editing recipe (fixup commits
-   and an autosquash rebase with `--keep-empty --empty=keep`, or any method yielding a linear chain
-   on `onto` with one commit per member and every prior message preserved as a prefix; for a rebase
-   conflict, `git rebase --onto` with conflicts resolved inside the constituent commits), and local
-   verification (`lake build --iofail`, `scripts/lint-env.sh` for lint findings, no weakening). For
-   a rebase conflict the rebase recipe and the conflicting files come right after the goal paragraph,
-   before the rules and the listings. A batch of more than `repair.LARGE_BATCH` (40) members does not
-   carry its commit and member listings in the prompt (1,197 members once made a 291 KB prompt, about
-   75k tokens of noise): the prompt shows the conflicting or diagnosed members with three neighbours
-   on each side in chain order, the counts, and a pointer to `.tauceti-repair/members.md` in the
-   worktree, where `repair.compose_prompt` writes the full listings for the agent to `grep`; the
-   directory is excluded from Git through the clone's `info/exclude`, so no recipe the agent runs
-   can commit it, and `checkout_worktree` leaves it alone. Small batches keep the full inline
-   listings. The verification advice follows the artifacts outcome: with warm artifacts it describes
-   the incremental whole-library build; when a rebase conflict runs without them (`cold`) it says so,
-   gives the reason, warns that `lake build --iofail` starts from nothing and may take hours, and asks
-   for the touched modules (`lake build <Module>`) to be built first. The
+   says what happened in plain words (for a rebase conflict: the queue replayed this batch of N squash
+   commits onto the current `main` commit with git, the replay stopped at PR N's commit with conflicts
+   in these files, the commits before it replayed cleanly and are at this commit, the job is to finish
+   the replay; for a repair: the batch was built on `main` with CI and the build failed), the evidence
+   with the git refs the agent needs named once (base, target, the conflicting commit, the clean
+   prefix, and for every file the owning commit: "PR N's commit `sha` modifies this file, and `main`
+   has changed it since the batch's base"; for a repair the compiler, audit and lint findings with
+   their owning commits), the result the queue expects (a linear chain on `onto` with one commit per
+   PR in the same order, each keeping its `Source-PR:` and `Accepted-Head:` trailers and its ` (#N)`
+   subject suffix; the queue reads it from the worktree, validates it and runs CI itself, so there is
+   nothing to push or report and `gh` is not needed; no changes introduced to the build configuration,
+   `scripts/` or `.github/`, though a constituent commit that modifies such files keeps its change),
+   an "Already on main" section when members' PRs have landed on `main` outside the queue since the
+   batch's base (one line each with PR number, title and landing commit, up to `repair.LANDED_SHOWN`,
+   the rest by count; such a member becomes an empty commit and a conflict in one of them takes
+   `main`'s version; the list comes from the members' `landed_externally` flag when the service sends
+   one, else from the subjects ending in ` (#N)` between base and target), one editing instruction
+   (for a rebase conflict: `git rebase --keep-empty --empty=keep --reapply-cherry-picks --onto <target>
+   <base>`, where `--reapply-cherry-picks` keeps a member whose identical patch is already on `main`
+   as an empty commit instead of dropping it; resolve each stop inside the constituent commit with
+   `git add`, `git commit --allow-empty -C REBASE_HEAD` (the member's own message and author, kept
+   when the resolution leaves it empty) and `GIT_EDITOR=true git rebase --continue`; explanations
+   appended with `git commit --allow-empty --squash=<sha> -m <explanation>` and content changes with
+   `git commit --fixup=<sha>`, folded in by an autosquash rebase that keeps each commit's message and
+   author), and local verification. The member listings are not in the prompt (1,197 members once
+   made a 291 KB prompt, about 75k tokens of noise): `repair.write_listings` writes
+   `.tauceti-repair/members.jsonl` in the worktree, one JSON object per member in chain order with
+   `position`, `commit`, `pr`, `title`, `accepted_head`, `provenance`, `landed_on_main` (the landing
+   commit, else null) and, for a rebase conflict, `state` (`replayed`, `conflicting` or `pending`),
+   and beside it `.tauceti-repair/check`, the agent's one validation command: a standalone Python
+   script that verifies the chain is linear on the target, has exactly one commit per member in the
+   recorded order with the trailers and ` (#N)` subjects kept and every original message preserved as
+   a prefix, that no rebase is in progress and that the working tree is clean, and prints the first
+   problem or `ok`. A rebase conflict also gets `.tauceti-repair/step`, a short shell script that
+   starts the rebase (or continues it), commits each stop whose member is already on `main` with
+   `main`'s version of the conflicted files as an empty commit, stops at the first real conflict
+   naming the commit and the files, and refuses to start when HEAD already sits on the target. The
+   directory is excluded from Git through the clone's `info/exclude`, so no recipe the agent runs can
+   commit it, and `checkout_worktree` leaves it alone; a prompt composed without a worktree (the
+   experiment's preview) carries the listings inline. The verification advice follows
+   the artifacts outcome: with warm artifacts it describes the incremental whole-library build; when a
+   rebase conflict runs without them (`cold`) it says so, gives the reason, warns that
+   `lake build --iofail` starts from nothing and may take hours, and asks for the touched modules
+   (`lake build <Module>`) to be built first. Either way long builds run in the foreground: the task
+   sets `TAUCETI_SHELL_LIMIT_SECONDS` to `RunnerConfig.shell_limit` (two hours;
+   `repair.SHELL_LIMIT_SECONDS`) for the agent's shell limit, where the fleet's authoring rounds keep
+   ten minutes, and the prompt says so. The prompt states the aim (every constituent PR's mathematics
+   lands as its author intended, compiled and checked) before the hard rules (no `sorry`, no
+   `native_decide`, no new axioms, no `set_option`, no silenced linters), and asks for a closing
+   summary of what changed in which PR's commit and the exit status of the final build. The
    agent runs through `tauceti_worker.agents.run_agent_host` with the claude authoring profile the
    workers use for repair, in the task's worktree, with `repair.isolation_env`: no
    `GH_TOKEN`/`GITHUB_TOKEN`, an empty `GH_CONFIG_DIR`, `remote.origin.pushurl` pointed at a
