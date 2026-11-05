@@ -457,6 +457,9 @@ CREATE TABLE ci_attempts (
 );
 """
 
+# Columns declared on `ci_attempts` for runs the controller cancels.
+CANCEL_COLUMNS = ("cancelled_at", "cancelled_by", "cancel_reason", "cancel_result")
+
 # Columns declared on `batches` and `tasks` after those tables existed.
 PRE_REBASED_CHAIN_COLUMNS = (("batches", "pre_rebase_prepared"), ("tasks", "pre_rebase_source"))
 
@@ -471,7 +474,8 @@ class OlderStore(ControllerCase):
         # Rebuild `ci_attempts` at the older schema, keeping the dispatched attempt.
         connection = sqlite3.connect(str(self.root / "queue.sqlite"))
         columns = [row[1] for row in connection.execute("PRAGMA table_info(ci_attempts)")]
-        columns.remove("repair_outputs_revs")
+        for column in ("repair_outputs_revs", *CANCEL_COLUMNS):
+            columns.remove(column)
         listed = ", ".join(columns)
         connection.executescript(
             "ALTER TABLE ci_attempts RENAME TO ci_attempts_current;"
@@ -486,13 +490,15 @@ class OlderStore(ControllerCase):
         restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
         self.addCleanup(restarted.store.close)
         present = {row["name"] for row in restarted.store.execute("PRAGMA table_info(ci_attempts)")}
-        self.assertIn("repair_outputs_revs", present)
+        for column in ("repair_outputs_revs", *CANCEL_COLUMNS):
+            self.assertIn(column, present)
         for table, column in PRE_REBASED_CHAIN_COLUMNS:
             present = {row["name"] for row in restarted.store.execute(f"PRAGMA table_info({table})")}
             self.assertIn(column, present, table)
         ci = restarted.status()["head"]["ci"]
         self.assertEqual(ci["attempt_id"], attempt["id"])
         self.assertEqual(ci["repair_outputs_revs"], [])
+        self.assertEqual(restarted.status()["head"]["cancelled_runs"], [])
 
 
 class Dispatch(ControllerCase):
