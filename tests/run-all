@@ -3,14 +3,21 @@
 #
 # The tests are standalone scripts (not pytest): each loads the `tauceti` program and exits 0/1.
 # This runner knows how each one wants to be invoked, and which one to skip in a plain CI box:
-#   - most are stdlib-only         -> `uv run python <file>`
+#   - most are stdlib-only         -> the project interpreter
 #   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
-#   - dashboard uses the project's rich/textual/Tools dependencies -> `uv run python`
+#   - dashboard uses the project's rich/textual/Tools dependencies -> the project interpreter
 #   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
 #   - egress needs the bubble sandbox/proxy              -> skipped here
 # The Python version is taken from $UV_PYTHON when set (uv honours it), so CI can matrix over versions.
 #
-# Usage: tests/run-all [--fail-fast]
+# Usage: tests/run-all [--fail-fast] [-j N] [--group all|portable|native|docs]
+#   -j N      run up to N modules at once (default 1). Every module gets its own activity, fleet-event,
+#             cache and verification-storage directories, so modules never share state, in any mode.
+#   --group   which modules to run (default all):
+#             native    the modules whose fixtures need a native filesystem (see NATIVE_FS)
+#             portable  everything else; runs on any Linux box, including Namespace runners
+#             docs      only the modules that assert on README.md, docs/*.md and workers.toml.example,
+#                       which is all a documentation-only change can break (see DOCS_CONTRACT)
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -19,21 +26,29 @@ cd "$(dirname "$0")/.." || exit 1
 export TAUCETI_GITHUB_STATE_URL=""
 
 FAIL_FAST=0
-[ "${1:-}" = "--fail-fast" ] && FAIL_FAST=1
+JOBS=1
+GROUP=all
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fail-fast) FAIL_FAST=1 ;;
+    -j) JOBS="$2"; shift ;;
+    -j*) JOBS="${1#-j}" ;;
+    --group) GROUP="$2"; shift ;;
+    --group=*) GROUP="${1#--group=}" ;;
+    *) echo "usage: tests/run-all [--fail-fast] [-j N] [--group all|portable|native|docs]" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$JOBS" in ''|*[!0-9]*|0) echo "run-all: -j wants a positive integer, got '$JOBS'" >&2; exit 2 ;; esac
 
 # Tests must keep receipts, usage history and legacy migration fixtures out of the operator's
 # real activity store. Legacy containment markers are ignored by current workers.
-TAUCETI_ACTIVITY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-activity-XXXXXX")"
-TAUCETI_FLEET_EVENTS="$TAUCETI_ACTIVITY_DIR/worker-events.jsonl"
-TAUCETI_SHARED_MATHLIB_ROOT="$TAUCETI_ACTIVITY_DIR/mathlib-builds"
-TAUCETI_BUILD_CACHE_ROOT="$TAUCETI_ACTIVITY_DIR/builds"
-export TAUCETI_BUILD_CACHE_ROOT
-export TAUCETI_ACTIVITY_DIR TAUCETI_FLEET_EVENTS TAUCETI_SHARED_MATHLIB_ROOT
-TAUCETI_VERIFY_STORAGE_DIR="$TAUCETI_ACTIVITY_DIR/verification-storage"
-export TAUCETI_VERIFY_STORAGE_DIR
-trap 'rm -rf "$TAUCETI_ACTIVITY_DIR"' EXIT
+# Each module gets its own subtree (see run_one), so concurrent modules cannot see each other's
+# activity, fleet events, caches or verification storage.
+RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-run-XXXXXX")"
+trap 'rm -rf "$RUN_ROOT"' EXIT
 
-# stdlib-only python tests, run with the uv-provided interpreter
+# stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
   activity.py
   activity_git.py
@@ -186,7 +201,7 @@ RUN_STDLIB=(
   work_recovery.py
   repair_recovery.py
 )
-# special-cased python tests (handled explicitly below)
+# special-cased python tests (handled explicitly in run_one)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
 # bash tests
 RUN_SH=(docker_entrypoint.sh lifecycle.sh)
@@ -194,24 +209,20 @@ RUN_SH=(docker_entrypoint.sh lifecycle.sh)
 # repair fixture needs Lean, Elixir and a bors checkout (see its module docstring).
 SKIP=(egress.sh integration_repair_fixture.py)
 
-pass=0; fail=0; failed=()
+# Modules whose storage fixtures compare inode/device identity and sweep real directories. They
+# failed on Namespace runners' filesystem (#409) and run on GitHub's native ubuntu-24.04 image in
+# CI; everything else is the `portable` group and runs anywhere.
+NATIVE_FS=(cache_storage.py shared_mathlib.py verification_storage.py retention.py)
+# Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
+# change that touches only documentation can break these and nothing else, so CI runs just this
+# group for it. The guard below keeps the list honest.
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py)
 
-# run <label> <cmd...> : run a test, tally the result, honour --fail-fast
-run() {
-  local label="$1"; shift
-  echo "== $label =="
-  if "$@"; then
-    echo "  [PASS] $label"; pass=$((pass + 1))
-  else
-    echo "  [FAIL] $label (rc=$?)"; fail=$((fail + 1)); failed+=("$label")
-    [ "$FAIL_FAST" = 1 ] && { summary; exit 1; }
-  fi
-  echo
-}
+pass=0; fail=0; failed=()
 
 summary() {
   echo "================================================================"
-  echo "run-all: $pass passed, $fail failed"
+  echo "run-all: $pass passed, $fail failed (group: $GROUP, jobs: $JOBS)"
   ((${#failed[@]})) && printf '  failed: %s\n' "${failed[@]}"
   ((${#SKIP[@]}))   && printf '  skipped (requires external tooling): %s\n' "${SKIP[@]}"
 }
@@ -230,22 +241,98 @@ if ((${#unclassified[@]})); then
   printf '  - %s\n' "${unclassified[@]}" >&2
   exit 2
 fi
+for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}"; do
+  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT but not a known test" >&2; exit 2; }
+done
+# A test that asserts on the repository's documentation must be in DOCS_CONTRACT, or a docs-only
+# change could break it without CI running it.
+docs_contract=(" ${DOCS_CONTRACT[*]} ")
+undeclared=()
+for f in $(grep -lE 'REPO / "(README\.md|docs|workers\.toml\.example)"' tests/*.py); do
+  base=$(basename "$f")
+  [[ "${docs_contract[*]}" == *" $base "* ]] || undeclared+=("$base")
+done
+if ((${#undeclared[@]})); then
+  echo "ERROR: test file(s) read README.md/docs/workers.toml.example but are not in DOCS_CONTRACT in tests/run-all:" >&2
+  printf '  - %s\n' "${undeclared[@]}" >&2
+  exit 2
+fi
+
+# --- select the group -----------------------------------------------------------------------------
+in_list() { local needle="$1"; shift; [[ " $* " == *" $needle "* ]]; }
+selected=()
+for t in "${RUN_STDLIB[@]}" "${RUN_SPECIAL[@]}" "${RUN_SH[@]}"; do
+  case "$GROUP" in
+    all) selected+=("$t") ;;
+    native) in_list "$t" "${NATIVE_FS[@]}" && selected+=("$t") ;;
+    portable) in_list "$t" "${NATIVE_FS[@]}" || selected+=("$t") ;;
+    docs) in_list "$t" "${DOCS_CONTRACT[@]}" && selected+=("$t") ;;
+    *) echo "run-all: unknown group '$GROUP' (all|portable|native|docs)" >&2; exit 2 ;;
+  esac
+done
+
+# --- resolve the interpreter once -----------------------------------------------------------------
+# `uv run` syncs the environment on every call; resolving it once and running the modules with the
+# environment's own interpreter saves that per-module cost and the lock contention between parallel
+# modules. The environment's bin/ goes on PATH as `uv run` would arrange.
+PY="$(uv run python -c 'import sys; print(sys.executable)')" || exit 1
+VIRTUAL_ENV="$(dirname "$(dirname "$PY")")"
+export PY VIRTUAL_ENV
+export PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# run_one <module>: run one module in its own activity subtree, record its result and output.
+# Prints one line per module as it finishes; the full output of failed modules is printed at the end
+# so parallel modules never interleave. With --fail-fast, a failure stops new modules from starting
+# (running ones finish). Exit status is the module's.
+run_one() {
+  local t="$1" d rc start end
+  d="$RUN_ROOT/${t%.*}"
+  mkdir -p "$d/activity"
+  [ -e "$RUN_ROOT/stop" ] && exit 0
+  export TAUCETI_ACTIVITY_DIR="$d/activity"
+  export TAUCETI_FLEET_EVENTS="$d/activity/worker-events.jsonl"
+  export TAUCETI_SHARED_MATHLIB_ROOT="$d/activity/mathlib-builds"
+  export TAUCETI_BUILD_CACHE_ROOT="$d/activity/builds"
+  export TAUCETI_VERIFY_STORAGE_DIR="$d/activity/verification-storage"
+  start=$SECONDS
+  case "$t" in
+    parity_selectors.py) "$PY" tests/parity_selectors.py tests/fixtures/pr_selectors.json >"$d/output" 2>&1 ;;
+    *.sh) bash "tests/$t" >"$d/output" 2>&1 ;;
+    *) "$PY" "tests/$t" >"$d/output" 2>&1 ;;
+  esac
+  rc=$?
+  end=$SECONDS
+  echo "$rc" >"$d/rc"
+  if [ "$rc" -eq 0 ]; then
+    echo "  [PASS] $t ($((end - start))s)"
+  else
+    echo "  [FAIL] $t (rc=$rc, $((end - start))s)"
+    [ "$FAIL_FAST" = 1 ] && touch "$RUN_ROOT/stop"
+  fi
+  return "$rc"
+}
+export -f run_one
+export RUN_ROOT FAIL_FAST
 
 # --- run ------------------------------------------------------------------------------------------
-for t in "${RUN_STDLIB[@]}"; do
-  run "$t" uv run python "tests/$t"
+echo "run-all: ${#selected[@]} modules, group $GROUP, $JOBS at a time, python $PY"
+printf '%s\n' "${selected[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+
+for t in "${selected[@]}"; do
+  d="$RUN_ROOT/${t%.*}"
+  if [ ! -e "$d/rc" ]; then
+    # Not started: --fail-fast stopped the run before this module.
+    continue
+  fi
+  if [ "$(cat "$d/rc")" -eq 0 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1)); failed+=("$t")
+    echo
+    echo "== $t == (rc=$(cat "$d/rc"))"
+    cat "$d/output"
+  fi
 done
-
-run parity_selectors.py uv run python tests/parity_selectors.py tests/fixtures/pr_selectors.json
-run dashboard.py uv run python tests/dashboard.py
-
-# lifecycle.sh resolves its own python; hand it the uv-selected interpreter so the matrix
-# actually covers it (otherwise it would always use the runner's default python3).
-PY="$(uv run python -c 'import sys; print(sys.executable)')"
-export PY
-for t in "${RUN_SH[@]}"; do
-  run "$t" bash "tests/$t"
-done
-
+echo
 summary
 [ "$fail" -eq 0 ]
