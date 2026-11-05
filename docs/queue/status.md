@@ -192,7 +192,7 @@ The Claude subscription was skipped all day as ahead of its weekly pace (55% use
 - Watch the outbox drain the 2,394 landed comments and closes of head 2.
 - The Zulip reply to Christian is pending the operator's review.
 - The fresh machine for the service (below).
-- Restart worker 2 onto `9d2643f` after prepare task 4 finishes, and verify its revision.
+- Both workers and the service run `c5cc444` (PR 555) since 13:38; the next deploy needs only the ordinary scripts.
 - Move the service and the repair worker from chungus to the dedicated machine when it arrives, restoring the systemd units and the backup timer ([operations.md](operations.md), "Moving to the dedicated host").
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
 - Give Bors's admission-time checks (declaration collisions, merge-selection overlaps) to the agent as diagnostics, as described in the plan; streaming repair, the other follow-up there, is done (https://github.com/TauCetiProject/TauCetiWorker/pull/531).
