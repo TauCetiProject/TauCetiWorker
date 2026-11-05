@@ -1343,7 +1343,7 @@ class Lanes(QueueFixture):
 
 
 class RepairOrReject(QueueFixture):
-    """Repair or reject, the author's choice: edit summaries, the `queue-no-repair` label, `problem-anticipated`."""
+    """Repair or reject, the author's choice: edit summaries, the `dont-repair-in-queue` label, `problem-anticipated`."""
 
     NOTE = (
         "Emptied: this PR's lemma duplicates one #101 adds.\n"
@@ -1388,10 +1388,10 @@ class RepairOrReject(QueueFixture):
         self.assertEqual(self.controller.status()["counters"]["edit_summaries"], 1)
 
     def withdrawn_head(self, interacting=101):
-        """A head of #101 and #102, #102 labelled `queue-no-repair`; CI fails on #102 and the agent empties it."""
+        """A head of #101 and #102, #102 labelled `dont-repair-in-queue`; CI fails on #102 and the agent empties it."""
         self.github.ci_policy = fail_members(102)
         self.approve(101, {"Dup.lean": "theorem foo : True := trivial\n"})
-        self.approve(102, {"Other.lean": "theorem foo : True := trivial\n"}, labels=["queue-no-repair"])
+        self.approve(102, {"Other.lean": "theorem foo : True := trivial\n"}, labels=["dont-repair-in-queue"])
         self.assertEqual(self.controller.status()["counters"]["no_repair_opt_outs"], 1)
         self.tick()
         head = self.head()
@@ -1424,10 +1424,10 @@ class RepairOrReject(QueueFixture):
         )
         self.tick()
         comment = self.github.comments_for(102)[0]["body"]
-        self.assertIn("carries `queue-no-repair`, so the merge queue does not edit it", comment)
+        self.assertIn("carries `dont-repair-in-queue`, so the merge queue does not edit it", comment)
         self.assertIn("- Interacting PR: #101\n- File: `Dup.lean`\n- Finding: duplicate declaration", comment)
         self.assertIn("You cannot reproduce this on your branch yet: #101 is still in staging", comment)
-        self.assertEqual(self.github.labels[102], {"queue-no-repair", "bors-staging"}, "no label change yet")
+        self.assertEqual(self.github.labels[102], {"dont-repair-in-queue", "bors-staging"}, "no label change yet")
         self.assertEqual(self.controller.status()["anticipated"][0]["interacting"], 101)
         # A later task on the head sees it withdrawn; an edit giving it content back is refused.
         self.assertEqual(self.controller.status()["counters"]["no_repair_withdrawals"], 1)
@@ -1468,7 +1468,7 @@ class RepairOrReject(QueueFixture):
         approved_at = None
         self.github.ci_policy = fail_members(102)
         self.approve(101, {"A.lean": "a\n"})
-        self.approve(102, {"Other.lean": "other\n"}, labels=["queue-no-repair"])
+        self.approve(102, {"Other.lean": "other\n"}, labels=["dont-repair-in-queue"])
         approved_at = {i["number"]: i for i in self.controller.inputs()}[102]["approved_at"]
         self.tick()
         head = self.head()
@@ -1506,7 +1506,7 @@ class RepairOrReject(QueueFixture):
     def test_an_edit_that_gives_a_no_repair_member_content_is_refused(self):
         self.github.ci_policy = fail_members(102)
         self.approve(101, {"A.lean": "a\n"})
-        self.approve(102, {"Broken.lean": "broken\n"}, labels=["queue-no-repair"])
+        self.approve(102, {"Broken.lean": "broken\n"}, labels=["dont-repair-in-queue"])
         self.tick()
         self.run_ci()
         self.tick()

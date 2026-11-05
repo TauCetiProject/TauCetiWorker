@@ -1210,7 +1210,7 @@ class Comments(ControllerCase):
 
 
 class NoRepair(ControllerCase):
-    """The `queue-no-repair` opt-out: read at approval, refreshed by label events, sent with tasks."""
+    """The `dont-repair-in-queue` opt-out: read at approval, refreshed by label events, sent with tasks."""
 
     def label_event(self, number, action, name, labels=None):
         pull = {"number": number}
@@ -1221,17 +1221,17 @@ class NoRepair(ControllerCase):
         )
 
     def test_label_at_approval_and_label_events_set_the_opt_out(self):
-        self.approve(101, {"A.lean": "a\n"}, labels=["Queue-No-Repair"])
+        self.approve(101, {"A.lean": "a\n"}, labels=["Dont-Repair-In-Queue"])
         self.approve(102, {"B.lean": "b\n"})
         rows = {row["number"]: row for row in self.controller.inputs()}
         self.assertEqual((rows[101]["no_repair"], rows[102]["no_repair"]), (1, 0))
-        self.label_event(102, "labeled", "queue-no-repair", ["queue-no-repair"])
+        self.label_event(102, "labeled", "dont-repair-in-queue", ["dont-repair-in-queue"])
         self.assertEqual(self.controller.input_for(PROJECT, 102)["no_repair"], 1)
         self.controller.tick()  # both inserted and sealed
         head = self.controller.store.row("batches", {"state": "head"})
         members = {m["number"]: m for m in self.controller.members(head["id"])}
         self.assertEqual((members[101]["no_repair"], members[102]["no_repair"]), (1, 1))
-        self.label_event(101, "unlabeled", "queue-no-repair", [])
+        self.label_event(101, "unlabeled", "dont-repair-in-queue", [])
         self.label_event(101, "labeled", "awaiting-author", ["awaiting-author"])
         members = {m["number"]: m for m in self.controller.members(head["id"])}
         self.assertEqual(members[101]["no_repair"], 0)
@@ -1243,19 +1243,19 @@ class NoRepair(ControllerCase):
         )
 
     def test_the_label_list_is_a_setting(self):
-        self.assertEqual(DEFAULT_SETTINGS["no_repair_labels"], ["queue-no-repair"])
+        self.assertEqual(DEFAULT_SETTINGS["no_repair_labels"], ["dont-repair-in-queue"])
         with self.assertRaises(ControllerError):
-            self.controller.set_setting("no_repair_labels", "queue-no-repair", "operator")
+            self.controller.set_setting("no_repair_labels", "dont-repair-in-queue", "operator")
         with self.assertRaises(ControllerError):
             self.controller.set_setting("no_repair_labels", [1], "operator")
-        self.controller.set_setting("no_repair_labels", ["queue-no-repair", "no-agents"], "operator")
+        self.controller.set_setting("no_repair_labels", ["dont-repair-in-queue", "no-agents"], "operator")
         self.approve(101, {"A.lean": "a\n"}, labels=["no-agents"])
         self.assertEqual(self.controller.input_for(PROJECT, 101)["no_repair"], 1)
 
     def test_tasks_carry_the_opt_out_and_an_unattributed_withdrawal_says_so(self):
         self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "B.lean", "message": "boom"}])
         self.approve(101, {"A.lean": "a\n"})
-        self.approve(102, {"B.lean": "b\n"}, labels=["queue-no-repair"])
+        self.approve(102, {"B.lean": "b\n"}, labels=["dont-repair-in-queue"])
         self.controller.tick()
         self.github.complete_runs()
         self.controller.handle_event("status", {"sha": self.github.runs[0].head_sha, "context": "build"})
