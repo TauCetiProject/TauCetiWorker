@@ -10,13 +10,15 @@ Tables:
 
 - `settings`: runtime settings and small pieces of controller state (`key`, JSON `value`, actor, time).
 - `inputs`: approved inputs, one row per accepted PR revision, with the waiting/reserved/inserted/
-  landed/cancelled state, priority, urgency and the retained ref of the accepted head.
+  landed/cancelled state, priority, urgency, the retained ref of the accepted head, the `no_repair`
+  opt-out and, for a `problem-anticipated` withdrawal, what it waits for (`anticipated`).
 - `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`),
   the expected parent recorded for promotion and, for an open batch, the version a `prepare` task
   last built (and repaired) on its own base and its pre-rebase onto the head's tip
   (`pre_rebase_state`, `_tip`, `_onto`, `_source`, `_edits`, `_at`).
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
-  the task that edited it and the explanation collected from its message.
+  the task that edited it, the explanation collected from its message, the `no_repair` opt-out and
+  whether it was `withdrawn` (an emptied `no_repair` member whose commit stays until the head lands).
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
 - `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state.
 - `ci_attempts`: every candidate dispatch with the run it was bound to, placement, phases, outcome.
@@ -66,7 +68,9 @@ CREATE TABLE IF NOT EXISTS inputs (
     last_probe_base TEXT NOT NULL DEFAULT '',
     probe_conflicts TEXT NOT NULL DEFAULT '{}',
     landed_at REAL,
-    landed_sha TEXT
+    landed_sha TEXT,
+    no_repair INTEGER NOT NULL DEFAULT 0,
+    anticipated TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS inputs_state ON inputs (repository, state);
 CREATE TABLE IF NOT EXISTS batches (
@@ -107,7 +111,9 @@ CREATE TABLE IF NOT EXISTS members (
     edited_shas TEXT NOT NULL DEFAULT '[]',
     added_at REAL NOT NULL,
     removed INTEGER NOT NULL DEFAULT 0,
-    removed_reason TEXT NOT NULL DEFAULT ''
+    removed_reason TEXT NOT NULL DEFAULT '',
+    no_repair INTEGER NOT NULL DEFAULT 0,
+    withdrawn INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS members_batch ON members (batch_id, removed);
 CREATE TABLE IF NOT EXISTS claims (
@@ -253,6 +259,10 @@ class Store:
         ("batches", "pre_rebase_source", "TEXT"),
         ("batches", "pre_rebase_edits", "TEXT NOT NULL DEFAULT '{}'"),
         ("batches", "pre_rebase_at", "REAL"),
+        ("inputs", "no_repair", "INTEGER NOT NULL DEFAULT 0"),
+        ("inputs", "anticipated", "TEXT NOT NULL DEFAULT '{}'"),
+        ("members", "no_repair", "INTEGER NOT NULL DEFAULT 0"),
+        ("members", "withdrawn", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     def _add_missing_columns(self) -> None:

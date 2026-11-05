@@ -159,6 +159,58 @@ or check id and URL, its time, the head approved, the command as typed, `single`
 repository admins the merge base of that head against the base branch, which is what Bors's
 `ManualApproval.grant` records and what the scope-approval check reads back as `scope_approvals`.
 
+## Repair or reject: comments and the `queue-no-repair` label
+
+Repair in place is the default; the author chooses rejection with a label (the plan's "Repair or
+reject: the author's choice").
+
+**The landing comment of an edited member.** A member whose provenance is not `clean` gets Bors's
+notice followed by the queue's edit summary: the batch, a link to the landed commit, the
+explanations the agents appended to its message (quoted), and a collapsed `<details>` block with
+`git diff <accepted head> <landed commit>` restricted to the PR's own files (those its branch
+changes since its merge base with the landed commit, plus those the landed commit changes), in a
+fenced `diff` block. A diff longer than 400 lines shows the first 400 and a note with the full
+line count and a link to the commit. Then the earlier edited revisions, the PRs the explanation
+mentions and the retained ref, as before. Each summary is journaled as `edit-summary` (number,
+commit, accepted head, `diff_lines`, `truncated`) and counted in `edit_summaries`. A clean member's
+comment is unchanged.
+
+**The label.** A PR carrying one of the `no_repair_labels` (a runtime setting, default
+`["queue-no-repair"]`, compared case-insensitively) is never edited by an agent. The controller
+reads the labels `fetch_pr` returns at approval into the input's `no_repair` flag, copies it to the
+member at insertion, and refreshes both from `pull_request` `labeled` and `unlabeled` deliveries
+for that label (the payload's `pull_request.labels` when present, else the action), journaled as
+`no-repair` and counted in `no_repair_opt_outs`. The task record carries `no_repair` per member and
+the repair prompt lists those members under "Do not edit": if a fix needs a change to one, the agent
+reduces it to an empty commit and appends three lines naming the cause, `Interacting-PR: #N`,
+`Interacting-File: <path>` and `Finding: <conflict, duplicate declaration, rename ripple or build
+error>: <sentence>`. A submission that changes such a member other than by emptying it (or by the
+queue's own empty commit for a PR already on `main`) is rejected as `no-repair-edited`.
+
+**The withdrawal comment.** When an adopted chain (a repair, a rebase conflict, a preparation, or
+a pre-rebase the seal uses) has emptied a `no_repair` member, the PR is withdrawn as
+`problem-anticipated` and gets one comment (marker `anticipated:<input id>`): it carries the label,
+so the queue did not edit it; integrating it in batch N needed a change, so its commit there is
+empty and it will not be closed as merged; then a list with the interacting PR, the file and the
+finding parsed from the agent's message (the PR falls back to the first other PR the message
+mentions; a missing file or finding reads "not named"; without any PR the comment says the queue
+could not attribute the change and asks for a rebase and a new approval); then that the problem is
+not yet reproducible on the author's branch because the other PR is still in staging, that the
+queue comments again and applies `needs-rebase` when it lands, and that the PR is re-admitted at
+its original age if the other PR leaves the queue without landing; then the agent's note, quoted.
+No label changes at withdrawal. If the interacting PR is already on `main`, the comment says the
+problem is reproducible now and `needs-rebase` is applied at once.
+
+**`needs-rebase` and re-admission.** When the interacting PR lands (its head landing, or a
+canonical advance whose commits carry its `Source-PR` trailer or ` (#N)` subject), the PR gets a
+second comment (marker `needs-rebase:<input id>`) saying the problem is now reproducible, with the
+same list, and the label `needs-rebase` through the outbox's `labels` entry; it re-enters through
+ordinary re-approval (the approval poll treats the `problem-anticipated` input as consumed until a
+newer eligibility check). When the interacting PR leaves the queue without landing (its input is
+cancelled or closed and it is not on `main`), the withdrawn input waits again at its original
+`approved_at` if the PR is still open at the accepted head and carries no keep label, with a
+comment (marker `readmitted:<input id>`) saying so; otherwise the comment asks for a new approval.
+
 ## Commands
 
 The grammar follows bors-ng's `COMMAND_PARSING.md`. A line is a command line when it starts with

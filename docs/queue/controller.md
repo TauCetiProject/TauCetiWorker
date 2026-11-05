@@ -27,9 +27,9 @@ Tables:
 | table | content |
 | --- | --- |
 | `settings` | runtime settings and controller state (`state:*` keys: canonical SHA, inference hold, counters, Bors's external head, the last approval poll) as JSON, with actor and time |
-| `inputs` | approved inputs: repository, PR, accepted head, title, description, author, evidence, reviewer, priority, urgent flag, state, age (`approved_at`), retained ref, probe history (`probes`, `last_probe`, `last_probe_tip`, `passes_waited`) |
+| `inputs` | approved inputs: repository, PR, accepted head, title, description, author, evidence, reviewer, priority, urgent flag, state, age (`approved_at`), retained ref, probe history (`probes`, `last_probe`, `last_probe_tip`, `passes_waited`), the `no_repair` opt-out and, for a `problem-anticipated` withdrawal, `anticipated` (JSON: batch, member, commit, `interacting`, `file`, `finding`, the agent's `explanation`, `stage`, times) |
 | `batches` | identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`), expected parent for promotion, urgent flag, first dispatch time |
-| `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA |
+| `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA, the `no_repair` opt-out, `withdrawn` (an emptied `no_repair` member: its empty commit stays in the chain, the PR does not land) |
 | `claims` | batch identity and version, operation (`insert`, `rebase`, `task:repair`, `task:rebase_conflict`), worker identity and GitHub login, token, starting tip, expiry, renewal, release and its reason |
 | `tasks` | repair and rebase-conflict tasks: batch and version, base, tip, `onto`, diagnostics, state (`open`, `submitted`, `superseded`), counts of claims and submissions |
 | `submissions` | every submitted chain with its retained ref, accepted flag and reason |
@@ -55,9 +55,29 @@ dispatch pushes the head's batch ref itself only when the outbox has not already
 
 Inputs: `waiting` -> `reserved` (during a probe) -> `inserted` (a member) -> `landed`; or
 `cancelled` with a reason (`unapproved`, `cancelled`, `closed`, `head-changed`, `draft`,
-`merged-externally`, `landed-externally`, `conflicts-with-main`, `superseded-by-new-approval`).
-A member is never withdrawn: `unapprove`, `cancel`, a closing or relabelling event on a member PR
-are journaled (`member-event-ignored`, `withdrawal-refused`) and change nothing.
+`merged-externally`, `landed-externally`, `conflicts-with-main`, `superseded-by-new-approval`,
+`problem-anticipated`).
+A member is never withdrawn by its author or reviewers: `unapprove`, `cancel`, a closing or
+relabelling event on a member PR are journaled (`member-event-ignored`, `withdrawal-refused`) and
+change nothing, except that a `labeled`/`unlabeled` event for one of the `no_repair_labels` updates
+the member's `no_repair` flag (journal `no-repair`).
+
+The one withdrawal of a member is the opt-out's: when an adopted chain has reduced a `no_repair`
+member to an empty commit (and the PR is not simply already on `main`), the member is marked
+`withdrawn` and its input `cancelled` with reason `problem-anticipated` (journal
+`problem-anticipated`, counter `no_repair_withdrawals`). The member stays in `_members` so the
+chain keeps its bijection, and its empty commit travels with the batch, through rebases, until the
+head lands; landing skips it (not marked landed, no comment, no close; `landed` journals it under
+`withdrawn`), a canonical advance does not count its commit as landing the PR, and `chain.landed_prs`
+ignores empty commits in general, so the PR can still land later. `anticipated.stage` then moves on:
+`pending` while the interacting PR is followed (`unattributed` when the agent named none, which
+waits for a new approval); `needs-rebase` when the interacting PR lands (head landing or canonical
+advance: comment, label, journal `needs-rebase`, counter `problem_anticipated_needs_rebase`; the PR
+re-enters by re-approval); `readmitted` when it leaves the queue without landing (input `waiting`
+again at its original `approved_at`, journal `readmitted`, counter `problem_anticipated_readmitted`),
+or `readmit-refused` when the PR is no longer open at its accepted head or carries a keep label;
+`superseded` when the PR was approved again meanwhile. Comment shapes: `docs/queue/github.md`,
+"Repair or reject".
 
 Batches: `open` -> `head` (sealed) -> `landed`; an empty open batch whose base is stale is
 `removed` and recreated on demand. There is at most one open and at most one head batch.
@@ -110,6 +130,7 @@ Every `tick()` (one reconciliation pass) does, under the controller lock:
 7. Background preparation (below): supersede `prepare` tasks whose batch sealed or changed;
    otherwise create the `prepare` tasks that are due, whatever the head is doing, except on a batch
    whose `pre_rebase` task a worker holds.
+   (Between steps 2 and 3 the pass follows the `problem-anticipated` withdrawals: above.)
 8. Enqueue the live batches' retained refs that never reached GitHub (above); drain the outbox again.
 
 Insertion draw: inputs are ordered urgent first, then priority, then age. The window is the
@@ -252,9 +273,10 @@ Provenance and comments: at adoption, `chain.compare` pairs the prior chain with
 appended explanation accumulated onto earlier ones and the commit SHA added to `edited_shas`; a
 member reported `clean` keeps its provenance (a mechanical replay after an earlier edit is not a
 new edit, and an earlier edit is not forgotten by a later clean replay). The landing comment of an
-edited member quotes the accumulated explanations, links the landed commit and every edited
-revision, lists the PRs the explanation mentions, and names the retained ref; a clean member's
-comment is Bors's notice only. Comment publication is an outbox entry retried independently of the
+edited member quotes the accumulated explanations, links the landed commit, shows the diff of the
+landed commit against the accepted head in the PR's own files (at most 400 lines, journal
+`edit-summary`), links every edited revision, lists the PRs the explanation mentions, and names the
+retained ref; a clean member's comment is Bors's notice only. Comment publication is an outbox entry retried independently of the
 landing.
 
 Inference hold: workers report provider outcomes through `report_inference(worker, ok, error)` and
@@ -338,6 +360,7 @@ and reported in status:
 | `prepare_min_members` | 20 | members an open batch needs before it is prepared |
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
+| `no_repair_labels` | `["queue-no-repair"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
 ## Ports
 
@@ -394,8 +417,10 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
   `invalid-chain` (`chain.validate` against the recorded members on `onto`, then `chain.compare`
   against the prior chain: single-parent history, the member bijection by identity, append-only
   messages), `explanation-required` (content changed without an appended explanation; the same
-  claim resubmits with it). Acceptance records the new version, base `onto`, tip, member commits
-  and provenance, supersedes other claims and tasks on the batch, retains the tip under
+  claim resubmits with it), `no-repair-edited` (a `no_repair` or withdrawn member changed other
+  than by reducing it to an empty commit; the worker retries with the violations). Acceptance
+  records the new version, base `onto`, tip, member commits and provenance (`withdrawn` for an
+  emptied `no_repair` member, above), supersedes other claims and tasks on the batch, retains the tip under
   `.../v<version>`, lifts any inference hold, and the next pass dispatches CI. A rejected chain stays
   retained under `.../submissions/<sha>`.
 
@@ -418,12 +443,17 @@ attempt, status, conclusion, timestamps, runner, labels, host, phases with times
 outcome and detail, plus `stall` with `since`, `silence_seconds` and the phase when the build has
 been silent for `stall_interval_seconds`); `external_head` (Bors's head awaited after the cutover:
 batch, head and base SHA, state, member counts, `pending_members`, timestamps); `approvals`
-(`webhook`, `polled`, `revoked_by_poll`, `last_poll`); `tasks`; `outbox` (pending entries with attempt history);
+(`webhook`, `polled`, `revoked_by_poll`, `last_poll`); `anticipated` (the `problem-anticipated`
+withdrawals still followed: `number`, `batch_id`, `interacting`, `file`, `finding`, `withdrawn_at`);
+`tasks`; `outbox` (pending entries with attempt history);
 `reasons` (why the last pass is waiting); `alerts` (the first-line conditions: a stall longer than
 two intervals, a hold older than an hour, two chain validation failures on one head, a failing
 promotion); `counters` (heads sealed and landed, PRs landed and edited, dispatches and
 re-dispatches, passes and source failures, repair rounds, rebase conflicts, shrink-to-empty events,
-claim collisions, chain validation failures, inference holds, promotion refusals); the recent
+claim collisions, chain validation failures, inference holds, promotion refusals; for the
+repair-or-reject decision: `no_repair_opt_outs`, `edit_summaries` and `prs_edited_landed` (the
+repairs), `no_repair_withdrawals`, `problem_anticipated_needs_rebase`,
+`problem_anticipated_readmitted`); the recent
 `head_cycle_seconds` (first dispatch to landing); `insertion_passes`; `max_passes_waited`.
 
 `status()` waits at most two seconds for the controller lock (`wait=` overrides; `/healthz` passes
@@ -460,6 +490,14 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 21 closing or relabelling a member changes nothing | F `test_s16_s21_...`; C `test_waiting_inputs_react_to_events_and_members_do_not` |
 | 22 status names runner, host, phases, stall, revision | F `test_s22_status_names_runner_host_phase_progress_stall_and_revision`; C `StatusShape` |
 | 23, 24 increment 0 and transition | not expressible here; `tests/queue_rehearsal.py` runs the cutover rehearsal's scenario script over these fakes (`docs/queue/rehearsal.md`); `tests/queue_bors_import.py` covers the import of Bors's state over a reduced production feed and the first-head rule; `tests/queue_approval_poll.py` the approval poll |
+
+Repair or reject is F `RepairOrReject` (a landing comment with the edit summary and the diff; a
+labelled member the agent empties withdrawn with the comment, landing as an empty commit without
+being closed as merged; the interacting PR landing converting it to `needs-rebase`; the interacting
+PR leaving re-admitting it at its original age, after which it lands with its content; an edit
+giving a labelled member content refused as `no-repair-edited`) and C `NoRepair` and `EditSummary`
+(the label at approval and from events, the setting, the task flag and an unattributed withdrawal,
+the 400-line cap, empty commits naming no landed PR).
 
 Also covered: infrastructure failures retried with backoff and bounded
 (`test_infrastructure_failures_are_retried_with_backoff_and_bounded`), shadow mode publishing

@@ -1209,6 +1209,117 @@ class Comments(ControllerCase):
         self.assertEqual(MERGED_TITLE_PREFIX, "[Merged by Bors] - ")
 
 
+class NoRepair(ControllerCase):
+    """The `queue-no-repair` opt-out: read at approval, refreshed by label events, sent with tasks."""
+
+    def label_event(self, number, action, name, labels=None):
+        pull = {"number": number}
+        if labels is not None:
+            pull["labels"] = [{"name": label} for label in labels]
+        self.controller.handle_event(
+            "pull_request", {"action": action, "number": number, "label": {"name": name}, "pull_request": pull}
+        )
+
+    def test_label_at_approval_and_label_events_set_the_opt_out(self):
+        self.approve(101, {"A.lean": "a\n"}, labels=["Queue-No-Repair"])
+        self.approve(102, {"B.lean": "b\n"})
+        rows = {row["number"]: row for row in self.controller.inputs()}
+        self.assertEqual((rows[101]["no_repair"], rows[102]["no_repair"]), (1, 0))
+        self.label_event(102, "labeled", "queue-no-repair", ["queue-no-repair"])
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["no_repair"], 1)
+        self.controller.tick()  # both inserted and sealed
+        head = self.controller.store.row("batches", {"state": "head"})
+        members = {m["number"]: m for m in self.controller.members(head["id"])}
+        self.assertEqual((members[101]["no_repair"], members[102]["no_repair"]), (1, 1))
+        self.label_event(101, "unlabeled", "queue-no-repair", [])
+        self.label_event(101, "labeled", "awaiting-author", ["awaiting-author"])
+        members = {m["number"]: m for m in self.controller.members(head["id"])}
+        self.assertEqual(members[101]["no_repair"], 0)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "no-repair"}), 2)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "member-event-ignored"}), 1)
+        self.assertEqual(self.controller.status()["counters"]["no_repair_opt_outs"], 2)
+        self.assertEqual(
+            [m["no_repair"] for m in self.controller.status()["head"]["members"] if m["number"] == 102], [True]
+        )
+
+    def test_the_label_list_is_a_setting(self):
+        self.assertEqual(DEFAULT_SETTINGS["no_repair_labels"], ["queue-no-repair"])
+        with self.assertRaises(ControllerError):
+            self.controller.set_setting("no_repair_labels", "queue-no-repair", "operator")
+        with self.assertRaises(ControllerError):
+            self.controller.set_setting("no_repair_labels", [1], "operator")
+        self.controller.set_setting("no_repair_labels", ["queue-no-repair", "no-agents"], "operator")
+        self.approve(101, {"A.lean": "a\n"}, labels=["no-agents"])
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["no_repair"], 1)
+
+    def test_tasks_carry_the_opt_out_and_an_unattributed_withdrawal_says_so(self):
+        self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "B.lean", "message": "boom"}])
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"B.lean": "b\n"}, labels=["queue-no-repair"])
+        self.controller.tick()
+        self.github.complete_runs()
+        self.controller.handle_event("status", {"sha": self.github.runs[0].head_sha, "context": "build"})
+        self.controller.tick()
+        agent = ScriptedAgent(
+            "agent",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution(empty=True, explanation="Emptied; it would not build.")},
+        )
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.assertEqual({m.number: m.no_repair for m in agent.tasks[0].members}, {101: False, 102: True})
+        record = loads(self.controller.input_for(PROJECT, 102)["anticipated"])
+        self.assertEqual((record["stage"], record["interacting"]), ("unattributed", None))
+        self.controller.tick()
+        body = self.github.comments_for(102)[0]["body"]
+        self.assertIn("could not attribute the change to another PR, file or finding", body)
+        self.assertIn("> Emptied; it would not build.", body)
+        self.assertEqual(self.controller.status()["anticipated"], [], "nothing to follow")
+
+
+class EditSummary(ControllerCase):
+    def test_a_long_diff_is_capped_with_a_note_and_the_commit_link(self):
+        self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "Long.lean", "message": "boom"}])
+        self.approve(101, {"Long.lean": "".join(f"line {i}\n" for i in range(500))})
+        self.controller.tick()
+        self.github.complete_runs()
+        self.controller.handle_event("status", {"sha": self.github.runs[0].head_sha, "context": "build"})
+        self.controller.tick()
+        agent = ScriptedAgent(
+            "agent",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                f"{PROJECT}#101": Resolution(
+                    {"Long.lean": "".join(f"changed {i}\n" for i in range(500))}, explanation="Rewrote every line."
+                )
+            },
+        )
+        self.assertTrue(agent.run(self.controller).accepted)
+        head = self.controller.store.row("batches", {"state": "head"})
+        member = self.controller.members(head["id"])[0]
+        text = self.controller.member_comment(head, member)
+        self.assertIn("The diff is 1005 lines; the first 400 are shown.", text)
+        self.assertIn(f"[the landed commit](https://github.com/{PROJECT}/commit/{member['commit_sha']})", text)
+        self.assertEqual(text.count("\n-line "), 395)
+
+    def test_an_empty_commit_names_no_landed_pr(self):
+        head, _ = self.approve(101, {"A.lean": "a\n"})
+        base = self.repo.main_sha()
+        member = chain.Member(PROJECT, 101, head, title="Change 101")
+        built = chain.build(self.repo.clone, base, [member], chain_id="t")
+        empty = chain.commit_tree(
+            self.repo.clone,
+            chain.tree_of(self.repo.clone, built.tip),
+            built.tip,
+            chain.read_commit(self.repo.clone, built.tip).message.replace("#101", "#102"),
+            ("a", "a@example.invalid"),
+        )
+        self.assertEqual(chain.landed_prs(self.repo.clone, base, empty), {f"{PROJECT}#101": built.tip})
+
+
 class StatusShape(ControllerCase):
     def test_status_is_json_serialisable_and_stable_when_empty(self):
         status = self.controller.status()
@@ -1233,6 +1344,7 @@ class StatusShape(ControllerCase):
                 "head",
                 "external_head",
                 "approvals",
+                "anticipated",
                 "tasks",
                 "outbox",
                 "reasons",
