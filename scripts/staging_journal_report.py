@@ -122,6 +122,13 @@ Handoff to readmission
     feed's admissions list. Suspects with no such appearance are still withdrawn as of the latest
     observation in the loaded data, and are listed by PR.
 
+Queue service
+    Queue-controller dispatches are bound by timestamp and batch generation, verdicts by
+    attempt id, and promotion by the exact dispatched tip. Batch-wide landed events
+    never promote an earlier failed attempt. Infrastructure and green unlanded attempts
+    have separate occupancy rows. Use queue_pilot_report.py for head cycles, deduplicated
+    throughput, task/cost accounting and comparison with the Bors baseline.
+
 Unclassified
     Every candidate the rules above could not place is listed with its reason, so a gap in the
     journal or in these rules is visible rather than silent.
@@ -170,6 +177,8 @@ OCCUPANCY_ROWS = [
     ("singleton_promoted", "Singleton, promoted"),
     ("singleton_failed_or_invalidated", "Singleton, failed, cancelled or invalidated"),
     ("small_any", "Small batch (2 to 14), any outcome"),
+    ("passed_not_landed", "Passed candidate, not landed"),
+    ("infrastructure", "Infrastructure failure"),
     ("no_outcome", "Dispatched, no outcome in journal"),
 ]
 SINGLETON_KINDS = ["conflict", "confirmation", "remainder", "bisection", "admitted_alone", "unknown"]
@@ -189,7 +198,13 @@ DETAIL_FIELDS = {
     "cancellation_terminal": ["outcome"],
     "train_released": ["reason"],
     "construction_stopped": ["state"],
-    "dispatched": ["commit"],
+    "dispatched": ["commit", "version", "tip", "dispatch_id"],
+    "run-readopted": ["attempt_id"],
+    "ci-pass": ["attempt_id", "run_id"],
+    "ci-source-failure": ["attempt_id", "run_id"],
+    "ci-infrastructure": ["attempt_id", "detail"],
+    "ci-cancelled": ["attempt_id", "reason"],
+    "landed": ["tip", "members", "withdrawn"],
     "dispatch_requested": ["commit"],
 }
 MEMBER_FIELDS = ["pr", "head_sha", "source", "retry_reason", "parent_candidate_id", "original_admitted_at"]
@@ -353,6 +368,8 @@ def describe(cand):
         "non_run_reason": None,
         "unclassified_reason": None,
     }
+    if any(e.get("source") == "queue.controller" for e in cand.get("events", [])):
+        return describe_queue(cand, info)
     dispatched = first_time(cand, "dispatched") or first_time(cand, "dispatch_requested")
     if dispatched is None:
         stopped = events(cand, "construction_stopped")
@@ -410,6 +427,74 @@ def describe(cand):
     return info
 
 
+def describe_queue(cand, info):
+    """Queue feeds repeat batch events in each attempt. Bind verdicts by attempt id,
+    and bind the dispatch by its recorded timestamp and generation. A later landing
+    must never turn an earlier failed/superseded attempt into a promotion.
+    """
+    dispatches = [
+        e
+        for e in events(cand, "dispatched", "queue.controller")
+        if e["observed_at"] == cand.get("observed_at") and e["details"].get("version") == cand.get("generation")
+    ]
+    if len(dispatches) != 1:
+        info["unclassified_reason"] = "queue dispatch identity missing or ambiguous"
+        return info
+    dispatch = dispatches[0]
+    start = dispatch["observed_at"]
+    info.update(run=True, dispatched_at=start)
+    bound = [
+        e
+        for e in cand.get("events", [])
+        if e.get("source") == "queue.controller"
+        and e["details"].get("attempt_id") == cand["id"]
+        and e["observed_at"] >= start
+    ]
+    # Re-adoption can undo an infrastructure classification while its run is live;
+    # only terminal facts after the last readoption belong to the current outcome.
+    readopted = max((e["observed_at"] for e in bound if e["kind"] == "run-readopted"), default=start)
+    terminal = [
+        e
+        for e in bound
+        if e["observed_at"] >= readopted
+        and e["kind"] in ("ci-pass", "ci-source-failure", "ci-infrastructure", "ci-cancelled")
+    ]
+    if not terminal:
+        info["unclassified_reason"] = "dispatched, no outcome in journal"
+        return info
+    event = min(terminal, key=lambda e: e["observed_at"])
+    outcome = {
+        "ci-pass": "passed",
+        "ci-source-failure": "failed",
+        "ci-infrastructure": "infrastructure",
+        "ci-cancelled": "invalidated",
+    }[event["kind"]]
+    if event["kind"] in ("ci-pass", "ci-source-failure"):
+        completed = cand.get("runner_finished_at")
+        if not event["details"].get("run_id") or completed is None or completed > event["observed_at"]:
+            info["unclassified_reason"] = "queue source verdict lacks completed-run evidence"
+            return info
+    if outcome == "passed":
+        tip = dispatch["details"].get("tip")
+        landed = [
+            e
+            for e in events(cand, "landed", "queue.controller")
+            if e["observed_at"] >= event["observed_at"] and e["details"].get("tip") == tip
+        ]
+        if landed:
+            outcome = "promoted"
+    end = event["observed_at"]
+    info.update(ended_at=end, outcome=outcome, minutes=minutes(start, end), timing_source="dispatch_to_terminal")
+    if cand.get("runner_started_at") and cand.get("runner_finished_at"):
+        info.update(
+            dispatched_at=cand["runner_started_at"],
+            ended_at=cand["runner_finished_at"],
+            minutes=minutes(cand["runner_started_at"], cand["runner_finished_at"]),
+            timing_source="runner_lifecycle",
+        )
+    return info
+
+
 def singleton_kind(cand, candidates, depth=0):
     """Kind and evidence for a one-member candidate (see the module docstring)."""
     member = members(cand)[0]
@@ -444,6 +529,8 @@ def singleton_kind(cand, candidates, depth=0):
 def occupancy_row(info):
     if info["outcome"] is None:
         return "no_outcome"
+    if info["outcome"] in ("passed", "infrastructure"):
+        return "passed_not_landed" if info["outcome"] == "passed" else "infrastructure"
     cls, outcome = info["size_class"], info["outcome"]
     if cls == "small":
         return "small_any"

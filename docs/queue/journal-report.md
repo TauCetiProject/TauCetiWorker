@@ -8,6 +8,73 @@ the suspect's readmission. It exists so every change to staging, and later the m
 service, has a before and an after computed the same way. The baseline for the triage window is
 committed below.
 
+## Queue pilot and daily reporting
+
+The candidate-feed report now reads the queue's `queue.controller` events as well as Bors's:
+`ci-source-failure`, `ci-infrastructure`, `ci-pass` and `ci-cancelled` are bound to their exact
+attempt ID. Source pass/failure verdicts also need a named run and its recorded completion time no
+later than the verdict; missing completion evidence remains unknown. Dispatches are matched by
+timestamp and batch generation; a `landed` event counts as
+promotion only for the dispatched tip. A later successful landing cannot turn every previous
+attempt of the same batch into a success. A green unlanded candidate and an infrastructure failure
+have separate occupancy rows. Historical attempts that were superseded without a terminal event
+remain explicitly unclassified.
+
+For the full pilot measurements use `scripts/queue_pilot_report.py`, also stdlib only. It reads the
+service's SQLite database in one **read-only transaction**, preserving a sanitized snapshot before
+reporting. It exports only the table fields needed for measurement, never credentials, claim tokens,
+PR descriptions, agent prompts or tool output. Worker outcome files contribute recorded token usage
+and cost estimates; estimates missing from their source stay unknown. Optional `--clone` reads retained
+Git objects in batches to distinguish nonempty contributions from empty member commits.
+
+```sh
+# Run on the service host daily and after a deployment; each run keeps its snapshot and reports
+# in a fresh UTC-timestamped directory. This command measures the most recent 24 hours (or the
+# whole pilot if it is younger), using wall time including downtime.
+python3 scripts/queue_pilot_report.py daily \
+  --database ~/TauCetiQueue-data/queue.sqlite3 \
+  --clone ~/TauCetiQueue-data/clone \
+  --worker-root ~/TauCetiQueue-data/repair \
+  --worker-root ~/TauCetiQueue-data/repair-2 \
+  --baseline ~/TauCetiQueue-data/reports/bors-baseline-2026-11-03.json \
+  --directory ~/TauCetiQueue-data/reports/daily
+
+# A whole-pilot comparison from an already captured snapshot, without contacting production
+python3 scripts/queue_pilot_report.py report \
+  --snapshot snapshot.json --baseline bors-baseline-2026-11-03.json \
+  --markdown report.md --json report.json
+```
+
+The first computed pilot is [2026-11-05](pilot-2026-11-05.md), with its
+[machine-readable measurements](pilot-2026-11-05.json). Inputs and copies of the reporting scripts
+are retained on chungus under `~/TauCetiQueue-data/reports/2026-11-05/`; the original baseline is on
+tauchonki at `~/tmp/bors-journal/candidates-2026-11-03T2251Z.json`. SHA-256 checksums identify the exact
+input copies. The baseline throughput denominator runs from its first dispatch through the snapshot's
+last observation, including idle time and unfinished work; the pilot uses the same wall-clock rule.
+
+Head measurements separate first-dispatch-to-landing from seal-to-landing (the first seal happened
+in shadow mode), observed CI intervals, claimed repair/preparation intervals, overlap and unobserved
+remainder. Throughput counts distinct PR identities from landing records once, rather than counting
+the same membership again for each CI attempt. Reports show membership occurrences, final empty
+commits and unique nonempty contributions separately, with both identity and nonempty-contribution
+rates. The historical baseline has no retained-commit scan, so its nonempty contribution rate stays
+unknown. Waiting-age distributions select members inserted inside the reporting window (including
+those approved earlier); earlier shadow insertions are excluded. The report states those denominators
+and lists negative approval-to-insertion timestamp deltas as timing inconsistencies, excluding them
+from the valid wait distribution. Empty commits bearing the scripted
+already-landed note are identifiable; other empty commits alone do not establish why source was
+removed. Full reduction of a contribution and partial shrink need the retained chain audit as well.
+
+Admission-prediction measurements count names predicted for each batch, names later discovered by
+CI's duplicate audit, and repair results preceding the **actual** completed run timestamp. An edit
+before the verdict does not itself prove that a collision was fixed; missing verification remains
+unknown. Before this instrumentation is deployed, zero events are not evidence of perfect prediction.
+
+The throughput scenario is evaluated separately from the sustained-week criterion. A short burst
+landing the inherited backlog cannot establish a week above baseline; attribution/comment correctness
+also requires the production audit. Historical stall conditions are unknown because the service does
+not retain a stall-condition history. The JSON includes these limits alongside each unavailable fact.
+
 ## Running it
 
 The journal is `https://bors.taucetiproject.org/repositories/1/candidates?base=main` (schema
