@@ -1,0 +1,33 @@
+# Environment for tauceti-queue-repair.service: ~/.config/tauceti-queue/repair-environment
+# (mode 0600). Every value is a default of `python -m tauceti_queue.repair_task`; the installer
+# writes this file from the example when it is absent. Paths are absolute (systemd does not expand
+# ~ or $HOME here). Keep secrets in the files named below, never in this file.
+
+# The queue service. On the service host itself the local port is enough; elsewhere, the public
+# endpoint.
+TAUCETI_QUEUE_SERVICE=http://127.0.0.1:8780
+#TAUCETI_QUEUE_SERVICE=https://queue.taucetiproject.org
+
+# The worker identity the service records on claims (status shows it with the claim's expiry).
+TAUCETI_QUEUE_WORKER=repair@tauchonki
+
+# Seconds between claims when nothing is claimable.
+TAUCETI_QUEUE_POLL_SECONDS=60
+
+# The content clone of TauCetiProject/TauCeti the worker fetches into and makes its worktrees from
+# (the installer clones it when absent) and the task root: checkpoints, logs, worktrees and the
+# private Lake artifact pool (tens of GB; see "Host requirements").
+TAUCETI_QUEUE_CLONE=/home/operator/TauCetiQueue-data/repair-clone
+TAUCETI_QUEUE_TASK_ROOT=/home/operator/TauCetiQueue-data/repair
+
+# Credentials, by location. The GitHub token of the worker's account (repository admin on
+# TauCetiProject/TauCeti): a mode 0600 file; without it the worker uses $GH_TOKEN, then
+# `gh auth token` from the account's gh login. Claude Code's credentials are read from
+# $CLAUDE_CONFIG_DIR/.credentials.json (default ~/.claude) and copied into the task's isolated
+# config dir; ANTHROPIC_API_KEY stays unset so the subscription is billed, as in the experiments.
+#TAUCETI_QUEUE_TOKEN_FILE=/home/operator/.config/tauceti-queue/github-token
+#CLAUDE_CONFIG_DIR=/home/operator/.claude
+
+# One extracted Mathlib (`lake exe cache get`) shared read-only through a .lake/packages symlink
+# instead of fetching it per task (the experiments' method); optional.
+#TAUCETI_QUEUE_SEED_PACKAGES=/home/operator/TauCetiQueue-data/mathlib-packages
