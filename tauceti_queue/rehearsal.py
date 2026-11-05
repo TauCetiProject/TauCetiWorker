@@ -38,6 +38,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -48,7 +49,11 @@ from . import chain, feeds, webhook
 
 SCHEMA = "tauceti-queue.rehearsal/v1"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.36.0-rc2"  # TauCeti's pin
-SCAFFOLD_VERSION = "4"
+SCAFFOLD_VERSION = "5"
+# Where CI reads the rehearsal service: the Bors observation feed TauCeti's staging path resolves a dispatch
+# through. Namespace runners cannot reach the service's local listener and TauCetiTools accepts HTTPS only,
+# so the hostname is a Cloudflare tunnel forwarded to that listener on the operator's host.
+DEFAULT_PUBLIC_URL = "https://queue-rehearsal.taucetiproject.org"
 SCRATCH_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 LOCAL_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
 QUEUE_APP_ID = 5607007
@@ -119,13 +124,29 @@ end Scratch
 
 PR_BUILD_YML = r"""name: pr-build
 # Adapted from TauCetiProject/TauCeti's .github/workflows/pr-build.yml for the queue cutover
-# rehearsal. Kept identical to what the queue service relies on: the `repository_dispatch` event
-# `tauceti-bors-staging` with the same `client_payload` (head_sha, base_sha, batch_id, members,
-# base_ref), the same `run-name` the service finds the run by, a build job named `sandboxed-build`
-# whose log carries lake's `error: TauCeti/...lean:line:col:` lines, and a `finalize-merge-group-build`
-# job that posts the `build` commit status on the candidate head with the run's URL as its target
-# (the service binds its verdict to that run id). Dropped: bwrap, caches, audits, lint, scope checks,
-# cache publication, runner picking. The build is `lake build --iofail` on `ubuntu-latest`.
+# rehearsal; the staging path is TauCeti's (read against it on 2026-11-04, TauCetiTools pinned at
+# 8bad7a00af97c00c90a9777c195618c857dbf91c in `uses:` lines and tauceti.toml, as in TauCeti):
+#
+# - the `repository_dispatch` event `tauceti-bors-staging` with the same `client_payload`
+#   (head_sha, base_sha, batch_id, members, base_ref), the same `run-name` the service finds the
+#   run by and the same concurrency group;
+# - a build job named `sandboxed-build` (the service reads its log for lake's
+#   `error: TauCeti/...lean:line:col:` lines and reports its runner) that checks out the
+#   workflow-pinned tooling into `gate/`, prepares the pinned shared tools and CI credentials with
+#   TauCetiTools' actions, and resolves the dispatch exactly as TauCeti does: `bors_train_identity.py`
+#   reads the Bors observation feed at the `services.bors.url` of tauceti.toml with `batch_id` and
+#   requires the running batch's `train.staging_ref` to be `staging-candidate-<candidate_id>-<generation>`;
+#   `ci_git.py resolve` fetches that branch and requires its tip to be the dispatched head and the
+#   base its strict ancestor. A failure here is reported as infrastructure without building;
+# - a `finalize-merge-group-build` job that posts the `build` commit status on the candidate head
+#   through TauCetiTools' `finalize_batch.py` (which revalidates the batch against the feed before
+#   a green status) with the run's URL as its target, which the service binds its verdict to.
+#
+# Dropped: bwrap, caches, cache publication, audits, lint, scope and bump checks, runner picking,
+# the fleet. The build is `lake build --iofail`. `pull_request` events build PR heads and post
+# `build` on them, as TauCeti does, so statuses from PR builds exist beside candidate statuses.
+# Added, for one scenario only: a candidate carrying `.rehearsal/suppress-build-status` keeps the
+# finalizer silent (see that job).
 run-name: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' && format('bors branch={0} batch={1} head={2} base={3}', github.event.client_payload.base_ref || 'unknown', github.event.client_payload.batch_id, github.event.client_payload.head_sha, github.event.client_payload.base_sha) || format('pr-build pr={0} head={1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
 
 on:
@@ -159,38 +180,127 @@ jobs:
     runs-on: nscloud-ubuntu-24.04-amd64-2x4  # the organisation's Namespace pool, as TauCeti's jobs; GitHub-hosted labels queue indefinitely here
     timeout-minutes: 30
     outputs:
-      status-sha: ${{ steps.candidate.outputs.sha }}
+      status-sha: ${{ steps.pr.outputs.status_sha }}
       build-state: ${{ steps.report.outputs.build-state }}
       build-description: ${{ steps.report.outputs.build-description }}
+      publication-required: ${{ steps.report.outputs.publication-required }}
     steps:
-      - name: Resolve the candidate
-        id: candidate
-        env:
-          BORS_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
-          BORS_BASE_SHA: ${{ github.event.client_payload.base_sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if [ "$IS_BATCH" = "true" ]; then
-            SHA="$BORS_HEAD_SHA"; BASE="$BORS_BASE_SHA"
-            [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ ]] || {
-              echo "::error::bors dispatch did not contain two commit SHAs"; exit 1; }
-          else
-            SHA="$PR_HEAD_SHA"; BASE=""
-          fi
-          { echo "sha=$SHA"; echo "base=$BASE"; } >> "$GITHUB_OUTPUT"
-      - name: Check out the candidate
+      # --- Trusted setup, as TauCeti: no candidate code runs until the build step ---
+      - name: Checkout workflow-pinned trusted build tooling
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.candidate.outputs.sha }}
+          ref: ${{ github.workflow_sha }}
+          path: gate
           persist-credentials: false
+          fetch-depth: 1
+
+      - name: Prepare pinned shared tools
+        uses: TauCetiProject/TauCetiTools/.github/actions/setup@8bad7a00af97c00c90a9777c195618c857dbf91c
+        with:
+          tools-repository: TauCetiProject/TauCetiTools
+          tools-ref: 8bad7a00af97c00c90a9777c195618c857dbf91c
+          project-directory: gate
+      - name: Select CI API credentials
+        id: ci-api
+        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@8bad7a00af97c00c90a9777c195618c857dbf91c
+        with:
+          owner: ${{ github.repository_owner }}
+          repository: ${{ github.event.repository.name }}
+          workflow-token: ${{ github.token }}
+          read-app-id: ${{ secrets.CI_READ_APP_ID }}
+          read-app-private-key: ${{ secrets.CI_READ_APP_PRIVATE_KEY }}
+          status-app-id: ${{ secrets.CI_STATUS_APP_ID }}
+          status-app-private-key: ${{ secrets.CI_STATUS_APP_PRIVATE_KEY }}
+
+      - name: Resolve PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.ci-api.outputs.read-token }}
+          GH_READ_TOKEN: ${{ steps.ci-api.outputs.read-token }}
+          TAUCETI_GITHUB_READ_ROLE: ${{ steps.ci-api.outputs.read-role }}
+          CI_GIT_TOKEN: ${{ steps.ci-api.outputs.read-token }}
+          BORS_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          BORS_BASE_SHA: ${{ github.event.client_payload.base_sha }}
+          BORS_BATCH_ID: ${{ github.event.client_payload.batch_id }}
+          BORS_BASE_REF: ${{ github.event.client_payload.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [ "$IS_BATCH" = "true" ]; then
+            REPO='${{ github.repository }}'
+            SHA="$BORS_HEAD_SHA"
+            BASE_REF="$BORS_BASE_SHA"
+            STATUS_SHA="$SHA"
+            NUM="bors-batch"
+            AUTHOR=""
+            [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$BASE_REF" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::bors dispatch did not contain two commit SHAs"; exit 1;
+            }
+            # Train batches use immutable generation refs so a queued predecessor
+            # survives publication of its successor. Legacy serial batches still
+            # use the mutable staging ref. The bors authority selects the ref.
+            # Payload fields never choose a ref, URL, executable or authority.
+            STAGING_REF=$(python3 gate/scripts/bors_train_identity.py \
+              --head "$SHA" --base "$BASE_REF" --batch-id "$BORS_BATCH_ID" --branch "$BORS_BASE_REF")
+          else
+            NUM="$PR_NUMBER"
+            SHA="$PR_HEAD_SHA"
+            REPO="$PR_HEAD_REPO"
+            BASE_REF="$PR_BASE_REF"
+            STATUS_SHA="$SHA"
+            AUTHOR="$PR_AUTHOR"
+          fi
+          # Keep the known head available to the always-run status reporter even
+          # when Git is unavailable. This does not authorize a build or guess a base.
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid head SHA"; exit 1; }
+          {
+            echo "num=$NUM"
+            echo "sha=$SHA"
+            echo "repo=$REPO"
+            echo "base_ref=$BASE_REF"
+            echo "status_sha=$STATUS_SHA"
+            echo "author=$AUTHOR"
+          } >> "$GITHUB_OUTPUT"
+          # Fetch immutable identities through Git, not REST. No candidate
+          # configuration/hooks execute; the authority-selected staging ref is
+          # checked against H and B must be its ancestor before anything builds.
+          identity_args=(--repository '${{ github.repository }}' --head-repository "$REPO"
+            --head "$SHA" --base-ref "$BASE_REF" --store "$RUNNER_TEMP/ci-identity.git")
+          if [ -n "${STAGING_REF:-}" ]; then identity_args+=(--staging-ref "$STAGING_REF"); fi
+          if ! identity=$(python3 gate/scripts/ci_git.py resolve "${identity_args[@]}"); then
+            echo 'INFRA=1' >> "$GITHUB_ENV"
+            echo "::error::Git identity unavailable; reporting failure on the known head without building"
+            exit 1
+          fi
+          BASE_SHA=$(printf '%s' "$identity" | jq -er .base_sha)
+          MB=$(printf '%s' "$identity" | jq -er .mergebase)
+          {
+            echo "base_sha=$BASE_SHA"
+            echo "mergebase=$MB"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building PR #$NUM @ $SHA from $REPO (author=${AUTHOR:-bors-batch}, status -> $STATUS_SHA, merge-base $MB)"
+
+      - name: Checkout the exact candidate head (untrusted contents, no credentials)
+        if: ${{ env.INFRA != '1' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pr.outputs.repo }}
+          ref: ${{ steps.pr.outputs.sha }}
+          path: pr
+          persist-credentials: false
+          fetch-depth: 1
       - name: Restore the pinned toolchain
+        if: ${{ env.INFRA != '1' }}
         id: toolchain-cache
         uses: actions/cache@v4
         with:
           path: ~/.elan
-          key: elan-${{ runner.os }}-${{ hashFiles('lean-toolchain') }}
+          key: elan-${{ runner.os }}-${{ hashFiles('pr/lean-toolchain') }}
       - name: Install elan
-        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        if: ${{ env.INFRA != '1' && steps.toolchain-cache.outputs.cache-hit != 'true' }}
         run: |
           set -o pipefail
           installer=https://elan.lean-lang.org/elan-init.sh
@@ -200,6 +310,8 @@ jobs:
           rm -f elan-init.sh
       - name: Build
         id: build
+        if: ${{ env.INFRA != '1' }}
+        working-directory: pr
         run: |
           export PATH="$HOME/.elan/bin:$PATH"
           if ! command -v lake > /dev/null; then
@@ -212,53 +324,104 @@ jobs:
         id: report
         if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.candidate.outputs.sha }}
+          GH_TOKEN: ${{ steps.ci-api.outputs.status-token }}
+          SHA: ${{ steps.pr.outputs.status_sha || github.event.client_payload.head_sha || github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IDENTITY_OUTCOME: ${{ steps.pr.outcome }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           BUILD_INFRA: ${{ steps.build.outputs.infra }}
         run: |
-          case "$BUILD_OUTCOME" in
-            success) state=success; desc="Build succeeded" ;;
-            failure)
-              state=failure; desc="Build failed: lake build --iofail reported errors"
-              [ "$BUILD_INFRA" = "1" ] && desc="infrastructure: lake is not installed on the runner" ;;
-            *) state=failure; desc="infrastructure: the build step did not run ($BUILD_OUTCOME)" ;;
-          esac
-          { echo "build-state=$state"; echo "build-description=$desc"; } >> "$GITHUB_OUTPUT"
+          # Descriptions as TauCeti's report step words them for a frozen candidate.
+          if [ "${INFRA:-}" = "1" ] || [ "$IDENTITY_OUTCOME" != "success" ]; then
+            state=failure; desc="build not run — see the scope check"
+          elif [ "$BUILD_OUTCOME" = "success" ]; then
+            state=success
+            if [ "$IS_BATCH" = "true" ]; then
+              desc="frozen candidate sandboxed build and workflow-pinned audits passed"
+            else
+              desc="PR head passed sandboxed build"
+            fi
+          elif [ "$BUILD_INFRA" = "1" ]; then
+            state=failure; desc="infrastructure: lake is not installed on the runner"
+          elif [ "$BUILD_OUTCOME" = "failure" ]; then
+            state=failure; desc="sandboxed build, audit, or simp-NF lint failed"
+          else
+            state=failure; desc="infrastructure: the build step did not run ($BUILD_OUTCOME)"
+          fi
+          {
+            echo "build-state=$state"
+            echo "build-description=$desc"
+            echo 'publication-required=false'  # no cache publication in the rehearsal
+          } >> "$GITHUB_OUTPUT"
           # PR heads are reported immediately; a candidate is reported by the finalizer job below.
-          if [ "$IS_BATCH" != "true" ]; then
+          if [ "$IS_BATCH" != "true" ] && [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
             gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f context=build -f state="$state" \
               -f description="$desc" -f target_url="$RUN_URL" > /dev/null
           fi
           [ "$state" = success ]
 
+  # The required `build` status of a candidate is posted only here, by TauCetiTools'
+  # finalize_batch.py, which revalidates the batch against the Bors observation feed before a
+  # green status and writes a retained status intent when publication fails.
   finalize-merge-group-build:
     needs: sandboxed-build
     if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' }}
     runs-on: nscloud-ubuntu-24.04-amd64-2x4  # the organisation's Namespace pool, as TauCeti's jobs; GitHub-hosted labels queue indefinitely here
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
-      contents: read
+      contents: read  # sparse immutable finalization tools only
+      actions: read   # run attempt fence
       statuses: write
     env:
-      GH_TOKEN: ${{ github.token }}
       STATUS_SHA: ${{ needs.sandboxed-build.outputs.status-sha || github.event.client_payload.head_sha }}
       BUILD_JOB_RESULT: ${{ needs.sandboxed-build.result }}
       BUILD_STATE: ${{ needs.sandboxed-build.outputs.build-state }}
       BUILD_DESCRIPTION: ${{ needs.sandboxed-build.outputs.build-description }}
-      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      PUBLICATION_REQUIRED: ${{ needs.sandboxed-build.outputs.publication-required }}
+      BORS_STAGING: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' }}
+      BORS_BATCH_ID: ${{ github.event.client_payload.batch_id }}
+      BORS_BASE_SHA: ${{ github.event.client_payload.base_sha }}
+      BORS_BASE_REF: ${{ github.event.client_payload.base_ref }}
     steps:
-      - name: Post the terminal merge-group build status
+      - name: Check out workflow-pinned finalization tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            tauceti.toml
+            scripts/finalize_batch.py
+            scripts/bors_observation.py
+            scripts/bors_train_identity.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Prepare pinned shared tools
+        uses: TauCetiProject/TauCetiTools/.github/actions/setup@8bad7a00af97c00c90a9777c195618c857dbf91c
+        with:
+          tools-repository: TauCetiProject/TauCetiTools
+          tools-ref: 8bad7a00af97c00c90a9777c195618c857dbf91c
+          project-directory: .
+      - name: Select CI API credentials
+        id: ci-api
+        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@8bad7a00af97c00c90a9777c195618c857dbf91c
+        with:
+          owner: ${{ github.repository_owner }}
+          repository: ${{ github.event.repository.name }}
+          workflow-token: ${{ github.token }}
+          read-app-id: ${{ secrets.CI_READ_APP_ID }}
+          read-app-private-key: ${{ secrets.CI_READ_APP_PRIVATE_KEY }}
+          status-app-id: ${{ secrets.CI_STATUS_APP_ID }}
+          status-app-private-key: ${{ secrets.CI_STATUS_APP_PRIVATE_KEY }}
+
+      # Rehearsal hook (stale-status scenario): a candidate carrying .rehearsal/suppress-build-status
+      # with a number N keeps this finalizer silent while fewer than N `build` statuses exist on the
+      # candidate, and waits so the rehearsal can plant a status from another run first. TauCeti's
+      # finalizer has no such hook; a candidate without the file is reported exactly as TauCeti's is.
+      - name: Rehearsal hook
+        id: hook
+        env:
+          GH_TOKEN: ${{ steps.ci-api.outputs.read-token }}
         run: |
-          state="$BUILD_STATE"; desc="$BUILD_DESCRIPTION"
-          if [ -z "$state" ]; then
-            state=failure; desc="infrastructure: build job ended as $BUILD_JOB_RESULT without a result"
-          fi
-          # Rehearsal hook (stale-status scenario): a candidate carrying .rehearsal/suppress-build-status
-          # with a number N keeps this finalizer silent while fewer than N `build` statuses exist on the
-          # candidate, and waits so the rehearsal can plant a status from another run first. The real
-          # finalizer has no such hook; a candidate without the file is reported exactly as TauCeti's is.
           threshold=$(gh api "repos/$GITHUB_REPOSITORY/contents/.rehearsal/suppress-build-status?ref=$STATUS_SHA" \
             --jq .content 2>/dev/null | base64 -d 2>/dev/null | tr -dc '0-9' || true)
           if [ -n "$threshold" ]; then
@@ -267,17 +430,94 @@ jobs:
             if [ "$existing" -lt "$threshold" ]; then
               echo "rehearsal: suppressing the build status ($existing of $threshold present); waiting 150 s"
               sleep 150
-              exit 0
+              echo "suppress=true" >> "$GITHUB_OUTPUT"
             fi
           fi
-          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$STATUS_SHA" -f context=build -f state="$state" \
-            -f description="$desc" -f target_url="$RUN_URL" > /dev/null
-          echo "posted build=$state on $STATUS_SHA: $desc"
+
+      - name: Post the terminal merge-group build status
+        if: ${{ steps.hook.outputs.suppress != 'true' }}
+        env:
+          CI_STATUS_APP_ID: ${{ secrets.CI_STATUS_APP_ID }}
+          CI_STATUS_APP_PRIVATE_KEY: ${{ secrets.CI_STATUS_APP_PRIVATE_KEY }}
+          GH_TOKEN: ${{ steps.ci-api.outputs.status-token }}
+          GH_READ_TOKEN: ${{ steps.ci-api.outputs.read-token }}
+          TAUCETI_GITHUB_READ_ROLE: ${{ steps.ci-api.outputs.read-role }}
+          TAUCETI_GITHUB_WRITE_ROLE: ${{ steps.ci-api.outputs.status-role }}
+        run: python3 scripts/finalize_batch.py
+      - name: Retain unpublished batch status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-status-intents-finalizer-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tauceti-status-intent.json
+          if-no-files-found: ignore
+          retention-days: 7
 """
 
+# TauCetiTools reads this in CI (its setup action exports TAUCETI_* and materializes the shared scripts
+# with services.bors.url substituted into bors_observation.py). `__PUBLIC_URL__` is the rehearsal
+# service's public address, `scaffold_files(public_url)`.
+TAUCETI_TOML = """# Project configuration of the queue rehearsal's scratch repository. The staging path of
+# .github/workflows/pr-build.yml is TauCeti's: the TauCetiTools setup action reads this file,
+# exports TAUCETI_* (including TAUCETI_BORS_URL) and materializes the shared scripts with
+# services.bors.url and repository_id substituted into bors_observation.py, which
+# bors_train_identity.py and finalize_batch.py read the observation feed through.
+schema_version = 1
 
-def scaffold_files() -> dict[str, str]:
-    """The scratch repository's content: a minimal Lean library and the workflow the service drives."""
+[project]
+name = "TauCetiQueueScratch"
+branch = "main"
+
+[repositories]
+content = "TauCetiProject/TauCetiQueueScratch"
+# Required by the schema; nothing in the rehearsal reads a roadmap.
+roadmap = "TauCetiProject/TauCetiQueueScratch"
+
+[lean]
+roots = ["TauCeti"]
+
+[merge]
+backend = "bors"
+checks = ["build"]
+
+# The queue service under rehearsal, as CI must reach it: the Namespace runners that serve this
+# repository cannot reach the rehearsal's local listener (http://127.0.0.1:8781), and the schema
+# accepts HTTPS only. Expose the rehearsal service at this address (a Cloudflare tunnel hostname,
+# as queue.taucetiproject.org is served) and give the service the same public_url; the runner
+# fails closed ("bors identity unavailable") while nothing answers here. The feed's `repo` must
+# be this repository, so production (queue.taucetiproject.org) can never stand in.
+[services.bors]
+mode = "custom"
+url = "__PUBLIC_URL__"
+repository_id = 1
+deployment = "cloudflare"
+
+[tools.tools]
+repo = "TauCetiProject/TauCetiTools"
+ref = "8bad7a00af97c00c90a9777c195618c857dbf91c"
+"""
+
+# TauCeti's scripts/*.py are these eleven lines; the finalizer sparse-checks-out three of them.
+COMPAT_ENTRYPOINT = '''#!/usr/bin/env python3
+"""Compatibility entrypoint; implementation is pinned through TauCetiTools."""
+import sys
+from tauceti_tools.templates import import_shared, run_script
+
+if __name__ == "__main__":
+    raise SystemExit(run_script('__SCRIPT__', sys.argv[1:]))
+else:
+    implementation = import_shared('__SCRIPT__', __name__)
+    globals().update(vars(implementation))
+    sys.modules[__name__] = implementation
+'''
+COMPAT_ENTRYPOINTS = ("bors_train_identity.py", "bors_observation.py", "finalize_batch.py")
+
+
+def scaffold_files(public_url: str = DEFAULT_PUBLIC_URL) -> dict[str, str]:
+    """The scratch repository's content: a minimal Lean library, TauCeti's staging workflow and its tooling.
+
+    `public_url` is where CI reads the rehearsal service (`services.bors.url` of the scaffolded `tauceti.toml`).
+    """
     return {
         "lakefile.toml": LAKEFILE,
         "lean-toolchain": LEAN_TOOLCHAIN + "\n",
@@ -296,17 +536,37 @@ def scaffold_files() -> dict[str, str]:
         ),
         SHARED_MODULE: SHARED_INITIAL,
         ".github/workflows/pr-build.yml": PR_BUILD_YML,
+        "tauceti.toml": TAUCETI_TOML.replace("__PUBLIC_URL__", public_url),
+        **{f"scripts/{name}": COMPAT_ENTRYPOINT.replace("__SCRIPT__", name) for name in COMPAT_ENTRYPOINTS},
         ".gitignore": ".lake/\n",
         ".rehearsal/VERSION": SCAFFOLD_VERSION + "\n",
         "README.md": README,
     }
 
 
-def scaffold(path: str | os.PathLike[str]) -> list[str]:
+def public_url_argument(value: str) -> str:
+    """An HTTPS origin without credentials, path or query, as TauCetiTools requires of `services.bors.url`."""
+    parts = urllib.parse.urlsplit(value.strip())
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or parts.username
+        or parts.password
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            f"the public URL must be https://HOST[:PORT] without credentials, path or query, got {value!r}"
+        )
+    return f"https://{parts.netloc}"
+
+
+def scaffold(path: str | os.PathLike[str], public_url: str = DEFAULT_PUBLIC_URL) -> list[str]:
     """Write the scratch repository's content under `path`; returns the files written."""
     root = Path(path)
     written = []
-    for name, text in scaffold_files().items():
+    for name, text in scaffold_files(public_url).items():
         target = root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
@@ -1195,6 +1455,7 @@ class LiveRig(Rig):
         credentials_dir: str | os.PathLike[str] | None,
         operator_token: str,
         port: int = 8781,
+        public_url: str = DEFAULT_PUBLIC_URL,
         service_url: str | None = None,
         keep_service: bool = False,
     ) -> None:
@@ -1214,10 +1475,16 @@ class LiveRig(Rig):
         self.operator_token = operator_token
         self.keep_service = keep_service
         self.port = port
+        self.public_url = public_url_argument(public_url)
         self.external_service = service_url
         self.process: subprocess.Popen | None = None
         self.synth: bool | None = None
-        self.facts: dict[str, Any] = {"mode": "live", "repository": repository, "tag": self.tag}
+        self.facts: dict[str, Any] = {
+            "mode": "live",
+            "repository": repository,
+            "tag": self.tag,
+            "public_url": self.public_url,
+        }
         from .github_app import config_dir
 
         self.credentials_dir = config_dir(credentials_dir)
@@ -1354,7 +1621,7 @@ class LiveRig(Rig):
             tip = run_git(clone, "rev-parse", f"refs/remotes/origin/{self.branch}")
         except RuntimeError:
             tip = None
-        wanted = scaffold_files()
+        wanted = scaffold_files(self.public_url)
         current: dict[str, str | None] = {}
         if tip:
             for name in wanted:
@@ -1411,7 +1678,7 @@ class LiveRig(Rig):
             f'log_dir = "{service_dir / "logs"}"',
             'listen_host = "127.0.0.1"',
             f"listen_port = {self.port}",
-            f'public_url = "http://127.0.0.1:{self.port}"',
+            f'public_url = "{self.public_url}"',  # the tunnel hostname CI reads the feeds through
             "reconcile_interval_seconds = 5",
             f"review_app_id = {QUEUE_APP_ID if self.eligibility_available else 3947238}",
             "",
@@ -2871,6 +3138,7 @@ def run_live(
     credentials_dir: str | None,
     operator_token: str,
     port: int,
+    public_url: str,
     service_url: str | None,
     only: set[str] | None,
     report_dir: str | os.PathLike[str],
@@ -2884,10 +3152,11 @@ def run_live(
             credentials_dir=credentials_dir,
             operator_token=operator_token,
             port=port,
+            public_url=public_url,
             service_url=service_url,
             keep_service=keep_service,
         )
-    except (Failure, Skip, RuntimeError, OSError) as error:
+    except (Failure, Skip, RuntimeError, OSError, ValueError) as error:
         # The repository, the installation, the permissions or the host are not ready: say exactly what.
         report.add(
             "setup",
@@ -2929,6 +3198,12 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     scaffold_cmd = commands.add_parser("scaffold", help="write the scratch repository's content")
     scaffold_cmd.add_argument("path")
+    scaffold_cmd.add_argument(
+        "--public-url",
+        type=public_url_argument,
+        default=DEFAULT_PUBLIC_URL,
+        help="where CI reads the rehearsal service (services.bors.url of the scaffolded tauceti.toml)",
+    )
     local_cmd = commands.add_parser("local", help="the dry run over the fakes (no network)")
     local_cmd.add_argument("--root", help="working directory (default: a temporary one)")
     local_cmd.add_argument(
@@ -2948,6 +3223,13 @@ def main(argv: list[str] | None = None) -> int:
         "--port", type=int, default=8781, help="port of the local service instance the rehearsal starts"
     )
     live_cmd.add_argument(
+        "--public-url",
+        type=public_url_argument,
+        default=DEFAULT_PUBLIC_URL,
+        help="the HTTPS hostname forwarded to the service's local port, which CI reads the feeds through "
+        "(the service's public_url and the scaffolded tauceti.toml's services.bors.url)",
+    )
+    live_cmd.add_argument(
         "--service", help="use this running service instead of starting one (the restart scenario is skipped)"
     )
     live_cmd.add_argument("--report", default="/tmp/queue-rehearsal-report")
@@ -2955,7 +3237,7 @@ def main(argv: list[str] | None = None) -> int:
     live_cmd.add_argument("--keep-service", action="store_true", help="leave the service running afterwards")
     args = parser.parse_args(argv)
     if args.command == "scaffold":
-        for name in scaffold(args.path):
+        for name in scaffold(args.path, args.public_url):
             print(name)
         return 0
     only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
@@ -2970,6 +3252,7 @@ def main(argv: list[str] | None = None) -> int:
         credentials_dir=args.credentials,
         operator_token=_operator_token(args.operator_token),
         port=args.port,
+        public_url=args.public_url,
         service_url=args.service,
         only=only,
         report_dir=args.report,
