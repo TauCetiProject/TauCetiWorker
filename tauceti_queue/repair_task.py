@@ -66,6 +66,8 @@ SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
 SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
 RELEASE_REASONS = ("artifacts_unavailable", "inference_unavailable", "agent_failed", "push_failed")
+# Checkpoint states before the agent has run: an error there is released as ``artifacts_unavailable``.
+PRE_AGENT_PHASES = (None, "claimed", "sources_ready", "artifacts_ready", "artifacts_unavailable")
 HERE = Path(__file__).resolve().parent.parent
 GIT_SAFE_PUSH = HERE / "scripts" / "git-safe-push"
 DEFAULT_ROOT = Path(
@@ -598,6 +600,13 @@ class RunnerConfig:
     lake: tuple[str, ...] = ("lake",)
     poll_seconds: float = 60.0
     admin_recheck_seconds: float = 3600.0
+    # The service publishes a task's retained refs through its outbox a moment after creating the
+    # task, so a ref the remote does not have yet is retried for this long before it is an error.
+    fetch_retry_seconds: float = 120.0
+    fetch_retry_delay: float = 10.0
+    # A release the service could not confirm (unreachable, 5xx) is retried from the checkpoint on
+    # every loop pass, waiting these many seconds between attempts (the last value repeats).
+    release_backoff: tuple[float, ...] = (5.0, 15.0, 60.0, 120.0, 300.0)
 
     @property
     def tasks_dir(self) -> Path:
@@ -658,14 +667,39 @@ class TaskState:
 # Phases
 
 
-def fetch_retained(clone: Path, task: Task) -> dict:
-    """Fetch the task's retained refs into private refs of the clone and check base and tip exist."""
-    fetched = []
+class SourcesUnavailable(RuntimeError):
+    """The task's retained refs or commits could not be fetched within the retry window."""
+
+
+FETCH_CHUNK = 200  # refspecs per `git fetch`: one round trip each, well under the command-line limit
+
+
+def retained_refspecs(task: Task) -> list[tuple[str, str]]:
+    """``(refspec, private ref)`` for each retained ref of the task."""
+    specs = []
     for ref in task.retained_refs:
         name = ref.removeprefix("refs/heads/").removeprefix("refs/")
         private = f"{RESULT_REF_PREFIX}/{task.task_id}/retained/{name}"
-        git(clone, "fetch", "--quiet", "origin", f"+{ref}:{private}")
-        fetched.append(private)
+        specs.append((f"+{ref}:{private}", private))
+    return specs
+
+
+def _fetch_retained_once(clone: Path, task: Task, chunk: int = FETCH_CHUNK) -> dict:
+    """Fetch the retained refs a chunk of refspecs per ``git fetch`` (a task can retain a thousand of
+    them: per ref, production took 1.3 s each); a chunk that fails is fetched ref by ref so the error
+    names the ref that is missing rather than the whole chunk."""
+    specs = retained_refspecs(task)
+    fetched = []
+    for start in range(0, len(specs), max(1, chunk)):
+        group = specs[start : start + max(1, chunk)]
+        try:
+            git(clone, "fetch", "--quiet", "origin", *(spec for spec, _ in group))
+        except RuntimeError:
+            if len(group) == 1:
+                raise
+            for spec, _ in group:
+                git(clone, "fetch", "--quiet", "origin", spec)
+        fetched.extend(private for _, private in group)
     for sha in (task.base, task.tip, task.validation_base):
         if git(clone, "cat-file", "-t", sha, check=False).strip() != "commit":
             git(clone, "fetch", "--quiet", "origin", sha, check=False)
@@ -673,6 +707,45 @@ def fetch_retained(clone: Path, task: Task) -> dict:
             raise RuntimeError(f"commit {sha[:12]} is not in the content repository after fetching the retained refs")
     git(clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/input", task.tip)
     return {"refs": fetched, "base": task.base, "tip": task.tip}
+
+
+def fetch_retained(
+    clone: Path,
+    task: Task,
+    *,
+    retry_seconds: float = 0.0,
+    retry_delay: float = 10.0,
+    cancel: threading.Event | None = None,
+    chunk: int = FETCH_CHUNK,
+) -> dict:
+    """Fetch the task's retained refs into private refs of the clone and check base and tip exist.
+
+    A ref the remote does not have yet (the service publishes them through its outbox a moment after
+    creating the task) or a transient fetch failure is retried every ``retry_delay`` seconds for
+    ``retry_seconds``; afterwards ``SourcesUnavailable`` carries the last error.
+    """
+    deadline = time.monotonic() + max(0.0, retry_seconds)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            fetched = _fetch_retained_once(clone, task, chunk)
+        except RuntimeError as error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (cancel is not None and cancel.is_set()):
+                raise SourcesUnavailable(f"{error} (after {attempt} attempt(s))") from error
+            wait = max(0.0, min(retry_delay, remaining))
+            log(
+                f"task {task.task_id}: sources not fetchable yet ({' '.join(str(error).split())[:300]}); retrying in {wait:.0f}s"
+            )
+            if cancel is not None:
+                if cancel.wait(wait):
+                    raise SourcesUnavailable(f"{error} (cancelled after {attempt} attempt(s))") from error
+            else:
+                time.sleep(wait)
+            continue
+        fetched["attempts"] = attempt
+        return fetched
 
 
 def task_findings(task: Task) -> dict:
@@ -891,12 +964,12 @@ def release_task(
     assert reason in RELEASE_REASONS
     if lease is not None:
         lease.submitting.set()
-    error = str(detail or "")[:2000]
+    error_text = str(detail or "")[:2000]
     outcome = outcome if outcome is not None else {"task_id": task.task_id}
     outcome.update(status="released", reason=reason, detail=detail)
     try:
         outcome["response"] = with_retries(
-            lambda: client.release(task, reason, error),
+            lambda: client.release(task, reason, error_text),
             attempts=cfg.service_attempts,
             delays=cfg.service_delays,
             what="release",
@@ -910,7 +983,20 @@ def release_task(
     except ServiceError as error:
         outcome["status"] = "release_failed"
         outcome["detail"] = f"{detail}; release failed: {error}"
-    state.write(outcome["status"], reason=reason, detail=outcome["detail"], outcome=outcome)
+        # The claim is still ours and the service does not know we gave up: the checkpoint keeps the
+        # release for ``retry_releases`` to confirm from the loop, with the claim token it already holds.
+        pending = {
+            "reason": reason,
+            "error": error_text,
+            "attempts": 1,
+            "next_at": time.time() + cfg.release_backoff[0],
+        }
+        state.write(
+            outcome["status"], reason=reason, detail=outcome["detail"], outcome=outcome, pending_release=pending
+        )
+        log(f"task {task.task_id}: release not confirmed; will retry from the checkpoint ({error})")
+        return outcome
+    state.write(outcome["status"], reason=reason, detail=outcome["detail"], outcome=outcome, pending_release=None)
     return outcome
 
 
@@ -968,7 +1054,13 @@ def run_task(
             verify_admin(task.repository)
         env_lake = repair.lake_env(cfg.root)
         if not resuming:
-            outcome["sources"] = fetch_retained(cfg.clone, task)
+            outcome["sources"] = fetch_retained(
+                cfg.clone,
+                task,
+                retry_seconds=cfg.fetch_retry_seconds,
+                retry_delay=cfg.fetch_retry_delay,
+                cancel=cancel,
+            )
             outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, task.tip, worktree)
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
@@ -1179,9 +1271,18 @@ def run_task(
             state.write("not_adopted", outcome=outcome)
             return outcome
     except Exception as error:  # the state record must say what happened
-        outcome.update(status="error", error=f"{type(error).__name__}: {error}")
+        phase = state.state
+        outcome.update(status="error", error=f"{type(error).__name__}: {error}", phase=phase)
         with contextlib.suppress(Exception):
-            state.write("error", error=outcome["error"], outcome=outcome)
+            state.write("error", error=outcome["error"], phase=phase, outcome=outcome)
+        # Give the claim back so the task is re-exposed now rather than at the claim's expiry. A
+        # failure before the agent ran is the sources' or artifacts' fault; later it is the attempt's.
+        # When the service cannot confirm, the checkpoint keeps the release for ``retry_releases``.
+        if not lease.lost.is_set():
+            reason = "artifacts_unavailable" if phase in PRE_AGENT_PHASES else "agent_failed"
+            with contextlib.suppress(Exception):
+                release_task(cfg, client, task, state, reason, outcome["error"], dict(outcome), lease)
+                outcome["release"] = state.state
         raise
     finally:
         lease.stop()
@@ -1328,6 +1429,73 @@ def report_inference(cfg: RunnerConfig, client: TaskClient, outcome: dict) -> No
         log(f"inference report failed: {error}")
 
 
+def pending_release(record: dict) -> dict | None:
+    """The release a checkpoint still owes the service, if any.
+
+    ``pending_release`` is written by ``release_task`` when the service could not confirm. A
+    checkpoint in ``error`` without one (written before releases were retried) owes a release too:
+    its claim token is in the record, and the service answers ``claim-expired`` if it is long gone.
+    """
+    pending = record.get("pending_release")
+    if isinstance(pending, dict) and pending.get("reason") in RELEASE_REASONS:
+        return pending
+    if record.get("state") == "error" and "pending_release" not in record:
+        reason = "artifacts_unavailable" if record.get("phase") in PRE_AGENT_PHASES else "agent_failed"
+        return {"reason": reason, "error": str(record.get("error") or "")[:2000], "attempts": 0, "next_at": 0.0}
+    return None
+
+
+def retry_releases(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None = None) -> list[dict]:
+    """Confirm the releases earlier runs could not: for every checkpoint of this worker that still
+    holds an unreleased claim, call ``release`` once (backing off between passes) until the service
+    confirms it, says the claim is gone, or has no such endpoint. Run before each claim, so a claim
+    the service refuses for concurrency because of our own stale claim is given back instead of
+    polled around for its whole TTL. Returns the checkpoints whose release was settled this pass."""
+    from tauceti_worker.runtime_status import read_json
+
+    settled = []
+    if not cfg.tasks_dir.is_dir():
+        return settled
+    for directory in sorted(cfg.tasks_dir.iterdir()):
+        if stop is not None and stop.is_set():
+            break
+        record = read_json(directory / "task.json")
+        pending = pending_release(record)
+        if pending is None or not isinstance(record.get("task"), dict):
+            continue
+        if record.get("worker") not in (None, cfg.worker):
+            continue  # another worker's checkpoint in a shared root
+        if float(pending.get("next_at") or 0) > time.time():
+            continue
+        try:
+            task = Task.from_json(record["task"])
+        except (ValueError, KeyError) as error:
+            log(f"{directory.name}: unreadable checkpoint ({error})")
+            continue
+        state = TaskState(directory, task)
+        reason, error = pending["reason"], str(pending.get("error") or "")
+        try:
+            response = client.release(task, reason, error)
+        except EndpointMissing:
+            state.write("release_unsupported", pending_release=None, detail=f"{error}; no release endpoint")
+            log(f"task {task.task_id}: the service has no release endpoint; letting the claim expire")
+        except ClaimRefused as refused:
+            state.write("claim_lost", pending_release=None, detail=f"{error}; release refused: {refused}")
+            log(f"task {task.task_id}: pending release settled; the claim is no longer ours ({refused})")
+        except ServiceError as failure:
+            attempts = int(pending.get("attempts") or 0) + 1
+            delay = cfg.release_backoff[min(attempts - 1, len(cfg.release_backoff) - 1)] if cfg.release_backoff else 0
+            pending = {**pending, "attempts": attempts, "next_at": time.time() + delay, "last_error": str(failure)}
+            state.write("release_failed", pending_release=pending, reason=reason)
+            log(f"task {task.task_id}: release still unconfirmed ({failure}); attempt {attempts}, next in {delay:.0f}s")
+            continue
+        else:
+            state.write("released", pending_release=None, reason=reason, detail=error, response=response)
+            log(f"task {task.task_id}: pending release confirmed ({reason})")
+        settled.append({"task_id": task.task_id, "state": state.state, "reason": reason})
+    return settled
+
+
 def serve(
     cfg: RunnerConfig, client: TaskClient, stop: Stop, admin: AdminCheck | None = None, *, resume: bool = True
 ) -> dict:
@@ -1386,6 +1554,9 @@ def serve(
     while not stop.is_set():
         outcome = None
         try:
+            settled = retry_releases(cfg, client, stop=stop)
+            if settled:
+                summary["releases_settled"] = summary.get("releases_settled", 0) + len(settled)
             write_heartbeat(cfg, summary, "claiming")
             outcome = claim_and_run(cfg, client, admin, stop=stop)
         except (Die, NoProgress) as error:
@@ -1553,6 +1724,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     admin.ensure()
     outcomes: list[dict] = []
+    retry_releases(cfg, client)
     if not args.no_resume:
         outcomes += resume_pending(cfg, client)
     outcome = claim_and_run(cfg, client, admin)
