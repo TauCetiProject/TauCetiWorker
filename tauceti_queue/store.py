@@ -27,7 +27,10 @@ Tables:
 - `batch_tips`: every tip a batch has had, by version and time, so that a CI dispatch can name the
   previous tips whose published build outputs Lake can reuse after the batch is replayed.
 - `ci_attempts`: every candidate dispatch with the run it was bound to, placement, phases, outcome,
-  and the candidate revisions for published outputs it sent (`repair_outputs_revs`).
+  and the candidate revisions for published outputs it sent (`repair_outputs_revs`). An attempt
+  whose live run the controller cancelled because a newer dispatch, a landing, a removal or a
+  rebuild superseded it records when (`cancelled_at`), the attempt that superseded it
+  (`cancelled_by`, empty otherwise), why (`cancel_reason`) and GitHub's answer (`cancel_result`).
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
 - `journal`: an append-only log of what the controller did, for status and tests.
@@ -214,7 +217,11 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     infrastructure_retry INTEGER NOT NULL DEFAULT 0,
     needs_observation INTEGER NOT NULL DEFAULT 1,
     verdicts TEXT NOT NULL DEFAULT '{}',
-    repair_outputs_revs TEXT NOT NULL DEFAULT '[]'
+    repair_outputs_revs TEXT NOT NULL DEFAULT '[]',
+    cancelled_at REAL,
+    cancelled_by INTEGER,
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancel_result TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ci_batch ON ci_attempts (batch_id, batch_version);
 CREATE TABLE IF NOT EXISTS outbox (
