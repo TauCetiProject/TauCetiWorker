@@ -182,9 +182,9 @@ All times UTC.
 - Head 3 (batch 3, 237 PRs after insertions) sealed at 15:27:24 on tip `99310cef` (version 239) and was dispatched as attempt 14 (run 42055229481) with eight fetch candidates, among them head 2's published tips `1a5349d2` and `89293a36` (https://github.com/TauCetiProject/TauCetiWorker/pull/557, admin-merged and deployed at 14:27, before the seal); the repair-output fetch took 9.5 minutes (15:37:34 to 15:47:07).
 - An unrelated landing moved `main` under it (base `83b84968`), so the controller replayed it to tip `28b669f8` and dispatched attempt 15 at 15:37:42; that run passed and head 3 landed at 17:01:27 by promotion.
 - The superseded run 42055229481 kept running until the operator cancelled it at 17:03: the workflow's concurrency group did not displace it, to be investigated.
-- Head 4 (batch 4, 9 PRs) was the first batch to go through the pre-rebased prepare of https://github.com/TauCetiProject/TauCetiWorker/pull/551: task 13 on worker 2 (Claude agent at 16:41:03, adopted at 16:41:31, outputs for tip `946de93f` published in the background). It sealed at 17:01:33 on that exact tip, was dispatched as attempt 16 (run 42070564972) and landed at about 17:25; the whole round took about 25 minutes.
+- Head 4 (batch 4, 9 PRs) was the first batch to go through the pre-rebased prepare of https://github.com/TauCetiProject/TauCetiWorker/pull/551: task 13 on worker 2 (Claude agent at 16:41:03, adopted at 16:41:31, outputs for tip `946de93f` published in the background). It sealed at 17:01:33 on that exact tip, was dispatched as attempt 16 (run 42070564972) and landed at 17:35:15; the whole round took 34 minutes.
 
-Totals for the day: four heads landed through the queue (head 1 at 00:33, head 2 with 1,197 PRs at 14:09, head 3 with 237 at 17:01, head 4 with 9 at about 17:25). At 17:30 no approved PR was waiting and the open batch was empty.
+Totals for the day: four heads landed through the queue (head 1 at 00:33, head 2 with 1,197 PRs at 14:09, head 3 with 237 at 17:01, head 4 with 9 at 17:35), 1,444 PRs in all. At 17:40 no approved PR was waiting, the outbox was empty, and two new approvals had entered the next open batch.
 
 ## Afternoon deploys (2026-11-05)
 
