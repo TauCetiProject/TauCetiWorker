@@ -89,17 +89,22 @@ Every `tick()` (one reconciliation pass) does, under the controller lock:
    none exists and fewer than `open_batch_limit` are open; a conflict against the canonical commit
    itself cancels the input and posts the conflict request. Any error returns the input to waiting
    and releases the claim. Empty open batches beyond the first are removed at the end of the pass.
-4. Seal: when there is no head, the oldest open batch is nonempty, no claim is active on it, no
+   A batch a `prepare` task holds (below) is skipped, so inflow goes on into the next open batch.
+4. Seal: when there is no head, the oldest open batch is nonempty, no insertion claim is active on it, no
    inference hold is in force and Bors's external head (below) is not awaited, it becomes the head
    in the same pass; the other open batches stay open and keep receiving insertions, and a new open
-   batch is created only when none remains. There is no collection window.
+   batch is created only when none remains. There is no collection window. A `prepare` task on the
+   batch is superseded (resolution `sealed`) and its claim released; the batch seals with what its
+   preparations adopted.
 5. Head reconciliation, in the plan's order: a head under a worker's task claim is left alone;
    a head not based on the canonical commit is claimed and replayed (`chain.replay`), a clean
    replay becoming the next version with provenance unchanged, a conflict becoming a
    `rebase_conflict` task with the conflicting member, paths and the clean prefix as evidence;
    a head with an open task waits for a worker; otherwise CI (below) and, on a pass, promotion
    through the outbox.
-6. Enqueue the live batches' retained refs that never reached GitHub (above); drain the outbox again.
+6. Background preparation (below): supersede `prepare` tasks whose batch sealed or changed, or all
+   of them while the head has an open task; otherwise create the `prepare` tasks that are due.
+7. Enqueue the live batches' retained refs that never reached GitHub (above); drain the outbox again.
 
 Insertion draw: inputs are ordered urgent first, then priority, then age. The window is the
 `insertion_age_window` first. An urgent input in the window is drawn; else an input that has waited
@@ -118,6 +123,29 @@ input that conflicts with every open batch waits as before. Sealing takes the ol
 when it lands and the canonical commit advances, the next sealed head is rebased by the ordinary
 path and its conflicts become `rebase_conflict` tasks for the agent, which is the intended place for
 them. The urgent lane still inserts into the first open batch, which seals when the head lands.
+
+Background preparation (item 8 of "Pipeline acceleration behind the head" in the plan): while the
+head waits on CI, an open batch is built as assembled on its own base (never on the head's tip) and
+its internal failures are repaired by an agent, so that it is ready when it seals. When
+`prepare_open_batches` is on and the head has no open task, every open batch with at least
+`prepare_min_members` members, no insertion for `prepare_quiet_seconds`, a `prepared_version` other
+than its version, and no `prepare` task open or settled (adopted, clean or failed) at that version
+gets one `prepare` task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty.
+`claim_task` offers it only when the head has no task, one claim per batch, while fewer than
+`repair_concurrency` task claims are active in total; the claim's `extra.renew_after` is 60 seconds,
+so a worker learns within a minute that the controller took the batch back. A head task appearing
+(a CI failure, a rebase conflict) supersedes every `prepare` task with resolution `head-task`, which
+is how the head keeps priority over the workers. While a worker holds the claim, insertion skips the
+batch and probes the next open batch (created on the canonical commit when `open_batch_limit`
+allows), so the preparation never makes inflow wait. The submission goes through `submit_task`
+unchanged except that a `prepare` task's batch must still be `open`: the member commits,
+provenance and explanations are adopted, the version advances, the batch stays open and
+`prepared_version` becomes the new version. A worker whose build is green releases the task as
+`prepared_clean`, which records the current version as prepared; a release as `agent_failed` or
+`push_failed` resolves the task as `failed` and it is not offered again at that version. An insertion
+after preparation advances the version, so the batch is prepared again (as a whole) once it is quiet.
+A green background build is never a verdict: the head's CI round, after the rebase onto the
+canonical commit of that time, remains the only one.
 
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
@@ -220,7 +248,7 @@ and reported in status:
 | --- | --- | --- |
 | `insertion_age_window` | 16 | size of the age window the draw is taken from |
 | `open_batch_limit` | 2 | open batches at most; an input conflicting with the first is assembled into the next (1 restores increment 1) |
-| `repair_concurrency` | 1 | concurrent task claims on the head |
+| `repair_concurrency` | 1 | concurrent task claims on the head; also the bound on all task claims when a `prepare` task is claimed |
 | `stall_interval_seconds` | 900 | build silence after which status raises a stall |
 | `publication_enabled` | false | shadow mode when false: no dispatch, promotion, comment, label, close or ref push; status says what would happen |
 | `claim_ttl_seconds` | 900 | claim lifetime between renewals |
@@ -236,6 +264,9 @@ and reported in status:
 | `membership_label` | `bors-staging` | label added to member PRs at insertion |
 | `insertion_probe_budget_seconds` | 20 | wall-clock budget of one tick's insertion probes; the rest wait for the next tick, which follows at once |
 | `outbox_drain_budget_seconds` | 20 | wall-clock budget of one tick's outbox drain; the rest wait for the next tick, which follows at once |
+| `prepare_open_batches` | true | create `prepare` tasks for quiet open batches while the head has no task |
+| `prepare_min_members` | 20 | members an open batch needs before it is prepared |
+| `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 
 ## Ports
 
@@ -267,19 +298,22 @@ Called by stream F's HTTP handlers on behalf of workers (stream G). Authorizatio
 predicate, repository admin permission (`security_audit.require_admin`), checked through
 `repository_admin(login)` at claim and again at submit.
 
-- `claim_task(worker_identity, github_login) -> Task | None`: the head's open task under a new claim
-  (`claim_token`, `expires_at` = now + `claim_ttl_seconds`) when the login is an admin and fewer
-  than `repair_concurrency` claims are active on it. The `Task` carries kind, batch and version,
+- `claim_task(worker_identity, github_login) -> Task | None`: an open task under a new claim
+  (`claim_token`, `expires_at` = now + `claim_ttl_seconds`) when the login is an admin. Tasks are
+  ordered by kind priority, then age: the head's `repair` or `rebase_conflict` task first, while
+  fewer than `repair_concurrency` claims are active on it; a `prepare` task (above) only when the
+  head has none. The `Task` carries kind, batch and version,
   `base` and `tip` (the chain to start from), `onto` (the commit the replacement must be based on:
-  the canonical commit for a rebase conflict, the base itself for a repair), members with accepted
+  the canonical commit for a rebase conflict, the base itself for a repair or a preparation), members with accepted
   head, current commit, provenance, title, description, author, explanation and retained ref,
   diagnostics, retained refs, `submission_ref` (where to push the result) and the agent instruction.
 - `renew_task(task_id, claim_token) -> expires_at`; `release_task(task_id, claim_token, reason,
-  error)`. Both raise `TaskError` (`unknown-claim`, `claim-expired`, `claim-superseded`) when the
+  error)` (for a `prepare` task, `prepared_clean`, `agent_failed` and `push_failed` settle it, above). Both raise `TaskError` (`unknown-claim`, `claim-expired`, `claim-superseded`) when the
   claim is not live.
 - `submit_task(task_id, claim_token, tip_sha, worker_notes) -> Adoption`: fetches the tip if it is
   not in the clone, retains it, then rejects in this order: `claim-expired`, `claim-superseded`,
-  `not-authorized`, `version-mismatch` (the task is no longer the head's current task), `tip-unavailable`,
+  `not-authorized`, `version-mismatch` (the task is no longer its batch's current task, or a head
+  task's batch is not the head, or a `prepare` task's batch is no longer open), `tip-unavailable`,
   `invalid-chain` (`chain.validate` against the recorded members on `onto`, then `chain.compare`
   against the prior chain: single-parent history, the member bijection by identity, append-only
   messages), `explanation-required` (content changed without an appended explanation; the same
@@ -295,7 +329,9 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
 `settings` (effective values) and `publication_enabled`; `inference_hold`; `waiting` (count, urgent
 count, oldest age, max passes waited, the inputs); `open_batch` (the first open batch: id, version,
 base, tip, size, oldest member age, members, claim, retained ref); `open_batches` (every open batch
-in id order: id, version, base, tip, size, urgent, oldest member age); `head` (the same plus `sealed_at`,
+in id order: id, version, base, tip, size, urgent, oldest member age, and the preparation:
+`prepared_version`, `prepared`, the open `prepare_task`, `quiet_seconds` since the last insertion;
+`open_batch` carries the same preparation fields); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
@@ -351,3 +387,8 @@ nothing and reconciling an external landing (`test_shadow_mode_builds_batches_bu
 assembled into a second batch based on the canonical commit, the oldest seals first and the other
 keeps receiving, `open_batch_limit` 1 keeps it waiting, a PR conflicting with every open batch
 waits, an empty second batch is removed, and a restart attributes a legacy conflict record.
+Background preparation is F `Preparation` (a prepared batch seals with its repairs and lands without
+a failed CI round where the same batch unprepared fails one; insertion during preparation goes to the
+next batch; the head's repair task is claimed first) and C `Preparation` (the quiet period and size,
+the setting, kind priority then age, the head task superseding a running preparation, adoption
+keeping the batch open, sealing superseding a preparation, clean and failed releases).
