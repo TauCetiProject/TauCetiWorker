@@ -8,6 +8,8 @@ decisions against the fake GitHub without driving whole head cycles.
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -19,12 +21,14 @@ from tauceti_queue.controller import (  # noqa: E402
     DEFAULT_SETTINGS,
     LOG_GRACE_SECONDS,
     MERGED_TITLE_PREFIX,
+    STATUS_SCHEMA,
     VERDICT_CONTEXTS,
     ControllerError,
     TaskError,
 )
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller  # noqa: E402
 from tauceti_queue.ports import AGENT_INSTRUCTION  # noqa: E402
+from tauceti_queue.store import loads  # noqa: E402
 
 PROJECT = "TauCetiProject/TauCeti"
 
@@ -582,6 +586,134 @@ class StatusShape(ControllerCase):
         self.assertEqual((report["released_claims"], report["returned_reservations"]), (1, 1))
         self.assertEqual(self.controller.inputs()[0]["state"], "waiting")
         self.assertEqual(self.controller.store.row("claims", {"batch_id": batch["id"]})["release_reason"], "restart")
+
+
+class TickBudget(ControllerCase):
+    """One tick's work is bounded by wall time so the controller lock is not held for minutes."""
+
+    def inserted(self):
+        return sorted(row["number"] for row in self.controller.inputs() if row["state"] == "inserted")
+
+    def test_insertion_stops_at_the_probe_budget_and_resumes_next_tick_without_starving(self):
+        self.controller.set_setting("insertion_probe_budget_seconds", 0, "t")  # one probe per tick
+        numbers = [101, 102, 103, 104]
+        for number in numbers:
+            self.approve(number, {f"F{number}.lean": f"{number}\n"})
+        wake = self.controller.wake_event()
+        wake.clear()
+        reasons = self.controller.tick()
+        self.assertEqual(len(self.inserted()), 1, "the budget stops the pass after the first probe")
+        self.assertIn("insertion paused after 1 probes (budget)", reasons)
+        self.assertTrue(wake.is_set(), "a budget stop wakes the loop for the next tick")
+        self.assertFalse(
+            [e for e in self.controller.store.journal_entries() if "paus" in e["kind"]], "no journal per stop"
+        )
+        for expected in (2, 3, 4):
+            reasons = self.controller.tick()
+            self.assertEqual(len(self.inserted()), expected, "each tick continues where the last stopped")
+        self.assertEqual(self.inserted(), numbers, "every input is inserted; the budget starves nobody")
+        self.assertFalse(any("(budget)" in reason for reason in reasons))
+        self.assertEqual(len([r for r in self.controller.inputs() if r["state"] == "waiting"]), 0)
+
+    def test_outbox_drain_stops_at_its_budget_and_wakes_the_loop(self):
+        self.controller.set_setting("outbox_drain_budget_seconds", 0, "t")  # one operation per drain
+        for number in (101, 102):
+            self.approve(number, {f"F{number}.lean": "x\n"})  # two retained input refs, pushed as one batch
+        self.controller._enqueue("labels", "labels:101", {"number": 101, "add": ["queued"], "remove": []})
+        self.controller.wake_event().clear()
+        self.controller._reasons = []
+        self.controller._drain_outbox(self.clock())
+        pending = self.controller.store.rows("outbox", {"state": "pending"})
+        self.assertEqual([entry["kind"] for entry in pending], ["labels"])
+        self.assertIn("outbox drain paused with 1 entries pending (budget)", self.controller._reasons)
+        self.assertTrue(self.controller.wake_event().is_set())
+        self.controller._drain_outbox(self.clock())
+        self.assertEqual(self.controller.store.count("outbox", {"state": "pending"}), 0)
+
+
+class OutboxBatching(ControllerCase):
+    def retains(self, state):
+        return self.controller.store.rows("outbox", {"kind": "retain_ref", "state": state}, order="id")
+
+    def test_retained_refs_are_pushed_in_one_batch(self):
+        heads = {number: self.approve(number, {f"F{number}.lean": "x\n"})[0] for number in (101, 102, 103)}
+        self.github.calls.clear()
+        self.controller._drain_outbox(self.clock())
+        batched = [args for name, args in self.github.calls if name == "update_refs"]
+        expected = tuple(
+            (self.controller.input_ref(number, heads[number]), heads[number]) for number in (101, 102, 103)
+        )
+        self.assertEqual(batched, [(expected,)], "the three retained refs go to GitHub in one push")
+        self.assertEqual(self.retains("pending"), [])
+        self.assertEqual([entry["result"] for entry in self.retains("done")], ["retained"] * 3)
+        for number, head in heads.items():
+            self.assertEqual(self.repo.rev_parse(self.controller.input_ref(number, head)), head)
+
+    def test_a_failed_batch_falls_back_to_single_pushes(self):
+        heads = {number: self.approve(number, {f"F{number}.lean": "x\n"})[0] for number in (101, 102)}
+        self.github.calls.clear()
+        self.github.fail_next["update_refs"] = 1
+        self.github.fail_next["update_ref"] = 1  # the first single push fails too; the second must still go
+        self.controller._drain_outbox(self.clock())
+        names = [name for name, _ in self.github.calls]
+        self.assertEqual(names, ["update_refs", "update_ref", "update_ref"])
+        pending = self.retains("pending")
+        self.assertEqual(
+            [(entry["attempts"], loads(entry["payload"], {})["sha"]) for entry in pending], [(1, heads[101])]
+        )
+        self.assertEqual([loads(entry["payload"], {})["sha"] for entry in self.retains("done")], [heads[102]])
+        self.assertEqual(self.repo.rev_parse(self.controller.input_ref(102, heads[102])), heads[102])
+
+    def test_a_single_retained_ref_is_pushed_alone(self):
+        self.approve(101, {"F101.lean": "x\n"})
+        self.github.calls.clear()
+        self.controller._drain_outbox(self.clock())
+        self.assertEqual([name for name, _ in self.github.calls], ["update_ref"])
+
+
+class StatusSnapshot(ControllerCase):
+    def hold_lock(self):
+        """Hold the controller lock from another thread until the returned event is set."""
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with self.controller._lock:
+                held.set()
+                release.wait(10)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        return release
+
+    def test_status_serves_the_last_snapshot_while_a_tick_holds_the_lock(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        release = self.hold_lock()
+        started = time.monotonic()
+        status = self.controller.status(wait=0.2)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual((status["snapshot"], status["head"]["size"]), (True, 1), "the snapshot the tick took")
+        self.assertGreaterEqual(status["stale_seconds"], 0)
+        json.dumps(status)
+        self.controller._status_snapshot = None
+        status = self.controller.status(wait=0.2)
+        self.assertEqual((status["snapshot"], status["stale_seconds"], status["schema"]), (True, None, STATUS_SCHEMA))
+        release.set()
+        live = self.controller.status()
+        self.assertNotIn("snapshot", live, "with the lock free, status is read live")
+        self.assertEqual(live["head"]["size"], 1)
+
+    def test_operator_actions_refresh_the_snapshot(self):
+        self.controller.tick()
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.set_setting("insertion_age_window", 4, "t")
+        self.hold_lock()
+        status = self.controller.status(wait=0.2)
+        self.assertEqual((status["waiting"]["count"], status["settings"]["insertion_age_window"]), (1, 4))
 
 
 if __name__ == "__main__":

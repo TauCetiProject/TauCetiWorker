@@ -540,6 +540,12 @@ class FakeGitHub:
             else:
                 run_git(self.repo.origin, "update-ref", ref, sha)
 
+    def update_refs(self, repo: str, updates: Sequence[tuple[str, str]]) -> None:
+        with self.lock:
+            self._call("update_refs", tuple(updates))
+            for ref, sha in updates:
+                self.update_ref(repo, ref, sha)
+
     def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
         with self.lock:
             self._call("post_comment", number, marker)

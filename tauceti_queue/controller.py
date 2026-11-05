@@ -71,7 +71,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "polling_interval_seconds": 60,
     "approval_poll_interval_seconds": 900,
     "membership_label": "bors-staging",
+    # Wall-clock bounds on one tick's work, so the controller lock is not held for minutes while the
+    # public endpoints wait on it: insertion stops probing and the outbox stops draining once the
+    # budget is spent, and the loop is woken to continue in the next tick.
+    "insertion_probe_budget_seconds": 20,
+    "outbox_drain_budget_seconds": 20,
 }
+
+# How long `status()` waits for the controller lock before serving the last snapshot instead.
+STATUS_LOCK_WAIT_SECONDS = 2.0
 
 INPUT_WAITING = "waiting"
 INPUT_RESERVED = "reserved"
@@ -142,6 +150,9 @@ class Controller:
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._reasons: list[str] = []
+        # The last status document and the monotonic time it was taken, served by `status()` when the
+        # lock is held by a long tick.
+        self._status_snapshot: tuple[float, dict[str, Any]] | None = None
         self.canonical_branch = canonical_branch or self._discover_canonical_branch()
         self._canonical: str | None = self.store.get_setting("state:canonical_sha")
 
@@ -174,6 +185,7 @@ class Controller:
                 self.store.set_setting(key, value, actor, now)
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
             self._wake.set()
+            self._refresh_snapshot()
             return self.effective_settings()
 
     def _state(self, key: str, default: Any = None) -> Any:
@@ -326,6 +338,7 @@ class Controller:
                 )
                 self.store.journal(now, "approved", number=pr, head=head_sha, reviewer=reviewer, input_id=input_id)
             self._wake.set()
+            self._refresh_snapshot()
             return {"accepted": True, "reason": "approved", "input": self.store.row("inputs", {"id": input_id})}
 
     def validate_pull(self, repo: str, pr: int, head_sha: str) -> tuple[Any, str | None]:
@@ -424,6 +437,7 @@ class Controller:
                     members=[m["pr"] for m in record.get("members", [])],
                 )
             self._wake.set()
+            self._refresh_snapshot()
 
     def release_external_head(self, reason: str, now: float) -> dict[str, Any] | None:
         """Stop waiting for Bors's head (it landed, was cancelled, or the operator released it)."""
@@ -436,6 +450,7 @@ class Controller:
                 self._set_state("external_head", record)
                 self.store.journal(now, "external-head-released", batch_id=record.get("batch_id"), reason=reason)
             self._wake.set()
+            self._refresh_snapshot()
             return record
 
     def _external_member_landed(self, numbers: set[int], how: str, now: float) -> None:
@@ -495,6 +510,7 @@ class Controller:
             with self.store.transaction():
                 self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason=reason)
                 self.store.journal(now, "withdrawn", number=pr, reason=reason, actor=actor)
+            self._refresh_snapshot()
             return {"withdrawn": True, "reason": reason}
 
     def set_priority(self, repo: str, pr: int, priority: int) -> dict[str, Any]:
@@ -504,6 +520,7 @@ class Controller:
             if current is None or current["state"] not in (INPUT_WAITING, INPUT_RESERVED):
                 return {"changed": False, "reason": "not-waiting"}
             self.store.update("inputs", {"id": current["id"]}, priority=priority)
+            self._refresh_snapshot()
             return {"changed": True, "priority": priority}
 
     def mark_urgent(self, repo: str, pr: int, actor: str) -> dict[str, Any]:
@@ -520,6 +537,7 @@ class Controller:
                     self.store.update("batches", {"id": current["batch_id"]}, urgent=1)
                 self.store.journal(now, "urgent", number=pr, actor=actor, state=current["state"])
             self._wake.set()
+            self._refresh_snapshot()
             return {"urgent": True, "state": current["state"]}
 
     def _input_for(self, pr: int) -> dict[str, Any] | None:
@@ -1085,27 +1103,36 @@ class Controller:
     # --- the reconciliation pass -------------------------------------------------------------------
 
     def tick(self) -> list[str]:
-        """One reconciliation pass; returns the reasons the queue is waiting (also reported in status)."""
+        """One reconciliation pass; returns the reasons the queue is waiting (also reported in status).
+
+        The pass ends by taking the status snapshot `status()` serves while a later pass holds the lock.
+        """
         with self._lock:
-            self._reasons = []
-            now = self.clock()
-            self._expire_claims(now)
-            self._drain_outbox(now)
             try:
-                canonical = self._fetch_canonical()
-            except Exception as error:  # noqa: BLE001 - the pass reports the failure and waits for the next one
-                self._reasons.append(f"canonical branch unavailable: {error}")
-                return self._reasons
-            self._observe_canonical(canonical, now)
-            hold = self._state("inference_hold")
-            if hold:
-                self._reasons.append(f"inference hold since {hold['since']:.0f}: {hold['last_error']}")
-            self._insertion_passes(now)
-            self._seal(now)
-            self._reconcile_head(now)
-            self._drain_outbox(self.clock())
-            self._set_state("last_tick_at", now)
+                return self._tick()
+            finally:
+                self._refresh_snapshot()
+
+    def _tick(self) -> list[str]:
+        self._reasons = []
+        now = self.clock()
+        self._expire_claims(now)
+        self._drain_outbox(now)
+        try:
+            canonical = self._fetch_canonical()
+        except Exception as error:  # noqa: BLE001 - the pass reports the failure and waits for the next one
+            self._reasons.append(f"canonical branch unavailable: {error}")
             return list(self._reasons)
+        self._observe_canonical(canonical, now)
+        hold = self._state("inference_hold")
+        if hold:
+            self._reasons.append(f"inference hold since {hold['since']:.0f}: {hold['last_error']}")
+        self._insertion_passes(now)
+        self._seal(now)
+        self._reconcile_head(now)
+        self._drain_outbox(self.clock())
+        self._set_state("last_tick_at", now)
+        return list(self._reasons)
 
     def recover(self) -> dict[str, Any]:
         """Restart reconciliation: release in-process claims, return reservations, leave worker claims and the outbox."""
@@ -1127,6 +1154,7 @@ class Controller:
                     now, "restart", released=released, returned=returned, outbox_pending=pending, revision=self.revision
                 )
             self.started_at = now
+            self._refresh_snapshot()
             return {"released_claims": released, "returned_reservations": returned, "outbox_pending": pending}
 
     def _attribute_legacy_conflicts(self) -> None:
@@ -1205,9 +1233,20 @@ class Controller:
         again but against the next open batch, created on the canonical commit (never on another batch's
         tip) while fewer than `open_batch_limit` are open. An input that conflicts with every open batch
         waits for a base to change (a new open batch or a rebase).
+
+        The passes stop once `insertion_probe_budget_seconds` of wall time is spent (each probe is a git
+        replay onto a batch's tip, and the controller lock is held throughout the tick); the remaining
+        inputs wait for the next tick, which the loop is woken to run at once. `probed` is per tick and
+        the draw's age bound carries over in `passes_waited`, so a paused tick starves nobody.
         """
         probed: set[tuple[int, int]] = set()  # (input, batch) pairs probed in this tick
+        started = time.monotonic()
+        budget = float(self.setting("insertion_probe_budget_seconds"))
         while self._waiting():
+            if probed and time.monotonic() - started >= budget:
+                self._reasons.append(f"insertion paused after {len(probed)} probes (budget)")
+                self._wake.set()
+                break
             batches = self._ensure_open_batches(now)
             if batches is None:
                 break
@@ -2080,39 +2119,74 @@ class Controller:
         self.store.insert("outbox", kind=kind, key=key, payload=dumps(payload), next_attempt_at=now, created_at=now)
 
     def _drain_outbox(self, now: float) -> None:
-        for entry in self.store.rows("outbox", {"state": "pending"}, order="id"):
-            if entry["next_attempt_at"] > now:
-                continue
-            payload = loads(entry["payload"], {})
+        """Perform the due entries: several retained refs go in one push, the rest one by one, until
+        `outbox_drain_budget_seconds` of wall time is spent; what remains waits for the next tick,
+        which the loop is woken to run at once."""
+        started = time.monotonic()
+        budget = float(self.setting("outbox_drain_budget_seconds"))
+        due = [e for e in self.store.rows("outbox", {"state": "pending"}, order="id") if e["next_attempt_at"] <= now]
+        performed = 0
+        retains = [e for e in due if e["kind"] == "retain_ref"]
+        if len(retains) > 1 and hasattr(self.github, "update_refs"):
+            performed += 1
+            if self._retain_batch(retains, now):
+                due = [e for e in due if e["kind"] != "retain_ref"]
+        for index, entry in enumerate(due):
+            if performed and time.monotonic() - started >= budget:
+                self._reasons.append(f"outbox drain paused with {len(due) - index} entries pending (budget)")
+                self._wake.set()
+                return
+            performed += 1
             history = loads(entry["history"], [])
             try:
-                result = self._perform(entry["kind"], payload, now)
+                result = self._perform(entry["kind"], loads(entry["payload"], {}), now)
             except Exception as error:  # noqa: BLE001 - every adapter failure is recorded and retried
-                attempts = entry["attempts"] + 1
-                backoff = min(
-                    int(self.setting("outbox_retry_seconds")) * (2 ** (attempts - 1)),
-                    int(self.setting("outbox_retry_max_seconds")),
-                )
-                history.append({"at": now, "error": str(error)[:500]})
-                self.store.update(
-                    "outbox",
-                    {"id": entry["id"]},
-                    attempts=attempts,
-                    history=dumps(history[-20:]),
-                    next_attempt_at=now + backoff,
-                )
-                self.log.warning("outbox %s %s failed (attempt %s): %s", entry["kind"], entry["key"], attempts, error)
+                self._outbox_failed(entry, history, error, now)
                 continue
-            history.append({"at": now, "result": result})
-            self.store.update(
-                "outbox",
-                {"id": entry["id"]},
-                state="done",
-                attempts=entry["attempts"] + 1,
-                history=dumps(history[-20:]),
-                done_at=now,
-                result=result,
-            )
+            self._outbox_done(entry, history, result, now)
+
+    def _retain_batch(self, entries: list[dict[str, Any]], now: float) -> bool:
+        """Push the entries' retained refs in one `git push` (one connection, one object upload) instead of
+        one push each. On failure nothing is recorded: the caller pushes them singly, so one bad ref
+        does not block the rest."""
+        payloads = [loads(entry["payload"], {}) for entry in entries]
+        updates = [(payload["ref"], payload["sha"]) for payload in payloads]
+        try:
+            self.github.update_refs(self.repository, updates)
+        except Exception as error:  # noqa: BLE001 - the single pushes record their own failures
+            self.log.warning("batched push of %s retained refs failed, pushing singly: %s", len(updates), error)
+            return False
+        for entry in entries:
+            self._outbox_done(entry, loads(entry["history"], []), "retained", now)
+        return True
+
+    def _outbox_done(self, entry: dict[str, Any], history: list[Any], result: str, now: float) -> None:
+        history.append({"at": now, "result": result})
+        self.store.update(
+            "outbox",
+            {"id": entry["id"]},
+            state="done",
+            attempts=entry["attempts"] + 1,
+            history=dumps(history[-20:]),
+            done_at=now,
+            result=result,
+        )
+
+    def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
+        attempts = entry["attempts"] + 1
+        backoff = min(
+            int(self.setting("outbox_retry_seconds")) * (2 ** (attempts - 1)),
+            int(self.setting("outbox_retry_max_seconds")),
+        )
+        history.append({"at": now, "error": str(error)[:500]})
+        self.store.update(
+            "outbox",
+            {"id": entry["id"]},
+            attempts=attempts,
+            history=dumps(history[-20:]),
+            next_attempt_at=now + backoff,
+        )
+        self.log.warning("outbox %s %s failed (attempt %s): %s", entry["kind"], entry["key"], attempts, error)
 
     def _perform(self, kind: str, payload: dict[str, Any], now: float) -> str:
         repo = self.repository
@@ -2179,7 +2253,47 @@ class Controller:
 
     # --- status ------------------------------------------------------------------------------------
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, wait: float = STATUS_LOCK_WAIT_SECONDS) -> dict[str, Any]:
+        """The status document, read live when the controller lock is free within `wait` seconds.
+
+        Otherwise (a tick is holding the lock) the snapshot the last tick or operator action took is
+        served, with `snapshot: true` and its age in `stale_seconds`, so that the public endpoints
+        answer during a long tick instead of hanging on it.
+        """
+        if not self._lock.acquire(timeout=wait):
+            return self._stale_status()
+        try:
+            return self._status()
+        finally:
+            self._lock.release()
+
+    def _refresh_snapshot(self) -> None:
+        """Take the snapshot `status()` serves while the lock is held; called under the lock after a mutation."""
+        try:
+            self._status_snapshot = (time.monotonic(), self._status())
+        except Exception as error:  # noqa: BLE001 - a snapshot failure must not fail the tick
+            self.log.warning("status snapshot failed: %s", error)
+
+    def _stale_status(self) -> dict[str, Any]:
+        if self._status_snapshot is None:
+            return {
+                "schema": STATUS_SCHEMA,
+                "repository": self.repository,
+                "canonical_branch": self.canonical_branch,
+                "service": {
+                    "revision": self.revision,
+                    "started_at": self.started_at,
+                    "now": self.clock(),
+                    "last_tick_at": None,
+                },
+                "reasons": ["the first reconciliation pass has not completed"],
+                "snapshot": True,
+                "stale_seconds": None,
+            }
+        taken, document = self._status_snapshot
+        return {**document, "snapshot": True, "stale_seconds": round(time.monotonic() - taken, 3)}
+
+    def _status(self) -> dict[str, Any]:
         with self._lock:
             now = self.clock()
             settings = self.effective_settings()

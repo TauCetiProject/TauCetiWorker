@@ -219,6 +219,8 @@ and reported in status:
 | `polling_interval_seconds` | 60 | polling fallback interval |
 | `approval_poll_interval_seconds` | 900 | interval of the approval reconciliation poll behind the webhooks |
 | `membership_label` | `bors-staging` | label added to member PRs at insertion |
+| `insertion_probe_budget_seconds` | 20 | wall-clock budget of one tick's insertion probes; the rest wait for the next tick, which follows at once |
+| `outbox_drain_budget_seconds` | 20 | wall-clock budget of one tick's outbox drain; the rest wait for the next tick, which follows at once |
 
 ## Ports
 
@@ -292,6 +294,11 @@ promotion); `counters` (heads sealed and landed, PRs landed and edited, dispatch
 re-dispatches, passes and source failures, repair rounds, rebase conflicts, shrink-to-empty events,
 claim collisions, chain validation failures, inference holds, promotion refusals); the recent
 `head_cycle_seconds` (first dispatch to landing); `insertion_passes`; `max_passes_waited`.
+
+`status()` waits at most two seconds for the controller lock (`wait=` overrides; `/healthz` passes
+half a second). When a pass holds it longer, the snapshot taken at the end of the last pass or
+operator action is returned with `snapshot: true` and its age in `stale_seconds`; before the first
+pass completes, a document with only the service facts. A live read carries neither key.
 
 ## Scenario to test mapping
 

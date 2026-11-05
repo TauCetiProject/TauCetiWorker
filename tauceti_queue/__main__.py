@@ -149,10 +149,11 @@ class Service:
                 self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
             )
 
-    def status_document(self) -> dict[str, Any]:
+    def status_document(self, *, wait: float | None = None) -> dict[str, Any]:
+        """The status envelope; `wait` bounds the wait for the controller lock (`Controller.status`)."""
         controller_status = None
         if self.controller is not None:
-            controller_status = self.controller.status()
+            controller_status = self.controller.status() if wait is None else self.controller.status(wait=wait)
         return rt.status_document(
             self.runtime, self.config.settings.as_dict(), controller_status, self.unavailable_reason
         )

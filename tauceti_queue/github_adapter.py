@@ -557,6 +557,16 @@ class GitHubAdapter:
         if response.status in (404, 422):
             self.client.request("POST", f"repos/{repo}/git/refs", json_body={"ref": f"refs/{ref}", "sha": sha})
 
+    def update_refs(self, repo: str, updates: Sequence[tuple[str, str]]) -> None:
+        """Create or force-update several refs in one `git push` with many refspecs (one connection,
+        one object upload) when there is a clone; without one, each ref goes through the API."""
+        if self.clone_dir is not None and self._tokens is not None and updates:
+            refspecs = [f"+{sha}:refs/{ref.removeprefix('refs/')}" for ref, sha in updates]
+            self._git_with_token(repo, ["push", "--quiet", "--no-verify", f"https://github.com/{repo}.git", *refspecs])
+            return
+        for ref, sha in updates:
+            self.update_ref(repo, ref, sha)
+
     def ref_sha(self, repo: str, ref: str) -> str | None:
         ref = ref.removeprefix("refs/")
         status, data = self.client.get_json(f"repos/{repo}/git/ref/{ref}", tolerate=(404,))

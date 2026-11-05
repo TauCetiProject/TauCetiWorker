@@ -148,6 +148,11 @@ class GitHubPort(Protocol):
         """Create or move a ref (used for the retained `refs/tauceti-queue/...` namespace)."""
         ...
 
+    def update_refs(self, repo: str, updates: Sequence[tuple[str, str]]) -> None:
+        """Create or move several refs in one push (`(ref, sha)` pairs); the controller falls back to
+        `update_ref` for each when the batched push fails, or when a port lacks this method."""
+        ...
+
     def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
         """Post (or update) the comment carrying `marker`; returns the comment id."""
         ...

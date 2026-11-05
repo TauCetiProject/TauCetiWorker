@@ -399,6 +399,7 @@ uv run tauceti-queue settings show
 uv run tauceti-queue settings set insertion_age_window 8
 uv run tauceti-queue settings set repair_concurrency 2 --token "$(gh auth token)"
 uv run tauceti-queue settings set approval_poll_interval_seconds 600
+uv run tauceti-queue settings set insertion_probe_budget_seconds 10
 ```
 
 `settings set` posts `{"<key>": <value>}` to `/admin/settings` with the operator's GitHub token
@@ -407,7 +408,9 @@ repository-admin permission on `TauCetiProject/TauCeti` with the same predicate 
 (`tauceti_worker/security_audit.py::require_admin`). A change applies to new scheduling decisions,
 is persisted in the store, and appears in `status.settings` immediately. Values are positive integers;
 anything else is rejected before the request is sent. `--url` points the command at the public endpoint
-when run from another machine.
+when run from another machine. The full list with initial values is the settings table in
+[controller.md](controller.md); `insertion_probe_budget_seconds` and `outbox_drain_budget_seconds`
+(20 each) bound one pass's insertion probes and outbox pushes in wall-clock seconds (Monitoring below).
 
 ## Approval polling
 
@@ -544,6 +547,18 @@ cutover (`external_head`), approvals by source and the last poll (`approvals`), 
 revision and start time (`service.revision`, `service.started_at`), and the effective settings (`settings`).
 "Which machine is this running on and is it moving" is answered by `head.ci.runner`, `head.ci.host` and
 the newest `updated_at` among the phases; `tauceti-queue status` prints exactly these.
+
+A reconciliation pass holds the controller lock, and `/status` waits at most two seconds for it
+(`/healthz` half a second). When a pass runs longer, the endpoints answer with the snapshot the last
+pass or operator action took, marked `snapshot: true` with its age in `stale_seconds`; a live read has
+neither key. The feeds (`/repositories/1/active-batches`, `/repositories/1/candidates`) read the store
+directly and never wait for the lock. A pass itself is bounded: insertion probes stop after
+`insertion_probe_budget_seconds` and the outbox drain after `outbox_drain_budget_seconds` of wall time
+(both 20 by default), the pass reports `insertion paused after N probes (budget)` or `outbox drain
+paused with N entries pending (budget)` in `reasons`, and the next pass follows at once rather than
+after the polling interval. A `stale_seconds` that keeps growing past the budgets plus the polling
+interval means the loop is stuck in something unbudgeted (a git fetch, a GitHub call) and is worth a
+look at the service log.
 
 The journal report (`scripts/staging_journal_report.py`) runs daily and after every change against the
 service's candidates feed and the Bors baseline window ([journal-report.md](journal-report.md)): landed
