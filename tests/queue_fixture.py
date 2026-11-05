@@ -778,6 +778,35 @@ class HeadOperations(QueueFixture):
         self.tick(2)
         self.assertEqual(self.repo.file_at("main", "Shared.lean"), "line one\nline two by 103\nline three\n")
 
+    def test_conflicting_pr_is_not_probed_again_until_the_batch_base_changes(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()  # head 101
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.tick()
+        self.approve(103, {"Shared.lean": "line one\nline two by 103\nline three\n"})
+        self.tick()
+        conflicted = self.controller.inputs()[2]
+        self.assertEqual(conflicted["state"], "waiting")
+        probes = conflicted["probes"]
+        open_batch = self.controller.store.row("batches", {"state": "open"})
+        self.assertEqual(conflicted["last_probe_base"], open_batch["base"])
+        # Appending members moves the tip but cannot resolve a conflict with content already in the chain.
+        for number, path in ((104, "B.lean"), (105, "C.lean")):
+            self.approve(number, {path: "x\n"})
+            self.tick()
+        self.assertEqual(self.controller.inputs()[3]["state"], "inserted")
+        self.assertEqual(self.controller.inputs()[4]["state"], "inserted")
+        self.assertNotEqual(self.controller.store.row("batches", {"state": "open"})["tip"], open_batch["tip"])
+        self.assertEqual(self.controller.inputs()[2]["probes"], probes, "no re-probe while the base is unchanged")
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-conflict"}), 1)
+        # The head lands, the open batch seals and a new open batch on the new base re-probes 103.
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual([m["number"] for m in self.members(self.head())], [102, 104, 105])
+        self.tick()
+        self.assertGreater(self.controller.inputs()[2]["probes"], probes, "re-probed against the new base")
+        self.assertEqual(self.controller.inputs()[2]["state"], "inserted", "clean against the new base")
+
     def test_pr_conflicting_with_main_itself_gets_the_conflict_request(self):
         self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
         self.approve(
