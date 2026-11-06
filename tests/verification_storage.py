@@ -99,6 +99,30 @@ class Storage(Receipts):
             job["source_digest"],
         )
 
+    def test_compacted_terminal_candidate_is_retired_but_pending_reference_survives(self):
+        pending, job, tree = self.pending()
+        terminal = self.state / "verification-jobs" / pending.name
+        v.atomic(terminal, {**job, "status": "success"})
+        pending.unlink()
+        self.collect()  # release build outputs first
+        self.assertTrue(tree.exists())
+        other = self.state / "verification-pending" / ("f" * 32 + ".json")
+        v.atomic(other, dict(root=str(tree), status="pending"))
+        self.collect()
+        self.assertTrue(tree.exists())
+        other.unlink()
+        with locked(self.state / "verification-jobs" / f"{job['id']}.lock"):
+            self.collect()
+            self.assertTrue(tree.exists())
+        for _ in range(6):
+            self.collect()
+            if not tree.exists():
+                break
+        self.assertFalse(tree.exists())
+        self.assertTrue(terminal.exists())
+        self.assertTrue(Path(job["receipt"]).exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
+
     def test_active_job_and_receipt_leases_prevent_removal(self):
         write(self.root, ".lake/build/keep.olean", "active")
         _, job, tree = self.pending()
@@ -200,9 +224,14 @@ class Storage(Receipts):
     def test_twenty_candidates_are_not_serialized_by_cleanup_targets(self):
         self.state.mkdir()
         os.environ.update(TAUCETI_VERIFY_CANDIDATE_BYTES=str(32 * 1024**3), TAUCETI_VERIFY_STORAGE_BYTES="1")
+        # Real candidates remain discoverable when optional accounting skips a
+        # contended write. Admission must succeed for every caller either way.
+        for index in range(20):
+            storage.candidate(self.state, f"{index:032x}").mkdir(parents=True)
         with ThreadPoolExecutor(max_workers=20) as pool:
             admitted = list(pool.map(lambda index: storage.reserve(self.state, f"{index:032x}"), range(20)))
         self.assertEqual(admitted, [32 * 1024**3] * 20)
+        storage.discover(self.state)
         rows = v.read_json(storage.root() / "candidates.json")["candidates"]
         self.assertEqual(len(rows), 20)
         self.assertTrue(all(row["reserved"] == storage.FLOOR for row in rows.values()))
@@ -358,6 +387,20 @@ class Storage(Receipts):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
         self.assertEqual(v.read_json(self.state / "verification-jobs" / pending.name)["status"], "success")
+
+    def test_unused_complete_checkpoint_is_removed_but_receipt_evidence_survives(self):
+        verifier = v.Verification(self.root, self.state)
+        verifier.base = self.base
+        verifier.checkpoint_sources(dict(sources=v.inventory(self.root, self.base)))
+        target = Path(verifier.receipt["source_checkpoint"]).parent
+        receipt = verifier.path
+        receipt.unlink()
+        with storage.ledger() as data:
+            row = data["candidates"][storage.key(self.state, target.name)]
+            row["last_used"] = time.time() - 1000
+        self.collect(retire_checkpoints=True)
+        self.assertFalse(target.exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
 
     def test_source_checkpoints_share_host_budget_and_never_expire(self):
         os.environ["TAUCETI_VERIFY_CHECKPOINT_BYTES"] = str(128 * 1024**2)
@@ -615,18 +658,29 @@ class Storage(Receipts):
         self.assertFalse(cache.exists())
 
     def test_slow_ownership_inspection_leaves_budget_for_real_deletion(self):
+        from tauceti_worker import work_recovery
+
         _, _, tree = self.pending()
         cache = write(tree, ".lake/build/cache", "generated")
+        clock = [100.0]
+        work_type = work_recovery.Work
 
         def slow_users(path):
-            time.sleep(0.3)
+            clock[0] += 0.5  # Longer than the unchanged 0.25-second deletion allowance.
             return []
 
-        with patch("tauceti_worker.work_recovery.live_users", side_effect=slow_users):
+        with (
+            patch.object(storage.time, "monotonic", side_effect=lambda: clock[0]),
+            # Work's dataclass default factory captured monotonic at definition time.
+            patch.object(work_recovery, "Work", side_effect=lambda **limits: work_type(started=clock[0], **limits)),
+            patch.object(work_recovery, "live_users", side_effect=slow_users),
+        ):
             report = storage.housekeep((self.state,), now=time.time() + 90000)
         self.assertFalse(cache.exists(), report)
-        self.assertGreaterEqual(report["work"]["ownership_seconds"], 0.3)
-        self.assertLess(report["work"]["seconds"], 0.25)
+        self.assertEqual(report["work"]["ownership_seconds"], 0.5)
+        self.assertEqual(report["work"]["wall_seconds"], 0.5)
+        self.assertEqual(report["work"]["seconds"], 0)
+        self.assertEqual(report["work"]["limits"]["seconds"], 0.25)
 
     def test_inventory_observer_does_not_hold_a_false_live_workspace_reference(self):
         _, _, tree = self.pending()
@@ -979,8 +1033,9 @@ class Storage(Receipts):
         self.assertTrue((tree / ".lake/build/oversized").exists())
         self.collect()
         self.collect()
-        self.assertFalse((tree / ".lake/build/oversized").exists())
-        self.assertTrue((tree / "TauCeti/A.lean").exists())
+        self.assertFalse(tree.exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
+        self.assertTrue(Path(job["receipt"]).exists())
 
     def test_cleanup_target_combinations_do_not_restrict_admission(self):
         with patch.dict(

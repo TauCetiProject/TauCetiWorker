@@ -782,20 +782,60 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
-def _foreground_shell_env(deadline: float) -> dict[str, str]:
+SHELL_LIMIT_SECONDS = 600  # an authoring round's foreground shell limit
+
+
+def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
     # A shell command is not a whole round. Background tasks can retain the CLI
     # after its final answer and overlap later builds in the same checkout.
+    # ``TAUCETI_SHELL_LIMIT_SECONDS`` lets a launcher with its own budget (the queue's repair task,
+    # whose agent runs whole-library builds in the foreground) lengthen the limit for its agent.
+    if limit_seconds is None:
+        try:
+            limit_seconds = float(os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS") or SHELL_LIMIT_SECONDS)
+        except ValueError:
+            limit_seconds = SHELL_LIMIT_SECONDS
+    limit_ms = max(1000, int(limit_seconds * 1000))
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
     return {
-        "BASH_DEFAULT_TIMEOUT_MS": str(min(600000, remaining_ms)),
-        "BASH_MAX_TIMEOUT_MS": str(min(600000, remaining_ms)),
+        "BASH_DEFAULT_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
+        "BASH_MAX_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     }
 
 
-def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
+# Linux rejects any single argv string above MAX_ARG_STRLEN (128 KiB) with E2BIG, so a prompt longer
+# than this many UTF-8 bytes leaves argv and is written to the agent's stdin instead. Half the kernel
+# limit keeps a wide margin for multi-byte text and for wrapper commands that re-quote their arguments.
+PROMPT_ARGV_LIMIT = 64 * 1024
+
+# Providers whose CLI reads the prompt from stdin when the positional prompt is absent (`claude -p`
+# with no prompt argument) or is `-` (`codex exec -`). Kiro and the Pi runner only take argv.
+_STDIN_PROMPT_PROVIDERS = frozenset({"claude", "codex"})
+
+
+def prompt_on_stdin(prompt: str, profile: AuthoringProfile | str) -> bool:
+    """Whether this prompt must reach the agent on stdin rather than in argv."""
+    provider = _authoring_profile(profile).provider
+    return provider in _STDIN_PROMPT_PROVIDERS and len(prompt.encode("utf-8", errors="replace")) > PROMPT_ARGV_LIMIT
+
+
+def host_agent_launch(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict, str | None]:
+    """``host_agent_argv`` plus the text to write on the agent's stdin: the prompt itself when it is
+    too long for one argv string (``PROMPT_ARGV_LIMIT``), else None and the prompt stays in argv."""
+    on_stdin = prompt_on_stdin(prompt, profile)
+    argv, env = host_agent_argv(prompt, profile, prompt_on_stdin=on_stdin)
+    return argv, env, prompt if on_stdin else None
+
+
+def host_agent_argv(
+    prompt: str, profile: AuthoringProfile | str, *, prompt_on_stdin: bool = False
+) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
-    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
+    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`.
+
+    With ``prompt_on_stdin`` the prompt is left out of argv (Claude) or replaced by ``-`` (Codex) and
+    the caller writes it to the process's stdin; see ``host_agent_launch``."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
@@ -808,7 +848,7 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
         argv += ["-c", 'model_reasoning_summary="detailed"', "-c", "show_raw_agent_reasoning=false"]
-        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", "-" if prompt_on_stdin else prompt]
     elif profile.provider == "kiro":
         # --model is mandatory: Kiro's Auto router is never allowed to choose on
         # the worker's behalf. Isolate its platform credential store for API-key
@@ -828,12 +868,18 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
-        env.pop("ANTHROPIC_API_KEY", None)
+        # The one exception is a launcher that bills the API with the key in its own environment and
+        # no accounting shim (the queue's repair task, `TAUCETI_CLAUDE_BILLING=api` without
+        # `TAUCETI_API_CONTEXT`); the fleet's API mode routes the key through the shim instead and has
+        # already removed it from the environment (claude_api.configure_api).
+        if not (env.get("TAUCETI_CLAUDE_BILLING") == "api" and not os.environ.get("TAUCETI_API_CONTEXT")):
+            env.pop("ANTHROPIC_API_KEY", None)
         command = (
             os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
         )
         base = shlex_split(command) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
-        argv = [*base, "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", profile.model]
+        argv = [*base, "-p", *([] if prompt_on_stdin else [prompt])]
+        argv += ["--output-format", "stream-json", "--verbose", "--model", profile.model]
         if profile.effort:
             argv += ["--effort", profile.effort]
         argv += ["--dangerously-skip-permissions"]
@@ -852,10 +898,18 @@ def run_agent_host(
     session_actor=None,
     session_scope=None,
     quota_cfg=None,
+    cache_note: bool = True,
 ) -> int:
+    """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
+    ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
+    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache."""
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
-    if TAUCETI_CACHE_SERVICE and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+    if (
+        cache_note
+        and TAUCETI_CACHE_SERVICE
+        and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
+    ):
         prompt += (
             "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
             "checkout and current main. The public `tauceti-public` Lake service remains configured "
@@ -869,7 +923,7 @@ def run_agent_host(
             " If TAUCETI_PR_CACHE_MISS=1, your PR history is uncached: merge/rebase onto current main "
             "and fetch again before building; if that cannot be done, report the cache miss and stop."
         )
-    argv, env = host_agent_argv(prompt, profile)
+    argv, env, stdin_text = host_agent_launch(prompt, profile)
     if resume:
         if profile.provider == "codex":
             # exec resume does not accept the fresh-run sandbox/repo-check flags.
@@ -884,7 +938,7 @@ def run_agent_host(
             ]
             if profile.effort:
                 argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
-            argv += [resume, prompt]
+            argv += [resume, "-" if stdin_text is not None else prompt]
         elif profile.provider == "claude":
             argv += ["--resume", resume]
     if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
@@ -914,12 +968,16 @@ def run_agent_host(
 
         with contextlib.suppress(ValueError, subprocess.CalledProcessError):
             env["TAUCETI_VERIFY_BASE"] = local_main(cwd)
-    env.setdefault("TAUCETI_VERIFY_STATE", str(legacy_data_root(HERE) / "state" / env.get("TAUCETI_WORKER_ID", "local")))
+    env.setdefault(
+        "TAUCETI_VERIFY_STATE", str(legacy_data_root(HERE) / "state" / env.get("TAUCETI_WORKER_ID", "local"))
+    )
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
     with host_build_cache_context(cwd, env, logdir) as prefix:
+        if not cache_note:
+            env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
             [*(prefix or []), *argv],
             env=env,
@@ -930,6 +988,7 @@ def run_agent_host(
             cancel_event=cancel_event,
             session_path=session_path,
             quota_cfg=quota_cfg,
+            stdin_text=stdin_text,
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
@@ -1040,6 +1099,32 @@ def take_last_agent_infra_failure() -> str | None:
     return reason
 
 
+# What the transcript renderer saw of the most recent agent subprocess: whether the agent did any work
+# (a tool call, a tool result, an assistant message), the final structured failure, and the last Claude
+# rate-limit status. A launcher with a chain of providers (the queue's repair task) reads this to tell
+# a provider that refused the request before any work from an agent that worked and failed.
+_LAST_AGENT_RUN: dict | None = None
+
+
+def take_last_agent_run() -> dict | None:
+    """The renderer's record of the last agent subprocess (``provider``, ``rc``, ``saw_work``,
+    ``terminal_failure``, ``rate_limit_status``, ``usage``, the last lines of its ``tail``), or None.
+    Reads AND CLEARS, like ``take_last_agent_infra_failure``."""
+    global _LAST_AGENT_RUN
+    record, _LAST_AGENT_RUN = _LAST_AGENT_RUN, None
+    return record
+
+
+def _feed_stdin(proc: subprocess.Popen, text: str) -> None:
+    """Write ``text`` to ``proc.stdin`` and close it; an agent that exits first just closes the pipe."""
+    assert proc.stdin is not None
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdin.write(text)
+        proc.stdin.flush()
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdin.close()
+
+
 def run_agent_proc(
     argv: list[str],
     *,
@@ -1051,20 +1136,25 @@ def run_agent_proc(
     cancel_event=None,
     session_path=None,
     quota_cfg=None,
+    stdin_text: str | None = None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
     By default the normalized transcript goes to a timestamped file under logdir. ``--stream`` sends
     the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
-    failures aren't silent.
+    failures aren't silent. ``stdin_text`` (a prompt too long for argv, see ``host_agent_launch``) is
+    written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
+    cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
     """
-    global _LAST_AGENT_FAILURE
+    global _LAST_AGENT_FAILURE, _LAST_AGENT_RUN
     _LAST_AGENT_FAILURE = None
+    _LAST_AGENT_RUN = None
     telemetry_stamp = time.strftime("%Y%m%d-%H%M%S")
     cwds = str(cwd) if cwd is not None else None
-    # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
-    # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
-    # Codex then treats it as additional prompt input and waits forever for EOF.
+    # A prompt arrives in argv unless it is too long for one argv string, in which case it is the whole
+    # of stdin. Otherwise close stdin explicitly: Bubble reaches the agent through a non-PTY SSH
+    # channel, so an inherited terminal becomes a non-TTY stream there; Codex then treats it as
+    # additional prompt input and waits forever for EOF.
     renderer = AgentTranscriptRenderer(provider)
     quota_reader, launch_credential = None, None
     if (
@@ -1106,7 +1196,7 @@ def run_agent_proc(
                     argv,
                     cwd=cwds,
                     env=env,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -1119,6 +1209,10 @@ def run_agent_proc(
             raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
         assert proc.stdout is not None
         finished = threading.Event()
+        feeder = None
+        if stdin_text is not None:
+            feeder = threading.Thread(target=_feed_stdin, args=(proc, stdin_text), daemon=True)
+            feeder.start()
 
         def cancel_on_lease_loss():
             while not finished.wait(0.5):
@@ -1172,6 +1266,8 @@ def run_agent_proc(
                 finished.set()
                 if monitor is not None:
                     monitor.join(3)
+                if feeder is not None:
+                    feeder.join(3)
         from .overlap_support import atomic
 
         telemetry = {
@@ -1182,6 +1278,16 @@ def run_agent_proc(
         }
         atomic(logdir / f"{label}-{telemetry_stamp}-telemetry.json", telemetry)
         atomic(logdir / f"{label}-telemetry.json", telemetry)
+        global _LAST_AGENT_RUN
+        _LAST_AGENT_RUN = {
+            "provider": provider,
+            "rc": rc,
+            "saw_work": renderer.saw_work,
+            "terminal_failure": renderer.terminal_failure_text,
+            "rate_limit_status": renderer.rate_limit_status,
+            "usage": dict(renderer.usage),
+            "tail": list(tail)[-6:],  # the guardian's own traceback when the agent executable is missing
+        }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
         return rc

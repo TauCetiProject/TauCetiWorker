@@ -549,6 +549,35 @@ def _observe_users(tree, work):
         wr._WORK.reset(token)
 
 
+def _retire_candidate(state, identifier, tree, job, journal, work):
+    """Release a finished task's copy; its job, receipt and original source survive."""
+    from . import recovery_maintenance as maintenance
+
+    if maintenance._referenced(state, tree):
+        return "pending-reference"
+    progress = read_json(journal)
+    retirement = progress.get("retire-candidate")
+    if retirement is None:
+        # This is a terminal isolated verification copy, not the agent's source
+        # workspace. Do not create another recovery task just to dispose of it.
+        atomic_json(
+            state / "verification-jobs" / f"{identifier}.json", dict(job, materialization_retired_at=time.time())
+        )
+        info = tree.stat()
+        retirement = dict(tree_identity=[info.st_dev, info.st_ino], stack=[""])
+        progress["retire-candidate"] = retirement
+        atomic_json(journal, progress)
+    try:
+        if maintenance._remove(tree, retirement, work):
+            release(state, identifier)
+            journal.unlink(missing_ok=True)
+            return "candidate-retired"
+        return "resume-candidate-retirement"
+    finally:
+        if tree.exists():
+            atomic_json(journal, progress)
+
+
 def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evict=False):
     from . import recovery_maintenance as maintenance
     from . import work_recovery as wr
@@ -557,14 +586,14 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
 
     tree = candidate(state, identifier)
     journal = state / "verification-storage" / f"{identifier}.json"
-    pending = read_json(state / "verification-pending" / f"{identifier}.json")
-    terminal = read_json(state / "verification-jobs" / f"{identifier}.json")
-    job = pending or terminal
-    if job and (job.get("schema") != "tauceti-verification-job/v1" or job.get("id") != identifier):
-        job = {}
     with contextlib.ExitStack() as stack:
         stack.enter_context(locked(state / "verification-jobs" / f"{identifier}.lock"))
         stack.enter_context(locked(state / "verification-storage" / f"{identifier}.lock"))
+        pending = read_json(state / "verification-pending" / f"{identifier}.json")
+        terminal = read_json(state / "verification-jobs" / f"{identifier}.json")
+        job = pending or terminal
+        if job and (job.get("schema") != "tauceti-verification-job/v1" or job.get("id") != identifier):
+            job = {}
         if lease := job.get("lease"):
             lease = Path(lease)
             if lease.is_relative_to("/opt/verification-state"):
@@ -584,6 +613,8 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
         target = canonical_candidate(tree)
         if mounts is None or any(point == target or point.is_relative_to(target) for point in mounts):
             return "mounted"
+        if terminal and not pending and job.get("isolated") and evict and row.get("compact"):
+            return _retire_candidate(state, identifier, tree, job, journal, work)
         copy_marker = state / "verification-copy-incomplete" / f"{identifier}.json"
         construction = read_json(copy_marker)
         if (
@@ -735,7 +766,27 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
                 _SCANS.pop(identity, None)
 
 
-def _measure_checkpoint(state, row, work):
+def _unused_checkpoint(state, target):
+    """A complete orphan has no receipt or pending consumer, unlike retained evidence."""
+    from . import recovery_maintenance as maintenance
+
+    if not read_json(target / "checkpoint.json") or maintenance._referenced(state, target):
+        return False
+    for receipt in (state / "verification").glob("*/receipt.json"):
+        value = read_json(receipt)
+        if not value:
+            return False
+        source = value.get("source_checkpoint")
+        if source:
+            path = Path(source)
+            if path.is_relative_to("/opt/verification-state"):
+                path = state / path.relative_to("/opt/verification-state")
+            if path.resolve().is_relative_to(target.resolve()):
+                return False
+    return True
+
+
+def _measure_checkpoint(state, row, work, *, retire=False):
     from .retention import locked
 
     target = state / "verification-checkpoints" / row["id"]
@@ -745,6 +796,37 @@ def _measure_checkpoint(state, row, work):
         if not target.exists():
             release(state, row["id"])
             return "absent"
+        if (
+            retire
+            and time.time() - row["last_used"] >= setting("COMPLETED_CACHE_SECONDS", 900)
+            and _unused_checkpoint(state, target)
+        ):
+            from . import recovery_maintenance as maintenance
+
+            if _observe_users(target, work):
+                return "active"
+            from .retention import mount_points
+
+            mounts = mount_points()
+            if mounts is None or any(p == target.resolve() or p.is_relative_to(target.resolve()) for p in mounts):
+                return "mounted"
+            journal = state / "verification-storage" / f"{row['id']}.json"
+            progress = read_json(journal)
+            deletion = progress.setdefault(
+                "unused-checkpoint", dict(tree_identity=[target.stat().st_dev, target.stat().st_ino], stack=[""])
+            )
+            try:
+                atomic_json(journal, progress)
+                if maintenance._remove(target, deletion, work):
+                    release(state, row["id"])
+                    journal.unlink(missing_ok=True)
+                    return "unused-checkpoint-retired"
+                return "resume-checkpoint-retirement"
+            finally:
+                if target.exists():
+                    atomic_json(journal, progress)
+        if row.get("compact") and row.get("settled"):
+            return "source-checkpoint-retained"
         return _measure(state, row, target, work, compact=True)
 
 
@@ -792,7 +874,9 @@ def _prune_scans(entries):
             _SCANS.pop(identity)[0].close()
 
 
-def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 1024**2, now=None):
+def _housekeep(
+    states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 1024**2, now=None, retire_checkpoints=False
+):
     """Ordinary supervisor/activity ticks own cleanup. No timer, model or GitHub reads."""
     from . import work_recovery as wr
 
@@ -898,11 +982,12 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                         data["candidates"].pop(identity, None)
                 continue
             if row.get("kind") == "checkpoint":
-                if row.get("legacy") or not row.get("settled"):
-                    try:
-                        report["candidates"][identity] = _measure_checkpoint(state, row, work)
-                    except BlockingIOError:
-                        report["candidates"][identity] = "active"
+                if row.get("compact") and row.get("settled") and not retire_checkpoints:
+                    continue
+                try:
+                    report["candidates"][identity] = _measure_checkpoint(state, row, work, retire=retire_checkpoints)
+                except BlockingIOError:
+                    report["candidates"][identity] = "active"
                 continue
             # Prefer terminal/own-build reclamation. If that cannot make room, release older
             # idle dependency caches from other jobs while keeping the oldest runnable job
@@ -915,9 +1000,9 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                 and not row.get("dependency_cache_evicted")
                 and (state / "verification-pending" / f"{identifier}.json").exists()
             )
-            if row.get("compact") and not drop_dependencies and identity not in continuing:
-                continue
             terminal, last_used = metadata[identity]
+            if row.get("compact") and not terminal and not drop_dependencies and identity not in continuing:
+                continue
             ttl = setting("COMPLETED_CACHE_SECONDS", 900) if terminal else setting("IDLE_CACHE_SECONDS", 21600)
             early_terminal_cleanup = terminal and (
                 excess > work.removed_bytes or observed(row) > setting("CANDIDATE_BYTES", 32 * GIB)

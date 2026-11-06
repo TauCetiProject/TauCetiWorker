@@ -1,0 +1,80 @@
+# Environment for tauceti-queue-repair.service: ~/.config/tauceti-queue/repair-environment
+# (mode 0600). Every value is a default of `python -m tauceti_queue.repair_task`; the installer
+# writes this file from the example when it is absent. Paths are absolute (systemd does not expand
+# ~ or $HOME here). Keep secrets in the files named below, never in this file.
+
+# The queue service. On the service host itself the local port is enough; elsewhere, the public
+# endpoint.
+TAUCETI_QUEUE_SERVICE=http://127.0.0.1:8780
+#TAUCETI_QUEUE_SERVICE=https://queue.taucetiproject.org
+
+# The worker identity the service records on claims (status shows it with the claim's expiry).
+TAUCETI_QUEUE_WORKER=repair@tauchonki
+
+# Seconds between claims when nothing is claimable.
+TAUCETI_QUEUE_POLL_SECONDS=60
+
+# The content clone of TauCetiProject/TauCeti the worker fetches into and makes its worktrees from
+# (the installer clones it when absent) and the task root: checkpoints, logs, worktrees and the
+# private Lake artifact pool (tens of GB; see "Host requirements").
+TAUCETI_QUEUE_CLONE=/home/operator/TauCetiQueue-data/repair-clone
+TAUCETI_QUEUE_TASK_ROOT=/home/operator/TauCetiQueue-data/repair
+
+# Credentials, by location. The GitHub token of the worker's account (repository admin on
+# TauCetiProject/TauCeti): a mode 0600 file; without it the worker uses $GH_TOKEN, then
+# `gh auth token` from the account's gh login.
+#TAUCETI_QUEUE_TOKEN_FILE=/home/operator/.config/tauceti-queue/github-token
+
+# The repair agent's providers, tried in this order for each task (docs/queue/repair-task.md,
+# "Providers"):
+#   claude  the Claude subscription, with the repository's Claude authoring profile; needs Claude
+#           Code's credentials in $CLAUDE_CONFIG_DIR/.credentials.json (default ~/.claude; `claude`
+#           logged in as the operator's account), copied into the task's isolated config dir with
+#           ANTHROPIC_API_KEY unset so the subscription is billed.
+#   codex   the Codex (ChatGPT) subscription, with the repository's Codex authoring profile; needs
+#           the Codex credential in $CODEX_HOME/auth.json (default ~/.codex; `codex login`), copied
+#           into the task's isolated CODEX_HOME, as the fleet's isolated workers are seeded.
+#   api     Claude billed to the Anthropic API: ANTHROPIC_API_KEY below, given only to this
+#           provider's agent, with no subscription credential beside it.
+# A subscription is eligible for a task only while its usage is under the pacing curve the fleet
+# worker's --pace flag applies (TAUCETI_QUEUE_RATE), read from the provider's usage endpoint with
+# the credential above; one over its pace, or unmeasurable, is skipped with the reason logged. A
+# provider that fails to start, or answers a rate-limit or authentication error before doing any
+# work, hands the task to the next one at once. Every provider tried or skipped is in the task's
+# outcome (provider_attempts) and in worker.json. Leave out a provider this host has no credential
+# or executable for.
+TAUCETI_QUEUE_PROVIDERS=claude,codex,api
+
+# The pacing curve for the eligibility check, the fleet's --pace spec: time%:budget% control points,
+# a subscription is eligible while used% is under the budget at the current point of each usage
+# window. Unset is the pacer's default, 60:40 (40% of the quota through the first 60% of a window,
+# then the full quota by its reset); 0:0,100:100 is the plain used% < elapsed% rule.
+#TAUCETI_QUEUE_RATE=60:40
+
+# The api provider's key. It lives in this file (mode 0600) and nowhere else; the worker removes it
+# from its own environment at start and passes it only to the api provider's agent. Never logged.
+#ANTHROPIC_API_KEY=sk-ant-...
+
+# Where the subscription credentials are read from when not at the defaults.
+#CLAUDE_CONFIG_DIR=/home/operator/.claude
+#CODEX_HOME=/home/operator/.codex
+
+# One extracted Mathlib (`lake exe cache get`) shared read-only through a .lake/packages symlink
+# instead of fetching it per task (the experiments' method); optional.
+#TAUCETI_QUEUE_SEED_PACKAGES=/home/operator/TauCetiQueue-data/mathlib-packages
+
+# The workers' own Lake cache namespace (docs/queue/repair-task.md, "Repair cache publication").
+# Repairs read it before the public cache and, after a green repair, publish their outputs to it.
+# The read URL is public; the upload URL is the S3 endpoint of the same bucket. The write key file
+# holds the `access-key-id:secret` pair of an R2 token scoped to that bucket only (mode 0600).
+# Publication is on when the key file and an upload URL are set; TAUCETI_QUEUE_PUBLISH_CACHE=0
+# turns it off.
+#TAUCETI_REPAIR_CACHE_URL=https://repair-cache.taucetiproject.org
+#TAUCETI_REPAIR_CACHE_UPLOAD_URL=https://<account>.r2.cloudflarestorage.com/tauceti-repair-cache
+#TAUCETI_REPAIR_CACHE_KEY_FILE=/home/operator/.config/tauceti-queue/repair-cache-key
+#TAUCETI_QUEUE_PUBLISH_CACHE=1
+
+# Concurrent agents for a repair whose failures split into independent groups (different members,
+# disjoint files, no imports between them), each in its own worktree of the tip; 0 or 1 keeps every
+# repair sequential. Builds are serialized by .tauceti-repair/build.lock in the task's worktree.
+#TAUCETI_QUEUE_PARALLEL_AGENTS=3

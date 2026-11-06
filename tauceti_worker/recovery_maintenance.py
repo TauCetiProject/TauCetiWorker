@@ -193,6 +193,7 @@ def defer_caches(state, record):
             created_at=previous.get("created_at", time.time()),
         ),
     )
+    retention.request_cleanup()
 
 
 def _cleanup_cache_tree(state, tree, registry, work, observation):
@@ -463,6 +464,7 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
                         from .work_recovery import _fsync_dir
 
                         _fsync_dir(tree.parent)
+                    work.removed_entries += 1
                     stack.pop()
                     continue
                 info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
@@ -508,6 +510,7 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
                     return False
                 work.charge(removed=size)
                 os.unlink(entry.name, dir_fd=fd)
+                work.removed_entries += 1
                 dirty.add(relative)
             finally:
                 os.close(fd)
@@ -1368,7 +1371,10 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
         _CHECKS.reset(checks_token)
     report = work.report()
     report.update(
-        safety_seconds=checks.seconds, process_scans=checks.scans, cleanup_pending=bool(sweep and sweep.cleanup_pending)
+        safety_seconds=checks.seconds,
+        process_scans=checks.scans,
+        cleanup_pending=bool(sweep and sweep.cleanup_pending),
+        sweep_complete=(base if cleanup else (base, "inventory")) not in _SWEEPS,
     )
     with contextlib.suppress(OSError):
         name = ".recovery-housekeeping.json" if cleanup else ".recovery-inventory.json"
@@ -1378,8 +1384,22 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
 
 def abandonment_reason(record, consumer):
     """A fixed source lifetime, independent of retries, journals, funding and worker admission."""
-    if (consumer.get("reason") or {}).get("code") == "content-allowance":
-        return "content-allowance-exhausted"
+    from .repair_recovery import RETRIES, normal_publication, uncertain_publication
+
+    # Small publication evidence must remain available to reconciliation, even when
+    # source recovery is no longer worth continuing.
+    manifest = _metadata(record / "manifest.json")
+    if (
+        consumer.get("state") != "published"
+        and not consumer.get("normal_publication_confirmed")
+        and (uncertain_publication(consumer) or normal_publication(record, manifest, consumer))
+    ):
+        return None
+    code = (consumer.get("reason") or {}).get("code")
+    if code in {"content-allowance", "recovery-exhausted"}:
+        return code + "-exhausted"
+    if code == "invocation-failed" and consumer.get("attempts", 0) >= len(RETRIES):
+        return "recovery-exhausted"
     manifest = _metadata(record / "manifest.json")
     try:
         # Manifest bytes are immutable; journal/checkpoint activity cannot renew the clock.
@@ -1410,6 +1430,17 @@ def discard_record(state, record):
         consumer = _metadata(record / "recovery.json")
         code = (consumer.get("reason") or {}).get("code")
         abandon = abandonment_reason(record, consumer)
+        from .repair_recovery import normal_publication, uncertain_publication
+
+        if (
+            consumer.get("state") != "published"
+            and not consumer.get("normal_publication_confirmed")
+            and (
+                uncertain_publication(consumer)
+                or normal_publication(record, _metadata(record / "manifest.json"), consumer)
+            )
+        ):
+            return False
         if not abandon:
             if consumer.get("state") not in {"published", "obsolete", "blocked"} or code in RETRYABLE:
                 return False
@@ -1460,6 +1491,10 @@ def discard_record(state, record):
         # Prepared status can lag the payload sweep. Invalidate this disposable
         # row immediately instead of continuing to display finished task history.
         (state / "recovery-prepared.json").unlink(missing_ok=True)
+        work = wr._WORK.get()
+        if work is not None:
+            work.removed_entries += 1
+        retention.request_cleanup()
         return True
 
 

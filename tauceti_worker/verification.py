@@ -1046,7 +1046,8 @@ def add_parser(sub):
 
 def command(args):
     state = Path(
-        os.environ.get("TAUCETI_VERIFY_STATE") or legacy_data_root(HERE) / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
+        os.environ.get("TAUCETI_VERIFY_STATE")
+        or legacy_data_root(HERE) / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
     )
     try:
         root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip()).resolve()

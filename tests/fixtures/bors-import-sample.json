@@ -1,0 +1,2741 @@
+{
+ "candidates": {
+  "admissions": [
+   {
+    "batch_id": null,
+    "id": 31461,
+    "snapshot": {
+     "head_sha": "8e0e29ab74e5d5f1e6929951a5f4f6a5f952ed48",
+     "manual_approval": null,
+     "original_admitted_at": 1793655160323859,
+     "pr": 20359,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31631,
+    "snapshot": {
+     "head_sha": "40b94f8d0020a65c56b0c1c69ec25c42564256ed",
+     "manual_approval": null,
+     "original_admitted_at": 1793664208152747,
+     "pr": 21209,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31632,
+    "snapshot": {
+     "head_sha": "5d1ac9abe6a4ff63014fcfd4b70a81eab14857e2",
+     "manual_approval": null,
+     "original_admitted_at": 1793664285840526,
+     "pr": 23816,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31633,
+    "snapshot": {
+     "head_sha": "13086ffe99d06b1adf6a171147472ece384ff050",
+     "manual_approval": null,
+     "original_admitted_at": 1793663862696437,
+     "pr": 23830,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31462,
+    "snapshot": {
+     "head_sha": "059a8927a6933191e561cafaf543ad65f6decacb",
+     "manual_approval": null,
+     "original_admitted_at": 1793655470549051,
+     "pr": 24202,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31463,
+    "snapshot": {
+     "head_sha": "475fa49b95179b7fbcda9b22223e5b96fe00f16a",
+     "manual_approval": null,
+     "original_admitted_at": 1793651765780364,
+     "pr": 24231,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27586,
+    "snapshot": {
+     "head_sha": "690569d31bde53af512beec4298855d0a1dffd94",
+     "manual_approval": null,
+     "original_admitted_at": 1793606737469478,
+     "pr": 24255,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27716,
+    "snapshot": {
+     "head_sha": "0b89c11e8afcfb9090473cc79f044bef4e9c5ac4",
+     "manual_approval": null,
+     "original_admitted_at": 1793616530404483,
+     "pr": 24450,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27587,
+    "snapshot": {
+     "head_sha": "d55c4670365a267d514836d78595e0202c7e4302",
+     "manual_approval": null,
+     "original_admitted_at": 1793609681462618,
+     "pr": 24491,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27588,
+    "snapshot": {
+     "head_sha": "18a815f229cfc858faed76ff460b07e3fd0bd68f",
+     "manual_approval": null,
+     "original_admitted_at": 1793605603029097,
+     "pr": 24551,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 30965,
+    "snapshot": {
+     "head_sha": "d469638b6a95a70b51d55d18427ab69460670d18",
+     "manual_approval": null,
+     "original_admitted_at": 1793687587779428,
+     "pr": 24556,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 30967,
+    "snapshot": {
+     "head_sha": "cb63efda5211b73c57620ea52390d050cce3d621",
+     "manual_approval": null,
+     "original_admitted_at": 1793692707197504,
+     "pr": 24589,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31634,
+    "snapshot": {
+     "head_sha": "1021f819dc8eeeeaab9fcf42603472c5d7500bed",
+     "manual_approval": null,
+     "original_admitted_at": 1793668292403356,
+     "pr": 24650,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31464,
+    "snapshot": {
+     "head_sha": "6e12098e3bb3b0be1219e1238259786100fe7dcc",
+     "manual_approval": null,
+     "original_admitted_at": 1793651150731750,
+     "pr": 24704,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27717,
+    "snapshot": {
+     "head_sha": "9a664eecccbb9800d990f900f6ce8d2a35c533f0",
+     "manual_approval": null,
+     "original_admitted_at": 1793616283671740,
+     "pr": 24769,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27720,
+    "snapshot": {
+     "head_sha": "2a1ca451d7b33968dde455edc1ada850fe782822",
+     "manual_approval": null,
+     "original_admitted_at": 1793620676226960,
+     "pr": 24837,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27721,
+    "snapshot": {
+     "head_sha": "9e1d477c8284c66be971dcccb2aceb24d0251576",
+     "manual_approval": null,
+     "original_admitted_at": 1793616202040463,
+     "pr": 24874,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27722,
+    "snapshot": {
+     "head_sha": "5a957b4109f8c829a2ea46cb3dacf4ac5e5073be",
+     "manual_approval": null,
+     "original_admitted_at": 1793616361085365,
+     "pr": 24906,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31635,
+    "snapshot": {
+     "head_sha": "f7e12161fd38591be8ee0e4f2c43e8ee434dbfbb",
+     "manual_approval": null,
+     "original_admitted_at": 1793668074569958,
+     "pr": 24945,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27723,
+    "snapshot": {
+     "head_sha": "7fe387f9038e2ae45ad72a5a4abdbe8278302e34",
+     "manual_approval": null,
+     "original_admitted_at": 1793620664413923,
+     "pr": 24962,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31636,
+    "snapshot": {
+     "head_sha": "fe549d9e423b3a0359bffb655095b7813f12ddb1",
+     "manual_approval": null,
+     "original_admitted_at": 1793664704237549,
+     "pr": 25086,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27583,
+    "snapshot": {
+     "head_sha": "f2ca71cd5889b3c1c71eef4af3a42db924b57c05",
+     "manual_approval": null,
+     "original_admitted_at": 1793616190241865,
+     "pr": 25113,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 30977,
+    "snapshot": {
+     "head_sha": "fedd7a85ba41b57fb82f17b2ff168efe04695ff3",
+     "manual_approval": null,
+     "original_admitted_at": 1793684738149104,
+     "pr": 25270,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28200,
+    "snapshot": {
+     "head_sha": "a8883245eeff805a80b3bb8a7af8af11ac4d4531",
+     "manual_approval": null,
+     "original_admitted_at": 1793680189562075,
+     "pr": 25376,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28790,
+    "snapshot": {
+     "head_sha": "a484d90ca1feb4e013361d6f644253f6087c433b",
+     "manual_approval": null,
+     "original_admitted_at": 1793634798386620,
+     "pr": 25416,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28187,
+    "snapshot": {
+     "head_sha": "f39e7e0f06a9bfa98e04a763c0697dc1c4c09378",
+     "manual_approval": null,
+     "original_admitted_at": 1793690105507332,
+     "pr": 25458,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31785,
+    "snapshot": {
+     "head_sha": "feecb403f64875682a8c867cf497540a601f9ad7",
+     "manual_approval": null,
+     "original_admitted_at": 1793741688715536,
+     "pr": 25470,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28197,
+    "snapshot": {
+     "head_sha": "c7850c7055c642e5add3302c039065342ad9f0b1",
+     "manual_approval": null,
+     "original_admitted_at": 1793691011645368,
+     "pr": 25502,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27966,
+    "snapshot": {
+     "head_sha": "c83f992852aa377fa7f2a32ffce11e279f100a5e",
+     "manual_approval": null,
+     "original_admitted_at": 1793685514083320,
+     "pr": 25503,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31321,
+    "snapshot": {
+     "head_sha": "19bebe78283f11b30fa1df60bb5acc9c6b9f95ad",
+     "manual_approval": null,
+     "original_admitted_at": 1793645321346122,
+     "pr": 25734,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 32241,
+    "snapshot": {
+     "head_sha": "eeeda3832a52f19ce1137b242a5bb35ae9afe669",
+     "manual_approval": null,
+     "original_admitted_at": 1793751985073248,
+     "pr": 25774,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31767,
+    "snapshot": {
+     "head_sha": "21315e2db762cecf0c0ca266c6af15cceb186b94",
+     "manual_approval": null,
+     "original_admitted_at": 1793739821101995,
+     "pr": 25860,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31513,
+    "snapshot": {
+     "head_sha": "6f76eafe7de746f6c043a2c188382b4f54e43077",
+     "manual_approval": null,
+     "original_admitted_at": 1793655110584683,
+     "pr": 25889,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31514,
+    "snapshot": {
+     "head_sha": "36e0d2ab05c062724c9e39270d1290c57f3962bd",
+     "manual_approval": null,
+     "original_admitted_at": 1793657042516946,
+     "pr": 25894,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31618,
+    "snapshot": {
+     "head_sha": "9cf068851fdcbad4f8bccc6e96a8c230fef8ee8c",
+     "manual_approval": null,
+     "original_admitted_at": 1793736830142442,
+     "pr": 25956,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31689,
+    "snapshot": {
+     "head_sha": "6e091127adfbbc82953f473d0572cbcbd5547d89",
+     "manual_approval": null,
+     "original_admitted_at": 1793664727688419,
+     "pr": 26067,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31690,
+    "snapshot": {
+     "head_sha": "3b58f3e8552882a54ab94c5c1607d98a4fb34a73",
+     "manual_approval": null,
+     "original_admitted_at": 1793665936090514,
+     "pr": 26070,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28188,
+    "snapshot": {
+     "head_sha": "70878d40a196f2411e1befbfaaaa5860994be802",
+     "manual_approval": null,
+     "original_admitted_at": 1793690135847346,
+     "pr": 26078,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31691,
+    "snapshot": {
+     "head_sha": "236fb2032e3eae76185bb848f2a0200b5772a407",
+     "manual_approval": null,
+     "original_admitted_at": 1793668157589601,
+     "pr": 26084,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31692,
+    "snapshot": {
+     "head_sha": "859af89454a766af1f47f524b189e528bb4bbafa",
+     "manual_approval": null,
+     "original_admitted_at": 1793668784818625,
+     "pr": 26097,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27584,
+    "snapshot": {
+     "head_sha": "90d9cd1c86c4600862f3ffe1551f4fa0a4a57416",
+     "manual_approval": null,
+     "original_admitted_at": 1793619758887495,
+     "pr": 26105,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31693,
+    "snapshot": {
+     "head_sha": "68c99a4999498579adc75f4f9625d5f326a8cf0d",
+     "manual_approval": null,
+     "original_admitted_at": 1793633486351550,
+     "pr": 26110,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31694,
+    "snapshot": {
+     "head_sha": "e9abd5fe2057b419ed7c05a71e443cf79a15569b",
+     "manual_approval": null,
+     "original_admitted_at": 1793665011708668,
+     "pr": 26115,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27585,
+    "snapshot": {
+     "head_sha": "490b7dcd8f08c75f78a83e34618e382cc1930efe",
+     "manual_approval": null,
+     "original_admitted_at": 1793619674726277,
+     "pr": 26123,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28201,
+    "snapshot": {
+     "head_sha": "2b056a7d452d0f8eba0beb6e19b776771e3cc908",
+     "manual_approval": null,
+     "original_admitted_at": 1793668983014445,
+     "pr": 26135,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28202,
+    "snapshot": {
+     "head_sha": "c2922329ef2b15ede70c07f90bbeb11f5db3c1c5",
+     "manual_approval": null,
+     "original_admitted_at": 1793637052478759,
+     "pr": 26157,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28203,
+    "snapshot": {
+     "head_sha": "17f651870a4b0342d7e2ff7e3af9bc1299723729",
+     "manual_approval": null,
+     "original_admitted_at": 1793669566056677,
+     "pr": 26169,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28204,
+    "snapshot": {
+     "head_sha": "b2b3f0a91815081c027ce6f55c0f5e598897c91c",
+     "manual_approval": null,
+     "original_admitted_at": 1793671996468067,
+     "pr": 26202,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28205,
+    "snapshot": {
+     "head_sha": "15391625f739586c00f149687e61fb14cf3a0a47",
+     "manual_approval": null,
+     "original_admitted_at": 1793640068984151,
+     "pr": 26209,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28206,
+    "snapshot": {
+     "head_sha": "3c264b171d0a7b53e66259a20db35bc9fc5cbf53",
+     "manual_approval": null,
+     "original_admitted_at": 1793633643872350,
+     "pr": 26212,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28207,
+    "snapshot": {
+     "head_sha": "1989d66f0938a99684c22916c40b680b342af23b",
+     "manual_approval": null,
+     "original_admitted_at": 1793671728549197,
+     "pr": 26216,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28208,
+    "snapshot": {
+     "head_sha": "caa60fa49d0f204ce8e2ff3404268183e675b25b",
+     "manual_approval": null,
+     "original_admitted_at": 1793637343761385,
+     "pr": 26241,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 33122,
+    "snapshot": {
+     "head_sha": "7d0fe5ba6b0f673f9da6495097227b6e27824a4f",
+     "manual_approval": null,
+     "original_admitted_at": 1793725319910797,
+     "pr": 26270,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28209,
+    "snapshot": {
+     "head_sha": "1bd4a4bbd7a6405296ca9eed996ef7f1e85d371e",
+     "manual_approval": null,
+     "original_admitted_at": 1793635069142389,
+     "pr": 26271,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 29449,
+    "snapshot": {
+     "head_sha": "b3fa0a6684047244c1330bc0c4989122d0f48c53",
+     "manual_approval": null,
+     "original_admitted_at": 1793648377372408,
+     "pr": 26281,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 29450,
+    "snapshot": {
+     "head_sha": "cbe761dddfd10a0e6efaec953bf781cc9c205f74",
+     "manual_approval": null,
+     "original_admitted_at": 1793643892343185,
+     "pr": 26284,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 29451,
+    "snapshot": {
+     "head_sha": "1da0cff2855902d8e4552b5d7a75c39537f604bb",
+     "manual_approval": null,
+     "original_admitted_at": 1793645070787404,
+     "pr": 26287,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 29452,
+    "snapshot": {
+     "head_sha": "134e8dda5a201c19c9a722f6fe6421cf648c2b4d",
+     "manual_approval": null,
+     "original_admitted_at": 1793646653943674,
+     "pr": 26291,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 29453,
+    "snapshot": {
+     "head_sha": "4434dc5ae585cac4526bead45c839befef0ac300",
+     "manual_approval": null,
+     "original_admitted_at": 1793643693823120,
+     "pr": 26292,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 29454,
+    "snapshot": {
+     "head_sha": "ca704bb8ae92b73606a08fc0fd2b61601081cdb1",
+     "manual_approval": null,
+     "original_admitted_at": 1793643367576774,
+     "pr": 26293,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31614,
+    "snapshot": {
+     "head_sha": "dd355208530a9edbc20df0ef3d445003550c6b53",
+     "manual_approval": null,
+     "original_admitted_at": 1793736440693508,
+     "pr": 26352,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 32269,
+    "snapshot": {
+     "head_sha": "2ad00aa08074912cd21135cc78127f925ca18c84",
+     "manual_approval": null,
+     "original_admitted_at": 1793754694086375,
+     "pr": 26386,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31770,
+    "snapshot": {
+     "head_sha": "e01d7811f9497ad812181fa2d74cf6201e6fd1a6",
+     "manual_approval": null,
+     "original_admitted_at": 1793740129568684,
+     "pr": 26401,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28210,
+    "snapshot": {
+     "head_sha": "3c737fb156228a5d623b864e77eeb59a77f1045b",
+     "manual_approval": null,
+     "original_admitted_at": 1793680499310304,
+     "pr": 26416,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 33137,
+    "snapshot": {
+     "head_sha": "c8e2cd978e86cf194088fb40f6fd4ab0a98289d0",
+     "manual_approval": null,
+     "original_admitted_at": 1793725650503259,
+     "pr": 26491,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 28211,
+    "snapshot": {
+     "head_sha": "7463bdb2180b88431796f5fb91b0947e8883c9b3",
+     "manual_approval": null,
+     "original_admitted_at": 1793681567882938,
+     "pr": 26549,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 27967,
+    "snapshot": {
+     "head_sha": "ebb163443f7b942002b649c937f369a807232fb3",
+     "manual_approval": null,
+     "original_admitted_at": 1793685536707922,
+     "pr": 26595,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 29493,
+    "snapshot": {
+     "head_sha": "f8a5e3ce9964ce1348fa40ded1cee72a2c5f992f",
+     "manual_approval": null,
+     "original_admitted_at": 1793643913065831,
+     "pr": 26697,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 30942,
+    "snapshot": {
+     "head_sha": "ce3632a57b39bdb7753c6536eb6e1ce672d67935",
+     "manual_approval": null,
+     "original_admitted_at": 1793696296687134,
+     "pr": 26745,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 30951,
+    "snapshot": {
+     "head_sha": "300d807c955868e62f94ae57be4efee137a8ca45",
+     "manual_approval": null,
+     "original_admitted_at": 1793686368127918,
+     "pr": 26837,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 30954,
+    "snapshot": {
+     "head_sha": "7136bbf5e91bd5c6cadffa22aaa5b7c164346160",
+     "manual_approval": null,
+     "original_admitted_at": 1793673714539934,
+     "pr": 26860,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 33181,
+    "snapshot": {
+     "head_sha": "ddf3470a10a268c31403517712960e71ef4491eb",
+     "manual_approval": null,
+     "original_admitted_at": 1793708574308681,
+     "pr": 27000,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 33186,
+    "snapshot": {
+     "head_sha": "db5380c5f8094de464e404c9d2cea91b739039f2",
+     "manual_approval": null,
+     "original_admitted_at": 1793708562357160,
+     "pr": 27022,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 33189,
+    "snapshot": {
+     "head_sha": "0f73a5bf72364117684446dbc0787d9df32aa33c",
+     "manual_approval": null,
+     "original_admitted_at": 1793725902250102,
+     "pr": 27049,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 32258,
+    "snapshot": {
+     "head_sha": "97ba7581ffa35640d57a141dabc78a4aa21a055d",
+     "manual_approval": null,
+     "original_admitted_at": 1793753505509332,
+     "pr": 27077,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31604,
+    "snapshot": {
+     "head_sha": "5119e5bb0dcf368cbf22303981fdc06694e983dc",
+     "manual_approval": null,
+     "original_admitted_at": 1793735552177904,
+     "pr": 27084,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31776,
+    "snapshot": {
+     "head_sha": "7f13d3244bc6f0908b81b545e80660cd74c3280b",
+     "manual_approval": null,
+     "original_admitted_at": 1793740764560571,
+     "pr": 27104,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 32232,
+    "snapshot": {
+     "head_sha": "2f5c851edb582afdc38894783540258c8fd8da1c",
+     "manual_approval": null,
+     "original_admitted_at": 1793751116822396,
+     "pr": 27138,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31600,
+    "snapshot": {
+     "head_sha": "c4a435efc04e02ee26fe221fe81a637e343fd07c",
+     "manual_approval": null,
+     "original_admitted_at": 1793735022264250,
+     "pr": 27167,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31606,
+    "snapshot": {
+     "head_sha": "458bde8accd9095d7e3dd575c427ec4f11cc1925",
+     "manual_approval": null,
+     "original_admitted_at": 1793735594289931,
+     "pr": 27180,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 32246,
+    "snapshot": {
+     "head_sha": "f41f372c2f79206471c3be62ca839098c150e9c0",
+     "manual_approval": null,
+     "original_admitted_at": 1793752626836099,
+     "pr": 27213,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 32251,
+    "snapshot": {
+     "head_sha": "ff06309695cf240031faccf59baa7cb5abc4bf5b",
+     "manual_approval": null,
+     "original_admitted_at": 1793752913064839,
+     "pr": 27226,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 31920,
+    "snapshot": {
+     "head_sha": "997a4757c7f4949ed808c45df5eaf772514b74d4",
+     "manual_approval": null,
+     "original_admitted_at": 1793743609000463,
+     "pr": 27255,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 32259,
+    "snapshot": {
+     "head_sha": "dcaded01d66967a390a938fc158559df9caf208e",
+     "manual_approval": null,
+     "original_admitted_at": 1793753774725494,
+     "pr": 27303,
+     "reviewer": "tauceti-review-bot[bot]",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   },
+   {
+    "batch_id": null,
+    "id": 33212,
+    "snapshot": {
+     "head_sha": "b65a5f795d95e3d4514aaafb4c2c9e9539af3d71",
+     "manual_approval": {
+      "actor_id": 477956,
+      "head_sha": "b65a5f795d95e3d4514aaafb4c2c9e9539af3d71",
+      "merge_base_sha": "178f807996a4d882a79e4cef922aa9270c2ff11e"
+     },
+     "original_admitted_at": 1793766213956609,
+     "pr": 27473,
+     "reviewer": "kim-em",
+     "scheduling": {
+      "priority": 0,
+      "singleton": false
+     },
+     "source": "bors.admission"
+    }
+   }
+  ],
+  "base": "main",
+  "candidates": [],
+  "repo": "TauCetiProject/TauCeti",
+  "schema": "tauceti-bors.candidates/v1",
+  "timestamp_unit": "unix_microseconds"
+ },
+ "observation": {
+  "base": "main",
+  "batch_ids": [
+   2598,
+   2640,
+   2639,
+   2637,
+   2636,
+   2630,
+   2626,
+   2625,
+   2624,
+   2619,
+   2618,
+   2617,
+   2614,
+   2613,
+   2612,
+   2611,
+   2606,
+   2602,
+   2597
+  ],
+  "batches": [
+   {
+    "base": "main",
+    "base_sha": "7ed979dc2eacd36a3962e1fdf3b481323fb3fb8b",
+    "head_sha": "cad83a3807f1e14c8e991bee175807511d6666e5",
+    "id": 2598,
+    "members": [
+     {
+      "head_sha": "b65a5f795d95e3d4514aaafb4c2c9e9539af3d71",
+      "pr": 27473
+     },
+     {
+      "head_sha": "db5380c5f8094de464e404c9d2cea91b739039f2",
+      "pr": 27022
+     },
+     {
+      "head_sha": "ddf3470a10a268c31403517712960e71ef4491eb",
+      "pr": 27000
+     },
+     {
+      "head_sha": "7d0fe5ba6b0f673f9da6495097227b6e27824a4f",
+      "pr": 26270
+     },
+     {
+      "head_sha": "c8e2cd978e86cf194088fb40f6fd4ab0a98289d0",
+      "pr": 26491
+     },
+     {
+      "head_sha": "0f73a5bf72364117684446dbc0787d9df32aa33c",
+      "pr": 27049
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "running",
+    "train": {
+     "candidate_id": 1948,
+     "generation": 4,
+     "predecessor_id": null,
+     "staging_ref": "staging-candidate-1948-4"
+    }
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2640,
+    "members": [
+     {
+      "head_sha": "70878d40a196f2411e1befbfaaaa5860994be802",
+      "pr": 26078
+     },
+     {
+      "head_sha": "bf1a04ed1f005b5ed62ae0207c87dd9954f787f1",
+      "pr": 27549
+     },
+     {
+      "head_sha": "d04cbdf8f8cdaa5d724f78a830b6e6a831820b58",
+      "pr": 25653
+     },
+     {
+      "head_sha": "6c73e2abca89587f2b15e7c475b82ee8275e53e5",
+      "pr": 27347
+     },
+     {
+      "head_sha": "3070290c1478cc4723765d60f1b088b5294c321d",
+      "pr": 27389
+     },
+     {
+      "head_sha": "9d9170a397525f14ece6a6997866d9dff1d93156",
+      "pr": 27362
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": false,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2639,
+    "members": [
+     {
+      "head_sha": "6f76eafe7de746f6c043a2c188382b4f54e43077",
+      "pr": 25889
+     },
+     {
+      "head_sha": "36e0d2ab05c062724c9e39270d1290c57f3962bd",
+      "pr": 25894
+     },
+     {
+      "head_sha": "8e0e29ab74e5d5f1e6929951a5f4f6a5f952ed48",
+      "pr": 20359
+     },
+     {
+      "head_sha": "059a8927a6933191e561cafaf543ad65f6decacb",
+      "pr": 24202
+     },
+     {
+      "head_sha": "475fa49b95179b7fbcda9b22223e5b96fe00f16a",
+      "pr": 24231
+     },
+     {
+      "head_sha": "6e12098e3bb3b0be1219e1238259786100fe7dcc",
+      "pr": 24704
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2637,
+    "members": [
+     {
+      "head_sha": "19bebe78283f11b30fa1df60bb5acc9c6b9f95ad",
+      "pr": 25734
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2636,
+    "members": [
+     {
+      "head_sha": "ec2897210c9aa934dfce91390aa403592a8c6bc6",
+      "pr": 27408
+     },
+     {
+      "head_sha": "987fd1a208a7d9a5e47c7370f5be99c3ab282950",
+      "pr": 27107
+     },
+     {
+      "head_sha": "55878220a230ac7f885a2a25c121eaeaae5231b2",
+      "pr": 27335
+     },
+     {
+      "head_sha": "b85252fa7730780fb208bd8c896b6e6d66205eb9",
+      "pr": 27422
+     },
+     {
+      "head_sha": "cef0dd279e29a4e688e57c3da4545cd9d6c88474",
+      "pr": 27010
+     },
+     {
+      "head_sha": "ee3f69b26acbe052abd221dfea4bf0c27bcc2c9f",
+      "pr": 27252
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": false,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2630,
+    "members": [
+     {
+      "head_sha": "eeeda3832a52f19ce1137b242a5bb35ae9afe669",
+      "pr": 25774
+     },
+     {
+      "head_sha": "f41f372c2f79206471c3be62ca839098c150e9c0",
+      "pr": 27213
+     },
+     {
+      "head_sha": "ff06309695cf240031faccf59baa7cb5abc4bf5b",
+      "pr": 27226
+     },
+     {
+      "head_sha": "97ba7581ffa35640d57a141dabc78a4aa21a055d",
+      "pr": 27077
+     },
+     {
+      "head_sha": "dcaded01d66967a390a938fc158559df9caf208e",
+      "pr": 27303
+     },
+     {
+      "head_sha": "2ad00aa08074912cd21135cc78127f925ca18c84",
+      "pr": 26386
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": false,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2626,
+    "members": [
+     {
+      "head_sha": "6e091127adfbbc82953f473d0572cbcbd5547d89",
+      "pr": 26067
+     },
+     {
+      "head_sha": "3b58f3e8552882a54ab94c5c1607d98a4fb34a73",
+      "pr": 26070
+     },
+     {
+      "head_sha": "236fb2032e3eae76185bb848f2a0200b5772a407",
+      "pr": 26084
+     },
+     {
+      "head_sha": "859af89454a766af1f47f524b189e528bb4bbafa",
+      "pr": 26097
+     },
+     {
+      "head_sha": "68c99a4999498579adc75f4f9625d5f326a8cf0d",
+      "pr": 26110
+     },
+     {
+      "head_sha": "e9abd5fe2057b419ed7c05a71e443cf79a15569b",
+      "pr": 26115
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2625,
+    "members": [
+     {
+      "head_sha": "40b94f8d0020a65c56b0c1c69ec25c42564256ed",
+      "pr": 21209
+     },
+     {
+      "head_sha": "5d1ac9abe6a4ff63014fcfd4b70a81eab14857e2",
+      "pr": 23816
+     },
+     {
+      "head_sha": "13086ffe99d06b1adf6a171147472ece384ff050",
+      "pr": 23830
+     },
+     {
+      "head_sha": "1021f819dc8eeeeaab9fcf42603472c5d7500bed",
+      "pr": 24650
+     },
+     {
+      "head_sha": "f7e12161fd38591be8ee0e4f2c43e8ee434dbfbb",
+      "pr": 24945
+     },
+     {
+      "head_sha": "fe549d9e423b3a0359bffb655095b7813f12ddb1",
+      "pr": 25086
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2624,
+    "members": [
+     {
+      "head_sha": "21315e2db762cecf0c0ca266c6af15cceb186b94",
+      "pr": 25860
+     },
+     {
+      "head_sha": "feecb403f64875682a8c867cf497540a601f9ad7",
+      "pr": 25470
+     },
+     {
+      "head_sha": "997a4757c7f4949ed808c45df5eaf772514b74d4",
+      "pr": 27255
+     },
+     {
+      "head_sha": "e01d7811f9497ad812181fa2d74cf6201e6fd1a6",
+      "pr": 26401
+     },
+     {
+      "head_sha": "7f13d3244bc6f0908b81b545e80660cd74c3280b",
+      "pr": 27104
+     },
+     {
+      "head_sha": "2ff9e97d94c0062a00c57c2ecf6367a7077e66e4",
+      "pr": 27430
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": false,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2619,
+    "members": [
+     {
+      "head_sha": "5119e5bb0dcf368cbf22303981fdc06694e983dc",
+      "pr": 27084
+     },
+     {
+      "head_sha": "c4a435efc04e02ee26fe221fe81a637e343fd07c",
+      "pr": 27167
+     },
+     {
+      "head_sha": "458bde8accd9095d7e3dd575c427ec4f11cc1925",
+      "pr": 27180
+     },
+     {
+      "head_sha": "dd355208530a9edbc20df0ef3d445003550c6b53",
+      "pr": 26352
+     },
+     {
+      "head_sha": "9cf068851fdcbad4f8bccc6e96a8c230fef8ee8c",
+      "pr": 25956
+     },
+     {
+      "head_sha": "cf0f122ac770adcdb0e30e01f3a567b2a166535f",
+      "pr": 25424
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": false,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2618,
+    "members": [
+     {
+      "head_sha": "b3fa0a6684047244c1330bc0c4989122d0f48c53",
+      "pr": 26281
+     },
+     {
+      "head_sha": "cbe761dddfd10a0e6efaec953bf781cc9c205f74",
+      "pr": 26284
+     },
+     {
+      "head_sha": "1da0cff2855902d8e4552b5d7a75c39537f604bb",
+      "pr": 26287
+     },
+     {
+      "head_sha": "134e8dda5a201c19c9a722f6fe6421cf648c2b4d",
+      "pr": 26291
+     },
+     {
+      "head_sha": "4434dc5ae585cac4526bead45c839befef0ac300",
+      "pr": 26292
+     },
+     {
+      "head_sha": "ca704bb8ae92b73606a08fc0fd2b61601081cdb1",
+      "pr": 26293
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2617,
+    "members": [
+     {
+      "head_sha": "f8a5e3ce9964ce1348fa40ded1cee72a2c5f992f",
+      "pr": 26697
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2614,
+    "members": [
+     {
+      "head_sha": "a484d90ca1feb4e013361d6f644253f6087c433b",
+      "pr": 25416
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2613,
+    "members": [
+     {
+      "head_sha": "ce3632a57b39bdb7753c6536eb6e1ce672d67935",
+      "pr": 26745
+     },
+     {
+      "head_sha": "300d807c955868e62f94ae57be4efee137a8ca45",
+      "pr": 26837
+     },
+     {
+      "head_sha": "7136bbf5e91bd5c6cadffa22aaa5b7c164346160",
+      "pr": 26860
+     },
+     {
+      "head_sha": "d469638b6a95a70b51d55d18427ab69460670d18",
+      "pr": 24556
+     },
+     {
+      "head_sha": "cb63efda5211b73c57620ea52390d050cce3d621",
+      "pr": 24589
+     },
+     {
+      "head_sha": "fedd7a85ba41b57fb82f17b2ff168efe04695ff3",
+      "pr": 25270
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2612,
+    "members": [
+     {
+      "head_sha": "2b056a7d452d0f8eba0beb6e19b776771e3cc908",
+      "pr": 26135
+     },
+     {
+      "head_sha": "c2922329ef2b15ede70c07f90bbeb11f5db3c1c5",
+      "pr": 26157
+     },
+     {
+      "head_sha": "b2b3f0a91815081c027ce6f55c0f5e598897c91c",
+      "pr": 26202
+     },
+     {
+      "head_sha": "1989d66f0938a99684c22916c40b680b342af23b",
+      "pr": 26216
+     },
+     {
+      "head_sha": "1bd4a4bbd7a6405296ca9eed996ef7f1e85d371e",
+      "pr": 26271
+     },
+     {
+      "head_sha": "7463bdb2180b88431796f5fb91b0947e8883c9b3",
+      "pr": 26549
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2611,
+    "members": [
+     {
+      "head_sha": "a8883245eeff805a80b3bb8a7af8af11ac4d4531",
+      "pr": 25376
+     },
+     {
+      "head_sha": "17f651870a4b0342d7e2ff7e3af9bc1299723729",
+      "pr": 26169
+     },
+     {
+      "head_sha": "15391625f739586c00f149687e61fb14cf3a0a47",
+      "pr": 26209
+     },
+     {
+      "head_sha": "3c264b171d0a7b53e66259a20db35bc9fc5cbf53",
+      "pr": 26212
+     },
+     {
+      "head_sha": "caa60fa49d0f204ce8e2ff3404268183e675b25b",
+      "pr": 26241
+     },
+     {
+      "head_sha": "3c737fb156228a5d623b864e77eeb59a77f1045b",
+      "pr": 26416
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2606,
+    "members": [
+     {
+      "head_sha": "0b89c11e8afcfb9090473cc79f044bef4e9c5ac4",
+      "pr": 24450
+     },
+     {
+      "head_sha": "9a664eecccbb9800d990f900f6ce8d2a35c533f0",
+      "pr": 24769
+     },
+     {
+      "head_sha": "2a1ca451d7b33968dde455edc1ada850fe782822",
+      "pr": 24837
+     },
+     {
+      "head_sha": "9e1d477c8284c66be971dcccb2aceb24d0251576",
+      "pr": 24874
+     },
+     {
+      "head_sha": "5a957b4109f8c829a2ea46cb3dacf4ac5e5073be",
+      "pr": 24906
+     },
+     {
+      "head_sha": "7fe387f9038e2ae45ad72a5a4abdbe8278302e34",
+      "pr": 24962
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2602,
+    "members": [
+     {
+      "head_sha": "f2ca71cd5889b3c1c71eef4af3a42db924b57c05",
+      "pr": 25113
+     },
+     {
+      "head_sha": "90d9cd1c86c4600862f3ffe1551f4fa0a4a57416",
+      "pr": 26105
+     },
+     {
+      "head_sha": "490b7dcd8f08c75f78a83e34618e382cc1930efe",
+      "pr": 26123
+     },
+     {
+      "head_sha": "690569d31bde53af512beec4298855d0a1dffd94",
+      "pr": 24255
+     },
+     {
+      "head_sha": "d55c4670365a267d514836d78595e0202c7e4302",
+      "pr": 24491
+     },
+     {
+      "head_sha": "18a815f229cfc858faed76ff460b07e3fd0bd68f",
+      "pr": 24551
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": true,
+    "state": "waiting",
+    "train": null
+   },
+   {
+    "base": "main",
+    "base_sha": null,
+    "head_sha": null,
+    "id": 2597,
+    "members": [
+     {
+      "head_sha": "ebb163443f7b942002b649c937f369a807232fb3",
+      "pr": 26595
+     },
+     {
+      "head_sha": "f39e7e0f06a9bfa98e04a763c0697dc1c4c09378",
+      "pr": 25458
+     },
+     {
+      "head_sha": "c83f992852aa377fa7f2a32ffce11e279f100a5e",
+      "pr": 25503
+     },
+     {
+      "head_sha": "c7850c7055c642e5add3302c039065342ad9f0b1",
+      "pr": 25502
+     },
+     {
+      "head_sha": "2f5c851edb582afdc38894783540258c8fd8da1c",
+      "pr": 27138
+     },
+     {
+      "head_sha": "bd6af9649bb0ab1cbfa0bee8146fadb178803897",
+      "pr": 21283
+     }
+    ],
+    "promotion_failures": 0,
+    "promotion_retry_at": 0,
+    "recovery_after": 0,
+    "recovery_failures": 0,
+    "sealed": false,
+    "state": "waiting",
+    "train": null
+   }
+  ],
+  "bump_repairs": [],
+  "handoff": {
+   "backend": "bors",
+   "bors_count": 19,
+   "candidate_scan_complete": false,
+   "candidate_snapshot_at": null,
+   "eligible": [
+    {
+     "head_sha": "cf0f122ac770adcdb0e30e01f3a567b2a166535f",
+     "pr": 25424,
+     "queued": false,
+     "ready": true
+    },
+    {
+     "head_sha": "236fb2032e3eae76185bb848f2a0200b5772a407",
+     "pr": 26084,
+     "queued": false,
+     "ready": true
+    },
+    {
+     "head_sha": "bd6af9649bb0ab1cbfa0bee8146fadb178803897",
+     "pr": 21283,
+     "queued": false,
+     "ready": true
+    },
+    {
+     "head_sha": "cbe761dddfd10a0e6efaec953bf781cc9c205f74",
+     "pr": 26284,
+     "queued": false,
+     "ready": true
+    },
+    {
+     "head_sha": "8e0e29ab74e5d5f1e6929951a5f4f6a5f952ed48",
+     "pr": 20359,
+     "queued": false,
+     "ready": true
+    }
+   ],
+   "github_count": 0,
+   "observed_at": "2026-11-04T07:35:09.483467Z",
+   "overlap": false,
+   "pending": 30,
+   "reason": "drained",
+   "released_github_prs": [],
+   "updated_at": "2026-10-12T08:12:15Z"
+  },
+  "held": [],
+  "outcomes": [
+   {
+    "batch_id": 2640,
+    "head_sha": "6c73e2abca89587f2b15e7c475b82ee8275e53e5",
+    "pr": 27347,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2640,
+    "head_sha": "70878d40a196f2411e1befbfaaaa5860994be802",
+    "pr": 26078,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2640,
+    "head_sha": "d04cbdf8f8cdaa5d724f78a830b6e6a831820b58",
+    "pr": 25653,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2640,
+    "head_sha": "bf1a04ed1f005b5ed62ae0207c87dd9954f787f1",
+    "pr": 27549,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2640,
+    "head_sha": "9d9170a397525f14ece6a6997866d9dff1d93156",
+    "pr": 27362,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2640,
+    "head_sha": "3070290c1478cc4723765d60f1b088b5294c321d",
+    "pr": 27389,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2639,
+    "head_sha": "6e12098e3bb3b0be1219e1238259786100fe7dcc",
+    "pr": 24704,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2639,
+    "head_sha": "475fa49b95179b7fbcda9b22223e5b96fe00f16a",
+    "pr": 24231,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2639,
+    "head_sha": "059a8927a6933191e561cafaf543ad65f6decacb",
+    "pr": 24202,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2639,
+    "head_sha": "8e0e29ab74e5d5f1e6929951a5f4f6a5f952ed48",
+    "pr": 20359,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2639,
+    "head_sha": "36e0d2ab05c062724c9e39270d1290c57f3962bd",
+    "pr": 25894,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2639,
+    "head_sha": "6f76eafe7de746f6c043a2c188382b4f54e43077",
+    "pr": 25889,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2637,
+    "head_sha": "19bebe78283f11b30fa1df60bb5acc9c6b9f95ad",
+    "pr": 25734,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2636,
+    "head_sha": "987fd1a208a7d9a5e47c7370f5be99c3ab282950",
+    "pr": 27107,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2636,
+    "head_sha": "ec2897210c9aa934dfce91390aa403592a8c6bc6",
+    "pr": 27408,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2636,
+    "head_sha": "b85252fa7730780fb208bd8c896b6e6d66205eb9",
+    "pr": 27422,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2636,
+    "head_sha": "55878220a230ac7f885a2a25c121eaeaae5231b2",
+    "pr": 27335,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2636,
+    "head_sha": "ee3f69b26acbe052abd221dfea4bf0c27bcc2c9f",
+    "pr": 27252,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2636,
+    "head_sha": "cef0dd279e29a4e688e57c3da4545cd9d6c88474",
+    "pr": 27010,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2630,
+    "head_sha": "eeeda3832a52f19ce1137b242a5bb35ae9afe669",
+    "pr": 25774,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2630,
+    "head_sha": "f41f372c2f79206471c3be62ca839098c150e9c0",
+    "pr": 27213,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2630,
+    "head_sha": "ff06309695cf240031faccf59baa7cb5abc4bf5b",
+    "pr": 27226,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2630,
+    "head_sha": "97ba7581ffa35640d57a141dabc78a4aa21a055d",
+    "pr": 27077,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2630,
+    "head_sha": "dcaded01d66967a390a938fc158559df9caf208e",
+    "pr": 27303,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2630,
+    "head_sha": "2ad00aa08074912cd21135cc78127f925ca18c84",
+    "pr": 26386,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2626,
+    "head_sha": "e9abd5fe2057b419ed7c05a71e443cf79a15569b",
+    "pr": 26115,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2626,
+    "head_sha": "68c99a4999498579adc75f4f9625d5f326a8cf0d",
+    "pr": 26110,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2626,
+    "head_sha": "859af89454a766af1f47f524b189e528bb4bbafa",
+    "pr": 26097,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2626,
+    "head_sha": "236fb2032e3eae76185bb848f2a0200b5772a407",
+    "pr": 26084,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2626,
+    "head_sha": "3b58f3e8552882a54ab94c5c1607d98a4fb34a73",
+    "pr": 26070,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2626,
+    "head_sha": "6e091127adfbbc82953f473d0572cbcbd5547d89",
+    "pr": 26067,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2625,
+    "head_sha": "40b94f8d0020a65c56b0c1c69ec25c42564256ed",
+    "pr": 21209,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2625,
+    "head_sha": "5d1ac9abe6a4ff63014fcfd4b70a81eab14857e2",
+    "pr": 23816,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2625,
+    "head_sha": "13086ffe99d06b1adf6a171147472ece384ff050",
+    "pr": 23830,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2625,
+    "head_sha": "1021f819dc8eeeeaab9fcf42603472c5d7500bed",
+    "pr": 24650,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2625,
+    "head_sha": "f7e12161fd38591be8ee0e4f2c43e8ee434dbfbb",
+    "pr": 24945,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2625,
+    "head_sha": "fe549d9e423b3a0359bffb655095b7813f12ddb1",
+    "pr": 25086,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2624,
+    "head_sha": "7f13d3244bc6f0908b81b545e80660cd74c3280b",
+    "pr": 27104,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2624,
+    "head_sha": "e01d7811f9497ad812181fa2d74cf6201e6fd1a6",
+    "pr": 26401,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2624,
+    "head_sha": "997a4757c7f4949ed808c45df5eaf772514b74d4",
+    "pr": 27255,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2624,
+    "head_sha": "feecb403f64875682a8c867cf497540a601f9ad7",
+    "pr": 25470,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2624,
+    "head_sha": "21315e2db762cecf0c0ca266c6af15cceb186b94",
+    "pr": 25860,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2624,
+    "head_sha": "2ff9e97d94c0062a00c57c2ecf6367a7077e66e4",
+    "pr": 27430,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2619,
+    "head_sha": "cf0f122ac770adcdb0e30e01f3a567b2a166535f",
+    "pr": 25424,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2619,
+    "head_sha": "9cf068851fdcbad4f8bccc6e96a8c230fef8ee8c",
+    "pr": 25956,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2619,
+    "head_sha": "dd355208530a9edbc20df0ef3d445003550c6b53",
+    "pr": 26352,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2619,
+    "head_sha": "458bde8accd9095d7e3dd575c427ec4f11cc1925",
+    "pr": 27180,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2619,
+    "head_sha": "c4a435efc04e02ee26fe221fe81a637e343fd07c",
+    "pr": 27167,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2619,
+    "head_sha": "5119e5bb0dcf368cbf22303981fdc06694e983dc",
+    "pr": 27084,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2618,
+    "head_sha": "ca704bb8ae92b73606a08fc0fd2b61601081cdb1",
+    "pr": 26293,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2618,
+    "head_sha": "4434dc5ae585cac4526bead45c839befef0ac300",
+    "pr": 26292,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2618,
+    "head_sha": "134e8dda5a201c19c9a722f6fe6421cf648c2b4d",
+    "pr": 26291,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2618,
+    "head_sha": "1da0cff2855902d8e4552b5d7a75c39537f604bb",
+    "pr": 26287,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2618,
+    "head_sha": "cbe761dddfd10a0e6efaec953bf781cc9c205f74",
+    "pr": 26284,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2618,
+    "head_sha": "b3fa0a6684047244c1330bc0c4989122d0f48c53",
+    "pr": 26281,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2617,
+    "head_sha": "f8a5e3ce9964ce1348fa40ded1cee72a2c5f992f",
+    "pr": 26697,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2614,
+    "head_sha": "a484d90ca1feb4e013361d6f644253f6087c433b",
+    "pr": 25416,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2613,
+    "head_sha": "cb63efda5211b73c57620ea52390d050cce3d621",
+    "pr": 24589,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2613,
+    "head_sha": "ce3632a57b39bdb7753c6536eb6e1ce672d67935",
+    "pr": 26745,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2613,
+    "head_sha": "300d807c955868e62f94ae57be4efee137a8ca45",
+    "pr": 26837,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2613,
+    "head_sha": "7136bbf5e91bd5c6cadffa22aaa5b7c164346160",
+    "pr": 26860,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2613,
+    "head_sha": "fedd7a85ba41b57fb82f17b2ff168efe04695ff3",
+    "pr": 25270,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2613,
+    "head_sha": "d469638b6a95a70b51d55d18427ab69460670d18",
+    "pr": 24556,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2612,
+    "head_sha": "1989d66f0938a99684c22916c40b680b342af23b",
+    "pr": 26216,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2612,
+    "head_sha": "b2b3f0a91815081c027ce6f55c0f5e598897c91c",
+    "pr": 26202,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2612,
+    "head_sha": "c2922329ef2b15ede70c07f90bbeb11f5db3c1c5",
+    "pr": 26157,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2612,
+    "head_sha": "2b056a7d452d0f8eba0beb6e19b776771e3cc908",
+    "pr": 26135,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2612,
+    "head_sha": "7463bdb2180b88431796f5fb91b0947e8883c9b3",
+    "pr": 26549,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2612,
+    "head_sha": "1bd4a4bbd7a6405296ca9eed996ef7f1e85d371e",
+    "pr": 26271,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2611,
+    "head_sha": "3c264b171d0a7b53e66259a20db35bc9fc5cbf53",
+    "pr": 26212,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2611,
+    "head_sha": "3c737fb156228a5d623b864e77eeb59a77f1045b",
+    "pr": 26416,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2611,
+    "head_sha": "a8883245eeff805a80b3bb8a7af8af11ac4d4531",
+    "pr": 25376,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2611,
+    "head_sha": "17f651870a4b0342d7e2ff7e3af9bc1299723729",
+    "pr": 26169,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2611,
+    "head_sha": "15391625f739586c00f149687e61fb14cf3a0a47",
+    "pr": 26209,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2611,
+    "head_sha": "caa60fa49d0f204ce8e2ff3404268183e675b25b",
+    "pr": 26241,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2606,
+    "head_sha": "0b89c11e8afcfb9090473cc79f044bef4e9c5ac4",
+    "pr": 24450,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2606,
+    "head_sha": "9a664eecccbb9800d990f900f6ce8d2a35c533f0",
+    "pr": 24769,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2606,
+    "head_sha": "2a1ca451d7b33968dde455edc1ada850fe782822",
+    "pr": 24837,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2606,
+    "head_sha": "9e1d477c8284c66be971dcccb2aceb24d0251576",
+    "pr": 24874,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2606,
+    "head_sha": "5a957b4109f8c829a2ea46cb3dacf4ac5e5073be",
+    "pr": 24906,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2606,
+    "head_sha": "7fe387f9038e2ae45ad72a5a4abdbe8278302e34",
+    "pr": 24962,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2602,
+    "head_sha": "18a815f229cfc858faed76ff460b07e3fd0bd68f",
+    "pr": 24551,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2602,
+    "head_sha": "d55c4670365a267d514836d78595e0202c7e4302",
+    "pr": 24491,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2602,
+    "head_sha": "690569d31bde53af512beec4298855d0a1dffd94",
+    "pr": 24255,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2602,
+    "head_sha": "490b7dcd8f08c75f78a83e34618e382cc1930efe",
+    "pr": 26123,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2602,
+    "head_sha": "90d9cd1c86c4600862f3ffe1551f4fa0a4a57416",
+    "pr": 26105,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2602,
+    "head_sha": "f2ca71cd5889b3c1c71eef4af3a42db924b57c05",
+    "pr": 25113,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2598,
+    "head_sha": "0f73a5bf72364117684446dbc0787d9df32aa33c",
+    "pr": 27049,
+    "state": "running"
+   },
+   {
+    "batch_id": 2598,
+    "head_sha": "c8e2cd978e86cf194088fb40f6fd4ab0a98289d0",
+    "pr": 26491,
+    "state": "running"
+   },
+   {
+    "batch_id": 2598,
+    "head_sha": "7d0fe5ba6b0f673f9da6495097227b6e27824a4f",
+    "pr": 26270,
+    "state": "running"
+   },
+   {
+    "batch_id": 2598,
+    "head_sha": "ddf3470a10a268c31403517712960e71ef4491eb",
+    "pr": 27000,
+    "state": "running"
+   },
+   {
+    "batch_id": 2598,
+    "head_sha": "db5380c5f8094de464e404c9d2cea91b739039f2",
+    "pr": 27022,
+    "state": "running"
+   },
+   {
+    "batch_id": 2598,
+    "head_sha": "b65a5f795d95e3d4514aaafb4c2c9e9539af3d71",
+    "pr": 27473,
+    "state": "running"
+   },
+   {
+    "batch_id": 2597,
+    "head_sha": "bd6af9649bb0ab1cbfa0bee8146fadb178803897",
+    "pr": 21283,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2597,
+    "head_sha": "2f5c851edb582afdc38894783540258c8fd8da1c",
+    "pr": 27138,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2597,
+    "head_sha": "c83f992852aa377fa7f2a32ffce11e279f100a5e",
+    "pr": 25503,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2597,
+    "head_sha": "f39e7e0f06a9bfa98e04a763c0697dc1c4c09378",
+    "pr": 25458,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2597,
+    "head_sha": "ebb163443f7b942002b649c937f369a807232fb3",
+    "pr": 26595,
+    "state": "waiting"
+   },
+   {
+    "batch_id": 2597,
+    "head_sha": "c7850c7055c642e5add3302c039065342ad9f0b1",
+    "pr": 25502,
+    "state": "waiting"
+   }
+  ],
+  "repo": "TauCetiProject/TauCeti",
+  "requested_batch": null,
+  "schema": "tauceti-bors.observation/v1",
+  "scope_approvals": [
+   {
+    "actor_id": 477956,
+    "head_sha": "b65a5f795d95e3d4514aaafb4c2c9e9539af3d71",
+    "merge_base_sha": "178f807996a4d882a79e4cef922aa9270c2ff11e",
+    "pr": 27473
+   }
+  ]
+ }
+}

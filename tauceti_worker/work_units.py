@@ -1436,32 +1436,37 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
-            rc = run_to_logfile(
-                [
-                    "uvx",
-                    "--from",
-                    f"git+https://github.com/{REVIEW}"
-                    + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
-                    "tauceti-review",
-                    str(pr),
-                    "--store",
-                    str(w.cfg.store_dir),
-                    "--post",
-                    "--no-sync",
-                    "--reviewer",
-                    reviewers,
-                    *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
-                    "--expect-head",
-                    head,
-                    "--submitted-by",
-                    me(),
-                    *(["--claude-model", claude_model] if claude_model else []),
-                    *(["--codex-model", cm] if cm else []),
-                    *(["--kiro-model", km] if km else []),
-                ],
-                logf,
-                f"review #{pr}",
-            )
+            from .retention import review_workspace
+
+            with review_workspace(w.cfg) as scratch:
+                rc = run_to_logfile(
+                    [
+                        "uvx",
+                        "--from",
+                        f"git+https://github.com/{REVIEW}"
+                        + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
+                        "tauceti-review",
+                        str(pr),
+                        "--workdir",
+                        str(scratch),
+                        "--store",
+                        str(w.cfg.store_dir),
+                        "--post",
+                        "--no-sync",
+                        "--reviewer",
+                        reviewers,
+                        *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
+                        "--expect-head",
+                        head,
+                        "--submitted-by",
+                        me(),
+                        *(["--claude-model", claude_model] if claude_model else []),
+                        *(["--codex-model", cm] if cm else []),
+                        *(["--kiro-model", km] if km else []),
+                    ],
+                    logf,
+                    f"review #{pr}",
+                )
         log(f"  review #{pr}: engine rc={rc}")
         from .claude_api import check_result
 

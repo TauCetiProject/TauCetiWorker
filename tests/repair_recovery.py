@@ -648,7 +648,7 @@ class Fixture(unittest.TestCase):
         self.assertEqual(tail[tail.index("--recovery-agent") + 1], "auto")
         self.assertIn("--recovery-unpinned-profile", tail)
 
-    def test_blocked_head_change_reenables_mechanical_recovery(self):
+    def test_head_change_does_not_revive_abandoned_content(self):
         rr.write(
             self.record,
             {},
@@ -657,8 +657,8 @@ class Fixture(unittest.TestCase):
             reason=rr.reason(rr.Block("content-allowance", "spent")),
         )
         self.advance_writer()
-        self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(self.journal()["state"], "published")
+        self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "obsolete")
 
     def test_archived_backlog_does_not_delay_new_checkpoint(self):
         for n in range(30):
@@ -747,7 +747,7 @@ class Fixture(unittest.TestCase):
         self.values["fix-10-head"] = 3
         FakeVerification.failures = 1
         self.assertFalse(self.run_recovery())
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertEqual(self.journal()["reason"]["next_action"], "continue-normal-selection")
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.assertEqual(self.values["fix-10-head"], 3)
@@ -764,7 +764,8 @@ class Fixture(unittest.TestCase):
         ):
             rr.write(self.record, {}, state, reason=rr.reason(rr.Block(code, "unavailable")))
             self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
-            self.assertIn(str(self.record), rr.retained_context(self.cfg, "upstream/repo", 10))
+            if code not in {"content-allowance", "recovery-exhausted"}:
+                self.assertIn(str(self.record), rr.retained_context(self.cfg, "upstream/repo", 10))
         self.assertEqual(saved._complete(self.record), self.manifest)
         self.assertFalse((self.record / "operator.json").exists())
 
@@ -822,7 +823,7 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["attempts"], 3)
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
 
-    def test_old_one_continuation_block_uses_remaining_original_budget(self):
+    def test_legacy_exhausted_content_does_not_restart_paid_repair(self):
         self.values["fix-10-head"] = 1
         FakeVerification.failures = 2
         calls = []
@@ -842,10 +843,10 @@ class Fixture(unittest.TestCase):
             journal.pop("protocol")
             journal.update(state="blocked", reason=dict(code="content-allowance"), retry_at=10**12)
             rr.atomic_json(self.record / "recovery.json", journal)
-            self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(self.values["fix-10-head"], 3)
-        self.assertEqual(self.journal()["state"], "published")
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.values["fix-10-head"], 2)
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertFalse((self.record / "operator.json").exists())
 
     def test_blocked_record_allows_fresh_dispatch_under_normal_quota_checks(self):
@@ -989,18 +990,18 @@ class Fixture(unittest.TestCase):
         self.assertEqual(git(self.remote, "rev-parse", "main"), writer)
         self.assertEqual(FakeVerification.calls, 1)
 
-    def test_three_failures_release_pr_and_changed_head_rearms(self):
+    def test_three_failures_release_pr_without_reviving_abandoned_work(self):
         with patch.object(self.backend, "verify", side_effect=RuntimeError("disk full")):
             for n in range(1, 4):
                 self.assertFalse(self.run_recovery())
                 self.assertEqual(self.journal()["attempts"], n)
                 self.retry_now()
-            self.assertEqual(self.journal()["state"], "eligible")
+            self.assertEqual(self.journal()["state"], "obsolete")
             self.assertFalse(self.run_recovery())
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.advance_writer()
         self.retry_now()  # simulate the bounded external-fact probe becoming due
-        self.assertTrue(self.run_recovery())
+        self.assertFalse(self.run_recovery())
         self.assert_retained()
 
     def test_claim_wait_does_not_consume_attempt(self):
@@ -1108,6 +1109,23 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["state"], "eligible")
         self.assertTrue(self.run_recovery())
         self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
+
+    def test_exhausted_uncertain_publication_keeps_reconciliation_scheduled(self):
+        with patch.object(self.backend, "reconcile", side_effect=RuntimeError("remote unavailable")):
+            for _ in range(3):
+                self.run_recovery()
+                self.retry_now()
+        published = git(self.remote, "rev-parse", "main")
+        git(self.remote, "update-ref", "refs/heads/main", self.base)
+        self.current["head"] = self.base
+        with patch.object(self.backend, "reconcile", return_value="not-published"):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["state"], "eligible", self.journal())
+        self.assertEqual(self.journal()["reason"]["code"], "publication-revalidation-failed")
+        git(self.remote, "update-ref", "refs/heads/main", published)
+        self.current["head"] = published
+        self.retry_now()
+        self.assertTrue(self.run_recovery())  # Remote commit already exists; reconcile only.
 
     def test_changed_source_after_verify_not_published(self):
         actual = self.backend.prepare
@@ -1352,7 +1370,7 @@ class Fixture(unittest.TestCase):
                 self.retry_now() if self.journal() else None
                 self.assertFalse(self.run_recovery())
                 self.assertEqual(self.journal()["attempts"], count)
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
 
     def test_no_model_cache_outage_preserves_content_allowance(self):
         from tauceti_worker.agents import BuildCacheUnavailable
@@ -1516,17 +1534,15 @@ class Fixture(unittest.TestCase):
         with patch.object(self.backend, "verify", try_push):
             self.assertTrue(self.run_recovery())
 
-    def test_lifted_hold_reenables_a_previously_exhausted_checkpoint(self):
+    def test_lifted_hold_does_not_revive_abandoned_exhausted_work(self):
         with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
             for _ in range(3):
                 self.run_recovery()
                 self.retry_now()
-        self.current["labels"] = ["hold"]
-        self.assertFalse(self.run_recovery())
-        self.assertEqual(self.journal()["reason"]["code"], "pr-held")
-        self.current["labels"] = []
-        self.retry_now()
-        self.assertTrue(self.run_recovery())
+        for labels in (["hold"], []):
+            self.current["labels"] = labels
+            self.assertFalse(self.run_recovery())
+            self.assertEqual(self.journal()["state"], "obsolete")
 
     def test_changed_round_scope_reenables_local_policy_wait(self):
         self.opts.only = ["review"]
@@ -1836,30 +1852,28 @@ class Fixture(unittest.TestCase):
         self.assertEqual((clone / "A.lean").read_text(), "latest partial\n")
         self.assertEqual(saved._complete(self.record), self.manifest)
 
-    def test_content_limit_schedules_mechanical_recheck_without_more_paid_work(self):
+    def test_content_limit_abandons_without_more_paid_or_mechanical_work(self):
         self.values["fix-10-head"] = 3
         FakeVerification.failures = 1
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "content-allowance")
         self.assertFalse(rr.due(self.cfg, only=["fix"]))
         with patch.object(rr.time, "time", return_value=self.journal()["retry_at"] + 1):
-            self.assertTrue(rr.due(self.cfg, only=["fix"]))
-            self.test_loop_recovery_precedes_model_budget()
-            self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(FakeVerification.calls, 2)
+            self.assertFalse(rr.due(self.cfg, only=["fix"]))
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(FakeVerification.calls, 1)
         self.assertEqual(self.values["fix-10-head"], 3)
 
-    def test_infrastructure_backoff_eventually_rechecks_automatically(self):
-        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+    def test_exhausted_infrastructure_selects_fresh_work_without_rechecking_forever(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")) as verify:
             for _ in range(3):
                 self.assertFalse(self.run_recovery())
                 self.retry_now()
-        due = self.journal()["mechanical_recheck_at"]
-        with patch.object(rr.time, "time", return_value=due + 1):
-            self.assertTrue(rr.due(self.cfg, only=["fix"]))
-            self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(self.journal()["infrastructure_failures"], 3)
-        self.assertEqual(self.journal()["state"], "published")
+        with patch.object(self.backend, "verify", side_effect=AssertionError("abandoned work retried")):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(verify.call_count, 3)
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertFalse(rr.due(self.cfg, only=["fix"]))
 
     def test_handoff_excludes_foreign_and_automatic_bump_source(self):
         for restriction in ("foreign", "automatic_bump"):
@@ -2576,17 +2590,17 @@ class Fixture(unittest.TestCase):
         self.assertEqual(FakeVerification.calls, 2)
         self.assertEqual(self.values.get("fix-10-head", 0), 0)
 
-    def test_repeated_unchanged_infrastructure_failure_backs_off_to_hours(self):
+    def test_repeated_unchanged_infrastructure_failure_abandons_at_existing_allowance(self):
         now = rr.time.time()
         with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
             for _ in range(9):
                 with patch.object(rr.time, "time", return_value=now):
                     self.assertFalse(self.run_recovery())
-                delay = self.journal()["retry_at"] - now
                 now = self.journal()["retry_at"] + 1
-        self.assertGreaterEqual(delay, 7200)
-        self.assertEqual(self.journal()["infrastructure_streak"], 9)
-        self.assertEqual(self.journal()["infrastructure_failures"], 9)
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(self.journal()["reason"]["code"], "recovery-exhausted")
+        self.assertEqual(self.journal()["infrastructure_streak"], 3)
+        self.assertEqual(self.journal()["infrastructure_failures"], 3)
         self.assertEqual(self.values.get("fix-10-head", 0), 0)
 
     def test_forensic_handoff_cannot_return_to_automatic_publication(self):
@@ -2610,7 +2624,7 @@ class Fixture(unittest.TestCase):
             patch.object(rr, "conversation_identity", return_value="fixture-account"),
             patch(
                 "tauceti_worker.agents.host_agent_argv",
-                side_effect=lambda *a: ([sys.executable, "-c", script], os.environ.copy()),
+                side_effect=lambda *a, **k: ([sys.executable, "-c", script], os.environ.copy()),
             ),
             patch("tauceti_worker.agents.host_build_cache_context", side_effect=lambda *a: contextlib.nullcontext([])),
             patch("tauceti_worker.fleet_capacity.check_launch_admission") as admission,
@@ -2744,7 +2758,7 @@ fi
             self.assertEqual(self.journal()["attempts"], count)
             self.assertNotIn("publication", self.journal())
             self.retry_now()
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertIn("server policy rejected", self.journal()["reason"]["detail"])
         self.assertEqual(self.values.get("fix-10-head", 0), 0)
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
@@ -2793,11 +2807,10 @@ fi
         for _ in range(6):
             with patch.object(rr.time, "time", return_value=now):
                 self.assertFalse(self.run_recovery())
-            delay = self.journal()["retry_at"] - now
             now = self.journal()["retry_at"] + 1
-        self.assertEqual(FakeVerification.calls, 6)
-        self.assertEqual(self.journal()["verification_failures"], 6)
-        self.assertEqual(delay, 21600)
+        self.assertEqual(FakeVerification.calls, 1)
+        self.assertEqual(self.journal()["verification_failures"], 1)
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertEqual(self.values["fix-10-head"], 3)
 
     def test_non_owned_operation_on_rewritten_source_gets_narrow_reasoning(self):
@@ -3032,7 +3045,7 @@ fi
                 self.assertFalse(self.run_recovery())
                 self.retry_now()
         self.assertEqual(self.journal()["infrastructure_failures"], 3)
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertNotIn("publication", self.journal())
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 

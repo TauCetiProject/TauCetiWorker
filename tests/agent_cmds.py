@@ -74,6 +74,36 @@ print("[OK ] claude env drops ANTHROPIC_API_KEY")
 a, env = tc.host_agent_argv(P, "deepseek")
 check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"], "--prompt", P])
 
+# A prompt longer than one argv string may be (Linux: MAX_ARG_STRLEN, 128 KiB) leaves argv for stdin:
+# `claude -p` with no prompt argument and `codex exec ... -` both read the whole of stdin.
+LONG = "x" * (tc.PROMPT_ARGV_LIMIT + 1)
+a, _, stdin = tc.host_agent_launch(P, "claude")
+check("claude short prompt stays in argv", (a[1:3], stdin), (["-p", P], None))
+a, _, stdin = tc.host_agent_launch(LONG, "claude")
+check(
+    "claude long prompt on stdin",
+    (a, stdin == LONG),
+    (
+        [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-opus-5-5",
+            "--effort",
+            "high",
+            "--dangerously-skip-permissions",
+        ],
+        True,
+    ),
+)
+a, _, stdin = tc.host_agent_launch(LONG, "codex")
+check("codex long prompt on stdin", (a[-2:], stdin == LONG), (["--skip-git-repo-check", "-"], True))
+a, _, stdin = tc.host_agent_launch(LONG, "deepseek")
+check("pi takes the prompt in argv only", (a[-1] == LONG, stdin), (True, None))
+
 a, env = tc.host_agent_argv(P, "kiro")
 check(
     "kiro",

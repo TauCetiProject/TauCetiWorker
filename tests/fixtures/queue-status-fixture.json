@@ -1,0 +1,362 @@
+{
+  "alerts": [],
+  "approvals": {
+    "last_poll": {
+      "approved": 5,
+      "at": 1793835136.9359455,
+      "closed": 0,
+      "drafted": 0,
+      "duration_seconds": 103.455,
+      "errors": [],
+      "head_changed": 0,
+      "listed": 1801,
+      "member_events": 34,
+      "reason": "start",
+      "reconciled": 20,
+      "revoked": 0,
+      "skipped": false,
+      "stopped_early": false,
+      "unchanged": 1275,
+      "with_check": 1412
+    },
+    "polled": 1438,
+    "revoked_by_poll": 0,
+    "webhook": 14
+  },
+  "approved_waiting": null,
+  "canonical_branch": "main",
+  "canonical_sha": "67aa17161ba1908f8a85182bfdf2d4ccaf21171c",
+  "conditions": [
+    {
+      "condition": "stall_over_two_intervals",
+      "detail": "phase build silent",
+      "since": 1793834400.0
+    }
+  ],
+  "counters": {
+    "approvals_polled": 1438,
+    "approvals_webhook": 14,
+    "ci_dispatches": 5,
+    "ci_redispatches": 3,
+    "head_rebases": 5,
+    "heads_sealed": 1
+  },
+  "external_head": {
+    "base_sha": "67aa17161ba1908f8a85182bfdf2d4ccaf21171c",
+    "batch_id": 2666,
+    "feed_observed_at": "2026-11-04T22:55:10.056419Z",
+    "head_sha": "e29fd355468e1382a94e4d4ac22f4275dca7a027",
+    "landed_at": null,
+    "landed_members": 0,
+    "members": 55,
+    "pending_members": [
+      25195,
+      25546,
+      25873,
+      26138,
+      26217,
+      26629,
+      27159,
+      27262,
+      27282,
+      27322,
+      27418,
+      27429,
+      27466,
+      27479,
+      27622,
+      27657,
+      27681,
+      27698,
+      27718,
+      27722,
+      27726,
+      27760,
+      27761,
+      27764,
+      27770,
+      27771,
+      27772,
+      27778,
+      27782,
+      27793,
+      27797,
+      27810,
+      27812,
+      27819,
+      27824,
+      27827,
+      27830,
+      27870,
+      27874,
+      27963,
+      27967,
+      27979,
+      27982,
+      27983,
+      27984,
+      27995,
+      28001,
+      28002,
+      28012,
+      28018,
+      28019,
+      28036,
+      28038,
+      28040,
+      28044
+    ],
+    "recorded_at": 1793833028.3655646,
+    "release_reason": "operator release",
+    "released_at": 1793833050.4572618,
+    "state": "released"
+  },
+  "feeds": {
+    "candidates": "/repositories/1/candidates",
+    "observation": "/repositories/1/active-batches"
+  },
+  "generated_at": "2026-11-04T23:36:51Z",
+  "github": {
+    "failures": 0,
+    "last_error": null,
+    "limit_waits": 0,
+    "rate_limit": 6400,
+    "rate_limit_remaining": 6394,
+    "rate_limit_reset_at": 1793838852.0,
+    "requests": 82,
+    "retries": 0
+  },
+  "head": {
+    "base": "67aa17161ba1908f8a85182bfdf2d4ccaf21171c",
+    "based_on_canonical": true,
+    "ci": {
+      "attempt_id": 5,
+      "completed_at": null,
+      "conclusion": null,
+      "created_at": 1793835189.0,
+      "dispatch_id": "bors branch=main batch=1 head=e50a096365223725c8a9b3561027afccf1603faa base=67aa17161ba1908f8a85182bfdf2d4ccaf21171c",
+      "dispatched_at": 1793835183.617169,
+      "host": "nsc-runner-0cui8flmji4i2",
+      "html_url": "https://github.com/TauCetiProject/TauCeti/actions/runs/41934607574",
+      "infrastructure_retry": 0,
+      "last_observed_at": 1793835376.000825,
+      "last_progress_at": 1793835365.0,
+      "outcome": "pending",
+      "outcome_detail": "",
+      "phases": [
+        {
+          "completed_at": 1793835205.0,
+          "detail": "success",
+          "name": "pick-runner / pick",
+          "started_at": 1793835198.0,
+          "status": "completed"
+        },
+        {
+          "completed_at": 1793835199.0,
+          "detail": "success",
+          "name": "pick-runner / pick: Set up job",
+          "started_at": 1793835199.0,
+          "status": "completed"
+        },
+        {
+          "completed_at": 1793835200.0,
+          "detail": "success",
+          "name": "pick-runner / pick: Set up runner",
+          "started_at": 1793835199.0,
+          "status": "completed"
+        },
+        {
+          "completed_at": 1793835201.0,
+          "detail": "success",
+          "name": "pick-runner / pick: Checkout workflow-pinned runner selector",
+          "started_at": 1793835200.0,
+          "status": "completed"
+        },
+        {
+          "completed_at": 1793835202.0,
+          "detail": "success",
+          "name": "pick-runner / pick: Prepare pinned shared tools",
+          "started_at": 1793835201.0,
+          "status": "completed"
+        },
+        {
+          "completed_at": 1793835203.0,
+          "detail": "success",
+          "name": "pick-runner / pick: Select destination in configured preference order",
+          "started_at": 1793835202.0,
+          "status": "completed"
+        },
+        {
+          "completed_at": 1793835203.0,
+          "detail": "success",
+          "name": "pick-runner / pick: Post Prepare pinned shared tools",
+          "started_at": 1793835203.0,
+          "status": "completed"
+        },
+        {
+          "completed_at": 1793835203.0,
+          "detail": "success",
+          "name": "pick-runner / pick: Post Checkout workflow-pinned runner selector",
+          "started_at": 1793835203.0,
+          "status": "completed"
+        }
+      ],
+      "run_attempt": 1,
+      "run_id": "41934607574",
+      "runner": "nsc-runner-0cui8flmji4i2",
+      "runner_labels": [
+        "nscloud-ubuntu-24.04-amd64-16x32-with-features;job.priority=1",
+        "namespace-features:container.privileged=true"
+      ],
+      "started_at": 1793835189.0,
+      "status": "in_progress"
+    },
+    "claim": null,
+    "claims": [],
+    "expected_parent": null,
+    "first_dispatch_at": 1793833086.977193,
+    "id": 1,
+    "members": [
+      {
+        "accepted_head": "8e0e29ab74e5d5f1e6929951a5f4f6a5f952ed48",
+        "commit": "e50a096365223725c8a9b3561027afccf1603faa",
+        "number": 20359,
+        "provenance": "clean",
+        "source_pr": "TauCetiProject/TauCeti#20359",
+        "task_id": null
+      }
+    ],
+    "oldest_member_age_seconds": 31622.035226106644,
+    "retained_ref": "refs/tauceti-queue/batches/1/v6",
+    "sealed_at": 1793803788.9500868,
+    "size": 1,
+    "stage": "ci",
+    "stall": {
+      "phase": "build",
+      "silence_seconds": 2100.0,
+      "since": 1793834700.0
+    },
+    "task": null,
+    "tip": "e50a096365223725c8a9b3561027afccf1603faa",
+    "urgent": false,
+    "version": 6
+  },
+  "head_cycle_seconds": [],
+  "hold": {
+    "last_error": "anthropic: 529 overloaded after 5 retries",
+    "since": 1793836200.0
+  },
+  "inference_hold": null,
+  "insertion_passes": 73477,
+  "max_passes_waited": 24,
+  "open_batch": {
+    "base": "5f78b5307b932e1e2ac7848dc7d4fedc6a52d6c1",
+    "claim": null,
+    "claims": [],
+    "id": 2,
+    "members": [
+      {
+        "accepted_head": "eac3100d6c79039eb54dbdea58eecefdaae1ef4c",
+        "commit": "b1ebc2cda1034e7668dfbc1935cb134c9c5e317a",
+        "number": 20932,
+        "provenance": "clean",
+        "source_pr": "TauCetiProject/TauCeti#20932",
+        "task_id": null
+      },
+      {
+        "accepted_head": "40b94f8d0020a65c56b0c1c69ec25c42564256ed",
+        "commit": "32aa6807aaea5d9a60bbd5afa78ec0138ca88d87",
+        "number": 21209,
+        "provenance": "clean",
+        "source_pr": "TauCetiProject/TauCeti#21209",
+        "task_id": null
+      }
+    ],
+    "oldest_member_age_seconds": 31614.227422952652,
+    "retained_ref": "refs/tauceti-queue/batches/2/v1197",
+    "size": 1197,
+    "tip": "a8b2934aa0ba2e331f866cfd98ad97ba21c71a6a",
+    "urgent": false,
+    "version": 1197
+  },
+  "outbox": {
+    "entries": [],
+    "pending": 0
+  },
+  "pending_task": null,
+  "publication_enabled": true,
+  "reasons": [
+    "head 1 waits for CI run 41934607574"
+  ],
+  "repository": "TauCetiProject/TauCeti",
+  "schema": "tauceti-queue.status/v1",
+  "service": {
+    "canonical_branch": "main",
+    "controller": "running",
+    "dirty": false,
+    "host": "chungus2",
+    "mode": "production",
+    "pid": 4242,
+    "publication_enabled": true,
+    "reason": null,
+    "repository": "TauCetiProject/TauCeti",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "revision_source": "baked",
+    "started_at": "2026-11-04T22:30:00Z"
+  },
+  "settings": {
+    "approval_poll_interval_seconds": 900,
+    "claim_ttl_seconds": 900,
+    "dispatch_timeout_seconds": 600,
+    "inference_failure_threshold": 3,
+    "inference_hold_backoff_max_seconds": 3600,
+    "inference_hold_backoff_seconds": 60,
+    "infrastructure_retry_backoff_seconds": 60,
+    "infrastructure_retry_limit": 3,
+    "insertion_age_window": 16,
+    "lost_run_seconds": 3600,
+    "membership_label": "bors-staging",
+    "outbox_retry_max_seconds": 900,
+    "outbox_retry_seconds": 30,
+    "polling_interval_seconds": 60,
+    "publication_enabled": true,
+    "repair_concurrency": 1,
+    "stall_interval_seconds": 900
+  },
+  "stall": null,
+  "tasks": [],
+  "waiting": {
+    "count": 190,
+    "inputs": [
+      {
+        "approved_at": 1793803822.3218398,
+        "head_sha": "578b56eee86c5926a02a49de5325c90d7a562878",
+        "last_probe": "[\"TauCeti/AlgebraicGeometry/Frobenius/UniversalHomeomorphism.lean\",\"TauCeti/AlgebraicGeometry/Morphisms/UniversalHomeomorphism.lean\"]",
+        "number": 22428,
+        "passes_waited": 0,
+        "priority": 0,
+        "probes": 1193,
+        "urgent": false
+      },
+      {
+        "approved_at": 1793803867.1456747,
+        "head_sha": "4eff28e446c307ed3dbf982ecb47442496b5aa93",
+        "last_probe": "[\"TauCeti/RingTheory/FormalGroup/Logarithm/InfiniteHeight.lean\",\"TauCeti/RingTheory/MvPowerSeries/Order.lean\",\"TauCeti/RingTheory/PowerSeries/Substitution.lean\"]",
+        "number": 24489,
+        "passes_waited": 0,
+        "priority": 0,
+        "probes": 1183,
+        "urgent": false
+      }
+    ],
+    "max_passes_waited": 0,
+    "oldest_age_seconds": 31588.663473129272,
+    "oldest_approved_at": 1793803822.3218398,
+    "urgent": 0
+  },
+  "webhooks": {
+    "duplicates": 0,
+    "ignored": 0,
+    "received": 889
+  }
+}

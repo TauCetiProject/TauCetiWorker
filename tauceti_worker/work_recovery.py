@@ -125,6 +125,7 @@ class Work:
     read_bytes: int = 0
     hash_bytes: int = 0
     removed_bytes: int = 0
+    removed_entries: int = 0
     removal_bytes: int | None = None
     deadline: float = float("inf")
     adaptive: bool = False
@@ -158,6 +159,7 @@ class Work:
             read_bytes=self.read_bytes,
             hash_bytes=self.hash_bytes,
             removed_bytes=self.removed_bytes,
+            removed_entries=self.removed_entries,
             limits=dict(
                 seconds=None if self.seconds == float("inf") else self.seconds,
                 entries=self.entries,

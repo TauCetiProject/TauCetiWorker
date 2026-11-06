@@ -623,6 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     recovery.add_argument("--json", action="store_true")
 
     cleanup = sub.add_parser("cleanup", help="reclaim disposable caches and expired diagnostics; local only")
+    cleanup.add_argument("--all-data-roots", action="store_true", help="include retired Fleet data roots")
     cleanup_mode = cleanup.add_mutually_exclusive_group()
     cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
     cleanup_mode.add_argument("--install-timer", action="store_true", help="install hourly systemd user cleanup")
@@ -680,7 +681,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     c.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     c.add_argument("--logs-dir", type=Path, default=legacy_data_root(HERE) / "logs", help="agent log root")
-    c.add_argument("--state-dir", type=Path, default=legacy_data_root(HERE) / "state", help="worker state/transcript root")
+    c.add_argument(
+        "--state-dir", type=Path, default=legacy_data_root(HERE) / "state", help="worker state/transcript root"
+    )
     c.add_argument(
         "--review-data-dir",
         type=Path,

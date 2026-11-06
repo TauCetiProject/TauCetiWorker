@@ -55,6 +55,38 @@ class LegacyDataRoot(unittest.TestCase):
                 )
                 self.assertEqual(child.strip(), str(data))
 
+    def test_cleanup_discovers_current_and_newly_installed_legacy_roots(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            fleet = home / ".local/share/tauceti-fleet"
+            old = fleet / "worker-data/retained/old"
+            current = fleet / "worker-data/current"
+            installed = fleet / "worker-runtimes/new/lib/python3.14/site-packages/tauceti_worker"
+            for path in (old, current):
+                (path / "state/w").mkdir(parents=True)
+            (fleet / "worker-data/roots.json").write_text(json.dumps(dict(roots={"old": str(old)})))
+            with (
+                patch.dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=str(current)),
+                patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
+                patch.object(retention, "legacy_project", return_value=True),
+            ):
+                self.assertEqual(retention.data_roots(), [current, old])
+                (installed / "state/w").mkdir(parents=True)
+                self.assertEqual(set(retention.data_roots()), {current, old, installed})
+                seen = []
+
+                def collect(**kwargs):
+                    seen.append(paths.legacy_data_root())
+                    return retention.fresh_report()
+
+                with patch.object(retention, "sweep", side_effect=collect):
+                    report = retention.run_all(dry=True)
+                self.assertEqual(set(seen), {current, old, installed})
+                self.assertEqual(len(report["roots"]), 3)
+                self.assertEqual(paths.legacy_data_root(), current)
+
     def test_default_and_invalid_override(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TAUCETI_LEGACY_DATA_ROOT", None)
