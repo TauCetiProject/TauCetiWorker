@@ -748,6 +748,8 @@ def run(args, stop, facts, opener, publisher):
     task_observations = TaskObservations()
     retry_seconds = args.interval
     while not stop.is_set():
+        iteration_started = time.monotonic()
+        succeeded = False
         try:
             try:
                 with urllib.request.urlopen(args.status_url, timeout=3) as response:
@@ -806,6 +808,7 @@ def run(args, stop, facts, opener, publisher):
                 retry_seconds = args.interval
             elif not args.output:
                 print(payload.decode(), flush=True)
+            succeeded = True
         except (
             OSError,
             ValueError,
@@ -826,7 +829,11 @@ def run(args, stop, facts, opener, publisher):
             )
             if not args.follow:
                 return 1
-        if not args.follow or stop.wait(retry_seconds):
+        # Successful upload time is part of the sampling interval. Slow work
+        # may overrun freely; yield before another sample instead of catching up
+        # in a hot loop. Failures retain their full post-request retry backoff.
+        wait_seconds = max(1, args.interval - (time.monotonic() - iteration_started)) if succeeded else retry_seconds
+        if not args.follow or stop.wait(wait_seconds):
             break
     return 0
 
