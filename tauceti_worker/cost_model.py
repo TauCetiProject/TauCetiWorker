@@ -233,6 +233,8 @@ def _model_family(provider: str, model: str | None) -> str | None:
             return "terra"
         if "luna" in value:
             return "luna"
+        if "astra" in value:
+            return "astra"
         if "sol" in value or value == "gpt-5.5":
             return "sol"
     if provider == "claude" and "opus" in value:
