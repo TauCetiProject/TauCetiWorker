@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tauceti_queue import monitoring
-from tauceti_queue.fakes import make_controller
+from tauceti_queue.fakes import make_controller, run_git
 
 PROJECT = "TauCetiProject/TauCeti"
 
@@ -48,6 +48,38 @@ class Monitoring(unittest.TestCase):
         self.assertEqual(attempt["version"], batch["version"])
         self.assertEqual(attempt["base"], batch["base"])
         self.assertEqual(batch["size"], 2)
+
+    def test_dispatch_policy_is_allowlisted_cached_and_bound_to_the_canonical_commit(self):
+        revision = self.repo.commit_branch(
+            {
+                "tauceti.toml": """[services.fleet]
+namespace_build_cap = 20
+pr_order = ["github", "chris", "namespace"]
+staging_order = ["chris", "namespace", "github"]
+private_token = "DO_NOT_PUBLISH_SECRET"
+url = "https://private.invalid"
+"""
+            },
+            "policy",
+            push_to="refs/heads/policy",
+        )
+        run_git(self.repo.clone, "fetch", "-q", "origin", revision)
+        facts = monitoring.CommitFacts(self.repo.clone)
+        value = self.export(facts=facts, status={"canonical_sha": revision})
+        self.assertEqual(value["dispatch_config"]["revision"], revision)
+        self.assertEqual(value["dispatch_config"]["namespace_build_cap"], 20)
+        self.assertEqual(value["dispatch_config"]["pr_order"], ["github", "chris", "namespace"])
+        self.assertNotIn("DO_NOT_PUBLISH_SECRET", json.dumps(value))
+        self.assertNotIn("private.invalid", json.dumps(value))
+        with patch.object(monitoring.subprocess, "run", side_effect=AssertionError("cached policy must not run git")):
+            self.assertEqual(facts.dispatch_config(revision), value["dispatch_config"])
+            self.assertIsNone(facts.dispatch_config("--help"))
+        self.assertIsNone(facts.dispatch_config(self.repo.main_sha()))
+        self.assertIsNone(
+            self.export(facts=facts, status={"canonical_sha": revision}, public_repositories=("Other/Public",))[
+                "dispatch_config"
+            ]
+        )
 
     def test_raw_claims_task_diagnostics_descriptions_and_worker_paths_never_escape(self):
         sentinel = "DO_NOT_PUBLISH_SECRET"
