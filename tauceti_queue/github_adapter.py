@@ -651,10 +651,10 @@ class GitHubAdapter:
         """`PATCH pulls/<n> {state: closed, title}`: Bors's `close_merged_pr`, bookkeeping fields only."""
         self.client.request("PATCH", f"repos/{repo}/pulls/{number}", json_body={"state": "closed", "title": title})
 
-    def labels(self, repo: str, number: int) -> list[str]:
+    def labels(self, repo: str, number: int, *, progress=None) -> list[str]:
         return [
             str(label.get("name"))
-            for label in self.client.paginate(f"repos/{repo}/issues/{number}/labels")
+            for label in self.client.paginate(f"repos/{repo}/issues/{number}/labels", progress=progress)
             if isinstance(label, dict)
         ]
 
@@ -1073,7 +1073,7 @@ class GitHubAdapter:
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        fresh, statuses = self._admission_fence(repo, number, pull)
+        fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
             fresh.base_sha,
@@ -1102,7 +1102,7 @@ class GitHubAdapter:
             fresh, merge_base, paths, comments, statuses, self._diff_version(pull.base_sha, pull.head_sha)
         )
 
-    def _admission_fence(self, repo, number, pull):
+    def _admission_fence(self, repo, number, pull, *, labels_progress=None):
         """Current head/target and CI together, after paced or paginated source reads.
 
         Statuses can change without moving PR updatedAt. Read the commit by SHA, avoiding
@@ -1123,7 +1123,7 @@ class GitHubAdapter:
         if "pageInfo" not in labels:
             raise GitHubError("incomplete admission label fence")
         names = (
-            self.labels(repo, number)
+            self.labels(repo, number, progress=labels_progress)
             if labels["pageInfo"].get("hasNextPage")
             else [s["name"] for s in labels.get("nodes", ())]
         )
@@ -1165,7 +1165,7 @@ class GitHubAdapter:
                 if not isinstance(node, dict) or not isinstance(node.get("number"), int):
                     raise GitHubError("incomplete PR discovery node")
                 try:
-                    observed = self._admission_node(repo, node)
+                    observed = self._admission_node(repo, node, labels_progress=progress.setdefault("labels", {}))
                 except RequestDeferred:
                     raise
                 except Exception as error:
@@ -1180,6 +1180,7 @@ class GitHubAdapter:
                         admission={"incomplete": str(error)},
                     )
                 batch.append(observed)
+                progress.pop("labels", None)
                 progress["index"] += 1
             if on_page is not None:
                 on_page(batch)
@@ -1194,7 +1195,7 @@ class GitHubAdapter:
                 raise GitHubError("PR pagination did not advance")
             progress.update(cursor=page["endCursor"], connection=None, index=0, batch=[])
 
-    def _admission_node(self, repo, node):
+    def _admission_node(self, repo, node, *, labels_progress=None):
         number, head, base = node["number"], node.get("headRefOid", ""), node.get("baseRefOid", "")
         # Fetch a new target once, so a normal canonical advance doesn't invalidate every
         # unchanged review. PR heads are fetched only when evaluating new/dirty work.
@@ -1206,7 +1207,7 @@ class GitHubAdapter:
         if not isinstance(page, dict):
             raise GitHubError("incomplete label connection")
         labels = (
-            self.labels(repo, number)
+            self.labels(repo, number, progress=labels_progress)
             if page.get("hasNextPage")
             else [s["name"] for s in label_connection.get("nodes", ())]
         )
