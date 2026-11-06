@@ -632,6 +632,11 @@ failures remain local to their PR, and urgent revocations can bypass background 
 respecting actual server cooldowns. Startup restores these waits into the shared client, including
 for newly observed PRs. Expected resource waits count as `deferred`, rather than poll errors.
 
+An evaluation retains its FIFO place across resource waits, so completing a PR's source reads
+does not require repeated rounds through the entire backlog. New input and genuine source
+failures rejoin at the current time; a changing or failing PR therefore lets other work proceed.
+The last-attempt timestamp and oldest-pending age remain separate diagnostics.
+
 Background reads are paced across each resource's remaining window, using REST requests and
 reported GraphQL point costs separately. Queue/CI calls, queued-review revocations and final
 head/CI fences receive priority. Source preparation resumes at the next eligible read without

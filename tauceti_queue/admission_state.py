@@ -36,6 +36,7 @@ class AdmissionState:
         if type(number) is not int or number <= 0:
             raise ValueError("admission needs a positive PR number")
         row = self.get(number)
+        now = self.clock()
         if row is None:
             self.store.insert(
                 "admission_work",
@@ -44,7 +45,8 @@ class AdmissionState:
                 head_sha=head,
                 observed_version=version,
                 urgent=int(urgent),
-                first_pending_at=self.clock(),
+                first_pending_at=now,
+                queue_at=now,
             )
             return
         pending = row["generation"] != row["evaluated_generation"]
@@ -55,7 +57,8 @@ class AdmissionState:
             observed_version=version,
             generation=row["generation"] + 1,
             urgent=int(urgent or row["urgent"]),
-            first_pending_at=row["first_pending_at"] if pending else self.clock(),
+            first_pending_at=row["first_pending_at"] if pending else now,
+            queue_at=now,
             next_attempt_at=0,
             retry_resource="",
         )
@@ -80,7 +83,8 @@ class AdmissionState:
         """A finite current generation; no PR-count ceiling and no lifetime retry limit."""
         query, params = self._pending_query()
         return self.store.query(
-            query + "AND ready_at<=? ORDER BY a.urgent DESC,a.attempted_at,a.first_pending_at,a.id",
+            query
+            + "AND ready_at<=? ORDER BY a.urgent DESC,COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id",
             (*params, self.clock()),
         )
 
@@ -89,8 +93,9 @@ class AdmissionState:
 
     def next_due(self, *, prefer_urgent=True, urgent_only=False):
         """Choose after each completed attempt, so a newly arrived revocation need not wait
-        behind a stale copy of the backlog. Alternating priority and oldest-work selections
-        gives both revocations and ordinary pending PRs service under continuing traffic.
+        behind a stale copy of the backlog. Resource waits retain a logical evaluation's FIFO
+        place; source changes and failures rejoin at the current time. Alternating priority and
+        FIFO selections give both revocations and ordinary pending PRs service under continuing traffic.
         """
         order = "a.urgent DESC, " if prefer_urgent else ""
         query, params = self._pending_query()
@@ -98,7 +103,7 @@ class AdmissionState:
             query
             + "AND ready_at<=? "
             + ("AND a.urgent=1 " if urgent_only else "")
-            + f"ORDER BY {order}a.attempted_at,a.first_pending_at,a.id LIMIT 1",
+            + f"ORDER BY {order}COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id LIMIT 1",
             (*params, self.clock()),
         )
         return rows[0] if rows else None
@@ -114,6 +119,7 @@ class AdmissionState:
                 authorization_key=authorization,
                 disposition=disposition,
                 urgent=0,
+                queue_at=None,
                 next_attempt_at=0,
                 last_error="",
                 retry_resource="",
@@ -129,6 +135,7 @@ class AdmissionState:
                 next_attempt_at=until,
                 last_error=error,
                 retry_resource=resource,
+                **({"queue_at": self.clock()} if resource == "source" else {}),
             )
             if resource != "source":
                 # Capacity belongs to the installation, even if this PR changed during the read.
