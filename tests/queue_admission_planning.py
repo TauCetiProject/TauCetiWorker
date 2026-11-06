@@ -469,16 +469,67 @@ class Planning(unittest.TestCase):
             batch = self.controller.store.row("batches", {"id": batch["id"]})
             self.assertIsNone(self.controller._prepare_outcome(batch))
 
-    def test_new_insertions_do_not_repeat_a_collision_preparation_bypass(self):
+    def test_unclaimed_collision_preparation_stays_claimable_during_insertions(self):
+        _, head_task = self.start_prediction()
+        self.controller.set_setting("repair_concurrency", 2, "test")
+        head_claim = self.controller.claim_task("head-worker", "admin-worker")
+        self.assertEqual(head_claim.task_id, head_task["id"])
+        self.approve(102, {"TauCeti/A.lean": "def a := 1\n"})
+        self.controller.tick()
+        batch = self.controller._open_batch()
+        first = self.controller.store.row("tasks", {"kind": "prepare", "batch_id": batch["id"]})
+        for number in (103, 104, 105):
+            self.clock.advance(1)
+            self.approve(number, {f"TauCeti/P{number}.lean": f"def p{number} := 1\n"})
+            self.controller.tick()
+            current = self.controller._open_batch()
+            offered = self.controller.store.rows("tasks", {"kind": "prepare", "batch_id": batch["id"], "state": "open"})
+            self.assertEqual(len(offered), 1)
+            self.assertEqual(offered[0]["batch_version"], current["version"])
+        prior = self.controller.store.row("tasks", {"id": first["id"]})
+        self.assertEqual((prior["state"], prior["resolution"], prior["claims"]), ("superseded", "batch-changed", 0))
+        count = self.controller.store.count("tasks", {"kind": "prepare", "batch_id": batch["id"]})
+        self.controller.tick()
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "prepare", "batch_id": batch["id"]}), count)
+        claimed = self.controller.claim_task("next-worker", "admin-worker")
+        self.assertEqual(
+            (claimed.kind, claimed.batch_id, claimed.batch_version), ("prepare", batch["id"], current["version"])
+        )
+        self.approve(106, {"TauCeti/P106.lean": "def p106 := 1\n"})
+        self.controller.tick()
+        self.assertNotEqual(self.controller.input_for(PROJECT, 106)["batch_id"], batch["id"])
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["version"], current["version"])
+
+    def test_old_unclaimed_collision_marker_does_not_suppress_a_new_offer(self):
         self.start_prediction()
         self.approve(102, {"TauCeti/A.lean": "def a := 1\n"})
         self.controller.tick()
         batch = self.controller._open_batch()
-        prepared = self.controller.store.rows("tasks", {"kind": "prepare", "batch_id": batch["id"]})
-        self.assertEqual(len(prepared), 1)
+        old = self.controller.store.row("tasks", {"kind": "prepare", "batch_id": batch["id"]})
+        self.controller.store.update("tasks", {"id": old["id"]}, state="superseded", resolution="batch-changed")
+        self.assertIsNotNone(self.controller._state(f"admission_prepare:{batch['id']}"))
+        self.controller.tick()
+        offered = self.controller.store.rows("tasks", {"kind": "prepare", "batch_id": batch["id"], "state": "open"})
+        self.assertEqual(len(offered), 1)
+        self.assertNotEqual(offered[0]["id"], old["id"])
+
+    def test_claimed_collision_preparation_keeps_quiet_rule_for_later_insertions(self):
+        _, head_task = self.start_prediction()
+        self.controller.set_setting("repair_concurrency", 2, "test")
+        self.assertEqual(self.controller.claim_task("head-worker", "admin-worker").task_id, head_task["id"])
+        self.approve(102, {"TauCeti/A.lean": "def a := 1\n"})
+        self.controller.tick()
+        batch = self.controller._open_batch()
+        prepared = self.controller.claim_task("next-worker", "admin-worker")
+        self.assertEqual((prepared.kind, prepared.batch_id), ("prepare", batch["id"]))
+        self.controller.release_task(prepared.task_id, prepared.claim_token, "prepared_clean")
+        self.clock.advance(1)
         self.approve(103, {"TauCeti/B.lean": "def b := 1\n"})
         self.controller.tick()
-        self.assertEqual(len(self.controller.store.rows("tasks", {"kind": "prepare", "batch_id": batch["id"]})), 1)
+        self.assertEqual(
+            self.controller.store.rows("tasks", {"kind": "prepare", "batch_id": batch["id"], "state": "open"}), []
+        )
+        self.assertFalse(self.controller._prepare_due(self.controller._open_batch(), self.clock()))
 
     def test_payload_is_bounded_and_compiled_collisions_are_prioritized(self):
         self.approve(101, {"TauCeti/A.lean": "def a := 1\n"})

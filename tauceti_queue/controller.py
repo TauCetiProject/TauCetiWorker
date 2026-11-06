@@ -3254,7 +3254,25 @@ class Controller:
             return False
         predicted = self._predicted_collisions(self._admission_context(batch, now))
         digest = admission_planning.fingerprint([{"base": batch["base"]}, *predicted])
-        if not predicted or self._state(f"admission_prepare:{batch['id']}") == digest:
+        attempted = False
+        if predicted and self._state(f"admission_prepare:{batch['id']}") == digest:
+            # A superseded offer nobody claimed is not an attempted preparation, including
+            # offers recorded before this distinction existed. Keep eager work available.
+            for task in self.store.rows(
+                "tasks", {"batch_id": batch["id"], "kind": TASK_PREPARE, "pre_rebase_source": None}
+            ):
+                if not task["claims"]:
+                    continue
+                collisions = [
+                    record
+                    for diagnostic in loads(task["diagnostics"], [])
+                    if diagnostic.get("kind") == "admission_predictions"
+                    for record in self._predicted_collisions(diagnostic)
+                ]
+                if admission_planning.fingerprint([{"base": task["base"]}, *collisions]) == digest:
+                    attempted = True
+                    break
+        if not predicted or attempted:
             if len(members) < max(1, int(self.setting("prepare_min_members"))):
                 return False
             if now - max(m["added_at"] for m in members) < int(self.setting("prepare_quiet_seconds")):
