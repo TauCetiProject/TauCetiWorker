@@ -24,7 +24,9 @@ The default managed root is `~/.cache/tauceti/lake-native`. Override it with
 ordinary private behavior. Explicit operator cache overrides are preserved.
 Compatible executables separate the store by toolchain identity and require
 restored artifacts and working hard links on the checkout filesystem. Other
-invocations use private storage.
+invocations use private storage. Forwarding sysroots, including the host Lean
+throttling wrapper, reuse the installed release’s namespace when their Lean
+libraries resolve to that release. The compiler wrapper remains in use.
 
 Run `lake --shared-cache-dir` in a workspace to see the native selection before
 loading its configuration. An empty result means private mode. Older Lake
@@ -47,7 +49,7 @@ same-user process that deliberately changes permissions and edits their bytes.
 The worker also supports an isolated standalone runtime for toolchains whose
 distributed Lake does not yet have the native fixes. Build the matching Lake
 source with the native patch, then install it using the project interpreter.
-The [v4.36.0-rc2 backport](https://github.com/kim-em/lean4/commit/6c3b36982299e72982590728ee80a8dba4d94980)
+The [v4.36.0-rc2 backport](https://github.com/kim-em/lean4/commit/2fab607f76571f4f399e2332e69d674b98277d64)
 is built from its `tests/lake` directory with
 `ELAN_TOOLCHAIN=leanprover/lean4:v4.36.0-rc2 lake build Lake lake`.
 Its executable is `tests/lake/.lake/build/bin/lake`, and the matching source is
