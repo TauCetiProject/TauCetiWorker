@@ -563,7 +563,7 @@ class Retention(unittest.TestCase):
         retention.recycle(self.cfg, now=self.clock + 1)
         self.assertTrue(fresh.exists())
 
-    def test_retained_source_uses_its_own_owner_and_removes_sidecar(self):
+    def test_expired_retained_source_uses_its_own_owner_and_keeps_abandonment_evidence(self):
         retained = self.checkout.parent / work_recovery.RETAINED_DIR / "TauCeti-old"
         retained.parent.mkdir()
         subprocess.run(["git", "clone", "-q", str(self.checkout), str(retained)], check=True)
@@ -586,11 +586,11 @@ class Retention(unittest.TestCase):
         # The existing collector now owns retained work too, without waiting for
         # the activity preparer's small foreground allowance.
         self.assertFalse(retained.exists())
-        self.assertFalse(sidecar.exists())
-        [record] = list(work_recovery.records(self.state.parent))
-        self.assertEqual(record[2]["pr"], 42)
-        self.assertEqual(record[2]["source_round"], "old-round")
-        self.assertEqual(record[3]["state"], "checkout-reset")
+        owner = read_json(sidecar)
+        self.assertEqual(owner["pr"], 42)
+        self.assertEqual(owner["round_id"], "old-round")
+        self.assertEqual(owner["abandonment_reason"], "recovery-lifetime-exhausted")
+        self.assertEqual(list(work_recovery.records(self.state.parent)), [])
 
     def test_stash_reflog_and_credentials_prevent_full_checkout_discard(self):
         self.old()
