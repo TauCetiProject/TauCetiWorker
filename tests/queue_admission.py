@@ -290,6 +290,69 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual((result["approved"], result["pending"]), (151, 0))
         self.assertEqual(len(self.controller.inputs("waiting")), 151)
 
+    def recovery(self, *, head=None, author="tau-ceti-bors[bot]", stalled=False):
+        head = head or self.github.prs[1]["head_sha"]
+        marker = "tauceti-merge-stalled" if stalled else "tauceti-rebase"
+        self.github.review_comments[1].append(
+            {
+                "id": 50,
+                "user": {"login": author},
+                "body": f"Merge-queue recovery for head `{head}`: repair needed\n\n<!--{marker}:v1 {head}-->",
+            }
+        )
+
+    def test_trusted_current_head_recovery_holds_survive_the_move_from_sweep(self):
+        self.ready()
+        self.recovery()
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.controller.inputs(), [])
+        labels = [json.loads(row["payload"]) for row in self.controller.store.rows("outbox", {"kind": "labels"})]
+        self.assertTrue(any("needs-rebase" in row["add"] for row in labels))
+        self.assertIn("trusted recovery", json.loads(self.intake.state.get(1)["decision"])["reason"])
+
+    def test_an_untrusted_recovery_marker_does_not_create_a_hold(self):
+        self.ready()
+        self.recovery(author="contributor")
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_stale_recovery_label_cleanup_is_bound_to_the_current_head_and_generation(self):
+        self.ready()
+        self.recovery(head="a" * 40)
+        self.github.labels[1].add("needs-rebase")
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        entry = next(
+            row
+            for row in self.controller.store.rows("outbox", {"kind": "labels"})
+            if "needs-rebase" in json.loads(row["payload"])["remove"]
+        )
+        self.intake.invalidate(1)
+        result = self.controller._perform(entry["kind"], json.loads(entry["payload"]), self.clock())
+        self.assertEqual(result, "stale-admission")
+        self.assertIn("needs-rebase", self.github.labels[1])
+
+    def test_new_review_revocation_is_selected_ahead_of_an_existing_backlog(self):
+        self.ready(1)
+        self.intake.run_once()
+        self.ready(2)
+        self.ready(3)
+        self.ready(4)
+        original = self.github.admission_snapshot
+        reads = []
+
+        def observe(repo, number, **kwargs):
+            snapshot = original(repo, number, **kwargs)
+            reads.append(number)
+            if number == 2:
+                self.review(1, state="blocking_block", round=2)
+                self.intake.invalidate(1)
+            return snapshot
+
+        self.github.admission_snapshot = observe
+        self.intake.request_discovery()
+        self.intake.run_once()
+        self.assertLess(reads.index(1), reads.index(4), "new revocations must not wait for the old pass list")
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
     def test_pending_review_change_cannot_be_inserted_while_its_read_is_quota_blocked(self):
         self.ready()
         self.intake.run_once()

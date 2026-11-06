@@ -1068,7 +1068,7 @@ class GitHubAdapter:
             fresh.base_ref,
             fresh.state,
             fresh.draft,
-            fresh.labels,
+            tuple(sorted(fresh.labels)),
             fresh.body,
             _timestamp(fresh.updated_at),
             fresh.comments_count,
@@ -1078,7 +1078,7 @@ class GitHubAdapter:
             pull.base_ref,
             pull.state,
             pull.draft,
-            pull.labels,
+            tuple(sorted(pull.labels)),
             pull.body,
             _timestamp(pull.updated_at),
             pull.comments_count,
@@ -1242,6 +1242,7 @@ class GitHubAdapter:
                         "created_at": comment.get("createdAt", ""),
                         "updated_at": comment.get("updatedAt", ""),
                         "html_url": comment.get("url", ""),
+                        "author": (comment.get("author") or {}).get("login", ""),
                     }
                 )
             page = connection.get("pageInfo")
@@ -1464,7 +1465,7 @@ query($owner: String!, $name: String!, $number: Int!, $head: GitObjectID!) {
 
 ADMISSION_COMMENT_FIELDS = """
   pageInfo { hasNextPage endCursor }
-  nodes { databaseId body createdAt updatedAt url }
+  nodes { databaseId body createdAt updatedAt url author { login } }
 """
 ADMISSION_PULLS_QUERY = (
     """

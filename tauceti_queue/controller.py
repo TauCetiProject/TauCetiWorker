@@ -2699,6 +2699,8 @@ class Controller:
                         reason="conflicts-with-main",
                         last_probe=dumps(paths),
                     )
+                    if self.admission is not None:
+                        self.admission.withdraw(row["number"], row["head_sha"])
                     self._conflict_request(row, paths, now)
                 else:
                     open_ids = {str(b["id"]) for b in self._open_batches()}
@@ -2788,6 +2790,8 @@ class Controller:
                     last_probe=dumps(listed),
                     last_probe_base="",
                 )
+                if self.admission is not None:
+                    self.admission.withdraw(row["number"], row["head_sha"])
                 self._missing_source_request(row, listed)
                 self._release_claim(claim, "missing-source", now)
                 self._count("missing_source_refusals")
@@ -5129,7 +5133,7 @@ class Controller:
             {"id": entry["id"]},
             attempts=attempts,
             history=dumps(history[-20:]),
-            next_attempt_at=now + backoff,
+            next_attempt_at=getattr(error, "retry_at", None) or now + backoff,
         )
         self.log.warning("outbox %s %s failed (attempt %s): %s", entry["kind"], entry["key"], attempts, error)
 
@@ -5152,6 +5156,16 @@ class Controller:
                 self.github.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )
         if kind == "labels":
+            if "admission_generation" in payload:
+                work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
+                if work is None or work["generation"] != payload["admission_generation"]:
+                    return "stale-admission"
+                pull = self.github.fetch_pr(repo, payload["number"])
+                if pull.head_sha != payload["head_sha"] or pull.state != "open" or pull.draft:
+                    return "stale-head"
+                work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
+                if work["generation"] != payload["admission_generation"]:
+                    return "stale-admission"
             self._ensure_labels(repo, payload.get("ensure", []))
             self.github.set_labels(repo, payload["number"], payload.get("add", []), payload.get("remove", []))
             return "labels"

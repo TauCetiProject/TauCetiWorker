@@ -25,7 +25,7 @@ from .store import dumps, loads
 
 log = logging.getLogger(__name__)
 EXPLICIT_WITHDRAWALS = frozenset(
-    {"unapproved", "cancelled", "conflicts-with-main", "landed-externally", "problem-anticipated"}
+    {"unapproved", "cancelled", "conflicts-with-main", "missing-source", "landed-externally", "problem-anticipated"}
 )
 CONTEXTS = ("build", "scope", "bump-guard")
 
@@ -50,15 +50,28 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             "policy": revision,
             **{key: source.get(key) for key in ("head", "base_ref", "state", "draft", "body")},
             "diff": source.get("diff_version") or source.get("merge_base"),
-            "labels": sorted({s.lower() for s in source.get("labels", ())} & (KEEP | set(no_repair_labels))),
+            "labels": sorted(
+                {s.lower() for s in source.get("labels", ())} & (KEEP | set(no_repair_labels) | {"needs-rebase"})
+            ),
             "comments": [
-                {key: c.get(key) for key in ("id", "body", "created_at", "updated_at")}
+                {
+                    **{key: c.get(key) for key in ("id", "body", "created_at", "updated_at")},
+                    "author": c.get("author") or (c.get("user") or {}).get("login"),
+                }
                 for c in source.get("comments", ())
-                if policy.SCOREBOARD_MARKER in (c.get("body") or "")
+                if relevant_comment(c)
             ],
             "statuses": {key: (source.get("statuses", {}).get(key) or "").lower() for key in CONTEXTS},
         }
     )
+
+
+def recovery_heads(comments):
+    return policy.rebase_request_heads(comments) | policy.rebase_request_heads(comments, stalled=True)
+
+
+def relevant_comment(comment):
+    return policy.SCOREBOARD_MARKER in (comment.get("body") or "") or bool(recovery_heads([comment]))
 
 
 class AdmissionPolicy:
@@ -101,6 +114,9 @@ class AdmissionPolicy:
             scope=snapshot.statuses.get("scope", ""),
             merge_base_sha=snapshot.merge_base_sha,
         )
+        result["recovery_heads"] = sorted(recovery_heads(snapshot.comments))
+        if result["review_safe"] and snapshot.pull.head_sha in result["recovery_heads"]:
+            result.update(merge=False, reason="waiting on a trusted recovery request for this head")
         board = policy.latest_current_scoreboard(snapshot.comments, snapshot.pull.head_sha)
         comment, meta = board if board else ({}, {})
         states = meta.get("states")
@@ -212,8 +228,8 @@ class AdmissionPoller:
             comment = payload.get("comment") or {}
             previous_body = ((payload.get("changes") or {}).get("body") or {}).get("from") or ""
             if "pull_request" not in (payload.get("issue") or {}) or (
-                policy.SCOREBOARD_MARKER not in (comment.get("body") or "")
-                and policy.SCOREBOARD_MARKER not in previous_body
+                not relevant_comment(comment)
+                and not relevant_comment(dict(comment, body=previous_body))
                 and payload.get("action") != "deleted"
             ):
                 return
@@ -413,6 +429,29 @@ class AdmissionPoller:
             disposition = "waiting"
             pull = snapshot.pull
             current = self.controller._input_for(work["number"])
+            requested = result["recovery_heads"]
+            labels = {label.lower() for label in pull.labels}
+            if (
+                pull.state == "open"
+                and not pull.draft
+                and pull.base_ref == self.controller.canonical_branch
+                and result["review_safe"]
+                and not labels & KEEP
+                and requested
+            ):
+                held, labelled = pull.head_sha in requested, "needs-rebase" in labels
+                if held != labelled:
+                    self.controller._enqueue(
+                        "labels",
+                        f"admission-rebase-label:{pull.number}:{pull.head_sha}:{work['generation']}",
+                        {
+                            "number": pull.number,
+                            "add": ["needs-rebase"] if held else [],
+                            "remove": [] if held else ["needs-rebase"],
+                            "head_sha": pull.head_sha,
+                            "admission_generation": work["generation"],
+                        },
+                    )
             if current and current["head_sha"] != pull.head_sha:
                 self.controller._pull_request_event(
                     {"number": pull.number, "action": "synchronize", "pull_request": {"head": {"sha": pull.head_sha}}},
