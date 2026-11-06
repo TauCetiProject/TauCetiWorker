@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from contextlib import ExitStack, closing
@@ -77,6 +78,49 @@ class CommitFacts:
     def __init__(self, clone):
         self.clone = clone
         self.cache = {}
+        self.policy_cache = {}
+
+    def dispatch_config(self, revision):
+        """Read only allowlisted policy from an immutable, already-local commit."""
+        if self.clone is None or not isinstance(revision, str) or not SHA.fullmatch(revision):
+            return None
+        if revision in self.policy_cache:
+            return self.policy_cache[revision]
+        args = ["git", "-C", str(self.clone), "cat-file"]
+        env = dict(os.environ, GIT_NO_LAZY_FETCH="1")
+        spec = revision + ":tauceti.toml"
+        try:
+            size = subprocess.run([*args, "-s", spec], capture_output=True, check=True, timeout=1, env=env)
+            if not size.stdout.strip().isdigit() or not 0 < int(size.stdout) <= 65536:
+                return None
+            result = subprocess.run([*args, "blob", spec], capture_output=True, check=True, timeout=1, env=env)
+            config = tomllib.loads(result.stdout.decode())["services"]["fleet"]
+            cap = config["namespace_build_cap"]
+            if type(cap) is not int or not 0 <= cap <= 10000:
+                return None
+            for order in (config["pr_order"], config["staging_order"]):
+                if (
+                    not isinstance(order, list)
+                    or not 0 < len(order) <= 20
+                    or any(
+                        not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,59}", name) for name in order
+                    )
+                    or len(set(order)) != len(order)
+                ):
+                    return None
+            value = {
+                "repository": "TauCetiProject/TauCeti",
+                "revision": revision,
+                "namespace_build_cap": cap,
+                "pr_order": config["pr_order"],
+                "staging_order": config["staging_order"],
+            }
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            return None
+        self.policy_cache[revision] = value
+        if len(self.policy_cache) > 128:
+            del self.policy_cache[next(iter(self.policy_cache))]
+        return value
 
     def _read(self, shas):
         requested = sorted(s for s in shas if SHA.fullmatch(s))[:2000]
@@ -511,6 +555,9 @@ def project(
         "source_revision": text(service.get("revision"), 40),
         "canonical_sha": status.get("canonical_sha")
         if isinstance(status.get("canonical_sha"), str) and SHA.fullmatch(status["canonical_sha"])
+        else None,
+        "dispatch_config": facts.dispatch_config(status.get("canonical_sha"))
+        if facts and "TauCetiProject/TauCeti" in public_repositories and hasattr(facts, "dispatch_config")
         else None,
         "coverage": "partial" if truncated else "observed",
         "truncated": truncated,
