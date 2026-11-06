@@ -120,6 +120,9 @@ def normalise_findings(raw: dict | None) -> dict:
     lint = raw.get("lint")
     if isinstance(lint, dict):
         findings["lint"] = {"findings": list(lint.get("findings") or []), "report": list(lint.get("report") or [])}
+    for key in ("admission_predictions",):
+        if isinstance(raw.get(key), dict):
+            findings[key] = raw[key]
     for key in ("built_modules", "canceled_jobs"):
         value = raw.get(key)
         if isinstance(value, int):
@@ -166,6 +169,9 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         if not isinstance(raw, dict):
             continue
         kind = str(raw.get("kind") or "")
+        if kind == "admission_predictions":
+            findings["admission_predictions"] = raw
+            continue
         if kind == "cross_batch":
             findings["cross_batch"] = raw
             continue
@@ -1680,10 +1686,25 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     landed = landed_on_main(context, chain, clone)
     where = write_listings(context, chain, landed) if context.listings_path is not None else None
+    knowledge = findings.get("admission_predictions")
+    if knowledge and context.listings_path is not None:
+        (context.listings_path.parent / "admission.json").write_text(json.dumps(knowledge, indent=2) + "\n")
     check_command = f"python3 {LISTINGS_DIR}/{CHECK_FILE}" if where else None
     if conflict:
         happened, evidence = _rebase_sections(context, chain, clone, base_short, where)
         lines += happened + evidence
+    elif knowledge and knowledge.get("proactive"):
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} attributed PR commits is on `{base_short}`. Its first CI attempt is still "
+            "being validated. Compiled accepted-input records predict an interaction worth checking now; no failed "
+            "CI verdict is implied. Resolve real problems found by the worker's scripted build and audits. If those "
+            "checks pass and no edit is needed, leave the chain unchanged; the controller keeps its existing CI.",
+            "",
+            "## Admission and build evidence",
+            "",
+        ]
     elif context.kind == "prepare" and context.pre_rebased:
         lines += [
             "## What happened",
@@ -1841,6 +1862,9 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
 
         lines += cross_batch_lines(findings.get("cross_batch"))
         lines += prepare_errors_lines(findings.get("prepare_errors"))
+    from .admission_planning import prompt_lines
+
+    lines += prompt_lines(knowledge, with_file=context.listings_path is not None)
     lines += _result_section(base_short)
     lines += _editing_section(context, chain, base_short, where)
     lines += _verification_section(context, findings, base_short, check_command)

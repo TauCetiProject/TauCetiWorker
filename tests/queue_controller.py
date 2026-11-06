@@ -1802,6 +1802,39 @@ class PreRebasedPreparation(ControllerCase):
         self.controller.tick()
         self.assertEqual(len(self.pre_rebased_tasks()), 1, "one background task per batch")
 
+    def test_clean_pre_rebase_preparation_gets_compiled_cross_batch_collisions(self):
+        from unittest.mock import patch
+
+        fetching = patch.object(self.controller, "_fetch_declaration_names", return_value=False)
+        fetching.start()
+        self.addCleanup(fetching.stop)
+        self.approve(101, {"A.lean": "def a := 1\n"})
+        self.controller.tick()
+        self.approve(201, {"P201.lean": "def b := 1\n"})
+        self.approve(202, {"P202.lean": "def c := 1\n"})
+        for row in self.controller.store.rows("inputs"):
+            record = {
+                "state": "known",
+                "version": 1,
+                "head": row["head_sha"],
+                "base": self.repo.main_sha(),
+                "tested": row["head_sha"],
+                "complete": True,
+                "added": {f"TauCeti.M{row['number']}": ["Generated.shared" if row["number"] != 202 else "other"]},
+            }
+            self.controller.store.update("inputs", {"id": row["id"]}, declaration_names=json.dumps(record))
+        self.controller.tick()
+        own = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(own.task_id, own.claim_token, "prepared_clean")
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertIn("pre_rebased", task.extra)
+        cross = next(d for d in task.diagnostics if d["kind"] == "cross_batch")
+        [collision] = cross["added_by_both"]
+        self.assertEqual(collision["name"], "Generated.shared")
+        self.assertEqual([m["pr"] for m in collision["head"]], [101])
+        self.assertEqual([m["pr"] for m in collision["next"]], [201])
+
     def test_no_task_before_the_own_base_preparation_or_below_the_size(self):
         self.controller.set_setting("prepare_min_members", 3, "t")
         self.approve(101, {"A.lean": "a\n"})
@@ -1840,9 +1873,23 @@ class PreRebasedPreparation(ControllerCase):
         )
         task = agent.claim(self.controller)
         self.assertIn("pre_rebased", task.extra)
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        diagnostics = loads(row["diagnostics"], [])
+        diagnostics.append(
+            {
+                "kind": "admission_predictions",
+                "records": [{"kind": "declaration_collision", "name": "Generated.shared", "sources": [{"pr": 202}]}],
+            }
+        )
+        self.controller.store.update("tasks", {"id": task.task_id}, diagnostics=json.dumps(diagnostics))
         tip = agent.produce(task)
         result = self.controller.submit_task(task.task_id, task.claim_token, tip, worker_notes="{}")
         self.assertTrue(result.accepted, result)
+        event = self.controller.store.row("journal", {"kind": "admission-repair-result"}, order="id DESC")
+        detail = loads(event["detail"])
+        self.assertEqual(detail["task_id"], task.task_id)
+        self.assertIsNone(detail["attempt_id"], "a background result must not bind to the preceding head's CI")
+        self.assertEqual(detail["edited"], [f"{PROJECT}#202"])
         self.assertEqual(result.provenance, {f"{PROJECT}#201": "clean", f"{PROJECT}#202": "edited"})
         after = self.controller.store.row("batches", {"id": batch["id"]})
         self.assertEqual(
