@@ -79,8 +79,53 @@ class Monitoring(unittest.TestCase):
         exported = self.export(worker_roots=[worker])
         self.assertNotIn(sentinel, json.dumps(exported))
         self.assertEqual(len(exported["claims"]), 1)
-        self.assertEqual(exported["workers"][0]["id"], "repair-a")
+        self.assertEqual(exported["workers"][0]["id"], monitoring.worker_alias("repair-a"))
         self.assertEqual(exported["workers"][0]["errors"], 0)
+
+    def test_task_checkpoint_and_outcome_keep_only_recorded_public_progress(self):
+        sentinel = "DO_NOT_PUBLISH_SECRET"
+        head = self.controller._head()
+        self.controller._create_task(head, "repair", head["base"], [], self.clock())
+        task_id = self.controller.store.rows("tasks")[-1]["id"]
+        root = self.root / "worker"
+        directory = root / "tasks" / str(task_id)
+        directory.mkdir(parents=True)
+        (directory / "task.json").write_text(
+            json.dumps(
+                {
+                    "task": {"task_id": str(task_id), "claim_token": sentinel},
+                    "state": "agent_running",
+                    "updated_at": self.clock(),
+                    "worktree": sentinel,
+                }
+            )
+        )
+        (directory / "outcome.json").write_text(
+            json.dumps(
+                {
+                    "seconds": 20,
+                    "agent": [
+                        {
+                            "attempts": [
+                                {
+                                    "provider": "codex",
+                                    "model": "gpt-6.1",
+                                    "estimated_cost_usd": 1.25,
+                                    "telemetry": {"raw_prompt": sentinel},
+                                }
+                            ]
+                        }
+                    ],
+                    "error": sentinel,
+                }
+            )
+        )
+        value = self.export(worker_roots=[root], task_observations=monitoring.TaskObservations())
+        progress = next(t for t in value["tasks"] if t["id"] == str(task_id))["progress"]
+        self.assertEqual(progress["models"], ["gpt-6.1"])
+        self.assertEqual(progress["cost"]["recorded_usd"], 1.25)
+        self.assertEqual(progress["state"], "agent_running")
+        self.assertNotIn(sentinel, json.dumps(value))
 
     def test_export_does_not_write_the_database(self):
         before = {
@@ -145,6 +190,10 @@ class Monitoring(unittest.TestCase):
         with self.assertRaises(ValueError):
             monitoring.public_url("https://private.example", "commit", "a" * 40)
         self.assertIsNone(monitoring.public_url(PROJECT, "commit", "../../secret"))
+
+    def test_a_malformed_display_value_cannot_stringify_a_private_object(self):
+        self.assertEqual(monitoring.text({"token": "PRIVATE_TOKEN"}), "")
+        self.assertEqual(monitoring.text("a\x00b\x1bc\nλ"), "abc\nλ")
 
     def test_an_unlisted_repository_never_enters_the_public_pr_index(self):
         original = self.controller.store.rows("inputs")[0]

@@ -1,0 +1,287 @@
+{
+  "schema": "tauceti.operations.history/v1",
+  "observed_at": "1970-01-01T01:23:20Z",
+  "scope": {
+    "repositories": [
+      "TauCetiProject/TauCeti"
+    ]
+  },
+  "coverage": "observed",
+  "windows": [
+    {
+      "key": "24h",
+      "label": "Last 24 hours",
+      "from": "1970-01-01T00:16:40Z",
+      "until": "1970-01-01T01:23:20Z",
+      "hours": 1.1111111111111112,
+      "summary": {
+        "landed_heads": 1,
+        "landed_prs": 2,
+        "landed_prs_per_hour": 1.7999999999999998,
+        "landed_membership_occurrences": 2,
+        "nonempty_unique_prs_per_hour": 0.8999999999999999,
+        "nonempty_unique_prs": 1,
+        "empty_member_occurrences": 1,
+        "already_landed_empty_occurrences": 1,
+        "emptiness_unknown": 0,
+        "baseline_ratio": 1.7999999999999998,
+        "ci_attempts": 2,
+        "singleton_runs": 0,
+        "failed_rounds_per_large_landing": null,
+        "claim_collisions": 0,
+        "claim_expiries": 0,
+        "opt_outs": 0,
+        "anticipated_withdrawals": 0,
+        "needs_rebase": 0,
+        "readmissions": 0,
+        "edit_summaries": null,
+        "shrink_to_empty": null,
+        "inference_hold_minutes": 5.0,
+        "head_dispatch_minutes": {
+          "count": 1,
+          "min": 50.0,
+          "median": 50.0,
+          "p95": 50.0,
+          "max": 50.0
+        },
+        "head_seal_minutes": {
+          "count": 1,
+          "min": 51.667,
+          "median": 51.667,
+          "p95": 51.667,
+          "max": 51.667
+        },
+        "repair_task_minutes": {
+          "count": 1,
+          "min": 5.0,
+          "median": 5.0,
+          "p95": 5.0,
+          "max": 5.0
+        },
+        "approval_to_insertion_minutes": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "p95": null,
+          "max": null
+        },
+        "currently_waiting_age_minutes": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "p95": null,
+          "max": null
+        },
+        "cost": {
+          "recorded_usd": 2.5,
+          "recorded_attempts": 1,
+          "unknown_attempts": 0,
+          "coverage": "recorded_subtotal_only"
+        }
+      },
+      "heads": [
+        {
+          "size": 2,
+          "ci_rounds": 2,
+          "source_failure_rounds": 1,
+          "first_dispatch_to_landing_minutes": 50.0,
+          "seal_to_landing_minutes": 51.666666666666664,
+          "ci_observed_minutes": 40.0,
+          "claimed_task_minutes": 5.0,
+          "ci_task_overlap_minutes": 0.0,
+          "other_or_unobserved_minutes": 6.666666666666667,
+          "batch_id": "1"
+        }
+      ],
+      "heads_truncated": false
+    },
+    {
+      "key": "7d",
+      "label": "Last seven days",
+      "from": "1970-01-01T00:16:40Z",
+      "until": "1970-01-01T01:23:20Z",
+      "hours": 1.1111111111111112,
+      "summary": {
+        "landed_heads": 1,
+        "landed_prs": 2,
+        "landed_prs_per_hour": 1.7999999999999998,
+        "landed_membership_occurrences": 2,
+        "nonempty_unique_prs_per_hour": 0.8999999999999999,
+        "nonempty_unique_prs": 1,
+        "empty_member_occurrences": 1,
+        "already_landed_empty_occurrences": 1,
+        "emptiness_unknown": 0,
+        "baseline_ratio": 1.7999999999999998,
+        "ci_attempts": 2,
+        "singleton_runs": 0,
+        "failed_rounds_per_large_landing": null,
+        "claim_collisions": 0,
+        "claim_expiries": 0,
+        "opt_outs": 0,
+        "anticipated_withdrawals": 0,
+        "needs_rebase": 0,
+        "readmissions": 0,
+        "edit_summaries": null,
+        "shrink_to_empty": null,
+        "inference_hold_minutes": 5.0,
+        "head_dispatch_minutes": {
+          "count": 1,
+          "min": 50.0,
+          "median": 50.0,
+          "p95": 50.0,
+          "max": 50.0
+        },
+        "head_seal_minutes": {
+          "count": 1,
+          "min": 51.667,
+          "median": 51.667,
+          "p95": 51.667,
+          "max": 51.667
+        },
+        "repair_task_minutes": {
+          "count": 1,
+          "min": 5.0,
+          "median": 5.0,
+          "p95": 5.0,
+          "max": 5.0
+        },
+        "approval_to_insertion_minutes": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "p95": null,
+          "max": null
+        },
+        "currently_waiting_age_minutes": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "p95": null,
+          "max": null
+        },
+        "cost": {
+          "recorded_usd": 2.5,
+          "recorded_attempts": 1,
+          "unknown_attempts": 0,
+          "coverage": "recorded_subtotal_only"
+        }
+      },
+      "heads": [
+        {
+          "size": 2,
+          "ci_rounds": 2,
+          "source_failure_rounds": 1,
+          "first_dispatch_to_landing_minutes": 50.0,
+          "seal_to_landing_minutes": 51.666666666666664,
+          "ci_observed_minutes": 40.0,
+          "claimed_task_minutes": 5.0,
+          "ci_task_overlap_minutes": 0.0,
+          "other_or_unobserved_minutes": 6.666666666666667,
+          "batch_id": "1"
+        }
+      ],
+      "heads_truncated": false
+    },
+    {
+      "key": "pilot",
+      "label": "Whole pilot",
+      "from": "1970-01-01T00:16:40Z",
+      "until": "1970-01-01T01:23:20Z",
+      "hours": 1.1111111111111112,
+      "summary": {
+        "landed_heads": 1,
+        "landed_prs": 2,
+        "landed_prs_per_hour": 1.7999999999999998,
+        "landed_membership_occurrences": 2,
+        "nonempty_unique_prs_per_hour": 0.8999999999999999,
+        "nonempty_unique_prs": 1,
+        "empty_member_occurrences": 1,
+        "already_landed_empty_occurrences": 1,
+        "emptiness_unknown": 0,
+        "baseline_ratio": 1.7999999999999998,
+        "ci_attempts": 2,
+        "singleton_runs": 0,
+        "failed_rounds_per_large_landing": null,
+        "claim_collisions": 0,
+        "claim_expiries": 0,
+        "opt_outs": 0,
+        "anticipated_withdrawals": 0,
+        "needs_rebase": 0,
+        "readmissions": 0,
+        "edit_summaries": null,
+        "shrink_to_empty": null,
+        "inference_hold_minutes": 5.0,
+        "head_dispatch_minutes": {
+          "count": 1,
+          "min": 50.0,
+          "median": 50.0,
+          "p95": 50.0,
+          "max": 50.0
+        },
+        "head_seal_minutes": {
+          "count": 1,
+          "min": 51.667,
+          "median": 51.667,
+          "p95": 51.667,
+          "max": 51.667
+        },
+        "repair_task_minutes": {
+          "count": 1,
+          "min": 5.0,
+          "median": 5.0,
+          "p95": 5.0,
+          "max": 5.0
+        },
+        "approval_to_insertion_minutes": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "p95": null,
+          "max": null
+        },
+        "currently_waiting_age_minutes": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "p95": null,
+          "max": null
+        },
+        "cost": {
+          "recorded_usd": 2.5,
+          "recorded_attempts": 1,
+          "unknown_attempts": 0,
+          "coverage": "recorded_subtotal_only"
+        }
+      },
+      "heads": [
+        {
+          "size": 2,
+          "ci_rounds": 2,
+          "source_failure_rounds": 1,
+          "first_dispatch_to_landing_minutes": 50.0,
+          "seal_to_landing_minutes": 51.666666666666664,
+          "ci_observed_minutes": 40.0,
+          "claimed_task_minutes": 5.0,
+          "ci_task_overlap_minutes": 0.0,
+          "other_or_unobserved_minutes": 6.666666666666667,
+          "batch_id": "1"
+        }
+      ],
+      "heads_truncated": false
+    }
+  ],
+  "baseline": {
+    "hours": null,
+    "landed_prs": null,
+    "landed_prs_per_hour": 1,
+    "singleton_runs": null,
+    "failed_rounds_per_large_landing": null
+  },
+  "limits": [
+    "Costs are recorded subtotals; absent interrupted sessions remain unknown.",
+    "The Bors baseline has no retained nonempty-commit comparison or inference costs.",
+    "CI and claimed repair intervals use unions; overlap is not counted twice in latency.",
+    "Attribution/comment correctness and warm-artifact conditions require a separate audit.",
+    "Historical host telemetry starts at activation; earlier periods remain unknown."
+  ]
+}
