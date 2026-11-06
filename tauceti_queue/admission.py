@@ -376,6 +376,30 @@ class AdmissionPoller:
             summary["errors"].append(f"#{work['number']}: {error}")
         return True
 
+    def _legacy_withdrawal(self, current):
+        """Recover the old boundary from local records, without treating current evidence as old intent."""
+        evidence = loads(current["evidence"], {})
+        boundary = None
+        reason = current["reason"]
+        if reason in {"unapproved", "cancelled", "landed-externally"}:
+            rows = self.controller.store.query(
+                "SELECT at FROM journal WHERE kind='withdrawn' AND at>=? "
+                "AND json_extract(detail, '$.number')=? AND json_extract(detail, '$.reason')=? "
+                "ORDER BY id DESC LIMIT 1",
+                (current["approved_at"], current["number"], reason),
+            )
+            boundary = rows[0]["at"] if rows else None
+        elif reason in {"conflicts-with-main", "missing-source"}:
+            kind = "selection_conflict" if reason == "conflicts-with-main" else "missing_source"
+            boundary = next(
+                (r.get("at") for r in reversed(evidence.get("merge_selection", [])) if r.get("kind") == kind),
+                None,
+            )
+        elif reason == "problem-anticipated":
+            boundary = loads(current["anticipated"], {}).get("withdrawn_at")
+        # Missing history is held conservatively. Never infer approval from a comment edit.
+        return boundary or self.clock(), evidence.get("authorization", "")
+
     def _cancelled(self, work, snapshot, authorization, comment, meta):
         current = self.controller._input_for(work["number"])
         if (
@@ -385,12 +409,13 @@ class AdmissionPoller:
             and (current["head_sha"] == snapshot.pull.head_sha and current["reason"] in EXPLICIT_WITHDRAWALS)
         ):
             # Migration: the old input, including its withdrawal, remains authoritative.
+            cancelled_at, cancelled_authorization = self._legacy_withdrawal(current)
             self.controller.store.update(
                 "admission_work",
                 {"id": work["id"]},
                 cancelled_head_sha=current["head_sha"],
-                cancelled_at=self.clock(),
-                cancelled_authorization=authorization,
+                cancelled_at=cancelled_at,
+                cancelled_authorization=cancelled_authorization,
             )
             work = self.state.get(work["number"])
         if work["cancelled_head_sha"] == "*":

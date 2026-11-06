@@ -641,6 +641,11 @@ queue rules. Late legacy eligibility checks and automatic review-App commands ar
 policy mode. The old eligibility consumer is available only through an explicit pre-cutover
 configuration; there is no automatic change of admission owner.
 
+At cutover, legacy withdrawals retain their recorded journal or rejection-evidence time. A new
+review comment created after that boundary can restore approval. If legacy records do not retain
+the earlier review authorization, an edit to an old comment cannot prove fresh intent; a new
+comment or explicit operator approval is required. Missing withdrawal history is held conservatively.
+
 `status.admission` reports the active source, policy digest, pending count, oldest pending time,
 and pending PRs with attempt time, retry deadline, resource and last error. The existing
 `approvals.last_poll` field carries the intake summary. Successful decisions are journaled as

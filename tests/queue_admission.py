@@ -43,7 +43,7 @@ class AdmissionTests(unittest.TestCase):
         self.github.review_comments[number] = [
             {
                 "id": comment,
-                "created_at": previous.get("created_at", ts),
+                "created_at": previous.get("created_at", ts) if previous.get("id") == comment else ts,
                 "updated_at": ts,
                 "body": "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 " + json.dumps(meta) + "-->",
             }
@@ -144,6 +144,31 @@ class AdmissionTests(unittest.TestCase):
         self.review(round=2)
         self.intake.invalidate(1)
         self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_cutover_uses_the_legacy_withdrawal_time_without_rejecting_a_new_comment(self):
+        head = self.ready()
+        self.controller.admission = None
+        self.controller.approve(REPO, 1, head, "kim-em", 0, {"kind": "issue_comment"})
+        self.clock.advance(1)
+        self.controller.cancel(REPO, 1, "kim-em")
+        self.clock.advance(60)
+        self.review(round=2, comment=11)
+        self.clock.advance(60)
+        self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_cutover_does_not_treat_an_edit_of_the_cancelled_review_as_fresh_intent(self):
+        head = self.ready()
+        self.controller.admission = None
+        self.controller.approve(REPO, 1, head, "kim-em", 0, {"kind": "issue_comment"})
+        self.clock.advance(1)
+        self.controller.cancel(REPO, 1, "kim-em")
+        self.clock.advance(60)
+        self.github.review_comments[1][0]["body"] += "\nAccounting updated."
+        self.github.review_comments[1][0]["updated_at"] = datetime.fromtimestamp(self.clock(), UTC).isoformat()
+        self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
 
     def test_event_during_read_prevents_old_commit_without_holding_controller_lock(self):
         head = self.ready()
