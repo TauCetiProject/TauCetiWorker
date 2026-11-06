@@ -15,6 +15,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -234,6 +235,34 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(body["started_at"], "2026-11-04T07:06:39Z")
         self.assertEqual(body["github"], {"requests": 12, "rate_limit_remaining": 4800})
         self.assertEqual(set(body["webhooks"]), {"received", "duplicates", "ignored"})
+
+    def test_frozen_admission_header_only_for_native_observation(self):
+        def fetch(path):
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            connection.request("GET", path)
+            response = connection.getresponse()
+            result = (response.status, response.getheader("TauCeti-Admission"), json.loads(response.read()))
+            connection.close()
+            return result
+
+        path = "/repositories/1/active-batches?base=main&batch_id=2650"
+        status, header, ordinary = fetch(path)
+        self.assertEqual(status, 200)
+        self.assertIsNone(header)  # compatibility FeedSource makes no frozen claim
+        native = feeds.ControllerFeedSource(object())
+        with (
+            patch.object(feeds, "feed_source", return_value=native),
+            patch.object(feeds, "observation_feed", return_value=ordinary),
+        ):
+            for route in (path, "/api/observation?base=main"):
+                status, header, doc = fetch(route)
+                self.assertEqual((status, header, doc), (200, "frozen-accepted-head/v1", ordinary))
+            with patch.object(feeds, "candidates_feed", return_value={}):
+                self.assertIsNone(fetch("/repositories/1/candidates?base=main")[1])
+            with patch.object(feeds, "observation_feed", side_effect=ValueError("invalid")):
+                status, header, _ = fetch(path)
+                self.assertEqual(status, 400)
+                self.assertIsNone(header)
 
     def test_feeds(self):
         schema = feeds.load_schema()

@@ -447,3 +447,26 @@ traceback logged. Workers push their result chain to the task's `submission_ref`
   and `create_server(..., status=..., adapter=..., app=...)`; it serves status only while the
   credentials or the content clone are missing, and the status document's `feeds.observation` is
   Bors's path.
+
+## Frozen admission authority for scope verification
+
+The native controller's successful active-batches observation responses include
+`TauCeti-Admission: frozen-accepted-head/v1`. This is an assertion by the same
+HTTPS authority that supplies the batch and its scope approvals: member heads
+are retained accepted commits; branch pushes, draft changes, retargeting and
+closure do not reopen admission after insertion. Scope approval records remain
+bound to their accepted head and admission merge base. The v1 JSON body is
+unchanged. Compatibility FeedSource implementations, candidate feeds and errors
+do not carry this assertion.
+
+Workflow-pinned tooling may use that header to inspect complete immutable member
+diffs instead of mutable PR files. It must still check exact batch head/base,
+restricted-path approval by a current effective repository admin, complete
+combined-path coverage, and a final authority refresh. Individual PR checks keep
+their live revision rules. A missing or unknown header retains legacy Bors rules;
+JSON fields or contributor dispatch data cannot enable frozen semantics.
+
+Deploy the capable Tools reader and its trusted workflow pin before enabling the
+native header in production. Verify the header end to end, then let a fresh
+normal CI attempt produce its own scope verdict; never manufacture a passing
+status to release a blocked batch.
