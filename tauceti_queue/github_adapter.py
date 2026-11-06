@@ -48,6 +48,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 
 from . import declaration_names, diagnostics, github_app, ports
 from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
@@ -81,7 +83,12 @@ class PullRequestNotFound(GitHubError, LookupError):
 
 
 class RateLimited(GitHubError):
-    """The primary or a secondary limit blocked the call for longer than the client would wait."""
+    """A retryable resource wait, with an absolute deadline the owner can persist."""
+
+    def __init__(self, message: str, status: int = 0, body: bytes = b"", *, retry_at: float, resource: str) -> None:
+        super().__init__(message, status, body)
+        self.retry_at = retry_at
+        self.resource = resource
 
 
 class AmbiguousCandidateRun(GitHubError):
@@ -198,6 +205,8 @@ class GitHubClient:
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.Lock()
+        self._local = threading.local()
+        self._blocked_until: dict[str, float] = {}
         self.requests = 0
         self.retries = 0
         self.limit_waits = 0
@@ -240,6 +249,21 @@ class GitHubClient:
 
     # -- requests
 
+    @contextmanager
+    def deferred_requests(self):
+        """Background intake persists waits instead of sleeping inside a source read.
+
+        This is thread-local: essential queue and command calls retain their existing retry
+        behavior. A known exhausted bucket refuses new reads until its original deadline;
+        trying another PR cannot move that deadline further away.
+        """
+        previous = getattr(self._local, "deferred", False)
+        self._local.deferred = True
+        try:
+            yield
+        finally:
+            self._local.deferred = previous
+
     def url(self, path: str, params: dict | None = None) -> str:
         url = path if path.startswith("http") else f"{self._api}/{path.lstrip('/')}"
         if params:
@@ -266,6 +290,16 @@ class GitHubClient:
         REST counter `rate_limit()` reports.
         """
         url = self.url(path, params)
+        resource = "graphql" if path.strip("/") == "graphql" else "core"
+        deferred = getattr(self._local, "deferred", False)
+        if deferred and token is None:
+            with self._lock:
+                blocked_resource, deadline = max(
+                    ((key, self._blocked_until.get(key, 0)) for key in (resource, "secondary")),
+                    key=lambda pair: pair[1],
+                )
+            if deadline > self._clock():
+                raise RateLimited("GitHub resource wait", retry_at=deadline, resource=blocked_resource)
         body = None if json_body is None else json.dumps(json_body).encode()
         accepted = set(ok) | set(tolerate)
         attempt = 0
@@ -293,16 +327,23 @@ class GitHubClient:
                 self._retry()
                 continue
             wait = self._limit_wait(status, response_headers)
-            if wait is not None and attempt < self.MAX_ATTEMPTS:
-                if wait > self.MAX_WAIT_SECONDS:
+            if wait is not None:
+                blocked_resource = resource if response_headers.get("x-ratelimit-remaining") == "0" else "secondary"
+                deadline = self._clock() + wait
+                if token is None:
+                    with self._lock:
+                        self._blocked_until[blocked_resource] = deadline
+                if deferred or wait > self.MAX_WAIT_SECONDS or attempt >= self.MAX_ATTEMPTS:
                     self._fail(f"rate limited for {wait:.0f}s on {method} {path}")
-                    raise RateLimited(f"rate limited for {wait:.0f}s", status, data)
+                    raise RateLimited(
+                        f"rate limited for {wait:.0f}s", status, data, retry_at=deadline, resource=blocked_resource
+                    )
                 with self._lock:
                     self.limit_waits += 1
                 self._retry()
                 self._sleep(wait)
                 continue
-            if status >= 500 and attempt < self.MAX_ATTEMPTS:
+            if status >= 500 and not deferred and attempt < self.MAX_ATTEMPTS:
                 self._retry()
                 self._sleep(min(2.0**attempt, 30.0))
                 continue
@@ -327,7 +368,10 @@ class GitHubClient:
             try:
                 return max(1.0, float(retry_after))
             except ValueError:
-                pass
+                try:
+                    return max(1.0, parsedate_to_datetime(retry_after).timestamp() - self._clock())
+                except (TypeError, ValueError, OverflowError):
+                    pass
         if headers.get("x-ratelimit-remaining") == "0" and headers.get("x-ratelimit-reset"):
             try:
                 return max(1.0, float(headers["x-ratelimit-reset"]) - self._clock() + 1.0)
@@ -367,6 +411,16 @@ class GitHubClient:
             raise GitHubError("unexpected GraphQL response shape", response.status)
         errors = document.get("errors")
         if errors:
+            if any(isinstance(error, dict) and error.get("type") == "RATE_LIMITED" for error in errors):
+                # GitHub reports GraphQL exhaustion with HTTP 200. Its headers still describe
+                # the GraphQL bucket, independently of the REST counter.
+                reset = response.headers.get("x-ratelimit-reset")
+                deadline = float(reset) + 1 if reset else self._clock() + 60
+                with self._lock:
+                    self._blocked_until["graphql"] = deadline
+                raise RateLimited(
+                    "GraphQL rate limited", response.status, response.body, retry_at=deadline, resource="graphql"
+                )
             raise GitHubError(f"GraphQL: {errors[0].get('message') if isinstance(errors[0], dict) else errors[0]}")
         data = document.get("data")
         if not isinstance(data, dict):
