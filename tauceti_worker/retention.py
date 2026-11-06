@@ -854,6 +854,10 @@ def run_all(*, dry=False):
             for path in paths:
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 configs.extend(worker_configs())
+            initial = {path: {} for path in paths}
+            if not dry:
+                # Exact queued disposal must not wait behind shared-cache inventory.
+                drain_pending(list(initial.items()))
             for index, path in enumerate(paths):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 try:
@@ -861,6 +865,8 @@ def run_all(*, dry=False):
                 except Exception as error:
                     result = fresh_report()
                     note(result, "errors", str(error))
+                if "drain" in initial[path]:
+                    result["drain"] = initial[path]["drain"]
                 report["roots"].append(dict(path=str(path), **result))
             if not dry:
                 drain_pending([(Path(result["path"]), result) for result in report["roots"]])
