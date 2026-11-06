@@ -80,20 +80,32 @@ class ImportGaps(unittest.TestCase):
         outside, _ = self.tree({"Scripts/Tool.lean": "import TauCeti.Nothing\n"}, start=base_sha)
         self.assertEqual(self.gaps(outside), (frozenset(), None))
 
-    def test_scan_is_memoised_and_reads_only_new_blobs(self):
-        base, base_sha = self.tree({f"TauCeti/M{n}.lean": f"module\ndef m{n} := {n}\n" for n in range(12)})
+    def test_scan_is_memoised_and_reads_only_importers_of_absent_sources(self):
+        base, base_sha = self.tree(
+            {f"TauCeti/M{n}.lean": f"module\nimport TauCeti.M{max(n - 1, 0)}\ndef m{n} := {n}\n" for n in range(12)}
+        )
         with patch.object(self.planner, "git", wraps=self.planner.git) as git:
             self.assertEqual(self.gaps(base), (frozenset(), None))
-            first = [c.args[0] for c in git.call_args_list]
-            self.assertEqual(first.count("cat-file"), 2)  # one size check, one batch read
+            calls = [c.args[0] for c in git.call_args_list]
+            self.assertEqual(calls, ["ls-tree", "grep"])  # no header is read when every source exists
             self.gaps(base)
-            self.assertEqual(len(git.call_args_list), len(first))  # memoised per tree
-            nxt, _ = self.tree({"TauCeti/M12.lean": "module\nimport TauCeti.M3\n"}, start=base_sha)
+            self.assertEqual(len(git.call_args_list), 2)  # memoised per tree
+            nxt, _ = self.tree({"TauCeti/M12.lean": "module\nimport TauCeti.M3\nimport TauCeti.Nope\n"}, start=base_sha)
             git.reset_mock()
-            self.assertEqual(self.gaps(nxt), (frozenset(), None))
+            self.assertEqual(self.gaps(nxt), (frozenset({("TauCeti/M12.lean", "TauCeti.Nope")}), None))
             batch_reads = [c for c in git.call_args_list if c.args[0] == "cat-file" and c.args[1] == "--batch"]
             self.assertEqual(len(batch_reads), 1)
-            self.assertEqual(batch_reads[0].kwargs["data"].decode().count("\n"), 1)  # only the new blob
+            self.assertEqual(batch_reads[0].kwargs["data"].decode().count("\n"), 1)  # only the importer's blob
+
+    def test_import_lines_outside_the_header_are_not_gaps(self):
+        tree, _ = self.tree(
+            {
+                "TauCeti/A.lean": "module\ndef a := 1\nimport TauCeti.AfterCode\n",
+                "TauCeti/B.lean": "module\n/-\nimport TauCeti.InComment\n-/\nimport TauCeti.A\ndef b := 1\n",
+                "TauCeti/C.lean": "module\nimport TauCeti.A\n  public import TauCeti.Real\ndef c := 1\n",
+            }
+        )
+        self.assertEqual(self.gaps(tree), (frozenset({("TauCeti/C.lean", "TauCeti.Real")}), None))
 
     def test_unsupported_entries_and_oversize_sources(self):
         base, base_sha = self.tree({"TauCeti/A.lean": "module\ndef a := 1\n"})

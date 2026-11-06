@@ -25,7 +25,13 @@ MAX_EDGES = 2048
 MAX_CONTEXT_BYTES = 512 * 1024
 PROJECT_MODULE_PREFIX = "TauCeti."
 MAX_GAP_TREES = 64  # memoised whole-tree import scans, keyed by tree id
-MAX_GAP_PASSES = 8  # byte-budgeted header reads one whole-tree scan may take when cold
+MAX_GAP_CANDIDATES = 64  # importers of an absent source one scan confirms by header before giving up
+# One line of a Lean import header naming a project module (POSIX ERE for `git grep`, and the
+# Python form that extracts the module from a matched line).
+IMPORT_LINE_ERE = (
+    r"^[[:space:]]*((public|private|meta)[[:space:]]+)*import[[:space:]]+TauCeti(\.[A-Za-z0-9_']+)+[[:space:]]*$"
+)
+IMPORT_LINE = re.compile(r"^\s*(?:(?:public|private|meta)\s+)*import\s+(TauCeti(?:\.[A-Za-z0-9_']+)+)\s*$")
 
 
 def imports(text: str) -> list[str]:
@@ -303,12 +309,14 @@ def project_source(path: str) -> bool:
 def import_gaps(planner: Planner, tree: str) -> tuple[frozenset[tuple[str, str]] | None, str | None]:
     """Every project import in `tree` with no source, as `(importer_path, module)`; memoised per tree.
 
-    The listing is the project inventory the CI preflight checks (regular blobs under `TauCeti/`
+    The inventory is the one the CI import-header preflight checks (regular blobs under `TauCeti/`
     and `TauCeti.lean`); any other kind of entry there makes the scan unavailable, as it does the
-    preflight. Headers come from the planner's blob cache, so a tree sharing almost every blob with
-    the last scanned tip reads only the changed files. A blob the cache omits (oversize or non-text)
-    still counts as a source; its own imports are unknown, which can hide a gap but never invent
-    one. Returns `(None, reason)` when the scan is unavailable.
+    preflight. The tree is far too large to read every header (26,000 files, 270 MiB), so one
+    `git grep` finds the lines that import a project module, and only the lines naming a module
+    with no source in the inventory, which are rare, are confirmed by parsing that importer's
+    header through the planner's blob cache: a match inside a comment or after the header is not
+    an import. An importer whose blob the cache omits (oversize or non-text) is unknown, which can
+    hide a gap but never invent one. Returns `(None, reason)` when the scan is unavailable.
     """
     if tree in planner.gaps:
         return planner.gaps[tree]
@@ -331,23 +339,21 @@ def import_gaps(planner: Planner, tree: str) -> tuple[frozenset[tuple[str, str]]
         if reason is not None:
             result = (None, reason)
         else:
-            blobs = sorted(set(files.values()))
-            complete = False
-            for _ in range(MAX_GAP_PASSES):
-                planner.pending = False
-                planner.read_headers(blobs)
-                if not planner.pending:
-                    complete = True
-                    break
-            planner.pending = False
-            if not complete:
-                result = (None, "import context byte budget exceeded")
+            candidates: dict[str, set[str]] = defaultdict(set)
+            matches = grep_imports(planner, tree)
+            for path, module in matches:
+                if path in files and module.replace(".", "/") + ".lean" not in files:
+                    candidates[path].add(module)
+            if len(candidates) > MAX_GAP_CANDIDATES:
+                result = (None, f"{len(candidates)} importers of absent sources; the base itself looks broken")
             else:
+                planner.read_headers([files[path] for path in candidates])
                 gaps = set()
-                for path, blob in files.items():
-                    for module in planner.headers.get(blob, []):
-                        if module.startswith(PROJECT_MODULE_PREFIX) and module.replace(".", "/") + ".lean" not in files:
-                            gaps.add((path, module))
+                for path, modules in candidates.items():
+                    header = planner.headers.get(files[path])
+                    if header is None:
+                        continue  # omitted blob: its imports are unknown
+                    gaps.update((path, module) for module in modules if module in header)
                 result = (frozenset(gaps), None)
     except (ValueError, UnicodeError, subprocess.SubprocessError) as error:
         result = (None, type(error).__name__ + ": " + str(error)[:200])
@@ -355,6 +361,30 @@ def import_gaps(planner: Planner, tree: str) -> tuple[frozenset[tuple[str, str]]
     while len(planner.gaps) > MAX_GAP_TREES:
         del planner.gaps[next(iter(planner.gaps))]
     return result
+
+
+def grep_imports(planner: Planner, tree: str) -> list[tuple[str, str]]:
+    """`(path, module)` for every line of a project source in `tree` that looks like a project import."""
+    try:
+        raw = planner.git(
+            "grep", "-I", "-z", "--no-color", "-E", "-e", IMPORT_LINE_ERE, tree, "--", "TauCeti/*.lean", "TauCeti.lean"
+        )
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1 and not error.stderr:
+            return []  # no match at all
+        raise
+    out = []
+    prefix = tree + ":"
+    for line in raw.decode().split("\n"):
+        if "\0" not in line:
+            continue
+        location, content = line.split("\0", 1)
+        if not location.startswith(prefix):
+            raise ValueError("unexpected git grep location")
+        match = IMPORT_LINE.match(content)
+        if match:
+            out.append((location[len(prefix) :], match[1]))
+    return out
 
 
 def task_context(context: dict) -> dict:

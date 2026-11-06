@@ -10,14 +10,14 @@ The insertion probe (`Controller._probe` in `tauceti_queue/controller.py`) repla
 
 ## Change
 
-### 1. A whole-tree gap scan, cached by tree
+### 1. A whole-tree gap scan, memoised by tree
 
-Add `admission_planning.import_gaps(planner, tree) -> Gaps | None`:
+Add `admission_planning.import_gaps(planner, tree) -> (gaps, reason)`:
 
-- `git ls-tree -r -z <tree>` restricted to `TauCeti.lean` and `TauCeti/**/*.lean`, regular blobs only; a symlink or a non-blob entry under `TauCeti/` makes the scan unavailable (`None`), the same rule the CI preflight applies.
-- Headers through `Planner.headers`, keyed by blob, so the second and later scans of a tree that shares almost every blob with the previous tip read only the changed files. Reuse the existing byte budgets (`MAX_FILE_BYTES`, `MAX_BLOB_BYTES`); over budget is unavailable, not partial.
-- A gap is `(importer_path, module)` where `module` starts with `TauCeti.` and `module.replace('.', '/') + '.lean'` is not in the listing. Imports outside the project are not inspected.
-- Memoise the result per tree id in the planner (`self.gaps: dict[str, Gaps | None]`), bounded to the last 64 trees. The open batch's current tip is scanned once per insertion pass, not once per probe.
+- `git ls-tree -r -z <tree>` restricted to `TauCeti.lean` and `TauCeti/**/*.lean`, regular blobs only; a symlink or a non-blob entry under `TauCeti/` makes the scan unavailable, the same rule the CI preflight applies.
+- The tree is far too large to read every header (26,314 files, 272 MiB on 2026-11-06; the first deployment's 64 MiB header-read budget made every scan unavailable). One `git grep -I -z -E` over the tree for lines of the form `[public|private|meta] import TauCeti.X` (0.4 s wall on the queue host) lists every project import; only the lines naming a module whose source is absent from the inventory, which are rare, are confirmed by parsing that importer's header with the existing `imports()` scanner through `Planner.headers`, so a match inside a comment or after the header is not a gap. More than 64 importers of absent sources means the base itself is broken and the scan is unavailable.
+- A gap is `(importer_path, module)`; imports outside the project are not inspected. An importer whose blob the cache omits (oversize or non-text) is unknown: it can hide a gap but never invent one.
+- Memoise the result per tree id in the planner (`planner.gaps`), bounded to the last 64 trees. The open batch's current tip is scanned once per insertion pass, not once per probe.
 
 ### 2. The probe refuses a new gap
 
@@ -58,7 +58,7 @@ The refused input is cancelled, so it re-enters through re-approval after the au
 ## Failure modes considered
 
 - **Wrong refusal.** Only a `TauCeti.*` import whose source path is absent from the prospective tree, and present or absent identically in the current tip, counts. The header scanner is the one already used for navigation and reads only the header; a misparse would have to yield a project module name that does not exist, and such an import fails the CI preflight regardless. A PR that deletes a module and updates every importer produces no gap; a rename with updated importers produces no gap.
-- **Slow probe.** One `ls-tree` per scan plus the headers of blobs not yet cached; the current tip's scan is shared across the pass. A cold cache reads every header once (bounded by `MAX_BLOB_BYTES`); every later pass reads only new blobs. The probe already runs without the controller lock.
+- **Slow probe.** One `ls-tree` and one `git grep` per scan (under a second on the real tree) plus the headers of the rare importers of absent sources; the current tip's scan is shared across the pass. The probe already runs without the controller lock.
 - **Scan unavailable.** The insertion proceeds as today; the journal says so.
 - **Batch-mate interactions.** A PR that imports a module a batch-mate in the same open batch adds inserts (the module is in the tip); one whose provider is in the head or another open batch waits for it (step 3); a PR that imports a module nobody provides is refused with the bad-import wording; a PR that removes a module a batch-mate imports is refused with the removal wording naming that batch-mate's file.
 - **Empty or edited contributions.** The scan runs on the exact prospective tip, whatever produced it.
