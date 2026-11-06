@@ -58,6 +58,13 @@ class FakeGitHub:
 
 
 class Decisions(unittest.TestCase):
+    def test_service_admission_has_no_workflow_backstop(self):
+        self.assertTrue(
+            {"merge-sweep.yml", "auto-merge.yml", "queue-release.yml"}.isdisjoint(
+                workflow.name for workflow in wb.WORKFLOWS
+            )
+        )
+
     def setUp(self):
         self.api = FakeGitHub()
         self.state = {"version": 1, "repo_id": None, "dispatches": {}}

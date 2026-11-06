@@ -143,8 +143,9 @@ effective values.
 ## Install and update
 
 Both are the same command, run on the host as the service account, and both are live: the fleet keeps
-admitting workers and CI, nothing is drained, and the only interruption is the service restart, during
-which webhook deliveries are queued by GitHub and redelivered or recovered by normal source discovery.
+admitting workers and CI, nothing is drained, and the only interruption is the service restart.
+Normal source discovery recovers missed policy observations. GitHub does not automatically redeliver
+failed webhooks; inspect failed deliveries after a restart and redeliver missed operator commands.
 
 ```sh
 # first time: get the installer, then let it manage the checkout

@@ -460,7 +460,12 @@ class AdmissionPoller:
             if pull.state != "open" or pull.draft:
                 action = "closed" if pull.state != "open" else "converted_to_draft"
                 self.controller._pull_request_event(
-                    {"number": pull.number, "action": action, "pull_request": {}}, self.clock()
+                    {
+                        "number": pull.number,
+                        "action": action,
+                        "pull_request": {"merged": getattr(pull, "merged", False), "title": pull.title},
+                    },
+                    self.clock(),
                 )
                 disposition = "closed" if pull.state != "open" else "draft"
             elif not result["review_safe"]:
