@@ -2968,14 +2968,13 @@ class Controller:
             self._reasons.append(blocked)
             return
         claims = self._active_claims(batch["id"])
-        if any(claim["task_id"] is None or claim["operation"] == f"task:{TASK_PRE_REBASE}" for claim in claims):
-            # A worker resolving the batch's pre-rebase onto what is now `main` holds the seal: its result
-            # is exactly the replay the new head needs, so sealing waits for it rather than redoing it.
+        if claims:
+            # Keep the batch open while its owner prepares or pre-rebases it. Adoption uses the
+            # ordinary open-batch validation, and the next head keeps the completed work.
             self._reasons.append(f"open batch {batch['id']} is claimed; sealing waits for the release")
             return
         with self.store.transaction():
-            # A preparation in flight does not hold the head back: its claim is superseded (the worker
-            # learns it at its next renewal and stops) and the batch seals with what it has adopted.
+            # Unclaimed background offers give way to the new head's own work.
             self._supersede_prepare(batch["id"], "sealed", now)
             for stale in self.store.rows(
                 "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PRE_REBASE}

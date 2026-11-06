@@ -1723,16 +1723,81 @@ class Preparation(ControllerCase):
         self.controller.tick()
         return self.controller.store.row("batches", {"state": "open"})
 
-    def test_sealing_supersedes_a_running_preparation(self):
+    def test_sealing_waits_for_prepared_edits_and_the_owner_can_renew_after_main_advances(self):
         batch = self.open_batch()
         self.quiet()
-        preparation = self.controller.claim_task("worker-1", "admin-worker")
+        agent = ScriptedAgent(
+            "preparer",
+            "admin-worker",
+            self.repo,
+            self.root / "preparer",
+            lambda _: {f"{PROJECT}#202": Resolution({"P202.lean": "fixed\n"}, explanation="Fixed P202.")},
+        )
+        preparation = agent.claim(self.controller)
+        prepared_tip = agent.produce(preparation)
         self.land_head()
+        self.assertNotEqual(self.repo.main_sha(), preparation.base)
+        self.assertIsNone(self.controller._head())
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["state"], "open")
+        self.assertIn(f"open batch {batch['id']} is claimed; sealing waits for the release", self.controller.tick())
+        self.controller.renew_task(preparation.task_id, preparation.claim_token)
+        self.assertIsNone(self.controller.claim_task("second-worker", "admin-worker"))
+        self.approve(301, {"P301.lean": "301\n"})
+        self.controller.tick()
+        self.assertNotEqual(self.controller.input_for(PROJECT, 301)["batch_id"], batch["id"])
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["version"], batch["version"])
+        result = self.controller.submit_task(preparation.task_id, preparation.claim_token, prepared_tip)
+        self.assertTrue(result.accepted, result)
+        self.assertEqual(self.controller._open_batch()["prepared_version"], result.version)
+        self.controller.tick()
         sealed = self.controller.store.row("batches", {"id": batch["id"]})
-        self.assertEqual(sealed["state"], "head", "a preparation does not hold the head back")
-        self.assertEqual(self.prepare_tasks("superseded")[0]["resolution"], "sealed")
-        result = self.controller.submit_task(preparation.task_id, preparation.claim_token, batch["tip"])
-        self.assertEqual((result.accepted, result.reason), (False, "claim-superseded"))
+        self.assertEqual((sealed["state"], sealed["base"]), ("head", self.repo.main_sha()))
+        self.assertEqual(self.repo.file_at(sealed["tip"], "P202.lean"), "fixed\n")
+        member = next(m for m in self.controller.members(batch["id"]) if m["number"] == 202)
+        self.assertEqual((member["provenance"], member["explanation"]), ("edited", "Fixed P202."))
+        self.assertEqual(self.controller.store.row("tasks", {"id": preparation.task_id})["resolution"], "adopted")
+        self.assertEqual(len(self.github.runs), 2, "the prepared result still needs the new head's CI")
+        self.assertEqual(self.github.runs[-1].head_sha, sealed["tip"])
+
+    def test_a_clean_preparation_release_unblocks_sealing(self):
+        batch = self.open_batch()
+        self.quiet()
+        task = self.controller.claim_task("preparer", "admin-worker")
+        self.land_head()
+        self.assertIsNone(self.controller._head())
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.controller.tick()
+        self.assertEqual(self.controller._head()["id"], batch["id"])
+
+    def test_a_worker_release_leaves_an_unclaimed_offer_that_can_seal(self):
+        batch = self.open_batch()
+        self.quiet()
+        task = self.controller.claim_task("preparer", "admin-worker")
+        self.land_head()
+        self.controller.release_task(task.task_id, task.claim_token, "worker-stopped")
+        self.controller.tick()
+        self.assertEqual(self.controller._head()["id"], batch["id"])
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["resolution"], "sealed")
+
+    def test_an_expired_preparation_claim_unblocks_sealing_and_rejects_late_results(self):
+        batch = self.open_batch()
+        self.quiet()
+        task = self.controller.claim_task("preparer", "admin-worker")
+        self.land_head()
+        self.assertIsNone(self.controller._head())
+        self.clock.advance(self.controller.setting("claim_ttl_seconds") + 1)
+        self.controller.tick()
+        self.assertEqual(self.controller._head()["id"], batch["id"])
+        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertEqual((result.accepted, result.reason), (False, "claim-expired"))
+
+    def test_an_unclaimed_preparation_offer_does_not_delay_sealing(self):
+        batch = self.open_batch()
+        self.quiet()
+        [task] = self.prepare_tasks()
+        self.land_head()
+        self.assertEqual(self.controller._head()["id"], batch["id"])
+        self.assertEqual(self.controller.store.row("tasks", {"id": task["id"]})["resolution"], "sealed")
 
     def test_a_clean_release_records_the_version_and_a_failed_one_is_not_retried(self):
         batch = self.open_batch()
@@ -2026,17 +2091,30 @@ class PreRebasedPreparation(ControllerCase):
         result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
         self.assertEqual((result.accepted, result.reason), (False, "claim-superseded"))
 
-    def test_sealing_does_not_wait_for_a_running_preparation(self):
+    def test_sealing_waits_for_and_adopts_a_running_pre_rebased_preparation(self):
         batch = self.open_batch()
-        task = self.controller.claim_task("worker-1", "admin-worker")
+        agent = ScriptedAgent(
+            "preparer",
+            "admin-worker",
+            self.repo,
+            self.root / "preparer",
+            lambda _: {f"{PROJECT}#202": Resolution({"P202.lean": "fixed on the head\n"}, explanation="Fixed P202.")},
+        )
+        task = agent.claim(self.controller)
         self.assertIn("pre_rebased", task.extra)
+        tip = agent.produce(task)
         self.land_head()
+        self.assertIsNone(self.head())
+        self.controller.renew_task(task.task_id, task.claim_token)
+        self.assertIsNone(self.controller.claim_task("second-worker", "admin-worker"))
+        result = self.controller.submit_task(task.task_id, task.claim_token, tip)
+        self.assertTrue(result.accepted, result)
+        self.controller.tick()
         sealed = self.controller.store.row("batches", {"id": batch["id"]})
-        self.assertEqual(sealed["state"], "head", "the preparation does not hold the seal")
-        self.assertEqual(sealed["tip"], batch["pre_rebase_tip"], "sealed with the latest adopted pre-rebase")
-        self.assertEqual(self.pre_rebased_tasks("superseded")[0]["resolution"], "sealed")
-        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
-        self.assertEqual((result.accepted, result.reason), (False, "claim-superseded"))
+        self.assertEqual((sealed["state"], sealed["tip"]), ("head", tip))
+        self.assertEqual(self.repo.file_at(tip, "P202.lean"), "fixed on the head\n")
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["resolution"], "adopted")
+        self.assertEqual(self.github.runs[-1].head_sha, tip)
 
 
 class Holds(ControllerCase):
