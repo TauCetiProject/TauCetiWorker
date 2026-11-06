@@ -872,13 +872,46 @@ print(json.dumps(dict(owner=owner, child=child)), flush=True)
         saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
         self.restored(saved, expected)
 
+    def test_expired_intent_cannot_abandon_a_younger_replacement(self):
+        self.dirty()
+        tree = self.retained()
+        info = tree.stat()
+        path = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            path,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[info.st_dev, info.st_ino],
+            ),
+        )
+        replacement = self.root / "replacement"
+        shutil.copytree(tree, replacement)
+        (replacement / "Draft.lean").write_text("younger unrelated source")
+        tree.rename(self.root / "old-retained")
+        replacement.rename(tree)
+        with patch.object(wr, "inspect", side_effect=AssertionError("stale intent cannot authorize new source work")):
+            self.tick()
+        self.assertTrue(tree.exists())
+        self.assertEqual((tree / "Draft.lean").read_text(), "younger unrelated source")
+        job = maintenance._read_job(path)
+        self.assertEqual(job["tree_identity"], [tree.stat().st_dev, tree.stat().st_ino])
+        self.assertLess(time.time() - job["created_at"], maintenance.RECOVERY_RECORD_TTL)
+
     def test_expired_owned_retained_tree_needs_no_git_salvage(self):
         self.dirty()
         tree = self.retained()
         shutil.rmtree(tree / ".git")
         job = maintenance._job_path(self.cfg.state, tree)
         maintenance._write_job(
-            job, dict(tree=str(tree), phase="save", created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1)
+            job,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[tree.stat().st_dev, tree.stat().st_ino],
+            ),
         )
         with patch.object(wr, "inspect", side_effect=AssertionError("abandoned task must not need salvage")):
             self.tick()
@@ -893,7 +926,13 @@ print(json.dumps(dict(owner=owner, child=child)), flush=True)
         tree.with_name(tree.name + ".owner.json").unlink()
         job = maintenance._job_path(self.cfg.state, tree)
         maintenance._write_job(
-            job, dict(tree=str(tree), phase="save", created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1)
+            job,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[tree.stat().st_dev, tree.stat().st_ino],
+            ),
         )
         self.tick()
         self.assertTrue(tree.exists())

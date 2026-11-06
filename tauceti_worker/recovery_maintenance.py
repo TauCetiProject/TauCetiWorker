@@ -655,7 +655,27 @@ def _cleanup(state, tree, root, work, observation=None):
     saving_source = False
     validating_source = False
     try:
-        if time.time() - job.get("created_at", tree.stat().st_mtime) >= RECOVERY_RECORD_TTL:
+        info = tree.stat()
+        identity = [info.st_dev, info.st_ino]
+        previous_identity = job.get("tree_identity")
+        if previous_identity is None and job.get("parked"):
+            previous_identity = job["parked"][0][:2]
+        if previous_identity is not None and previous_identity != identity:
+            # Old removal/parking intent cannot abandon a replacement. Bind a
+            # fresh preservation attempt using the existing journal generation.
+            job = dict(
+                tree=str(original),
+                phase="save",
+                created_at=time.time(),
+                tree_identity=identity,
+                next_action="preserve-replaced-source",
+                stack=[""],
+            )
+            return
+        if previous_identity is None:
+            job["created_at"] = max(job.get("created_at", info.st_mtime), info.st_mtime)
+        job["tree_identity"] = identity
+        if time.time() - job.get("created_at", info.st_mtime) >= RECOVERY_RECORD_TTL:
             if reason := _safe(state, tree, owner):
                 job["next_action"] = reason
                 return
