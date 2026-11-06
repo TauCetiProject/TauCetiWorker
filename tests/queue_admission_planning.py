@@ -102,7 +102,22 @@ class ImportGaps(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo.scratch), "checkout", "-q", "--detach", base_sha], check=True)
         link.symlink_to("A.lean")
         subprocess.run(["git", "-C", str(self.repo.scratch), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(self.repo.scratch), "commit", "-q", "-m", "link"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo.scratch),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "link",
+            ],
+            check=True,
+        )
         sha = subprocess.run(
             ["git", "-C", str(self.repo.scratch), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
         ).stdout.strip()
