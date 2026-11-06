@@ -67,6 +67,15 @@ other new log output, do not advance that time. Log replacement, truncation,
 counter regression, a new phase or claim resets the comparison. The phase's own
 checkpoint time stays unchanged. A silent log alone is not a stalled build.
 
+Worker liveness is distinct from task progress. Busy workers may not rewrite
+worker.json until a long task finishes. On Linux the sidecar can instead verify
+the recorded process using its owner, module, root and birth time (fencing reused
+PIDs). Its observation time then records actual local liveness; a current claim
+and recorded task phase supply the displayed activity. An old checkpoint without
+that evidence stays dated. Missing/inaccessible process evidence means unknown,
+not dead or idle. No PID, command arguments or private paths are exported, and
+the observer never signals a process or controls the task's execution time.
+
 A separate hourly report reuses the existing pilot calculations:
 
 ```sh

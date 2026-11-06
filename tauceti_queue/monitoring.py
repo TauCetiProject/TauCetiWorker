@@ -192,16 +192,61 @@ class CommitFacts:
         return self.cache
 
 
-def workers(roots):
+def verified_worker_alive(value, root, *, proc=Path("/proc")):
+    """Positive local liveness evidence only; False means unverified, never dead."""
+    pid, started = value.get("pid"), numeric(value.get("started_at"))
+    if type(pid) is not int or not 0 < pid < 2**31 or started is None:
+        return False
+    try:
+        if not isinstance(value.get("root"), str) or Path(value["root"]).resolve() != Path(root).resolve():
+            return False
+        process = proc / str(pid)
+        if process.stat().st_uid != os.getuid():
+            return False
+        with (process / "cmdline").open("rb") as stream:
+            command = stream.read(65_537)
+        if len(command) > 65_536 or b"tauceti_queue.repair_task" not in command.split(b"\0"):
+            return False
+        with (process / "stat").open() as stream:
+            record = stream.read(4097)
+        if len(record) > 4096:
+            return False
+        ticks = int(record[record.rfind(")") + 2 :].split()[19])
+        if ticks < 0:
+            return False
+        born = time.time() - time.clock_gettime(time.CLOCK_BOOTTIME) + ticks / os.sysconf("SC_CLK_TCK")
+        # The process must predate this worker session. An unrelated/reused PID
+        # or inaccessible evidence leaves the old checkpoint visibly dated.
+        return born <= started <= time.time() + 5
+    except (OSError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def workers(roots, *, claims=(), task_states=None, captured=None):
+    captured = time.time() if captured is None else captured
+    task_states = task_states or {}
     result = []
     for index, root in enumerate(roots):
         try:
             value = json_read(Path(root) / "worker.json")
+            alias = worker_alias(value.get("worker"))
+            alive = verified_worker_alive(value, root)
+            active = [c for c in claims if worker_alias(c.get("worker")) == alias and c.get("expires_at", 0) > captured]
+            phase = next((p for c in active if (p := task_states.get(c.get("task_id"), {}).get("state"))), None)
+            state = text(value.get("state"), 40)
+            if alive:
+                checkpoint_age = captured - (numeric(value.get("updated_at")) or 0)
+                if phase:
+                    state = text("alive / " + phase, 40)
+                elif active or not -5 <= checkpoint_age <= 60:
+                    state = "alive; task state unknown"
+                else:
+                    state = text("alive / " + state, 40)
             result.append(
                 {
-                    "id": worker_alias(value.get("worker")),
-                    "state": text(value.get("state"), 40),
-                    "observed_at": iso(numeric(value.get("updated_at"))),
+                    "id": alias,
+                    "state": state,
+                    "observed_at": iso(captured if alive else numeric(value.get("updated_at"))),
                     "started_at": iso(numeric(value.get("started_at"))),
                     "tasks": numeric(value.get("tasks")),
                     "errors": numeric(value.get("errors")),
@@ -696,7 +741,7 @@ def project(
         ],
         "event_history_truncated": len(events) > 3000,
         "claim_history_truncated": len(claims) > 1000,
-        "workers": workers(worker_roots),
+        "workers": workers(worker_roots, claims=claims, task_states=task_progress, captured=captured),
     }
 
     # Full live projection stays comfortably inside the receiver's 16MB budget.

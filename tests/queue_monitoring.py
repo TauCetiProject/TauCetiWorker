@@ -316,6 +316,76 @@ class ParallelTaskObservations(unittest.TestCase):
             self.assertEqual(observer.observe(roots, tasks, claims=claims, observed_at=130)[19]["state"], "released")
 
 
+class WorkerLiveness(unittest.TestCase):
+    def test_positive_process_evidence_is_bound_to_root_role_owner_and_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "proc/42"
+            process.mkdir(parents=True)
+            command = process / "cmdline"
+            command.write_bytes(b"python\0-m\0tauceti_queue.repair_task\0PRIVATE_ARGUMENT\0")
+            record = process / "stat"
+
+            def stat_record(ticks):
+                return "42 (python) " + " ".join(["S"] + ["0"] * 18 + [str(ticks)])
+
+            record.write_text(stat_record(100))
+            value = {"pid": 42, "started_at": 95, "root": str(root)}
+            with (
+                patch.object(monitoring.time, "time", return_value=100),
+                patch.object(monitoring.time, "clock_gettime", return_value=10),
+                patch.object(monitoring.os, "sysconf", return_value=100),
+            ):
+                self.assertTrue(monitoring.verified_worker_alive(value, root, proc=root / "proc"))
+                record.write_text(stat_record(1500))  # Same PID, newer process: no liveness claim.
+                self.assertFalse(monitoring.verified_worker_alive(value, root, proc=root / "proc"))
+                record.write_text(stat_record(100))
+                self.assertFalse(
+                    monitoring.verified_worker_alive(value | {"root": str(root / "other")}, root, proc=root / "proc")
+                )
+                with patch.object(monitoring.os, "getuid", return_value=os.getuid() + 1):
+                    self.assertFalse(monitoring.verified_worker_alive(value, root, proc=root / "proc"))
+                command.write_bytes(b"python\0unrelated_process\0")
+                self.assertFalse(monitoring.verified_worker_alive(value, root, proc=root / "proc"))
+                command.write_bytes(b"python\0-m\0tauceti_queue.repair_task\0" + b"PRIVATE" * 10000)
+                self.assertFalse(monitoring.verified_worker_alive(value, root, proc=root / "proc"))
+                command.unlink()
+                self.assertFalse(monitoring.verified_worker_alive(value, root, proc=root / "proc"))
+
+    def test_liveness_does_not_refresh_task_progress_or_invent_idle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "worker.json").write_text(
+                json.dumps(
+                    {
+                        "pid": 42,
+                        "root": "PRIVATE",
+                        "worker": "repair",
+                        "state": "claiming",
+                        "updated_at": 10,
+                        "started_at": 5,
+                        "tasks": 3,
+                        "errors": 0,
+                    }
+                )
+            )
+            phase = {21: {"state": "agent_running", "observed_at": monitoring.iso(100)}}
+            claims = [{"worker": "repair", "task_id": 21, "expires_at": 200}]
+            with patch.object(monitoring, "verified_worker_alive", return_value=True):
+                [value] = monitoring.workers([root], claims=claims, task_states=phase, captured=130)
+                self.assertEqual(value["observed_at"], monitoring.iso(130))
+                self.assertEqual(value["state"], "alive / agent_running")
+                self.assertEqual(phase[21]["observed_at"], monitoring.iso(100))
+                self.assertNotIn("PRIVATE", json.dumps(value))
+                self.assertNotIn("pid", value)
+                [expired] = monitoring.workers([root], claims=claims, task_states=phase, captured=201)
+                self.assertEqual(expired["state"], "alive; task state unknown")
+            with patch.object(monitoring, "verified_worker_alive", return_value=False):
+                [unknown] = monitoring.workers([root], claims=claims, task_states=phase, captured=130)
+                self.assertEqual(unknown["observed_at"], monitoring.iso(10))
+                self.assertEqual(unknown["state"], "claiming")
+
+
 class BuildObservations(unittest.TestCase):
     def test_build_counters_follow_the_current_claim_not_the_newest_worker_file(self):
         with tempfile.TemporaryDirectory() as directory:
