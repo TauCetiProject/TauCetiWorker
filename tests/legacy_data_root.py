@@ -67,6 +67,11 @@ class LegacyDataRoot(unittest.TestCase):
             for path in (old, current):
                 (path / "state/w").mkdir(parents=True)
             (fleet / "worker-data/roots.json").write_text(json.dumps(dict(roots={"old": str(old)})))
+            state = old / "state/w"
+            (state / "recovery-prepared.json").write_text(json.dumps(dict(cleanup_backlog=4)))
+            (state / "recovery-cleanup/discarded/old-copy").mkdir(parents=True)
+            (state / "verification-pending").mkdir()
+            (state / "verification-pending/job.json").write_text("{}")
             with (
                 patch.dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=str(current)),
                 patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
@@ -88,6 +93,19 @@ class LegacyDataRoot(unittest.TestCase):
                 self.assertEqual(set(seen), {current, old, installed})
                 self.assertEqual(len(report["roots"]), 3)
                 self.assertEqual(shared, [True, False, False])
+                self.assertIsInstance(report["free_before_bytes"], int)
+                self.assertIsInstance(report["free_bytes"], int)
+                by_root = {item["path"]: item for item in report["roots"]}
+                self.assertEqual(
+                    by_root[str(old)]["pending_work"], dict(recovery_backlog=4, discarded_trees=1, verification_jobs=1)
+                )
+                self.assertEqual(
+                    by_root[str(current)]["pending_work"],
+                    dict(recovery_backlog=0, discarded_trees=0, verification_jobs=0),
+                )
+                for item in report["roots"]:
+                    self.assertIsInstance(item["free_before_bytes"], int)
+                    self.assertIsInstance(item["free_bytes"], int)
                 self.assertEqual(paths.legacy_data_root(), current)
 
     def test_default_and_invalid_override(self):
