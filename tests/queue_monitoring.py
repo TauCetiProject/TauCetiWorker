@@ -83,8 +83,9 @@ class Monitoring(unittest.TestCase):
         self.assertEqual(exported["workers"][0]["errors"], 0)
 
     def test_canonical_tip_uses_the_existing_status_fact(self):
-        value = self.export(status={"canonical_sha": "a" * 40})
+        value = self.export(status={"canonical_sha": "a" * 40, "service": {"now": self.clock()}})
         self.assertEqual(value["canonical_sha"], "a" * 40)
+        self.assertEqual(value["status_observed_at"], monitoring.iso(self.clock()))
         self.assertIsNone(self.export(status={"canonical_sha": "PRIVATE_PATH"})["canonical_sha"])
 
     def test_task_checkpoint_and_outcome_keep_only_recorded_public_progress(self):

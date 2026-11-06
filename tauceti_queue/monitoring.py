@@ -527,7 +527,7 @@ def project(
             if type(service.get("publication_enabled")) is bool
             else None,
         },
-        "status_observed_at": text(status.get("generated_at"), 40) or None,
+        "status_observed_at": iso(numeric(service.get("now"))) or text(status.get("generated_at"), 40) or None,
         "conditions": conditions,
         "outbox": [{"kind": text(r["kind"], 60), "state": text(r["state"], 30), "count": r["count"]} for r in outbox]
         if outbox is not None
