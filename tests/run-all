@@ -47,6 +47,7 @@ RUN_STDLIB=(
   usage_supervisor.py
   expanded_cache.py
   cache_storage.py
+  machine_lake_cache.py
   local_lint.py
   lean_pressure.py
   shared_mathlib.py

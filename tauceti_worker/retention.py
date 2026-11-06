@@ -421,6 +421,12 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     mounts = mount_points()
     configs = list(worker_configs())
     if not diagnostics_only:
+        from . import machine_lake_cache
+
+        try:
+            report["machine_lake_cache"] = machine_lake_cache.collect(dry=dry, now=now)
+        except Exception as error:
+            note(report, "errors", f"optional native Lake cache cleanup: {error}")
         from . import recovery_maintenance
 
         # Already-retired data needs no source archival. Use the existing collector
@@ -644,6 +650,9 @@ def install_timer():
             "PATH",
             "TAUCETI_BUILD_CACHE_ROOT",
             "TAUCETI_CACHE_MAX_GIB",
+            "TAUCETI_MACHINE_LAKE_CACHE_ROOT",
+            "TAUCETI_MACHINE_LAKE_CACHE_MAX_GIB",
+            "TAUCETI_MACHINE_LAKE_CACHE_MAX_AGE_HOURS",
         }
     )
     (directory / "tauceti-cleanup.service").write_text(

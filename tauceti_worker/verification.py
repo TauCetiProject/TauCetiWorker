@@ -417,6 +417,8 @@ class Verification:
             raise Incomplete("dependency, toolchain or verifier mutated during verification")
 
     def command(self, phase, argv, *, env=None, capture=False):
+        env = dict(os.environ if env is None else env)
+        env.pop("LAKE_SHARED_CACHE_ROOT", None)
         self.watch()
         report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
         log = self.directory / f"{len(self.receipt['commands']):03d}-{phase}.log"

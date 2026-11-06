@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Install a matching standalone Lake without changing elan or compiler/toolchain pins."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_worker.machine_lake_cache import router_root
+from tauceti_worker.runtime_status import atomic_json
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--toolchain", required=True, help="existing elan toolchain to match")
+    parser.add_argument("--lake", required=True, type=Path, help="built standalone .lake/build/bin/lake")
+    parser.add_argument("--source", type=Path, help="matching Lake source directory, for diagnostics")
+    args = parser.parse_args()
+    env = dict(os.environ, ELAN_TOOLCHAIN=args.toolchain)
+    original = Path(subprocess.check_output(["elan", "which", "lake"], env=env, text=True).strip()).resolve()
+    native = args.lake.resolve()
+    expected = subprocess.check_output([str(original), "--version"], env=env, text=True)
+    actual = subprocess.check_output([str(native), "--version"], env=env, text=True)
+    if expected != actual:
+        parser.error("built Lake does not match the selected toolchain's Lean/Lake version")
+    with native.open("rb") as handle:
+        identity = hashlib.file_digest(handle, "sha256").hexdigest()
+    directory = router_root(env)
+    destination = directory / "runtimes" / identity
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        with tempfile.TemporaryDirectory(prefix="install-", dir=destination.parent) as tmp:
+            stage = Path(tmp) / "runtime"
+            build = stage / ".lake/build"
+            (build / "bin").mkdir(parents=True)
+            shutil.copy2(native, build / "bin/lake")
+            shutil.copytree(native.parent.parent / "lib", build / "lib", symlinks=True)
+            if args.source:
+                shutil.copytree(args.source / "Lake", stage / "Lake", symlinks=True)
+                shutil.copy2(args.source / "Lake.lean", stage / "Lake.lean")
+            try:
+                stage.rename(destination)
+            except OSError:
+                if not destination.is_dir():
+                    raise
+    binary = directory / "bin"
+    installed = destination / ".lake/build/bin/lake"
+    if subprocess.check_output([str(installed), "--version"], env=env, text=True) != expected:
+        parser.error("installed standalone runtime does not match the selected toolchain")
+    binary.mkdir(parents=True, exist_ok=True)
+    registry = binary / "registry.json"
+    info = original.stat()
+    entry = dict(
+        executable=str(destination / ".lake/build/bin/lake"),
+        original_signature=[info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns],
+        toolchain=args.toolchain,
+        sha256=identity,
+    )
+    source = Path(__file__).with_name("machine-lake-router")
+    with (binary / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        entries = json.loads(registry.read_text()) if registry.exists() else {}
+        entries[str(original)] = entry
+        atomic_json(registry, entries)
+        router = binary / "lake"
+        contents = source.read_bytes()
+        if not router.exists() or router.read_bytes() != contents:
+            with tempfile.NamedTemporaryFile(dir=binary, delete=False) as handle:
+                handle.write(contents)
+                temporary = Path(handle.name)
+            temporary.chmod(0o755)
+            temporary.replace(router)
+    print(json.dumps(entry, indent=2))
+
+
+if __name__ == "__main__":
+    main()

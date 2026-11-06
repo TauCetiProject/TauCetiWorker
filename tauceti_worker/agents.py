@@ -1380,10 +1380,12 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
     from . import expanded_cache
 
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
+    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
     with expanded_cache.preparation(
         cwd,
         env,
         report=report,
+        deadline=deadline,
         refetch=lambda warm: _cache_fetch(
             [
                 *prefix,
@@ -1402,7 +1404,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
             30,
         ),
     ) as warm_env:
-        warm_host_build_caches(cwd, warm_env, logdir, report=report)
+        warm_host_build_caches(cwd, warm_env, logdir, report=report, deadline=deadline)
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
@@ -1454,7 +1456,7 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
             reap_round_group(proc.pid)
 
 
-def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
+def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None, deadline=None) -> None:
     """Fetch both caches on the selected branch; warm main too for subsequent rebases.
 
     Genuine workspace errors must reach repair agents. Transport, publication and partial-download
@@ -1465,7 +1467,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     max_revs = lake_cache_max_revs(env)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
+    deadline = time.monotonic() + HOST_CACHE_TIMEOUT if deadline is None else deadline
     log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
 
     def unavailable(reason: str):
@@ -1474,7 +1476,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         report_failure(message, code=75, log_file=logf)
         raise BuildCacheUnavailable(message, log_file=logf)
 
-    def fetch(label: str, command: list[str]) -> str:
+    def fetch(label: str, command: list[str], *, fetch_env=None) -> str:
         for attempt in range(1, 3):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1487,7 +1489,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                     from .expanded_cache import measured
 
                     with measured(report, label.lower().replace(" ", "_") + "_fetch"):
-                        rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
+                        rc = _cache_fetch([*prefix, *command], cwd, env if fetch_env is None else fetch_env, output, remaining)
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1602,10 +1604,12 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     if main and main != head:
         # An explicit toolchain fetch also primes the store for a rebase that changes Lean versions.
         toolchain = git("show", base_ref + ":lean-toolchain")
+        main_env = dict(env, ELAN_TOOLCHAIN=toolchain) if toolchain and env.get("LAKE_SHARED_CACHE_ROOT") else env
         revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), base_ref)
         for revision in revisions.splitlines():
             status = fetch(
-                "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])]
+                "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])],
+                fetch_env=main_env,
             )
             if status != "miss":
                 if status == "workspace-error":
@@ -1910,7 +1914,13 @@ def ensure_bubble_home(cfg: Config) -> dict:
     # Host cache paths mean nothing inside the container, and Bubble supplies the in-container Lake and
     # Mathlib cache configuration itself (through its own download-only proxy and a per-round overlay,
     # below). Drop the host redirects so they cannot reach the container if Bubble ever forwards them.
-    for var in ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR"):
+    for var in (
+        "ELAN_HOME",
+        "MATHLIB_CACHE_DIR",
+        "LAKE_CACHE_DIR",
+        "LAKE_SHARED_CACHE_ROOT",
+        "LAKE_SHARED_CACHE_FALLBACK",
+    ):
         env.pop(var, None)
     home.mkdir(parents=True, exist_ok=True)
 
@@ -2761,11 +2771,9 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
     a redundant download per worker per bump. So `ELAN_HOME` points at the login user's `~/.elan`,
     where the operator's own toolchains already are.
 
-    Lake's cache is NOT shared, even though it normally sits under the toolchain directory and would
-    otherwise follow `ELAN_HOME` there. It is written throughout a build rather than once at install,
-    and that its concurrent writers are safe is not established; `LAKE_CACHE_DIR` therefore stays in
-    the worker's own data root. That also keeps a per-worker experiment with `LAKE_ARTIFACT_CACHE`
-    honest, since the store it fills is then that worker's alone.
+    `LAKE_CACHE_DIR` remains a private fallback for older Lake executables. Fixed Lake versions can
+    select the machine store through their native opt-in on each invocation; changing toolchains
+    does not expose a shared writable root to an unfixed executable. Explicit overrides win.
 
     Mathlib's `.ltar` cache also stays per-worker — as the download target. `lake exe cache get` takes
     no lock and, in any checkout older than mathlib4#42752, writes fixed-name temporaries, so pointing
@@ -2782,6 +2790,9 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
     os.environ.setdefault("ELAN_HOME", str(build_caches.elan_pool(host)))
     os.environ.setdefault("MATHLIB_CACHE_DIR", str(data_home / ".cache" / "mathlib"))
     os.environ.setdefault("LAKE_CACHE_DIR", str(data_home / ".cache" / "lake"))
+    from .machine_lake_cache import configure
+
+    configure(host, data_home, os.environ)
     return {var: os.environ[var] for var in ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR")}
 
 

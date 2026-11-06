@@ -3044,10 +3044,12 @@ class RealVerifierIntegration(unittest.TestCase):
 
         @contextlib.contextmanager
         def prepared(checkout, env, logdir):
+            self.assertNotIn("LAKE_SHARED_CACHE_ROOT", env)
             env["LAKE_CONFIG"] = str(case.home / "throwaway-cache-config.toml")
             yield ["env"]
 
         with (
+            patch.dict(os.environ, LAKE_SHARED_CACHE_ROOT=str(case.home / "native-cache")),
             patch("tauceti_worker.agents.host_build_cache_context", side_effect=prepared),
             patch.object(processes, "run", wraps=processes.run) as helper,
         ):

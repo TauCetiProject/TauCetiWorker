@@ -382,10 +382,15 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, shared by every worker: an install takes a lock and lands by rename. |
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
 | `TAUCETI_MATHLIB_POOL` | `$XDG_CACHE_HOME/mathlib`, else login user's `~/.cache/mathlib` | The pool those hardlinks go to and come from. |
-| `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Lake's own build-output cache. Per-worker: unlike a toolchain install it is written throughout a build. |
+| `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Private native-cache fallback for older Lake executables; explicit overrides are preserved. See [machine Lake sharing](machine-lake-cache.md). |
+| `TAUCETI_MACHINE_LAKE_CACHE` | `1` | Offer native machine-cache sharing to compatible executables; `0` retains private behavior. |
+| `TAUCETI_MACHINE_LAKE_CACHE_ROOT` | `~/.cache/tauceti/lake-native` | Managed native artifact store; compatible Lake selects its own toolchain directory. |
+| `TAUCETI_MACHINE_LAKE_RUNTIME_ROOT` | `~/.local/share/tauceti/native-lake` | Optional standalone Lake runtimes registered for matching installed toolchains. |
+| `TAUCETI_MACHINE_LAKE_CACHE_MAX_GIB` | unset | Optional host-wide native-cache reclamation target, without blocking work to meet it. |
+| `TAUCETI_MACHINE_LAKE_CACHE_MAX_AGE_HOURS` | unset | Optional native-cache eligibility age based on change time; no implicit expiry. |
 | `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main. |
 | `LAKE_ARTIFACT_CACHE` | `1` | Keep local build outputs in Lake's artifact store so later rounds can reuse them. |
-| `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
+| `LAKE_RESTORE_ARTIFACTS` | `1` | Restore artifact-store hits into the build directory, normally through hard links, for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_INHERIT_CLAUDE_CONFIG` | _(unset)_ | `1` gives an isolated worker your own `CLAUDE.md`, `settings.json`, and skills instead of its own. Off by default: a round should not depend on whose config dir it ran from, and personal instructions can contradict the task prompt. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-6.1-sol` (Luna fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
