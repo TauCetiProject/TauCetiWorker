@@ -936,6 +936,26 @@ def task_findings(task: Task) -> dict:
     return repair.findings_from_diagnostics(task.diagnostics)
 
 
+def scope_only_repair(task: Task) -> bool:
+    """A trusted scope-policy finding is not evidence that Lean needs an edit.
+
+    Converted proactive predictions retain the controller's existing refresh
+    guard. All other source findings still require a changed repair result.
+    """
+    if task.kind != "repair" or not isinstance(task.diagnostics, list):
+        return False
+    findings = []
+    for entry in task.diagnostics:
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("kind") == "admission_predictions":
+            if entry.get("was_proactive"):
+                return False
+        else:
+            findings.append(entry)
+    return bool(findings) and all(d.get("kind") == "status" and d.get("context") == "scope" for d in findings)
+
+
 def admission_verification(task: Task, tip: str, outcome: dict, stream_findings: list) -> dict | None:
     """Telemetry from scripted checks, never permission to skip the candidate's CI."""
     if not task_findings(task).get("admission_predictions"):
@@ -1092,6 +1112,7 @@ def prompt_context(
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
+        scope_failure_only=scope_only_repair(task),
     )
 
 
@@ -2018,7 +2039,11 @@ def run_task(
             report["agent_failed"] = agent["status"] == "failed"
             state.write("validated", attempt=attempt, tip=tip, report=report)
             proactive = bool((task_findings(task).get("admission_predictions") or {}).get("proactive"))
-            acceptable = report["ok"] and not report["dirty"] and (not report["unchanged"] or proactive)
+            acceptable = (
+                report["ok"]
+                and not report["dirty"]
+                and (not report["unchanged"] or proactive or scope_only_repair(task))
+            )
             if not acceptable:
                 detail = format_report(report)
                 if agent.get("timed_out"):
