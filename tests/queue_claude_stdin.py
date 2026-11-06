@@ -42,17 +42,21 @@ class API(http.server.ThreadingHTTPServer):
                     self.wfile.write(data)
                     return
                 index = len(self.server.calls)
-                self.server.calls.append(
-                    {
-                        "path": self.path,
-                        "model": body.get("model"),
-                        "tool_names": [t.get("name") for t in body.get("tools", [])],
-                        "last_message": next(
-                            (m for m in reversed(body.get("messages", [])) if m.get("role") == "user"), {}
-                        ),
-                    }
+                main_request = self.path.split("?", 1)[0].endswith("/messages") and any(
+                    tool.get("name") == "Bash" for tool in body.get("tools", [])
                 )
-                if index < len(self.server.commands) and self.server.commands[index] is not None:
+                if main_request:
+                    self.server.calls.append(
+                        {
+                            "path": self.path,
+                            "model": body.get("model"),
+                            "tool_names": [t.get("name") for t in body.get("tools", [])],
+                            "last_message": next(
+                                (m for m in reversed(body.get("messages", [])) if m.get("role") == "user"), {}
+                            ),
+                        }
+                    )
+                if main_request and index < len(self.server.commands) and self.server.commands[index] is not None:
                     content = {
                         "type": "tool_use",
                         "id": f"toolu_probe_{index}",
@@ -187,7 +191,7 @@ class ShellEnvironment(unittest.TestCase):
             commands = [
                 "cat <<'END'\nheredoc payload\nEND\ngrep -c exec $(ls /nonexistent-rebase-done 2>/dev/null); test $? -eq 1 && echo EOF_REACHED",
                 "cd subdir; cat <<'END'\ncwd payload\nEND\ngrep -c exec; test $? -eq 1 && echo EOF_REACHED",
-                "printf 'exec\nother\n' | grep -c exec; cat <<'END'\nexplicit heredoc\nEND\n"
+                "pwd; printf 'exec\nother\n' | grep -c exec; cat <<'END'\nexplicit heredoc\nEND\n"
                 "printf 'exec\n' > input.txt; grep -c exec < input.txt; "
                 "grep -c exec < <(printf 'exec\n'); exec 3< input.txt; cat <&3; "
                 "grep -c exec; test $? -eq 1 && echo EOF_REACHED",
@@ -203,7 +207,6 @@ class ShellEnvironment(unittest.TestCase):
                 CLAUDE_CONFIG_DIR=str(home / ".claude"),
                 CLAUDE_ENV_FILE=broken,
                 ANTHROPIC_BASE_URL=f"http://127.0.0.1:{api.server_port}",
-                DISABLE_NONESSENTIAL_TRAFFIC="1",
                 DISABLE_AUTOUPDATER="1",
                 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
                 IS_SANDBOX="1",  # the native CLI regression also runs in the CI container
@@ -257,7 +260,7 @@ class ShellEnvironment(unittest.TestCase):
                 api.commands = [
                     *commands,
                     None,
-                    "cat <<'END'\nresume payload\nEND\ngrep -c exec; test $? -eq 1 && echo EOF_REACHED",
+                    "pwd; cat <<'END'\nresume payload\nEND\ngrep -c exec; test $? -eq 1 && echo EOF_REACHED",
                 ]
                 resumed = repair_task.run_repair_agent(
                     cfg,
@@ -288,6 +291,8 @@ class ShellEnvironment(unittest.TestCase):
             self.assertIn("cwd payload", results[2])
             self.assertIn("1\nexplicit heredoc\n1\n1\nexec\n0\nEOF_REACHED", results[3])
             self.assertIn("resume payload", results[5])
+            self.assertEqual(results[3].splitlines()[0], str(checkout / "subdir"))
+            self.assertEqual(results[5].splitlines()[0], str(checkout))
             for index in (1, 2, 3, 5):
                 self.assertIn("EOF_REACHED", results[index])
 
