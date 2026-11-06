@@ -1235,6 +1235,12 @@ class GitHubAdapter:
             for comment in connection["nodes"]:
                 if not isinstance(comment, dict) or not isinstance(comment.get("databaseId"), int):
                     raise GitHubError("incomplete review comment")
+                author = comment.get("author") or {}
+                login = author.get("login", "")
+                # GraphQL Bot.login omits REST's suffix. Preserve the same actor identity
+                # for trusted recovery holds and stable source versions across both APIs.
+                if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+                    login += "[bot]"
                 comments.append(
                     {
                         "id": comment["databaseId"],
@@ -1242,7 +1248,7 @@ class GitHubAdapter:
                         "created_at": comment.get("createdAt", ""),
                         "updated_at": comment.get("updatedAt", ""),
                         "html_url": comment.get("url", ""),
-                        "author": (comment.get("author") or {}).get("login", ""),
+                        "author": login,
                     }
                 )
             page = connection.get("pageInfo")
@@ -1465,7 +1471,7 @@ query($owner: String!, $name: String!, $number: Int!, $head: GitObjectID!) {
 
 ADMISSION_COMMENT_FIELDS = """
   pageInfo { hasNextPage endCursor }
-  nodes { databaseId body createdAt updatedAt url author { login } }
+  nodes { databaseId body createdAt updatedAt url author { login __typename } }
 """
 ADMISSION_PULLS_QUERY = (
     """

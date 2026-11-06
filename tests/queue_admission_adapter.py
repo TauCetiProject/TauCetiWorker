@@ -78,6 +78,40 @@ def fence_document(raw, *, build="SUCCESS"):
 
 
 class SourceTests(unittest.TestCase):
+    def test_graphql_bot_identity_matches_rest_for_recovery_holds_and_source_versions(self):
+        body = f"Merge-queue recovery for head `{HEAD}`: repair needed\n<!--tauceti-rebase:v1 {HEAD}-->"
+        transport = FakeTransport()
+        c, _ = client(transport)
+        adapter = ga.GitHubAdapter(c, repo=TAUCETI)
+        comment = {
+            "databaseId": 6007920631,
+            "body": body,
+            "createdAt": "2026-11-06T04:00:00Z",
+            "updatedAt": "2026-11-06T04:00:00Z",
+            "author": {"login": "tau-ceti-bors", "__typename": "Bot"},
+        }
+        observed = adapter._admission_comments(TAUCETI, 42, connection([comment]))
+        rest = [
+            {
+                "id": comment["databaseId"],
+                "body": body,
+                "created_at": comment["createdAt"],
+                "updated_at": comment["updatedAt"],
+                "user": {"login": "tau-ceti-bors[bot]"},
+            }
+        ]
+        source = {"head": HEAD, "state": "open"}
+        self.assertEqual(
+            source_version(source | {"comments": observed}, "policy"),
+            source_version(source | {"comments": rest}, "policy"),
+        )
+        human = dict(comment, author={"login": "tau-ceti-bors", "__typename": "User"})
+        human_comments = adapter._admission_comments(TAUCETI, 42, connection([human]))
+        self.assertEqual(
+            source_version(source | {"comments": human_comments}, "policy"),
+            source_version(source | {"comments": []}, "policy"),
+        )
+
     def test_a_callers_exhausted_quota_cannot_poison_installation_intake(self):
         transport = FakeTransport()
         transport.add(
