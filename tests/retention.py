@@ -956,6 +956,20 @@ class Retention(unittest.TestCase):
         self.assertEqual(report["drain"]["slices"], 4)
         self.assertEqual(report["drain"]["removed_entries"], 2)
 
+    def test_initial_disposal_turn_yields_to_other_stores_despite_backlog(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        with (
+            patch.object(
+                maintenance, "prepare", return_value=dict(removed_entries=1, sweep_complete=False, metadata_entries=1)
+            ) as prepare,
+            patch.object(maintenance, "collect_discarded", return_value={}),
+            patch.object(verification_storage, "housekeep", return_value={}),
+        ):
+            retention.drain_pending([(self.root, {}), (self.root, {})], once=True)
+        self.assertEqual(prepare.call_count, 2)
+
     def test_continuous_requests_cannot_repeat_a_stalled_drain_forever(self):
         from tauceti_worker import recovery_maintenance as maintenance
         from tauceti_worker import verification_storage

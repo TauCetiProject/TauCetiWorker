@@ -685,7 +685,7 @@ def pressure_cleanup():
         log(f"retention: disk-pressure cleanup deferred: {error}")
 
 
-def drain_pending(reports):
+def drain_pending(reports, *, once=False):
     """Round-robin existing deletion slices without repeating expensive inventories."""
     from . import recovery_maintenance, verification_storage
     from .activity import root
@@ -734,6 +734,8 @@ def drain_pending(reports):
                     report["free_bytes"] = shutil.disk_usage(worker_state_root()).free
                 except Exception as error:
                     note(report, "errors", f"{path}: {error}")
+            if once:
+                break
             requested = read_json(root() / "cleanup-request.json").get("at", 0)
             if requested > requested_at and (again or not extra_requested):
                 requested_at = requested
@@ -866,7 +868,7 @@ def run_all(*, dry=False):
             initial = {path: {} for path in paths}
             if not dry:
                 # Exact queued disposal must not wait behind shared-cache inventory.
-                drain_pending(list(initial.items()))
+                drain_pending(list(initial.items()), once=True)
             for index, path in enumerate(paths):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 try:
