@@ -51,6 +51,7 @@ class Retention(unittest.TestCase):
                 {
                     "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
                     "TAUCETI_BUILD_CACHE_ROOT": str(self.root / "build-cache"),
+                    "TAUCETI_MACHINE_LAKE_CACHE_ROOT": str(self.root / "native-lake"),
                     "TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool"),
                     "TAUCETI_WORKERS_STATE_DIR": str(self.root / "managed"),
                 },
