@@ -103,8 +103,6 @@ CI scheduling, result classification, retry, and promotion are controller operat
 
 Keep accepted membership and useful source during admin merges or queue restarts. A canonical advance does not reset original PR review.
 
-Routine rechecks of member PRs are not withdrawals. Label sweeps, eligibility reconciles and status polls run continuously, about one per minute across the open PR population, and a head of a hundred PRs always has one in flight while it is being sealed, rebased or dispatched. Only an actual withdrawal signal (a cancel command, a changed head, a closed or retargeted PR) may make a claimed preparation yield; a pending recheck neither delays nor restarts it, and a recheck that later finds the PR ineligible removes it through the ordinary cancel path. Bors yielded to every pending recheck and restarted the construction of each large batch four or five times, five to eight minutes per batch.
-
 ## Staging capacity and build progress
 
 The head build is the serial resource. Staging builds keep running on the fleet hosts as they do today; the controller records which runner and host executed each candidate build and how long each build phase took, so placement decisions can be made from measurements.
@@ -138,8 +136,6 @@ Every execution path shares the same claims. A delayed or duplicate attempt cann
 When no execution path can obtain inference (provider errors or exhausted credentials across every configured path, after bounded retries), the queue holds: it stops sealing, the head waits with its membership and retained source intact, and blocked repair tasks remain exposed to any authorized worker that can still run. The controller retries with backoff and resumes automatically when a task completes or a provider call succeeds. There is no conventional-splitting fallback, no return of members to authors, and no operator page. A difficult source problem or an ordinary infrastructure error is not evidence that inference is unavailable.
 
 Queue status reports the hold, its start time, and the last provider error so the cause is visible after the fact.
-
-GitHub authorization failures hold the queue the same way. When every GitHub call is rejected with a permanent authorization failure (a suspended installation, a revoked or expired token, a lost permission), the controller enters the hold within one reconcile instead of retrying each call: no claim may expire because of retries against a rejecting API, no job may be requeued and reclaimed ahead of the work it blocks, and status names the failure. Work resumes on the first successful call. When Bors's installation was suspended on 2026-11-04 its reads were retried for three minutes each, the job overran its lease, was requeued and reclaimed first, and the queue stopped with thousands of jobs waiting and nothing in status saying why.
 
 ## State, existing code, and implementation
 
@@ -204,8 +200,6 @@ The service is a drop-in replacement for Bors's batch policy, not a new interfac
 23. Increment 0: the historical repair experiments, run over at least twenty past failed candidates, report time to a green local build, edited PRs, shrink events and cost for each, without publishing anything; a suspect readmitted after repair is ordered by its original admission age.
 24. Transition: the shadow period shows two days of membership-for-membership agreement with Bors; the rehearsal passes on the scratch repository; cutover is one setting change that preserves every approved input with its original age.
 25. A PR that removes or renames a module still imported by an unchanged module on `main` or by a batch-mate is refused at insertion from the import headers, with the ordinary missing-source request, and never reaches head CI.
-26. Routine rechecks of member PRs (label sweeps, eligibility reconciles, status polls) never delay or restart a seal, rebase or CI launch; only an actual withdrawal signal does, and a head of 120 PRs is prepared in one attempt while such sweeps run.
-27. When GitHub rejects every call with a permanent authorization failure (suspended installation, revoked token), the controller enters a reported hold within one reconcile; no claim expires because of retries, status names the cause, and work resumes on the first successful call.
 
 ## Work plan for autonomous implementation
 
