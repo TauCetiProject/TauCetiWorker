@@ -290,6 +290,31 @@ url = "https://private.invalid"
         self.assertEqual(value["scope"]["repositories"], [PROJECT])
 
 
+class ParallelTaskObservations(unittest.TestCase):
+    def test_a_released_worker_does_not_hide_another_current_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roots = [Path(directory) / str(i) for i in range(2)]
+            for root, state, token, updated in zip(
+                roots, ["agent_running", "released"], ["PRIVATE_ACTIVE", "PRIVATE_RELEASED"], [100, 120], strict=True
+            ):
+                task_dir = root / "tasks/19"
+                task_dir.mkdir(parents=True)
+                (task_dir / "task.json").write_text(
+                    json.dumps({"task": {"task_id": "19", "claim_token": token}, "state": state, "updated_at": updated})
+                )
+            tasks = [{"id": 19, "state": "open"}]
+            claims = [{"task_id": 19, "token": "PRIVATE_ACTIVE", "expires_at": 200}]
+            observer = monitoring.TaskObservations()
+            value = observer.observe(roots, tasks, claims=claims, observed_at=130)
+            self.assertEqual(value[19]["state"], "agent_running")
+            self.assertNotIn("PRIVATE", json.dumps(value))
+            # Lease expiry and terminal task state must not make stale running
+            # work appear current, even when the cached files have not changed.
+            self.assertEqual(observer.observe(roots, tasks, claims=claims, observed_at=201)[19]["state"], "released")
+            tasks[0]["state"] = "submitted"
+            self.assertEqual(observer.observe(roots, tasks, claims=claims, observed_at=130)[19]["state"], "released")
+
+
 class PublisherCadence(unittest.TestCase):
     def test_upload_duration_is_included_without_execution_deadlines_or_hot_retries(self):
         for duration, failed, expected_wait in [(7, False, 3), (21, False, 1), (21, True, 20)]:
