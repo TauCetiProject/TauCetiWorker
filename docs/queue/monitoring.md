@@ -43,7 +43,9 @@ extraordinary active-only overflow is marked partial. Authoritative batch counts
 remain distinct from retained member detail. The public report records its source
 scope and observation times. Worker checkpoint/outcome summaries contain only
 phase/observation/duration, approved provider/model labels and recorded cost
-coverage. No raw task payload, claim token, worker path, prompt, model response,
+coverage. Recorded token subtotals retain known-attempt and missing-attempt counts
+for each token category; absent usage is not zero. The canonical tip comes from
+the existing controller status fact, without another Git scan. No raw task payload, claim token, worker path, prompt, model response,
 process command, environment or private error is exported.
 
 A separate hourly report reuses the existing pilot calculations:
