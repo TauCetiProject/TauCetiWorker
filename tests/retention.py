@@ -947,6 +947,27 @@ class Retention(unittest.TestCase):
         self.assertEqual(report["drain"]["slices"], 4)
         self.assertEqual(report["drain"]["removed_entries"], 2)
 
+    def test_continuous_requests_cannot_repeat_a_stalled_drain_forever(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        calls = []
+
+        def prepare(*args, **kwargs):
+            calls.append(1)
+            atomic_json(activity.root() / "cleanup-request.json", dict(at=2000 + len(calls)))
+            return dict(sweep_complete=True)
+
+        with (
+            patch.object(retention.time, "time", return_value=1000),
+            patch.object(maintenance, "prepare", side_effect=prepare),
+            patch.object(maintenance, "collect_discarded", return_value={}),
+            patch.object(verification_storage, "housekeep", return_value={}) as housekeep,
+        ):
+            retention.drain_pending([(self.root, {})])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(housekeep.call_args.kwargs["now"], 1000)
+
     def test_drain_rotates_roots_before_repeating_progress(self):
         from tauceti_worker import recovery_maintenance as maintenance
         from tauceti_worker import verification_storage

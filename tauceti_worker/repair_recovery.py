@@ -265,7 +265,12 @@ class Recovery:
             return False
         charged = False
         try:
-            facts = b.facts(m)
+            try:
+                facts = b.facts(m)
+            except Wait:
+                raise
+            except Exception as error:
+                raise Wait("metadata-unavailable", f"Await current PR state: {error}") from error
             j["observed_head"] = facts["head"]
             normal_pending = normal_publication(self.record, m, j)
             if normal_pending:
@@ -556,7 +561,7 @@ class WorkerBackend:
             with read_context(fresh=True, direct=True):
                 data = self.w.gh.pr_view(m["pr"], fields)
         if not data:
-            raise RuntimeError("Cannot read current PR state")
+            raise Wait("metadata-unavailable", "Await current PR state; no source recovery attempt was made")
         return dict(
             head=data["headRefOid"],
             state=data["state"],

@@ -974,6 +974,16 @@ class Fixture(unittest.TestCase):
         self.assertTrue(self.run_recovery())
         self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
 
+    def test_metadata_outage_before_claim_does_not_spend_source_attempts(self):
+        with patch.object(self.backend, "facts", side_effect=RuntimeError("shared state offline")):
+            for _ in range(4):
+                self.assertFalse(self.run_recovery())
+                self.retry_now()
+        self.assertEqual(self.journal()["attempts"], 0)
+        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["reason"]["code"], "metadata-unavailable")
+        self.assertTrue(self.run_recovery())
+
     def test_exhausted_uncertain_publication_keeps_reconciliation_scheduled(self):
         with patch.object(self.backend, "reconcile", side_effect=RuntimeError("remote unavailable")):
             for _ in range(3):

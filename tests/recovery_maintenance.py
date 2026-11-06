@@ -116,7 +116,15 @@ class RecoveryMaintenance(unittest.TestCase):
             journal = exhausted | publication
             maintenance.atomic_json(record / "recovery.json", journal)
             self.expire_record(record)
-            self.assertIsNone(maintenance.abandonment_reason(record, journal))
+            self.assertEqual(maintenance.abandonment_reason(record, journal), "recovery-lifetime-exhausted")
+            checkout = record / "checkout"
+            checkout.mkdir(exist_ok=True)
+            (checkout / "derived").write_text("disposable")
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            self.assertTrue(record.exists())
+            self.assertFalse(checkout.exists())
+            self.assertEqual(maintenance._metadata(record / "recovery.json")["state"], "obsolete")
+            self.assertFalse(maintenance.disposal_pending(record, journal))
             self.assertFalse(maintenance.discard_record(self.cfg.state, record))
         maintenance.atomic_json(record / "recovery.json", exhausted)
         self.assertTrue(maintenance.discard_record(self.cfg.state, record))

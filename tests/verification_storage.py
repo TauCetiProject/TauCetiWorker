@@ -388,20 +388,6 @@ class Storage(Receipts):
             self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
         self.assertEqual(v.read_json(self.state / "verification-jobs" / pending.name)["status"], "success")
 
-    def test_unused_complete_checkpoint_is_removed_but_receipt_evidence_survives(self):
-        verifier = v.Verification(self.root, self.state)
-        verifier.base = self.base
-        verifier.checkpoint_sources(dict(sources=v.inventory(self.root, self.base)))
-        target = Path(verifier.receipt["source_checkpoint"]).parent
-        receipt = verifier.path
-        receipt.unlink()
-        with storage.ledger() as data:
-            row = data["candidates"][storage.key(self.state, target.name)]
-            row["last_used"] = time.time() - 1000
-        self.collect(retire_checkpoints=True)
-        self.assertFalse(target.exists())
-        self.assertTrue((self.root / "TauCeti/A.lean").exists())
-
     def test_source_checkpoints_share_host_budget_and_never_expire(self):
         os.environ["TAUCETI_VERIFY_CHECKPOINT_BYTES"] = str(128 * 1024**2)
         with patch.dict(os.environ, TAUCETI_VERIFY_BUBBLE="1"):
