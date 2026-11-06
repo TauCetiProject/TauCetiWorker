@@ -55,6 +55,19 @@ PERMANENT_BLOCKS = {
     "billing-policy",
     "expected-head-missing",
 }
+CONTINUATION_BLOCKS = {"profile-missing", "unsupported-continuation-provider", "billing-policy"}
+
+
+def verification_tools_changed(journal):
+    if not journal.get("failed_source"):
+        return False
+    code = (journal.get("reason") or {}).get("code")
+    if code in PERMANENT_BLOCKS and code not in CONTINUATION_BLOCKS:
+        return False
+    from .verification_tools import identity
+
+    previous = journal.get("verification_retry_identity", journal.get("failed_tool_identity"))
+    return previous != identity()
 
 
 class Wait(Exception):
@@ -248,7 +261,8 @@ class Recovery:
             self.transition(j.get("state", "retained"), retry_at=0)
         selected = selection(b.opts.only, b.opts.prs, b.opts.sandbox_host, b.opts.agent)
         changed_selection = selection_changed(j.get("selection"), selected)
-        if j.get("retry_at", 0) > time.time() and not changed_selection:
+        changed_tools = verification_tools_changed(j)
+        if j.get("retry_at", 0) > time.time() and not changed_selection and not changed_tools:
             return False
         charged = False
         try:
@@ -314,6 +328,10 @@ class Recovery:
                     reason=None,
                 )
             b.policy(m, facts)
+            if changed_tools:
+                from .verification_tools import identity
+
+                self.transition(j["state"], verification_retry_identity=identity(), retry_at=0)
             if (m.get("round_outcome") or {}).get("published_head") not in (None, m.get("expected_remote_head")):
                 raise Obsolete(
                     "post-publication-leftovers",
@@ -341,6 +359,7 @@ class Recovery:
                 j.get("failed_head") == facts["head"]
                 and (j.get("reason") or {}).get("code") != "content-allowance"
                 and j.get("failed_source")
+                and not changed_tools
                 and j.get("failed_recheck_at", 0) > time.time()
                 and (prior_checkout / ".git").exists()
                 and saved.inspect(prior_checkout).fingerprint == j["failed_source"]
@@ -348,6 +367,8 @@ class Recovery:
                 # A known failed source needs reasoning. Admission waits must not
                 # warm caches or repeat the same expensive failed build each time.
                 b.continuation_admission(self.record, m, j)
+            prior = prior_checkout if prior_checkout.is_dir() else b.w.cfg.checkout
+            b.check_verification_tools(prior)
             b.acquire(m, facts)
             # No attempt is consumed until a real claim and all prerequisites are available.
             claimed = b.facts(m)
@@ -1162,6 +1183,9 @@ class WorkerBackend:
         from .paths import HERE
         from .processes import run as run_process
         from .verification import Verification
+        from .verification_tools import identity as tool_identity
+
+        self.check_verification_tools(checkout)
 
         policy = scope_policy(
             facts["labels"], facts["ref"], bump=m.get("authorization", {}).get("automatic_bump", False)
@@ -1177,7 +1201,11 @@ class WorkerBackend:
                 base = saved._rev(checkout, f"origin/{BASE_BRANCH}")
                 j = getattr(self, "journal", {})
                 current = self.verification_fingerprint(checkout, m, facts)
-                if j.get("failed_fingerprint") == current and j.get("failed_recheck_at", 0) > time.time():
+                if (
+                    j.get("failed_fingerprint") == current
+                    and j.get("failed_tool_identity") == tool_identity()
+                    and j.get("failed_recheck_at", 0) > time.time()
+                ):
                     return j["failed_receipt"]
                 if prefix:
                     # The supervisor is outside the agent's mount namespace. Run
@@ -1229,11 +1257,17 @@ class WorkerBackend:
                         failed_fingerprint=current,
                         failed_head=facts["head"],
                         failed_source=saved.inspect(checkout).fingerprint,
+                        failed_tool_identity=tool_identity(),
                         failed_receipt=result,
                         verification_failures=failures,
                         failed_recheck_at=time.time() + min(21600, 1800 * 2 ** min(failures - 1, 4)),
                     )
         return result
+
+    def check_verification_tools(self, checkout):
+        from .verification_tools import check
+
+        check(checkout)
 
     def continuation_admission(self, record, m, j):
         from .agents import AuthoringProfile
@@ -1725,6 +1759,8 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True, agent=None):
             return True  # The next owned round reconciles an unfinished normal task.
         if journal.get("state") in TERMINAL:
             continue
+        if verification_tools_changed(journal):
+            return True
         if (journal.get("reason") or {}).get("code") in RETRYABLE and journal.get("retry_at", 0) > time.time():
             continue
         if journal.get("protocol") != PROTOCOL:
@@ -2324,7 +2360,8 @@ def recover(w, opts):
             j.get("selection"), selection(opts.only, opts.prs, opts.sandbox_host, opts.agent)
         )
         permanent = j.get("state") == "blocked" and (j.get("reason") or {}).get("code") in PERMANENT_BLOCKS
-        if current_protocol and permanent and same_selection:
+        changed_tools = verification_tools_changed(j)
+        if current_protocol and permanent and same_selection and not changed_tools:
             # Metadata-only external-fact probe. No payload hashing or source work,
             # using existing shared state only, never a new direct GitHub poll.
             manifest = read_json(record / "manifest.json")
@@ -2347,7 +2384,7 @@ def recover(w, opts):
                 except Exception as error:
                     write(record, j, "blocked", probe_at=time.time() + 1800, probe_error=str(error))
             continue
-        if current_protocol and j.get("retry_at", 0) > time.time() and same_selection:
+        if current_protocol and j.get("retry_at", 0) > time.time() and same_selection and not changed_tools:
             continue
         if inspected >= MAX_INSPECT:
             break

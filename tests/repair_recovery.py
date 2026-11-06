@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import repair_recovery as rr
+from tauceti_worker import verification_tools
 from tauceti_worker import work_recovery as saved
 from tauceti_worker.agents import AuthoringProfile
 from tauceti_worker.agents import run_agent_host as run_real_agent_host
@@ -419,6 +420,93 @@ class Fixture(unittest.TestCase):
                 self.assertFalse(self.run_recovery())
         self.assertEqual(FakeVerification.calls, 1)
         self.assertEqual(self.journal()["attempts"], 0)
+
+    def test_missing_verification_tools_never_acquire_or_warm_or_launch_source_repair(self):
+        counts = dict(self.values)
+        with (
+            patch.object(
+                self.backend, "check_verification_tools", side_effect=verification_tools.Unavailable("missing")
+            ),
+            patch.object(self.backend, "acquire", side_effect=AssertionError("acquired with missing tooling")),
+            patch.object(self.backend, "restore", side_effect=AssertionError("restored with missing tooling")),
+            patch(
+                "tauceti_worker.agents.host_build_cache_context",
+                side_effect=AssertionError("warmed with missing tools"),
+            ),
+        ):
+            for _ in range(2):
+                self.assertFalse(self.run_recovery())
+                self.assertEqual(self.journal()["reason"]["code"], "invocation-failed")
+                self.assertNotIn("failed_source", self.journal())
+                self.retry_now()
+        self.assertEqual(self.values, counts)
+        self.assertEqual(FakeVerification.calls, 0)
+        self.assertTrue(self.run_recovery())
+
+    def test_legacy_continuation_block_reverifies_once_after_tool_change(self):
+        FakeVerification.failures = 1
+        with patch.object(self.backend, "continuation_admission", side_effect=rr.Block("profile-missing", "no model")):
+            self.assertFalse(self.run_recovery())
+        j = self.journal()
+        j.pop("failed_tool_identity")  # An existing deployed record predates this field.
+        rr.write(self.record, j, "blocked", retry_at=10**12, probe_at=10**12)
+        with patch(
+            "tauceti_worker.agents.run_agent_host", side_effect=AssertionError("mechanical check needs no model")
+        ):
+            self.assertTrue(rr.due(self.cfg))
+            self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "published")
+        self.assertEqual(FakeVerification.calls, 2)
+        self.assertEqual(self.values["historical-paid"], 17)
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_unchanged_tools_do_not_reopen_continuation_block(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            failed_source="saved source",
+            failed_tool_identity=verification_tools.identity(),
+            reason=rr.reason(rr.Block("profile-missing", "no model")),
+            retry_at=10**12,
+            probe_at=10**12,
+        )
+        self.assertFalse(rr.due(self.cfg))
+        with patch.object(rr.Recovery, "run", side_effect=AssertionError("unchanged blocked record retried")):
+            self.assertFalse(rr.recover(self.w, self.opts))
+
+    def test_tool_change_does_not_reopen_unrelated_permanent_authorization_block(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            failed_source="saved source",
+            failed_tool_identity="old Tools",
+            reason=rr.reason(rr.Block("foreign-scope", "not authorized")),
+            retry_at=10**12,
+            probe_at=10**12,
+        )
+        self.assertFalse(rr.due(self.cfg))
+        with patch.object(rr.Recovery, "run", side_effect=AssertionError("foreign work retried")):
+            self.assertFalse(rr.recover(self.w, self.opts))
+
+    def test_unchanged_missing_tools_after_reopen_obey_infrastructure_backoff(self):
+        rr.write(
+            self.record,
+            {},
+            "eligible",
+            failed_source="saved source",
+            failed_tool_identity="old Tools",
+            reason=dict(code="invocation-failed"),
+            retry_at=10**12,
+        )
+        with patch.object(
+            self.backend, "check_verification_tools", side_effect=verification_tools.Unavailable("missing")
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertFalse(rr.due(self.cfg))
+        with patch.object(self.backend, "check_verification_tools", side_effect=AssertionError("ignored retry time")):
+            self.assertFalse(self.run_recovery())
 
     def test_verified_provider_outage_refunds_content_but_counts_infrastructure(self):
         FakeVerification.failures = 1
