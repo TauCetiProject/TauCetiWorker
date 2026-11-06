@@ -956,6 +956,11 @@ class Retention(unittest.TestCase):
         self.assertEqual(report["drain"]["slices"], 4)
         self.assertEqual(report["drain"]["removed_entries"], 2)
 
+    def test_extra_roots_do_not_repeat_optional_native_cache_inventory(self):
+        with patch("tauceti_worker.machine_lake_cache.collect") as collect:
+            retention.sweep(shared=False)
+        collect.assert_not_called()
+
     def test_initial_disposal_turn_yields_to_other_stores_despite_backlog(self):
         from tauceti_worker import recovery_maintenance as maintenance
         from tauceti_worker import verification_storage
