@@ -112,13 +112,13 @@ I/O, below):
    itself cancels the input and posts the conflict request. Any error returns the input to waiting
    and releases the claim. Empty open batches beyond the first are removed at the end of the pass.
    A batch a `prepare` task holds (below) is skipped, so inflow goes on into the next open batch.
-4. Seal: when there is no head, the oldest open batch is nonempty, no insertion claim is active on it, no
+4. Seal: when there is no head, the oldest open batch is nonempty, no claim is active on it, no
    inference hold is in force and Bors's external head (below) is not awaited, it becomes the head
    in the same pass; the other open batches stay open and keep receiving insertions, and a new open
-   batch is created only when none remains. There is no collection window. A `prepare` task on the
-   batch is superseded (resolution `sealed`) and its claim released; the batch seals with what its
-   preparations adopted. A worker's claim on the batch's `pre_rebase` task holds the seal instead
-   (its result is the replay the new head needs); an unclaimed one is superseded (`sealed`).
+   batch is created only when none remains. There is no collection window. An active `prepare` or
+   `pre_rebase` owner keeps the batch open until adoption, release or claim expiry, so completed
+   repairs enter the new head through ordinary validation. Unclaimed background offers are
+   superseded (resolution `sealed`); the batch seals with what its preparations adopted.
 5. Head reconciliation, in the plan's order: a head under a worker's task claim is left alone;
    a head not based on the canonical commit is claimed and, when its pre-rebase (below) was made on
    exactly that commit, based there from the pre-rebased chain without a replay; otherwise replayed (`chain.replay`), a clean
@@ -165,8 +165,11 @@ otherwise sit idle. `claim_task` offers it after every head task nobody holds, o
 within `repair_concurrency` claims in total and at most `repair_concurrency - 1` background claims
 (below), so a second worker prepares while the first repairs the head, a head task appearing is
 claimed at once by a free worker, and with `repair_concurrency` 1 no preparation is claimed; the claim's `extra.renew_after` is 60 seconds, so a worker learns within a minute
-that the controller took the batch back. A preparation is superseded only when its batch seals
-(`sealed`) or changes (`batch-changed`, an insertion or a trim), never by a head task appearing.
+that the controller took the batch back. A preparation is superseded when its batch changes
+(`batch-changed`, an insertion or a trim), never by a head task appearing. When the preceding head
+lands, an active preparation claim keeps the batch open and renewable until its result is adopted,
+the worker releases it or the lease expires. An unclaimed preparation is superseded on sealing
+(`sealed`).
 While a worker holds the claim, insertion skips the batch and probes the next open batch (created
 on the canonical commit when `open_batch_limit` allows), so the preparation never makes inflow wait.
 The submission goes through `submit_task` unchanged except that a `prepare` task's batch must still
@@ -248,9 +251,9 @@ becomes `pre_rebase_tip`, the members the agent edited join `pre_rebase_edits`, 
 release records the task's tip the same way, and `agent_failed` or `push_failed` settles the task as
 `failed` for that tip. The batch's own chain, version and members are unchanged. A task whose `onto`
 is no longer the head's tip (`head-moved`), or whose chain is no longer a prefix of the batch's
-usable pre-rebase (`pre-rebase-changed`), is superseded and its claims released; sealing never waits
-for it (it is superseded as `sealed` with the own-base preparation). An own-base preparation that
-becomes due waits while a worker holds this task and supersedes it when unclaimed. A head that lands
+usable pre-rebase (`pre-rebase-changed`), is superseded and its claims released. Sealing waits for an
+active owner while the chain remains current; an unclaimed offer is superseded as `sealed`. An own-base
+preparation that becomes due waits while a worker holds this task and supersedes it when unclaimed. A head that lands
 as the prepared tip's base seals with the prepared tip unchanged, so its CI round fetches the outputs
 the worker published for that exact tip; a later insertion extends the pre-rebase by replay, which
 leaves it unprepared until the next preparation.
@@ -358,8 +361,8 @@ successful report or adopted task; the status reports it, and an alert names a h
 hour.
 
 Urgent lane: `mark_urgent` flags the input (drawn next, ahead of the random draw) or, if it is
-already a member of the open batch, the batch. The open batch seals as soon as the head lands in
-any case; the running head is never cancelled.
+already a member of the open batch, the batch. The open batch seals as soon as the head lands and
+its active claims finish; the running head is never cancelled.
 
 Bors's state at the cutover (`import_bors_state(observation, candidates, now=, dry_run=,
 release_head=)`, implemented in `tauceti_queue/bors_import.py`): every member of a non-running batch
@@ -605,7 +608,8 @@ next batch; the head's repair task is claimed first; a second worker prepares th
 first repairs the head) and C `Preparation` (the quiet period and size, the setting, the claim tiers,
 a preparation created, claimed and adopted while the head has a task and not superseded by one, a
 head task appearing during a preparation claimed at once, no background claim at concurrency 1,
-adoption keeping the batch open, sealing superseding a preparation, clean and failed releases).
+adoption keeping the batch open, sealing preserving active preparations, unclaimed offers and
+released or expired claims unblocking sealing, clean and failed releases).
 The sequencing of the two background kinds is F `SequencedBackgroundTasks` (prepared, then
 pre-rebased from the prepared chain, sealed and landed with both) and C `PreRebase` (no `pre_rebase`
 task until prepared, then one from the prepared chain carrying `prepare_errors`; a clean preparation
