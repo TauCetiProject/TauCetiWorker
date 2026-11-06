@@ -126,6 +126,9 @@ def prepare(snapshot, baseline, reporter, public_repositories=("TauCetiProject/T
             | {"batch_id": str(h["batch"])}
             for h in report["heads"][-100:]
         ]
+        checks = report["exit_criteria"]
+        scenario = checks["110_pr_two_source_failures_under_120_minutes"]
+        week = checks["week_above_baseline_without_comment_or_attribution_regression"]
         windows.append(
             {
                 "key": key,
@@ -136,6 +139,19 @@ def prepare(snapshot, baseline, reporter, public_repositories=("TauCetiProject/T
                 "summary": summary,
                 "heads": heads,
                 "heads_truncated": len(report["heads"]) > 100,
+                "criteria": {
+                    "scenario": {
+                        "status": scenario["status"],
+                        "eligible_count": len(scenario["eligible_batches"]),
+                        "qualifying_count": len(scenario["qualifying_batches"]),
+                        "qualifying_batches": [str(b) for b in scenario["qualifying_batches"][:100]],
+                    },
+                    "week": {
+                        "status": week["status"],
+                        "observed_days": number(week["observed_days"]),
+                        "rate_above_baseline": week["observed_rate_above_baseline"],
+                    },
+                },
             }
         )
     return {

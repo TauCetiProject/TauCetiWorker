@@ -40,6 +40,10 @@ class History(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertNotIn("SECRET", json.dumps(after))
         self.assertEqual(after["windows"][0]["summary"]["cost"]["recorded_usd"], 2.5)
+        self.assertIn(
+            after["windows"][0]["criteria"]["week"]["status"],
+            ["not_yet_observable", "requires_attribution_and_comment_audit"],
+        )
 
     def test_unattributed_legacy_snapshot_fails_closed(self):
         value = snapshot()

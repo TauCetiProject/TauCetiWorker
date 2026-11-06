@@ -93,7 +93,20 @@
           "batch_id": "1"
         }
       ],
-      "heads_truncated": false
+      "heads_truncated": false,
+      "criteria": {
+        "scenario": {
+          "status": "not_observed",
+          "eligible_count": 0,
+          "qualifying_count": 0,
+          "qualifying_batches": []
+        },
+        "week": {
+          "status": "not_yet_observable",
+          "observed_days": 0.046296296296296294,
+          "rate_above_baseline": true
+        }
+      }
     },
     {
       "key": "7d",
@@ -180,7 +193,20 @@
           "batch_id": "1"
         }
       ],
-      "heads_truncated": false
+      "heads_truncated": false,
+      "criteria": {
+        "scenario": {
+          "status": "not_observed",
+          "eligible_count": 0,
+          "qualifying_count": 0,
+          "qualifying_batches": []
+        },
+        "week": {
+          "status": "not_yet_observable",
+          "observed_days": 0.046296296296296294,
+          "rate_above_baseline": true
+        }
+      }
     },
     {
       "key": "pilot",
@@ -267,7 +293,20 @@
           "batch_id": "1"
         }
       ],
-      "heads_truncated": false
+      "heads_truncated": false,
+      "criteria": {
+        "scenario": {
+          "status": "not_observed",
+          "eligible_count": 0,
+          "qualifying_count": 0,
+          "qualifying_batches": []
+        },
+        "week": {
+          "status": "not_yet_observable",
+          "observed_days": 0.046296296296296294,
+          "rate_above_baseline": true
+        }
+      }
     }
   ],
   "baseline": {
