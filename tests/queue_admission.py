@@ -84,6 +84,24 @@ class AdmissionTests(unittest.TestCase):
         self.event("status", {"sha": head, "context": "build"})
         self.assertEqual(self.intake.run_once()["approved"], 1)
 
+    def test_inference_outage_preserves_primary_intake_and_resumes_the_same_queue(self):
+        for _ in range(self.controller.setting("inference_failure_threshold")):
+            self.controller.report_inference("worker", False, "all providers unavailable")
+        self.ready()
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.controller.tick()
+        self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
+        self.assertEqual(self.github.dispatches, [])
+        hold = self.controller.inference_hold()
+        membership = self.controller.store.rows("members")
+        self.restart()
+        self.assertEqual(self.controller.inference_hold(), hold)
+        self.assertEqual(self.controller.store.rows("members"), membership)
+        self.controller.report_inference("worker", True)
+        self.controller.tick()
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertIsNone(self.controller.inference_hold())
+
     def test_unsafe_review_revokes_waiting_but_neutral_build_does_not(self):
         head = self.ready()
         self.intake.run_once()
