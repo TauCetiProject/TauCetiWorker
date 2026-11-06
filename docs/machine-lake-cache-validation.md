@@ -46,19 +46,11 @@ libraries and therefore shares the release's native namespace.
 
 Both native branches pass the 20 real shared-cache regressions and standalone
 Lake builds. The upstream [Linux CI run](https://github.com/leanprover/lean4/actions/runs/42169213507)
-passed its full build/test suite, including 4,831 tests. The Worker integration's
-functional [CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42160999154)
-passed. The final extensionless-executable cleanup change adds a regression,
-passes the complete
-[Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42167078533).
-The staging-alias accounting fix brings the machine-cache suite to 29 passing
-tests; the 62 retention tests pass too. The final fix passes the complete
-[Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42175130857).
-The additional native race tests pass both locally and in that upstream run.
-They do not change the installed native executable. Documentation revision
-`30d733e` also passes the complete
-[Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42169322712),
-and the production pin passes
+passed its full build/test suite, including 4,831 tests. Worker validation includes
+29 machine-cache tests and 62 retention tests. All nine jobs in the complete
+[Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42177480442)
+passed at revision `afaf5163ad56ee200664fa73bcfa5cb0f78d94f9`.
+The production pin passes
 [Fleet PR CI](https://github.com/TauCetiProject/TauCetiFleet/actions/runs/42175762332).
 
 Focused Worker validation also covers retention, expanded caches, host warming,
@@ -103,7 +95,10 @@ The corrected live collector reported 24,772,435,968 retained allocated bytes, o
 which 24,133,988,352 bytes had additional links. Both retention targets were
 unset and no collection errors were recorded. It removed four abandoned
 temporary names and reported zero estimated payload blocks reclaimed. The store
-is growing as more workers adopt it. These are inode-deduplicated inventory estimates, not newly
+is growing as more workers adopt it. A subsequent dry-run inventory at 07:19 UTC,
+after all 40 workers had adopted the integration, reported 24,992,493,568 retained
+bytes, including 24,045,010,944 bytes with additional links, with both targets
+still unset and no errors. These are inode-deduplicated inventory estimates, not newly
 allocated bytes or bytes saved. XFS reflinks, existing CI aliases and concurrent
 writes prevent those interpretations.
 
@@ -142,8 +137,9 @@ virtual capacity and references the same prepared base image. The image director
 accounts for another 4.08 GB. These are observed per-runner costs that vary with
 job activity, rather than preallocated 64 GiB per runner.
 
-A host snapshot measured 3,811,084,533,760 bytes used of 3,837,570,154,496 bytes,
-with 119,971,144 inodes in use. Free space fluctuates as active work and existing
+A host snapshot at 07:19 UTC measured 3,691,381,080,064 bytes used of
+3,837,570,154,496 bytes, with 146,189,074,432 bytes available and 119,238,533
+inodes in use. Free space fluctuates as active work and existing
 cleanup proceed. The overall scan of retained roots is still pending, so these
 component inventories do not yet close the host-wide accounting. They must not
 be summed as disjoint physical allocations.
@@ -152,7 +148,7 @@ The existing Fleet memory-pressure guard temporarily held new rounds during
 validation. Configuration still has workers enabled, `draining = false`, and
 40 science slots. The deployment did not change that guard or its thresholds.
 
-## Remaining validation
+## Current rollout
 
 The boundary rollout is complete across the 40 enabled science workers. The
 manager and background collector now use worker revision `cbf2b2da4c2359603bb69eea4064e670c4213cee`;
@@ -162,12 +158,18 @@ and dependency versions match the previous production runtime. The 16 configured
 subscription slots remain explicitly stopped. Host and worker configuration
 hashes are unchanged by the rollout.
 
-Record final cache inventory, host allocated blocks/inodes, remaining private and
-retained-workspace storage, and representative preparation/download/build
-measurements. Disk pressure arose during rollout: host free space fell below
-30 GB while the shared store was below 10 GB. Existing cleanup is running under
-existing policy. That observation alone does not identify the other growth or
-prove disk relief from this feature.
+A fresh independent audit at 07:29 UTC again found exactly 40 compatible worker
+loops, no duplicate or unexpected worker IDs, matching specifications, and every
+original instance-lock inode still open. The original stock Lake signature and
+installed native executable hash match. Normal worker and CI admissions remain
+configured as enabled; the existing memory-pressure guard can temporarily hold
+new rounds without a deployment drain. The subscription pool remains inactive.
+
+The retained-data scan is the only outstanding measurement. Representative
+private-cache, dependency-source, retained-build, download and build observations
+are recorded above. Disk pressure arose during rollout: host free space fell
+below 30 GB while the shared store was below 10 GB. That observation alone does
+not identify the other growth or prove disk relief from this feature.
 
 Dependency source trees, Git checkouts, recovery snapshots and existing private
 aliases remain substantial separate costs. This implementation does not provide
