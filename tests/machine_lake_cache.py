@@ -94,6 +94,43 @@ class MachineCache(unittest.TestCase):
         self.assertTrue(live.exists())
         self.assertEqual(result["removed_files"], 1)
 
+    def test_killed_publisher_staging_does_not_double_subtract_completed_payload(self):
+        payload = self.artifact()
+        amount = payload.stat().st_blocks * 512
+        staging = payload.parent / ".lake-cache-123456789-1.tmp"
+        os.link(payload, staging)
+        result = cache.collect(env=self.env)
+        self.assertFalse(staging.exists())
+        self.assertEqual(payload.read_bytes(), b"x" * 8192)
+        self.assertEqual(result["retained_bytes"], amount)
+        self.assertEqual(result["pinned_bytes"], 0)
+        self.assertEqual(result["removed_files"], 1)
+        self.assertEqual(result["removed_allocated_bytes"], 0)
+
+    def test_staging_with_only_an_external_alias_does_not_report_reclaimed_blocks(self):
+        payload = self.artifact(".lake-cache-123456789-1.tmp")
+        workspace = self.home / "workspace.olean"
+        os.link(payload, workspace)
+        result = cache.collect(env=self.env)
+        self.assertFalse(payload.exists())
+        self.assertEqual(workspace.read_bytes(), b"x" * 8192)
+        self.assertEqual(result["retained_bytes"], 0)
+        self.assertEqual(result["pinned_bytes"], 0)
+        self.assertEqual(result["removed_allocated_bytes"], 0)
+
+    def test_staging_alias_removal_does_not_prematurely_satisfy_size_target(self):
+        winner = self.artifact()
+        staging = winner.parent / ".lake-cache-123456789-1.tmp"
+        os.link(winner, staging)
+        other = self.artifact("c" * 16 + ".olean")
+        amount = winner.stat().st_blocks * 512
+        result = cache.collect(env=dict(self.env, TAUCETI_MACHINE_LAKE_CACHE_MAX_GIB=str(amount / 1024**3)))
+        self.assertTrue(winner.exists())
+        self.assertFalse(staging.exists())
+        self.assertFalse(other.exists())
+        self.assertEqual(result["retained_bytes"], amount)
+        self.assertEqual(result["removed_allocated_bytes"], amount)
+
     def test_configuration_recovers_a_cleared_native_root(self):
         self.artifact()
         (self.root / "owner.json").unlink()

@@ -207,15 +207,17 @@ def collect(*, env=None, dry=False, now=None):
     try:
         free_before = shutil.disk_usage(path).free
         result.update(retained_bytes=0, pinned_bytes=0)
-        seen = set()
+        seen = {}
         candidates = []
         for candidate, info, kind in _files(path):
             identity = info.st_dev, info.st_ino
-            if identity not in seen:
+            count, pinned = seen.get(identity, (0, False))
+            if count == 0:
                 result["retained_bytes"] += info.st_blocks * 512
-                if info.st_nlink > 1:
+                pinned = info.st_nlink > 1
+                if pinned:
                     result["pinned_bytes"] += info.st_blocks * 512
-                seen.add(identity)
+            seen[identity] = count + 1, pinned
             temporary = _TEMPORARY.fullmatch(candidate.name)
             if temporary:
                 eligible = _owner_exited(int(temporary[1]))
@@ -247,8 +249,18 @@ def collect(*, env=None, dry=False, now=None):
                 if not dry:
                     candidate.unlink()
                     result["removed_files"] += 1
-                    result["removed_allocated_bytes"] += amount
-                remaining -= amount
+                    if current.st_nlink == 1:
+                        result["removed_allocated_bytes"] += amount
+                identity = current.st_dev, current.st_ino
+                count, pinned = seen[identity]
+                # A dead writer's staging alias can leave the completed payload in this inventory.
+                count = 0 if current.st_nlink == 1 else count - 1
+                if count == 0:
+                    remaining -= amount
+                if not dry and pinned and (count == 0 or current.st_nlink == 2):
+                    result["pinned_bytes"] -= amount
+                    pinned = False
+                seen[identity] = count, pinned
             except FileNotFoundError:
                 continue  # Another native writer or collector changed an optional entry.
             except OSError as error:
