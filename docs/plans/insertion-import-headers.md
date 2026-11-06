@@ -43,26 +43,30 @@ Comparing the prospective tip with the current tip, rather than with `main`, att
 
 Unavailable scans (`None` on either side) insert the PR exactly as today and journal `probe-import-scan-unavailable` with the reason; the CI preflight remains the authority. The scan never changes a verdict, only refuses an insertion that CI would refuse anyway.
 
-### 3. Re-entry
+### 3. A source that is in flight: wait, do not refuse
+
+A gap whose missing source exists in the head's tip or in another open batch's tip is not the PR's fault: the provider is approved and ahead of it, and once the head lands the next open batch, based on the new `main`, has the source. When every gap is of that kind the PR stays waiting with `last_probe = "missing-source-in-flight"` and the batch's base recorded, is not probed against any batch on that base again (a fresh open batch on the same canonical commit lacks the source just the same, so unlike a textual conflict this is no reason to open one), and is probed once a base moves. The journal records `probe-missing-source-waiting` with the gaps and the batches holding the sources; no comment is posted. If any gap has no provider anywhere the PR is refused as in step 2: it needs a fix regardless of what lands.
+
+### 4. Re-entry after a refusal
 
 The refused input is cancelled, so it re-enters through re-approval after the author (or the review pipeline) pushes a fix, exactly as `conflicts-with-main` does. A PR whose gap was caused by `main` moving (the importer landed after its head) needs a new head in any case; a PR whose gap is a bad import of its own needs a new head too. No `needs-rebase` label and no withdrawal row: those are for members already inserted.
 
-### 4. Status and counters
+### 5. Status and counters
 
-`_count("missing_source_refusals")`; the journal report (`docs/queue/journal-report.md`) gains a line counting `probe-missing-source` events and `probe-import-scan-unavailable` reasons, so an unavailable scan that recurs (a repository with a symlink under `TauCeti/`, a budget that is too small) is visible rather than silent.
+`_count("missing_source_refusals")`; the pilot report (`scripts/queue_pilot_report.py`) retains the `probe-missing-source`, `probe-missing-source-waiting` and `probe-import-scan-unavailable` journal kinds in its snapshots, so an unavailable scan that recurs (a repository with a symlink under `TauCeti/`, a budget that is too small) is visible rather than silent.
 
 ## Failure modes considered
 
 - **Wrong refusal.** Only a `TauCeti.*` import whose source path is absent from the prospective tree, and present or absent identically in the current tip, counts. The header scanner is the one already used for navigation and reads only the header; a misparse would have to yield a project module name that does not exist, and such an import fails the CI preflight regardless. A PR that deletes a module and updates every importer produces no gap; a rename with updated importers produces no gap.
 - **Slow probe.** One `ls-tree` per scan plus the headers of blobs not yet cached; the current tip's scan is shared across the pass. A cold cache reads every header once (bounded by `MAX_BLOB_BYTES`); every later pass reads only new blobs. The probe already runs without the controller lock.
 - **Scan unavailable.** The insertion proceeds as today; the journal says so.
-- **Batch-mate interactions.** A PR that imports a module a batch-mate adds inserts (the module is in the tip); a PR that imports a module nobody provides is refused with the bad-import wording; a PR that removes a module a batch-mate imports is refused with the removal wording naming that batch-mate's file.
+- **Batch-mate interactions.** A PR that imports a module a batch-mate in the same open batch adds inserts (the module is in the tip); one whose provider is in the head or another open batch waits for it (step 3); a PR that imports a module nobody provides is refused with the bad-import wording; a PR that removes a module a batch-mate imports is refused with the removal wording naming that batch-mate's file.
 - **Empty or edited contributions.** The scan runs on the exact prospective tip, whatever produced it.
 
 ## Tests
 
 - `tests/queue_admission_planning.py`: `import_gaps` on a temporary repository: a clean tree; a removed provider with an unchanged importer; a bad import; a gap already on the base; a symlink making the scan unavailable; the per-tree memo and the shared blob cache (count `cat-file` calls).
-- `tests/queue_fixture.py`, `test_s25_removal_that_strands_an_importer_is_refused_at_insertion`: `main` has `Provider.lean` and `Importer.lean` importing it; PR 101 deletes `Provider.lean` and is refused with the removal comment, its input cancelled, no member added, the batch tip unchanged; PR 102 deletes `Provider.lean` and updates `Importer.lean` and inserts; PR 103 adds `Consumer.lean` importing `TauCeti.Gone` and is refused with the bad-import wording; a PR inserted after a batch-mate added `New.lean`, importing it, inserts. Add the scenario to the mapping in `docs/queue/controller.md`.
+- `tests/queue_fixture.py`, class `MissingSource` (four `test_s25_...` tests): `main` has `Provider.lean` and `Importer.lean` importing it; a PR deleting `Provider.lean` is refused with the removal comment, its input cancelled, no member added; the same deletion with `Importer.lean` updated inserts; a PR importing a batch-mate's new module and a module nobody provides is refused naming only the latter; a PR importing a module that is in the head waits with no comment, is not probed again on that base, and lands after the head does; a gap already on `main` and an unavailable scan do not refuse. The scenario is in the mapping in `docs/queue/controller.md`.
 - The existing s1 and s9 scenarios keep passing unchanged: a clean insertion runs two scans whose result is empty.
 
 ## Rollout
