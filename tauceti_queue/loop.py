@@ -4,8 +4,8 @@ The service is event-driven: `Controller.handle_event` (webhooks), the command m
 API set the controller's wake event, and the loop runs a pass as soon as it is set. Without events
 the loop still runs a pass every `polling_interval_seconds` (a runtime setting) so a lost webhook
 cannot strand the head; the pass itself only re-reads a CI run when that interval has elapsed or an
-event named it, which bounds the polling cost. When GitHub's remaining quota is below
-`rate_limit_reserve`, polling passes are skipped until the reset and only event-driven passes run.
+event named it, which bounds the polling cost. The shared GitHub client applies actual resource
+deadlines to each call; a quota snapshot never suppresses unrelated or local controller work.
 """
 
 from __future__ import annotations
@@ -26,17 +26,14 @@ class ReconciliationLoop:
         self,
         controller: Controller,
         *,
-        rate_limit_reserve: int = 200,
         on_error: Callable[[BaseException], None] | None = None,
         max_interval: float | None = None,
     ) -> None:
         self.controller = controller
-        self.rate_limit_reserve = rate_limit_reserve
         self.on_error = on_error
         self.max_interval = max_interval
         self.stop_event = threading.Event()
         self.passes = 0
-        self.skipped_polls = 0
         self.last_error: str | None = None
         self._thread: threading.Thread | None = None
 
@@ -47,16 +44,7 @@ class ReconciliationLoop:
         return max(interval, 0.05)
 
     def run_once(self, woken: bool) -> bool:
-        """One pass. A polling pass (not woken by an event) is skipped when the API quota is low."""
-        if not woken:
-            try:
-                remaining, _reset = self.controller.github.rate_limit()
-            except Exception as error:  # noqa: BLE001 - quota unknown: poll anyway, the pass records its own failures
-                log.debug("rate limit unavailable: %s", error)
-                remaining = self.rate_limit_reserve
-            if remaining < self.rate_limit_reserve:
-                self.skipped_polls += 1
-                return False
+        """Run due controller work; individual requests obey their own resource deadlines."""
         try:
             self.controller.tick()
             self.passes += 1
