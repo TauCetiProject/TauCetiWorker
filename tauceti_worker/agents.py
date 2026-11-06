@@ -1508,7 +1508,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
             30,
         ),
     ) as warm_env:
-        warm_host_build_caches(cwd, warm_env, logdir, report=report, deadline=deadline)
+        warm_host_build_caches(cwd, warm_env, logdir, report=report, deadline=deadline, main_env=env)
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
@@ -1560,7 +1560,7 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
             reap_round_group(proc.pid)
 
 
-def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None, deadline=None) -> None:
+def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None, deadline=None, main_env=None) -> None:
     """Fetch both caches on the selected branch; warm main too for subsequent rebases.
 
     Genuine workspace errors must reach repair agents. Transport, publication and partial-download
@@ -1708,12 +1708,15 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None, d
     if main and main != head:
         # An explicit toolchain fetch also primes the store for a rebase that changes Lean versions.
         toolchain = git("show", base_ref + ":lean-toolchain")
-        main_env = dict(env, ELAN_TOOLCHAIN=toolchain) if toolchain and env.get("LAKE_SHARED_CACHE_ROOT") else env
+        main_fetch_env = (
+            dict(env if main_env is None else main_env, ELAN_TOOLCHAIN=toolchain)
+            if toolchain and env.get("LAKE_SHARED_CACHE_ROOT") else env
+        )
         revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), base_ref)
         for revision in revisions.splitlines():
             status = fetch(
                 "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])],
-                fetch_env=main_env,
+                fetch_env=main_fetch_env,
             )
             if status != "miss":
                 if status == "workspace-error":

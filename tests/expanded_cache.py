@@ -33,15 +33,18 @@ class Cache(unittest.TestCase):
         warm_env = dict(env, LAKE_CACHE_DIR=str(self.root / "downloads"))
 
         @contextlib.contextmanager
-        def preparation(cwd, environment, *, refetch, report=None):
+        def preparation(cwd, environment, *, refetch, report=None, deadline=None):
             self.assertEqual(cwd, self.root)
             self.assertIs(environment, env)
+            self.assertIsNotNone(deadline)
             events.append("prepare")
             yield warm_env
             events.append("hydrate")
 
-        def warm(cwd, environment, logdir, *, report=None):
+        def warm(cwd, environment, logdir, *, report=None, deadline=None, main_env=None):
             self.assertIs(environment, warm_env)
+            self.assertIsNotNone(deadline)
+            self.assertIs(main_env, env)
             events.append("fetch")
 
         with (
