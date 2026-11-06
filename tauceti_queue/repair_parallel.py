@@ -7,8 +7,8 @@ runs one agent per group concurrently, up to ``RunnerConfig.parallel_agents``. E
 own detached worktree of the chain tip (added from the task's worktree, sharing the extracted
 ``.lake/packages`` by symlink) with a prompt scoped to its group, and leaves ``fixup!`` and ``squash!``
 commits for the owning members on top of the tip instead of rewriting the chain. The worker then
-cherry-picks every group's commits onto the tip in the task's worktree, folds them with one autosquash
-rebase, validates the chain with the usual checks and runs the single whole-library
+cherry-picks every group's commits onto the tip as a reference, folds their deltas into the original
+members in the object store, validates the chain with the usual checks and runs the single whole-library
 ``lake build --iofail``. A group whose agent failed, whose commits were not the fixups asked for, or
 whose fixups do not apply is handed back to the sequential path in ``repair_task.run_task``, which runs
 the usual agent on the task's worktree with the remaining findings.
@@ -54,6 +54,7 @@ import types
 import typing
 from pathlib import Path
 
+from tauceti_queue import chain as chain_tool
 from tauceti_queue import repair, repair_audit, repair_context, repair_sandbox, repair_stream, repair_tools
 from tauceti_queue.repair import ChainCommit, PromptContext, git
 
@@ -568,20 +569,20 @@ def collect_fixups(group_worktree: Path, tip: str, group: Group) -> tuple[list[s
         match = FIXUP_SUBJECT.match(subject)
         if not match:
             return [], f"commit {sha[:12]} is not a fixup! or squash! commit ({subject[:60]})"
-        if match.group(1) == "fixup":
-            touched = set(git(group_worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split())
-            outside = sorted(touched - allowed)
-            if outside:
-                return [], f"fixup {sha[:12]} changes files outside the group: {', '.join(outside[:5])}"
+        touched = set(git(group_worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).splitlines())
+        outside = sorted(touched - allowed)
+        if outside:
+            return [], f"{match.group(1)} {sha[:12]} changes files outside the group: {', '.join(outside[:5])}"
     return shas, None
 
 
 def fold_fixups(worktree: Path, base: str, tip: str, groups: list[Group]) -> dict:
     """Cherry-pick every repaired group's commits onto the tip in the task's worktree and fold them
-    into the owning members with one autosquash rebase. A group whose commits do not apply is marked
-    ``fixups_not_applied`` and left for the sequential path; a rebase that fails leaves the worktree
-    at the tip with every group handed back."""
-    env = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": ":"}
+    into their original owners with object-store merges. Empty members and raw messages survive.
+    A group whose commits do not apply is left for the sequential path; a folding conflict or tree
+    mismatch leaves the worktree at the tip with every applied group handed back."""
+    original = chain_tool.chain_commits(worktree, base, tip)
+    updates: dict[str, list[tuple[str, chain_tool.ChainCommit]]] = {}
     git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
     record: dict = {"cherry_picked": 0, "applied": [], "not_applied": []}
     for group in groups:
@@ -589,29 +590,73 @@ def fold_fixups(worktree: Path, base: str, tip: str, groups: list[Group]) -> dic
             continue
         before = git(worktree, "rev-parse", "HEAD").strip()
         try:
+            resolved = []
             for sha in group.fixups:
-                git(worktree, "cherry-pick", "--allow-empty", "--keep-redundant-commits", sha, env=env)
-        except RuntimeError as error:
+                fixup = chain_tool.read_commit(worktree, sha)
+                match = FIXUP_SUBJECT.fullmatch(fixup.message.partition("\n")[0])
+                if match is None or FIXUP_SUBJECT.match(match[2]) or len(fixup.parents) != 1:
+                    raise RuntimeError(f"invalid original-member fixup: {sha[:12]}")
+                target = match[2]
+                owners = [commit for commit in original if commit.message.partition("\n")[0] == target]
+                if not owners and re.fullmatch(r"[0-9a-fA-F]{4,40}", target):
+                    owners = [commit for commit in original if commit.sha.startswith(target.lower())]
+                if len(owners) != 1:
+                    raise RuntimeError(f"fixup target is unknown or ambiguous: {target}")
+                owner = owners[0]
+                if not owner.source_pr or int(owner.source_pr.rsplit("#", 1)[1]) not in group.members:
+                    raise RuntimeError(f"fixup target is outside the group's members: {target}")
+                touched = set(git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).splitlines())
+                if touched - set(group.files):
+                    raise RuntimeError(f"{match[1]} {sha[:12]} changes files outside the group")
+                resolved.append((owner.sha, match[1], fixup))
+            for sha in group.fixups:
+                git(worktree, "cherry-pick", "--allow-empty", "--keep-redundant-commits", sha)
+        except (RuntimeError, chain_tool.ChainError, ValueError) as error:
             git(worktree, "cherry-pick", "--abort", check=False)
             git(worktree, "reset", "--hard", "--quiet", before)
             group.status = "fixups_not_applied"
             group.detail = " ".join(str(error).split())[:300]
             record["not_applied"].append(group.name)
             continue
+        for owner, kind, fixup in resolved:
+            updates.setdefault(owner, []).append((kind, fixup))
         record["cherry_picked"] += len(group.fixups)
         record["applied"].append(group.name)
     if not record["applied"]:
         return record
     try:
-        git(worktree, "rebase", "-i", "--autosquash", "--keep-empty", "--empty=keep", base, env=env)
-    except RuntimeError as error:
-        git(worktree, "rebase", "--abort", check=False)
+        reference_tree = chain_tool.tree_of(worktree, "HEAD")
+        parent = base
+        for owner in original:
+            if len(owner.parents) != 1:
+                raise RuntimeError(f"original member {owner.sha[:12]} is not single-parent")
+            message = owner.message
+            merged = chain_tool.merge_trees(worktree, parent, owner.sha, merge_base=owner.parents[0])
+            if not merged.clean:
+                raise RuntimeError(f"replaying member {owner.sha[:12]} conflicts: {', '.join(merged.conflict_paths)}")
+            current = chain_tool.commit_tree(
+                worktree, merged.tree, parent, message, (owner.author_name, owner.author_email), owner.author_date
+            )
+            for kind, fixup in updates.get(owner.sha, []):
+                merged = chain_tool.merge_trees(worktree, current, fixup.sha, merge_base=fixup.parents[0])
+                if not merged.clean:
+                    raise RuntimeError(f"folding {fixup.sha[:12]} conflicts: {', '.join(merged.conflict_paths)}")
+                if kind == "squash" and (body := fixup.message.partition("\n")[2].strip("\n")):
+                    message = message.rstrip("\n") + "\n\n" + body + "\n"
+                current = chain_tool.commit_tree(
+                    worktree, merged.tree, parent, message, (owner.author_name, owner.author_email), owner.author_date
+                )
+            parent = current
+        if chain_tool.tree_of(worktree, parent) != reference_tree:
+            raise RuntimeError("the folded tree differs from the cherry-picked reference tree")
+        git(worktree, "checkout", "--quiet", "--force", "--detach", parent)
+    except (RuntimeError, chain_tool.ChainError) as error:
         git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
-        record["rebase_error"] = " ".join(str(error).split())[:300]
+        record["fold_error"] = " ".join(str(error).split())[:300]
         for group in groups:
             if group.status == "repaired":
                 group.status = "fixups_not_applied"
-                group.detail = "the autosquash rebase failed: " + record["rebase_error"]
+                group.detail = "folding the member deltas failed: " + record["fold_error"]
         record["not_applied"] += record["applied"]
         record["applied"] = []
         return record

@@ -67,6 +67,7 @@ RUN_STDLIB=(
   local_lint.py
   lean_pressure.py
   repair_pressure.py
+  repair_parallel_fold.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py

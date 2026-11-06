@@ -531,10 +531,14 @@ through it, and the worker's verification build holds the lock through `repair_t
 every one of these builds runs in the offline sandbox (`repair_sandbox.sandboxed_lake`), which binds
 a group worktree's symlinked `.lake/packages` read-only from its target. When
 every agent has finished the worker collects each group's commits (they must all be `fixup!` or
-`squash!` commits, the fixups touching only the group's files, on a clean tree; anything else makes
-the group `unusable`), cherry-picks them onto the tip in the task's worktree, folds them with
-`GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash --keep-empty --empty=keep <base>`, validates the
-chain with `repair.chain_report` and runs the one whole-library `lake build --iofail`. A group whose
+`squash!` commits, both kinds touching only the group's files, on a clean tree; anything else makes
+the group `unusable`). Each target must uniquely identify an original member belonging to that
+group. The worker cherry-picks the accepted changes to capture their combined reference tree,
+then rebuilds the attributed members in order using Git object-store merges and commits. It
+preserves each member's author, date and raw message, appends squash explanations, and retains
+one commit even when a repair makes that member empty. The rebuilt tree must equal the reference
+tree. It then validates the chain with `repair.chain_report` and runs the one whole-library
+`lake build --iofail`. A group whose
 agent failed, whose commits were unusable or did not apply, or whose module still fails that build
 goes back to the sequential path: phase 4's usual agent runs on the task's worktree (now holding the
 folded chain) with only the remaining findings, and the ordinary retry and release rules apply from
