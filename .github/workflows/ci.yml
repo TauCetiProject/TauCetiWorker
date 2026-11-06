@@ -259,6 +259,14 @@ jobs:
             set -e
             ! printf "%s\n" "$claude_output" | grep -F "cannot be used with root/sudo privileges"
           '
+      # Exercise the pinned native CLI through the queue launcher, with a local
+      # scripted API and an isolated home: no model calls or credentials needed.
+      - name: Queue Claude stdin regression
+        run: |
+          docker run --rm --entrypoint python3 \
+            -v "$PWD:/workspace:ro" -w /workspace \
+            -e TAUCETI_TEST_CLAUDE=claude \
+            tauceti-worker:ci tests/queue_claude_stdin.py
       - name: Smoke-test configurable worker options
         run: |
           TAUCETI_WORKER_ARGS=--help docker compose run --rm --no-deps tauceti 2>&1 |

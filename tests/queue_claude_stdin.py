@@ -206,6 +206,7 @@ class ShellEnvironment(unittest.TestCase):
                 DISABLE_NONESSENTIAL_TRAFFIC="1",
                 DISABLE_AUTOUPDATER="1",
                 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+                IS_SANDBOX="1",  # the native CLI regression also runs in the CI container
                 TAUCETI_ACTIVITY_DIR=str(root / "activity"),
                 TAUCETI_FLEET_EVENT_DIR=str(root / "events"),
             )
@@ -275,10 +276,17 @@ class ShellEnvironment(unittest.TestCase):
                 self.assertEqual(resumed["session"], session)
                 self.assertEqual(len(api.calls), 6)
                 self.assertEqual(json.loads(settings.read_text()), existing)
-            results = [str(call["last_message"]) for call in api.calls]
+            results = [
+                "\n".join(
+                    str(block.get("content", ""))
+                    for block in call["last_message"].get("content", [])
+                    if isinstance(block, dict) and block.get("type") == "tool_result"
+                )
+                for call in api.calls
+            ]
             self.assertIn("heredoc payload", results[1])
             self.assertIn("cwd payload", results[2])
-            self.assertIn("explicit heredoc", results[3])
+            self.assertIn("1\nexplicit heredoc\n1\n1\nexec\n0\nEOF_REACHED", results[3])
             self.assertIn("resume payload", results[5])
             for index in (1, 2, 3, 5):
                 self.assertIn("EOF_REACHED", results[index])
