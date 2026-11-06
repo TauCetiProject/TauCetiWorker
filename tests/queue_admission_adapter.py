@@ -51,7 +51,143 @@ def graph_page(nodes, cursor=None):
     return {"data": {"repository": {"pullRequests": connection(nodes, cursor)}}}
 
 
+def fence_document(raw, *, build="SUCCESS"):
+    head, base = raw["head"]["sha"], raw["base"]["sha"]
+    fresh = node(raw["number"], head=head, base=base)
+    fresh.update(
+        state=raw["state"].upper(),
+        isDraft=raw["draft"],
+        title=raw["title"],
+        body=raw["body"],
+        updatedAt=raw.get("updated_at", ""),
+        comments={"totalCount": raw.get("comments", 0)},
+    )
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": fresh,
+                "object": {
+                    "oid": head,
+                    "status": {
+                        "contexts": [{"context": "build", "state": build}, {"context": "scope", "state": "SUCCESS"}]
+                    },
+                },
+            }
+        }
+    }
+
+
 class SourceTests(unittest.TestCase):
+    def test_a_callers_exhausted_quota_cannot_poison_installation_intake(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/user",
+            200,
+            {"login": "operator"},
+            {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1800007200"},
+        )
+        transport.add("GET", "https://api.github.com/source", 200, {"ready": True})
+        c, _ = client(transport)
+        c.get_json("user", token="test-personal-bearer")
+        with c.deferred_requests():
+            self.assertEqual(c.get_json("source")[1], {"ready": True})
+        self.assertNotIn("core", c.stats()["blocked_until"])
+
+    def test_secondary_limit_without_retry_header_blocks_all_installation_calls(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET", "https://api.github.com/source", 403, {"message": "You have exceeded a secondary rate limit"}
+        )
+        c, clock = client(transport)
+        with c.deferred_requests(), self.assertRaises(ga.RateLimited) as paused:
+            c.get_json("source")
+        self.assertEqual(paused.exception.retry_at, clock.now + 60)
+        # An essential request waits for the same known deadline, without extending the
+        # secondary penalty by sending another rejected request before it.
+        transport.add("GET", "https://api.github.com/essential", 200, {})
+        c.get_json("essential")
+        self.assertEqual(clock.slept, [60])
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_background_paces_actual_quota_and_leaves_essential_requests_available(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/background",
+            200,
+            {},
+            {"x-ratelimit-remaining": "10", "x-ratelimit-reset": "1800000100"},
+        )
+        transport.add("GET", "https://api.github.com/essential", 200, {})
+        c, clock = client(transport)
+        with c.deferred_requests():
+            c.get_json("background")
+            with self.assertRaises(ga.RequestDeferred) as paused:
+                c.get_json("background")
+        self.assertEqual(paused.exception.retry_at, clock.now + 10)
+        self.assertEqual(paused.exception.resource, "core:background")
+        c.get_json("essential")
+        with c.deferred_requests(urgent=True):
+            c.get_json("essential")
+        self.assertEqual(len(transport.calls), 3)
+        self.assertEqual(clock.slept, [])
+
+    def test_graphql_background_pacing_uses_points_not_http_request_count(self):
+        transport = FakeTransport()
+        transport.add(
+            "POST",
+            "https://api.github.com/graphql",
+            200,
+            {"data": {"rateLimit": {"cost": 20, "remaining": 100, "resetAt": "2027-01-15T08:01:40Z"}}},
+            {"x-ratelimit-remaining": "100", "x-ratelimit-reset": "1800000100"},
+        )
+        c, clock = client(transport)
+        with c.deferred_requests():
+            c.graphql("query { rateLimit { cost remaining resetAt } }")
+            with self.assertRaises(ga.RequestDeferred) as paused:
+                c.graphql("query { rateLimit { cost remaining resetAt } }")
+        self.assertEqual(paused.exception.retry_at, clock.now + 20)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_paced_snapshot_advances_through_its_reads_instead_of_repeating_first_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- source\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            transport = FakeTransport()
+            raw = pr_json(head={"sha": head}, base={"ref": "main", "sha": base})
+
+            def headers(remaining, reset=1800000020):
+                return {"x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset)}
+
+            url = f"https://api.github.com/repos/{TAUCETI}"
+            transport.add("GET", url + "/pulls/42", 200, raw, headers(4))
+            transport.add(
+                "GET",
+                url + f"/compare/{base}...{head}?per_page=1",
+                200,
+                {"merge_base_commit": {"sha": base}},
+                headers(3),
+            )
+            transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, [], headers(2))
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw, build="FAILURE"))
+            c, clock = client(transport)
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
+            with c.deferred_requests():
+                while True:
+                    try:
+                        snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
+                        break
+                    except ga.RequestDeferred as pending:
+                        self.assertLess(pending.retry_at, 1800000040, "pacing must make source progress")
+                        clock.now = pending.retry_at
+            self.assertEqual(snapshot.pull.head_sha, head)
+            self.assertEqual(snapshot.statuses["build"], "failure", "CI must be read fresh after all pacing waits")
+            self.assertEqual(len(transport.calls), 4)
+            self.assertEqual(clock.slept, [])
+
     def test_essential_requests_take_priority_without_serializing_other_buckets(self):
         essential_started, release = threading.Event(), threading.Event()
         background_started, core_entered = threading.Event(), threading.Event()
@@ -151,17 +287,18 @@ class SourceTests(unittest.TestCase):
         self.assertEqual([v["after"] for v in variables], [None, "comments-1", "comments-1", "prs-1"])
         self.assertEqual(clock.slept, [])
 
-    def test_incomplete_nested_connection_never_finishes_discovery(self):
+    def test_incomplete_node_stays_unknown_without_hiding_later_prs(self):
         transport = FakeTransport()
         bad = connection([])
         bad["pageInfo"]["hasNextPage"] = True
-        transport.add("POST", "https://api.github.com/graphql", 200, graph_page([node(1, comments=bad)]))
+        transport.add("POST", "https://api.github.com/graphql", 200, graph_page([node(1, comments=bad), node(2)]))
         c, _ = client(transport)
         adapter = ga.GitHubAdapter(c, repo=TAUCETI)
         observed = []
-        with self.assertRaises(ga.GitHubError):
-            adapter.list_open_pull_requests(TAUCETI, review_app_id=0, admission=True, on_page=observed.extend)
-        self.assertEqual(observed, [])
+        listed = adapter.list_open_pull_requests(TAUCETI, review_app_id=0, admission=True, on_page=observed.extend)
+        self.assertEqual([p.number for p in listed], [1, 2])
+        self.assertIn("incomplete", observed[0].admission)
+        self.assertNotIn("incomplete", observed[1].admission)
 
     def test_rest_pagination_keeps_read_pages_across_quota_wait(self):
         transport = FakeTransport()
@@ -205,12 +342,7 @@ class SourceTests(unittest.TestCase):
             transport.add(
                 "GET", f"https://api.github.com/repos/{TAUCETI}/issues/42/comments?per_page=100&page=1", 200, []
             )
-            transport.add(
-                "GET",
-                f"https://api.github.com/repos/{TAUCETI}/commits/{head}/statuses?per_page=100&page=1",
-                200,
-                [{"context": "build", "state": "success"}, {"context": "scope", "state": "success"}],
-            )
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw))
             transport.add("POST", "https://api.github.com/graphql", 200, graph_page([node(42, head=head, base=base)]))
             c, _ = client(transport)
             adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)

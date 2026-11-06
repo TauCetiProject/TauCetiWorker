@@ -8,6 +8,7 @@ same PR pending in SQLite, rather than turning it into a policy refusal.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import inspect
 import logging
 import threading
@@ -19,11 +20,10 @@ from runner import admission_policy as policy
 
 from .admission_state import AdmissionState
 from .eligibility import KEEP
-from .github_adapter import RateLimited
+from .github_adapter import RequestDeferred
 from .store import dumps, loads
 
 log = logging.getLogger(__name__)
-POLICY_REVISION = "3450a9cff8dae11b23bd6b446f8516ed9b020dee"
 EXPLICIT_WITHDRAWALS = frozenset(
     {"unapproved", "cancelled", "conflicts-with-main", "landed-externally", "problem-anticipated"}
 )
@@ -43,6 +43,8 @@ def timestamp(value) -> float:
 
 def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
     """Exclude queue output and incidental comments; include CI independently of PR updated_at."""
+    if source.get("draft") or source.get("state") != "open":
+        return digest({"policy": revision, **{key: source.get(key) for key in ("head", "base_ref", "state", "draft")}})
     return digest(
         {
             "policy": revision,
@@ -67,9 +69,18 @@ class AdmissionPolicy:
         if not self.rubrics or not prefix or not all(self.rubrics):
             raise ValueError("admission requires trusted rubrics and a path prefix")
         # The installed, pinned source is trusted service code, never a PR checkout.
+        source = inspect.getsource(policy)
+        self.source_revision = "sha256:" + hashlib.sha256(source.encode()).hexdigest()
+        try:
+            metadata = loads(importlib.metadata.distribution("tauceti-review").read_text("direct_url.json"), {})
+            commit = metadata.get("vcs_info", {}).get("commit_id")
+            if isinstance(commit, str) and len(commit) == 40 and all(c in "0123456789abcdef" for c in commit):
+                self.source_revision = commit
+        except (importlib.metadata.PackageNotFoundError, ValueError, OSError):
+            pass  # unpackaged source still records its exact source digest
         self.revision = digest(
             {
-                "code": inspect.getsource(policy),
+                "code": source,
                 "rubrics": self.rubrics,
                 "prefix": prefix,
                 "allow_files": self.allow_files,
@@ -112,7 +123,7 @@ class AdmissionPolicy:
         )
         evidence = {
             "kind": "admission_policy",
-            "policy_revision": POLICY_REVISION,
+            "policy_revision": self.source_revision,
             "policy_digest": self.revision,
             "head_sha": snapshot.pull.head_sha,
             "merge_base_sha": snapshot.merge_base_sha,
@@ -138,10 +149,25 @@ class AdmissionPoller:
         self._discovery_serial = 0
         self.wake = lambda: None
         self.last_summary = None
+        self.stopping = threading.Event()
+        self._prefer_urgent = True
         # Restore retry deadlines as-is. Discovery is due at startup independently of pending work.
         saved = controller.store.get_setting("state:admission_discovery", {})
         self._discovery_at = float(saved.get("retry_at", 0))
         controller.admission = self
+        waiting = controller.store.rows("inputs", {"repository": repo, "state": ["waiting", "reserved"]})
+        waiting_numbers = {row["number"] for row in waiting}
+        for work in controller.store.rows("admission_work", {"repository": repo}):
+            previous_policy = loads(work["decision"], {}).get("evidence", {}).get("policy_digest")
+            if work["generation"] == work["evaluated_generation"] and previous_policy != self.policy.revision:
+                self.state.dirty(work["number"], head=work["head_sha"], urgent=work["number"] in waiting_numbers)
+        for row in waiting:
+            if self.state.get(row["number"]) is None:
+                self.state.dirty(row["number"], head=row["head_sha"], urgent=True)
+
+    def is_current(self, number, head):
+        work = self.state.get(number)
+        return bool(work and work["head_sha"] == head and work["generation"] == work["evaluated_generation"])
 
     def interval(self):
         pending = self.state.summary()["next_attempt_at"]
@@ -184,13 +210,16 @@ class AdmissionPoller:
         number = payload.get("number") or pull.get("number") or (payload.get("issue") or {}).get("number")
         if kind == "issue_comment":
             comment = payload.get("comment") or {}
+            previous_body = ((payload.get("changes") or {}).get("body") or {}).get("from") or ""
             if "pull_request" not in (payload.get("issue") or {}) or (
-                policy.SCOREBOARD_MARKER not in (comment.get("body") or "") and payload.get("action") != "deleted"
+                policy.SCOREBOARD_MARKER not in (comment.get("body") or "")
+                and policy.SCOREBOARD_MARKER not in previous_body
+                and payload.get("action") != "deleted"
             ):
                 return
-        if kind in ("pull_request", "pull_request_review", "issue_comment") and number:
+        if kind in ("pull_request", "issue_comment") and number:
             self.invalidate(int(number), head=(pull.get("head") or {}).get("sha", ""))
-        elif kind in ("status", "check_run", "check_suite", "workflow_run"):
+        elif kind == "status":
             detail = payload.get(kind) or payload
             if kind == "status" and detail.get("context") not in CONTEXTS:
                 return
@@ -206,7 +235,7 @@ class AdmissionPoller:
                     for row in self.controller.store.rows("admission_work", {"repository": self.repo, "head_sha": sha})
                 )
             for number in numbers:
-                self.invalidate(number)
+                self.invalidate(number, urgent=False)
             # Unknown heads are discovered by the existing discovery path, not an extra scan.
             if not numbers and kind == "status":
                 self.request_discovery()
@@ -233,7 +262,12 @@ class AdmissionPoller:
         for pull in pulls:
             if pull.admission is None:
                 raise ValueError("discovery did not supply admission source inputs")
-            self.state.observe(pull.number, pull.head_sha, self._version(pull.admission))
+            version = (
+                ("incomplete:" + digest(pull.admission))
+                if "incomplete" in pull.admission
+                else self._version(pull.admission)
+            )
+            self.state.observe(pull.number, pull.head_sha, version)
 
     def run_once(self, *, reason="interval"):
         with self._lock:
@@ -252,7 +286,17 @@ class AdmissionPoller:
             "unchanged": 0,
             "errors": [],
         }
-        self._process(summary, urgent_only=True)
+        while not self.stopping.is_set():
+            if self.clock() >= self._discovery_at:
+                self._discover(summary)
+            if not self._process_one(summary, prefer_urgent=self._prefer_urgent):
+                break
+            self._prefer_urgent = not self._prefer_urgent
+        self.last_summary = summary | self.state.summary()
+        self.controller.record_approval_poll(self.last_summary)
+        return self.last_summary
+
+    def _discover(self, summary):
         if self.clock() >= self._discovery_at:
             with self._discovery_lock:
                 serial = self._discovery_serial
@@ -262,7 +306,7 @@ class AdmissionPoller:
                     self.repo,
                     review_app_id=0,
                     admission=True,
-                    on_page=lambda pulls: (self._observe_page(pulls), self._process(summary, urgent_only=True)),
+                    on_page=lambda pulls: (self._observe_page(pulls), self._process_one(summary, urgent_only=True)),
                 )
                 numbers = {p.number for p in listed}
                 for row in self.controller.store.rows("admission_work", {"repository": self.repo}):
@@ -282,34 +326,39 @@ class AdmissionPoller:
                 "admission",
                 self.clock(),
             )
-        self._process(summary)
-        self.last_summary = summary | self.state.summary()
-        self.controller.record_approval_poll(self.last_summary)
-        return self.last_summary
 
     def _retry_at(self, error):
         return (
             error.retry_at
-            if isinstance(error, RateLimited)
+            if isinstance(error, RequestDeferred)
             else self.clock() + self.controller.setting("outbox_retry_seconds")
         )
 
-    def _process(self, summary, *, urgent_only=False):
-        for work in self.state.due():
-            if urgent_only and not work["urgent"]:
-                continue
-            self.state.attempted(work)
-            try:
-                self._evaluate(work, summary)
-            except Exception as error:
-                self.state.defer(
-                    work,
-                    self._retry_at(error),
-                    str(error),
-                    error.resource if isinstance(error, RateLimited) else "source",
+    def _process_one(self, summary, *, prefer_urgent=True, urgent_only=False):
+        work = self.state.next_due(prefer_urgent=prefer_urgent, urgent_only=urgent_only)
+        if work is None:
+            return False
+        self.state.attempted(work)
+        try:
+            client = getattr(self.adapter, "client", None)
+            revocation = bool(
+                work["urgent"]
+                and self.controller.store.row(
+                    "inputs", {"repository": self.repo, "number": work["number"], "state": ["waiting", "reserved"]}
                 )
-                log.warning("admission #%s pending: %s", work["number"], error)
-                summary["errors"].append(f"#{work['number']}: {error}")
+            )
+            with client.deferred_requests(urgent=revocation) if client is not None else nullcontext():
+                self._evaluate(work, summary)
+        except Exception as error:
+            self.state.defer(
+                work,
+                self._retry_at(error),
+                str(error),
+                error.resource if isinstance(error, RequestDeferred) else "source",
+            )
+            log.warning("admission #%s pending: %s", work["number"], error)
+            summary["errors"].append(f"#{work['number']}: {error}")
+        return True
 
     def _cancelled(self, work, snapshot, authorization, comment, meta):
         current = self.controller._input_for(work["number"])
@@ -376,8 +425,8 @@ class AdmissionPoller:
                 )
                 disposition = "closed" if pull.state != "open" else "draft"
             elif not result["review_safe"]:
-                self.controller._withdraw(self.repo, pull.number, "review-unsafe", "tauceti-queue policy")
-                summary["revoked"] += 1
+                withdrawn = self.controller._withdraw(self.repo, pull.number, "review-unsafe", "tauceti-queue policy")
+                summary["revoked"] += int(withdrawn["withdrawn"])
                 disposition = "review-unsafe"
             elif result["merge"] and pull.base_ref == self.controller.canonical_branch:
                 if (

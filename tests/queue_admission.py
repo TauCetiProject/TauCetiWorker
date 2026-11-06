@@ -148,12 +148,13 @@ class AdmissionTests(unittest.TestCase):
             self.assertFalse(self.controller.status().get("snapshot"))
             self.controller.cancel(REPO, 1, "kim-em", head_sha=head)
             self.event("status", {"sha": head, "context": "build"})
+            self.assertEqual(self.intake.state.summary()["pending"], 1)
         finally:
             release.set()
             thread.join(3)
         self.assertFalse(thread.is_alive())
         self.assertEqual(self.controller.inputs(), [])
-        self.assertEqual(self.intake.state.summary()["pending"], 1)
+        self.assertEqual(self.intake.state.summary()["pending"], 0)
         self.github.admission_snapshot = original
         self.intake.run_once()
         self.assertEqual(self.controller.inputs(), [])
@@ -199,6 +200,23 @@ class AdmissionTests(unittest.TestCase):
         self.intake.run_once()
         self.assertEqual(self.controller.inputs()[0]["priority"], 42)
 
+    def test_edit_removing_scoreboard_marker_invalidates_and_revokes(self):
+        self.ready()
+        self.intake.run_once()
+        old_body = self.github.review_comments[1][0]["body"]
+        self.github.review_comments[1][0]["body"] = "Review withdrawn."
+        self.event(
+            "issue_comment",
+            {
+                "action": "edited",
+                "issue": {"number": 1, "pull_request": {}},
+                "comment": {"body": "Review withdrawn."},
+                "changes": {"body": {"from": old_body}},
+            },
+        )
+        self.assertEqual(self.intake.run_once()["revoked"], 1)
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
     def test_policy_change_is_not_fresh_authorization_after_withdrawal(self):
         self.ready()
         self.intake.run_once()
@@ -222,16 +240,19 @@ class AdmissionTests(unittest.TestCase):
         self.intake.state.dirty(1, head=head)
         self.intake._discovery_at = self.clock() + 1000
         original = self.github.admission_snapshot
+        reads = []
 
         def changed(*args, **kwargs):
             snapshot = original(*args, **kwargs)
-            self.event("push", {"ref": "refs/heads/main", "after": "f" * 40})
+            reads.append(snapshot)
+            if len(reads) == 1:
+                self.event("push", {"ref": "refs/heads/main", "after": "f" * 40})
             return snapshot
 
         self.github.admission_snapshot = changed
         self.intake.run_once()
-        self.assertEqual(self.controller.inputs(), [])
-        self.assertEqual(self.intake.state.summary()["pending"], 1)
+        self.assertEqual(len(reads), 2, "the pre-event result must be replaced by a fresh read")
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
 
     def test_normal_main_advance_does_not_reevaluate_an_unchanged_diff(self):
         self.ready()
@@ -268,6 +289,22 @@ class AdmissionTests(unittest.TestCase):
         result = self.intake.run_once()
         self.assertEqual((result["approved"], result["pending"]), (151, 0))
         self.assertEqual(len(self.controller.inputs("waiting")), 151)
+
+    def test_pending_review_change_cannot_be_inserted_while_its_read_is_quota_blocked(self):
+        self.ready()
+        self.intake.run_once()
+        self.review(state="blocking_block", round=2)
+        self.intake.invalidate(1)
+        until = self.clock() + 7200
+
+        def limited(*args, **kwargs):
+            raise RateLimited("review quota", retry_at=until, resource="core")
+
+        self.github.admission_snapshot = limited
+        self.intake.run_once()
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.assertEqual(self.controller.store.count("members"), 0)
 
 
 if __name__ == "__main__":

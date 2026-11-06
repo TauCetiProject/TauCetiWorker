@@ -556,6 +556,29 @@ class ServerTest(unittest.TestCase):
         finally:
             self.server.poller = None
 
+    def test_primary_reconciliation_wakes_intake_without_network_work_in_http_request(self):
+        class PrimaryPoller:
+            def __init__(self):
+                self.state = self
+                self.requested = False
+
+            def summary(self):
+                return {"pending": 12}
+
+            def request_discovery(self):
+                self.requested = True
+
+            def run_once(self, **kwargs):
+                raise AssertionError("HTTP request must not run policy/source reads")
+
+        poller = self.server.poller = PrimaryPoller()
+        try:
+            status, body = self.request("POST", "/admin/reconcile-approvals", {}, self.bearer("ghp_kim"))
+            self.assertEqual((status, body), (200, {"requested": True, "pending": 12}))
+            self.assertTrue(poller.requested)
+        finally:
+            self.server.poller = None
+
 
 class PersistentIdentities(unittest.TestCase):
     """Bearer identities and admin answers kept in the store across a restart, served while GitHub's

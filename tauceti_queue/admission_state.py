@@ -69,6 +69,21 @@ class AdmissionState:
     def attempted(self, work: dict) -> None:
         self.store.update("admission_work", {"id": work["id"]}, attempted_at=self.clock())
 
+    def next_due(self, *, prefer_urgent=True, urgent_only=False):
+        """Choose after each completed attempt, so a newly arrived revocation need not wait
+        behind a stale copy of the backlog. Alternating priority and oldest-work selections
+        gives both revocations and ordinary pending PRs service under continuing traffic.
+        """
+        order = "urgent DESC, " if prefer_urgent else ""
+        rows = self.store.query(
+            "SELECT * FROM admission_work WHERE repository=? AND generation!=evaluated_generation "
+            "AND next_attempt_at<=? "
+            + ("AND urgent=1 " if urgent_only else "")
+            + f"ORDER BY {order}attempted_at, first_pending_at, id LIMIT 1",
+            (self.repository, self.clock()),
+        )
+        return rows[0] if rows else None
+
     def complete(self, work: dict, version: str, authorization: str, disposition: str) -> bool:
         """CAS: an old observation cannot acknowledge a newer delivered change."""
         return bool(

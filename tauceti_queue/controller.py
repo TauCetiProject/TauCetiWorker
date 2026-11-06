@@ -2532,7 +2532,11 @@ class Controller:
         return loads(row["probe_conflicts"], {}).get(str(batch["id"])) == batch["base"]
 
     def _probe_eligible(self, row: dict[str, Any], batch: dict[str, Any]) -> bool:
-        return row["last_probe_tip"] != batch["tip"] and not self._conflicted_with(row, batch)
+        return (
+            row["last_probe_tip"] != batch["tip"]
+            and not self._conflicted_with(row, batch)
+            and (self.admission is None or self.admission.is_current(row["number"], row["head_sha"]))
+        )
 
     def _draw(self, waiting: list[dict[str, Any]]) -> dict[str, Any]:
         window = waiting[: max(1, int(self.setting("insertion_age_window")))]
@@ -2717,6 +2721,12 @@ class Controller:
         record = result.commits[0]
         version = batch["version"] + 1
         with self.store.transaction():
+            if self.admission is not None and not self.admission.is_current(row["number"], row["head_sha"]):
+                self.store.update(
+                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="admission-pending"
+                )
+                self._release_claim(claim, "admission-pending", now)
+                return False
             position = len(self._members(batch["id"]))
             self.store.insert(
                 "members",

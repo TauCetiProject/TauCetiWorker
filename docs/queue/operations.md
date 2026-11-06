@@ -625,6 +625,13 @@ other runnable work proceeds. Resident pagination buffers retain pages already r
 wait. After a process restart the database still owns pending work and deadlines, and source
 reconciliation restores observations. There are no admission workflow reruns or cache handoffs.
 
+Background reads are paced across each resource's remaining window, using REST requests and
+reported GraphQL point costs separately. Queue/CI calls, queued-review revocations and final
+head/CI fences receive priority. Source preparation resumes at the next eligible read without
+restarting from its first request. The final fence reads current CI independently of PR timestamps.
+An approved input with a pending review change cannot be inserted until evaluation completes;
+the same check protects a replay that was already in progress when the change arrived.
+
 Manual withdrawal records a separate head/authorization fence, even before the first policy
 evaluation. CI/configuration changes, incidental review edits and repeated polls cannot revive it.
 A fresh published review round (or a new review comment) after withdrawal can supply fresh intent;

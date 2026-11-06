@@ -282,6 +282,8 @@ class ApprovalPollLoop:
         self._thread: threading.Thread | None = None
         if hasattr(poller, "wake"):
             poller.wake = self.wake
+        if hasattr(poller, "stopping"):
+            poller.stopping = self.stop_event
 
     def interval(self) -> float:
         interval = self.poller.interval()

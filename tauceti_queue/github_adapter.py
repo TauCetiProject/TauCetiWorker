@@ -82,13 +82,17 @@ class PullRequestNotFound(GitHubError, LookupError):
     """`fetch_pr` for a number GitHub does not know."""
 
 
-class RateLimited(GitHubError):
-    """A retryable resource wait, with an absolute deadline the owner can persist."""
+class RequestDeferred(GitHubError):
+    """A resource opportunity, with an absolute time the owner can persist."""
 
     def __init__(self, message: str, status: int = 0, body: bytes = b"", *, retry_at: float, resource: str) -> None:
         super().__init__(message, status, body)
         self.retry_at = retry_at
         self.resource = resource
+
+
+class RateLimited(RequestDeferred):
+    """GitHub itself has blocked the resource until retry_at."""
 
 
 class AmbiguousCandidateRun(GitHubError):
@@ -108,6 +112,7 @@ class PullRequest(ports.PullRequest):
     head_repo: str = ""
     merged: bool = False
     updated_at: str = ""
+    comments_count: int = 0
 
     @classmethod
     def from_json(cls, data: dict) -> PullRequest:
@@ -129,6 +134,7 @@ class PullRequest(ports.PullRequest):
             head_repo=str(((head.get("repo") or {}).get("full_name")) or ""),
             merged=bool(data.get("merged")),
             updated_at=str(data.get("updated_at") or ""),
+            comments_count=int(data.get("comments") or 0),
         )
 
 
@@ -212,6 +218,7 @@ class GitHubClient:
         self._priority = threading.Condition(self._lock)
         self._essential: dict[str, int] = {}
         self._resource_limits: dict[str, dict] = {}
+        self._background_at: dict[str, float] = {}
         self._local = threading.local()
         self._blocked_until: dict[str, float] = {}
         self.requests = 0
@@ -244,9 +251,12 @@ class GitHubClient:
         with self._lock:
             return self.remaining, self.reset_at
 
-    def _record(self, headers: dict[str, str], resource="core") -> None:
+    def _record(self, headers: dict[str, str], resource="core", *, cost=None) -> None:
         with self._lock:
             record = self._resource_limits.setdefault(resource, {})
+            previous_remaining, previous_reset = record.get("remaining"), record.get("reset_at")
+            if isinstance(cost, int) and cost > 0:
+                record["cost"] = cost
             try:
                 if "x-ratelimit-remaining" in headers:
                     record["remaining"] = int(headers["x-ratelimit-remaining"])
@@ -260,6 +270,19 @@ class GitHubClient:
                 self.remaining = record.get("remaining")
                 self.limit = record.get("limit")
                 self.reset_at = record.get("reset_at")
+            remaining, reset = record.get("remaining"), record.get("reset_at")
+            now = self._clock()
+            observed = "x-ratelimit-remaining" in headers or cost is not None
+            if observed and remaining is not None and reset is not None and reset > now:
+                if remaining <= 0:
+                    self._blocked_until[resource] = reset + 1
+                else:
+                    # Background reads share the real remaining window; essential requests
+                    # consume their share immediately and their responses adjust this spacing.
+                    next_at = now + record.get("cost", 1) * (reset - now) / remaining
+                    if previous_reset == reset and previous_remaining is not None and remaining <= previous_remaining:
+                        next_at = max(next_at, self._background_at.get(resource, 0))
+                    self._background_at[resource] = min(reset + 1, next_at)
 
     # -- requests
 
@@ -281,7 +304,7 @@ class GitHubClient:
                     self._priority.notify_all()
 
     @contextmanager
-    def deferred_requests(self):
+    def deferred_requests(self, *, urgent=False):
         """Background intake persists waits instead of sleeping inside a source read.
 
         This is thread-local: essential queue and command calls retain their existing retry
@@ -289,11 +312,14 @@ class GitHubClient:
         trying another PR cannot move that deadline further away.
         """
         previous = getattr(self._local, "deferred", False)
+        prior_background = getattr(self._local, "background", False)
         self._local.deferred = True
+        self._local.background = not urgent
         try:
             yield
         finally:
             self._local.deferred = previous
+            self._local.background = prior_background
 
     def url(self, path: str, params: dict | None = None) -> str:
         url = path if path.startswith("http") else f"{self._api}/{path.lstrip('/')}"
@@ -323,14 +349,26 @@ class GitHubClient:
         url = self.url(path, params)
         resource = "graphql" if path.strip("/") == "graphql" else "core"
         deferred = getattr(self._local, "deferred", False)
-        if deferred and token is None:
+        background = getattr(self._local, "background", False)
+        if token is None:
             with self._lock:
                 blocked_resource, deadline = max(
                     ((key, self._blocked_until.get(key, 0)) for key in (resource, "secondary")),
                     key=lambda pair: pair[1],
                 )
             if deadline > self._clock():
-                raise RateLimited("GitHub resource wait", retry_at=deadline, resource=blocked_resource)
+                if deferred or deadline - self._clock() > self.MAX_WAIT_SECONDS:
+                    raise RateLimited("GitHub resource wait", retry_at=deadline, resource=blocked_resource)
+                self._sleep(deadline - self._clock())
+            if background:
+                with self._lock:
+                    next_at = self._background_at.get(resource, 0)
+                if next_at > self._clock():
+                    raise RequestDeferred(
+                        "background read paced by remaining GitHub capacity",
+                        retry_at=next_at,
+                        resource=resource + ":background",
+                    )
         body = None if json_body is None else json.dumps(json_body).encode()
         accepted = set(ok) | set(tolerate)
         attempt = 0
@@ -348,20 +386,23 @@ class GitHubClient:
             with self._lock:
                 self.requests += 1
             status, response_headers, data = self._send(
-                method, url, headers, body, resource=resource, deferred=deferred
+                method, url, headers, body, resource=resource, deferred=background
             )
             response_headers = {k.lower(): v for k, v in response_headers.items()}
-            self._record(
-                response_headers,
-                response_headers.get("x-ratelimit-resource") or (resource if not record_limit else "core"),
-            )
+            if token is None:
+                # GET /user uses an operator/worker bearer, and GET /app uses an App JWT.
+                # Neither is the installation bucket used for queue/intake work.
+                self._record(
+                    response_headers,
+                    response_headers.get("x-ratelimit-resource") or (resource if not record_limit else "core"),
+                )
             if status in accepted:
                 return Response(status, response_headers, data)
             if status == 401 and used_installation and attempt == 1:
                 self._tokens.invalidate()
                 self._retry()
                 continue
-            wait = self._limit_wait(status, response_headers)
+            wait = self._limit_wait(status, response_headers, data)
             if wait is not None:
                 blocked_resource = resource if response_headers.get("x-ratelimit-remaining") == "0" else "secondary"
                 deadline = self._clock() + wait
@@ -394,26 +435,33 @@ class GitHubClient:
             self.failures += 1
             self.last_error = message
 
-    def _limit_wait(self, status: int, headers: dict[str, str]) -> float | None:
+    def _limit_wait(self, status: int, headers: dict[str, str], body: bytes = b"") -> float | None:
         """Seconds to wait when the response is a primary or secondary rate limit, else None."""
         if status not in (403, 429):
             return None
+        waits = []
         retry_after = headers.get("retry-after")
         if retry_after:
             try:
-                return max(1.0, float(retry_after))
+                waits.append(max(1.0, float(retry_after)))
             except ValueError:
                 try:
-                    return max(1.0, parsedate_to_datetime(retry_after).timestamp() - self._clock())
+                    waits.append(max(1.0, parsedate_to_datetime(retry_after).timestamp() - self._clock()))
                 except (TypeError, ValueError, OverflowError):
                     pass
         if headers.get("x-ratelimit-remaining") == "0" and headers.get("x-ratelimit-reset"):
             try:
-                return max(1.0, float(headers["x-ratelimit-reset"]) - self._clock() + 1.0)
+                waits.append(max(1.0, float(headers["x-ratelimit-reset"]) - self._clock() + 1.0))
             except ValueError:
-                return None
+                pass
+        if waits:
+            return max(waits)
         if status == 429:
             return 60.0
+        if status == 403:
+            message = body.decode("utf-8", errors="replace").lower()
+            if "secondary rate limit" in message or "abuse detection" in message:
+                return 60.0
         return None
 
     def get_json(self, path: str, *, params: dict | None = None, token: str | None = None, tolerate=()):
@@ -473,6 +521,15 @@ class GitHubClient:
         data = document.get("data")
         if not isinstance(data, dict):
             raise GitHubError("GraphQL response without data", response.status)
+        rate = data.get("rateLimit") or {}
+        if isinstance(rate.get("cost"), int):
+            headers = dict(response.headers)
+            if isinstance(rate.get("remaining"), int):
+                headers["x-ratelimit-remaining"] = str(rate["remaining"])
+            reset = _timestamp(rate.get("resetAt"))
+            if reset is not None:
+                headers["x-ratelimit-reset"] = str(reset)
+            self._record(headers, "graphql", cost=rate["cost"])
         return data
 
     def fetch_bare(self, url: str) -> tuple[int, bytes]:
@@ -957,7 +1014,13 @@ class GitHubAdapter:
 
     def admission_snapshot(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """Read complete current inputs and the exact reviewed diff; never run a PR's code."""
-        pull = self.fetch_pr(repo, number)
+        progress = self._admission_reads.get((repo, number))
+        if progress is None or progress["generation"] != generation:
+            pull = self.fetch_pr(repo, number)
+            progress = {"generation": generation, "pull": pull}
+            self._admission_reads[(repo, number)] = progress
+        else:
+            pull = progress["pull"]
         if pull.state != "open" or pull.draft:
             self._admission_reads.pop((repo, number), None)
             return ports.AdmissionSnapshot(pull, "", (), (), {})
@@ -968,10 +1031,6 @@ class GitHubAdapter:
             self.fetch_refs(repo, missing)
         # The pending head stays reachable across local GC until it is replaced or closed.
         chain.git(self.clone_dir, "update-ref", f"{chain.REF_NAMESPACE}/admission/{number}", pull.head_sha)
-        identity = (pull.head_sha, pull.base_sha, pull.updated_at, generation)
-        progress = self._admission_reads.setdefault((repo, number), {"identity": identity})
-        if progress["identity"] != identity:
-            progress = self._admission_reads[(repo, number)] = {"identity": identity}
         if "merge_base" not in progress:
             _, compare = self.client.get_json(
                 f"repos/{repo}/compare/{pull.base_sha}...{pull.head_sha}", params={"per_page": 1}
@@ -1002,13 +1061,7 @@ class GitHubAdapter:
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        statuses = {}
-        for item in self.client.paginate(
-            f"repos/{repo}/commits/{pull.head_sha}/statuses", progress=progress.setdefault("statuses", {})
-        ):
-            if item.get("context") in ("build", "scope", "bump-guard"):
-                statuses.setdefault(item["context"], str(item.get("state") or "").lower())
-        fresh = self.fetch_pr(repo, number)
+        fresh, statuses = self._admission_fence(repo, number, pull)
         if (
             fresh.head_sha,
             fresh.base_sha,
@@ -1017,7 +1070,8 @@ class GitHubAdapter:
             fresh.draft,
             fresh.labels,
             fresh.body,
-            fresh.updated_at,
+            _timestamp(fresh.updated_at),
+            fresh.comments_count,
         ) != (
             pull.head_sha,
             pull.base_sha,
@@ -1026,7 +1080,8 @@ class GitHubAdapter:
             pull.draft,
             pull.labels,
             pull.body,
-            pull.updated_at,
+            _timestamp(pull.updated_at),
+            pull.comments_count,
         ):
             self._admission_reads.pop((repo, number), None)
             raise GitHubError("PR inputs changed while admission was reading source evidence")
@@ -1034,6 +1089,51 @@ class GitHubAdapter:
         return ports.AdmissionSnapshot(
             fresh, merge_base, paths, comments, statuses, self._diff_version(pull.base_sha, pull.head_sha)
         )
+
+    def _admission_fence(self, repo, number, pull):
+        """Current head/target and CI together, after paced or paginated source reads.
+
+        Statuses can change without moving PR updatedAt. Read the commit by SHA, avoiding
+        both resumed newest-first status pages and PR commit-connection caps.
+        """
+        owner, name = repo.split("/", 1)
+        # Finish a prepared decision before spending the next background discovery slot.
+        # This still obeys the GraphQL bucket and secondary-limit deadlines.
+        with self.client.deferred_requests(urgent=True):
+            data = self.client.graphql(
+                ADMISSION_FENCE_QUERY, {"owner": owner, "name": name, "number": number, "head": pull.head_sha}
+            )
+        repository = data.get("repository") or {}
+        node, commit = repository.get("pullRequest"), repository.get("object")
+        if not isinstance(node, dict) or not isinstance(commit, dict) or commit.get("oid") != pull.head_sha:
+            raise GitHubError("incomplete admission head/CI fence")
+        labels = node.get("labels") or {}
+        if "pageInfo" not in labels:
+            raise GitHubError("incomplete admission label fence")
+        names = (
+            self.labels(repo, number)
+            if labels["pageInfo"].get("hasNextPage")
+            else [s["name"] for s in labels.get("nodes", ())]
+        )
+        fresh = dataclasses.replace(
+            pull,
+            head_sha=node.get("headRefOid", ""),
+            base_sha=node.get("baseRefOid", ""),
+            base_ref=node.get("baseRefName", ""),
+            state=str(node.get("state") or "").lower(),
+            draft=bool(node.get("isDraft")),
+            body=node.get("body") or "",
+            title=node.get("title") or pull.title,
+            updated_at=node.get("updatedAt") or "",
+            comments_count=(node.get("comments") or {}).get("totalCount", 0),
+            labels=tuple(names),
+        )
+        statuses = {
+            s["context"]: str(s.get("state") or "").lower()
+            for s in (commit.get("status") or {}).get("contexts", ())
+            if s.get("context") in ("build", "scope", "bump-guard")
+        }
+        return fresh, statuses
 
     def _admission_pulls(self, repo, on_page):
         owner, name = repo.split("/", 1)
@@ -1052,42 +1152,22 @@ class GitHubAdapter:
             for node in connection["nodes"][progress["index"] :]:
                 if not isinstance(node, dict) or not isinstance(node.get("number"), int):
                     raise GitHubError("incomplete PR discovery node")
-                number, head, base = node["number"], node.get("headRefOid", ""), node.get("baseRefOid", "")
-                # Fetch a new target once, so a normal canonical advance doesn't invalidate every
-                # unchanged review. PR heads are fetched only when evaluating new/dirty work.
-                if self.clone_dir and SHA.fullmatch(base) and not chain.object_exists(self.clone_dir, base):
-                    self.fetch_refs(repo, [base])
-                comments = self._admission_comments(repo, number, node.get("comments"))
-                label_connection = node.get("labels") or {}
-                page = label_connection.get("pageInfo")
-                if not isinstance(page, dict):
-                    raise GitHubError("incomplete label connection")
-                labels = (
-                    self.labels(repo, number)
-                    if page.get("hasNextPage")
-                    else [s["name"] for s in label_connection.get("nodes", ())]
-                )
-                commits = (node.get("commits") or {}).get("nodes") or []
-                commit = (commits[-1].get("commit") or {}) if commits else {}
-                if commit.get("oid") != head:
-                    raise GitHubError("discovery commit does not match the PR head")
-                statuses = {
-                    s["context"]: str(s.get("state") or "").lower()
-                    for s in (commit.get("status") or {}).get("contexts", ())
-                    if s.get("context") in ("build", "scope", "bump-guard")
-                }
-                source = {
-                    "head": head,
-                    "base_ref": node.get("baseRefName", ""),
-                    "state": "open",
-                    "draft": bool(node.get("isDraft")),
-                    "body": node.get("body", ""),
-                    "labels": labels,
-                    "comments": comments,
-                    "statuses": statuses,
-                    "diff_version": self._diff_version(base, head),
-                }
-                batch.append(ports.OpenPullRequest(number, head, source["base_ref"], source["draft"], admission=source))
+                try:
+                    observed = self._admission_node(repo, node)
+                except RequestDeferred:
+                    raise
+                except Exception as error:
+                    # A known PR with incomplete evidence stays dirty. It is not evidence that
+                    # later PRs disappeared, and must not restart repository discovery at page one.
+                    self._admission_comment_pages.pop((repo, node["number"]), None)
+                    observed = ports.OpenPullRequest(
+                        node["number"],
+                        node.get("headRefOid", ""),
+                        node.get("baseRefName", ""),
+                        bool(node.get("isDraft")),
+                        admission={"incomplete": str(error)},
+                    )
+                batch.append(observed)
                 progress["index"] += 1
             if on_page is not None:
                 on_page(batch)
@@ -1101,6 +1181,44 @@ class GitHubAdapter:
             if page["endCursor"] == cursor:
                 raise GitHubError("PR pagination did not advance")
             progress.update(cursor=page["endCursor"], connection=None, index=0, batch=[])
+
+    def _admission_node(self, repo, node):
+        number, head, base = node["number"], node.get("headRefOid", ""), node.get("baseRefOid", "")
+        # Fetch a new target once, so a normal canonical advance doesn't invalidate every
+        # unchanged review. PR heads are fetched only when evaluating new/dirty work.
+        if self.clone_dir and SHA.fullmatch(base) and not chain.object_exists(self.clone_dir, base):
+            self.fetch_refs(repo, [base])
+        comments = self._admission_comments(repo, number, node.get("comments"))
+        label_connection = node.get("labels") or {}
+        page = label_connection.get("pageInfo")
+        if not isinstance(page, dict):
+            raise GitHubError("incomplete label connection")
+        labels = (
+            self.labels(repo, number)
+            if page.get("hasNextPage")
+            else [s["name"] for s in label_connection.get("nodes", ())]
+        )
+        commits = (node.get("commits") or {}).get("nodes") or []
+        commit = (commits[-1].get("commit") or {}) if commits else {}
+        if commit.get("oid") != head:
+            raise GitHubError("discovery commit does not match the PR head")
+        statuses = {
+            s["context"]: str(s.get("state") or "").lower()
+            for s in (commit.get("status") or {}).get("contexts", ())
+            if s.get("context") in ("build", "scope", "bump-guard")
+        }
+        source = {
+            "head": head,
+            "base_ref": node.get("baseRefName", ""),
+            "state": "open",
+            "draft": bool(node.get("isDraft")),
+            "body": node.get("body", ""),
+            "labels": labels,
+            "comments": comments,
+            "statuses": statuses,
+            "diff_version": self._diff_version(base, head),
+        }
+        return ports.OpenPullRequest(number, head, source["base_ref"], source["draft"], admission=source)
 
     def _admission_comments(self, repo, number, connection):
         owner, name = repo.split("/", 1)
@@ -1156,7 +1274,7 @@ class GitHubAdapter:
         if admission:
             try:
                 return self._admission_pulls(repo, on_page)
-            except RateLimited:
+            except RequestDeferred:
                 raise
             except Exception:
                 # Invalid/partial GraphQL data is never promoted into a completed source view.
@@ -1330,6 +1448,20 @@ query($owner: String!, $name: String!, $after: String, $appId: Int!) {
 }
 """
 
+ADMISSION_FENCE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $head: GitObjectID!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid baseRefOid baseRefName state isDraft body title updatedAt
+      comments { totalCount }
+      labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
+    }
+    object(oid: $head) { ... on Commit { oid status { contexts { context state } } } }
+  }
+}
+"""
+
 ADMISSION_COMMENT_FIELDS = """
   pageInfo { hasNextPage endCursor }
   nodes { databaseId body createdAt updatedAt url }
@@ -1337,6 +1469,7 @@ ADMISSION_COMMENT_FIELDS = """
 ADMISSION_PULLS_QUERY = (
     """
 query($owner: String!, $name: String!, $after: String) {
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
       pageInfo { hasNextPage endCursor }
@@ -1356,6 +1489,7 @@ query($owner: String!, $name: String!, $after: String) {
 ADMISSION_COMMENTS_QUERY = (
     """
 query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) { comments(first: 100, after: $after) { """
     + ADMISSION_COMMENT_FIELDS
