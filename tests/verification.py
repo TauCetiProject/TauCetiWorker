@@ -11,12 +11,14 @@ import sys
 import tempfile
 import time
 import unittest
+import venv
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from process_cleanup import running
 
+from tauceti_worker import verification_tools
 from tauceti_worker.verification import (
     Verification,
     _HashCache,
@@ -483,6 +485,98 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         write(self.root, "lean-toolchain", "pin change")
         self.verify(stage="shim-expiry", base=base)
         self.assertNotIn("--only-new", json.loads((self.root / ".lake/shim-args").read_text()))
+
+    def test_shim_wrapper_uses_worker_python_and_preserves_nested_sibling_imports(self):
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        bare = self.home / "bare-python"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(bare)
+        os.environ["PATH"] = f"{self.bin}:{bare / 'bin'}:{os.environ['PATH']}"
+        script = write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "import sys\nfrom pathlib import Path\n"
+            "from tauceti_tools.templates import run_script\n"
+            "import tauceti_tools.templates as templates\n"
+            "templates.ASSETS = Path(__file__).parent / 'shared'\n"
+            "templates.bootstrap = lambda args: None\n"
+            "Path('.lake').mkdir(exist_ok=True)\n"
+            "Path('.lake/shim-python').write_text(sys.executable)\n"
+            "raise SystemExit(run_script('shim.py', sys.argv[1:]))\n",
+        )
+        write(self.root, "scripts/shared/scripts/sibling.py", "VALUE = 'nested checker completed'\n")
+        write(
+            self.root,
+            "scripts/shared/scripts/shim.py",
+            "from pathlib import Path\nfrom sibling import VALUE\nPath('.lake/nested-shim').write_text(VALUE)\n",
+        )
+        old = subprocess.run(["python3", str(script)], cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn("No module named 'tauceti_tools'", old.stderr)
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual((self.root / ".lake/shim-python").read_text(), sys.executable)
+        self.assertEqual((self.root / ".lake/nested-shim").read_text(), "nested checker completed")
+
+    def test_missing_tools_is_incomplete_before_lake_and_recovers_without_latch(self):
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        with patch.object(verification_tools, "check", side_effect=verification_tools.Unavailable("missing Tools")):
+            for _ in range(2):
+                result = self.verify(stage="shim-expiry")
+                self.assertEqual(result["status"], "incomplete")
+                self.assertEqual(result["incomplete_reason"], "tool-missing")
+                self.assertEqual(result["commands"], [])
+        self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_probe_preserves_mounted_pythonpath_and_observes_package_repair(self):
+        bare = self.home / "mounted-python"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(bare)
+        mounted = self.home / "mounted-tools"
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        env = dict(os.environ, PYTHONPATH=str(mounted))
+        with patch.object(sys, "executable", str(bare / "bin/python")):
+            with self.assertRaises(verification_tools.Unavailable):
+                verification_tools.check(self.root, env=env)
+            write(mounted, "tauceti_tools/__init__.py", "")
+            write(mounted, "tauceti_tools/templates.py", "# repaired mounted package\n")
+            verification_tools.check(self.root, env=env)
+
+    def test_tools_disappearing_after_preflight_are_incomplete(self):
+        write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "from tauceti_tools import templates\nraise SystemExit(1)\n",
+        )
+        with patch.object(
+            verification_tools, "check", side_effect=[None, None, verification_tools.Unavailable("Tools removed")]
+        ):
+            result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+
+    def test_shim_failure_codes_remain_source_failures_with_working_tools(self):
+        for code in (1, 2, 3, 75):
+            write(
+                self.root,
+                "scripts/check-expired-mathlib-shims.py",
+                f"from tauceti_tools import templates\nraise SystemExit({code})\n",
+            )
+            result = self.verify(stage="shim-expiry", reuse=False)
+            self.assertEqual(result["status"], "failed", (code, result.get("error")))
+
+    def test_tools_changes_invalidate_receipts_and_readiness(self):
+        from tauceti_worker.verification_jobs import tool_readiness
+
+        tools = self.home / "installed-tools"
+        marker = write(tools, "checker.py", "# installed Tools revision one\n")
+        with patch.object(verification_tools, "root", return_value=tools):
+            first = self.verify(stage="build")
+            before = tool_readiness({})
+            marker.write_text("# installed Tools revision two\n")
+            second = self.verify(stage="build")
+            self.assertNotEqual(before, tool_readiness({}))
+        self.assertEqual(first["status"], "success", first.get("error"))
+        self.assertEqual(second["status"], "success", second.get("error"))
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
 
     def test_old_cleanup_markers_do_not_block_verification(self):
         markers = self.home / "activity/containment-unconfirmed"
