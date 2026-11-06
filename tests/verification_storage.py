@@ -200,9 +200,14 @@ class Storage(Receipts):
     def test_twenty_candidates_are_not_serialized_by_cleanup_targets(self):
         self.state.mkdir()
         os.environ.update(TAUCETI_VERIFY_CANDIDATE_BYTES=str(32 * 1024**3), TAUCETI_VERIFY_STORAGE_BYTES="1")
+        # Real candidates remain discoverable when optional accounting skips a
+        # contended write. Admission must succeed for every caller either way.
+        for index in range(20):
+            storage.candidate(self.state, f"{index:032x}").mkdir(parents=True)
         with ThreadPoolExecutor(max_workers=20) as pool:
             admitted = list(pool.map(lambda index: storage.reserve(self.state, f"{index:032x}"), range(20)))
         self.assertEqual(admitted, [32 * 1024**3] * 20)
+        storage.discover(self.state)
         rows = v.read_json(storage.root() / "candidates.json")["candidates"]
         self.assertEqual(len(rows), 20)
         self.assertTrue(all(row["reserved"] == storage.FLOOR for row in rows.values()))

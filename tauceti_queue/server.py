@@ -313,7 +313,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return data
 
-    def _call(self, action: Callable[[], object]) -> None:
+    def _call(self, action: Callable[[], object], *, headers: dict | None = None) -> None:
         """Run a controller action and map its outcome to a reply."""
         try:
             result = action()
@@ -336,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
             if result is None:
                 self._send(204, b"")
             else:
-                self._json(200, _jsonable(result))
+                self._json(200, _jsonable(result), extra=headers)
 
     def _authenticated(self) -> tuple[str, int] | None:
         identity = self.server.auth.resolve(self.headers.get("Authorization"))
@@ -366,13 +366,13 @@ class Handler(BaseHTTPRequestHandler):
             if repo is None:
                 self._send(404, b"")
                 return
-            self._call(lambda: self._feed("active-batches", repo, query))
+            self._feed_reply("active-batches", repo, query)
         elif match := REPOSITORY_ROUTE.match(path):
             repo = self.server.config.repositories.get(int(match.group(1)))
             if repo is None:
                 self._send(404, b"")
                 return
-            self._call(lambda: self._feed(match.group(2), repo, query))
+            self._feed_reply(match.group(2), repo, query)
         else:
             self._error(404, "no such route")
 
@@ -481,8 +481,18 @@ class Handler(BaseHTTPRequestHandler):
             self._error(403, f"{login} is not a repository admin")
         return admin
 
-    def _feed(self, which: str, repo: str, query: dict) -> dict:
+    def _feed_reply(self, which: str, repo: str, query: dict) -> None:
         source = feeds.feed_source(self.server.controller)
+        # Only the native controller guarantees retained, frozen admissions.
+        # The legacy JSON schema and imported FeedSource behavior stay intact.
+        headers = {}
+        if which == "active-batches" and isinstance(source, feeds.ControllerFeedSource):
+            headers["TauCeti-Admission"] = "frozen-accepted-head/v1"
+        self._call(lambda: self._feed(which, repo, query, source=source), headers=headers)
+
+    def _feed(self, which: str, repo: str, query: dict, *, source=None) -> dict:
+        if source is None:
+            source = feeds.feed_source(self.server.controller)
         base = (query.get("base") or [None])[0]
         if not base:
             canonical = getattr(source, "canonical_branch", None)
