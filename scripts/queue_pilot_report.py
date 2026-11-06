@@ -31,6 +31,8 @@ COLUMNS = {
 }
 JOURNAL_KINDS = {
     "landed",
+    "probe-missing-source",
+    "probe-import-scan-unavailable",
     "sealed",
     "claimed",
     "released",
