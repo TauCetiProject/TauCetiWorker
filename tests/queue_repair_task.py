@@ -1418,13 +1418,49 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(warm, [f"task 1: warm artifacts from {self.onto[:12]} (the rebase target)"])
         self.assertEqual(self.service.releases, [])
         self.assertEqual(len(self.service.results), 1)
+        self.assertEqual([call for call in self.lake_calls() if call.startswith("build")], [])
+        self.assertFalse(outcome["artifacts"]["incremental_build"], "the old-base chain is not compiled before replay")
         prompt = self.agent_calls()[0]["prompt"]
         self.assertIn("Artifacts are warm", prompt)
+        self.assertIn("without building the original chain. Finish the rebase first", prompt)
+        self.assertIn("then build the resulting chain", prompt)
+        self.assertNotIn("every module of this batch that compiled are already built", prompt)
         self.assertNotIn("The build is cold", prompt)
         env = self.agent_calls()[0]["env"]
         self.assertEqual(env["TAUCETI_SHELL_LIMIT_SECONDS"], "7200", "the repair task's own shell limit")
         self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], str(min(7_200_000, int(env["BASH_MAX_TIMEOUT_MS"]))))
         self.assertIn("shell commands have a two-hour limit", prompt)
+
+    def test_a_warm_pre_rebase_fetches_artifacts_without_building_the_old_chain(self):
+        self.raw["kind"] = "pre_rebase"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.fetches(), [self.onto])
+        self.assertEqual(outcome["artifacts"]["cache_revision"], self.onto)
+        self.assertTrue(outcome["artifacts"]["available"])
+        self.assertFalse(outcome["artifacts"]["incremental_build"])
+        self.assertEqual([call for call in self.lake_calls() if call.startswith("build")], [])
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertEqual(self.service.releases, [])
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn("without building the original chain. Finish the rebase first", prompt)
+        self.assertIn("then build the resulting chain", prompt)
+        self.assertTrue(self.state()["report"]["ok"], "the resulting chain still goes through ordinary validation")
+
+    def test_a_pre_rebase_cache_miss_still_runs_the_agent_cold(self):
+        self.raw["kind"] = "pre_rebase"
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.fetches(), [self.onto, self.content.base])
+        self.assertFalse(outcome["artifacts"]["available"])
+        self.assertTrue(outcome["artifacts"]["cold"])
+        self.assertEqual([call for call in self.lake_calls() if call.startswith("build")], [])
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertIn("The build is cold", self.agent_calls()[0]["prompt"])
+        self.assertEqual(self.service.releases, [])
 
     def test_the_base_is_the_fallback_when_onto_is_not_published_yet(self):
         os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.onto

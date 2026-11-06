@@ -887,9 +887,8 @@ def prepare_artifacts(
     that had a mapping, in order); Lake keys the outputs by input trace, so the fetches add to one
     another and a later one never displaces an artifact for a different input. A warm hit makes the
     artifacts available even when no other revision is published (``cache_revision`` is then the
-    first warmed revision). ``build=False`` fetches only: the caller runs the
-    incremental build itself (``repair_stream`` streams it to the agent), so ``available`` rests on the
-    fetch alone.
+    first warmed revision). ``build=False`` fetches only, so ``available`` rests on the fetch alone:
+    streaming callers build afterwards, and rebase tasks build the resulting chain after replay.
     """
     record: dict = {}
     seconds = 0.0
@@ -1433,6 +1432,14 @@ def _verification_section(
             + " "
             + CACHE_SENTENCE
             + " Do not use `--fail-fast`.",
+            *scoped,
+        ]
+    elif context.kind in REBASE_KINDS:
+        lines += [
+            "Artifacts are warm: the worker fetched the available cache outputs into `.lake` without building "
+            "the original chain. Finish the rebase first, then build the resulting chain with "
+            "`lake build --iofail` and judge it by its exit status; cached outputs are reused when their inputs "
+            "still match. " + foreground + " " + CACHE_SENTENCE + " Do not use `--fail-fast`.",
             *scoped,
         ]
     else:

@@ -1780,7 +1780,7 @@ def run_task(
                 lake=cfg.lake,
                 preferred=repair_publish.preferred(cfg.publish, task),
                 warm=repair_publish.warm(cfg.publish, task),
-                build=not streaming,
+                build=not streaming and task.kind not in repair.REBASE_KINDS,
             )
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
