@@ -57,6 +57,15 @@ token totals. A failed progress write leaves the last observation in place and c
 Older running workers and historical tasks remain readable without an immediate worker restart.
 That compatibility path loads trusted local checkpoints/outcomes with memory proportional to their
 size; it has no task-size cutoff. Public frame and transport bounds remain unchanged.
+Open tasks may also carry `progress.build`: preparation, verification or streaming
+stage, Lake's reported completed/total **build tasks**, sampler time, log update
+time and the last observed increase in completed tasks. These are not module
+counts or a CI verdict. The sidecar reads at most the last 64 KB of a known local
+build log; no log text, module names or paths leave the machine. The first sample
+has unknown progress-change time. Unchanged counts, including a heartbeat or
+other new log output, do not advance that time. Log replacement, truncation,
+counter regression, a new phase or claim resets the comparison. The phase's own
+checkpoint time stays unchanged. A silent log alone is not a stalled build.
 
 A separate hourly report reuses the existing pilot calculations:
 

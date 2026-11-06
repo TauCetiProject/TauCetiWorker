@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -35,6 +36,7 @@ LIMIT = 20_000
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MAX_BYTES = 2_000_000
+BUILD_TAIL_BYTES = 64_000
 
 
 def iso(value):
@@ -212,11 +214,63 @@ def workers(roots):
     return result
 
 
+class BuildObservations:
+    """Numeric observations of existing local build logs, never log excerpts or verdicts."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def observe(self, directory, phase, token, captured, phase_at):
+        stage, name = {
+            "sources_ready": ("preparation", "prepare-build.log"),
+            "verifying": ("verification", "verify-build.log"),
+            "agent_running": ("streaming", "stream-build.log"),
+        }.get(phase, (None, None))
+        if name is None:
+            return None
+        try:
+            descriptor = os.open(directory / "logs" / name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or (phase_at is not None and info.st_mtime < phase_at):
+                    return None
+                offset = max(0, info.st_size - BUILD_TAIL_BYTES)
+                stream.seek(offset)
+                tail = stream.read(BUILD_TAIL_BYTES)
+                if offset:
+                    tail = tail.partition(b"\n")[2]  # Never parse a truncated line as a counter.
+            matches = re.findall(rb"\[(\d{1,9})/(\d{1,9})\]", tail)
+            valid = [(int(a), int(b)) for a, b in matches if 0 <= int(a) <= int(b) and int(b) > 0]
+            if not valid:
+                return None
+            completed, total = valid[-1]
+            identity = (info.st_dev, info.st_ino, token, phase_at)
+            key = (str(directory), stage)
+            previous = self.cache.get(key)
+            last_progress = None
+            if previous and previous[0] == identity and info.st_size >= previous[1] and completed >= previous[2]:
+                last_progress = captured if completed > previous[2] else previous[3]
+            self.cache[key] = (identity, info.st_size, completed, last_progress)
+            if len(self.cache) > 1000:
+                self.cache = dict(list(self.cache.items())[-500:])
+            return {
+                "stage": stage,
+                "completed_tasks": completed,
+                "total_tasks": total,
+                "sampled_at": iso(captured),
+                "log_updated_at": iso(info.st_mtime),
+                "last_progress_at": iso(last_progress),
+            }
+        except (OSError, ValueError, OverflowError):
+            return None
+
+
 class TaskObservations:
     """Bounded cached projection of trusted worker checkpoints/outcomes."""
 
     def __init__(self):
         self.cache = {}
+        self.builds = BuildObservations()
 
     def observe(self, roots, tasks, *, claims=(), observed_at=None):
         result = {}
@@ -262,7 +316,7 @@ class TaskObservations:
                         observation = task_progress.public(record)
                         binding = record.get("claim_token")
                         self.cache[key] = (fingerprint, observation, binding if isinstance(binding, str) else None)
-                    candidates.append(self.cache[key][1:])
+                    candidates.append((*self.cache[key][1:], directory))
                 except (OSError, ValueError, TypeError, AttributeError):
                     continue
             if candidates:
@@ -278,9 +332,19 @@ class TaskObservations:
                     if task["state"] == "open"
                     else set()
                 )
-                result[task["id"]] = max(
-                    candidates, key=lambda item: (item[1] in live_tokens, item[0]["observed_at"] or "")
-                )[0]
+                selected = max(candidates, key=lambda item: (item[1] in live_tokens, item[0]["observed_at"] or ""))
+                observation, token, directory = selected
+                phase_at = (
+                    datetime.fromisoformat(observation["observed_at"]).timestamp()
+                    if observation["observed_at"]
+                    else None
+                )
+                build = (
+                    self.builds.observe(directory, observation["state"], token, observed_at, phase_at)
+                    if task["state"] == "open"
+                    else None
+                )
+                result[task["id"]] = observation | ({"build": build} if build else {})
         if len(self.cache) > 1000:
             self.cache = dict(list(self.cache.items())[-500:])
         return result
