@@ -644,6 +644,7 @@ def install_timer():
             "PATH",
             "TAUCETI_BUILD_CACHE_ROOT",
             "TAUCETI_CACHE_MAX_GIB",
+            "TAUCETI_LEGACY_DATA_ROOT",
         }
     )
     (directory / "tauceti-cleanup.service").write_text(

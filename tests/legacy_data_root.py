@@ -63,6 +63,25 @@ class LegacyDataRoot(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "absolute path"):
                 paths.legacy_data_root()
 
+    def test_installed_cleanup_keeps_the_selected_data_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            units = root / "units"
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "TAUCETI_LEGACY_DATA_ROOT": str(root / "durable"),
+                        "TAUCETI_ACTIVITY_DIR": str(root / "activity"),
+                    },
+                ),
+                patch("tauceti_worker.worker_manager._service_path", return_value=units / "workers.service"),
+                patch.object(retention.subprocess, "run"),
+            ):
+                retention.install_timer()
+            unit = (units / "tauceti-cleanup.service").read_text()
+            self.assertIn("TAUCETI_LEGACY_DATA_ROOT=" + str(root / "durable"), unit)
+
 
 if __name__ == "__main__":
     unittest.main()
