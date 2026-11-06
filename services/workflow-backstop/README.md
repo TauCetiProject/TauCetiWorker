@@ -6,7 +6,8 @@ or dispatches overdue maintenance workflows on the repository's current default
 branch. Existing GitHub schedules remain enabled.
 
 The default set is dependency updates (hourly), conflict checks (15 minutes),
-merge sweep (hourly), API docs (hourly), and website publication (three hours).
+API docs (hourly), and website publication (three hours). Admission belongs to the
+continuously running queue service and has no workflow backstop.
 The alert reconciler is excluded by default: it edits and sends Zulip alerts.
 `--include-alerts` is an explicit opt-in for an operator authorized to run it.
 

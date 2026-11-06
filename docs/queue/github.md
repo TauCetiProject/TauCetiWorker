@@ -125,12 +125,17 @@ controller uses those alone for classification and hands the rest to the repair 
 
 ## Admission: how approvals arrive
 
-Bors takes approvals from three sources; the queue takes the same three.
+With `admission_source = "policy"`, the queue reads published scoreboards, current head/base and
+diff, scope/build/bump results and trusted recovery holds through the shared TauCetiReview policy.
+The installed policy and trusted project configuration determine eligibility; the queue records
+`admission_policy` evidence and admits directly. It requires no model calls. The existing discovery
+and approval-poll thread own pending work and missed policy observations; see
+[Primary admission](operations.md#primary-admission).
 
 **Comment commands.** `bors r+`, `bors merge`, `bors r=login`, `bors p=N`, `bors r-`, `bors cancel`
 in issue comments and review bodies, from collaborators with push access, parsed below.
 
-**The review App's eligibility checks.** TauCetiReview no longer comments `bors r+`: its reusable
+**Legacy eligibility checks (explicit pre-cutover mode only).** TauCetiReview's reusable
 `merge-only.yml` and `merge-sweep.yml` run `runner/backend.py eligibility`, which publishes an
 App-owned check run named `merge eligibility` on the reviewed head (App 3947238,
 `tauceti-review-bot[bot]`). The check's `external_id` is the decision, `{"schema":
@@ -148,10 +153,14 @@ nothing. The checks describe eligibility independently of `MERGE_BACKEND`. Behin
 reconciles the decisions the controller has not recorded (`docs/queue/operations.md`, "Approval
 polling"), so an inactive or lossy webhook cannot lose an approval or a revocation.
 
-**The review App's exact-head comments.** `bors r+ sha=<head>`, `bors r+ single sha=<head>` and
-`bors r- sha=<head>` are still accepted from comments whose `performed_via_github_app.id` is the
+**Legacy exact-head comments (explicit pre-cutover mode only).** `bors r+ sha=<head>`, `bors r+ single sha=<head>` and
+`bors r- sha=<head>` are accepted from comments whose `performed_via_github_app.id` is the
 review App, and only while the live head is that SHA, as Bors's webhook accepts them (the legacy
 path of the same App).
+
+Policy mode ignores both legacy automated sources, including late in-flight publications. Manual
+commands retain their permission and membership rules. There is no automatic switch to legacy
+intake or to the old Bors engine during an inference outage.
 
 Every approval reaches the controller as `approve(repo, pr, head_sha, reviewer, priority,
 evidence)` with the evidence as a dict (`commands.Evidence`): the source kind (`issue_comment`,

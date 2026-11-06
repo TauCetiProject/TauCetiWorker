@@ -1721,6 +1721,16 @@ class Holds(QueueFixture):
 
 
 class Restart(QueueFixture):
+    def test_polling_uses_remaining_capacity_without_a_fixed_reserve(self):
+        self.github.remaining = 1
+        self.approve(101, {"A.lean": "a\n"})
+        loop = ReconciliationLoop(self.controller)
+        loop.run_once(woken=False)
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.run_ci()
+        loop.run_once(woken=False)
+        self.assertEqual(self.batch_state(1), "landed")
+
     def test_s12_restart_recovers_pending_outbox_expired_claim_and_repeats_no_work(self):
         self.github.ci_policy = verdicts("fail")
         self.approve(101, {"A.lean": "a\n"})

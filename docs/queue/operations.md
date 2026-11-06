@@ -120,11 +120,15 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `listen_host`, `listen_port` | `127.0.0.1`, `8780` | the local listen address the tunnel forwards to |
 | `public_url` | `https://queue.taucetiproject.org` | the public base; the webhook address is `<public_url>/webhook/github` |
 | `reconcile_interval_seconds` | `30` | the loop's cadence between event-driven wakeups |
-| `review_app_id` | `3947238` | the GitHub App whose `merge eligibility` checks and exact-head comments are approvals (TauCetiReview); the rehearsal points it at the queue's own App on the scratch repository |
+| `review_app_id` | `3947238` | identifies legacy automatic publications so policy mode can ignore late output; pre-cutover eligibility mode trusts this App |
+| `admission_source` | `policy` | primary policy intake; `eligibility` is only the explicit pre-cutover configuration |
+| `admission_lean_root` | `TauCeti` | trusted project root, converted to the allowed Lean path prefix |
+| `admission_rubrics` | the ten standard rubrics | required review rubrics, comma separated; trusted service configuration |
+| `admission_extra_files` | empty | extra allowed repository paths, comma separated, beyond the configured root file, Lake pins and bibliography |
 | `[settings] insertion_age_window` | `16` | initial runtime control (plan, "Runtime controls") |
 | `[settings] repair_concurrency` | `1` | initial runtime control |
 | `[settings] stall_interval_seconds` | `900` | initial runtime control |
-| `[settings] approval_poll_interval_seconds` | `900` | how often the approval poll lists the open PRs' `merge eligibility` checks behind the webhooks (Approval polling below) |
+| `[settings] approval_poll_interval_seconds` | `900` | existing discovery cadence for missed-delivery reconciliation; pending policy work wakes on events or its actual retry deadline |
 
 The `[settings]` values and `publication_enabled` are seeds: `serve` writes a file value into the
 store (actor `configuration`) only when the store has no value for the key, or when the stored value is
@@ -139,8 +143,9 @@ effective values.
 ## Install and update
 
 Both are the same command, run on the host as the service account, and both are live: the fleet keeps
-admitting workers and CI, nothing is drained, and the only interruption is the service restart, during
-which webhook deliveries are queued by GitHub and redelivered or picked up by the fallback poll.
+admitting workers and CI, nothing is drained, and the only interruption is the service restart.
+Normal source discovery recovers missed policy observations. GitHub does not automatically redeliver
+failed webhooks; inspect failed deliveries after a restart and redeliver missed operator commands.
 
 ```sh
 # first time: get the installer, then let it manage the checkout
@@ -596,31 +601,73 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `prepare_pre_rebased` | `true` | `true` or `false` |
 
 
-## Approval polling
+## Primary admission
 
-Approvals arrive as TauCetiReview's `merge eligibility` check runs, reconciled on every `check_run`
-webhook delivery. Behind the webhooks, `tauceti_queue/approval_poll.py` runs a reconciliation pass at
-service start and every `approval_poll_interval_seconds` (default 900): it lists the open PRs with
-the review App's check runs on their heads (one GraphQL call per 100 PRs, on the GraphQL quota) and
-feeds through the same `eligibility.reconcile` path as a delivery exactly those whose decision the
-service has not recorded: an eligible check at a head without a live input (a missed approval), an
-unsafe review on a PR with one (a missed revocation), and a waiting input whose PR moved to another
-head, closed or became a draft. A pass costs the listing (12 GraphQL calls for 1,200 open PRs) plus
-at most four REST calls per difference found; it is skipped while the REST quota is below the loop's
-reserve (200) and stops early when the quota runs out, leaving the rest to the next pass.
+The queue service evaluates published review evidence itself. `admission_source = "policy"`
+uses the pure policy from the pinned TauCetiReview dependency, with explicit project configuration.
+It runs no model and executes no PR code. The resulting input records the source review comment,
+head, reviewed merge base and policy revision/digest as `admission_policy` evidence; it does not
+claim to be an approval signed by the review App.
 
-`status.approvals` reports `webhook` and `polled` (approvals discovered by deliveries and by the
-poll), `revoked_by_poll`, and `last_poll` (the last pass: `at`, `reason`, `listed`, `with_check`,
-`reconciled`, `approved`, `revoked`, `head_changed`, `closed`, `drafted`, `member_events`,
-`skipped`, `stopped_early`, `errors`, `duration_seconds`). A growing `polled` while the App's
-Advanced page shows no deliveries means the webhook is inactive or not reaching the service; a
-growing `polled` beside healthy deliveries means deliveries are being lost. Run a pass by hand:
+The existing approval-poll thread runs intake. Relevant authenticated webhooks persist dirty PRs
+in `admission_work` in the existing SQLite database before acknowledgment. Reads and git fetches
+happen outside the controller/database lock. Applying a result checks its generation and target
+epoch, and commits the input and completed evaluation together. A newer event stays pending.
 
-```sh
-uv run tauceti-queue reconcile-approvals            # prints the pass summary
-```
+The same paginated discovery supplies PR, review-comment, label and commit-status inputs at
+startup and every `approval_poll_interval_seconds`. Nested comment connections are completed.
+Build changes invalidate decisions independently of PR `updated_at`; queue output and incidental
+comments do not. A normal advance of the target that leaves the merge base unchanged creates no
+new evaluation. Missing or incomplete source reads never imply approval or removal of unseen work.
 
-## Cutover
+Pending PRs have no invocation, PR-count, fixed-reserve or lifetime-attempt allowance. REST and
+GraphQL waits retain their absolute server deadline. Intake does not sleep on an exhausted bucket;
+other runnable work proceeds. Resident pagination buffers retain pages already read during a quota
+wait. After a process restart the database still owns pending work and deadlines, and source
+reconciliation restores observations. There are no admission workflow reruns or cache handoffs.
+
+Background reads are paced across each resource's remaining window, using REST requests and
+reported GraphQL point costs separately. Queue/CI calls, queued-review revocations and final
+head/CI fences receive priority. Source preparation resumes at the next eligible read without
+restarting from its first request. The final fence reads current CI independently of PR timestamps.
+An approved input with a pending review change cannot be inserted until evaluation completes;
+the same check protects a replay that was already in progress when the change arrived.
+
+Manual withdrawal records a separate head/authorization fence, even before the first policy
+evaluation. CI/configuration changes, incidental review edits and repeated polls cannot revive it.
+A fresh published review round (or a new review comment) after withdrawal can supply fresh intent;
+an explicit operator approval can too. Already-inserted membership remains governed by the normal
+queue rules. Late legacy eligibility checks and automatic review-App commands are ignored in
+policy mode. The old eligibility consumer is available only through an explicit pre-cutover
+configuration; there is no automatic change of admission owner.
+
+At cutover, legacy withdrawals retain their recorded journal or rejection-evidence time. A new
+review comment created after that boundary can restore approval. If legacy records do not retain
+the earlier review authorization, an edit to an old comment cannot prove fresh intent; a new
+comment or explicit operator approval is required. Missing withdrawal history is held conservatively.
+
+`status.admission` reports the active source, policy digest, pending count, oldest pending time,
+and pending PRs with attempt time, retry deadline, resource and last error. The existing
+`approvals.last_poll` field carries the intake summary. Successful decisions are journaled as
+`admission-evaluated`, including their reason; `admission_evaluations` and `admission_approvals`
+count completed work. `tauceti-queue reconcile-approvals` wakes this same intake path for diagnosis;
+routine progress does not require that command.
+
+To switch an existing eligibility deployment, back up the database, verify its process supervisor,
+deploy the service live with `admission_source = "policy"`, and verify that source and revision in
+status. Then retire TauCeti's separate `auto-merge`/`merge-sweep` workflow execution and calls to
+merge-only evaluation, leaving review publication and ordinary CI enabled. The service ignores
+in-flight old publications from the moment it switches. Preserve worker/CI admissions throughout.
+Verify pending work, useful admissions/landings and restart recovery from the same database.
+
+Inference failure never transfers this repository back to legacy Bors. Deterministic intake
+continues to use valid existing review evidence; repair-dependent tasks retain membership and
+source under the existing inference hold and retry automatically when a provider returns.
+`MERGE_BACKEND=bors`, Bors-compatible commands, feed schemas and hostnames remain compatibility
+surfaces for this engine. TODO: make this same queue operate without inference using splitting;
+the design is deferred and hold-and-retry is interim behavior.
+
+## Original Bors cutover
 
 Preconditions (plan, "Transition to production"): the rehearsal on
 `TauCetiProject/TauCetiQueueScratch` passed. There is no shadow period (operator decision,

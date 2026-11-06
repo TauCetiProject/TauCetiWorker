@@ -21,7 +21,12 @@ listen_host = "127.0.0.1"
 listen_port = 8780
 public_url = "https://queue.taucetiproject.org"
 reconcile_interval_seconds = 30
-# review_app_id = 3947238       # the App whose `merge eligibility` checks approve; only the rehearsal changes it
+# Primary deterministic intake. Policy source and project defaults are trusted service
+# configuration, never loaded from a PR. An upgrade must make the owner switch deliberately.
+admission_source = "policy"
+admission_lean_root = "TauCeti"
+admission_rubrics = "correctness,reuse,scope,attribution,api-design,generality,placement,naming,documentation,proof-quality"
+# admission_extra_files = ""   # additional explicitly allowed repository paths, comma separated
 
 # Initial runtime controls: `serve` seeds the store with these (and `publication_enabled` above)
 # only for keys the store has no value for, or whose stored value is an earlier seed from this file.
@@ -31,5 +36,6 @@ reconcile_interval_seconds = 30
 insertion_age_window = 16
 repair_concurrency = 1
 stall_interval_seconds = 900
-# How often the approval poll lists the open PRs' `merge eligibility` checks behind the webhooks.
+# Existing source discovery at startup and to recover missed deliveries; events wake pending
+# policy work immediately. This is not a work allowance or a maximum retry count.
 approval_poll_interval_seconds = 900

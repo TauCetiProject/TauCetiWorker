@@ -90,6 +90,30 @@ CREATE TABLE IF NOT EXISTS inputs (
     declaration_retry_at REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS inputs_state ON inputs (repository, state);
+CREATE TABLE IF NOT EXISTS admission_work (
+    id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL DEFAULT '',
+    number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    generation INTEGER NOT NULL DEFAULT 1,
+    evaluated_generation INTEGER NOT NULL DEFAULT 0,
+    observed_version TEXT NOT NULL DEFAULT '',
+    evaluated_version TEXT NOT NULL DEFAULT '',
+    authorization_key TEXT NOT NULL DEFAULT '',
+    cancelled_authorization TEXT NOT NULL DEFAULT '',
+    cancelled_head_sha TEXT NOT NULL DEFAULT '',
+    cancelled_at REAL NOT NULL DEFAULT 0,
+    urgent INTEGER NOT NULL DEFAULT 0,
+    first_pending_at REAL NOT NULL DEFAULT 0,
+    attempted_at REAL NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    retry_resource TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL DEFAULT '{}',
+    disposition TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_pr ON admission_work (repository, number);
+CREATE INDEX IF NOT EXISTS admission_due ON admission_work (repository, next_attempt_at, attempted_at);
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY,
     repository TEXT NOT NULL,
@@ -358,6 +382,11 @@ class Store:
                     self._connection.execute("COMMIT")
 
     # --- generic rows ------------------------------------------------------------------------------
+
+    def query(self, sql: str, params=()) -> list[dict[str, Any]]:
+        """Fetch a complete read under the shared connection lock."""
+        with self._lock:
+            return [dict(row) for row in self._connection.execute(sql, params).fetchall()]
 
     def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> sqlite3.Cursor:
         with self._lock:

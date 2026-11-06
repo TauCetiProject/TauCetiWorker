@@ -458,9 +458,19 @@ def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) 
             reviewer = command.reviewer or context.actor_login
             controller.approve(repo, number, head, reviewer, command.priority or 0, evidence.as_dict())
         elif command.kind == "unapprove":
-            controller.unapprove(repo, number, context.actor_login)
+            controller.unapprove(
+                repo,
+                number,
+                context.actor_login,
+                **({"head_sha": pr.head_sha} if getattr(controller, "admission", None) is not None else {}),
+            )
         elif command.kind == "cancel":
-            controller.cancel(repo, number, context.actor_login)
+            controller.cancel(
+                repo,
+                number,
+                context.actor_login,
+                **({"head_sha": pr.head_sha} if getattr(controller, "admission", None) is not None else {}),
+            )
         elif command.kind == "priority":
             controller.set_priority(repo, number, command.priority)
         elif command.kind == "single":

@@ -52,6 +52,34 @@ class OpenPullRequest:
     base_ref: str
     draft: bool = False
     eligibility_checks: tuple[dict[str, Any], ...] = ()
+    # Complete primary policy inputs from the same discovery, without reading diff paths.
+    admission: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AdmissionSnapshot:
+    """Fresh source evidence; obtaining it never executes code from the PR."""
+
+    pull: PullRequest
+    merge_base_sha: str
+    paths: tuple[str, ...]
+    comments: tuple[dict[str, Any], ...]
+    statuses: dict[str, str]
+    diff_version: str = ""
+
+    def source(self) -> dict[str, Any]:
+        return {
+            "head": self.pull.head_sha,
+            "base_ref": self.pull.base_ref,
+            "state": self.pull.state,
+            "draft": self.pull.draft,
+            "body": self.pull.body,
+            "labels": list(self.pull.labels),
+            "comments": list(self.comments),
+            "statuses": self.statuses,
+            "merge_base": self.merge_base_sha,
+            "diff_version": self.diff_version,
+        }
 
 
 @dataclass(frozen=True)

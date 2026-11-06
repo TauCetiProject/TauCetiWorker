@@ -144,9 +144,25 @@ class Service:
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
         if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):
-            self.poller = poll_module.ApprovalPoller(
-                self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
-            )
+            if self.config.admission_source == "policy":
+                from .admission import AdmissionPolicy, AdmissionPoller, policy
+
+                root = self.config.admission_lean_root
+                self.poller = AdmissionPoller(
+                    self.controller,
+                    self.github,
+                    self.config.repository,
+                    AdmissionPolicy(
+                        rubrics=self.config.admission_rubrics.split(","),
+                        prefix=root.replace(".", "/") + "/",
+                        allow_files=policy.default_allow_files(root)
+                        + [s for s in self.config.admission_extra_files.split(",") if s],
+                    ),
+                )
+            else:
+                self.poller = poll_module.ApprovalPoller(
+                    self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
+                )
 
     def seed_settings(self) -> None:
         """Seed the store with the configuration file's runtime controls (`serve` only).

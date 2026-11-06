@@ -31,7 +31,6 @@ class Workflow:
 WORKFLOWS = (
     Workflow("update.yml", 3600),
     Workflow("merge-conflicts.yml", 900),
-    Workflow("merge-sweep.yml", 3600),
     Workflow("api-docs.yml", 3600),
     Workflow("pages.yml", 10800),
     Workflow("stuck-alerts.yml", 3600, alerts=True),

@@ -340,6 +340,7 @@ class Controller:
         logger: logging.Logger | None = None,
     ) -> None:
         self.store = store
+        self.admission = None  # primary policy intake, attached by the service in policy mode
         self.github = github
         self.clone = clone
         self.repository = repository
@@ -712,6 +713,8 @@ class Controller:
                         changed["priority"] = priority
                     if changed:
                         self.store.update("inputs", {"id": existing["id"]}, **changed)
+                    if self.admission is not None and (evidence or {}).get("kind") != "admission_policy":
+                        self.admission.accept_manual(pr, head_sha)
                     return {"accepted": True, "reason": "already-approved", "input": self._input_for(pr)}
                 if existing["state"] == INPUT_INSERTED:
                     return {"accepted": False, "reason": "member", "input": existing}
@@ -750,6 +753,8 @@ class Controller:
                     retained_ref=ref,
                     no_repair=int(no_repair),
                 )
+                if self.admission is not None and (evidence or {}).get("kind") != "admission_policy":
+                    self.admission.accept_manual(pr, head_sha)
                 self.store.journal(
                     now,
                     "approved",
@@ -920,19 +925,31 @@ class Controller:
             "has not landed; the first head seals after that canonical advance or a release"
         )
 
-    def unapprove(self, repo: str, pr: int, actor: str = "") -> dict[str, Any]:
+    def unapprove(self, repo: str, pr: int, actor: str = "", *, head_sha: str = "") -> dict[str, Any]:
         """`bors r-`: a waiting input is withdrawn; a batch member is not (membership is fixed)."""
-        return self._withdraw(repo, pr, "unapproved", actor)
+        return self._withdraw(repo, pr, "unapproved", actor, head_sha=head_sha)
 
-    def cancel(self, repo: str, pr: int, actor: str = "") -> dict[str, Any]:
+    def cancel(self, repo: str, pr: int, actor: str = "", *, head_sha: str = "") -> dict[str, Any]:
         """`bors cancel`: the same as `unapprove`; the head is never cancelled."""
-        return self._withdraw(repo, pr, "cancelled", actor)
+        return self._withdraw(repo, pr, "cancelled", actor, head_sha=head_sha)
 
-    def _withdraw(self, repo: str, pr: int, reason: str, actor: str) -> dict[str, Any]:
+    def _withdraw(self, repo: str, pr: int, reason: str, actor: str, *, head_sha: str = "") -> dict[str, Any]:
         with self._lock:
             self._check_repo(repo)
             now = self.clock()
             current = self._input_for(pr)
+            if (
+                self.admission is not None
+                and reason in ("unapproved", "cancelled")
+                and (current is None or current["state"] != INPUT_INSERTED)
+            ):
+                with self.store.transaction():
+                    self.admission.withdraw(pr, head_sha or (current or {}).get("head_sha", ""))
+                    if current is not None and current["state"] in (INPUT_WAITING, INPUT_RESERVED):
+                        self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason=reason)
+                        self.store.journal(now, "withdrawn", number=pr, reason=reason, actor=actor)
+                        self._refresh_snapshot()
+                        return {"withdrawn": True, "reason": reason}
             if current is None or current["state"] in (INPUT_LANDED, INPUT_CANCELLED):
                 return {"withdrawn": False, "reason": "not-waiting"}
             if current["state"] == INPUT_INSERTED:
@@ -2526,7 +2543,11 @@ class Controller:
     def _probe_eligible(self, row: dict[str, Any], batch: dict[str, Any]) -> bool:
         if row["last_probe"] == MISSING_SOURCE_IN_FLIGHT and row["last_probe_base"] == batch["base"]:
             return False  # the source it imports is still in flight; no batch on this base has it
-        return row["last_probe_tip"] != batch["tip"] and not self._conflicted_with(row, batch)
+        return (
+            row["last_probe_tip"] != batch["tip"]
+            and not self._conflicted_with(row, batch)
+            and (self.admission is None or self.admission.is_current(row["number"], row["head_sha"]))
+        )
 
     def _draw(self, waiting: list[dict[str, Any]]) -> dict[str, Any]:
         window = waiting[: max(1, int(self.setting("insertion_age_window")))]
@@ -2687,6 +2708,8 @@ class Controller:
                         reason="conflicts-with-main",
                         last_probe=dumps(paths),
                     )
+                    if self.admission is not None:
+                        self.admission.withdraw(row["number"], row["head_sha"])
                     self._conflict_request(row, paths, now)
                 else:
                     open_ids = {str(b["id"]) for b in self._open_batches()}
@@ -2776,6 +2799,8 @@ class Controller:
                     last_probe=dumps(listed),
                     last_probe_base="",
                 )
+                if self.admission is not None:
+                    self.admission.withdraw(row["number"], row["head_sha"])
                 self._missing_source_request(row, listed)
                 self._release_claim(claim, "missing-source", now)
                 self._count("missing_source_refusals")
@@ -2785,6 +2810,12 @@ class Controller:
             return False
         version = batch["version"] + 1
         with self.store.transaction():
+            if self.admission is not None and not self.admission.is_current(row["number"], row["head_sha"]):
+                self.store.update(
+                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="admission-pending"
+                )
+                self._release_claim(claim, "admission-pending", now)
+                return False
             position = len(self._members(batch["id"]))
             self.store.insert(
                 "members",
@@ -5120,7 +5151,7 @@ class Controller:
             {"id": entry["id"]},
             attempts=attempts,
             history=dumps(history[-20:]),
-            next_attempt_at=now + backoff,
+            next_attempt_at=getattr(error, "retry_at", None) or now + backoff,
         )
         self.log.warning("outbox %s %s failed (attempt %s): %s", entry["kind"], entry["key"], attempts, error)
 
@@ -5143,6 +5174,16 @@ class Controller:
                 self.github.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )
         if kind == "labels":
+            if "admission_generation" in payload:
+                work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
+                if work is None or work["generation"] != payload["admission_generation"]:
+                    return "stale-admission"
+                pull = self.github.fetch_pr(repo, payload["number"])
+                if pull.head_sha != payload["head_sha"] or pull.state != "open" or pull.draft:
+                    return "stale-head"
+                work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
+                if work["generation"] != payload["admission_generation"]:
+                    return "stale-admission"
             self._ensure_labels(repo, payload.get("ensure", []))
             self.github.set_labels(repo, payload["number"], payload.get("add", []), payload.get("remove", []))
             return "labels"
@@ -5299,6 +5340,13 @@ class Controller:
                     "polled": counters.get("approvals_polled", 0),
                     "revoked_by_poll": counters.get("approvals_revoked_by_poll", 0),
                     "last_poll": self._state("approval_poll"),
+                },
+                "admission": {"source": "eligibility"}
+                if self.admission is None
+                else {
+                    "source": "policy",
+                    "policy_digest": self.admission.policy.revision,
+                    **self.admission.state.summary(),
                 },
                 "anticipated": [
                     {

@@ -396,8 +396,8 @@ Restart: `recover()` releases the controller's own in-process claims (`insert`, 
 that never reached GitHub and leaves worker claims, tasks and the outbox as they are; the first pass
 then drains the outbox before any new work. `ReconciliationLoop`
 calls it once, then runs a pass whenever the controller's wake event is set (webhooks, commands,
-task calls) and otherwise every `polling_interval_seconds`, skipping polling passes while the API
-quota is below `rate_limit_reserve`.
+task calls) and otherwise every `polling_interval_seconds`. Individual requests obey the shared
+client's actual resource deadlines; no fixed quota reserve suppresses a controller pass.
 
 ## Settings
 

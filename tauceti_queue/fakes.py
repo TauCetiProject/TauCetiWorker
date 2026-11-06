@@ -27,6 +27,7 @@ from typing import Any
 from . import chain
 from .controller import Controller
 from .ports import (
+    AdmissionSnapshot,
     Adoption,
     CandidatePhase,
     CandidateRun,
@@ -225,6 +226,7 @@ class FakeGitHub:
         # When set, `repository_admin` raises `GitHubUnavailable` (a quota outage) with this message.
         self.unavailable: str | None = None
         self.comments: list[dict[str, Any]] = []
+        self.review_comments: dict[int, list[dict[str, Any]]] = {}
         self.labels: dict[int, set[str]] = {}
         # Repository labels by name: (color, description).
         self.repository_labels: dict[str, tuple[str, str]] = {}
@@ -684,7 +686,46 @@ class FakeGitHub:
             )
             return result.stdout.strip() or None if result.returncode == 0 else None
 
-    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[OpenPullRequest]:
+    def _admission_source(self, number):
+        pull = self.fetch_pr(self.repository, number)
+        base = self.pr_merge_base(self.repository, number, pull.head_sha) or ""
+        return {
+            "head": pull.head_sha,
+            "base_ref": pull.base_ref,
+            "state": pull.state,
+            "draft": pull.draft,
+            "body": pull.body,
+            "labels": list(pull.labels),
+            "comments": list(self.review_comments.get(number, [])),
+            "diff_version": base,
+            "statuses": {
+                context: status.state
+                for (head, context), status in self.statuses.items()
+                if head == pull.head_sha and context in ("build", "scope", "bump-guard")
+            },
+        }
+
+    def admission_snapshot(self, repo, number, *, generation=0):
+        self._call("admission_snapshot", number)
+        pull = self.fetch_pr(repo, number)
+        source = self._admission_source(number)
+        base = source["diff_version"]
+        if pull.state == "open" and not pull.draft:
+            self.fetch_refs(repo, [pull.head_sha, base])
+            paths = tuple(
+                p
+                for p in chain.git(
+                    self.repo.clone, "diff", "--name-only", "-z", "--no-renames", base, pull.head_sha
+                ).split("\0")
+                if p
+            )
+        else:
+            paths = ()
+        return AdmissionSnapshot(pull, base, paths, tuple(source["comments"]), source["statuses"], base)
+
+    def list_open_pull_requests(
+        self, repo: str, *, review_app_id: int, admission=False, on_page=None
+    ) -> list[OpenPullRequest]:
         with self.lock:
             self._call("list_open_pull_requests", review_app_id)
             listed = []
@@ -696,7 +737,18 @@ class FakeGitHub:
                     for c in self.checks.get(pr["head_sha"], [])
                     if c.get("name") == "merge eligibility" and (c.get("app") or {}).get("id") == review_app_id
                 )
-                listed.append(OpenPullRequest(number, pr["head_sha"], pr["base_ref"], pr["draft"], checks))
+                listed.append(
+                    OpenPullRequest(
+                        number,
+                        pr["head_sha"],
+                        pr["base_ref"],
+                        pr["draft"],
+                        checks,
+                        self._admission_source(number) if admission else None,
+                    )
+                )
+            if on_page:
+                on_page(listed)
             return listed
 
 

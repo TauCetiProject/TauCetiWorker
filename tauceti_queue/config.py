@@ -97,6 +97,12 @@ class Config:
     public_url: str = "https://queue.taucetiproject.org"
     reconcile_interval_seconds: int = 30
     review_app_id: int = 3947238  # the App whose `merge eligibility` checks and exact-head comments approve
+    admission_source: str = "policy"  # eligibility is only for an explicit pre-cutover deployment
+    admission_rubrics: str = (
+        "correctness,reuse,scope,attribution,api-design,generality,placement,naming,documentation,proof-quality"
+    )
+    admission_lean_root: str = "TauCeti"
+    admission_extra_files: str = ""
     settings: Settings = field(default_factory=Settings)
     # Bookkeeping, not configuration: where the file came from and the source of every value.
     path: Path | None = None
@@ -255,6 +261,16 @@ def validate(config: Config) -> list[str]:
         problems.append("reconcile_interval_seconds must be at least 1")
     if config.review_app_id < 1:
         problems.append("review_app_id must be a positive GitHub App id")
+    if config.admission_source not in ("eligibility", "policy"):
+        problems.append("admission_source must be eligibility or policy")
+    if not config.admission_rubrics or any(
+        not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", s) for s in config.admission_rubrics.split(",")
+    ):
+        problems.append("admission_rubrics must be a comma-separated list of rubric names")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*", config.admission_lean_root):
+        problems.append("admission_lean_root must be a Lean module name")
+    if any(s.startswith(("/", "-")) or ".." in Path(s).parts for s in config.admission_extra_files.split(",") if s):
+        problems.append("admission_extra_files must contain relative repository paths")
     for name in SETTING_FIELDS:
         if getattr(config.settings, name) < 1:
             problems.append(f"{name} must be at least 1")

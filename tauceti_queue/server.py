@@ -697,6 +697,11 @@ class Handler(BaseHTTPRequestHandler):
         if poller is None:
             self._error(503, "the approval poller is not running in this service")
             return
+        request = getattr(poller, "request_discovery", None)
+        if callable(request):
+            request()
+            self._json(200, {"requested": True, **poller.state.summary()})
+            return
         self._call(lambda: poller.run_once(reason=f"operator {identity[0]}"))
 
     def _admin_revoke_identity(self) -> None:

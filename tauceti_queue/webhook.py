@@ -106,6 +106,16 @@ class WebhookReceiver:
         if delivery.event not in EVENTS or repo not in self.repositories:
             self.ignored += 1
             return "ignored"
+        admission = getattr(self.controller, "admission", None)
+        if admission is not None:
+            try:
+                admission.handle_event(delivery.event, payload)
+            except BaseException:
+                # A failed durable invalidation must be retried on redelivery, not remembered
+                # as successfully handled by the in-memory delivery optimization.
+                with self._lock:
+                    self._seen.pop(delivery.delivery_id, None)
+                raise
         if delivery.event == "issue_comment":
             self._issue_comment(repo, payload)
         elif delivery.event == "pull_request_review":
@@ -117,6 +127,8 @@ class WebhookReceiver:
 
     def _check_run(self, repo: str, payload: dict) -> None:
         """A `merge eligibility` check from the review App is the App's approval or revocation."""
+        if getattr(self.controller, "admission", None) is not None:
+            return  # late legacy publications have no automatic authority after the switch
         pr = eligibility.notification_pr(payload.get("check_run") or {}, repo, review_app_id=self.review_app_id)
         if pr is not None:
             disposition = eligibility.reconcile(
@@ -136,6 +148,8 @@ class WebhookReceiver:
         user = comment.get("user") or {}
         app = comment.get("performed_via_github_app") or {}
         review_app = bool(self.review_app_id) and app.get("id") == self.review_app_id
+        if review_app and getattr(self.controller, "admission", None) is not None:
+            return  # retired automatic exact-head commands cannot compete with primary intake
         context = commands.CommentContext(
             repo=repo,
             pr_number=int(issue.get("number") or 0),

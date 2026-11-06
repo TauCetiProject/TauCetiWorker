@@ -180,6 +180,60 @@ def client(transport, clock=None):
 
 
 class Client(unittest.TestCase):
+    def test_deferred_wait_keeps_original_deadline_and_other_bucket_runs(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/x",
+            403,
+            {},
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1800007200"},
+        )
+        transport.add("POST", "https://api.github.com/graphql", 200, {"data": {"ok": True}})
+        c, clock = client(transport)
+        with c.deferred_requests():
+            with self.assertRaises(ga.RateLimited) as first:
+                c.get_json("x")
+            self.assertEqual((first.exception.resource, first.exception.retry_at), ("core", 1800007201))
+            clock.now += 30
+            with self.assertRaises(ga.RateLimited) as again:
+                c.get_json("a-different-pr")
+            self.assertEqual(again.exception.retry_at, first.exception.retry_at)
+            self.assertEqual(c.graphql("query { ok }"), {"ok": True})
+        self.assertEqual(clock.slept, [])
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_graphql_http_success_rate_error_is_retryable_and_independent(self):
+        transport = FakeTransport()
+        transport.add(
+            "POST",
+            "https://api.github.com/graphql",
+            200,
+            {"errors": [{"type": "RATE_LIMITED", "message": "quota exhausted"}]},
+            {"X-RateLimit-Reset": "1800003600"},
+        )
+        transport.add("GET", "https://api.github.com/x", 200, {"ok": True})
+        c, clock = client(transport)
+        with c.deferred_requests():
+            with self.assertRaises(ga.RateLimited) as limited:
+                c.graphql("query { ok }")
+            self.assertEqual((limited.exception.resource, limited.exception.retry_at), ("graphql", 1800003601))
+            self.assertEqual(c.get_json("x")[1], {"ok": True})
+            with self.assertRaises(ga.RateLimited):
+                c.graphql("query { ok }")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(clock.slept, [])
+
+    def test_short_secondary_wait_is_persistable_without_blocking_intake(self):
+        transport = FakeTransport()
+        transport.add("GET", "https://api.github.com/x", 429, {}, {"Retry-After": "7"})
+        c, clock = client(transport)
+        with c.deferred_requests(), self.assertRaises(ga.RateLimited) as limited:
+            c.get_json("x")
+        self.assertEqual(limited.exception.retry_at, clock.now + 7)
+        self.assertEqual(limited.exception.resource, "secondary")
+        self.assertEqual(clock.slept, [])
+
     def test_records_rate_limit_and_counts(self):
         transport = FakeTransport()
         transport.add(
