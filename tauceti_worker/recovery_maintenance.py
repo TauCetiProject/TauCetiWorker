@@ -645,9 +645,7 @@ def _cleanup(state, tree, root, work, observation=None):
     path = _job_path(state, original)
     job = _read_job(path)
     if not job:
-        job = dict(
-            tree=str(original), phase="save", created_at=tree.stat().st_mtime, next_action="preserve-source", stack=[""]
-        )
+        job = dict(tree=str(original), phase="save", next_action="preserve-source", stack=[""])
     if job.get("tree") != str(original):
         return
     sidecar = original.with_name(original.name + ".owner.json")
@@ -672,10 +670,14 @@ def _cleanup(state, tree, root, work, observation=None):
                 stack=[""],
             )
             return
-        if previous_identity is None:
-            job["created_at"] = max(job.get("created_at", info.st_mtime), info.st_mtime)
+        # _retain writes the owner sidecar when moving the checkout. The tree's
+        # mtime can predate retention by days, including in older cleanup jobs.
+        # Reuse this existing retention timestamp; uncertain attribution gets a
+        # fresh observation, never the age of the warm checkout's root directory.
+        retained_at = sidecar.stat().st_mtime if sidecar.exists() else time.time()
+        job["created_at"] = max(job.get("created_at", retained_at), retained_at)
         job["tree_identity"] = identity
-        if time.time() - job.get("created_at", info.st_mtime) >= RECOVERY_RECORD_TTL:
+        if time.time() - job["created_at"] >= RECOVERY_RECORD_TTL:
             if reason := _safe(state, tree, owner):
                 job["next_action"] = reason
                 return
@@ -1176,7 +1178,8 @@ class Sweep:
                     self.cleanup_pending |= abandon_incomplete(state, path) is not None
                 return  # Temporary writes are not recovery records or operator tasks.
             consumer = read_json(path / "recovery.json")
-            if abandonment_reason(path, consumer):
+            abandon = abandonment_reason(path, consumer)
+            if abandon:
                 self.cleanup_pending |= disposal_pending(path, consumer)
                 if self.cleanup and discard_record(state, path):
                     return
@@ -1192,12 +1195,14 @@ class Sweep:
                 write(path, consumer, "resuming")
                 state_name = "resuming"
             if state_name in {"published", "obsolete", "blocked"}:
-                if state_name == "blocked" and code in RETRYABLE:
-                    # Migrate old infrastructure pauses to ordinary automatic retries.
+                if state_name == "blocked" and (
+                    code in RETRYABLE or not abandon and publication_pending(path, consumer)
+                ):
+                    # Pending publications still reconcile before their source lifetime ends.
                     write(path, consumer, "eligible")
                 else:
                     self.cleanup_pending |= disposal_pending(path, consumer)
-                    if self.cleanup:
+                    if self.cleanup and not abandon:
                         discard_record(state, path)
                     return  # Done records never remain in the operator's task inventory.
             manifest = wr._complete(path, digests=False)
@@ -1488,6 +1493,8 @@ def discard_record(state, record):
         code = (consumer.get("reason") or {}).get("code")
         abandon = abandonment_reason(record, consumer)
         pending_publication = publication_pending(record, consumer)
+        if pending_publication and (not abandon or not disposal_pending(record, consumer)):
+            return False  # Reconcile live intent; evidence alone needs no process/mount scan.
         if not abandon:
             if consumer.get("state") not in {"published", "obsolete", "blocked"} or code in RETRYABLE:
                 return False
