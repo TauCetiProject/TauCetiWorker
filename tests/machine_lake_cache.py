@@ -140,6 +140,18 @@ class MachineCache(unittest.TestCase):
         self.assertGreater(result["pinned_bytes"], 0)
         self.assertGreater(result["retained_bytes"], result["max_bytes"])
 
+    def test_native_executables_without_extensions_follow_requested_retention(self):
+        unpinned = self.artifact("1" * 16)
+        pinned = self.artifact("2" * 16)
+        workspace = self.home / "executable"
+        os.link(pinned, workspace)
+        cache.collect(env=self.env)
+        self.assertTrue(unpinned.exists())
+        cache.collect(env=dict(self.env, TAUCETI_MACHINE_LAKE_CACHE_MAX_GIB="0"))
+        self.assertFalse(unpinned.exists())
+        self.assertTrue(pinned.exists())
+        self.assertEqual(workspace.read_bytes(), b"x" * 8192)
+
     def test_dry_run_preserves_payload_and_metadata(self):
         path = self.artifact()
         env = dict(self.env, TAUCETI_MACHINE_LAKE_CACHE_MAX_GIB="0")
