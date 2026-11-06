@@ -66,7 +66,7 @@ def linked_transcript(directory, session, sessions=None):
     from pathlib import Path
 
     from .claude_api import safe_message
-    from .paths import HERE
+    from .paths import HERE, legacy_data_root
     from .usage_accounting import MAX_CHECKPOINT, UsageJournal
 
     try:
@@ -77,7 +77,7 @@ def linked_transcript(directory, session, sessions=None):
         worker = session["worker"]
         if not worker or Path(worker).name != worker:
             return None
-        roots = [HERE / "state" / worker / "home/.claude/projects"]
+        roots = [legacy_data_root(HERE) / "state" / worker / "home/.claude/projects"]
         if worker == "default":
             roots.append(Path.home() / ".claude/projects")
         if override := os.environ.get("TAUCETI_USAGE_TRANSCRIPT_ROOTS"):

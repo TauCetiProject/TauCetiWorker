@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from .config import Config, Die, legacy_project, log, worker_state_root
-from .paths import HERE, canonical_candidate, self_env
+from .paths import HERE, canonical_candidate, legacy_data_root, self_env
 from .runtime_status import atomic_json, read_json
 
 LIFETIME = 3 * 86400
@@ -366,7 +366,7 @@ def worker_configs():
     """Discover removed workers too; resolve only the roots, not their children."""
     base = Config.resolve()
     root = worker_state_root().resolve()
-    checkout_root = (HERE / "checkouts").resolve() if legacy_project() else root
+    checkout_root = (legacy_data_root(HERE) / "checkouts").resolve() if legacy_project() else root
     ids = (
         {
             p.name
@@ -391,7 +391,7 @@ def worker_configs():
             state=state,
             checkout=checkout,
             data_home=state / "home",
-            logdir=(HERE / "logs").resolve() / wid if legacy_project() else state / "logs",
+            logdir=(legacy_data_root(HERE) / "logs").resolve() / wid if legacy_project() else state / "logs",
         )
 
 

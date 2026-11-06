@@ -94,6 +94,7 @@ RUN_STDLIB=(
   infra_failure_budget.py
   isolate_home_macos.py
   isolate_home_paths.py
+  legacy_data_root.py
   kiro.py
   local_verification_scope.py
   local_axioms.py
