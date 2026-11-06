@@ -193,6 +193,7 @@ def defer_caches(state, record):
             created_at=previous.get("created_at", time.time()),
         ),
     )
+    retention.request_cleanup()
 
 
 def _cleanup_cache_tree(state, tree, registry, work, observation):
@@ -463,6 +464,7 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
                         from .work_recovery import _fsync_dir
 
                         _fsync_dir(tree.parent)
+                    work.removed_entries += 1
                     stack.pop()
                     continue
                 info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
@@ -508,6 +510,7 @@ def _remove_slice(tree, job, work, stack, root_stat, dirty):
                     return False
                 work.charge(removed=size)
                 os.unlink(entry.name, dir_fd=fd)
+                work.removed_entries += 1
                 dirty.add(relative)
             finally:
                 os.close(fd)
@@ -642,9 +645,7 @@ def _cleanup(state, tree, root, work, observation=None):
     path = _job_path(state, original)
     job = _read_job(path)
     if not job:
-        job = dict(
-            tree=str(original), phase="save", created_at=tree.stat().st_mtime, next_action="preserve-source", stack=[""]
-        )
+        job = dict(tree=str(original), phase="save", next_action="preserve-source", stack=[""])
     if job.get("tree") != str(original):
         return
     sidecar = original.with_name(original.name + ".owner.json")
@@ -652,6 +653,49 @@ def _cleanup(state, tree, root, work, observation=None):
     saving_source = False
     validating_source = False
     try:
+        info = tree.stat()
+        identity = [info.st_dev, info.st_ino]
+        previous_identity = job.get("tree_identity")
+        if previous_identity is None and job.get("parked"):
+            previous_identity = job["parked"][0][:2]
+        if previous_identity is not None and previous_identity != identity:
+            # Old removal/parking intent cannot abandon a replacement. Bind a
+            # fresh preservation attempt using the existing journal generation.
+            job = dict(
+                tree=str(original),
+                phase="save",
+                created_at=time.time(),
+                tree_identity=identity,
+                next_action="preserve-replaced-source",
+                stack=[""],
+            )
+            return
+        # _retain writes the owner sidecar when moving the checkout. The tree's
+        # mtime can predate retention by days, including in older cleanup jobs.
+        # Reuse this existing retention timestamp; uncertain attribution gets a
+        # fresh observation, never the age of the warm checkout's root directory.
+        retained_at = sidecar.stat().st_mtime if sidecar.exists() else time.time()
+        job["created_at"] = max(job.get("created_at", retained_at), retained_at)
+        job["tree_identity"] = identity
+        if time.time() - job["created_at"] >= RECOVERY_RECORD_TTL:
+            if reason := _safe(state, tree, owner):
+                job["next_action"] = reason
+                return
+            # The same source lifetime applies before preservation succeeds. An
+            # exhausted owned task need not repair Git metadata to release its copy.
+            directory = state / "recovery-cleanup/discarded"
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / ("abandoned-" + original.name + "-" + uuid.uuid4().hex)
+            atomic_json(
+                sidecar, dict(owner, abandonment_reason="recovery-lifetime-exhausted", abandoned_at=time.time())
+            )
+            tree.rename(target)
+            wr._fsync_dir(original.parent)
+            wr._fsync_dir(directory)
+            path.unlink(missing_ok=True)
+            work.removed_entries += 1
+            retention.request_cleanup()
+            return
         if (
             job.get("parked")
             and job["parked"] == _park_signature(tree, sidecar)
@@ -1134,8 +1178,9 @@ class Sweep:
                     self.cleanup_pending |= abandon_incomplete(state, path) is not None
                 return  # Temporary writes are not recovery records or operator tasks.
             consumer = read_json(path / "recovery.json")
-            if abandonment_reason(path, consumer):
-                self.cleanup_pending = True
+            abandon = abandonment_reason(path, consumer)
+            if abandon:
+                self.cleanup_pending |= disposal_pending(path, consumer)
                 if self.cleanup and discard_record(state, path):
                     return
             from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE, write
@@ -1150,12 +1195,14 @@ class Sweep:
                 write(path, consumer, "resuming")
                 state_name = "resuming"
             if state_name in {"published", "obsolete", "blocked"}:
-                if state_name == "blocked" and code in RETRYABLE:
-                    # Migrate old infrastructure pauses to ordinary automatic retries.
+                if state_name == "blocked" and (
+                    code in RETRYABLE or not abandon and publication_pending(path, consumer)
+                ):
+                    # Pending publications still reconcile before their source lifetime ends.
                     write(path, consumer, "eligible")
                 else:
-                    self.cleanup_pending = True
-                    if self.cleanup:
+                    self.cleanup_pending |= disposal_pending(path, consumer)
+                    if self.cleanup and not abandon:
                         discard_record(state, path)
                     return  # Done records never remain in the operator's task inventory.
             manifest = wr._complete(path, digests=False)
@@ -1326,7 +1373,7 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
                     and not handed_off
                     and code not in RETRYABLE
                 ):
-                    sweep.cleanup_pending = True
+                    sweep.cleanup_pending |= disposal_pending(record, consumer)
                     if cleanup:
                         discard_record(state, record)
             while True:
@@ -1368,7 +1415,10 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
         _CHECKS.reset(checks_token)
     report = work.report()
     report.update(
-        safety_seconds=checks.seconds, process_scans=checks.scans, cleanup_pending=bool(sweep and sweep.cleanup_pending)
+        safety_seconds=checks.seconds,
+        process_scans=checks.scans,
+        cleanup_pending=bool(sweep and sweep.cleanup_pending),
+        sweep_complete=(base if cleanup else (base, "inventory")) not in _SWEEPS,
     )
     with contextlib.suppress(OSError):
         name = ".recovery-housekeeping.json" if cleanup else ".recovery-inventory.json"
@@ -1376,10 +1426,42 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
     return report
 
 
+def publication_pending(record, consumer):
+    from .repair_recovery import normal_publication, uncertain_publication
+
+    return (
+        consumer.get("state") != "published"
+        and not consumer.get("normal_publication_confirmed")
+        and (
+            uncertain_publication(consumer) or normal_publication(record, _metadata(record / "manifest.json"), consumer)
+        )
+    )
+
+
+def disposal_pending(record, consumer):
+    if publication_pending(record, consumer):
+        return any(
+            child.is_dir()
+            and not child.is_symlink()
+            and (child.name == "checkout" or child.name.startswith(("restore-", "interrupted-restore-")))
+            for child in record.iterdir()
+        )
+    return True
+
+
 def abandonment_reason(record, consumer):
     """A fixed source lifetime, independent of retries, journals, funding and worker admission."""
-    if (consumer.get("reason") or {}).get("code") == "content-allowance":
-        return "content-allowance-exhausted"
+    from .repair_recovery import RETRIES
+
+    code = (consumer.get("reason") or {}).get("code")
+    if not publication_pending(record, consumer) and code in {"content-allowance", "recovery-exhausted"}:
+        return code
+    if (
+        not publication_pending(record, consumer)
+        and code == "invocation-failed"
+        and consumer.get("attempts", 0) >= len(RETRIES)
+    ):
+        return "recovery-exhausted"
     manifest = _metadata(record / "manifest.json")
     try:
         # Manifest bytes are immutable; journal/checkpoint activity cannot renew the clock.
@@ -1410,6 +1492,9 @@ def discard_record(state, record):
         consumer = _metadata(record / "recovery.json")
         code = (consumer.get("reason") or {}).get("code")
         abandon = abandonment_reason(record, consumer)
+        pending_publication = publication_pending(record, consumer)
+        if pending_publication and (not abandon or not disposal_pending(record, consumer)):
+            return False  # Reconcile live intent; evidence alone needs no process/mount scan.
         if not abandon:
             if consumer.get("state") not in {"published", "obsolete", "blocked"} or code in RETRYABLE:
                 return False
@@ -1446,6 +1531,30 @@ def discard_record(state, record):
                         return False
             except (OSError, IndexError):
                 return False
+        if pending_publication:
+            # Immutable bundles, patches and intent remain evidence; an abandoned
+            # derived checkout is no longer a consumer and can use ordinary trash.
+            directory = state / "recovery-cleanup/discarded"
+            moved = False
+            for child in record.iterdir():
+                if not (child.name == "checkout" or child.name.startswith(("restore-", "interrupted-restore-"))):
+                    continue
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                directory.mkdir(parents=True, exist_ok=True)
+                child.rename(directory / ("publication-" + record.name + "-" + uuid.uuid4().hex))
+                moved = True
+            if moved:
+                atomic_json(
+                    record / "recovery.json",
+                    dict(consumer, state="obsolete", forensic_only=True, materialization_retired_at=time.time()),
+                )
+                wr._fsync_dir(record)
+                wr._fsync_dir(directory)
+                if work := wr._WORK.get():
+                    work.removed_entries += 1
+                retention.request_cleanup()
+            return moved
         manifest = _metadata(record / "manifest.json")
         directory = state / "recovery-cleanup" / "discarded"
         directory.mkdir(parents=True, exist_ok=True)
@@ -1460,6 +1569,10 @@ def discard_record(state, record):
         # Prepared status can lag the payload sweep. Invalidate this disposable
         # row immediately instead of continuing to display finished task history.
         (state / "recovery-prepared.json").unlink(missing_ok=True)
+        work = wr._WORK.get()
+        if work is not None:
+            work.removed_entries += 1
+        retention.request_cleanup()
         return True
 
 

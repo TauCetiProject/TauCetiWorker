@@ -99,6 +99,30 @@ class Storage(Receipts):
             job["source_digest"],
         )
 
+    def test_compacted_terminal_candidate_is_retired_but_pending_reference_survives(self):
+        pending, job, tree = self.pending()
+        terminal = self.state / "verification-jobs" / pending.name
+        v.atomic(terminal, {**job, "status": "success"})
+        pending.unlink()
+        self.collect()  # release build outputs first
+        self.assertTrue(tree.exists())
+        other = self.state / "verification-pending" / ("f" * 32 + ".json")
+        v.atomic(other, dict(root=str(tree), status="pending"))
+        self.collect()
+        self.assertTrue(tree.exists())
+        other.unlink()
+        with locked(self.state / "verification-jobs" / f"{job['id']}.lock"):
+            self.collect()
+            self.assertTrue(tree.exists())
+        for _ in range(6):
+            self.collect()
+            if not tree.exists():
+                break
+        self.assertFalse(tree.exists())
+        self.assertTrue(terminal.exists())
+        self.assertTrue(Path(job["receipt"]).exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
+
     def test_active_job_and_receipt_leases_prevent_removal(self):
         write(self.root, ".lake/build/keep.olean", "active")
         _, job, tree = self.pending()
@@ -995,8 +1019,9 @@ class Storage(Receipts):
         self.assertTrue((tree / ".lake/build/oversized").exists())
         self.collect()
         self.collect()
-        self.assertFalse((tree / ".lake/build/oversized").exists())
-        self.assertTrue((tree / "TauCeti/A.lean").exists())
+        self.assertFalse(tree.exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
+        self.assertTrue(Path(job["receipt"]).exists())
 
     def test_cleanup_target_combinations_do_not_restrict_admission(self):
         with patch.dict(

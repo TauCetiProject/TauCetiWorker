@@ -549,6 +549,35 @@ def _observe_users(tree, work):
         wr._WORK.reset(token)
 
 
+def _retire_candidate(state, identifier, tree, job, journal, work):
+    """Release a finished task's copy; its job, receipt and original source survive."""
+    from . import recovery_maintenance as maintenance
+
+    if maintenance._referenced(state, tree):
+        return "pending-reference"
+    progress = read_json(journal)
+    retirement = progress.get("retire-candidate")
+    if retirement is None:
+        # This is a terminal isolated verification copy, not the agent's source
+        # workspace. Do not create another recovery task just to dispose of it.
+        atomic_json(
+            state / "verification-jobs" / f"{identifier}.json", dict(job, materialization_retired_at=time.time())
+        )
+        info = tree.stat()
+        retirement = dict(tree_identity=[info.st_dev, info.st_ino], stack=[""])
+        progress["retire-candidate"] = retirement
+        atomic_json(journal, progress)
+    try:
+        if maintenance._remove(tree, retirement, work):
+            release(state, identifier)
+            journal.unlink(missing_ok=True)
+            return "candidate-retired"
+        return "resume-candidate-retirement"
+    finally:
+        if tree.exists():
+            atomic_json(journal, progress)
+
+
 def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evict=False):
     from . import recovery_maintenance as maintenance
     from . import work_recovery as wr
@@ -557,14 +586,14 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
 
     tree = candidate(state, identifier)
     journal = state / "verification-storage" / f"{identifier}.json"
-    pending = read_json(state / "verification-pending" / f"{identifier}.json")
-    terminal = read_json(state / "verification-jobs" / f"{identifier}.json")
-    job = pending or terminal
-    if job and (job.get("schema") != "tauceti-verification-job/v1" or job.get("id") != identifier):
-        job = {}
     with contextlib.ExitStack() as stack:
         stack.enter_context(locked(state / "verification-jobs" / f"{identifier}.lock"))
         stack.enter_context(locked(state / "verification-storage" / f"{identifier}.lock"))
+        pending = read_json(state / "verification-pending" / f"{identifier}.json")
+        terminal = read_json(state / "verification-jobs" / f"{identifier}.json")
+        job = pending or terminal
+        if job and (job.get("schema") != "tauceti-verification-job/v1" or job.get("id") != identifier):
+            job = {}
         if lease := job.get("lease"):
             lease = Path(lease)
             if lease.is_relative_to("/opt/verification-state"):
@@ -584,6 +613,8 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
         target = canonical_candidate(tree)
         if mounts is None or any(point == target or point.is_relative_to(target) for point in mounts):
             return "mounted"
+        if terminal and not pending and job.get("isolated") and evict and row.get("compact"):
+            return _retire_candidate(state, identifier, tree, job, journal, work)
         copy_marker = state / "verification-copy-incomplete" / f"{identifier}.json"
         construction = read_json(copy_marker)
         if (
@@ -915,9 +946,9 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
                 and not row.get("dependency_cache_evicted")
                 and (state / "verification-pending" / f"{identifier}.json").exists()
             )
-            if row.get("compact") and not drop_dependencies and identity not in continuing:
-                continue
             terminal, last_used = metadata[identity]
+            if row.get("compact") and not terminal and not drop_dependencies and identity not in continuing:
+                continue
             ttl = setting("COMPLETED_CACHE_SECONDS", 900) if terminal else setting("IDLE_CACHE_SECONDS", 21600)
             early_terminal_cleanup = terminal and (
                 excess > work.removed_bytes or observed(row) > setting("CANDIDATE_BYTES", 32 * GIB)

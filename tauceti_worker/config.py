@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .constants import MAX_OPEN_PRS, ROADMAP, ROADMAP_DIR, TAUCETI
-from .paths import HERE
+from .paths import HERE, legacy_data_root
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
 
@@ -194,7 +194,7 @@ def legacy_project() -> bool:
 
 def worker_state_root() -> Path:
     if legacy_project():
-        return HERE / "state"
+        return legacy_data_root(HERE) / "state"
     return Path(os.environ["TAUCETI_PROJECT_STATE"]) / "workers"
 
 
@@ -292,12 +292,12 @@ class Config:
             home=h,
             data_home=dh,
             state=state,
-            checkout=(HERE / "checkouts" / wid / "TauCeti")
+            checkout=(legacy_data_root(HERE) / "checkouts" / wid / "TauCeti")
             if legacy_project()
             else worker_state_root() / wid / "checkout",
             store_dir=dh / ".cache" / "tauceti-review" / wid / "store" / TAUCETI.replace("/", "__"),
             sbcache=state / "cache" / "scoreboard",
-            logdir=(HERE / "logs" / wid) if legacy_project() else state / "logs",
+            logdir=(legacy_data_root(HERE) / "logs" / wid) if legacy_project() else state / "logs",
             quota_cache=state / "cache",
         )
 

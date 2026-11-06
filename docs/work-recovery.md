@@ -414,15 +414,14 @@ without model funding, with a shared thirty-minute scheduling throttle so a bloc
 backlog cannot continuously replace normal work. Checks observe PR closure or head changes
 through the existing shared state service, without a direct GitHub fallback or
 payload hashing. Infrastructure retries back off for
-60, 300 and 1800 seconds. Failed invocations remain eligible for scheduled mechanical
-rechecks, even without model funding. They never become a permanent blocked task and
-do not evict their warm artifacts on an infrastructure pause.
-Cumulative failure counts
-remain recorded; unchanged repeated infrastructure failures increase backoff
-up to six hours. Repeated exact-input verification failures also increase their
-mechanical recheck interval up to six hours, even when source and funding have
-not changed. Changed external facts reset this delay. Exhausted content allowances permit mechanical reevaluation
-and normal work, without authorizing another identical paid attempt.
+60, 300 and 1800 seconds. After the existing three-invocation allowance is spent,
+source recovery becomes obsolete and its private materialization is discarded by
+the existing collector. Exhausted content allowances use the same abandonment
+path. Fresh normal work continues. Active handoffs remain owned by the receiving
+round; uncertain publication retains its intent and reconciliation evidence and
+cannot authorize a new content attempt. The existing source lifetime still ends
+source repair: derived checkouts enter discarded storage while immutable source
+records and uncertain publication intent remain as compact evidence.
 Claim, capacity, policy, budget and content waits do not consume infrastructure
 attempts. Content remains bounded by the original workflow's existing counters.
 Consumer protocol 3 automatically re-evaluates older operator-dependent blocks

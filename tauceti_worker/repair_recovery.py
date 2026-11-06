@@ -30,7 +30,7 @@ RETRIES = (60, 300, 1800)
 MAX_INSPECT = 8
 RESERVATION_SECONDS = 300
 PROTOCOL = 3
-RETRYABLE = {"invocation-failed", "recovery-exhausted", "content-allowance", "publication-revalidation-failed"}
+RETRYABLE = {"invocation-failed", "publication-revalidation-failed"}
 ACTIVE_HANDOFF = {"source-handed-to-normal-round", "source-handoff-source-pending", "source-handoff-reconciliation"}
 HOLDS = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
 LOCAL_WAITS = {"work-policy", "pr-policy", "profile-policy", "roadmap-policy"}
@@ -101,6 +101,13 @@ def write(record, journal, state, **fields):
     handoff = fields.get("handoff", journal.get("handoff")) or {}
     if state == "obsolete" and handoff.get("state") == "offered" and code in ACTIVE_HANDOFF:
         state = "resuming"  # a live source handoff is active work, never finished history
+    if (
+        code in {"content-allowance", "recovery-exhausted"}
+        and handoff.get("state") != "offered"
+        and not uncertain_publication(journal)
+        and not normal_publication(record, {}, journal)
+    ):
+        state = "obsolete"
     if state == "blocked" and code in RETRYABLE:
         state = "eligible"
     journal.update(
@@ -242,6 +249,12 @@ class Recovery:
                 ),
             )
             return False
+        from .recovery_maintenance import abandonment_reason
+
+        if exhausted := abandonment_reason(self.record, j):
+            self.transition("obsolete", reason=reason(Obsolete(exhausted, "Abandoned recovery; select fresh work")))
+            b.evict_caches(self.record)
+            return False
         if j.get("protocol") != PROTOCOL:
             # Re-evaluate old operator-dependent dispositions under autonomous rules,
             # without resetting either paid content counters or infrastructure failures.
@@ -252,7 +265,12 @@ class Recovery:
             return False
         charged = False
         try:
-            facts = b.facts(m)
+            try:
+                facts = b.facts(m)
+            except Wait:
+                raise
+            except Exception as error:
+                raise Wait("metadata-unavailable", f"Await current PR state: {error}") from error
             j["observed_head"] = facts["head"]
             normal_pending = normal_publication(self.record, m, j)
             if normal_pending:
@@ -319,21 +337,13 @@ class Recovery:
                     "post-publication-leftovers",
                     "The original round already published through git-safe-push; these later edits have no publication authorization",
                 )
-            if j.get("attempts", 0) >= 3:
-                recheck = j.get("mechanical_recheck_at") or time.time() + RETRIES[-1]
-                if time.time() < recheck:
-                    self.transition(
-                        "blocked",
-                        reason=dict(
-                            code="recovery-exhausted",
-                            detail="Three infrastructure failures; scheduled mechanical reevaluation precedes any further source reasoning",
-                            next_action="scheduled-mechanical-recheck",
-                        ),
-                        mechanical_recheck_at=recheck,
-                        retry_at=recheck,
+            if j.get("attempts", 0) >= len(RETRIES):
+                if uncertain_publication(j):
+                    raise Wait(
+                        "publication-revalidation-failed",
+                        "Source recovery exhausted; reconcile the existing publication before selecting fresh work",
                     )
-                    return False
-                self.transition("eligible", attempts=0, mechanical_recheck_at=None, reason=None)
+                raise Obsolete("recovery-exhausted", "Recovery allowance exhausted; select fresh work")
             if j.get("retry_at", 0) > time.time() and not changed_selection:
                 return False
             prior_checkout = self.record / "checkout"
@@ -463,9 +473,16 @@ class Recovery:
                 next_action="scheduled-mechanical-recheck" if attempts >= 3 else "retry-infrastructure",
                 retry_when="scheduled-backoff-or-changed-authorized-external-facts",
             )
-            # Infrastructure failures always retry automatically. The delay is
-            # bounded; exhausting invocation attempts never parks a recovery.
-            state = "eligible"
+            # Spend the existing allowance once. Uncertain publication still needs
+            # reconciliation, but failed source recovery must not retry forever.
+            exhausted = (
+                attempts >= len(RETRIES)
+                and not uncertain_publication(j)
+                and not normal_publication(self.record, m or {}, j)
+            )
+            state = "obsolete" if exhausted else "eligible"
+            if exhausted:
+                failure.update(code="recovery-exhausted", next_action="continue-normal-selection", retry_when=None)
             self.transition(
                 state,
                 attempts=attempts,
@@ -544,7 +561,7 @@ class WorkerBackend:
             with read_context(fresh=True, direct=True):
                 data = self.w.gh.pr_view(m["pr"], fields)
         if not data:
-            raise RuntimeError("Cannot read current PR state")
+            raise Wait("metadata-unavailable", "Await current PR state; no source recovery attempt was made")
         return dict(
             head=data["headRefOid"],
             state=data["state"],

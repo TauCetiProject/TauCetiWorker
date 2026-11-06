@@ -11,11 +11,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from .config import Config, Die, legacy_project, log, worker_state_root
-from .paths import HERE, canonical_candidate, self_env
+from .paths import HERE, canonical_candidate, legacy_data_root, self_env
 from .runtime_status import atomic_json, read_json
 
 LIFETIME = 3 * 86400
@@ -259,6 +260,60 @@ def collect_retired(cfg, report, *, now, dry=False, discard_checkout=False):
     note(report, "protected", f"{parent}: queued for bounded recovery housekeeping")
 
 
+def collect_review_scratch(cfg, report, *, dry=False):
+    """Only worker-owned review inputs; review results and outboxes live elsewhere."""
+    from . import work_recovery as recovery
+
+    parent = cfg.state / "review-work"
+    for path in children(parent, report):
+        if not path.name.startswith("review-") or path.is_symlink() or not path.is_dir():
+            continue
+        try:
+            with locked(path / "live.lock", dry=dry):
+                owner = read_json(path / "owner.json")
+                if not (owner.get("finished") or recovery.owner_stopped(owner.get("process"))) or recovery.live_users(
+                    path
+                ):
+                    note(report, "protected", str(path))
+                    continue
+                mounts = mount_points()
+                if mounts is None or any(p == path.resolve() or p.is_relative_to(path.resolve()) for p in mounts):
+                    note(report, "protected", str(path))
+                    continue
+                if not dry:
+                    discarded = cfg.state / "recovery-cleanup/discarded"
+                    discarded.mkdir(parents=True, exist_ok=True)
+                    path.rename(discarded / path.name)
+                    recovery._fsync_dir(discarded)
+                    recovery._fsync_dir(parent)
+                    request_cleanup()
+                note(report, "removed", str(path))
+        except (BlockingIOError, FileNotFoundError):
+            continue
+        except OSError as error:
+            note(report, "errors", f"{path}: {error}")
+
+
+@contextlib.contextmanager
+def review_workspace(cfg):
+    from .work_recovery import process_owner
+
+    parent = cfg.state / "review-work"
+    parent.mkdir(parents=True, exist_ok=True)
+    collect_review_scratch(cfg, fresh_report())
+    path = Path(tempfile.mkdtemp(prefix="review-", dir=parent))
+    atomic_json(path / "owner.json", dict(process=process_owner()))
+    try:
+        with locked(path / "live.lock"):
+            yield path
+    finally:
+        # The subprocess has exited. A fresh process observation still protects
+        # any independently surviving reviewer that has not released its inputs.
+        with contextlib.suppress(OSError):
+            atomic_json(path / "owner.json", dict(finished=True))
+            collect_review_scratch(cfg, fresh_report())
+
+
 def recycle(cfg, *, now=None, dry=False):
     """At a round boundary, a generation expires even if short rounds kept using it."""
     now = time.time() if now is None else now
@@ -366,7 +421,7 @@ def worker_configs():
     """Discover removed workers too; resolve only the roots, not their children."""
     base = Config.resolve()
     root = worker_state_root().resolve()
-    checkout_root = (HERE / "checkouts").resolve() if legacy_project() else root
+    checkout_root = (legacy_data_root(HERE) / "checkouts").resolve() if legacy_project() else root
     ids = (
         {
             p.name
@@ -391,7 +446,7 @@ def worker_configs():
             state=state,
             checkout=checkout,
             data_home=state / "home",
-            logdir=(HERE / "logs").resolve() / wid if legacy_project() else state / "logs",
+            logdir=(legacy_data_root(HERE) / "logs").resolve() / wid if legacy_project() else state / "logs",
         )
 
 
@@ -412,7 +467,7 @@ def referenced_attempt(cfg, attempt):
     return False
 
 
-def sweep(*, dry=False, now=None, diagnostics_only=False):
+def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_configs=None):
     from . import activity, shared_mathlib
 
     now = time.time() if now is None else now
@@ -445,21 +500,32 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
                     note(report, "errors", "recovery trash: " + error)
             except Exception as error:
                 note(report, "errors", f"recovery trash cleanup: {error}")
-        from .cache_storage import collect
+        if shared:
+            from .cache_storage import collect
 
-        try:
-            storage = collect(configs, dry=dry, now=now, opened=opened)
-            merge_report(report, storage)
-            report.update(
-                {
-                    key: value
-                    for key, value in storage.items()
-                    if key
-                    not in ("at", "removed", "protected", "errors", "removed_count", "protected_count", "errors_count")
-                }
-            )
-        except (OSError, ValueError) as error:
-            note(report, "errors", f"shared cache cleanup: {error}")
+            try:
+                storage = collect(
+                    configs if shared_configs is None else shared_configs, dry=dry, now=now, opened=opened
+                )
+                merge_report(report, storage)
+                report.update(
+                    {
+                        key: value
+                        for key, value in storage.items()
+                        if key
+                        not in (
+                            "at",
+                            "removed",
+                            "protected",
+                            "errors",
+                            "removed_count",
+                            "protected_count",
+                            "errors_count",
+                        )
+                    }
+                )
+            except (OSError, ValueError) as error:
+                note(report, "errors", f"shared cache cleanup: {error}")
         from . import verification_storage
 
         states = [state for cfg in configs for state in (cfg.state, cfg.state / "verification-state")]
@@ -468,6 +534,7 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
         )
 
     for cfg in configs:
+        collect_review_scratch(cfg, report, dry=dry)
         try:
             if not safe(cfg.state, cfg.state.parent):
                 continue
@@ -536,35 +603,36 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     try:
         for key in (
             ()
-            if diagnostics_only or not (shared_mathlib.root() / "entries").is_dir()
+            if not shared or diagnostics_only or not (shared_mathlib.root() / "entries").is_dir()
             else shared_mathlib.collect(shared_mathlib.root(), max_age=LIFETIME, now=now, dry_run=dry)
         ):
             note(report, "removed", str(shared_mathlib.root() / "entries" / key))
     except OSError as error:
         note(report, "errors", str(error))
-    from .worker_manager import workers_state_dir
+    if shared:
+        from .worker_manager import workers_state_dir
 
-    log_root = workers_state_dir().resolve() / "logs"
-    if opened is None:
-        note(report, "protected", str(log_root))
-    else:
-        for directory in children(log_root, report):
-            try:
-                if directory.is_symlink() or not directory.is_dir():
-                    continue
-            except OSError as error:
-                note(report, "errors", f"{directory}: {error}")
-                continue
-            for path in children(directory, report):
+        log_root = workers_state_dir().resolve() / "logs"
+        if opened is None:
+            note(report, "protected", str(log_root))
+        else:
+            for directory in children(log_root, report):
                 try:
-                    if not path.name.startswith("work-") or path.suffix != ".log":
+                    if directory.is_symlink() or not directory.is_dir():
                         continue
-                    if not path.is_symlink() and path.is_file() and now - path.stat().st_mtime >= LIFETIME:
-                        remove(path, log_root, report, dry=dry, opened=opened, mounts=mounts)
-                except FileNotFoundError:
-                    continue
                 except OSError as error:
-                    note(report, "errors", f"{path}: {error}")
+                    note(report, "errors", f"{directory}: {error}")
+                    continue
+                for path in children(directory, report):
+                    try:
+                        if not path.name.startswith("work-") or path.suffix != ".log":
+                            continue
+                        if not path.is_symlink() and path.is_file() and now - path.stat().st_mtime >= LIFETIME:
+                            remove(path, log_root, report, dry=dry, opened=opened, mounts=mounts)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as error:
+                        note(report, "errors", f"{path}: {error}")
     if not dry:
         base = worker_state_root()
         while not base.exists():
@@ -585,9 +653,14 @@ def request_cleanup():
             return  # Do not invoke a global unit for an uninstalled/isolated project.
         with locked(directory / "cleanup-request.lock"):
             marker = directory / "cleanup-request.json"
-            if time.time() - read_json(marker).get("at", 0) < 300:
+            previous = read_json(marker)
+            now = time.time()
+            start = now - previous.get("started_at", previous.get("at", 0)) >= 300
+            atomic_json(
+                marker, dict(at=now, started_at=now if start else previous.get("started_at", previous.get("at", 0)))
+            )
+            if not start:
                 return
-            atomic_json(marker, dict(at=time.time()))
             subprocess.run(
                 ["systemctl", "--user", "start", "--no-block", "tauceti-cleanup.service"],
                 capture_output=True,
@@ -606,12 +679,107 @@ def pressure_cleanup():
         log(f"retention: disk-pressure cleanup deferred: {error}")
 
 
+def free_bytes(path):
+    while not path.exists():
+        path = path.parent
+    return shutil.disk_usage(path).free
+
+
+def pending_work(base):
+    """Prepared counts and immediate queue entries, never materialized-tree walks."""
+    from .recovery_maintenance import cached_summary
+
+    result = dict(recovery_backlog=cached_summary(base)["cleanup_backlog"], discarded_trees=0, verification_jobs=0)
+    for state in base.iterdir() if base.is_dir() else ():
+        if state.is_symlink() or not state.is_dir():
+            continue
+        for member in (state, state / "verification-state"):
+            result["discarded_trees"] += sum(
+                path.is_dir() and not path.is_symlink() for path in (member / "recovery-cleanup/discarded").glob("*")
+            )
+            result["verification_jobs"] += sum(1 for _ in (member / "verification-pending").glob("*.json"))
+    return result
+
+
+def drain_pending(reports, *, once=False):
+    """Round-robin existing deletion slices without repeating expensive inventories."""
+    from . import recovery_maintenance, verification_storage
+    from .activity import root
+
+    previous = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
+    requested_at = time.time()
+    pending = list(reports)
+    extra_requested = False
+    try:
+        while pending:
+            again = []
+            for path, report in pending:
+                os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
+                totals = report.setdefault("drain", dict(slices=0, removed_bytes=0, removed_entries=0))
+                try:
+                    states = [
+                        member for cfg in worker_configs() for member in (cfg.state, cfg.state / "verification-state")
+                    ]
+                    recovery = recovery_maintenance.prepare(
+                        worker_state_root().resolve(),
+                        seconds=30,
+                        entries=262144,
+                        bytes=1024**3,
+                        removal_bytes=32 * 1024**3,
+                    )
+                    trash = recovery_maintenance.collect_discarded(worker_state_root().resolve())
+                    verification = verification_storage.housekeep(
+                        states,
+                        seconds=1,
+                        entries=8192,
+                        removal_bytes=1024**3,
+                        now=time.time(),
+                    )
+                    totals["slices"] += 1
+                    progress = 0
+                    for result in (recovery, trash, verification.get("work", {})):
+                        for key in ("removed_bytes", "removed_entries"):
+                            amount = result.get(key, 0)
+                            totals[key] += amount
+                            progress += amount
+                    for error in trash.get("errors", []) + verification.get("errors", []):
+                        note(report, "errors", str(error))
+                    scanning = not recovery.get("sweep_complete", True) and recovery.get("metadata_entries", 0) > 0
+                    if progress or scanning:
+                        again.append((path, report))
+                    report["free_bytes"] = shutil.disk_usage(worker_state_root()).free
+                except Exception as error:
+                    note(report, "errors", f"{path}: {error}")
+            if once:
+                break
+            requested = read_json(root() / "cleanup-request.json").get("at", 0)
+            if requested > requested_at and (again or not extra_requested):
+                requested_at = requested
+                extra_requested = not bool(again)
+                pending = list(reports)
+            else:
+                pending = again
+    finally:
+        if previous is None:
+            os.environ.pop("TAUCETI_LEGACY_DATA_ROOT", None)
+        else:
+            os.environ["TAUCETI_LEGACY_DATA_ROOT"] = previous
+
+
 def run(*, dry=False, diagnostics_only=False):
     from .activity import pin_root, root
 
     pin_root()
     with locked(root() / "cleanup.lock", dry=dry):
-        return sweep(dry=dry, diagnostics_only=diagnostics_only)
+        before = free_bytes(worker_state_root())
+        report = sweep(dry=dry, diagnostics_only=diagnostics_only)
+        report["free_before_bytes"] = before
+        if not dry and not diagnostics_only:
+            drain_pending([(legacy_data_root(HERE), report)])
+            report["pending_work"] = pending_work(worker_state_root())
+            report["free_bytes"] = free_bytes(worker_state_root())
+            atomic_json(root() / "cleanup.json", report)
+        return report
 
 
 def install_timer():
@@ -636,6 +804,7 @@ def install_timer():
         in {
             "PYTHONPATH",
             "TAUCETI_PROJECT_STATE",
+            "TAUCETI_LEGACY_DATA_ROOT",
             "TAUCETI_REPO",
             "TAUCETI_ACTIVITY_DIR",
             "TAUCETI_SHARED_MATHLIB_ROOT",
@@ -648,7 +817,10 @@ def install_timer():
     )
     (directory / "tauceti-cleanup.service").write_text(
         "[Unit]\nDescription=Reclaim retired TauCeti worker data\n[Service]\nType=oneshot\nNice=10\n"
-        "IOSchedulingClass=idle\nExecStart=" + " ".join(map(quote, self_argv("cleanup"))) + "\n" + extra
+        "IOSchedulingClass=idle\nExecStart="
+        + " ".join(map(quote, self_argv("cleanup", "--all-data-roots")))
+        + "\n"
+        + extra
     )
     (directory / "tauceti-cleanup.timer").write_text(
         "[Unit]\nDescription=Hourly TauCeti cleanup\n[Timer]\nOnCalendar=hourly\nPersistent=true\n"
@@ -668,12 +840,91 @@ def install_timer():
     atomic_json(root() / "cleanup-service.json", dict(installed=True))
 
 
+def data_roots():
+    """Current selection plus already-owned Fleet roots; upgrades may add aliases."""
+    from .paths import legacy_data_root
+
+    selected = legacy_data_root(HERE).resolve()
+    roots = {selected}
+    if not legacy_project():
+        return [selected]
+    fleet = Config.resolve().home / ".local/share/tauceti-fleet"
+    registry = read_json(fleet / "worker-data/roots.json").get("roots", {})
+    candidates = list(registry.values()) if isinstance(registry, dict) else []
+    candidates += list((fleet / "worker-runtimes").glob("*/lib/python*/site-packages/tauceti_worker"))
+    for value in candidates:
+        if not isinstance(value, (str, Path)):
+            continue
+        path = Path(value).resolve()
+        if (
+            path.is_relative_to(fleet.resolve())
+            and path.is_dir()
+            and any((path / name).is_dir() for name in ("state", "checkouts"))
+        ):
+            roots.add(path)
+    return [selected, *sorted(roots - {selected})]
+
+
+def run_all(*, dry=False):
+    """One collector covers current and retired roots, with fair deletion slices."""
+    from .activity import pin_root, root
+
+    if not legacy_project():
+        return run(dry=dry)
+    pin_root()
+    previous = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
+    report = fresh_report()
+    report["roots"] = []
+    report["free_before_bytes"] = free_bytes(worker_state_root())
+    with locked(root() / "cleanup.lock", dry=dry):
+        try:
+            paths = data_roots()
+            configs = []
+            for path in paths:
+                os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
+                configs.extend(worker_configs())
+            initial = {path: dict(free_before_bytes=free_bytes(path)) for path in paths}
+            if not dry:
+                # Exact queued disposal must not wait behind shared-cache inventory.
+                drain_pending(list(initial.items()), once=True)
+            for index, path in enumerate(paths):
+                os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
+                try:
+                    result = sweep(dry=dry, shared=index == 0, shared_configs=configs)
+                except Exception as error:
+                    result = fresh_report()
+                    note(result, "errors", str(error))
+                result["free_before_bytes"] = initial[path]["free_before_bytes"]
+                if "drain" in initial[path]:
+                    result["drain"] = initial[path]["drain"]
+                report["roots"].append(dict(path=str(path), **result))
+            if not dry:
+                drain_pending([(Path(result["path"]), result) for result in report["roots"]])
+            for result in report["roots"]:
+                base = Path(result["path"]) / "state"
+                try:
+                    result["pending_work"] = pending_work(base)
+                    result["free_bytes"] = free_bytes(base)
+                except (OSError, ValueError, TypeError) as error:
+                    note(result, "errors", f"pending-work report: {error}")
+                merge_report(report, result)
+        finally:
+            if previous is None:
+                os.environ.pop("TAUCETI_LEGACY_DATA_ROOT", None)
+            else:
+                os.environ["TAUCETI_LEGACY_DATA_ROOT"] = previous
+        report["free_bytes"] = free_bytes(worker_state_root())
+        if not dry:
+            atomic_json(root() / "cleanup.json", report)
+    return report
+
+
 def cmd_cleanup(args):
     if args.install_timer:
         install_timer()
         return 0
     try:
-        report = run(dry=args.dry_run)
+        report = (run_all if args.all_data_roots else run)(dry=args.dry_run)
     except BlockingIOError:
         raise Die("cleanup is already running") from None
     print(json.dumps(report, indent=2))

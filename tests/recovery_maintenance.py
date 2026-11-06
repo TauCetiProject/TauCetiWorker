@@ -90,7 +90,6 @@ class RecoveryMaintenance(unittest.TestCase):
             {},
             dict(state="eligible", reason=dict(code="invocation-failed"), retry_at=time.time() + 999999),
             dict(state="resuming", handoff=dict(state="offered"), reason=dict(code="source-handoff-source-pending")),
-            dict(state="publication-pending", publication=dict(oid="unconfirmed", push_started=True)),
         ):
             with self.subTest(journal=journal):
                 self.dirty()
@@ -103,6 +102,53 @@ class RecoveryMaintenance(unittest.TestCase):
                     self.tick()
                 self.assertFalse(record.exists())
                 self.assertEqual(json.loads(outbox.read_text()), dict(pending=True))
+
+    def test_exhausted_recovery_retires_but_uncertain_publication_survives(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        exhausted = dict(state="eligible", attempts=3, reason=dict(code="invocation-failed"))
+        maintenance.atomic_json(record / "recovery.json", exhausted)
+        self.assertEqual(maintenance.abandonment_reason(record, exhausted), "recovery-exhausted")
+        for publication in [
+            dict(publication=dict(oid="unconfirmed", push_started=True)),
+            dict(normal_publication=dict(oid="unconfirmed", expected="old", ref="main")),
+        ]:
+            journal = exhausted | publication
+            maintenance.atomic_json(record / "recovery.json", journal)
+            self.expire_record(record)
+            self.assertEqual(maintenance.abandonment_reason(record, journal), "recovery-lifetime-exhausted")
+            checkout = record / "checkout"
+            checkout.mkdir(exist_ok=True)
+            (checkout / "derived").write_text("disposable")
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            self.assertTrue(record.exists())
+            self.assertFalse(checkout.exists())
+            self.assertEqual(maintenance._metadata(record / "recovery.json")["state"], "obsolete")
+            self.assertFalse(maintenance.disposal_pending(record, journal))
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        maintenance.atomic_json(record / "recovery.json", exhausted)
+        self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+        self.assertFalse(record.exists())
+
+    def test_legacy_blocked_publication_reconciles_before_lifetime_expiry(self):
+        for code in ("content-allowance", "recovery-exhausted"):
+            self.dirty()
+            record = wr.guard(self.cfg, self.co).record
+            journal = dict(
+                state="blocked", reason=dict(code=code), publication=dict(oid="unconfirmed", push_started=True)
+            )
+            maintenance.atomic_json(record / "recovery.json", journal)
+            checkout = record / "checkout"
+            checkout.mkdir(exist_ok=True)
+            with patch.object(wr, "live_users", side_effect=AssertionError("not ready for disposal")):
+                self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+            self.tick()
+            self.assertTrue(checkout.exists())
+            self.assertEqual(maintenance._metadata(record / "recovery.json")["state"], "eligible")
+            self.expire_record(record)
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            with patch.object(wr, "live_users", side_effect=AssertionError("evidence needs no process scan")):
+                self.assertFalse(maintenance.discard_record(self.cfg.state, record))
 
     def test_native_cleanup_restart_progresses_past_slow_fresh_records(self):
         base = self.cfg.state.parent
@@ -845,6 +891,90 @@ print(json.dumps(dict(owner=owner, child=child)), flush=True)
         self.assertFalse(tree.exists())
         saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
         self.restored(saved, expected)
+
+    def test_recent_retention_of_old_directory_saves_source_before_abandonment(self):
+        expected = self.dirty()
+        old = time.time() - 3 * maintenance.RECOVERY_RECORD_TTL
+        os.utime(self.co, (old, old))
+        tree = self.retained()
+        # Old collector versions also derived the job clock from the root mtime.
+        maintenance._write_job(
+            maintenance._job_path(self.cfg.state, tree),
+            dict(tree=str(tree), phase="save", created_at=old, stack=[""]),
+        )
+        self.tick()
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+        owner = maintenance._metadata(tree.with_name(tree.name + ".owner.json"))
+        self.assertNotIn("abandonment_reason", owner)
+
+    def test_expired_intent_cannot_abandon_a_younger_replacement(self):
+        self.dirty()
+        tree = self.retained()
+        info = tree.stat()
+        path = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            path,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[info.st_dev, info.st_ino],
+            ),
+        )
+        replacement = self.root / "replacement"
+        shutil.copytree(tree, replacement)
+        (replacement / "Draft.lean").write_text("younger unrelated source")
+        tree.rename(self.root / "old-retained")
+        replacement.rename(tree)
+        with patch.object(wr, "inspect", side_effect=AssertionError("stale intent cannot authorize new source work")):
+            self.tick()
+        self.assertTrue(tree.exists())
+        self.assertEqual((tree / "Draft.lean").read_text(), "younger unrelated source")
+        job = maintenance._read_job(path)
+        self.assertEqual(job["tree_identity"], [tree.stat().st_dev, tree.stat().st_ino])
+        self.assertLess(time.time() - job["created_at"], maintenance.RECOVERY_RECORD_TTL)
+
+    def test_expired_owned_retained_tree_needs_no_git_salvage(self):
+        self.dirty()
+        tree = self.retained()
+        shutil.rmtree(tree / ".git")
+        job = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            job,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[tree.stat().st_dev, tree.stat().st_ino],
+            ),
+        )
+        old = time.time() - maintenance.RECOVERY_RECORD_TTL - 1
+        os.utime(tree.with_name(tree.name + ".owner.json"), (old, old))
+        with patch.object(wr, "inspect", side_effect=AssertionError("abandoned task must not need salvage")):
+            self.tick()
+        self.assertFalse(tree.exists())
+        owner = maintenance._metadata(tree.with_name(tree.name + ".owner.json"))
+        self.assertEqual(owner["abandonment_reason"], "recovery-lifetime-exhausted")
+        self.assertFalse(job.exists())
+
+    def test_expired_retained_tree_still_waits_for_owner_evidence(self):
+        self.dirty()
+        tree = self.retained()
+        tree.with_name(tree.name + ".owner.json").unlink()
+        job = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            job,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[tree.stat().st_dev, tree.stat().st_ino],
+            ),
+        )
+        self.tick()
+        self.assertTrue(tree.exists())
+        self.assertEqual(maintenance._read_job(job)["next_action"], "await-owner")
 
     def test_parked_candidates_do_not_repeat_source_analysis(self):
         self.dirty()
