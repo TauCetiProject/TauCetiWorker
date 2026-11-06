@@ -724,6 +724,7 @@ class TaskState:
         self.path = directory / "task.json"
         self.session_path = directory / "session.json"
         self.task = task
+        self.progress_outcome: dict | None = None  # Live accounting; never copied into the checkpoint.
         self.record = self.read()
         if not self.record:
             self.record = {"schema": SCHEMA, "task": task.to_json(), "history": []}
@@ -742,6 +743,12 @@ class TaskState:
         self.record["task"] = self.task.to_json()
         self.record.setdefault("history", []).append({"state": state, "at": self.record["updated_at"]})
         atomic_json(self.path, self.record)
+        self.write_progress()
+
+    def write_progress(self, final=None) -> None:
+        from .task_progress import write
+
+        write(self.directory, self.record, final if final is not None else self.progress_outcome)
 
     @property
     def state(self) -> str | None:
@@ -1673,6 +1680,7 @@ def run_task(
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
     outcome: dict = {"task_id": task.task_id, "status": "running", "worker": cfg.worker}
+    state.progress_outcome = outcome
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
     streaming = (task.kind == "prepare" or (cfg.stream_repair and task.kind == "repair")) and not resuming
@@ -2206,6 +2214,7 @@ def run_task(
                 repair.remove_worktree(cfg.clone, worktree)
         with contextlib.suppress(Exception):
             repair.write_record(state_dir / "outcome.json", outcome)
+        state.write_progress(outcome)
     return outcome
 
 

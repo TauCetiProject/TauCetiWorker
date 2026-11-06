@@ -151,6 +151,7 @@ RUN_STDLIB=(
   queue_diagnostics.py
   queue_controller.py
   queue_monitoring.py
+  queue_task_progress.py
   queue_monitoring_protocol.py
   queue_monitoring_history.py
   queue_admission_planning.py

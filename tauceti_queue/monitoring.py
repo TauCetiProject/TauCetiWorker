@@ -27,6 +27,7 @@ from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import task_progress
 from .monitoring_protocol import PublicationRejected, PublisherIdentity, ResyncRequired, SnapshotPublisher, encode
 
 SCHEMA = "tauceti.operations.queue/v1"
@@ -34,9 +35,6 @@ LIMIT = 20_000
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MAX_BYTES = 2_000_000
-# Private worker checkpoints include member context and prompts. They may be
-# larger than a public frame; the projection below still emits only its allowlist.
-TASK_CHECKPOINT_BYTES = 16_000_000
 
 
 def iso(value):
@@ -214,22 +212,6 @@ def workers(roots):
     return result
 
 
-TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
-
-
-def recorded_usage(records):
-    result = {}
-    for key in TOKEN_KEYS:
-        values = [r.get(key) for r in records]
-        known = [v for v in values if type(v) is int and 0 <= v <= 10**12]
-        result[key] = {
-            "recorded_tokens": sum(known),
-            "recorded_attempts": len(known),
-            "unknown_attempts": len(values) - len(known),
-        }
-    return result
-
-
 class TaskObservations:
     """Bounded cached projection of trusted worker checkpoints/outcomes."""
 
@@ -244,65 +226,42 @@ class TaskObservations:
             for root in roots:
                 directory = Path(root) / "tasks" / str(task["id"])
                 try:
+                    progress = directory / task_progress.FILENAME
+                    try:
+                        progress_stat = progress.stat()
+                    except FileNotFoundError:
+                        progress_stat = None
                     checkpoint = directory / "task.json"
                     outcome = directory / "outcome.json"
                     fingerprint = (
-                        checkpoint.stat().st_mtime_ns,
-                        outcome.stat().st_mtime_ns if outcome.exists() else None,
+                        ("progress", progress_stat.st_mtime_ns, progress_stat.st_ino)
+                        if progress_stat is not None
+                        else (
+                            "legacy",
+                            checkpoint.stat().st_mtime_ns,
+                            outcome.stat().st_mtime_ns if outcome.exists() else None,
+                        )
                     )
                     key = str(directory)
                     if self.cache.get(key, (None,))[0] != fingerprint:
-                        raw = json_read(checkpoint, limit=TASK_CHECKPOINT_BYTES)
-                        final = json_read(outcome) if outcome.exists() else (raw.get("outcome") or {})
-                        # The task itself carries a claim token. Never copy it.
-                        if str((raw.get("task") or {}).get("task_id")) != str(task["id"]):
+                        if progress_stat is not None:
+                            record = json_read(progress)
+                        else:
+                            # Trusted legacy files have no task-size ceiling. This compatibility
+                            # path uses memory proportional to their size; new workers avoid it.
+                            with checkpoint.open() as stream:
+                                raw = json.load(stream)
+                            if outcome.exists():
+                                with outcome.open() as stream:
+                                    final = json.load(stream)
+                            else:
+                                final = raw.get("outcome") or raw
+                            record = task_progress.summarize(raw, final)
+                        if str(record.get("task_id")) != str(task["id"]):
                             continue
-                        costs, providers, models, usages, nodes = [], set(), set(), [], 0
-
-                        def walk(value, depth=0, *, costs=costs, providers=providers, models=models, usages=usages):
-                            nonlocal nodes
-                            nodes += 1
-                            if depth > 8 or nodes > 500:
-                                return
-                            if isinstance(value, list):
-                                for row in value[:100]:
-                                    walk(row, depth + 1)
-                            elif isinstance(value, dict):
-                                if "telemetry" in value or "estimated_cost_usd" in value:
-                                    costs.append(numeric(value.get("estimated_cost_usd")))
-                                    usage = (value.get("telemetry") or {}).get("usage")
-                                    usages.append(usage if isinstance(usage, dict) else {})
-                                    provider = value.get("provider")
-                                    if provider in ("codex", "claude", "openai", "anthropic", "gemini"):
-                                        providers.add(provider)
-                                    model = value.get("model")
-                                    if (
-                                        isinstance(model, str)
-                                        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", model)
-                                        and ".." not in model
-                                    ):
-                                        models.add(model)
-                                else:
-                                    for name in ("agent", "parallel", "attempts", "groups", "result"):
-                                        walk(value.get(name), depth + 1)
-
-                        walk(final)
-                        observation = {
-                            "coverage": "observed",
-                            "state": text(raw.get("state"), 40),
-                            "observed_at": iso(numeric(raw.get("updated_at"))),
-                            "seconds": numeric(final.get("seconds")),
-                            "providers": sorted(providers),
-                            "models": sorted(models),
-                            "usage": recorded_usage(usages),
-                            "cost": {
-                                "recorded_usd": sum(c for c in costs if c is not None),
-                                "recorded_attempts": sum(c is not None for c in costs),
-                                "unknown_attempts": sum(c is None for c in costs),
-                                "coverage": "recorded_subtotal_only",
-                            },
-                        }
-                        self.cache[key] = (fingerprint, observation, (raw.get("task") or {}).get("claim_token"))
+                        observation = task_progress.public(record)
+                        binding = record.get("claim_token")
+                        self.cache[key] = (fingerprint, observation, binding if isinstance(binding, str) else None)
                     candidates.append(self.cache[key][1:])
                 except (OSError, ValueError, TypeError, AttributeError):
                     continue

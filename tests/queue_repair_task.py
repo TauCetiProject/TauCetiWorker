@@ -1043,7 +1043,15 @@ class Fixture(unittest.TestCase):
 class HappyPath(Fixture):
     def test_claim_renew_push_submit_adopt(self):
         cfg = self.config()
-        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        progress_phases = {}
+        write_progress = repair_task.TaskState.write_progress
+
+        def capture_progress(state, final=None):
+            write_progress(state, final)
+            progress_phases[state.state] = json.loads((state.directory / "progress.json").read_text())
+
+        with patch.object(repair_task.TaskState, "write_progress", capture_progress):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         # The service saw one claim, renewals while the agent ran, and one result with the pushed ref.
         self.assertEqual(len(self.service.results), 1)
@@ -1125,6 +1133,14 @@ class HappyPath(Fixture):
         self.assertIsNotNone(outcome["agent"][0]["attempts"][0]["estimated_cost_usd"])
         written = json.loads((self.root / "state" / "tasks" / "1" / "outcome.json").read_text())
         self.assertEqual(written["status"], "adopted")
+        progress = json.loads((self.root / "state" / "tasks" / "1" / "progress.json").read_text())
+        self.assertEqual(progress["state"], "adopted")
+        self.assertEqual(progress["seconds"], written["seconds"])
+        self.assertEqual(progress["cost"]["recorded_usd"], outcome["agent"][0]["attempts"][0]["estimated_cost_usd"])
+        for phase in ("validated", "verifying"):
+            self.assertEqual(progress_phases[phase]["cost"]["recorded_attempts"], 1)
+            self.assertEqual(progress_phases[phase]["cost"]["recorded_usd"], progress["cost"]["recorded_usd"])
+        self.assertNotIn("progress_outcome", state)
         self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
         self.assertIsNone(repair_task.claim_and_run(cfg, self.client(cfg)), "the adopted task is not claimable again")
 
