@@ -130,7 +130,8 @@ class AdmissionState:
                 last_error=error,
                 retry_resource=resource,
             )
-            if updated and resource != "source":
+            if resource != "source":
+                # Capacity belongs to the installation, even if this PR changed during the read.
                 deadlines = self.store.get_setting(self.resource_key, {})
                 deadlines[resource] = max(deadlines.get(resource, 0), until)
                 self.store.set_setting(self.resource_key, deadlines, "admission", self.clock())

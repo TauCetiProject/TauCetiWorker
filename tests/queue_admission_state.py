@@ -117,6 +117,15 @@ class AdmissionStateTests(unittest.TestCase):
         self.state = AdmissionState(self.store, "o/r", clock=lambda: self.now)
         self.assertEqual(self.state.due(), [])
 
+    def test_racing_source_change_does_not_discard_observed_resource_capacity(self):
+        self.state.observe(1, "head", "v1")
+        old = self.state.get(1)
+        self.state.dirty(1, head="new-head", urgent=True)
+        self.assertFalse(self.state.defer(old, self.now + 90, "server cooldown", "core"))
+        self.assertEqual(self.state.get(1)["retry_resource"], "")
+        self.assertEqual(self.state.get(1)["last_error"], "")
+        self.assertEqual(self.store.get_setting(self.state.resource_key)["core"], self.now + 90)
+
 
 if __name__ == "__main__":
     unittest.main()
